@@ -667,8 +667,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         handled = scrollViewerFramePixels(horizontal, 0) || handled;
       }
       if (vertical !== 0 && !event.shiftKey) {
-        let verticalHandled = scrollViewerFramePixels(0, vertical);
-        if (!verticalHandled) verticalHandled = scrollViewportPixels(vertical);
+        let verticalHandled = scrollViewportPixels(vertical);
         if (!verticalHandled) verticalHandled = scrollViewerFramePixels(0, vertical);
         handled = verticalHandled || handled;
       }
