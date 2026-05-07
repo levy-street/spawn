@@ -663,14 +663,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const vertical = wheelEventToPixels(event, term.rows, "y");
       const horizontal = event.shiftKey ? vertical : wheelEventToPixels(event, term.rows, "x");
       let handled = false;
-      if (horizontal !== 0) {
+      if (displayOwnerRef.current === false && horizontal !== 0) {
         handled = scrollViewerFramePixels(horizontal, 0) || handled;
       }
       if (vertical !== 0 && !event.shiftKey) {
         let verticalHandled = scrollViewportPixels(vertical);
-        if (!verticalHandled) verticalHandled = scrollViewerFramePixels(0, vertical);
+        if (!verticalHandled && displayOwnerRef.current === false) {
+          verticalHandled = scrollViewerFramePixels(0, vertical);
+        }
         handled = verticalHandled || handled;
       }
+      if (!handled) return true;
       event.preventDefault();
       event.stopPropagation();
       return false;
