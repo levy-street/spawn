@@ -1,0 +1,5 @@
+# Bun configuration for spawn-web
+[install]
+# Allow lifecycle scripts only for trusted packages we know need them.
+# (Next/Tailwind don't generally require postinstall, but biome ships a
+# platform binary via optionalDependencies.)

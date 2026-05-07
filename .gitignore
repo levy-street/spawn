@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.python-version
+.env
+.env.local
+
+# uv
+.uv/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node / Bun
+node_modules/
+.next/
+out/
+.turbo/
+dist/
+build/
+*.tsbuildinfo
+.bun/
+bun.lockb
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Local data
+*.db
+*.sqlite
+*.sqlite3
+server/data/
+data/postgres/
+data/redis/
+
+# Spawn local state
+.spawn/
+spawn.log

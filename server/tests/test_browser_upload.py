@@ -1,0 +1,71 @@
+"""Browser image upload validation."""
+
+from __future__ import annotations
+
+import base64
+
+import pytest
+
+from spawn_server.ws.browser import (
+    UploadValidationError,
+    _decode_image_upload,
+    _prefer_transcript_history,
+    _upload_paste_prefix,
+)
+
+
+def test_decode_image_upload_canonicalizes_payload():
+    name, mime_type, bytes_b64 = _decode_image_upload(
+        {
+            "name": " screenshot.png ",
+            "mime_type": "IMAGE/PNG",
+            "bytes_b64": base64.b64encode(b"png-ish").decode("ascii"),
+        }
+    )
+
+    assert name == "screenshot.png"
+    assert mime_type == "image/png"
+    assert base64.b64decode(bytes_b64) == b"png-ish"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"name": "x.txt", "mime_type": "text/plain", "bytes_b64": "eA=="}, "Only image"),
+        ({"name": "x.png", "mime_type": "image/png", "bytes_b64": "not-base64"}, "base64"),
+        ({"name": "x.png", "mime_type": "image/png", "bytes_b64": ""}, "empty"),
+    ],
+)
+def test_decode_image_upload_rejects_bad_payloads(payload, message):
+    with pytest.raises(UploadValidationError, match=message):
+        _decode_image_upload(payload)
+
+
+@pytest.mark.parametrize(
+    ("argv", "prefix"),
+    [
+        (["codex", "--yolo"], "@"),
+        (["/usr/local/bin/claude"], "@"),
+        (["opencode"], "@"),
+        (["aider", "--model", "sonnet"], "@"),
+        (["bash", "-l"], ""),
+    ],
+)
+def test_upload_paste_prefix(argv, prefix):
+    assert _upload_paste_prefix(argv) == prefix
+
+
+@pytest.mark.parametrize(
+    ("argv", "prefer_transcript"),
+    [
+        (["codex", "--yolo"], False),
+        (["/usr/local/bin/claude"], False),
+        (["claude-code"], False),
+        (["opencode"], False),
+        (["aider", "--model", "sonnet"], False),
+        (["bash", "-l"], False),
+        ([], False),
+    ],
+)
+def test_prefer_transcript_history(argv, prefer_transcript):
+    assert _prefer_transcript_history(argv) is prefer_transcript

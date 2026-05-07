@@ -1,0 +1,216 @@
+"""Broker routing without a real PTY: fake daemon + fake browser objects."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+
+import pytest
+
+from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
+from spawn_server.ws.frames import (
+    KIND_INPUT,
+    KIND_OUTPUT,
+    decode_binary_frame,
+    encode_binary_frame,
+)
+
+
+@dataclass
+class FakeWS:
+    """Minimal stand-in for a Starlette WebSocket capturing send_*."""
+
+    sent_text: list[str] = field(default_factory=list)
+    sent_bytes: list[bytes] = field(default_factory=list)
+
+    async def send_text(self, s: str) -> None:
+        self.sent_text.append(s)
+
+    async def send_bytes(self, b: bytes) -> None:
+        self.sent_bytes.append(b)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        pass
+
+
+def test_frame_roundtrip():
+    aid = "00000000-0000-4000-8000-00000000abcd"
+    payload = b"hello terminal"
+    raw = encode_binary_frame(KIND_OUTPUT, aid, payload)
+    f = decode_binary_frame(raw)
+    assert f.kind == KIND_OUTPUT
+    assert f.agent_id == aid
+    assert f.payload == payload
+
+
+@pytest.mark.asyncio
+async def test_broker_routes_browser_to_daemon():
+    broker = get_broker()
+
+    host_id = "host-xyz"
+    user_id = "user-1"
+    agent_id = "00000000-0000-4000-8000-0000000000aa"
+
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    browser_ws = FakeWS()
+    browser = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
+    await broker.attach_browser(browser)
+
+    # Browser sends stdin → server should wrap and forward to daemon.
+    stdin_bytes = b"ls -la\r"
+    fake_frame = encode_binary_frame(KIND_INPUT, agent_id, stdin_bytes)
+    await daemon.send_bytes(fake_frame)
+    assert daemon_ws.sent_bytes[-1] == fake_frame
+    decoded = decode_binary_frame(daemon_ws.sent_bytes[-1])
+    assert decoded.kind == KIND_INPUT
+    assert decoded.payload == stdin_bytes
+
+    # Daemon emits output → broker fans out to subscribed browsers.
+    out_bytes = b"total 0\n"
+    for b in broker.browsers_for(agent_id):
+        await b.send_bytes(out_bytes)
+    assert browser_ws.sent_bytes == [out_bytes]
+
+    # Cleanup.
+    await broker.detach_browser(browser)
+    await broker.unregister_daemon(daemon)
+    assert broker.get_daemon_for_host(host_id) is None
+    assert broker.get_daemon_for_agent(agent_id) is None
+
+    await asyncio.sleep(0)  # let any pending tasks settle
+
+
+@pytest.mark.asyncio
+async def test_broker_snapshot_request_roundtrip():
+    broker = get_broker()
+
+    host_id = "host-snapshot"
+    user_id = "user-1"
+    agent_id = "00000000-0000-4000-8000-0000000000cc"
+
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    task = asyncio.create_task(broker.request_snapshot(agent_id, daemon, lines=123, timeout=1))
+    await asyncio.sleep(0)
+
+    sent = json.loads(daemon_ws.sent_text[-1])
+    assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123}
+
+    await broker.resolve_snapshot(agent_id, "aGVsbG8=")
+    assert await task == "aGVsbG8="
+
+    await broker.unregister_daemon(daemon)
+
+
+@pytest.mark.asyncio
+async def test_broker_plain_snapshot_request_roundtrip():
+    broker = get_broker()
+
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(
+        host_id="host-plain-snapshot",
+        user_id="user-1",
+        websocket=daemon_ws,  # type: ignore[arg-type]
+    )
+    await broker.register_daemon(daemon)
+    agent_id = "00000000-0000-4000-8000-0000000000cd"
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    task = asyncio.create_task(broker.request_snapshot(agent_id, daemon, lines=321, plain=True))
+    await asyncio.sleep(0)
+
+    sent = json.loads(daemon_ws.sent_text[-1])
+    assert sent == {
+        "type": "agent.snapshot",
+        "agent_id": agent_id,
+        "lines": 321,
+        "plain": True,
+    }
+
+    await broker.resolve_snapshot(agent_id, "cGxhaW4=")
+    assert await task == "cGxhaW4="
+
+    await broker.unregister_daemon(daemon)
+
+
+@pytest.mark.asyncio
+async def test_broker_directory_request_roundtrip():
+    broker = get_broker()
+
+    host_id = "host-dirs"
+    user_id = "user-1"
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(
+        host_id=host_id,
+        user_id=user_id,
+        websocket=daemon_ws,  # type: ignore[arg-type]
+        home_dir="/home/me",
+    )
+    await broker.register_daemon(daemon)
+
+    task = asyncio.create_task(broker.request_dir_list(daemon, path="/home/me", timeout=1))
+    await asyncio.sleep(0)
+
+    sent = json.loads(daemon_ws.sent_text[-1])
+    assert sent["type"] == "host.fs.list"
+    assert sent["path"] == "/home/me"
+    request_id = sent["request_id"]
+
+    payload = {
+        "type": "host.fs.list_result",
+        "request_id": request_id,
+        "path": "/home/me",
+        "home_dir": "/home/me",
+        "parent": "/home",
+        "entries": [{"name": "src", "path": "/home/me/src"}],
+        "error": None,
+    }
+    await broker.resolve_dir_list(request_id, payload)
+    assert await task == payload
+
+    await broker.unregister_daemon(daemon)
+
+
+@pytest.mark.asyncio
+async def test_pubsub_publish_subscribe_roundtrip(app):
+    """publish() on one side reaches subscribe() on the other (in-proc pubsub)."""
+    from spawn_server.redis import get_backend
+
+    backend = get_backend()
+    agent_id = "00000000-0000-4000-8000-0000000000bb"
+
+    received: list[bytes] = []
+    ready = asyncio.Event()
+    done = asyncio.Event()
+
+    async def consumer():
+        async with backend.subscribe(agent_id) as stream:
+            ready.set()
+            async for chunk in stream:
+                received.append(chunk)
+                if len(received) == 2:
+                    done.set()
+                    return
+
+    task = asyncio.create_task(consumer())
+    await ready.wait()
+
+    await backend.publish(agent_id, b"hello ")
+    await backend.publish(agent_id, b"world")
+
+    await asyncio.wait_for(done.wait(), timeout=1.0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert received == [b"hello ", b"world"]
