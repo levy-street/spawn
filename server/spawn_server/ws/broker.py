@@ -42,6 +42,7 @@ class BrowserConn:
     user_id: str
     agent_id: str
     websocket: WebSocket
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def send_text(self, payload: dict) -> None:
@@ -53,11 +54,27 @@ class BrowserConn:
             await self.websocket.send_bytes(payload)
 
 
+@dataclass
+class _DisplayState:
+    owner_conn_id: str | None = None
+    cols: int | None = None
+    rows: int | None = None
+
+
+@dataclass(frozen=True)
+class BrowserDisplayState:
+    owner: bool
+    cols: int | None
+    rows: int | None
+    viewers: int
+
+
 class Broker:
     def __init__(self) -> None:
         self._daemons_by_host: dict[str, DaemonConn] = {}
         self._daemon_by_agent: dict[str, DaemonConn] = {}
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
+        self._display_by_agent: dict[str, _DisplayState] = {}
         self._snapshot_waiters: dict[str, set[asyncio.Future[str]]] = defaultdict(set)
         self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
         self._lock = asyncio.Lock()
@@ -104,16 +121,108 @@ class Broker:
 
     # ---- browser attach ----
 
-    async def attach_browser(self, conn: BrowserConn) -> None:
+    async def attach_browser(
+        self,
+        conn: BrowserConn,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+    ) -> BrowserDisplayState:
         async with self._lock:
-            self._browsers_by_agent[conn.agent_id].add(conn)
+            browsers = self._browsers_by_agent[conn.agent_id]
+            had_browsers = bool(browsers)
+            browsers.add(conn)
+            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
+            self._drop_stale_display_owner_locked(conn.agent_id, state)
+            if state.owner_conn_id is None and not had_browsers:
+                state.owner_conn_id = conn.id
+                if cols is not None and rows is not None:
+                    state.cols = cols
+                    state.rows = rows
+            elif state.cols is None and cols is not None and rows is not None:
+                state.cols = cols
+                state.rows = rows
+            return self._browser_display_state_locked(conn, state)
 
-    async def detach_browser(self, conn: BrowserConn) -> None:
+    async def detach_browser(self, conn: BrowserConn) -> BrowserDisplayState | None:
         async with self._lock:
-            self._browsers_by_agent.get(conn.agent_id, set()).discard(conn)
+            browsers = self._browsers_by_agent.get(conn.agent_id)
+            if browsers is not None:
+                browsers.discard(conn)
+                if not browsers:
+                    self._browsers_by_agent.pop(conn.agent_id, None)
+            state = self._display_by_agent.get(conn.agent_id)
+            if state is None:
+                return None
+            if state.owner_conn_id == conn.id:
+                state.owner_conn_id = None
+            self._drop_stale_display_owner_locked(conn.agent_id, state)
+            return self._browser_display_state_locked(conn, state)
 
     def browsers_for(self, agent_id: str) -> list[BrowserConn]:
         return list(self._browsers_by_agent.get(agent_id, ()))
+
+    async def update_display_size(
+        self,
+        conn: BrowserConn,
+        *,
+        cols: int,
+        rows: int,
+    ) -> BrowserDisplayState | None:
+        async with self._lock:
+            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
+            self._drop_stale_display_owner_locked(conn.agent_id, state)
+            if state.owner_conn_id != conn.id:
+                return None
+            state.cols = cols
+            state.rows = rows
+            return self._browser_display_state_locked(conn, state)
+
+    async def take_display_control(
+        self,
+        conn: BrowserConn,
+        *,
+        cols: int,
+        rows: int,
+    ) -> BrowserDisplayState:
+        async with self._lock:
+            browsers = self._browsers_by_agent[conn.agent_id]
+            browsers.add(conn)
+            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
+            state.owner_conn_id = conn.id
+            state.cols = cols
+            state.rows = rows
+            return self._browser_display_state_locked(conn, state)
+
+    async def display_states_for_agent(
+        self, agent_id: str
+    ) -> list[tuple[BrowserConn, BrowserDisplayState]]:
+        async with self._lock:
+            state = self._display_by_agent.setdefault(agent_id, _DisplayState())
+            self._drop_stale_display_owner_locked(agent_id, state)
+            return [
+                (conn, self._browser_display_state_locked(conn, state))
+                for conn in self._browsers_by_agent.get(agent_id, ())
+            ]
+
+    def _drop_stale_display_owner_locked(self, agent_id: str, state: _DisplayState) -> None:
+        if state.owner_conn_id is None:
+            return
+        if any(
+            conn.id == state.owner_conn_id for conn in self._browsers_by_agent.get(agent_id, ())
+        ):
+            return
+        state.owner_conn_id = None
+
+    def _browser_display_state_locked(
+        self, conn: BrowserConn, state: _DisplayState
+    ) -> BrowserDisplayState:
+        return BrowserDisplayState(
+            owner=state.owner_conn_id == conn.id,
+            cols=state.cols,
+            rows=state.rows,
+            viewers=len(self._browsers_by_agent.get(conn.agent_id, ())),
+        )
 
     async def request_snapshot(
         self,

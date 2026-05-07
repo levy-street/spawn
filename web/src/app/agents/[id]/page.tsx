@@ -13,6 +13,7 @@ import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
 import { agentCommand, agentKind, agentTitle, isAgentArchived } from "@/lib/agents";
 import { agents } from "@/lib/api";
+import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 
@@ -34,11 +35,17 @@ function AgentTerminal() {
 
   const termRef = useRef<TerminalHandle>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
 
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
     if (desktop) requestAnimationFrame(() => termRef.current?.focus());
   }, []);
+
+  useEffect(() => {
+    if (!id) return;
+    setDisplayState(null);
+  }, [id]);
 
   const q = useQuery({
     queryKey: ["agent", id],
@@ -112,6 +119,10 @@ function AgentTerminal() {
           </div>
         </div>
         <div className="flex items-center gap-1">
+          <TerminalDisplayControl
+            state={displayState}
+            onTakeControl={() => termRef.current?.takeControl()}
+          />
           <Button asChild variant="ghost" size="sm">
             <Link href="/agents">All agents</Link>
           </Button>
@@ -182,6 +193,7 @@ function AgentTerminal() {
           mobileReturnMode="newline"
           mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
           imagePasteMode={q.data && agentKind(q.data) === "codex" ? "bracketed-path" : "deferred"}
+          onDisplayControl={setDisplayState}
         />
       </div>
 
@@ -206,5 +218,39 @@ function AgentTerminal() {
         }}
       />
     </div>
+  );
+}
+
+function TerminalDisplayControl({
+  state,
+  onTakeControl,
+}: {
+  state: DisplayControlState | null;
+  onTakeControl: () => void;
+}) {
+  if (!state) return null;
+  if (!state.owner) {
+    const size =
+      typeof state.cols === "number" && typeof state.rows === "number"
+        ? `${state.cols}x${state.rows}`
+        : "shared";
+    return (
+      <div className="flex items-center gap-1">
+        <span className="hidden whitespace-nowrap text-xs text-muted-foreground sm:inline">
+          Viewer · {size}
+        </span>
+        <Button variant="secondary" size="sm" onClick={onTakeControl}>
+          Take control
+        </Button>
+      </div>
+    );
+  }
+
+  const otherViewers = Math.max(0, state.viewers - 1);
+  if (otherViewers === 0) return null;
+  return (
+    <span className="hidden whitespace-nowrap px-2 text-xs text-muted-foreground sm:inline">
+      {otherViewers} viewer{otherViewers === 1 ? "" : "s"}
+    </span>
   );
 }

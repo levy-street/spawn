@@ -15,7 +15,7 @@ from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
-from .broker import BrowserConn, get_broker
+from .broker import BrowserConn, BrowserDisplayState, get_broker
 from .frames import KIND_INPUT, encode_binary_frame
 
 router = APIRouter()
@@ -70,6 +70,25 @@ def _prefer_transcript_history(argv: list[str]) -> bool:
     return False
 
 
+def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
+    return {
+        "type": "display.control",
+        "owner": state.owner,
+        "cols": state.cols,
+        "rows": state.rows,
+        "viewers": state.viewers,
+    }
+
+
+async def _broadcast_display_control(agent_id: str) -> None:
+    broker = get_broker()
+    for conn, state in await broker.display_states_for_agent(agent_id):
+        try:
+            await conn.send_text(_display_control_payload(state))
+        except Exception as e:
+            log.warning("display control broadcast failed: %s", e)
+
+
 async def _send_initial_history(
     conn: BrowserConn,
     *,
@@ -78,12 +97,13 @@ async def _send_initial_history(
     agent_argv: list[str],
     initial_cols: int | None,
     initial_rows: int | None,
+    resize_before_snapshot: bool,
 ) -> None:
     broker = get_broker()
     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
     if daemon is not None and not _prefer_transcript_history(agent_argv):
         try:
-            if initial_cols is not None and initial_rows is not None:
+            if resize_before_snapshot and initial_cols is not None and initial_rows is not None:
                 await daemon.send_text(
                     {
                         "type": "agent.resize",
@@ -167,20 +187,30 @@ async def browser_ws(
 
     broker = get_broker()
     conn = BrowserConn(user_id=user.id, agent_id=agent_id, websocket=websocket)
-    await broker.attach_browser(conn)
-    log.info("browser attached agent=%s user=%s", agent_id, user.id)
     initial_cols = _clamp_initial_size(cols, 20, 400)
     initial_rows = _clamp_initial_size(rows, 5, 200)
+    display_state = await broker.attach_browser(conn, cols=initial_cols, rows=initial_rows)
+    log.info(
+        "browser attached agent=%s user=%s owner=%s viewers=%s",
+        agent_id,
+        user.id,
+        display_state.owner,
+        display_state.viewers,
+    )
 
-    # Send replay history before any live frames.
+    # Tell the browser which terminal geometry it should render before replaying
+    # history. Followers must adopt the controller geometry instead of fitting
+    # their own viewport and racing the shared PTY size.
     try:
+        await _broadcast_display_control(agent_id)
         await _send_initial_history(
             conn,
             agent_id=agent_id,
             host_id=host_id,
             agent_argv=agent_argv,
-            initial_cols=initial_cols,
-            initial_rows=initial_rows,
+            initial_cols=display_state.cols if display_state.cols is not None else initial_cols,
+            initial_rows=display_state.rows if display_state.rows is not None else initial_rows,
+            resize_before_snapshot=display_state.owner,
         )
         await conn.send_text({"type": "agent.status", "status": agent_status})
     except Exception as e:
@@ -248,8 +278,15 @@ async def browser_ws(
                     continue
                 ftype = obj.get("type")
                 if ftype == "resize":
-                    cols = int(obj.get("cols") or 80)
-                    rows = int(obj.get("rows") or 24)
+                    cols = _clamp_message_size(obj, "cols", 80, 20, 400)
+                    rows = _clamp_message_size(obj, "rows", 24, 5, 200)
+                    display_state = await broker.update_display_size(
+                        conn,
+                        cols=cols,
+                        rows=rows,
+                    )
+                    if display_state is None:
+                        continue
                     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
                         host_id
                     )
@@ -265,6 +302,32 @@ async def browser_ws(
                             )
                         except Exception as e:
                             log.warning("resize forward failed: %s", e)
+                    await _broadcast_display_control(agent_id)
+                elif ftype == "take_control":
+                    cols = _clamp_message_size(obj, "cols", 80, 20, 400)
+                    rows = _clamp_message_size(obj, "rows", 24, 5, 200)
+                    display_state = await broker.take_display_control(
+                        conn,
+                        cols=cols,
+                        rows=rows,
+                    )
+                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
+                        host_id
+                    )
+                    if daemon is not None:
+                        try:
+                            await daemon.send_text(
+                                {
+                                    "type": "agent.resize",
+                                    "agent_id": agent_id,
+                                    "cols": display_state.cols,
+                                    "rows": display_state.rows,
+                                }
+                            )
+                        except Exception as e:
+                            log.warning("take control resize forward failed: %s", e)
+                    await _broadcast_display_control(agent_id)
+                    await _request_agent_redraw(agent_id, host_id)
                 elif ftype == "scroll":
                     raw_lines = int(obj.get("lines") or 0)
                     lines = max(-200, min(200, raw_lines))
@@ -364,6 +427,7 @@ async def browser_ws(
         except (asyncio.CancelledError, Exception):
             pass
         await broker.detach_browser(conn)
+        await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)
 
 
@@ -371,6 +435,20 @@ def _clamp_initial_size(value: int | None, minimum: int, maximum: int) -> int | 
     if value is None:
         return None
     return max(minimum, min(maximum, int(value)))
+
+
+def _clamp_message_size(
+    obj: dict,
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(obj.get(key) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 async def _request_agent_redraw(agent_id: str, host_id: str) -> None:

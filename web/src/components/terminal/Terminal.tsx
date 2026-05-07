@@ -18,6 +18,7 @@ import {
   useState,
 } from "react";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
+import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_FONT_SIZE = 13;
 const TERMINAL_LINE_HEIGHT = 1.2;
@@ -66,6 +67,8 @@ export interface TerminalHandle {
   pasteDataTransfer: (data: DataTransfer) => void;
   /** Paste plain text supplied by a native editable fallback. */
   pasteText: (text: string) => void;
+  /** Promote this browser to the shared PTY geometry controller. */
+  takeControl: () => void;
 }
 
 export interface TerminalProps {
@@ -78,6 +81,8 @@ export interface TerminalProps {
   mobileReturnBytes?: string;
   /** How uploaded images should be handed to the terminal application. */
   imagePasteMode?: ImagePasteMode;
+  /** Server-side shared terminal display ownership changed. */
+  onDisplayControl?: (state: DisplayControlState) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
 }
 
@@ -93,6 +98,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     mobileReturnMode = "submit",
     mobileReturnBytes = ALT_ENTER,
     imagePasteMode = "deferred",
+    onDisplayControl,
     onExit,
   },
   ref,
@@ -100,6 +106,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
+  const displayOwnerRef = useRef<boolean | null>(null);
+  const displayGeometryRef = useRef<{ cols: number; rows: number } | null>(null);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
   const uploadStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -320,6 +329,47 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [getScrollbackViewport, updateScrollbackReveal],
   );
 
+  const applyDisplayControl = useCallback(
+    (state: DisplayControlState) => {
+      const geometry =
+        typeof state.cols === "number" && typeof state.rows === "number"
+          ? { cols: state.cols, rows: state.rows }
+          : null;
+      displayOwnerRef.current = state.owner;
+      displayGeometryRef.current = geometry;
+      onDisplayControl?.(state);
+
+      requestAnimationFrame(() => {
+        const term = termRef.current;
+        if (!term) return;
+
+        if (state.owner) {
+          fitTerminalRef.current(true);
+          return;
+        }
+
+        if (!geometry) return;
+        const buffer = term.buffer.active;
+        const atBottom = buffer.viewportY >= buffer.baseY;
+        const viewportY = buffer.viewportY;
+        try {
+          term.resize(geometry.cols, geometry.rows);
+          scrollbackTermRef.current?.resize(geometry.cols, geometry.rows);
+        } catch {
+          return;
+        }
+        lastSizeRef.current = geometry;
+        if (atBottom) {
+          term.scrollToBottom();
+          scrollbackTermRef.current?.scrollToBottom();
+        } else {
+          term.scrollToLine(Math.max(0, Math.min(term.buffer.active.baseY, viewportY)));
+        }
+      });
+    },
+    [onDisplayControl],
+  );
+
   const socket = useAgentSocket({
     agentId,
     enabled: socketInitialSize !== null,
@@ -347,6 +397,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       term.reset();
       term.write(bytes);
     },
+    onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes) => {
       if (scrollbackIgnoreSnapshotCountRef.current > 0) {
         scrollbackIgnoreSnapshotCountRef.current -= 1;
@@ -1083,6 +1134,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         setSocketInitialSize({ cols, rows });
         return;
       }
+      if (displayOwnerRef.current !== true) {
+        lastSizeRef.current = { cols, rows };
+        return;
+      }
       const last = lastSizeRef.current;
       if (cols !== last.cols || rows !== last.rows) {
         lastSizeRef.current = { cols, rows };
@@ -1092,6 +1147,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const fitTerminal = (preserveScroll: boolean) => {
       const anchor = preserveScroll ? captureScrollAnchor() : null;
+      const followerGeometry =
+        displayOwnerRef.current === false ? displayGeometryRef.current : null;
+      if (followerGeometry) {
+        try {
+          term.resize(followerGeometry.cols, followerGeometry.rows);
+        } catch {
+          return;
+        }
+        lastSizeRef.current = followerGeometry;
+        if (anchor) {
+          restoreScrollAnchor(anchor);
+          requestAnimationFrame(() => restoreScrollAnchor(anchor));
+        } else {
+          alignViewportToRows();
+        }
+        return;
+      }
       try {
         fit.fit();
       } catch {
@@ -1105,6 +1177,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       notifyResizeIfChanged();
     };
+    fitTerminalRef.current = fitTerminal;
 
     // Initial fit + resize notification.
     requestAnimationFrame(() => {
@@ -1154,6 +1227,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
+      fitTerminalRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
@@ -1332,7 +1406,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
-    if (socket.state === "open") {
+    if (socket.state === "open" && displayOwnerRef.current === true) {
       const { cols, rows } = lastSizeRef.current;
       socket.sendJson({ type: "resize", cols, rows });
     }
@@ -1347,14 +1421,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       },
       resize: (cols, rows) => {
         lastSizeRef.current = { cols, rows };
-        socket.sendJson({ type: "resize", cols, rows });
+        if (displayOwnerRef.current === true) {
+          socket.sendJson({ type: "resize", cols, rows });
+        } else {
+          socket.sendJson({ type: "take_control", cols, rows });
+        }
       },
       fit: () => {
-        try {
-          fitRef.current?.fit();
-        } catch {
-          /* ignore */
-        }
+        fitTerminalRef.current(true);
       },
       focus: () => termRef.current?.focus(),
       submit: () => {
@@ -1365,6 +1439,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteFromClipboard,
       pasteDataTransfer,
       pasteText,
+      takeControl: () => {
+        hideScrollbackOverlay();
+        const term = termRef.current;
+        if (!term) return;
+        try {
+          fitRef.current?.fit();
+        } catch {
+          // Keep the current size if fit is unavailable.
+        }
+        const { cols, rows } = term;
+        lastSizeRef.current = { cols, rows };
+        socket.sendJson({ type: "take_control", cols, rows });
+        term.focus();
+      },
     }),
     [
       appendAttachmentsForSubmit,

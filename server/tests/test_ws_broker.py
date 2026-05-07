@@ -45,6 +45,94 @@ def test_frame_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_broker_display_control_first_browser_owns_later_browsers_view():
+    broker = get_broker()
+
+    agent_id = "00000000-0000-4000-8000-0000000000d1"
+    user_id = "user-1"
+    first = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    second = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+
+    first_state = await broker.attach_browser(first, cols=132, rows=43)
+    second_state = await broker.attach_browser(second, cols=60, rows=20)
+
+    assert first_state.owner is True
+    assert first_state.cols == 132
+    assert first_state.rows == 43
+    assert first_state.viewers == 1
+
+    assert second_state.owner is False
+    assert second_state.cols == 132
+    assert second_state.rows == 43
+    assert second_state.viewers == 2
+
+    ignored = await broker.update_display_size(second, cols=61, rows=21)
+    assert ignored is None
+
+    owner_update = await broker.update_display_size(first, cols=140, rows=44)
+    assert owner_update is not None
+    assert owner_update.owner is True
+    assert owner_update.cols == 140
+    assert owner_update.rows == 44
+
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[first].owner is True
+    assert states[second].owner is False
+    assert states[second].cols == 140
+    assert states[second].rows == 44
+
+    await broker.detach_browser(first)
+    await broker.detach_browser(second)
+
+
+@pytest.mark.asyncio
+async def test_broker_display_control_can_be_taken_by_viewer():
+    broker = get_broker()
+
+    agent_id = "00000000-0000-4000-8000-0000000000d2"
+    user_id = "user-1"
+    first = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    second = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+
+    await broker.attach_browser(first, cols=132, rows=43)
+    await broker.attach_browser(second, cols=60, rows=20)
+
+    second_state = await broker.take_display_control(second, cols=60, rows=20)
+    assert second_state.owner is True
+    assert second_state.cols == 60
+    assert second_state.rows == 20
+    assert second_state.viewers == 2
+
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[first].owner is False
+    assert states[second].owner is True
+
+    await broker.detach_browser(second)
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[first].owner is False
+    assert states[first].cols == 60
+    assert states[first].rows == 20
+
+    await broker.detach_browser(first)
+
+
+@pytest.mark.asyncio
 async def test_broker_routes_browser_to_daemon():
     broker = get_broker()
 

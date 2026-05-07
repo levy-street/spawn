@@ -4,11 +4,11 @@
  * See `proto/README.md`:
  *   - URL: `${WS_URL}/ws/browser?agent_id=<uuid>`
  *   - Subprotocol: `spawn.v1`
- *   - Inbound: text JSON ({type:"history", bytes_b64} | {type:"agent.exit",...} |
- *             {type:"agent.status",...} | {type:"upload.saved",...} |
- *             {type:"upload.error",...}); binary stdout bytes.
- *   - Outbound: text JSON ({type:"resize",cols,rows} | {type:"scroll",lines} |
- *              {type:"upload",...});
+ *   - Inbound: text JSON ({type:"history", bytes_b64} | {type:"display.control",...} |
+ *             {type:"agent.exit",...} | {type:"agent.status",...} |
+ *             {type:"upload.saved",...} | {type:"upload.error",...}); binary stdout bytes.
+ *   - Outbound: text JSON ({type:"resize",cols,rows} | {type:"take_control",cols,rows} |
+ *              {type:"scroll",lines} | {type:"upload",...});
  *               binary stdin bytes.
  */
 
@@ -43,8 +43,16 @@ export function buildAgentWsUrl(
 
 // ---------- Inbound JSON frame types ----------
 
+export interface DisplayControlState {
+  owner: boolean;
+  cols: number | null;
+  rows: number | null;
+  viewers: number;
+}
+
 export type InboundMessage =
   | { type: "history"; bytes_b64: string }
+  | ({ type: "display.control" } & DisplayControlState)
   | { type: "snapshot"; bytes_b64: string; plain?: boolean }
   | { type: "agent.exit"; exit_code: number | null; signal: string | null }
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
@@ -65,6 +73,7 @@ export function parseInbound(raw: string): InboundMessage | null {
 
 export type OutboundMessage =
   | { type: "resize"; cols: number; rows: number }
+  | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
   | { type: "snapshot"; lines?: number; plain?: boolean }
   | {

@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { base64ToBytes, buildAgentWsUrl, parseInbound, SPAWN_WS_SUBPROTOCOL } from "@/lib/ws";
+import {
+  base64ToBytes,
+  buildAgentWsUrl,
+  type DisplayControlState,
+  parseInbound,
+  SPAWN_WS_SUBPROTOCOL,
+} from "@/lib/ws";
 
 /**
  * Lifecycle hook for the per-agent browser WS.
@@ -17,6 +23,7 @@ export interface UseAgentSocketOptions {
   initialSize?: { cols: number; rows: number } | null;
   onData: (bytes: Uint8Array) => void;
   onHistory?: (bytes: Uint8Array) => void;
+  onDisplayControl?: (state: DisplayControlState) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
   onStatus?: (status: string) => void;
   onSnapshot?: (bytes: Uint8Array, plain: boolean) => void;
@@ -32,6 +39,7 @@ export function useAgentSocket({
   initialSize = null,
   onData,
   onHistory,
+  onDisplayControl,
   onExit,
   onStatus,
   onSnapshot,
@@ -44,6 +52,7 @@ export function useAgentSocket({
   const handlersRef = useRef({
     onData,
     onHistory,
+    onDisplayControl,
     onExit,
     onStatus,
     onSnapshot,
@@ -54,6 +63,7 @@ export function useAgentSocket({
   handlersRef.current = {
     onData,
     onHistory,
+    onDisplayControl,
     onExit,
     onStatus,
     onSnapshot,
@@ -96,6 +106,13 @@ export function useAgentSocket({
             const bytes = base64ToBytes(msg.bytes_b64);
             if (h.onHistory) h.onHistory(bytes);
             else h.onData(bytes);
+          } else if (msg.type === "display.control") {
+            h.onDisplayControl?.({
+              owner: msg.owner,
+              cols: msg.cols,
+              rows: msg.rows,
+              viewers: msg.viewers,
+            });
           } else if (msg.type === "snapshot") {
             h.onSnapshot?.(base64ToBytes(msg.bytes_b64), Boolean(msg.plain));
           } else if (msg.type === "agent.exit") {
