@@ -1626,9 +1626,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       <div ref={terminalViewportRef} className="absolute inset-0 overflow-hidden touch-none">
         <div
           ref={terminalContentRef}
-          className="relative min-h-full min-w-full bg-[var(--color-terminal-bg)]"
+          className="relative size-full min-h-full min-w-full bg-[var(--color-terminal-bg)]"
         >
-          <div ref={containerRef} className="absolute inset-0 touch-none" />
+          <div ref={containerRef} className="size-full touch-none" />
           {scrollbackVisible && (
             <div
               className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
