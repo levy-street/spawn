@@ -354,6 +354,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
 
         if (!geometry) return;
+        if (!coarsePointerRef.current) {
+          layoutTerminalSurfaceRef.current(false);
+          fitTerminalRef.current(true);
+          return;
+        }
         const buffer = term.buffer.active;
         const atBottom = buffer.viewportY >= buffer.baseY;
         const viewportY = buffer.viewportY;
@@ -1248,8 +1253,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const fitTerminal = (preserveScroll: boolean) => {
       const anchor = preserveScroll ? captureScrollAnchor() : null;
-      const followerGeometry =
-        displayOwnerRef.current === false ? displayGeometryRef.current : null;
+      const followerGeometry = usesViewerFrame() ? displayGeometryRef.current : null;
       if (followerGeometry) {
         try {
           term.resize(followerGeometry.cols, followerGeometry.rows);
