@@ -660,20 +660,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     term.attachCustomWheelEventHandler((event) => {
       if (event.ctrlKey) return true;
-      const vertical = wheelEventToPixels(event, term.rows, "y");
-      const horizontal = event.shiftKey ? vertical : wheelEventToPixels(event, term.rows, "x");
-      let handled = false;
-      if (displayOwnerRef.current === false && horizontal !== 0) {
-        handled = scrollViewerFramePixels(horizontal, 0) || handled;
-      }
-      if (vertical !== 0 && !event.shiftKey) {
-        let verticalHandled = scrollViewportPixels(vertical);
-        if (!verticalHandled && displayOwnerRef.current === false) {
-          verticalHandled = scrollViewerFramePixels(0, vertical);
-        }
-        handled = verticalHandled || handled;
-      }
-      if (!handled) return true;
+      const amount = wheelEventToPixels(event, term.rows);
+      if (amount !== 0) scrollViewportPixels(amount);
       event.preventDefault();
       event.stopPropagation();
       return false;
@@ -709,8 +697,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return Math.max(0, terminalViewport.scrollHeight - terminalViewport.clientHeight);
     };
 
+    const usesViewerFrame = () => {
+      return (
+        coarsePointerRef.current &&
+        displayOwnerRef.current === false &&
+        displayGeometryRef.current !== null
+      );
+    };
+
     const scrollViewerFramePixels = (deltaX: number, deltaY = 0) => {
-      if (displayOwnerRef.current !== false || !displayGeometryRef.current) return false;
+      if (!usesViewerFrame()) return false;
 
       const maxLeft = maxFrameScrollLeft();
       const maxTop = maxFrameScrollTop();
@@ -731,8 +727,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     const layoutTerminalSurface = (pinToBottom = false) => {
-      const followerGeometry =
-        displayOwnerRef.current === false ? displayGeometryRef.current : null;
+      const followerGeometry = usesViewerFrame() ? displayGeometryRef.current : null;
 
       if (!followerGeometry) {
         terminalContent.style.width = "100%";
@@ -1700,13 +1695,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   );
 });
 
-function wheelEventToPixels(event: WheelEvent, rows: number, axis: "x" | "y" = "y"): number {
-  const delta = axis === "x" ? event.deltaX : event.deltaY;
+function wheelEventToPixels(event: WheelEvent, rows: number): number {
   return event.deltaMode === WheelEvent.DOM_DELTA_LINE
-    ? delta * TERMINAL_LINE_HEIGHT_PX
+    ? event.deltaY * TERMINAL_LINE_HEIGHT_PX
     : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-      ? delta * rows * TERMINAL_LINE_HEIGHT_PX
-      : delta;
+      ? event.deltaY * rows * TERMINAL_LINE_HEIGHT_PX
+      : event.deltaY;
 }
 
 function clamp(value: number, min: number, max: number): number {
