@@ -113,6 +113,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const displayOwnerRef = useRef<boolean | null>(null);
   const displayGeometryRef = useRef<TerminalGeometry | null>(null);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
+  const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const lastSizeRef = useRef<TerminalGeometry>({ cols: 80, rows: 24 });
   const uploadStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -702,8 +703,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return Math.max(0, terminalViewport.scrollHeight - terminalViewport.clientHeight);
     };
 
+    const viewerPanFrameIsAtBottom = () => {
+      const maxTop = maxFrameScrollTop();
+      return maxTop <= 0 || terminalViewport.scrollTop >= maxTop - 1;
+    };
+
     const layoutTerminalSurface = (pinToBottom = false) => {
       if (!usesViewerPanFrame()) {
+        viewerPanFrameActiveRef.current = false;
         terminalSurface.style.width = "100%";
         terminalSurface.style.height = "100%";
         terminalElement.style.width = "100%";
@@ -713,13 +720,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
 
+      const wasActive = viewerPanFrameActiveRef.current;
+      const shouldPinToBottom = pinToBottom && (!wasActive || viewerPanFrameIsAtBottom());
+      viewerPanFrameActiveRef.current = true;
       const size = getTerminalPixelSize();
       terminalSurface.style.width = `${size.width}px`;
       terminalSurface.style.height = `${size.height}px`;
       terminalElement.style.width = `${size.width}px`;
       terminalElement.style.height = `${size.height}px`;
 
-      if (pinToBottom) {
+      if (shouldPinToBottom) {
         terminalViewport.scrollTop = maxFrameScrollTop();
       } else {
         terminalViewport.scrollTop = Math.min(terminalViewport.scrollTop, maxFrameScrollTop());
