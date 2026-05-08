@@ -8,12 +8,14 @@ import "@xterm/xterm/css/xterm.css";
 import Image from "next/image";
 import {
   type ClipboardEvent,
+  type CSSProperties,
   type DragEvent,
   forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -42,6 +44,16 @@ type PendingAttachmentStatus = "uploading" | "ready" | "error";
 type ScrollAnchor = { viewportY: number; atBottom: boolean };
 type ScrollbackSnapshotOptions = { reset?: boolean };
 type TerminalGeometry = { cols: number; rows: number };
+type AnsiStyle = {
+  fg?: string;
+  bg?: string;
+  bold?: boolean;
+  dim?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+};
+type AnsiSegment = { key: string; text: string; style: AnsiStyle };
+type AnsiRow = { key: string; segments: AnsiSegment[] };
 
 type PendingAttachment = {
   id: string;
@@ -167,8 +179,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   } | null>(null);
   const socketStartedRef = useRef(false);
   const scrollbackTerminalHostRef = useRef<HTMLDivElement>(null);
+  const mobileScrollbackViewportRef = useRef<HTMLDivElement>(null);
   const scrollbackTermRef = useRef<XTerm | null>(null);
   const scrollbackVisibleRef = useRef(false);
+  const mobileViewerHistoryRef = useRef(false);
   const scrollbackTextRef = useRef("");
   const scrollbackSnapshotRequestedRef = useRef(false);
   const scrollbackStickToBottomRef = useRef(false);
@@ -184,6 +198,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
   const [scrollbackReady, setScrollbackReady] = useState(false);
   const [scrollbackText, setScrollbackText] = useState("");
+  const [mobileViewerHistory, setMobileViewerHistory] = useState(false);
+
+  const mobileScrollbackRows = useMemo(() => {
+    if (!mobileViewerHistory || !scrollbackVisible || scrollbackText.length === 0) return [];
+    return parseAnsiRows(scrollbackText);
+  }, [mobileViewerHistory, scrollbackText, scrollbackVisible]);
 
   const invalidateScrollbackSnapshot = useCallback(() => {
     scrollbackSnapshotRequestedRef.current = false;
@@ -204,13 +224,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackStickToBottomRef.current = false;
     scrollbackPendingDeltaPxRef.current = 0;
     scrollbackReadyRef.current = false;
+    mobileViewerHistoryRef.current = false;
     scrollbackTermRef.current?.scrollToBottom();
     setScrollbackReady(false);
+    setMobileViewerHistory(false);
     setScrollbackVisible(false);
     termRef.current?.scrollToBottom();
   }, [invalidateScrollbackSnapshot]);
 
   const getScrollbackViewport = useCallback(() => {
+    if (mobileViewerHistoryRef.current) return mobileScrollbackViewportRef.current;
     return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
   }, []);
 
@@ -505,6 +528,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   useLayoutEffect(() => {
     if (!scrollbackVisible) return;
+    if (mobileViewerHistory) return;
     const host = scrollbackTerminalHostRef.current;
     if (!host || scrollbackTermRef.current) return;
 
@@ -535,10 +559,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       historyTerm.dispose();
       if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
     };
-  }, [getScrollbackViewport, scrollbackVisible]);
+  }, [getScrollbackViewport, mobileViewerHistory, scrollbackVisible]);
 
   useLayoutEffect(() => {
     if (!scrollbackVisible || scrollbackText.length === 0) return;
+    if (mobileViewerHistory) return;
     const historyTerm = scrollbackTermRef.current;
     if (!historyTerm) return;
 
@@ -554,7 +579,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         flushScrollbackOverlayPosition();
       });
     });
-  }, [flushScrollbackOverlayPosition, scrollbackText, scrollbackVisible, writeScrollbackLiveBytes]);
+  }, [
+    flushScrollbackOverlayPosition,
+    mobileViewerHistory,
+    scrollbackText,
+    scrollbackVisible,
+    writeScrollbackLiveBytes,
+  ]);
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
@@ -622,8 +653,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackStickToBottomRef.current = false;
       scrollbackPendingDeltaPxRef.current = 0;
       scrollbackReadyRef.current = false;
+      mobileViewerHistoryRef.current = false;
       scrollbackTermRef.current?.scrollToBottom();
       setScrollbackReady(false);
+      setMobileViewerHistory(false);
       setScrollbackVisible(false);
       term.scrollToBottom();
     };
@@ -816,6 +849,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const showScrollbackOverlay = (initialDeltaY = 0, force = false) => {
       if (!force && !coarsePointerRef.current) return false;
       const wasVisible = scrollbackVisibleRef.current;
+      const useMobileViewerHistory = usesViewerPanFrame();
+      if (mobileViewerHistoryRef.current !== useMobileViewerHistory) {
+        mobileViewerHistoryRef.current = useMobileViewerHistory;
+        setMobileViewerHistory(useMobileViewerHistory);
+      }
 
       if (!wasVisible) {
         scrollbackVisibleRef.current = true;
@@ -1667,7 +1705,51 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           <div ref={containerRef} className="size-full touch-none" />
         </div>
       </div>
-      {scrollbackVisible && (
+      {scrollbackVisible && mobileViewerHistory && (
+        <div
+          className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
+          style={{
+            visibility: scrollbackReady ? "visible" : "hidden",
+          }}
+        >
+          <div
+            ref={mobileScrollbackViewportRef}
+            className="size-full touch-none overflow-hidden"
+            style={{
+              WebkitOverflowScrolling: "touch",
+              overscrollBehavior: "contain",
+              scrollbarWidth: "none",
+            }}
+          >
+            <div
+              className="inline-block min-w-full bg-[var(--color-terminal-bg)]"
+              style={{
+                fontFamily:
+                  'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                fontSize: TERMINAL_FONT_SIZE,
+                lineHeight: `${TERMINAL_LINE_HEIGHT_PX}px`,
+              }}
+            >
+              {mobileScrollbackRows.map((row) => (
+                <div
+                  key={row.key}
+                  className="whitespace-pre"
+                  style={{
+                    height: `${TERMINAL_LINE_HEIGHT_PX}px`,
+                  }}
+                >
+                  {row.segments.map((segment) => (
+                    <span key={segment.key} style={ansiStyleToCss(segment.style)}>
+                      {segment.text}
+                    </span>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {scrollbackVisible && !mobileViewerHistory && (
         <div
           className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
           style={{
@@ -1782,6 +1864,209 @@ function formatSnapshotForXterm(input: string): string {
   // `capture-pane -p` returns already-rendered rows. Disable xterm autowrap so
   // exact-width rows do not gain an extra wrapped line while replaying them.
   return `\x1b[?7l${input.split("\n").join("\r\n")}\x1b[?7h`;
+}
+
+function parseAnsiRows(input: string): AnsiRow[] {
+  const rows: AnsiRow[] = [];
+  let row: AnsiSegment[] = [];
+  let style: AnsiStyle = {};
+  let segmentText = "";
+  let rowIndex = 0;
+  let segmentIndex = 0;
+
+  const flushSegment = () => {
+    if (segmentText.length === 0) return;
+    row.push({ key: `s${rowIndex}-${segmentIndex}`, text: segmentText, style: { ...style } });
+    segmentIndex += 1;
+    segmentText = "";
+  };
+
+  const flushRow = () => {
+    flushSegment();
+    rows.push({ key: `r${rowIndex}`, segments: row });
+    rowIndex += 1;
+    segmentIndex = 0;
+    row = [];
+  };
+
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i];
+    if (char === "\n") {
+      flushRow();
+      continue;
+    }
+    if (char === "\r") continue;
+    if (char !== "\x1b") {
+      segmentText += char;
+      continue;
+    }
+
+    const next = input[i + 1];
+    if (next === "[") {
+      const end = findAnsiFinal(input, i + 2);
+      if (end === -1) continue;
+      const final = input[end];
+      if (final === "m") {
+        flushSegment();
+        style = applySgr(style, input.slice(i + 2, end));
+      }
+      i = end;
+      continue;
+    }
+
+    if (next === "]") {
+      const end = findOscEnd(input, i + 2);
+      if (end === -1) continue;
+      i = end;
+      continue;
+    }
+
+    if ((next === "(" || next === ")") && input[i + 2] !== undefined) {
+      i += 2;
+    } else if (next !== undefined) {
+      i += 1;
+    }
+  }
+
+  flushRow();
+  return rows;
+}
+
+function findAnsiFinal(input: string, start: number): number {
+  for (let i = start; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    if (code >= 0x40 && code <= 0x7e) return i;
+  }
+  return -1;
+}
+
+function findOscEnd(input: string, start: number): number {
+  for (let i = start; i < input.length; i += 1) {
+    if (input[i] === "\x07") return i;
+    if (input[i] === "\x1b" && input[i + 1] === "\\") return i + 1;
+  }
+  return -1;
+}
+
+function applySgr(current: AnsiStyle, paramsText: string): AnsiStyle {
+  const params = paramsText
+    .split(";")
+    .map((part) => (part === "" ? 0 : Number(part)))
+    .filter((value) => Number.isFinite(value));
+  if (params.length === 0) params.push(0);
+
+  let next: AnsiStyle = { ...current };
+  for (let i = 0; i < params.length; i += 1) {
+    const code = params[i] ?? 0;
+    if (code === 0) {
+      next = {};
+    } else if (code === 1) {
+      next.bold = true;
+      next.dim = false;
+    } else if (code === 2) {
+      next.dim = true;
+      next.bold = false;
+    } else if (code === 3) {
+      next.italic = true;
+    } else if (code === 4) {
+      next.underline = true;
+    } else if (code === 22) {
+      next.bold = false;
+      next.dim = false;
+    } else if (code === 23) {
+      next.italic = false;
+    } else if (code === 24) {
+      next.underline = false;
+    } else if (code === 39) {
+      next.fg = undefined;
+    } else if (code === 49) {
+      next.bg = undefined;
+    } else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+      next.fg = ANSI_COLORS[code] ?? next.fg;
+    } else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
+      next.bg = ANSI_COLORS[code] ?? next.bg;
+    } else if ((code === 38 || code === 48) && params[i + 1] === 5) {
+      const color = color256(params[i + 2] ?? 0);
+      if (code === 38) next.fg = color;
+      else next.bg = color;
+      i += 2;
+    } else if ((code === 38 || code === 48) && params[i + 1] === 2) {
+      const color = rgbColor(params[i + 2] ?? 0, params[i + 3] ?? 0, params[i + 4] ?? 0);
+      if (code === 38) next.fg = color;
+      else next.bg = color;
+      i += 4;
+    }
+  }
+  return next;
+}
+
+const ANSI_COLORS: Record<number, string> = {
+  30: "#000000",
+  31: "#cd3131",
+  32: "#0dbc79",
+  33: "#e5e510",
+  34: "#2472c8",
+  35: "#bc3fbc",
+  36: "#11a8cd",
+  37: "#e5e5e5",
+  40: "#000000",
+  41: "#cd3131",
+  42: "#0dbc79",
+  43: "#e5e510",
+  44: "#2472c8",
+  45: "#bc3fbc",
+  46: "#11a8cd",
+  47: "#e5e5e5",
+  90: "#666666",
+  91: "#f14c4c",
+  92: "#23d18b",
+  93: "#f5f543",
+  94: "#3b8eea",
+  95: "#d670d6",
+  96: "#29b8db",
+  97: "#ffffff",
+  100: "#666666",
+  101: "#f14c4c",
+  102: "#23d18b",
+  103: "#f5f543",
+  104: "#3b8eea",
+  105: "#d670d6",
+  106: "#29b8db",
+  107: "#ffffff",
+};
+
+function color256(value: number): string {
+  const n = clamp(Math.round(value), 0, 255);
+  if (n < 16) return ANSI_COLORS[n < 8 ? 30 + n : 90 + n - 8] ?? "#e5e5e5";
+  if (n >= 232) {
+    const level = 8 + (n - 232) * 10;
+    return rgbColor(level, level, level);
+  }
+  const index = n - 16;
+  const r = Math.floor(index / 36);
+  const g = Math.floor((index % 36) / 6);
+  const b = index % 6;
+  const scale = [0, 95, 135, 175, 215, 255];
+  return rgbColor(scale[r] ?? 0, scale[g] ?? 0, scale[b] ?? 0);
+}
+
+function rgbColor(r: number, g: number, b: number): string {
+  return `rgb(${clamp(Math.round(r), 0, 255)}, ${clamp(Math.round(g), 0, 255)}, ${clamp(
+    Math.round(b),
+    0,
+    255,
+  )})`;
+}
+
+function ansiStyleToCss(style: AnsiStyle): CSSProperties {
+  return {
+    backgroundColor: style.bg,
+    color: style.fg,
+    fontStyle: style.italic ? "italic" : undefined,
+    fontWeight: style.bold ? 700 : undefined,
+    opacity: style.dim ? 0.65 : undefined,
+    textDecorationLine: style.underline ? "underline" : undefined,
+  };
 }
 
 function decodeUtf8(bytes: Uint8Array): string {
