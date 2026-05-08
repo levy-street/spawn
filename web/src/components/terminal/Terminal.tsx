@@ -650,8 +650,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     term.attachCustomWheelEventHandler((event) => {
       if (event.ctrlKey) return true;
+      if (!coarsePointerRef.current) return true;
       const amount = wheelEventToPixels(event, term.rows);
-      if (amount !== 0) scrollViewportPixels(amount);
+      const handled = amount !== 0 && scrollViewportPixels(amount);
+      if (!handled) return true;
       event.preventDefault();
       event.stopPropagation();
       return false;
