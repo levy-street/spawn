@@ -24,8 +24,9 @@ Next.js 15 + React 19 PWA frontend for `spawn`.
 ```sh
 bun install
 bun dev          # next dev
-bun run build    # next build
-bun run start    # next start
+bun run build    # next build with a stable API proxy target
+bun run start    # next start with the same API proxy target default
+bun run start:spawn # next start on 0.0.0.0:3001 for the local spawn pane
 bun run lint     # biome check .
 ```
 
@@ -33,8 +34,14 @@ bun run lint     # biome check .
 
 See repo root `.env.example`:
 
-- `NEXT_PUBLIC_SPAWN_API_URL` — REST base URL (default `http://localhost:8000`)
-- `NEXT_PUBLIC_SPAWN_WS_URL`  — WebSocket base URL (default `ws://localhost:8000`)
+- `SPAWN_API_PROXY_TARGET` — server-side proxy target for Next rewrites.
+  Production rewrites are captured during `next build`, so this must be set
+  before invoking `next` directly. The package `build`/`start` scripts default
+  it to `http://127.0.0.1:8001`, matching the local production panes.
+- `NEXT_PUBLIC_SPAWN_API_URL` — optional browser REST base URL. Leave unset for
+  same-origin `/api/*` through Next's proxy.
+- `NEXT_PUBLIC_SPAWN_WS_URL` — optional browser WebSocket base URL. Leave unset
+  for same-origin `/ws/*` through Next's proxy.
 
 ## Structure
 

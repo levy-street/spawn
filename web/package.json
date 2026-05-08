@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "build": "node scripts/next-with-proxy-target.mjs build",
+    "start": "node scripts/next-with-proxy-target.mjs start",
+    "start:spawn": "node scripts/next-with-proxy-target.mjs start -H 0.0.0.0 -p 3001",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
