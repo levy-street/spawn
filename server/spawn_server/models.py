@@ -100,6 +100,8 @@ class Agent(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     exited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_output_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[int | None] = mapped_column(nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

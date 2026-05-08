@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 
 async def _signup(client, email: str) -> str:
     r = await client.post("/api/auth/signup", json={"email": email, "password": "passpasspass"})
@@ -90,3 +92,43 @@ async def test_agent_create_defaults_name_from_host_and_cwd(client):
     body = r.json()
     assert body["name"] == "dream - spawn"
     assert body["host_name"] == "dream"
+
+
+async def test_agent_activity_fields(client):
+    token = await _signup(client, "agent-activity@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Agent, Host, User
+
+    now = datetime.now(UTC)
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "agent-activity@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="online")
+        session.add(host)
+        await session.flush()
+        agent = Agent(
+            owner_user_id=user.id,
+            host_id=host.id,
+            cwd="/repo",
+            argv=["codex"],
+            env={},
+            status="running",
+            last_output_at=now - timedelta(seconds=30),
+        )
+        session.add(agent)
+        await session.commit()
+        agent_id = agent.id
+
+    r = await client.get(f"/api/agents/{agent_id}", headers=auth)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["activity_state"] == "waiting"
+    assert body["activity_label"] == "Awaiting input"
+    assert body["last_output_at"] is not None
+    assert body["last_activity_at"] is not None

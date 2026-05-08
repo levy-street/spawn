@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -25,10 +26,37 @@ MAX_UPLOAD_NAME_LENGTH = 255
 MAX_UPLOAD_MIME_LENGTH = 128
 MAX_UPLOAD_CLIENT_ID_LENGTH = 128
 TERMINAL_UI_AGENT_BINS = {"codex", "claude", "claude-code", "opencode", "aider"}
+ACTIVITY_TOUCH_INTERVAL = timedelta(seconds=1)
+_last_input_touch_at: dict[str, datetime] = {}
 
 
 class UploadValidationError(ValueError):
     pass
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _should_touch_input(agent_id: str, now: datetime) -> bool:
+    previous = _last_input_touch_at.get(agent_id)
+    if previous is not None and now - previous < ACTIVITY_TOUCH_INTERVAL:
+        return False
+    _last_input_touch_at[agent_id] = now
+    return True
+
+
+async def _touch_agent_input(agent_id: str) -> None:
+    now = _utcnow()
+    if not _should_touch_input(agent_id, now):
+        return
+    sm = get_sessionmaker()
+    async with sm() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            return
+        agent.last_input_at = now
+        await session.commit()
 
 
 def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
@@ -284,6 +312,7 @@ async def browser_ws(
                 try:
                     frame = encode_binary_frame(KIND_INPUT, agent_id, data_bytes)
                     await daemon.send_bytes(frame)
+                    await _touch_agent_input(agent_id)
                 except Exception as e:
                     log.warning("forward to daemon failed: %s", e)
 

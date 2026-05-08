@@ -55,6 +55,31 @@ export function agentStatusLabel(agent: Agent): string {
   return agent.status.toUpperCase();
 }
 
+export function agentActivityLabel(agent: Agent): string {
+  return agent.activity_label || agentStatusLabel(agent);
+}
+
+export function agentActivityDetail(agent: Agent): string {
+  const label = agentActivityLabel(agent);
+  const age = relativeTime(agent.last_activity_at);
+  return age ? `${label} · ${age}` : label;
+}
+
 export function isAgentArchived(agent: Agent): boolean {
   return agent.archived_at !== null;
+}
+
+function relativeTime(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return null;
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 5) return "now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }

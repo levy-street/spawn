@@ -23,7 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { agentCommand, agentStatusLabel, agentTitle, isAgentArchived } from "@/lib/agents";
+import { agentActivityDetail, agentCommand, agentTitle, isAgentArchived } from "@/lib/agents";
 import { type Agent, ApiError, agents, type Host, hosts, presets } from "@/lib/api";
 import { normalizeCommandText, parseArgv } from "@/lib/argv";
 
@@ -47,6 +47,7 @@ function AgentsView() {
   const q = useQuery({
     queryKey: ["agents", { includeArchived }],
     queryFn: () => agents.list({ include_archived: includeArchived }),
+    refetchInterval: 5_000,
   });
 
   const invalidateAgents = () => {
@@ -255,7 +256,7 @@ function AgentCard({
           <Link href={`/agents/${agent.id}`} className="min-w-0 text-xs text-muted-foreground">
             <span className="block truncate">{agent.cwd}</span>
             <span className="mt-1 block">
-              {agentStatusLabel(agent)}
+              {agentActivityDetail(agent)}
               {archived ? " · ARCHIVED" : ""}
             </span>
           </Link>

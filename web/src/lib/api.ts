@@ -112,6 +112,13 @@ export const AgentSchema = z.object({
   status: z.enum(["starting", "running", "exited", "killed"]),
   started_at: z.string(),
   exited_at: z.string().nullable(),
+  last_output_at: z.string().nullable().default(null),
+  last_input_at: z.string().nullable().default(null),
+  last_activity_at: z.string().nullable().default(null),
+  activity_state: z
+    .enum(["starting", "active", "quiet", "waiting", "input_sent", "exited", "killed", "unknown"])
+    .default("unknown"),
+  activity_label: z.string().default("Unknown"),
   exit_code: z.number().int().nullable(),
   archived_at: z.string().nullable().default(null),
 });

@@ -11,7 +11,13 @@ import { AppShell } from "@/components/nav/AppShell";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
-import { agentCommand, agentKind, agentTitle, isAgentArchived } from "@/lib/agents";
+import {
+  agentActivityDetail,
+  agentCommand,
+  agentKind,
+  agentTitle,
+  isAgentArchived,
+} from "@/lib/agents";
 import { agents } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -51,6 +57,7 @@ function AgentTerminal() {
     queryKey: ["agent", id],
     queryFn: () => agents.get(id as string),
     enabled: !!id,
+    refetchInterval: 5_000,
   });
 
   const renameM = useMutation({
@@ -113,7 +120,7 @@ function AgentTerminal() {
             </div>
             <div className="truncate text-[11px] text-muted-foreground">
               {q.data
-                ? `${q.data.status}${isAgentArchived(q.data) ? " · archived" : ""} · ${q.data.cwd}`
+                ? `${agentActivityDetail(q.data)}${isAgentArchived(q.data) ? " · archived" : ""} · ${q.data.cwd}`
                 : ""}
             </div>
           </div>

@@ -163,5 +163,10 @@ class AgentOut(BaseModel):
     status: str
     started_at: datetime
     exited_at: datetime | None = None
+    last_output_at: datetime | None = None
+    last_input_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    activity_state: str = "unknown"
+    activity_label: str = "Unknown"
     exit_code: int | None = None
     archived_at: datetime | None = None

@@ -6,7 +6,7 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { agentTitle } from "@/lib/agents";
+import { agentActivityDetail, agentTitle } from "@/lib/agents";
 import { type Agent, agents, type Host, hosts } from "@/lib/api";
 
 export default function HomePage() {
@@ -21,7 +21,11 @@ export default function HomePage() {
 
 function Dashboard() {
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
-  const agentsQ = useQuery({ queryKey: ["agents"], queryFn: () => agents.list() });
+  const agentsQ = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => agents.list(),
+    refetchInterval: 5_000,
+  });
 
   return (
     <div className="mx-auto w-full max-w-5xl p-4 @container/dash">
@@ -93,7 +97,9 @@ function Dashboard() {
                     className="flex items-center justify-between hover:underline"
                   >
                     <span className="truncate text-xs font-medium">{agentTitle(a)}</span>
-                    <span className="text-[11px] text-muted-foreground">{a.status}</span>
+                    <span className="text-[11px] text-muted-foreground">
+                      {agentActivityDetail(a)}
+                    </span>
                   </Link>
                 </li>
               ))}

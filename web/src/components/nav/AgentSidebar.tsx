@@ -8,7 +8,7 @@ import { useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { agentCommand, agentTitle } from "@/lib/agents";
+import { agentActivityDetail, agentActivityLabel, agentCommand, agentTitle } from "@/lib/agents";
 import { type Agent, agents } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -21,7 +21,11 @@ export function AgentSidebar({
 }) {
   const qc = useQueryClient();
   const router = useRouter();
-  const q = useQuery({ queryKey: ["agents"], queryFn: () => agents.list() });
+  const q = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => agents.list(),
+    refetchInterval: 5_000,
+  });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
@@ -109,7 +113,7 @@ export function AgentSidebar({
                 <Link
                   href={`/agents/${agent.id}`}
                   aria-current={active ? "page" : undefined}
-                  title={`${agentTitle(agent)} · ${agentCommand(agent)} · ${agent.cwd}`}
+                  title={`${agentTitle(agent)} · ${agentCommand(agent)} · ${agentActivityDetail(agent)} · ${agent.cwd}`}
                   className={cn(
                     "relative flex size-10 items-center justify-center rounded-md transition-colors",
                     active ? "bg-accent" : "hover:bg-accent/50",
@@ -205,7 +209,7 @@ export function AgentSidebar({
                   <Link
                     href={`/agents/${agent.id}`}
                     aria-current={active ? "page" : undefined}
-                    title={`${agentTitle(agent)} · ${agentCommand(agent)} · ${agent.status} · ${agent.cwd}`}
+                    title={`${agentTitle(agent)} · ${agentCommand(agent)} · ${agentActivityDetail(agent)} · ${agent.cwd}`}
                     className={cn(
                       "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors group-hover:pr-[4.25rem] group-focus-within:pr-[4.25rem]",
                       active
@@ -220,7 +224,7 @@ export function AgentSidebar({
                     <span className="min-w-0">
                       <span className="block truncate font-medium">{agentTitle(agent)}</span>
                       <span className="block truncate text-[10px] opacity-70">
-                        {agentCommand(agent)}
+                        {agentActivityDetail(agent)}
                       </span>
                     </span>
                   </Link>
@@ -279,14 +283,22 @@ function AgentStatusDot({ agent, className }: { agent: Agent; className?: string
     <span
       className={cn(
         "size-2 rounded-full border border-card",
-        agent.status === "running"
+        agent.activity_state === "active"
           ? "bg-green-500"
-          : agent.status === "starting"
-            ? "bg-yellow-500"
-            : "bg-zinc-500",
+          : agent.activity_state === "waiting"
+            ? "bg-sky-500"
+            : agent.activity_state === "input_sent"
+              ? "bg-violet-500"
+              : agent.activity_state === "starting"
+                ? "bg-yellow-500"
+                : agent.activity_state === "quiet"
+                  ? "bg-zinc-400"
+                  : "bg-zinc-600",
         className,
       )}
-      aria-hidden
+      role="img"
+      aria-label={agentActivityLabel(agent)}
+      title={agentActivityDetail(agent)}
     />
   );
 }

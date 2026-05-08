@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import desc, select
@@ -16,6 +16,8 @@ from ..ws.broker import get_broker
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 log = logging.getLogger("spawn.routes.agents")
+ACTIVE_OUTPUT_WINDOW = timedelta(seconds=3)
+WAITING_OUTPUT_WINDOW = timedelta(seconds=8)
 
 
 def _utcnow() -> datetime:
@@ -33,9 +35,57 @@ def _default_agent_name(host_name: str, cwd: str) -> str:
     return f"{host_name} - {_last_cwd_dir(cwd)}"[:128]
 
 
+def _aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _last_activity_at(agent: Agent) -> datetime | None:
+    candidates = [
+        _aware(agent.last_output_at),
+        _aware(agent.last_input_at),
+        _aware(agent.exited_at),
+        _aware(agent.started_at),
+    ]
+    return max((value for value in candidates if value is not None), default=None)
+
+
+def _activity(agent: Agent, now: datetime | None = None) -> tuple[str, str]:
+    if agent.status == "starting":
+        return "starting", "Starting"
+    if agent.status == "exited":
+        return "exited", "Exited"
+    if agent.status == "killed":
+        return "killed", "Killed"
+    if agent.status != "running":
+        return agent.status, agent.status.replace("_", " ").title()
+
+    now = now or _utcnow()
+    last_output = _aware(agent.last_output_at)
+    last_input = _aware(agent.last_input_at)
+
+    if last_output is None:
+        started = _aware(agent.started_at)
+        if started is not None and now - started >= WAITING_OUTPUT_WINDOW:
+            return "quiet", "Quiet"
+        return "starting", "Starting"
+    if now - last_output <= ACTIVE_OUTPUT_WINDOW:
+        return "active", "Active"
+    if last_input is not None and last_input > last_output:
+        return "input_sent", "Input sent"
+    if now - last_output >= WAITING_OUTPUT_WINDOW:
+        return "waiting", "Awaiting input"
+    return "quiet", "Quiet"
+
+
 def _to_out(agent: Agent, host_name: str | None = None) -> schemas.AgentOut:
     out = schemas.AgentOut.model_validate(agent)
     out.host_name = host_name
+    out.last_activity_at = _last_activity_at(agent)
+    out.activity_state, out.activity_label = _activity(agent)
     return out
 
 
