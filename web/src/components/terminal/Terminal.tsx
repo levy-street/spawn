@@ -885,9 +885,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
-      if (usesViewerPanFrame()) {
-        return scrollViewerPanFrame(deltaX, deltaY);
-      }
 
       if (coarsePointerRef.current) {
         if (scrollbackVisibleRef.current) {
@@ -907,6 +904,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           return Boolean(
             overlay && (maxOverlayScrollTop(overlay) > 0 || scrollbackTextRef.current.length === 0),
           );
+        }
+
+        if (usesViewerPanFrame()) {
+          const movedFrame = scrollViewerPanFrame(deltaX, deltaY);
+          const shouldEnterHistory =
+            !movedFrame &&
+            deltaY < 0 &&
+            Math.abs(deltaY) >= Math.abs(deltaX) &&
+            terminalViewport.scrollTop <= 0.5;
+          if (shouldEnterHistory && showScrollbackOverlay(deltaY)) {
+            state.scrollRemainderPx = 0;
+            return true;
+          }
+          return movedFrame;
         }
 
         if (deltaY < 0 && showScrollbackOverlay(deltaY)) {
