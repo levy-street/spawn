@@ -114,7 +114,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         log.warning("daemon stream for unknown agent=%s", frame.agent_id)
                         continue
                     now = _utcnow()
-                    if should_record_agent_output(str(frame.agent_id), now):
+                    if should_record_agent_output(str(frame.agent_id), now, frame.payload):
                         agent.last_output_at = now
                     host_obj = await session.get(Host, host.id)
                     if host_obj is not None:
