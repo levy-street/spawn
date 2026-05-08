@@ -577,10 +577,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      // Generous scrollback so the user can browse far back. The actual
-      // history is also persisted server-side per agent — see
-      // `server/spawn_server/transcript.py`.
-      scrollback: 50000,
+      // Full-screen agent UIs repaint in-place, which makes browser-local
+      // scrollback preserve stale frames. Scrollback is rendered from tmux
+      // snapshots instead.
+      scrollback: 0,
       smoothScrollDuration: 70,
       theme: {
         background: "#0a0a0a",
@@ -677,19 +677,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return true;
     };
 
-    const scrollViewportPixels = (deltaY: number) => {
-      const viewport = getViewport();
-      if (!viewport) return false;
-      const maxTop = maxScrollTop(viewport);
-      if (maxTop <= 0) return false;
-      const before = viewport.scrollTop;
-      const next = Math.max(0, Math.min(maxTop, before + deltaY));
-      if (Math.abs(next - before) < 0.5) return false;
-
-      viewport.scrollTop = next;
-      return true;
-    };
-
     const scrollViewportRows = (rows: number) => {
       if (rows === 0) return 0;
       const viewport = getViewport();
@@ -778,15 +765,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return false;
       }
 
-      if (scrollViewportPixels(amount)) {
+      if (amount < 0) {
+        showScrollbackOverlay(amount, true);
         event.preventDefault();
         event.stopPropagation();
         return false;
       }
 
-      if (amount < 0) {
-        showScrollbackOverlay(amount, true);
-      }
       event.preventDefault();
       event.stopPropagation();
       return false;
