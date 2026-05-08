@@ -907,16 +907,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
 
         if (usesViewerPanFrame()) {
-          const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
-          const shouldEnterHistory =
-            deltaY < 0 &&
-            !frameScroll.movedY &&
-            Math.abs(deltaY) >= Math.abs(deltaX) &&
-            terminalViewport.scrollTop <= 0.5;
-          if (shouldEnterHistory && showScrollbackOverlay(deltaY)) {
+          const mostlyVertical = Math.abs(deltaY) >= Math.abs(deltaX);
+          if (mostlyVertical && deltaY < 0 && showScrollbackOverlay(deltaY)) {
             state.scrollRemainderPx = 0;
             return true;
           }
+
+          const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
           return frameScroll.movedX || frameScroll.movedY;
         }
 
