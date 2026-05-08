@@ -104,12 +104,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const terminalViewportRef = useRef<HTMLDivElement>(null);
-  const terminalContentRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
-  const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const displayOwnerRef = useRef<boolean | null>(null);
   const displayGeometryRef = useRef<{ cols: number; rows: number } | null>(null);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -125,7 +122,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     active: boolean;
     startX: number;
     startY: number;
-    lastX: number;
     lastY: number;
     lastTime: number;
     movedPx: number;
@@ -141,7 +137,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     active: false,
     startX: 0,
     startY: 0,
-    lastX: 0,
     lastY: 0,
     lastTime: 0,
     movedPx: 0,
@@ -344,7 +339,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       displayGeometryRef.current = geometry;
       onDisplayControl?.(state);
 
-      const applyGeometry = () => {
+      requestAnimationFrame(() => {
         const term = termRef.current;
         if (!term) return;
 
@@ -355,7 +350,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
         if (!geometry) return;
         if (!coarsePointerRef.current) {
-          layoutTerminalSurfaceRef.current(false);
           fitTerminalRef.current(true);
           return;
         }
@@ -369,18 +363,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           return;
         }
         lastSizeRef.current = geometry;
-        layoutTerminalSurfaceRef.current(atBottom);
-        requestAnimationFrame(() => layoutTerminalSurfaceRef.current(atBottom));
         if (atBottom) {
           term.scrollToBottom();
           scrollbackTermRef.current?.scrollToBottom();
         } else {
           term.scrollToLine(Math.max(0, Math.min(term.buffer.active.baseY, viewportY)));
         }
-      };
-
-      applyGeometry();
-      requestAnimationFrame(applyGeometry);
+      });
     },
     [onDisplayControl],
   );
@@ -580,11 +569,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Bootstrap xterm.js once on mount.
   useEffect(() => {
-    if (!containerRef.current || !terminalViewportRef.current || !terminalContentRef.current) {
-      return;
-    }
-    const terminalViewport = terminalViewportRef.current;
-    const terminalContent = terminalContentRef.current;
+    if (!containerRef.current) return;
     const term = new XTerm({
       convertEol: false,
       cursorBlink: true,
@@ -680,81 +665,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (canvasHeight > 0 && term.rows > 0) return rememberRowHeight(canvasHeight / term.rows);
       return terminalRowHeightRef.current;
     };
-
-    const getTerminalPixelSize = () => {
-      const canvas = terminalElement.querySelector<HTMLCanvasElement>(".xterm-screen canvas");
-      const rect = canvas?.getBoundingClientRect();
-      const width =
-        rect && rect.width > 0 ? rect.width : Math.max(1, term.cols) * (TERMINAL_FONT_SIZE * 0.62);
-      const height =
-        rect && rect.height > 0 ? rect.height : Math.max(1, term.rows) * getRowHeight();
-      return {
-        width: Math.max(1, Math.ceil(width)),
-        height: Math.max(1, Math.ceil(height)),
-      };
-    };
-
-    const maxFrameScrollLeft = () => {
-      return Math.max(0, terminalViewport.scrollWidth - terminalViewport.clientWidth);
-    };
-
-    const maxFrameScrollTop = () => {
-      return Math.max(0, terminalViewport.scrollHeight - terminalViewport.clientHeight);
-    };
-
-    const usesViewerFrame = () => {
-      return (
-        coarsePointerRef.current &&
-        displayOwnerRef.current === false &&
-        displayGeometryRef.current !== null
-      );
-    };
-
-    const scrollViewerFramePixels = (deltaX: number, deltaY = 0) => {
-      if (!usesViewerFrame()) return false;
-
-      const maxLeft = maxFrameScrollLeft();
-      const maxTop = maxFrameScrollTop();
-      const beforeLeft = terminalViewport.scrollLeft;
-      const beforeTop = terminalViewport.scrollTop;
-
-      if (maxLeft > 0 && deltaX !== 0) {
-        terminalViewport.scrollLeft = Math.max(0, Math.min(maxLeft, beforeLeft + deltaX));
-      }
-      if (maxTop > 0 && deltaY !== 0) {
-        terminalViewport.scrollTop = Math.max(0, Math.min(maxTop, beforeTop + deltaY));
-      }
-
-      return (
-        Math.abs(terminalViewport.scrollLeft - beforeLeft) >= 0.5 ||
-        Math.abs(terminalViewport.scrollTop - beforeTop) >= 0.5
-      );
-    };
-
-    const layoutTerminalSurface = (pinToBottom = false) => {
-      const followerGeometry = usesViewerFrame() ? displayGeometryRef.current : null;
-
-      if (!followerGeometry) {
-        terminalContent.style.width = "100%";
-        terminalContent.style.height = "100%";
-        terminalElement.style.width = "100%";
-        terminalElement.style.height = "100%";
-        terminalViewport.scrollLeft = 0;
-        terminalViewport.scrollTop = 0;
-        return;
-      }
-
-      const { width, height } = getTerminalPixelSize();
-      terminalContent.style.width = `${width}px`;
-      terminalContent.style.height = `${height}px`;
-      terminalElement.style.width = `${width}px`;
-      terminalElement.style.height = `${height}px`;
-
-      if (pinToBottom) {
-        terminalViewport.scrollTop = maxFrameScrollTop();
-      }
-    };
-    layoutTerminalSurfaceRef.current = layoutTerminalSurface;
 
     const maxScrollTop = (viewport: HTMLElement) => {
       return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
@@ -860,15 +770,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return deltaY > 0 ? viewport.scrollTop < maxTop - 0.5 : viewport.scrollTop > 0.5;
     };
 
-    const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
+    const applyTouchScrollDelta = (deltaY: number) => {
       const state = touchScrollRef.current;
-      let handled = false;
-      if (displayOwnerRef.current === false && displayGeometryRef.current) {
-        handled = scrollViewerFramePixels(deltaX, 0) || handled;
-        handled = scrollViewerFramePixels(0, deltaY) || handled;
-      }
-      if (handled && !scrollbackVisibleRef.current) return true;
-
       if (coarsePointerRef.current) {
         if (scrollbackVisibleRef.current) {
           const overlay = getScrollbackViewport();
@@ -885,9 +788,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             return true;
           }
           return Boolean(
-            handled ||
-              (overlay &&
-                (maxOverlayScrollTop(overlay) > 0 || scrollbackTextRef.current.length === 0)),
+            overlay && (maxOverlayScrollTop(overlay) > 0 || scrollbackTextRef.current.length === 0),
           );
         }
 
@@ -898,16 +799,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
 
       const rowHeight = getRowHeight();
-      if (rowHeight <= 0) return handled;
+      if (rowHeight <= 0) return false;
 
       state.scrollRemainderPx += deltaY;
       const rows = Math.trunc(state.scrollRemainderPx / rowHeight);
-      if (rows === 0) return canScrollViewport(deltaY) || handled;
+      if (rows === 0) return canScrollViewport(deltaY);
 
       const scrolledRows = scrollViewportRows(rows);
       if (scrolledRows === 0) {
         state.scrollRemainderPx = 0;
-        return handled;
+        return false;
       }
 
       state.scrollRemainderPx -= scrolledRows * rowHeight;
@@ -990,7 +891,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
 
-      if (!applyTouchScrollDelta(0, deltaY)) {
+      if (!applyTouchScrollDelta(deltaY)) {
         stopTouchMomentum();
         return;
       }
@@ -1004,7 +905,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       touchScrollRef.current.active = true;
       touchScrollRef.current.startX = x;
       touchScrollRef.current.startY = y;
-      touchScrollRef.current.lastX = x;
       touchScrollRef.current.lastY = y;
       touchScrollRef.current.lastTime = time;
       touchScrollRef.current.movedPx = 0;
@@ -1020,11 +920,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!state.active) return;
 
       state.movedPx = Math.max(state.movedPx, Math.hypot(x - state.startX, y - state.startY));
-      const deltaX = state.lastX - x;
       const deltaY = state.lastY - y;
-      state.lastX = x;
       state.lastY = y;
-      if (deltaX === 0 && deltaY === 0) return;
+      if (deltaY === 0) return;
 
       const dt = Math.max(1, time - state.lastTime);
       state.lastTime = time;
@@ -1033,7 +931,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const sampledVelocity = estimateTouchVelocity();
       state.velocityPxPerMs = sampledVelocity * 0.75 + instantVelocity * 0.25;
 
-      applyTouchScrollDelta(deltaX, deltaY);
+      applyTouchScrollDelta(deltaY);
     };
 
     const endTouchScroll = () => {
@@ -1253,7 +1151,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const fitTerminal = (preserveScroll: boolean) => {
       const anchor = preserveScroll ? captureScrollAnchor() : null;
-      const followerGeometry = usesViewerFrame() ? displayGeometryRef.current : null;
+      const followerGeometry =
+        coarsePointerRef.current && displayOwnerRef.current === false
+          ? displayGeometryRef.current
+          : null;
       if (followerGeometry) {
         try {
           term.resize(followerGeometry.cols, followerGeometry.rows);
@@ -1261,8 +1162,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           return;
         }
         lastSizeRef.current = followerGeometry;
-        layoutTerminalSurface(anchor?.atBottom ?? true);
-        requestAnimationFrame(() => layoutTerminalSurface(anchor?.atBottom ?? true));
         if (anchor) {
           restoreScrollAnchor(anchor);
           requestAnimationFrame(() => restoreScrollAnchor(anchor));
@@ -1276,7 +1175,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       } catch {
         return;
       }
-      layoutTerminalSurface(false);
       if (anchor) {
         restoreScrollAnchor(anchor);
         requestAnimationFrame(() => restoreScrollAnchor(anchor));
@@ -1305,7 +1203,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const ro = new ResizeObserver(() => {
       scheduleFit();
     });
-    ro.observe(terminalViewport);
+    if (containerRef.current) ro.observe(containerRef.current);
 
     return () => {
       ro.disconnect();
@@ -1336,7 +1234,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       termRef.current = null;
       fitRef.current = null;
       fitTerminalRef.current = () => {};
-      layoutTerminalSurfaceRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
@@ -1554,7 +1451,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         if (!term) return;
         displayOwnerRef.current = true;
         displayGeometryRef.current = null;
-        layoutTerminalSurfaceRef.current(false);
         try {
           fitRef.current?.fit();
         } catch {
@@ -1622,31 +1518,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <div ref={terminalViewportRef} className="absolute inset-0 overflow-hidden touch-none">
+      <div ref={containerRef} className="size-full touch-none" />
+      {scrollbackVisible && (
         <div
-          ref={terminalContentRef}
-          className="relative size-full min-h-full min-w-full bg-[var(--color-terminal-bg)]"
+          className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
+          style={{
+            visibility: scrollbackReady ? "visible" : "hidden",
+          }}
         >
-          <div ref={containerRef} className="size-full touch-none" />
-          {scrollbackVisible && (
-            <div
-              className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
-              style={{
-                visibility: scrollbackReady ? "visible" : "hidden",
-              }}
-            >
-              <div
-                ref={scrollbackTerminalHostRef}
-                className="size-full touch-none"
-                style={{
-                  WebkitOverflowScrolling: "touch",
-                  overscrollBehavior: "contain",
-                }}
-              />
-            </div>
-          )}
+          <div
+            ref={scrollbackTerminalHostRef}
+            className="size-full touch-none"
+            style={{
+              WebkitOverflowScrolling: "touch",
+              overscrollBehavior: "contain",
+            }}
+          />
         </div>
-      </div>
+      )}
       {pendingAttachments.length > 0 && (
         <div className="pointer-events-auto absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] gap-2 overflow-x-auto rounded-md border border-border bg-background/90 p-1 shadow-lg backdrop-blur">
           {pendingAttachments.map((attachment) => (
