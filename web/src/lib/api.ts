@@ -140,8 +140,10 @@ export interface PresetCreateInput {
   agent_kind: string;
   default_argv: string[];
   env_template?: Record<string, string>;
-  install?: string;
+  install?: string | null;
 }
+
+export type PresetUpdateInput = Partial<PresetCreateInput>;
 
 export const AuthResponseSchema = z.object({
   access_token: z.string(),
@@ -272,6 +274,12 @@ export const presets = {
   create: (body: PresetCreateInput) =>
     api("/api/presets", {
       method: "POST",
+      body: JSON.stringify(body),
+      schema: PresetSchema,
+    }),
+  update: (id: string, body: PresetUpdateInput) =>
+    api(`/api/presets/${id}`, {
+      method: "PATCH",
       body: JSON.stringify(body),
       schema: PresetSchema,
     }),

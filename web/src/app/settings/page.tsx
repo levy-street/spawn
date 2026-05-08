@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Trash2 } from "lucide-react";
+import { Pencil, Trash2, X } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
@@ -10,7 +10,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ApiError, presets } from "@/lib/api";
+import { ApiError, type Preset, type PresetCreateInput, presets } from "@/lib/api";
 import { parseArgv, parseEnvLines } from "@/lib/argv";
 import { logout, useAuth } from "@/lib/auth";
 
@@ -64,17 +64,42 @@ function PresetsSettings() {
   const [argv, setArgv] = useState("");
   const [install, setInstall] = useState("");
   const [envText, setEnvText] = useState("");
+  const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const resetForm = () => {
+    setName("");
+    setKind("");
+    setArgv("");
+    setInstall("");
+    setEnvText("");
+    setEditingPresetId(null);
+    setError(null);
+  };
+
+  const editPreset = (preset: Preset) => {
+    setName(preset.name);
+    setKind(preset.agent_kind);
+    setArgv(formatArgv(preset.default_argv));
+    setInstall(preset.install ?? "");
+    setEnvText(formatEnvTemplate(preset.env_template));
+    setEditingPresetId(preset.id);
+    setError(null);
+  };
 
   const createM = useMutation({
     mutationFn: presets.create,
     onSuccess: () => {
-      setName("");
-      setKind("");
-      setArgv("");
-      setInstall("");
-      setEnvText("");
-      setError(null);
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["presets"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+
+  const updateM = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: PresetCreateInput }) => presets.update(id, body),
+    onSuccess: () => {
+      resetForm();
       qc.invalidateQueries({ queryKey: ["presets"] });
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
@@ -82,7 +107,8 @@ function PresetsSettings() {
 
   const removeM = useMutation({
     mutationFn: (id: string) => presets.remove(id),
-    onSuccess: () => {
+    onSuccess: (_, removedId) => {
+      if (editingPresetId === removedId) resetForm();
       setError(null);
       qc.invalidateQueries({ queryKey: ["presets"] });
     },
@@ -116,14 +142,20 @@ function PresetsSettings() {
       return;
     }
 
-    createM.mutate({
+    const body: PresetCreateInput = {
       name: name.trim(),
       agent_kind: kind.trim(),
       default_argv: defaultArgv,
       env_template: envTemplate,
-      install: install.trim() || undefined,
-    });
+      install: install.trim() || (editingPresetId ? null : undefined),
+    };
+
+    if (editingPresetId) updateM.mutate({ id: editingPresetId, body });
+    else createM.mutate(body);
   };
+
+  const isSaving = createM.isPending || updateM.isPending;
+  const isEditing = editingPresetId !== null;
 
   return (
     <Card>
@@ -140,7 +172,7 @@ function PresetsSettings() {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="aider-sonnet"
-              disabled={createM.isPending}
+              disabled={isSaving}
             />
           </div>
           <div className="space-y-1">
@@ -150,7 +182,7 @@ function PresetsSettings() {
               value={kind}
               onChange={(e) => setKind(e.target.value)}
               placeholder="aider"
-              disabled={createM.isPending}
+              disabled={isSaving}
             />
           </div>
           <div className="space-y-1 @md/settings:col-span-2">
@@ -163,7 +195,7 @@ function PresetsSettings() {
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
-              disabled={createM.isPending}
+              disabled={isSaving}
             />
           </div>
           <div className="space-y-1 @md/settings:col-span-2">
@@ -176,7 +208,7 @@ function PresetsSettings() {
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
-              disabled={createM.isPending}
+              disabled={isSaving}
             />
           </div>
           <div className="space-y-1 @md/settings:col-span-2">
@@ -190,7 +222,7 @@ function PresetsSettings() {
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
-              disabled={createM.isPending}
+              disabled={isSaving}
             />
           </div>
           {(error || q.error) && (
@@ -198,10 +230,16 @@ function PresetsSettings() {
               {error ?? `Failed to load presets: ${String(q.error)}`}
             </p>
           )}
-          <div className="@md/settings:col-span-2">
-            <Button type="submit" disabled={createM.isPending}>
-              {createM.isPending ? "Saving..." : "Add preset"}
+          <div className="flex flex-wrap gap-2 @md/settings:col-span-2">
+            <Button type="submit" disabled={isSaving}>
+              {isSaving ? "Saving..." : isEditing ? "Update preset" : "Add preset"}
             </Button>
+            {isEditing && (
+              <Button type="button" variant="secondary" onClick={resetForm} disabled={isSaving}>
+                <X className="size-4" />
+                Cancel
+              </Button>
+            )}
           </div>
         </form>
 
@@ -232,18 +270,30 @@ function PresetsSettings() {
                 )}
               </div>
               {preset.owner_user_id && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`Delete preset ${preset.name}`}
-                  title="Delete preset"
-                  disabled={removeM.isPending}
-                  onClick={() => {
-                    if (confirm(`Delete preset ${preset.name}?`)) removeM.mutate(preset.id);
-                  }}
-                >
-                  <Trash2 className="size-4" />
-                </Button>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Edit preset ${preset.name}`}
+                    title="Edit preset"
+                    disabled={isSaving}
+                    onClick={() => editPreset(preset)}
+                  >
+                    <Pencil className="size-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Delete preset ${preset.name}`}
+                    title="Delete preset"
+                    disabled={removeM.isPending}
+                    onClick={() => {
+                      if (confirm(`Delete preset ${preset.name}?`)) removeM.mutate(preset.id);
+                    }}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </div>
               )}
             </div>
           ))}
@@ -251,4 +301,19 @@ function PresetsSettings() {
       </CardContent>
     </Card>
   );
+}
+
+function formatArgv(argv: string[]): string {
+  return argv.map(formatArg).join(" ");
+}
+
+function formatArg(arg: string): string {
+  if (/^[A-Za-z0-9_./:=@%+-]+$/.test(arg)) return arg;
+  return `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+function formatEnvTemplate(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
 }

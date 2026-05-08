@@ -119,6 +119,14 @@ class PresetCreate(BaseModel):
     install: str | None = Field(default=None, max_length=2048)
 
 
+class PresetPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    agent_kind: str | None = Field(default=None, max_length=64)
+    default_argv: list[str] | None = None
+    env_template: dict[str, str] | None = None
+    install: str | None = Field(default=None, max_length=2048)
+
+
 class PresetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
