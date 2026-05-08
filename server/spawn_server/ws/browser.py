@@ -82,11 +82,27 @@ def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
 
 async def _broadcast_display_control(agent_id: str) -> None:
     broker = get_broker()
+    failed: list[BrowserConn] = []
     for conn, state in await broker.display_states_for_agent(agent_id):
         try:
             await conn.send_text(_display_control_payload(state))
         except Exception as e:
             log.warning("display control broadcast failed: %s", e)
+            failed.append(conn)
+    if not failed:
+        return
+
+    failed_ids = {conn.id for conn in failed}
+    for conn in failed:
+        await broker.detach_browser(conn)
+
+    for conn, state in await broker.display_states_for_agent(agent_id):
+        if conn.id in failed_ids:
+            continue
+        try:
+            await conn.send_text(_display_control_payload(state))
+        except Exception as e:
+            log.warning("display control rebroadcast failed: %s", e)
 
 
 async def _send_initial_history(

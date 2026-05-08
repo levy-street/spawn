@@ -130,11 +130,10 @@ class Broker:
     ) -> BrowserDisplayState:
         async with self._lock:
             browsers = self._browsers_by_agent[conn.agent_id]
-            had_browsers = bool(browsers)
             browsers.add(conn)
             state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
             self._drop_stale_display_owner_locked(conn.agent_id, state)
-            if state.owner_conn_id is None and not had_browsers:
+            if state.owner_conn_id is None:
                 state.owner_conn_id = conn.id
                 if cols is not None and rows is not None:
                     state.cols = cols
@@ -157,6 +156,7 @@ class Broker:
             if state.owner_conn_id == conn.id:
                 state.owner_conn_id = None
             self._drop_stale_display_owner_locked(conn.agent_id, state)
+            self._promote_display_owner_locked(conn.agent_id, state)
             return self._browser_display_state_locked(conn, state)
 
     def browsers_for(self, agent_id: str) -> list[BrowserConn]:
@@ -172,6 +172,7 @@ class Broker:
         async with self._lock:
             state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
             self._drop_stale_display_owner_locked(conn.agent_id, state)
+            self._promote_display_owner_locked(conn.agent_id, state, preferred=conn)
             if state.owner_conn_id != conn.id:
                 return None
             state.cols = cols
@@ -200,6 +201,7 @@ class Broker:
         async with self._lock:
             state = self._display_by_agent.setdefault(agent_id, _DisplayState())
             self._drop_stale_display_owner_locked(agent_id, state)
+            self._promote_display_owner_locked(agent_id, state)
             return [
                 (conn, self._browser_display_state_locked(conn, state))
                 for conn in self._browsers_by_agent.get(agent_id, ())
@@ -213,6 +215,21 @@ class Broker:
         ):
             return
         state.owner_conn_id = None
+
+    def _promote_display_owner_locked(
+        self,
+        agent_id: str,
+        state: _DisplayState,
+        *,
+        preferred: BrowserConn | None = None,
+    ) -> None:
+        if state.owner_conn_id is not None:
+            return
+        browsers = self._browsers_by_agent.get(agent_id)
+        if not browsers:
+            return
+        owner = preferred if preferred in browsers else next(iter(browsers))
+        state.owner_conn_id = owner.id
 
     def _browser_display_state_locked(
         self, conn: BrowserConn, state: _DisplayState

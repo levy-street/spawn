@@ -125,11 +125,46 @@ async def test_broker_display_control_can_be_taken_by_viewer():
 
     await broker.detach_browser(second)
     states = dict(await broker.display_states_for_agent(agent_id))
-    assert states[first].owner is False
+    assert states[first].owner is True
     assert states[first].cols == 60
     assert states[first].rows == 20
 
     await broker.detach_browser(first)
+
+
+@pytest.mark.asyncio
+async def test_broker_promotes_next_browser_when_owner_detaches():
+    broker = get_broker()
+
+    agent_id = "00000000-0000-4000-8000-0000000000d3"
+    user_id = "user-1"
+    first = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    second = BrowserConn(
+        user_id=user_id,
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+
+    await broker.attach_browser(first, cols=132, rows=43)
+    await broker.attach_browser(second, cols=60, rows=20)
+    await broker.detach_browser(first)
+
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[second].owner is True
+    assert states[second].cols == 132
+    assert states[second].rows == 43
+
+    owner_update = await broker.update_display_size(second, cols=60, rows=20)
+    assert owner_update is not None
+    assert owner_update.owner is True
+    assert owner_update.cols == 60
+    assert owner_update.rows == 20
+
+    await broker.detach_browser(second)
 
 
 @pytest.mark.asyncio

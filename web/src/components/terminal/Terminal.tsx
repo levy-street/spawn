@@ -648,17 +648,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return terminalRowHeightRef.current;
     };
 
-    term.attachCustomWheelEventHandler((event) => {
-      if (event.ctrlKey) return true;
-      if (!coarsePointerRef.current) return true;
-      const amount = wheelEventToPixels(event, term.rows);
-      const handled = amount !== 0 && scrollViewportPixels(amount);
-      if (!handled) return true;
-      event.preventDefault();
-      event.stopPropagation();
-      return false;
-    });
-
     const getViewport = () => terminalElement.querySelector<HTMLElement>(".xterm-viewport");
 
     const getRowHeight = () => {
@@ -739,17 +728,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return true;
     };
 
-    const showScrollbackOverlay = (initialDeltaY = 0) => {
-      if (!coarsePointerRef.current) return false;
+    const showScrollbackOverlay = (initialDeltaY = 0, force = false) => {
+      if (!force && !coarsePointerRef.current) return false;
       const wasVisible = scrollbackVisibleRef.current;
 
       if (!wasVisible) {
         scrollbackVisibleRef.current = true;
         scrollbackStickToBottomRef.current = true;
-        scrollbackPendingDeltaPxRef.current = 0;
+        scrollbackPendingDeltaPxRef.current = initialDeltaY;
         scrollbackReadyRef.current = false;
         setScrollbackReady(false);
         setScrollbackVisible(true);
+      } else if (initialDeltaY !== 0) {
+        scrollbackPendingDeltaPxRef.current += initialDeltaY;
       }
 
       if (!scrollbackSnapshotRequestedRef.current) {
@@ -758,11 +749,48 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       requestAnimationFrame(() => {
         flushMobileScrollbackOverlayPosition();
-        if (wasVisible && initialDeltaY !== 0) scrollOverlayPixels(initialDeltaY);
       });
 
       return true;
     };
+
+    term.attachCustomWheelEventHandler((event) => {
+      if (event.ctrlKey) return true;
+      const amount = wheelEventToPixels(event, term.rows);
+      if (amount === 0) return true;
+
+      if (scrollbackVisibleRef.current) {
+        const overlay = getScrollbackViewport();
+        if (!overlay) {
+          showScrollbackOverlay(amount, true);
+        } else if (amount > 0 && overlayIsAtBottom(overlay)) {
+          hideMobileScrollbackOverlay();
+        } else {
+          const moved = scrollOverlayPixels(amount);
+          if (moved && amount > 0 && overlayIsAtBottom(overlay)) {
+            hideMobileScrollbackOverlay();
+          } else if (!moved && maxOverlayScrollTop(overlay) <= 0) {
+            showScrollbackOverlay(amount, true);
+          }
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      }
+
+      if (scrollViewportPixels(amount)) {
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      }
+
+      if (amount < 0) {
+        showScrollbackOverlay(amount, true);
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    });
 
     const canScrollViewport = (deltaY: number) => {
       const viewport = getViewport();
