@@ -739,20 +739,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     layoutTerminalSurfaceRef.current = layoutTerminalSurface;
 
     const scrollViewerPanFrame = (deltaX: number, deltaY: number) => {
-      if (!usesViewerPanFrame()) return false;
+      if (!usesViewerPanFrame()) return { movedX: false, movedY: false };
       const maxLeft = maxFrameScrollLeft();
       const maxTop = maxFrameScrollTop();
-      if (maxLeft <= 0 && maxTop <= 0) return false;
+      if (maxLeft <= 0 && maxTop <= 0) return { movedX: false, movedY: false };
 
       const beforeLeft = terminalViewport.scrollLeft;
       const beforeTop = terminalViewport.scrollTop;
       terminalViewport.scrollLeft = Math.max(0, Math.min(maxLeft, beforeLeft + deltaX));
       terminalViewport.scrollTop = Math.max(0, Math.min(maxTop, beforeTop + deltaY));
 
-      return (
-        Math.abs(terminalViewport.scrollLeft - beforeLeft) >= 0.5 ||
-        Math.abs(terminalViewport.scrollTop - beforeTop) >= 0.5
-      );
+      return {
+        movedX: Math.abs(terminalViewport.scrollLeft - beforeLeft) >= 0.5,
+        movedY: Math.abs(terminalViewport.scrollTop - beforeTop) >= 0.5,
+      };
     };
 
     const maxScrollTop = (viewport: HTMLElement) => {
@@ -907,17 +907,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
 
         if (usesViewerPanFrame()) {
-          const movedFrame = scrollViewerPanFrame(deltaX, deltaY);
+          const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
           const shouldEnterHistory =
-            !movedFrame &&
             deltaY < 0 &&
+            !frameScroll.movedY &&
             Math.abs(deltaY) >= Math.abs(deltaX) &&
             terminalViewport.scrollTop <= 0.5;
           if (shouldEnterHistory && showScrollbackOverlay(deltaY)) {
             state.scrollRemainderPx = 0;
             return true;
           }
-          return movedFrame;
+          return frameScroll.movedX || frameScroll.movedY;
         }
 
         if (deltaY < 0 && showScrollbackOverlay(deltaY)) {
