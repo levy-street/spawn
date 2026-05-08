@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,13 +13,12 @@ from .. import auth as auth_mod
 from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, Host
+from .activity import should_record_agent_output
 from .broker import DaemonConn, get_broker
 from .frames import KIND_OUTPUT, decode_binary_frame
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
-ACTIVITY_TOUCH_INTERVAL = timedelta(seconds=2)
-_last_output_touch_at: dict[str, datetime] = {}
 
 
 def _utcnow() -> datetime:
@@ -73,14 +72,6 @@ async def _touch_host(session: AsyncSession, host: Host) -> None:
     await session.commit()
 
 
-def _should_touch_output(agent_id: str, now: datetime) -> bool:
-    previous = _last_output_touch_at.get(agent_id)
-    if previous is not None and now - previous < ACTIVITY_TOUCH_INTERVAL:
-        return False
-    _last_output_touch_at[agent_id] = now
-    return True
-
-
 @router.websocket("/ws/daemon")
 async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
     # Pre-accept-time auth check: we accept first because most clients can't read
@@ -123,7 +114,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         log.warning("daemon stream for unknown agent=%s", frame.agent_id)
                         continue
                     now = _utcnow()
-                    if _should_touch_output(str(frame.agent_id), now):
+                    if should_record_agent_output(str(frame.agent_id), now):
                         agent.last_output_at = now
                     host_obj = await session.get(Host, host.id)
                     if host_obj is not None:

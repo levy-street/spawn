@@ -7,7 +7,6 @@ import base64
 import binascii
 import json
 import logging
-from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -16,6 +15,12 @@ from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
+from .activity import (
+    REDRAW_SUPPRESS_WINDOW,
+    should_record_agent_input,
+    suppress_agent_output_activity,
+    utcnow,
+)
 from .broker import BrowserConn, BrowserDisplayState, get_broker
 from .frames import KIND_INPUT, encode_binary_frame
 
@@ -26,29 +31,15 @@ MAX_UPLOAD_NAME_LENGTH = 255
 MAX_UPLOAD_MIME_LENGTH = 128
 MAX_UPLOAD_CLIENT_ID_LENGTH = 128
 TERMINAL_UI_AGENT_BINS = {"codex", "claude", "claude-code", "opencode", "aider"}
-ACTIVITY_TOUCH_INTERVAL = timedelta(seconds=1)
-_last_input_touch_at: dict[str, datetime] = {}
 
 
 class UploadValidationError(ValueError):
     pass
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-def _should_touch_input(agent_id: str, now: datetime) -> bool:
-    previous = _last_input_touch_at.get(agent_id)
-    if previous is not None and now - previous < ACTIVITY_TOUCH_INTERVAL:
-        return False
-    _last_input_touch_at[agent_id] = now
-    return True
-
-
 async def _touch_agent_input(agent_id: str) -> None:
-    now = _utcnow()
-    if not _should_touch_input(agent_id, now):
+    now = utcnow()
+    if not should_record_agent_input(agent_id, now):
         return
     sm = get_sessionmaker()
     async with sm() as session:
@@ -337,6 +328,9 @@ async def browser_ws(
                     )
                     if daemon is not None:
                         try:
+                            suppress_agent_output_activity(
+                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
+                            )
                             await daemon.send_text(
                                 {
                                     "type": "agent.resize",
@@ -361,6 +355,9 @@ async def browser_ws(
                     )
                     if daemon is not None:
                         try:
+                            suppress_agent_output_activity(
+                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
+                            )
                             await daemon.send_text(
                                 {
                                     "type": "agent.resize",
@@ -383,6 +380,9 @@ async def browser_ws(
                     )
                     if daemon is not None:
                         try:
+                            suppress_agent_output_activity(
+                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
+                            )
                             await daemon.send_text(
                                 {
                                     "type": "agent.scroll",
@@ -503,6 +503,7 @@ async def _request_agent_redraw(agent_id: str, host_id: str) -> None:
     if daemon is None:
         return
     try:
+        suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
         await daemon.send_text({"type": "agent.redraw", "agent_id": agent_id})
     except Exception as e:
         log.warning("redraw forward failed: %s", e)
