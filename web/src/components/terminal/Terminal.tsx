@@ -431,7 +431,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!term) return;
       scrollbackSnapshotRequestedRef.current = false;
       term.reset();
-      term.write(bytes);
+      term.write(wrapSnapshotForXterm(decodeUtf8(bytes)));
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes) => {
@@ -1863,7 +1863,11 @@ function normalizeSnapshotText(input: string): string {
 function formatSnapshotForXterm(input: string): string {
   // `capture-pane -p` returns already-rendered rows. Disable xterm autowrap so
   // exact-width rows do not gain an extra wrapped line while replaying them.
-  return `\x1b[?7l${input.split("\n").join("\r\n")}\x1b[?7h`;
+  return wrapSnapshotForXterm(input.split("\n").join("\r\n"));
+}
+
+function wrapSnapshotForXterm(input: string): string {
+  return `\x1b[?7l${input}\x1b[?7h`;
 }
 
 function parseAnsiRows(input: string): AnsiRow[] {
