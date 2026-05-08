@@ -215,7 +215,11 @@ pub async fn capture_history(session: &str, lines: u16, styled: bool) -> Result<
     let start = format!("-{}", lines.clamp(1, 10_000));
     let mut args = vec!["capture-pane"];
     if styled {
+        // Styled snapshots need trailing cells: those blanks can carry
+        // background resets/colors required to faithfully replay full-screen
+        // terminal UIs into xterm.
         args.push("-e");
+        args.push("-N");
     }
     args.extend(["-p", "-t", session, "-S", &start]);
     let out = Command::new("tmux")
