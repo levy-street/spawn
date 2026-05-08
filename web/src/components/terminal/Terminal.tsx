@@ -41,6 +41,7 @@ type ImagePasteMode = "deferred" | "bracketed-path";
 type PendingAttachmentStatus = "uploading" | "ready" | "error";
 type ScrollAnchor = { viewportY: number; atBottom: boolean };
 type ScrollbackSnapshotOptions = { reset?: boolean };
+type TerminalGeometry = { cols: number; rows: number };
 
 type PendingAttachment = {
   id: string;
@@ -103,14 +104,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   },
   ref,
 ) {
+  const terminalViewportRef = useRef<HTMLDivElement>(null);
+  const terminalSurfaceRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
   const displayOwnerRef = useRef<boolean | null>(null);
-  const displayGeometryRef = useRef<{ cols: number; rows: number } | null>(null);
+  const displayGeometryRef = useRef<TerminalGeometry | null>(null);
+  const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
-  const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+  const lastSizeRef = useRef<TerminalGeometry>({ cols: 80, rows: 24 });
   const uploadStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragDepthRef = useRef(0);
   const rawInputRef = useRef(rawInput);
@@ -122,6 +126,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     active: boolean;
     startX: number;
     startY: number;
+    lastX: number;
     lastY: number;
     lastTime: number;
     movedPx: number;
@@ -137,6 +142,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     active: false,
     startX: 0,
     startY: 0,
+    lastX: 0,
     lastY: 0,
     lastTime: 0,
     movedPx: 0,
@@ -363,6 +369,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           return;
         }
         lastSizeRef.current = geometry;
+        layoutTerminalSurfaceRef.current(atBottom);
+        requestAnimationFrame(() => layoutTerminalSurfaceRef.current(atBottom));
         if (atBottom) {
           term.scrollToBottom();
           scrollbackTermRef.current?.scrollToBottom();
@@ -569,7 +577,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Bootstrap xterm.js once on mount.
   useEffect(() => {
-    if (!containerRef.current) return;
+    if (!terminalViewportRef.current || !terminalSurfaceRef.current || !containerRef.current) {
+      return;
+    }
     const term = new XTerm({
       convertEol: false,
       cursorBlink: true,
@@ -598,7 +608,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    const terminalViewport = terminalViewportRef.current;
+    const terminalSurface = terminalSurfaceRef.current;
     const terminalElement = containerRef.current;
+    terminalViewport.style.touchAction = "none";
     terminalElement.style.touchAction = "none";
 
     const hideMobileScrollbackOverlay = () => {
@@ -655,6 +668,81 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const canvasHeight = canvas?.getBoundingClientRect().height ?? 0;
       if (canvasHeight > 0 && term.rows > 0) return rememberRowHeight(canvasHeight / term.rows);
       return terminalRowHeightRef.current;
+    };
+
+    const usesViewerPanFrame = () => {
+      return (
+        coarsePointerRef.current &&
+        displayOwnerRef.current === false &&
+        displayGeometryRef.current !== null
+      );
+    };
+
+    const getTerminalPixelSize = () => {
+      const canvas = terminalElement.querySelector<HTMLCanvasElement>(".xterm-screen canvas");
+      const canvasRect = canvas?.getBoundingClientRect();
+      const elementRect = terminalElement.getBoundingClientRect();
+      return {
+        width: Math.max(
+          1,
+          Math.ceil(canvasRect && canvasRect.width > 0 ? canvasRect.width : elementRect.width),
+        ),
+        height: Math.max(
+          1,
+          Math.ceil(canvasRect && canvasRect.height > 0 ? canvasRect.height : elementRect.height),
+        ),
+      };
+    };
+
+    const maxFrameScrollLeft = () => {
+      return Math.max(0, terminalViewport.scrollWidth - terminalViewport.clientWidth);
+    };
+
+    const maxFrameScrollTop = () => {
+      return Math.max(0, terminalViewport.scrollHeight - terminalViewport.clientHeight);
+    };
+
+    const layoutTerminalSurface = (pinToBottom = false) => {
+      if (!usesViewerPanFrame()) {
+        terminalSurface.style.width = "100%";
+        terminalSurface.style.height = "100%";
+        terminalElement.style.width = "100%";
+        terminalElement.style.height = "100%";
+        terminalViewport.scrollLeft = 0;
+        terminalViewport.scrollTop = 0;
+        return;
+      }
+
+      const size = getTerminalPixelSize();
+      terminalSurface.style.width = `${size.width}px`;
+      terminalSurface.style.height = `${size.height}px`;
+      terminalElement.style.width = `${size.width}px`;
+      terminalElement.style.height = `${size.height}px`;
+
+      if (pinToBottom) {
+        terminalViewport.scrollTop = maxFrameScrollTop();
+      } else {
+        terminalViewport.scrollTop = Math.min(terminalViewport.scrollTop, maxFrameScrollTop());
+      }
+      terminalViewport.scrollLeft = Math.min(terminalViewport.scrollLeft, maxFrameScrollLeft());
+    };
+    layoutTerminalSurfaceRef.current = layoutTerminalSurface;
+
+    const scrollViewerPanFrame = (deltaX: number, deltaY: number) => {
+      if (!usesViewerPanFrame()) return false;
+      const maxLeft = maxFrameScrollLeft();
+      const maxTop = maxFrameScrollTop();
+      if (maxLeft <= 0 && maxTop <= 0) return false;
+
+      const beforeLeft = terminalViewport.scrollLeft;
+      const beforeTop = terminalViewport.scrollTop;
+      terminalViewport.scrollLeft = Math.max(0, Math.min(maxLeft, beforeLeft + deltaX));
+      terminalViewport.scrollTop = Math.max(0, Math.min(maxTop, beforeTop + deltaY));
+
+      return (
+        Math.abs(terminalViewport.scrollLeft - beforeLeft) >= 0.5 ||
+        Math.abs(terminalViewport.scrollTop - beforeTop) >= 0.5
+      );
     };
 
     const maxScrollTop = (viewport: HTMLElement) => {
@@ -785,8 +873,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return deltaY > 0 ? viewport.scrollTop < maxTop - 0.5 : viewport.scrollTop > 0.5;
     };
 
-    const applyTouchScrollDelta = (deltaY: number) => {
+    const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
+      if (usesViewerPanFrame()) {
+        return scrollViewerPanFrame(deltaX, deltaY);
+      }
+
       if (coarsePointerRef.current) {
         if (scrollbackVisibleRef.current) {
           const overlay = getScrollbackViewport();
@@ -838,7 +930,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       state.momentumLastTime = 0;
       state.scrollRemainderPx = 0;
-      if (!scrollbackVisibleRef.current) alignViewportToRows();
+      if (!scrollbackVisibleRef.current && !usesViewerPanFrame()) alignViewportToRows();
     };
 
     const sendMobilePromptNewline = () => {
@@ -906,7 +998,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
 
-      if (!applyTouchScrollDelta(deltaY)) {
+      if (!applyTouchScrollDelta(0, deltaY)) {
         stopTouchMomentum();
         return;
       }
@@ -920,6 +1012,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       touchScrollRef.current.active = true;
       touchScrollRef.current.startX = x;
       touchScrollRef.current.startY = y;
+      touchScrollRef.current.lastX = x;
       touchScrollRef.current.lastY = y;
       touchScrollRef.current.lastTime = time;
       touchScrollRef.current.movedPx = 0;
@@ -935,9 +1028,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!state.active) return;
 
       state.movedPx = Math.max(state.movedPx, Math.hypot(x - state.startX, y - state.startY));
+      const deltaX = state.lastX - x;
       const deltaY = state.lastY - y;
+      state.lastX = x;
       state.lastY = y;
-      if (deltaY === 0) return;
+      if (deltaX === 0 && deltaY === 0) return;
 
       const dt = Math.max(1, time - state.lastTime);
       state.lastTime = time;
@@ -946,7 +1041,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const sampledVelocity = estimateTouchVelocity();
       state.velocityPxPerMs = sampledVelocity * 0.75 + instantVelocity * 0.25;
 
-      applyTouchScrollDelta(deltaY);
+      applyTouchScrollDelta(deltaX, deltaY);
     };
 
     const endTouchScroll = () => {
@@ -973,7 +1068,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         state.momentumFrame = requestAnimationFrame(stepTouchMomentum);
       } else {
         state.scrollRemainderPx = 0;
-        alignViewportToRows();
+        if (!usesViewerPanFrame()) alignViewportToRows();
       }
     };
 
@@ -1177,19 +1272,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           return;
         }
         lastSizeRef.current = followerGeometry;
+        layoutTerminalSurface(anchor?.atBottom ?? true);
+        requestAnimationFrame(() => layoutTerminalSurface(anchor?.atBottom ?? true));
         if (anchor) {
           restoreScrollAnchor(anchor);
           requestAnimationFrame(() => restoreScrollAnchor(anchor));
         } else {
-          alignViewportToRows();
+          if (!usesViewerPanFrame()) alignViewportToRows();
         }
         return;
       }
+      layoutTerminalSurface(false);
       try {
         fit.fit();
       } catch {
         return;
       }
+      layoutTerminalSurface(false);
       if (anchor) {
         restoreScrollAnchor(anchor);
         requestAnimationFrame(() => restoreScrollAnchor(anchor));
@@ -1218,7 +1317,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const ro = new ResizeObserver(() => {
       scheduleFit();
     });
-    if (containerRef.current) ro.observe(containerRef.current);
+    ro.observe(terminalViewport);
 
     return () => {
       ro.disconnect();
@@ -1249,6 +1348,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       termRef.current = null;
       fitRef.current = null;
       fitTerminalRef.current = () => {};
+      layoutTerminalSurfaceRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
@@ -1466,6 +1566,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         if (!term) return;
         displayOwnerRef.current = true;
         displayGeometryRef.current = null;
+        layoutTerminalSurfaceRef.current(false);
         try {
           fitRef.current?.fit();
         } catch {
@@ -1533,7 +1634,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <div ref={containerRef} className="size-full touch-none" />
+      <div
+        ref={terminalViewportRef}
+        className="absolute inset-0 overflow-hidden touch-none bg-[var(--color-terminal-bg)]"
+        style={{
+          overscrollBehavior: "contain",
+          scrollbarWidth: "none",
+        }}
+      >
+        <div
+          ref={terminalSurfaceRef}
+          className="relative size-full min-h-full min-w-full bg-[var(--color-terminal-bg)]"
+        >
+          <div ref={containerRef} className="size-full touch-none" />
+        </div>
+      </div>
       {scrollbackVisible && (
         <div
           className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
