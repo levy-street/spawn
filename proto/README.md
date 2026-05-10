@@ -35,6 +35,7 @@ also accepts `Bearer` for API testing).
 | GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
+| PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
 | DELETE | `/api/hosts/{id}`     | revoke daemon token + drop the host      |
 
@@ -61,6 +62,7 @@ Host shape:
 | GET    | `/api/agents/{id}`   |                                                                                   |
 | POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, create_cwd?}` — at least one of preset_id or argv |
 | PATCH  | `/api/agents/{id}`   | rename/archive: `{name?, archived?}`                                              |
+| POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
 | DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
 
 Agent shape:
@@ -176,6 +178,8 @@ Agent IDs are big-endian 16-byte UUIDs.
    "installed": true,
    "path": "/usr/local/bin/codex",
    "version": "codex 1.2.3",
+   "latest_version": "1.2.4|null",
+   "update_available": true,
    "error": null}]}
 
 {"type": "host.tools.install_result",
@@ -228,6 +232,17 @@ Agent IDs are big-endian 16-byte UUIDs.
    "install": "npm install -g @openai/codex"}}
 
 {"type": "agent.create",
+ "agent_id": "uuid",
+ "cwd": "/home/me/projects/foo",
+ "argv": ["claude"],
+ "env": {"FOO": "bar"},
+ "install": "npm install -g @anthropic-ai/claude-code",
+ "tmux_session": "spawn-<uuid>",
+ "cols": 120,
+ "rows": 32,
+ "create_cwd": true}
+
+{"type": "agent.restart",
  "agent_id": "uuid",
  "cwd": "/home/me/projects/foo",
  "argv": ["claude"],

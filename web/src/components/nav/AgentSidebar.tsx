@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, Check, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Archive, Check, Pencil, Plus, RotateCcw, Trash2, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -67,6 +67,15 @@ export function AgentSidebar({
     onError: (err) => setActionError(String(err)),
   });
 
+  const restartM = useMutation({
+    mutationFn: (id: string) => agents.restart(id),
+    onSuccess: (_agent, id) => {
+      setActionError(null);
+      invalidate(id);
+    },
+    onError: (err) => setActionError(String(err)),
+  });
+
   const startRename = (agent: Agent) => {
     setEditingId(agent.id);
     setDraftName(agent.name ?? agentTitle(agent));
@@ -88,7 +97,7 @@ export function AgentSidebar({
   };
 
   const visible = q.data ?? [];
-  const busy = renameM.isPending || archiveM.isPending || deleteM.isPending;
+  const busy = renameM.isPending || archiveM.isPending || deleteM.isPending || restartM.isPending;
 
   if (collapsed) {
     return (
@@ -211,7 +220,7 @@ export function AgentSidebar({
                     aria-current={active ? "page" : undefined}
                     title={`${agentTitle(agent)} · ${agentCommand(agent)} · ${agentActivityDetail(agent)} · ${agent.cwd}`}
                     className={cn(
-                      "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors group-hover:pr-[4.25rem] group-focus-within:pr-[4.25rem]",
+                      "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors group-hover:pr-[7.25rem] group-focus-within:pr-[7.25rem]",
                       active
                         ? "bg-accent text-accent-foreground"
                         : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -239,6 +248,19 @@ export function AgentSidebar({
                       onClick={() => startRename(agent)}
                     >
                       <Pencil className="size-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7"
+                      aria-label={`Restart ${agentTitle(agent)}`}
+                      title="Restart agent"
+                      disabled={busy}
+                      onClick={() => {
+                        if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
+                      }}
+                    >
+                      <RotateCcw className="size-3.5" />
                     </Button>
                     <Button
                       variant="ghost"

@@ -70,6 +70,8 @@ export interface TerminalHandle {
   resize: (cols: number, rows: number) => void;
   /** Force a re-fit against the current container size. */
   fit: () => void;
+  /** Last known terminal geometry. */
+  getSize: () => TerminalGeometry;
   /** Focus the terminal so keystrokes flow there (raw mode). */
   focus: () => void;
   /** Submit the current terminal draft, appending pending image refs first. */
@@ -1607,6 +1609,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       fit: () => {
         fitTerminalRef.current(true);
       },
+      getSize: () => lastSizeRef.current,
       focus: () => termRef.current?.focus(),
       submit: () => {
         hideScrollbackOverlay();

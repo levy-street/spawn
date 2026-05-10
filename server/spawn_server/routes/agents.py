@@ -123,6 +123,55 @@ async def get_agent(
     return _to_out(a, host.name if host is not None else None)
 
 
+async def _resolve_agent_preset(
+    session: AsyncSession, preset_id: str | None, user: User
+) -> Preset | None:
+    if preset_id is None:
+        return None
+    preset = await session.get(Preset, preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="preset not found")
+    if preset.owner_user_id is not None and preset.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="preset not found")
+    return preset
+
+
+async def _dispatch_agent_launch(
+    *,
+    frame_type: str,
+    agent: Agent,
+    host: Host,
+    preset: Preset | None,
+    cols: int,
+    rows: int,
+    create_cwd: bool,
+) -> None:
+    broker = get_broker()
+    daemon = broker.get_daemon_for_host(host.id)
+    if daemon is None:
+        log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
+        return
+
+    await broker.attach_agent_to_daemon(agent.id, daemon)
+    try:
+        await daemon.send_text(
+            {
+                "type": frame_type,
+                "agent_id": agent.id,
+                "cwd": agent.cwd,
+                "argv": agent.argv,
+                "env": agent.env,
+                "install": preset.install if preset is not None else None,
+                "tmux_session": f"spawn-{agent.id}",
+                "cols": cols,
+                "rows": rows,
+                "create_cwd": create_cwd,
+            }
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("%s dispatch failed: %s", frame_type, e)
+
+
 @router.patch("/{agent_id}", response_model=schemas.AgentOut)
 async def patch_agent(
     agent_id: str,
@@ -159,13 +208,7 @@ async def create_agent(
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
 
-    preset: Preset | None = None
-    if body.preset_id is not None:
-        preset = await session.get(Preset, body.preset_id)
-        if preset is None:
-            raise HTTPException(status_code=404, detail="preset not found")
-        if preset.owner_user_id is not None and preset.owner_user_id != user.id:
-            raise HTTPException(status_code=404, detail="preset not found")
+    preset = await _resolve_agent_preset(session, body.preset_id, user)
 
     argv = list(body.argv) if body.argv else (list(preset.default_argv) if preset else [])
     if not argv:
@@ -194,30 +237,58 @@ async def create_agent(
 
     # Dispatch agent.create to the daemon. spawn does not manage agent
     # credentials — the agent CLI on the host handles its own auth.
-    broker = get_broker()
-    daemon = broker.get_daemon_for_host(host.id)
-    if daemon is None:
-        log.warning("create_agent: no daemon connection for host=%s", host.id)
-    else:
-        await broker.attach_agent_to_daemon(agent.id, daemon)
-        try:
-            await daemon.send_text(
-                {
-                    "type": "agent.create",
-                    "agent_id": agent.id,
-                    "cwd": agent.cwd,
-                    "argv": agent.argv,
-                    "env": agent.env,
-                    "install": preset.install if preset is not None else None,
-                    "tmux_session": f"spawn-{agent.id}",
-                    "cols": body.cols,
-                    "rows": body.rows,
-                    "create_cwd": body.create_cwd,
-                }
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("agent.create dispatch failed: %s", e)
+    await _dispatch_agent_launch(
+        frame_type="agent.create",
+        agent=agent,
+        host=host,
+        preset=preset,
+        cols=body.cols,
+        rows=body.rows,
+        create_cwd=body.create_cwd,
+    )
 
+    return _to_out(agent, host.name)
+
+
+@router.post("/{agent_id}/restart", response_model=schemas.AgentOut)
+async def restart_agent(
+    agent_id: str,
+    body: schemas.AgentRestart,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentOut:
+    agent = await session.get(Agent, agent_id)
+    if agent is None or agent.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    host = await session.get(Host, agent.host_id)
+    if host is None or host.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="host not found")
+
+    daemon = get_broker().get_daemon_for_host(host.id)
+    if daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+
+    preset = await _resolve_agent_preset(session, agent.preset_id, user)
+    now = _utcnow()
+    agent.status = "starting"
+    agent.started_at = now
+    agent.exited_at = None
+    agent.exit_code = None
+    agent.last_output_at = None
+    agent.last_input_at = None
+    await session.commit()
+    await session.refresh(agent)
+
+    await _dispatch_agent_launch(
+        frame_type="agent.restart",
+        agent=agent,
+        host=host,
+        preset=preset,
+        cols=body.cols,
+        rows=body.rows,
+        create_cwd=body.create_cwd,
+    )
     return _to_out(agent, host.name)
 
 

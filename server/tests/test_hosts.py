@@ -192,3 +192,106 @@ async def test_host_tools_require_online_daemon(client):
 
     r = await client.get(f"/api/hosts/{host_id}/tools", headers=auth)
     assert r.status_code == 409
+
+
+async def test_host_tool_policy_auto_update_schedules_install(client):
+    token = await _signup(client, "host-tools-auto@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, Preset, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "host-tools-auto@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="auto-box", status="online")
+        session.add(host)
+        preset = (
+            await session.execute(select(Preset).where(Preset.name == "codex"))
+        ).scalar_one()
+        await session.commit()
+        host_id = host.id
+        preset_id = preset.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+
+    r = await client.patch(
+        f"/api/hosts/{host_id}/tools/{preset_id}/policy",
+        json={"auto_update": True},
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_update"] is True
+
+    check_task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/tools", headers=auth))
+    for _ in range(100):
+        if fake_ws.sent_text:
+            break
+        await asyncio.sleep(0.01)
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "host.tools.check"
+    await broker.resolve_tool_check(
+        sent["request_id"],
+        {
+            "type": "host.tools.check_result",
+            "request_id": sent["request_id"],
+            "tools": [
+                {
+                    "preset_id": preset_id,
+                    "preset_name": "codex",
+                    "agent_kind": "codex",
+                    "command": "codex",
+                    "install": "npm install -g @openai/codex",
+                    "installed": True,
+                    "path": "/usr/local/bin/codex",
+                    "version": "codex 1.2.3",
+                    "latest_version": "1.2.4",
+                    "update_available": True,
+                    "error": None,
+                }
+            ],
+        },
+    )
+    r = await check_task
+    assert r.status_code == 200, r.text
+    tool = r.json()["tools"][0]
+    assert tool["auto_update"] is True
+    assert tool["update_available"] is True
+
+    for _ in range(100):
+        if any(json.loads(text)["type"] == "host.tools.install" for text in fake_ws.sent_text):
+            break
+        await asyncio.sleep(0.01)
+    sent_frames = [json.loads(text) for text in fake_ws.sent_text]
+    install_sent = next(frame for frame in sent_frames if frame["type"] == "host.tools.install")
+    assert install_sent["target"]["preset_id"] == preset_id
+
+    await broker.resolve_tool_install(
+        install_sent["request_id"],
+        {
+            "type": "host.tools.install_result",
+            "request_id": install_sent["request_id"],
+            "result": {
+                "preset_id": preset_id,
+                "preset_name": "codex",
+                "agent_kind": "codex",
+                "command": "codex",
+                "install": "npm install -g @openai/codex",
+                "success": True,
+                "exit_code": 0,
+                "output": "updated",
+                "error": None,
+                "status": None,
+            },
+        },
+    )
+    await asyncio.sleep(0)
+    await broker.unregister_daemon(daemon)

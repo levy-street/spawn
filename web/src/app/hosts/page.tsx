@@ -227,6 +227,7 @@ function HostToolsPanel({ host }: { host: Host }) {
     queryFn: () => hosts.tools(host.id),
     enabled: host.status === "online",
     staleTime: 30_000,
+    refetchInterval: 60_000,
   });
   const installM = useMutation({
     mutationFn: (tool: HostToolStatus) => hosts.installTool(host.id, tool.preset_id),
@@ -238,6 +239,24 @@ function HostToolsPanel({ host }: { host: Host }) {
       setLastResult({
         preset_id: "",
         preset_name: "Install",
+        agent_kind: "",
+        command: "",
+        success: false,
+        output: "",
+        error: err instanceof ApiError ? err.message : String(err),
+      });
+    },
+  });
+  const policyM = useMutation({
+    mutationFn: ({ tool, autoUpdate }: { tool: HostToolStatus; autoUpdate: boolean }) =>
+      hosts.updateToolPolicy(host.id, tool.preset_id, { auto_update: autoUpdate }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
+    },
+    onError: (err) => {
+      setLastResult({
+        preset_id: "",
+        preset_name: "Policy",
         agent_kind: "",
         command: "",
         success: false,
@@ -296,23 +315,50 @@ function HostToolsPanel({ host }: { host: Host }) {
                   <span className="font-medium">{tool.preset_name}</span>
                   <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{tool.command}</code>
                   <span className="text-xs text-muted-foreground">{tool.agent_kind}</span>
+                  {tool.update_available && (
+                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-xs text-amber-500">
+                      Update available
+                    </span>
+                  )}
                 </div>
                 <div className="space-y-0.5 text-xs text-muted-foreground">
                   {tool.installed ? (
                     <>
                       {tool.version && <div className="truncate">{tool.version}</div>}
+                      {tool.latest_version && (
+                        <div className="truncate">latest {tool.latest_version}</div>
+                      )}
                       {tool.path && <div className="truncate">{tool.path}</div>}
                     </>
                   ) : (
                     <div>Missing from PATH</div>
                   )}
                   {tool.error && <div className="text-destructive">{tool.error}</div>}
+                  {tool.last_auto_update_error && (
+                    <div className="text-destructive">
+                      auto update failed: {tool.last_auto_update_error}
+                    </div>
+                  )}
                   {tool.install && <div className="truncate">install {tool.install}</div>}
+                  {tool.last_checked_at && (
+                    <div>checked {new Date(tool.last_checked_at).toLocaleTimeString()}</div>
+                  )}
                 </div>
               </div>
-              <div className="flex items-start justify-end">
+              <div className="flex flex-col items-end gap-2">
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={tool.auto_update}
+                    disabled={!tool.install || policyM.isPending}
+                    onChange={(event) =>
+                      policyM.mutate({ tool, autoUpdate: event.currentTarget.checked })
+                    }
+                  />
+                  Auto update
+                </label>
                 <Button
-                  variant={tool.installed ? "outline" : "secondary"}
+                  variant={tool.installed && !tool.update_available ? "outline" : "secondary"}
                   size="sm"
                   disabled={!tool.install || installM.isPending}
                   onClick={() => {

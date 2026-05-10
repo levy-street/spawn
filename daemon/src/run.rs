@@ -274,6 +274,9 @@ async fn dispatch_loop(
                 Inbound::AgentCreate(create) => {
                     handle_agent_create(create, registry, out_tx).await;
                 }
+                Inbound::AgentRestart(create) => {
+                    handle_agent_restart(create, registry, out_tx).await;
+                }
                 Inbound::AgentKill { agent_id, signal } => {
                     handle_agent_kill(agent_id, signal, registry).await;
                 }
@@ -458,6 +461,8 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
             installed: false,
             path: None,
             version: None,
+            latest_version: None,
+            update_available: None,
             error: Some("preset argv has no executable".into()),
         };
     }
@@ -473,6 +478,8 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
             installed: false,
             path: None,
             version: None,
+            latest_version: None,
+            update_available: None,
             error: None,
         };
     };
@@ -480,6 +487,11 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
     let (version, error) = match read_tool_version(&command).await {
         Ok(version) => (version, None),
         Err(e) => (None, Some(format!("version check failed: {e:#}"))),
+    };
+    let latest_version = latest_tool_version(target.install.as_deref()).await;
+    let update_available = match (version.as_deref(), latest_version.as_deref()) {
+        (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
+        _ => None,
     };
 
     HostToolStatus {
@@ -491,6 +503,8 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
         installed: true,
         path: Some(path),
         version,
+        latest_version,
+        update_available,
         error,
     }
 }
@@ -564,6 +578,175 @@ async fn read_tool_version(command: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+async fn latest_tool_version(install: Option<&str>) -> Option<String> {
+    let install = install?.trim();
+    if install.is_empty() {
+        return None;
+    }
+
+    if let Some(package) = npm_package_from_install_command(install) {
+        let capture = run_program_capture(
+            "npm",
+            &["view", &package, "version"],
+            TOOL_VERSION_TIMEOUT,
+            4096,
+        )
+        .await;
+        if capture.success {
+            return first_meaningful_line(&capture.output);
+        }
+    }
+
+    if let Some(package) = python_package_from_install_command(install) {
+        let capture = run_program_capture(
+            "python3",
+            &["-m", "pip", "index", "versions", &package],
+            TOOL_VERSION_TIMEOUT,
+            4096,
+        )
+        .await;
+        if capture.success {
+            return parse_pip_latest_version(&package, &capture.output);
+        }
+    }
+
+    None
+}
+
+fn npm_package_from_install_command(command: &str) -> Option<String> {
+    let parts = shell_words(command);
+    let npm_index = parts
+        .iter()
+        .position(|part| part == "npm" || part.ends_with("/npm"))?;
+    let mut saw_install = false;
+    let mut saw_global = false;
+    for part in parts.iter().skip(npm_index + 1) {
+        match part.as_str() {
+            "install" | "i" => saw_install = true,
+            "-g" | "--global" => saw_global = true,
+            _ if saw_install && saw_global && !part.starts_with('-') => return Some(part.clone()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn python_package_from_install_command(command: &str) -> Option<String> {
+    let parts = shell_words(command);
+    for (idx, part) in parts.iter().enumerate() {
+        if part != "pipx" && part != "pip" && !part.ends_with("/pip") && !part.ends_with("/pipx") {
+            continue;
+        }
+        let mut saw_install = false;
+        for next in parts.iter().skip(idx + 1) {
+            match next.as_str() {
+                "install" => saw_install = true,
+                _ if saw_install && !next.starts_with('-') => return Some(next.clone()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn parse_pip_latest_version(package: &str, output: &str) -> Option<String> {
+    let first = first_meaningful_line(output)?;
+    let prefix = format!("{package} (");
+    first
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split(')').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn version_suggests_update(installed: &str, latest: &str) -> Option<bool> {
+    let installed = numeric_version(installed)?;
+    let latest = numeric_version(latest)?;
+    Some(compare_versions(&installed, &latest) == std::cmp::Ordering::Less)
+}
+
+fn numeric_version(text: &str) -> Option<Vec<u64>> {
+    let mut best: Vec<u64> = Vec::new();
+    for raw in text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.') {
+        let candidate = raw.trim_start_matches('v');
+        if !candidate
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let parts: Vec<u64> = candidate
+            .split('.')
+            .take_while(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+            .filter_map(|part| part.parse::<u64>().ok())
+            .collect();
+        if parts.len() > best.len() {
+            best = parts;
+        }
+    }
+    if best.is_empty() {
+        None
+    } else {
+        Some(best)
+    }
+}
+
+fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
+    let len = left.len().max(right.len());
+    for idx in 0..len {
+        let l = left.get(idx).copied().unwrap_or(0);
+        let r = right.get(idx).copied().unwrap_or(0);
+        match l.cmp(&r) {
+            std::cmp::Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 #[derive(Debug)]
 struct CommandCapture {
     success: bool,
@@ -619,7 +802,11 @@ async fn run_program_capture(
     }
 }
 
-async fn run_shell_capture(command: &str, timeout: Duration, output_limit: usize) -> CommandCapture {
+async fn run_shell_capture(
+    command: &str,
+    timeout: Duration,
+    output_limit: usize,
+) -> CommandCapture {
     let child = match Command::new("bash")
         .arg("-c")
         .arg(format!("{command} 2>&1"))
@@ -657,7 +844,10 @@ async fn run_shell_capture(command: &str, timeout: Duration, output_limit: usize
             success: false,
             exit_code: None,
             output: String::new(),
-            error: Some(format!("install command timed out after {}s", timeout.as_secs())),
+            error: Some(format!(
+                "install command timed out after {}s",
+                timeout.as_secs()
+            )),
         },
     }
 }
@@ -893,7 +1083,7 @@ async fn handle_agent_create(
     // the registry — that way the first PTY bytes (tmux's initial pane draw)
     // route through cleanly instead of piling up in the outbox.
     launched.handle.control.set_sink(out_tx.clone()).await;
-    registry.insert(launched.handle);
+    let generation = registry.insert(launched.handle);
 
     // Tell server it's up.
     let started = Outbound::AgentStarted { agent_id, pid };
@@ -909,7 +1099,13 @@ async fn handle_agent_create(
             exit_code: None,
             signal: None,
         });
-        registry.remove(agent_id);
+        if registry
+            .remove_if_generation(agent_id, generation)
+            .is_none()
+        {
+            tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
+            return;
+        }
         let exit = Outbound::AgentExit {
             agent_id,
             exit_code: reason.exit_code,
@@ -919,6 +1115,41 @@ async fn handle_agent_create(
             let _ = out_tx.send(WsOutbound::Json(s)).await;
         }
     });
+}
+
+async fn handle_agent_restart(
+    create: AgentCreate,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    let agent_id = create.agent_id;
+    let session = tmux::session_name(agent_id);
+    tracing::info!(%agent_id, argv = ?create.argv, "agent.restart");
+
+    // Remove the current handle before killing tmux. Its exit task will see
+    // that its generation is no longer current and will not emit agent.exit.
+    if let Some(handle) = registry.remove(agent_id) {
+        handle.control.clear_sink().await;
+    }
+    if let Err(e) = tmux::kill_session(&session).await {
+        tracing::debug!(%agent_id, error = %e, "tmux kill-session before restart");
+    }
+
+    for _ in 0..30 {
+        if !tmux::has_session(&session).await {
+            handle_agent_create(create, registry, out_tx).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    send_pty_text(
+        agent_id,
+        out_tx,
+        "\r\n\x1b[31m[spawn] restart failed: old tmux session did not exit\x1b[0m\r\n",
+    )
+    .await;
+    send_spawn_failed_exit(agent_id, out_tx, "restart timeout").await;
 }
 
 async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &AgentRegistry) {
@@ -1104,7 +1335,7 @@ async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sen
                 let exit_rx = launched.exit_rx;
                 // Wire the rediscovered agent's forwarder to this session.
                 launched.handle.control.set_sink(out_tx.clone()).await;
-                registry.insert(launched.handle);
+                let generation = registry.insert(launched.handle);
                 let registry_clone = registry.clone();
                 let out_tx_clone = out_tx.clone();
                 tokio::spawn(async move {
@@ -1112,7 +1343,13 @@ async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sen
                         exit_code: None,
                         signal: None,
                     });
-                    registry_clone.remove(agent_id);
+                    if registry_clone
+                        .remove_if_generation(agent_id, generation)
+                        .is_none()
+                    {
+                        tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
+                        return;
+                    }
                     let exit = Outbound::AgentExit {
                         agent_id,
                         exit_code: reason.exit_code,

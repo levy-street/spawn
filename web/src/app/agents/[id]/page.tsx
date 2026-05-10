@@ -1,7 +1,15 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, ArchiveRestore, ArrowLeft, Pencil, Trash2 } from "lucide-react";
+import {
+  Archive,
+  ArchiveRestore,
+  ArrowLeft,
+  Download,
+  Pencil,
+  RotateCcw,
+  Trash2,
+} from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
@@ -18,7 +26,7 @@ import {
   agentTitle,
   isAgentArchived,
 } from "@/lib/agents";
-import { agents } from "@/lib/api";
+import { agents, hosts } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -59,6 +67,14 @@ function AgentTerminal() {
     enabled: !!id,
     refetchInterval: 5_000,
   });
+  const toolsQ = useQuery({
+    queryKey: ["host-tools", q.data?.host_id],
+    queryFn: () => hosts.tools(q.data!.host_id),
+    enabled: Boolean(q.data?.host_id && q.data?.preset_id),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+  const currentTool = toolsQ.data?.tools.find((tool) => tool.preset_id === q.data?.preset_id);
 
   const renameM = useMutation({
     mutationFn: (name: string) => agents.rename(id as string, name),
@@ -103,6 +119,28 @@ function AgentTerminal() {
     onError: (err) => setActionError(String(err)),
   });
 
+  const restartM = useMutation({
+    mutationFn: () => {
+      const size = termRef.current?.getSize();
+      return agents.restart(id as string, size ? { ...size, create_cwd: true } : undefined);
+    },
+    onSuccess: () => {
+      setActionError(null);
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["agent", id] });
+    },
+    onError: (err) => setActionError(String(err)),
+  });
+
+  const updateToolM = useMutation({
+    mutationFn: () => hosts.installTool(q.data!.host_id, q.data!.preset_id!),
+    onSuccess: () => {
+      setActionError(null);
+      if (q.data) qc.invalidateQueries({ queryKey: ["host-tools", q.data.host_id] });
+    },
+    onError: (err) => setActionError(String(err)),
+  });
+
   if (!id) return null;
 
   return (
@@ -126,6 +164,33 @@ function AgentTerminal() {
           </div>
         </div>
         <div className="flex items-center gap-1">
+          {currentTool?.update_available && (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={updateToolM.isPending}
+              title={
+                currentTool.latest_version
+                  ? `Latest version: ${currentTool.latest_version}`
+                  : "Update available"
+              }
+              onClick={() => updateToolM.mutate()}
+            >
+              <Download className="size-4" />
+              <span className="hidden sm:inline">
+                {updateToolM.isPending
+                  ? "Updating..."
+                  : currentTool.auto_update
+                    ? "Auto updating"
+                    : "Update available"}
+              </span>
+            </Button>
+          )}
+          {!currentTool?.update_available && currentTool?.auto_update && (
+            <span className="hidden whitespace-nowrap rounded border border-border px-2 py-1 text-xs text-muted-foreground sm:inline">
+              Auto update on
+            </span>
+          )}
           <TerminalDisplayControl
             state={displayState}
             onTakeControl={() => termRef.current?.takeControl()}
@@ -148,6 +213,18 @@ function AgentTerminal() {
             }}
           >
             <Pencil className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Restart agent"
+            title="Restart agent"
+            disabled={!q.data || restartM.isPending}
+            onClick={() => {
+              if (confirm("Restart this agent?")) restartM.mutate();
+            }}
+          >
+            <RotateCcw className={`size-4 ${restartM.isPending ? "animate-spin" : ""}`} />
           </Button>
           {q.data && isAgentArchived(q.data) ? (
             <Button

@@ -40,10 +40,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await seed_builtin_presets(session)
         except Exception as e:  # noqa: BLE001
             log.warning("preset seed skipped: %s", e)
+    hosts_routes.start_auto_update_checker()
 
     try:
         yield
     finally:
+        await hosts_routes.stop_auto_update_checker()
         await redis_shutdown()
         await dispose_engine()
 

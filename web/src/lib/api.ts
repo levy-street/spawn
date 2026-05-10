@@ -109,7 +109,13 @@ export const HostToolStatusSchema = z.object({
   installed: z.boolean().default(false),
   path: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
+  latest_version: z.string().nullable().optional(),
+  update_available: z.boolean().nullable().optional(),
   error: z.string().nullable().optional(),
+  auto_update: z.boolean().default(false),
+  last_checked_at: z.string().nullable().optional(),
+  last_auto_update_at: z.string().nullable().optional(),
+  last_auto_update_error: z.string().nullable().optional(),
 });
 export type HostToolStatus = z.infer<typeof HostToolStatusSchema>;
 
@@ -131,6 +137,15 @@ export const HostToolInstallResultSchema = z.object({
   status: HostToolStatusSchema.nullable().optional(),
 });
 export type HostToolInstallResult = z.infer<typeof HostToolInstallResultSchema>;
+
+export const HostToolPolicySchema = z.object({
+  preset_id: z.string(),
+  auto_update: z.boolean().default(false),
+  last_checked_at: z.string().nullable().optional(),
+  last_auto_update_at: z.string().nullable().optional(),
+  last_auto_update_error: z.string().nullable().optional(),
+});
+export type HostToolPolicy = z.infer<typeof HostToolPolicySchema>;
 
 export const AgentSchema = z.object({
   id: z.string().uuid(),
@@ -261,6 +276,12 @@ export const hosts = {
       method: "POST",
       schema: HostToolInstallResultSchema,
     }),
+  updateToolPolicy: (id: string, presetId: string, body: { auto_update?: boolean }) =>
+    api(`/api/hosts/${id}/tools/${presetId}/policy`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: HostToolPolicySchema,
+    }),
 };
 
 export const agents = {
@@ -299,6 +320,12 @@ export const agents = {
     api(`/api/agents/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
+      schema: AgentSchema,
+    }),
+  restart: (id: string, body?: { cols?: number; rows?: number; create_cwd?: boolean }) =>
+    api(`/api/agents/${id}/restart`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
       schema: AgentSchema,
     }),
   rename: (id: string, name: string | null) => agents.update(id, { name }),

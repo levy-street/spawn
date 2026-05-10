@@ -102,6 +102,8 @@ pub enum Inbound {
     },
     #[serde(rename = "agent.create")]
     AgentCreate(AgentCreate),
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentCreate),
     #[serde(rename = "agent.kill")]
     AgentKill {
         agent_id: Uuid,
@@ -197,6 +199,10 @@ pub struct HostToolStatus {
     pub path: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub update_available: Option<bool>,
     #[serde(default)]
     pub error: Option<String>,
 }

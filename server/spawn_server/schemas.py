@@ -120,7 +120,13 @@ class HostToolStatus(HostToolTarget):
     installed: bool = False
     path: str | None = None
     version: str | None = None
+    latest_version: str | None = None
+    update_available: bool | None = None
     error: str | None = None
+    auto_update: bool = False
+    last_checked_at: datetime | None = None
+    last_auto_update_at: datetime | None = None
+    last_auto_update_error: str | None = None
 
 
 class HostToolList(BaseModel):
@@ -138,6 +144,19 @@ class HostToolInstallResult(BaseModel):
     output: str = ""
     error: str | None = None
     status: HostToolStatus | None = None
+
+
+class HostToolPolicyPatch(BaseModel):
+    auto_update: bool | None = None
+
+
+class HostToolPolicyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    preset_id: str
+    auto_update: bool = False
+    last_checked_at: datetime | None = None
+    last_auto_update_at: datetime | None = None
+    last_auto_update_error: str | None = None
 
 
 # ---------- presets ----------
@@ -180,6 +199,12 @@ class AgentCreate(BaseModel):
     cwd: str
     argv: list[str] | None = None
     env: dict[str, str] | None = None
+    cols: int = 120
+    rows: int = 32
+    create_cwd: bool = True
+
+
+class AgentRestart(BaseModel):
     cols: int = 120
     rows: int = 32
     create_cwd: bool = True

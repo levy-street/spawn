@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     String,
@@ -76,6 +77,38 @@ class Preset(Base):
     install: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
     __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_presets_owner_name"),)
+
+
+class HostToolPolicy(Base):
+    __tablename__ = "host_tool_policies"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    host_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    preset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("presets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    auto_update: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_auto_update_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_auto_update_error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "host_id",
+            "preset_id",
+            name="uq_host_tool_policies_owner_host_preset",
+        ),
+    )
 
 
 class Agent(Base):

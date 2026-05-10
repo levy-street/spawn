@@ -11,6 +11,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   Trash2,
   X,
 } from "lucide-react";
@@ -84,6 +85,12 @@ function AgentsView() {
     onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
   });
 
+  const restartM = useMutation({
+    mutationFn: (id: string) => agents.restart(id),
+    onSuccess: invalidateAgents,
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+
   const startRename = (agent: Agent) => {
     setEditingId(agent.id);
     setDraftName(agent.name ?? agentTitle(agent));
@@ -149,7 +156,11 @@ function AgentsView() {
             editing={editingId === a.id}
             draftName={draftName}
             busy={
-              renameM.isPending || archiveM.isPending || unarchiveM.isPending || deleteM.isPending
+              renameM.isPending ||
+              archiveM.isPending ||
+              unarchiveM.isPending ||
+              deleteM.isPending ||
+              restartM.isPending
             }
             onDraftName={setDraftName}
             onStartRename={() => startRename(a)}
@@ -160,6 +171,9 @@ function AgentsView() {
             }}
             onArchive={() => archiveM.mutate(a.id)}
             onUnarchive={() => unarchiveM.mutate(a.id)}
+            onRestart={() => {
+              if (confirm(`Restart ${agentTitle(a)}?`)) restartM.mutate(a.id);
+            }}
             onDelete={() => {
               if (confirm(`Delete ${agentTitle(a)}?`)) deleteM.mutate(a.id);
             }}
@@ -181,6 +195,7 @@ function AgentCard({
   onCancelRename,
   onArchive,
   onUnarchive,
+  onRestart,
   onDelete,
 }: {
   agent: Agent;
@@ -193,6 +208,7 @@ function AgentCard({
   onCancelRename: () => void;
   onArchive: () => void;
   onUnarchive: () => void;
+  onRestart: () => void;
   onDelete: () => void;
 }) {
   const archived = isAgentArchived(agent);
@@ -274,6 +290,17 @@ function AgentCard({
                 <Pencil className="size-4" />
               </Button>
             )}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label={`Restart ${agentTitle(agent)}`}
+              title="Restart agent"
+              disabled={busy}
+              onClick={onRestart}
+            >
+              <RotateCcw className="size-4" />
+            </Button>
             {archived ? (
               <Button
                 variant="ghost"

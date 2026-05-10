@@ -3,7 +3,7 @@
 //! the right PTY and to enumerate `existing_agents` on (re)connect.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -12,11 +12,17 @@ use crate::pty::{AgentHandle, ForwarderControl};
 
 #[derive(Default, Clone)]
 pub struct AgentRegistry {
-    inner: Arc<Mutex<HashMap<Uuid, AgentHandle>>>,
+    inner: Arc<Mutex<HashMap<Uuid, RegistryEntry>>>,
+    generation: Arc<AtomicU64>,
     /// One-shot guard for "have we already scanned tmux for orphaned sessions
     /// from a previous daemon process this lifetime?". The first WS session
     /// of the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
+}
+
+struct RegistryEntry {
+    generation: u64,
+    handle: AgentHandle,
 }
 
 impl AgentRegistry {
@@ -34,13 +40,34 @@ impl AgentRegistry {
         self.inner.lock().expect("agents lock").contains_key(&id)
     }
 
-    pub fn insert(&self, handle: AgentHandle) {
+    pub fn insert(&self, handle: AgentHandle) -> u64 {
         let id = handle.agent_id;
-        self.inner.lock().expect("agents lock").insert(id, handle);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner
+            .lock()
+            .expect("agents lock")
+            .insert(id, RegistryEntry { generation, handle });
+        generation
     }
 
     pub fn remove(&self, id: Uuid) -> Option<AgentHandle> {
-        self.inner.lock().expect("agents lock").remove(&id)
+        self.inner
+            .lock()
+            .expect("agents lock")
+            .remove(&id)
+            .map(|entry| entry.handle)
+    }
+
+    pub fn remove_if_generation(&self, id: Uuid, generation: u64) -> Option<AgentHandle> {
+        let mut guard = self.inner.lock().expect("agents lock");
+        if guard
+            .get(&id)
+            .map(|entry| entry.generation == generation)
+            .unwrap_or(false)
+        {
+            return guard.remove(&id).map(|entry| entry.handle);
+        }
+        None
     }
 
     pub fn ids(&self) -> Vec<Uuid> {
@@ -55,8 +82,8 @@ impl AgentRegistry {
     /// Apply `f` to the handle if it exists. Returns whether it was found.
     pub fn with_handle<F: FnOnce(&AgentHandle)>(&self, id: Uuid, f: F) -> bool {
         let guard = self.inner.lock().expect("agents lock");
-        if let Some(h) = guard.get(&id) {
-            f(h);
+        if let Some(entry) = guard.get(&id) {
+            f(&entry.handle);
             true
         } else {
             false
@@ -70,7 +97,7 @@ impl AgentRegistry {
             .lock()
             .expect("agents lock")
             .iter()
-            .map(|(id, h)| (*id, h.control.clone()))
+            .map(|(id, entry)| (*id, entry.handle.control.clone()))
             .collect()
     }
 }
