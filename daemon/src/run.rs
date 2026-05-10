@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures_util::StreamExt;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -426,10 +426,20 @@ async fn handle_host_tools_check(
     targets: Vec<HostToolTarget>,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let mut tools = Vec::with_capacity(targets.len());
-    for target in targets {
-        tools.push(check_host_tool(target).await);
+    let mut checks = FuturesUnordered::new();
+    let target_count = targets.len();
+    for (index, target) in targets.into_iter().enumerate() {
+        checks.push(async move { (index, check_host_tool(target).await) });
     }
+
+    let mut indexed_tools: Vec<Option<HostToolStatus>> =
+        std::iter::repeat_with(|| None).take(target_count).collect();
+    while let Some((index, tool)) = checks.next().await {
+        if let Some(slot) = indexed_tools.get_mut(index) {
+            *slot = Some(tool);
+        }
+    }
+    let tools = indexed_tools.into_iter().flatten().collect();
 
     let frame = Outbound::HostToolsCheckResult { request_id, tools };
     if let Ok(s) = serde_json::to_string(&frame) {

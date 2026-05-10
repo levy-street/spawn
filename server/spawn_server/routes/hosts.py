@@ -391,6 +391,7 @@ async def list_host_dirs(
     user: User = Depends(auth.current_user),
 ) -> schemas.HostDirList:
     await _get_owned_host(session, host_id, user)
+    await session.commit()
 
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is None:
@@ -418,6 +419,8 @@ async def list_host_tools(
     policies = await _policies_for_presets(session, user=user, host_id=host_id, presets=presets)
     targets_by_preset = {p.id: _preset_to_tool_target(p) for p in presets}
     targets = [target.model_dump() for target in targets_by_preset.values()]
+    await session.commit()
+
     result = await get_broker().request_tool_check(daemon, targets=targets)
     if result is None:
         raise HTTPException(status_code=504, detail="host tool check timed out")
@@ -462,6 +465,7 @@ async def install_host_tool(
 
     if not (target.install or "").strip():
         raise HTTPException(status_code=400, detail="preset has no install command")
+    await session.commit()
 
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is None:

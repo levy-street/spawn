@@ -105,6 +105,15 @@ async def test_host_tool_check_roundtrip(client):
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "host.tools.check"
     assert any(t["preset_id"] == preset_id and t["command"] == "codex" for t in sent["targets"])
+    async with sm() as session:
+        from spawn_server.models import HostToolPolicy
+
+        policy_count = (
+            await session.execute(
+                select(HostToolPolicy).where(HostToolPolicy.host_id == host_id)
+            )
+        ).scalars().all()
+    assert policy_count
 
     await broker.resolve_tool_check(
         sent["request_id"],
