@@ -1,7 +1,16 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, Trash2, X } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  CheckCircle2,
+  Download,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
@@ -9,7 +18,13 @@ import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { ApiError, type Host, hosts } from "@/lib/api";
+import {
+  ApiError,
+  type Host,
+  type HostToolInstallResult,
+  type HostToolStatus,
+  hosts,
+} from "@/lib/api";
 
 export default function HostsPage() {
   return (
@@ -108,87 +123,93 @@ function HostsList() {
         {(q.data ?? []).map((h: Host) => (
           <li key={h.id}>
             <Card>
-              <CardContent className="flex items-center justify-between p-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <span
-                      className={`inline-block size-2 rounded-full ${
-                        h.status === "online" ? "bg-green-500" : "bg-zinc-500"
-                      }`}
-                      aria-hidden
-                    />
-                    {editingId === h.id ? (
-                      <Input
-                        aria-label="Host name"
-                        value={draftName}
-                        onChange={(e) => setDraftName(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") submitRename(h);
-                          if (e.key === "Escape") setEditingId(null);
-                        }}
-                        className="h-8"
-                        disabled={renameM.isPending}
+              <CardContent className="space-y-4 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <span
+                        className={`inline-block size-2 rounded-full ${
+                          h.status === "online" ? "bg-green-500" : "bg-zinc-500"
+                        }`}
+                        aria-hidden
                       />
+                      {editingId === h.id ? (
+                        <Input
+                          aria-label="Host name"
+                          value={draftName}
+                          onChange={(e) => setDraftName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") submitRename(h);
+                            if (e.key === "Escape") setEditingId(null);
+                          }}
+                          className="h-8"
+                          disabled={renameM.isPending}
+                        />
+                      ) : (
+                        <span className="truncate">{h.name}</span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        {h.os ?? "unknown"}/{h.arch ?? "unknown"} · spawnd {h.version ?? "unknown"}
+                      </span>
+                      <span>{h.agent_count} agents</span>
+                      {h.home_dir && <span className="truncate">home {h.home_dir}</span>}
+                      {h.last_seen_at && (
+                        <span>last seen {new Date(h.last_seen_at).toLocaleString()}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {editingId === h.id ? (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Save host name"
+                          title="Save host name"
+                          disabled={renameM.isPending}
+                          onClick={() => submitRename(h)}
+                        >
+                          <Check className="size-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Cancel rename"
+                          title="Cancel rename"
+                          disabled={renameM.isPending}
+                          onClick={() => setEditingId(null)}
+                        >
+                          <X className="size-4" />
+                        </Button>
+                      </>
                     ) : (
-                      <span className="truncate">{h.name}</span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Rename ${h.name}`}
+                        title="Rename host"
+                        onClick={() => startRename(h)}
+                      >
+                        <Pencil className="size-4" />
+                      </Button>
                     )}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {h.os ?? "unknown"}/{h.arch ?? "unknown"} · v{h.version ?? "unknown"} ·{" "}
-                    {h.agent_count} agents
-                    {h.last_seen_at
-                      ? ` · last seen ${new Date(h.last_seen_at).toLocaleString()}`
-                      : ""}
-                  </div>
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  {editingId === h.id ? (
-                    <>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label="Save host name"
-                        title="Save host name"
-                        disabled={renameM.isPending}
-                        onClick={() => submitRename(h)}
-                      >
-                        <Check className="size-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label="Cancel rename"
-                        title="Cancel rename"
-                        disabled={renameM.isPending}
-                        onClick={() => setEditingId(null)}
-                      >
-                        <X className="size-4" />
-                      </Button>
-                    </>
-                  ) : (
                     <Button
                       variant="ghost"
                       size="icon"
-                      aria-label={`Rename ${h.name}`}
-                      title="Rename host"
-                      onClick={() => startRename(h)}
+                      aria-label={`Remove ${h.name}`}
+                      title="Remove host"
+                      disabled={removeM.isPending}
+                      onClick={() => {
+                        if (confirm(`Remove host ${h.name}?`)) removeM.mutate(h.id);
+                      }}
                     >
-                      <Pencil className="size-4" />
+                      <Trash2 className="size-4" />
                     </Button>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Remove ${h.name}`}
-                    title="Remove host"
-                    disabled={removeM.isPending}
-                    onClick={() => {
-                      if (confirm(`Remove host ${h.name}?`)) removeM.mutate(h.id);
-                    }}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
+                  </div>
                 </div>
+                <HostToolsPanel host={h} />
               </CardContent>
             </Card>
           </li>
@@ -196,4 +217,149 @@ function HostsList() {
       </ul>
     </div>
   );
+}
+
+function HostToolsPanel({ host }: { host: Host }) {
+  const qc = useQueryClient();
+  const [lastResult, setLastResult] = useState<HostToolInstallResult | null>(null);
+  const toolsQ = useQuery({
+    queryKey: ["host-tools", host.id],
+    queryFn: () => hosts.tools(host.id),
+    enabled: host.status === "online",
+    staleTime: 30_000,
+  });
+  const installM = useMutation({
+    mutationFn: (tool: HostToolStatus) => hosts.installTool(host.id, tool.preset_id),
+    onSuccess: (result) => {
+      setLastResult(result);
+      qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
+    },
+    onError: (err) => {
+      setLastResult({
+        preset_id: "",
+        preset_name: "Install",
+        agent_kind: "",
+        command: "",
+        success: false,
+        output: "",
+        error: err instanceof ApiError ? err.message : String(err),
+      });
+    },
+  });
+
+  if (host.status !== "online") {
+    return (
+      <div className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+        Daemon offline
+      </div>
+    );
+  }
+
+  const installingId = installM.variables?.preset_id;
+  const tools = toolsQ.data?.tools ?? [];
+
+  return (
+    <div className="rounded-md border border-border">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
+        <div className="text-xs font-medium uppercase text-muted-foreground">Targets</div>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={`Refresh targets for ${host.name}`}
+          title="Refresh targets"
+          onClick={() => toolsQ.refetch()}
+          disabled={toolsQ.isFetching}
+        >
+          <RefreshCw className={`size-4 ${toolsQ.isFetching ? "animate-spin" : ""}`} />
+        </Button>
+      </div>
+
+      {toolsQ.isLoading && (
+        <div className="px-3 py-3 text-sm text-muted-foreground">Checking targets...</div>
+      )}
+      {toolsQ.error && (
+        <div className="px-3 py-3 text-sm text-destructive">
+          {toolsQ.error instanceof ApiError ? toolsQ.error.message : String(toolsQ.error)}
+        </div>
+      )}
+      {!toolsQ.isLoading && !toolsQ.error && tools.length === 0 && (
+        <div className="px-3 py-3 text-sm text-muted-foreground">No preset targets.</div>
+      )}
+
+      {tools.length > 0 && (
+        <div className="divide-y divide-border">
+          {tools.map((tool) => (
+            <div key={tool.preset_id} className="grid gap-3 px-3 py-3 sm:grid-cols-[1fr_auto]">
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <ToolStatusIcon tool={tool} />
+                  <span className="font-medium">{tool.preset_name}</span>
+                  <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{tool.command}</code>
+                  <span className="text-xs text-muted-foreground">{tool.agent_kind}</span>
+                </div>
+                <div className="space-y-0.5 text-xs text-muted-foreground">
+                  {tool.installed ? (
+                    <>
+                      {tool.version && <div className="truncate">{tool.version}</div>}
+                      {tool.path && <div className="truncate">{tool.path}</div>}
+                    </>
+                  ) : (
+                    <div>Missing from PATH</div>
+                  )}
+                  {tool.error && <div className="text-destructive">{tool.error}</div>}
+                  {tool.install && <div className="truncate">install {tool.install}</div>}
+                </div>
+              </div>
+              <div className="flex items-start justify-end">
+                <Button
+                  variant={tool.installed ? "outline" : "secondary"}
+                  size="sm"
+                  disabled={!tool.install || installM.isPending}
+                  onClick={() => {
+                    if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
+                      setLastResult(null);
+                      installM.mutate(tool);
+                    }
+                  }}
+                >
+                  <Download className="size-4" />
+                  {installingId === tool.preset_id
+                    ? "Running..."
+                    : tool.installed
+                      ? "Update"
+                      : "Install"}
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {lastResult && (
+        <div className="border-t border-border px-3 py-3">
+          <div
+            className={`mb-2 text-sm ${lastResult.success ? "text-green-500" : "text-destructive"}`}
+          >
+            {lastResult.preset_name}: {lastResult.success ? "completed" : "failed"}
+            {lastResult.error ? ` · ${lastResult.error}` : ""}
+          </div>
+          {lastResult.output && (
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted p-2 text-xs">
+              {lastResult.output}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolStatusIcon({ tool }: { tool: HostToolStatus }) {
+  if (tool.error) {
+    return <AlertCircle className="size-4 text-amber-500" aria-label="Target warning" />;
+  }
+  if (tool.installed) {
+    return <CheckCircle2 className="size-4 text-green-500" aria-label="Installed" />;
+  }
+  return <X className="size-4 text-muted-foreground" aria-label="Missing" />;
 }

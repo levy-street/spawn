@@ -165,6 +165,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if isinstance(request_id, str):
                         await broker.resolve_dir_list(request_id, obj)
 
+                elif ftype == "host.tools.check_result":
+                    request_id = obj.get("request_id")
+                    if isinstance(request_id, str):
+                        await broker.resolve_tool_check(request_id, obj)
+
+                elif ftype == "host.tools.install_result":
+                    request_id = obj.get("request_id")
+                    if isinstance(request_id, str):
+                        await broker.resolve_tool_install(request_id, obj)
+
                 elif ftype == "host.heartbeat":
                     async with sm() as session:
                         h = await session.get(Host, host.id)

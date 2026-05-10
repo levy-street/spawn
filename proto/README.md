@@ -33,6 +33,8 @@ also accepts `Bearer` for API testing).
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
 | GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
+| GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
+| POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
 | DELETE | `/api/hosts/{id}`     | revoke daemon token + drop the host      |
 
@@ -163,6 +165,33 @@ Agent IDs are big-endian 16-byte UUIDs.
  "entries": [{"name": "foo", "path": "/home/me/projects/foo"}],
  "error": null}
 
+{"type": "host.tools.check_result",
+ "request_id": "uuid",
+ "tools": [{
+   "preset_id": "uuid",
+   "preset_name": "codex",
+   "agent_kind": "codex",
+   "command": "codex",
+   "install": "npm install -g @openai/codex",
+   "installed": true,
+   "path": "/usr/local/bin/codex",
+   "version": "codex 1.2.3",
+   "error": null}]}
+
+{"type": "host.tools.install_result",
+ "request_id": "uuid",
+ "result": {
+   "preset_id": "uuid",
+   "preset_name": "codex",
+   "agent_kind": "codex",
+   "command": "codex",
+   "install": "npm install -g @openai/codex",
+   "success": true,
+   "exit_code": 0,
+   "output": "...",
+   "error": null,
+   "status": null}}
+
 {"type": "error",
  "agent_id": "uuid|null",
  "code": "spawn_failed|invalid_credential|...",
@@ -179,6 +208,24 @@ Agent IDs are big-endian 16-byte UUIDs.
 {"type": "host.fs.list",
  "request_id": "uuid",
  "path": "/home/me/projects"}
+
+{"type": "host.tools.check",
+ "request_id": "uuid",
+ "targets": [{
+   "preset_id": "uuid",
+   "preset_name": "codex",
+   "agent_kind": "codex",
+   "command": "codex",
+   "install": "npm install -g @openai/codex"}]}
+
+{"type": "host.tools.install",
+ "request_id": "uuid",
+ "target": {
+   "preset_id": "uuid",
+   "preset_name": "codex",
+   "agent_kind": "codex",
+   "command": "codex",
+   "install": "npm install -g @openai/codex"}}
 
 {"type": "agent.create",
  "agent_id": "uuid",

@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::StreamExt;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -16,7 +17,10 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, StoredCreds};
 use crate::frames;
-use crate::proto::{AgentCreate, HostDirEntry, Inbound, Outbound};
+use crate::proto::{
+    AgentCreate, HostDirEntry, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound,
+    Outbound,
+};
 use crate::pty::{self, WsOutbound};
 use crate::tmux;
 use crate::upload;
@@ -24,6 +28,9 @@ use crate::ws::{self, WsInbound};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
+const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let stored = creds::load().context("loading stored credentials")?;
@@ -255,6 +262,15 @@ async fn dispatch_loop(
                 Inbound::HostFsList { request_id, path } => {
                     handle_host_fs_list(request_id, path, out_tx).await;
                 }
+                Inbound::HostToolsCheck {
+                    request_id,
+                    targets,
+                } => {
+                    handle_host_tools_check(request_id, targets, out_tx).await;
+                }
+                Inbound::HostToolsInstall { request_id, target } => {
+                    handle_host_tools_install(request_id, target, out_tx).await;
+                }
                 Inbound::AgentCreate(create) => {
                     handle_agent_create(create, registry, out_tx).await;
                 }
@@ -400,6 +416,279 @@ async fn handle_host_fs_list(
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::Json(s)).await;
     }
+}
+
+async fn handle_host_tools_check(
+    request_id: String,
+    targets: Vec<HostToolTarget>,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    let mut tools = Vec::with_capacity(targets.len());
+    for target in targets {
+        tools.push(check_host_tool(target).await);
+    }
+
+    let frame = Outbound::HostToolsCheckResult { request_id, tools };
+    if let Ok(s) = serde_json::to_string(&frame) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
+    }
+}
+
+async fn handle_host_tools_install(
+    request_id: String,
+    target: HostToolTarget,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    let result = install_host_tool(target).await;
+    let frame = Outbound::HostToolsInstallResult { request_id, result };
+    if let Ok(s) = serde_json::to_string(&frame) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
+    }
+}
+
+async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
+    let command = target.command.trim().to_string();
+    if command.is_empty() {
+        return HostToolStatus {
+            preset_id: target.preset_id,
+            preset_name: target.preset_name,
+            agent_kind: target.agent_kind,
+            command,
+            install: target.install,
+            installed: false,
+            path: None,
+            version: None,
+            error: Some("preset argv has no executable".into()),
+        };
+    }
+
+    let path = binary_path(&command).await;
+    let Some(path) = path else {
+        return HostToolStatus {
+            preset_id: target.preset_id,
+            preset_name: target.preset_name,
+            agent_kind: target.agent_kind,
+            command,
+            install: target.install,
+            installed: false,
+            path: None,
+            version: None,
+            error: None,
+        };
+    };
+
+    let (version, error) = match read_tool_version(&command).await {
+        Ok(version) => (version, None),
+        Err(e) => (None, Some(format!("version check failed: {e:#}"))),
+    };
+
+    HostToolStatus {
+        preset_id: target.preset_id,
+        preset_name: target.preset_name,
+        agent_kind: target.agent_kind,
+        command,
+        install: target.install,
+        installed: true,
+        path: Some(path),
+        version,
+        error,
+    }
+}
+
+async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
+    let install = target.install.as_deref().unwrap_or("").trim().to_string();
+    if install.is_empty() {
+        return HostToolInstallResult {
+            preset_id: target.preset_id,
+            preset_name: target.preset_name,
+            agent_kind: target.agent_kind,
+            command: target.command,
+            install: target.install,
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some("preset has no install command".into()),
+            status: None,
+        };
+    }
+
+    let capture = run_shell_capture(&install, TOOL_INSTALL_TIMEOUT, TOOL_OUTPUT_LIMIT).await;
+    let status = Some(check_host_tool(target.clone()).await);
+    HostToolInstallResult {
+        preset_id: target.preset_id,
+        preset_name: target.preset_name,
+        agent_kind: target.agent_kind,
+        command: target.command,
+        install: target.install,
+        success: capture.success,
+        exit_code: capture.exit_code,
+        output: capture.output,
+        error: capture.error,
+        status,
+    }
+}
+
+async fn binary_path(bin: &str) -> Option<String> {
+    let output = Command::new("which")
+        .arg(bin)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+async fn read_tool_version(command: &str) -> Result<Option<String>> {
+    for args in [
+        &["--version"][..],
+        &["version"][..],
+        &["-V"][..],
+        &["-v"][..],
+    ] {
+        let capture = run_program_capture(command, args, TOOL_VERSION_TIMEOUT, 4096).await;
+        if capture.success {
+            if let Some(version) = first_meaningful_line(&capture.output) {
+                return Ok(Some(version));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct CommandCapture {
+    success: bool,
+    exit_code: Option<i32>,
+    output: String,
+    error: Option<String>,
+}
+
+async fn run_program_capture(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+) -> CommandCapture {
+    let child = match Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return CommandCapture {
+                success: false,
+                exit_code: None,
+                output: String::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => CommandCapture {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            output: combined_output(&output.stdout, &output.stderr, output_limit),
+            error: None,
+        },
+        Ok(Err(e)) => CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some(e.to_string()),
+        },
+        Err(_) => CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some(format!("command timed out after {}s", timeout.as_secs())),
+        },
+    }
+}
+
+async fn run_shell_capture(command: &str, timeout: Duration, output_limit: usize) -> CommandCapture {
+    let child = match Command::new("bash")
+        .arg("-c")
+        .arg(format!("{command} 2>&1"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return CommandCapture {
+                success: false,
+                exit_code: None,
+                output: String::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => CommandCapture {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            output: combined_output(&output.stdout, &output.stderr, output_limit),
+            error: None,
+        },
+        Ok(Err(e)) => CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some(e.to_string()),
+        },
+        Err(_) => CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some(format!("install command timed out after {}s", timeout.as_secs())),
+        },
+    }
+}
+
+fn combined_output(stdout: &[u8], stderr: &[u8], limit: usize) -> String {
+    let mut bytes = Vec::with_capacity(stdout.len() + stderr.len() + 1);
+    bytes.extend_from_slice(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() {
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(stderr);
+
+    let (truncated, slice) = if bytes.len() > limit {
+        (true, &bytes[bytes.len() - limit..])
+    } else {
+        (false, bytes.as_slice())
+    };
+    let text = String::from_utf8_lossy(slice).trim().to_string();
+    if truncated {
+        format!("[spawn] output truncated to last {limit} bytes\n{text}")
+    } else {
+        text
+    }
+}
+
+fn first_meaningful_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(240).collect())
 }
 
 async fn ensure_agent_cwd(

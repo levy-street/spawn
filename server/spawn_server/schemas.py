@@ -108,6 +108,38 @@ class HostDirList(BaseModel):
     error: str | None = None
 
 
+class HostToolTarget(BaseModel):
+    preset_id: str
+    preset_name: str
+    agent_kind: str
+    command: str
+    install: str | None = None
+
+
+class HostToolStatus(HostToolTarget):
+    installed: bool = False
+    path: str | None = None
+    version: str | None = None
+    error: str | None = None
+
+
+class HostToolList(BaseModel):
+    tools: list[HostToolStatus] = Field(default_factory=list)
+
+
+class HostToolInstallResult(BaseModel):
+    preset_id: str
+    preset_name: str
+    agent_kind: str
+    command: str
+    install: str | None = None
+    success: bool
+    exit_code: int | None = None
+    output: str = ""
+    error: str | None = None
+    status: HostToolStatus | None = None
+
+
 # ---------- presets ----------
 
 

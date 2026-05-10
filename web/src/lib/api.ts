@@ -100,6 +100,38 @@ export const HostDirListSchema = z.object({
 });
 export type HostDirList = z.infer<typeof HostDirListSchema>;
 
+export const HostToolStatusSchema = z.object({
+  preset_id: z.string(),
+  preset_name: z.string(),
+  agent_kind: z.string(),
+  command: z.string(),
+  install: z.string().nullable().optional(),
+  installed: z.boolean().default(false),
+  path: z.string().nullable().optional(),
+  version: z.string().nullable().optional(),
+  error: z.string().nullable().optional(),
+});
+export type HostToolStatus = z.infer<typeof HostToolStatusSchema>;
+
+export const HostToolListSchema = z.object({
+  tools: z.array(HostToolStatusSchema).default([]),
+});
+export type HostToolList = z.infer<typeof HostToolListSchema>;
+
+export const HostToolInstallResultSchema = z.object({
+  preset_id: z.string(),
+  preset_name: z.string(),
+  agent_kind: z.string(),
+  command: z.string(),
+  install: z.string().nullable().optional(),
+  success: z.boolean(),
+  exit_code: z.number().int().nullable().optional(),
+  output: z.string().default(""),
+  error: z.string().nullable().optional(),
+  status: HostToolStatusSchema.nullable().optional(),
+});
+export type HostToolInstallResult = z.infer<typeof HostToolInstallResultSchema>;
+
 export const AgentSchema = z.object({
   id: z.string().uuid(),
   name: z.string().nullable().default(null),
@@ -219,6 +251,16 @@ export const hosts = {
       schema: HostDirListSchema,
     });
   },
+  tools: (id: string) =>
+    api(`/api/hosts/${id}/tools`, {
+      method: "GET",
+      schema: HostToolListSchema,
+    }),
+  installTool: (id: string, presetId: string) =>
+    api(`/api/hosts/${id}/tools/${presetId}/install`, {
+      method: "POST",
+      schema: HostToolInstallResultSchema,
+    }),
 };
 
 export const agents = {

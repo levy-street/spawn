@@ -54,6 +54,16 @@ pub enum Outbound {
         #[serde(default)]
         error: Option<String>,
     },
+    #[serde(rename = "host.tools.check_result")]
+    HostToolsCheckResult {
+        request_id: String,
+        tools: Vec<HostToolStatus>,
+    },
+    #[serde(rename = "host.tools.install_result")]
+    HostToolsInstallResult {
+        request_id: String,
+        result: HostToolInstallResult,
+    },
     Error {
         agent_id: Option<Uuid>,
         code: String,
@@ -78,6 +88,17 @@ pub enum Inbound {
         request_id: String,
         #[serde(default)]
         path: Option<String>,
+    },
+    #[serde(rename = "host.tools.check")]
+    HostToolsCheck {
+        request_id: String,
+        #[serde(default)]
+        targets: Vec<HostToolTarget>,
+    },
+    #[serde(rename = "host.tools.install")]
+    HostToolsInstall {
+        request_id: String,
+        target: HostToolTarget,
     },
     #[serde(rename = "agent.create")]
     AgentCreate(AgentCreate),
@@ -151,6 +172,51 @@ pub struct AgentCreate {
 pub struct HostDirEntry {
     pub name: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostToolTarget {
+    pub preset_id: String,
+    pub preset_name: String,
+    pub agent_kind: String,
+    pub command: String,
+    #[serde(default)]
+    pub install: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostToolStatus {
+    pub preset_id: String,
+    pub preset_name: String,
+    pub agent_kind: String,
+    pub command: String,
+    #[serde(default)]
+    pub install: Option<String>,
+    pub installed: bool,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostToolInstallResult {
+    pub preset_id: String,
+    pub preset_name: String,
+    pub agent_kind: String,
+    pub command: String,
+    #[serde(default)]
+    pub install: Option<String>,
+    pub success: bool,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub output: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub status: Option<HostToolStatus>,
 }
 
 // ---------------------------------------------------------------------------
