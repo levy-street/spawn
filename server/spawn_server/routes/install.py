@@ -296,8 +296,13 @@ INSTALL_SCRIPT = dedent(
       say "downloading prebuilt spawnd for $TARGET"
       if curl -fsSL "$URL" -o "$TMP_BIN"; then
         chmod 755 "$TMP_BIN"
-        mv "$TMP_BIN" "$BIN"
-        return 0
+        if "$TMP_BIN" --version >/dev/null 2>&1; then
+          mv "$TMP_BIN" "$BIN"
+          return 0
+        fi
+        rm -f "$TMP_BIN"
+        say "prebuilt daemon is not compatible with this host"
+        return 1
       fi
       rm -f "$TMP_BIN"
       return 1
@@ -350,6 +355,7 @@ INSTALL_SCRIPT = dedent(
       ensure_rust
       install_spawnd
     fi
+    "$BIN" --version >/dev/null 2>&1 || die "installed spawnd cannot run on this host"
 
     say "installed $("$BIN" --version 2>/dev/null || printf spawnd) at $BIN"
 
