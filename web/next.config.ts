@@ -31,6 +31,7 @@ const nextConfig: NextConfig = {
       { source: "/api/:path*", destination: `${API_PROXY_TARGET}/api/:path*` },
       { source: "/ws/:path*", destination: `${API_PROXY_TARGET}/ws/:path*` },
       { source: "/healthz", destination: `${API_PROXY_TARGET}/healthz` },
+      { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
     ];
   },
 };

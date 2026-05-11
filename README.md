@@ -38,6 +38,25 @@ System prerequisites: `docker`, Python 3.13 (`uv` installs interpreters on
 demand), Rust stable (via `rustup`), Bun 1.x, and **`tmux`** on every host
 that will run `spawnd`.
 
+## Daemon install
+
+From any host that should run agents, use the hosted installer from your spawn
+web URL:
+
+```bash
+curl -fsSL https://spawn.example.com/install.sh | sh
+```
+
+The script installs prerequisites where it can, downloads a prebuilt daemon
+when available, falls back to building from source, runs the device-code login
+flow, then starts a user `systemd` service when available with a background
+fallback. The hosted script defaults to `SPAWN_PUBLIC_URL`; override it
+explicitly when needed:
+
+```bash
+curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spawn.example.com
+```
+
 ```bash
 # 0. One-time: copy env template
 cp .env.example server/.env
