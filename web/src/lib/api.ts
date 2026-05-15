@@ -167,6 +167,7 @@ export const AgentSchema = z.object({
     .default("unknown"),
   activity_label: z.string().default("Unknown"),
   exit_code: z.number().int().nullable(),
+  pinned_at: z.string().nullable().default(null),
   archived_at: z.string().nullable().default(null),
 });
 export type Agent = z.infer<typeof AgentSchema>;
@@ -316,7 +317,7 @@ export const agents = {
       body: JSON.stringify(body),
       schema: AgentSchema,
     }),
-  update: (id: string, body: { name?: string | null; archived?: boolean }) =>
+  update: (id: string, body: { name?: string | null; archived?: boolean; pinned?: boolean }) =>
     api(`/api/agents/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -329,6 +330,8 @@ export const agents = {
       schema: AgentSchema,
     }),
   rename: (id: string, name: string | null) => agents.update(id, { name }),
+  pin: (id: string) => agents.update(id, { pinned: true }),
+  unpin: (id: string) => agents.update(id, { pinned: false }),
   archive: (id: string) => agents.update(id, { archived: true }),
   unarchive: (id: string) => agents.update(id, { archived: false }),
   remove: (id: string) => api<void>(`/api/agents/${id}`, { method: "DELETE" }),

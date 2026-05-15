@@ -61,6 +61,15 @@ async def test_agent_rename_archive_and_delete(client):
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "ui work"
     assert r.json()["archived_at"] is None
+    assert r.json()["pinned_at"] is None
+
+    r = await client.patch(f"/api/agents/{agent_id}", json={"pinned": True}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["pinned_at"] is not None
+
+    r = await client.patch(f"/api/agents/{agent_id}", json={"pinned": False}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["pinned_at"] is None
 
     r = await client.patch(f"/api/agents/{agent_id}", json={"archived": True}, headers=auth)
     assert r.status_code == 200, r.text

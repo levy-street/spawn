@@ -61,7 +61,7 @@ Host shape:
 | GET    | `/api/agents`        | list current user's unarchived agents (optional `?host_id=...`, `?include_archived=true`) |
 | GET    | `/api/agents/{id}`   |                                                                                   |
 | POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, create_cwd?}` — at least one of preset_id or argv |
-| PATCH  | `/api/agents/{id}`   | rename/archive: `{name?, archived?}`                                              |
+| PATCH  | `/api/agents/{id}`   | rename/pin/archive: `{name?, pinned?, archived?}`                                 |
 | POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
 | DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
 
@@ -80,6 +80,7 @@ Agent shape:
   "started_at": "...",
   "exited_at": "...|null",
   "exit_code": "int|null",
+  "pinned_at": "...|null",
   "archived_at": "...|null"
 }
 ```

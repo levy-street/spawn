@@ -186,6 +186,8 @@ async def patch_agent(
     if "name" in body.model_fields_set:
         next_name = body.name.strip() if body.name is not None else ""
         a.name = next_name or None
+    if body.pinned is not None:
+        a.pinned_at = _utcnow() if body.pinned else None
     if body.archived is not None:
         a.archived_at = _utcnow() if body.archived else None
 

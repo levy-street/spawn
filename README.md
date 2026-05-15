@@ -87,6 +87,17 @@ End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
 approve the device code on `/device`, see the host appear on `/hosts`, then
 spawn a `shell` preset agent and watch xterm.js attach to it.
 
+## Agent sidebar
+
+The desktop sidebar keeps active workflows reachable while leaving terminal
+space clear:
+
+- Agents are grouped with pinned agents first, then sorted by most recent user
+  input so noisy long-running agents do not constantly jump to the top.
+- Hover an agent row, or long-press on touch, to show quick actions just over
+  the content pane: rename, pin/unpin, restart, archive, and delete.
+- A compact divider separates pinned agents from the rest of the recent list.
+
 ## Known limits in this scaffold
 
 - **Single uvicorn worker only.** Cross-worker live PTY fan-out via Redis

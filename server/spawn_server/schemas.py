@@ -213,6 +213,7 @@ class AgentRestart(BaseModel):
 class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     archived: bool | None = None
+    pinned: bool | None = None
 
 
 class AgentOut(BaseModel):
@@ -234,4 +235,5 @@ class AgentOut(BaseModel):
     activity_state: str = "unknown"
     activity_label: str = "Unknown"
     exit_code: int | None = None
+    pinned_at: datetime | None = None
     archived_at: datetime | None = None
