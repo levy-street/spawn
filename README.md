@@ -87,6 +87,38 @@ End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
 approve the device code on `/device`, see the host appear on `/hosts`, then
 spawn a `shell` preset agent and watch xterm.js attach to it.
 
+## Production deploy
+
+Production infrastructure is bootstrapped from the Levy Street Ansible repo:
+the `spawnd-prod` host is configured with nginx + certbot, TLS for
+`spawnd.dev`, and a reverse proxy to the Next.js web service on
+`127.0.0.1:3001`. Keep the FastAPI server private on `127.0.0.1:8001`; the web
+service proxies API and websocket traffic to it.
+
+After the production host has a checkout, runtime dependencies, and systemd
+services such as `spawn-server` and `spawn-web`, deploy the current branch
+with:
+
+```bash
+SPAWN_DEPLOY_HOST=spawnd-prod \
+SPAWN_DEPLOY_PATH=/opt/spawn \
+scripts/deploy-prod.sh
+```
+
+The host can be any alias from the caller's `~/.ssh/config`. The deploy script
+fetches the same branch from `origin` on the production machine, rebuilds the
+server/web/hosted daemon binary, runs database migrations, and restarts the
+configured services. It refuses to run when the local checkout has uncommitted
+changes or commits that have not been pushed.
+
+Useful overrides:
+
+```bash
+SPAWN_DEPLOY_SERVICES="spawn-server spawn-web" scripts/deploy-prod.sh spawnd-prod
+SPAWN_DEPLOY_BUILD=0 scripts/deploy-prod.sh spawnd-prod
+SPAWN_DEPLOY_SUDO="" scripts/deploy-prod.sh spawnd-prod
+```
+
 ## Agent sidebar
 
 The desktop sidebar keeps active workflows reachable while leaving terminal
