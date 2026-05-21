@@ -89,6 +89,8 @@ env_prefix="$(
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
 set -euo pipefail
 
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+
 die() {
   printf 'remote deploy: %s\n' "$*" >&2
   exit 1
