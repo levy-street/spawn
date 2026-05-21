@@ -235,6 +235,7 @@ mod tests {
                 "bytes_b64":"cG5n",
                 "paste_prefix":"@",
                 "paste":false,
+                "destination":"cwd",
                 "client_id":"upload-1"
             }"#,
         )
@@ -247,6 +248,7 @@ mod tests {
                 bytes_b64,
                 paste_prefix,
                 paste,
+                destination,
                 client_id,
                 ..
             } => {
@@ -256,6 +258,7 @@ mod tests {
                 assert_eq!(bytes_b64, "cG5n");
                 assert_eq!(paste_prefix.as_deref(), Some("@"));
                 assert_eq!(paste, Some(false));
+                assert_eq!(destination.as_deref(), Some("cwd"));
                 assert_eq!(client_id.as_deref(), Some("upload-1"));
             }
             _ => panic!("expected AgentUpload"),

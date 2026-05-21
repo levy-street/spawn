@@ -130,6 +130,14 @@ space clear:
   the content pane: rename, pin/unpin, restart, archive, and delete.
 - A compact divider separates pinned agents from the rest of the recent list.
 
+## Agent file uploads
+
+The agent terminal pane accepts local files through drag and drop or the upload
+button. Files are streamed through the browser websocket to the daemon for that
+agent's host and saved directly into the agent working directory using
+sanitized, non-overwriting filenames. Image paste/attachment behavior remains
+separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
+
 ## Known limits in this scaffold
 
 - **Single uvicorn worker only.** Cross-worker live PTY fan-out via Redis

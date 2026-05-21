@@ -8,13 +8,24 @@ use uuid::Uuid;
 
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
-pub async fn save_image_upload(
+#[cfg(test)]
+async fn save_image_upload(
     cwd: &str,
     name: &str,
     mime_type: &str,
     bytes_b64: &str,
 ) -> Result<PathBuf> {
-    if !mime_type.starts_with("image/") {
+    save_upload(cwd, name, mime_type, bytes_b64, false).await
+}
+
+pub async fn save_upload(
+    cwd: &str,
+    name: &str,
+    mime_type: &str,
+    bytes_b64: &str,
+    save_to_cwd: bool,
+) -> Result<PathBuf> {
+    if !save_to_cwd && !mime_type.starts_with("image/") {
         anyhow::bail!("upload is not an image");
     }
     if cwd.trim().is_empty() {
@@ -32,16 +43,23 @@ pub async fn save_image_upload(
     }
 
     let cwd_path = Path::new(cwd);
-    let dir = cwd_path.join(".spawn").join("attachments");
+    let dir = if save_to_cwd {
+        cwd_path.to_path_buf()
+    } else {
+        cwd_path.join(".spawn").join("attachments")
+    };
     fs::create_dir_all(&dir)
         .await
-        .with_context(|| format!("creating attachment directory {}", dir.display()))?;
+        .with_context(|| format!("creating upload directory {}", dir.display()))?;
 
-    let file_name = unique_file_name(name, mime_type);
-    let path = dir.join(file_name);
+    let path = if save_to_cwd {
+        available_upload_path(&dir, &sanitized_file_name(name, mime_type, "file", false)).await?
+    } else {
+        dir.join(unique_file_name(name, mime_type))
+    };
     fs::write(&path, bytes)
         .await
-        .with_context(|| format!("writing attachment {}", path.display()))?;
+        .with_context(|| format!("writing upload {}", path.display()))?;
     Ok(path)
 }
 
@@ -70,15 +88,20 @@ fn unique_file_name(name: &str, mime_type: &str) -> String {
     format!(
         "{stamp}-{}-{}",
         &unique[..8],
-        sanitized_file_name(name, mime_type)
+        sanitized_file_name(name, mime_type, "image", true)
     )
 }
 
-fn sanitized_file_name(name: &str, mime_type: &str) -> String {
+fn sanitized_file_name(
+    name: &str,
+    mime_type: &str,
+    default_name: &str,
+    add_image_extension: bool,
+) -> String {
     let base = Path::new(name)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("image");
+        .unwrap_or(default_name);
     let mut safe = String::with_capacity(base.len());
     for ch in base.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
@@ -93,15 +116,48 @@ fn sanitized_file_name(name: &str, mime_type: &str) -> String {
 
     let safe = safe.trim_matches(['.', '_', '-']).to_string();
     let mut safe = if safe.is_empty() {
-        "image".to_string()
+        default_name.to_string()
     } else {
         safe
     };
-    if Path::new(&safe).extension().is_none() {
+    if add_image_extension && Path::new(&safe).extension().is_none() {
         safe.push('.');
         safe.push_str(extension_for_mime(mime_type));
     }
     safe
+}
+
+async fn available_upload_path(dir: &Path, file_name: &str) -> Result<PathBuf> {
+    let path = dir.join(file_name);
+    if !fs::try_exists(&path)
+        .await
+        .with_context(|| format!("checking upload path {}", path.display()))?
+    {
+        return Ok(path);
+    }
+
+    let file_path = Path::new(file_name);
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("file");
+    let extension = file_path.extension().and_then(|s| s.to_str());
+    for n in 2..10_000 {
+        let candidate_name = match extension {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{n}.{ext}"),
+            _ => format!("{stem}-{n}"),
+        };
+        let candidate = dir.join(candidate_name);
+        if !fs::try_exists(&candidate)
+            .await
+            .with_context(|| format!("checking upload path {}", candidate.display()))?
+        {
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!("could not choose a free upload filename for {}", file_name)
 }
 
 fn extension_for_mime(mime_type: &str) -> &'static str {
@@ -136,11 +192,14 @@ mod tests {
 
     #[test]
     fn sanitizes_upload_names() {
-        let name = sanitized_file_name("../Screen Shot 1.png", "image/png");
+        let name = sanitized_file_name("../Screen Shot 1.png", "image/png", "image", true);
         assert_eq!(name, "Screen_Shot_1.png");
 
-        let name = sanitized_file_name("", "image/jpeg");
+        let name = sanitized_file_name("", "image/jpeg", "image", true);
         assert_eq!(name, "image.jpg");
+
+        let name = sanitized_file_name("../notes 1.txt", "text/plain", "file", false);
+        assert_eq!(name, "notes_1.txt");
     }
 
     #[test]
@@ -172,6 +231,26 @@ mod tests {
             .unwrap();
         assert!(path.starts_with(tmp.path().join(".spawn").join("attachments")));
         assert_eq!(std::fs::read(path).unwrap(), b"png-ish");
+    }
+
+    #[tokio::test]
+    async fn saves_cwd_upload_without_overwriting_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"old").unwrap();
+        let data = STANDARD.encode(b"new");
+        let path = save_upload(
+            tmp.path().to_str().unwrap(),
+            "../note.txt",
+            "text/plain",
+            &data,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(path, tmp.path().join("note-2.txt"));
+        assert_eq!(std::fs::read(tmp.path().join("note.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(path).unwrap(), b"new");
     }
 
     #[tokio::test]

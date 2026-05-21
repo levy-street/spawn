@@ -145,6 +145,8 @@ pub enum Inbound {
         #[serde(default)]
         paste: Option<bool>,
         #[serde(default)]
+        destination: Option<String>,
+        #[serde(default)]
         client_id: Option<String>,
     },
 }

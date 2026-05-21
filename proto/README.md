@@ -272,13 +272,16 @@ Agent IDs are big-endian 16-byte UUIDs.
  "bytes_b64": "...",
  "paste_prefix": "@",
  "paste": false,
+ "destination": "cwd",
  "client_id": "browser-upload-id"}
 ```
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
 provider credentials — each agent CLI authenticates itself on the host.
-Image uploads are saved by the daemon under `<cwd>/.spawn/attachments/`.
+Image uploads are saved by the daemon under `<cwd>/.spawn/attachments/` by
+default. When `destination` is `"cwd"`, the upload may be any file type and is
+saved directly under `<cwd>` using a sanitized, non-overwriting filename.
 When `paste` is true or omitted, the saved path is inserted into the agent PTY
 using `paste_prefix`; when `paste` is false, the daemon only reports the saved
 path back to the browser. `client_id` is an optional browser correlation id.
@@ -300,6 +303,7 @@ distinguish healthy idle connections from dead sockets.
 {"type": "resize", "cols": 120, "rows": 32}
 {"type": "scroll", "lines": -8}
 {"type": "upload", "name": "screenshot.png", "mime_type": "image/png", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
+{"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 ```
 Plus raw binary stdin bytes.
 
@@ -310,6 +314,7 @@ Plus raw binary stdin bytes.
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
+{"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
 {"type": "upload.error", "message": "..."}
 ```
 Plus raw binary stdout bytes.

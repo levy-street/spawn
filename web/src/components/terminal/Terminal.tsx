@@ -5,8 +5,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { Upload } from "lucide-react";
 import Image from "next/image";
 import {
+  type ChangeEvent,
   type ClipboardEvent,
   type CSSProperties,
   type DragEvent,
@@ -121,6 +123,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const terminalViewportRef = useRef<HTMLDivElement>(null);
   const terminalSurfaceRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
@@ -465,11 +468,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       showUploadStatus(message);
     },
     onUploadSaved: (path, clientId) => {
+      const targetId = clientId
+        ? pendingAttachmentsRef.current.find((attachment) => attachment.id === clientId)?.id
+        : pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
+      if (!targetId) {
+        showUploadStatus(`Uploaded ${compactPath(path)}`);
+        termRef.current?.focus();
+        return;
+      }
+
       if (imagePasteMode === "bracketed-path") {
-        const targetId =
-          clientId ??
-          pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
-        if (targetId) removePendingAttachment(targetId);
+        removePendingAttachment(targetId);
         socketRef.current.sendBinary(bracketedPaste(shellSingleQuote(path)));
         showUploadStatus("Image pasted");
         termRef.current?.focus();
@@ -478,9 +487,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       const promptText = `@${compactPath(path)}`;
       updatePendingAttachments((attachments) => {
-        const targetId =
-          clientId ?? attachments.find((attachment) => attachment.status === "uploading")?.id;
-        if (!targetId) return attachments;
         return attachments.map((attachment) =>
           attachment.id === targetId ? { ...attachment, promptText, status: "ready" } : attachment,
         );
@@ -1473,6 +1479,46 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [showUploadStatus, updatePendingAttachments],
   );
 
+  const uploadFilesToCwd = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      showUploadStatus(
+        files.length === 1 ? "Uploading file..." : `Uploading ${files.length} files...`,
+      );
+      let sent = 0;
+      for (const file of files) {
+        if (file.size > MAX_UPLOAD_BYTES) {
+          showUploadStatus(`${file.name || "File"} is larger than 20 MB.`);
+          continue;
+        }
+        try {
+          const bytes_b64 = await fileToBase64(file);
+          const ok = socketRef.current.sendJson({
+            type: "upload",
+            client_id: makeClientId(),
+            destination: "cwd",
+            name: file.name || "file",
+            mime_type: mimeTypeForUpload(file),
+            bytes_b64,
+            paste: false,
+          });
+          if (!ok) {
+            showUploadStatus("Terminal is not connected.");
+            return;
+          }
+          sent += 1;
+        } catch {
+          showUploadStatus(`${file.name || "File"} could not be read.`);
+        }
+      }
+      if (sent > 0) {
+        showUploadStatus(sent === 1 ? "Saving file..." : `Saving ${sent} files...`);
+        termRef.current?.focus();
+      }
+    },
+    [showUploadStatus],
+  );
+
   const pasteFromClipboard = useCallback(async () => {
     const clipboard = navigator.clipboard;
     if (!clipboard) {
@@ -1648,7 +1694,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   );
 
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasImageTransfer(event.dataTransfer)) return;
+    if (!hasFileTransfer(event.dataTransfer)) return;
     event.preventDefault();
     dragDepthRef.current += 1;
     setDropActive(true);
@@ -1662,22 +1708,28 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   };
 
   const onDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasImageTransfer(event.dataTransfer)) return;
+    if (!hasFileTransfer(event.dataTransfer)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
   };
 
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
-    const files = imageFilesFromDataTransfer(event.dataTransfer);
+    const files = filesFromDataTransfer(event.dataTransfer);
     if (files.length === 0) return;
     event.preventDefault();
     dragDepthRef.current = 0;
     setDropActive(false);
-    void uploadImages(files);
+    void uploadFilesToCwd(files);
+  };
+
+  const onFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = "";
+    void uploadFilesToCwd(files);
   };
 
   const onDragLeave = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasImageTransfer(event.dataTransfer)) return;
+    if (!hasFileTransfer(event.dataTransfer)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDropActive(false);
   };
@@ -1805,10 +1857,26 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       {dropActive && (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center border-2 border-dashed border-primary/70 bg-background/35 backdrop-blur-[1px]">
           <div className="rounded-md border border-border bg-card/95 px-3 py-2 text-sm text-foreground shadow-lg">
-            Drop image
+            Drop files
           </div>
         </div>
       )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={onFileInputChange}
+      />
+      <button
+        type="button"
+        aria-label="Upload files"
+        title="Upload files"
+        className="pointer-events-auto absolute right-2 top-8 z-20 grid size-8 place-items-center rounded-md border border-border bg-card/90 text-muted-foreground shadow-sm backdrop-blur hover:bg-accent hover:text-accent-foreground"
+        onClick={() => fileInputRef.current?.click()}
+      >
+        <Upload className="size-4" aria-hidden="true" />
+      </button>
       <div
         className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-muted-foreground"
         aria-live="polite"
@@ -2134,7 +2202,7 @@ function isCsiParameter(char: string | undefined): boolean {
 }
 
 function imageFilesFromDataTransfer(data: DataTransfer): File[] {
-  const files = Array.from(data.files).filter(isImageFile);
+  const files = filesFromDataTransfer(data).filter(isImageFile);
   if (files.length > 0) return files;
 
   return Array.from(data.items)
@@ -2143,10 +2211,20 @@ function imageFilesFromDataTransfer(data: DataTransfer): File[] {
     .filter((file): file is File => file !== null && isImageFile(file));
 }
 
-function hasImageTransfer(data: DataTransfer): boolean {
+function filesFromDataTransfer(data: DataTransfer): File[] {
+  const files = Array.from(data.files).filter((file) => file.size > 0 || file.name !== "");
+  if (files.length > 0) return files;
+
+  return Array.from(data.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+}
+
+function hasFileTransfer(data: DataTransfer): boolean {
   return (
-    Array.from(data.files).some(isImageFile) ||
-    Array.from(data.items).some((item) => item.kind === "file" && isImageMimeOrName(item.type))
+    Array.from(data.files).some((file) => file.size > 0 || file.name !== "") ||
+    Array.from(data.items).some((item) => item.kind === "file")
   );
 }
 
@@ -2172,6 +2250,10 @@ function mimeTypeForFile(file: File): string {
   if (name.endsWith(".tif") || name.endsWith(".tiff")) return "image/tiff";
   if (name.endsWith(".svg")) return "image/svg+xml";
   return "image/png";
+}
+
+function mimeTypeForUpload(file: File): string {
+  return file.type || "application/octet-stream";
 }
 
 function defaultImageName(file: File): string {

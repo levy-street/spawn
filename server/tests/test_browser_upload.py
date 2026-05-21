@@ -8,6 +8,7 @@ import pytest
 
 from spawn_server.ws.browser import (
     UploadValidationError,
+    _decode_upload,
     _decode_image_upload,
     _prefer_transcript_history,
     _upload_paste_prefix,
@@ -26,6 +27,22 @@ def test_decode_image_upload_canonicalizes_payload():
     assert name == "screenshot.png"
     assert mime_type == "image/png"
     assert base64.b64decode(bytes_b64) == b"png-ish"
+
+
+def test_decode_upload_allows_generic_files_to_cwd():
+    name, mime_type, bytes_b64, destination = _decode_upload(
+        {
+            "destination": "cwd",
+            "name": " notes.txt ",
+            "mime_type": "text/plain",
+            "bytes_b64": base64.b64encode(b"hello").decode("ascii"),
+        }
+    )
+
+    assert name == "notes.txt"
+    assert mime_type == "text/plain"
+    assert base64.b64decode(bytes_b64) == b"hello"
+    assert destination == "cwd"
 
 
 @pytest.mark.parametrize(

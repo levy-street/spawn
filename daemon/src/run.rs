@@ -315,6 +315,7 @@ async fn dispatch_loop(
                     bytes_b64,
                     paste_prefix,
                     paste,
+                    destination,
                     client_id,
                 } => {
                     handle_agent_upload(
@@ -325,6 +326,7 @@ async fn dispatch_loop(
                         bytes_b64,
                         paste_prefix,
                         paste.unwrap_or(true),
+                        destination,
                         client_id,
                         registry,
                         out_tx,
@@ -1250,6 +1252,7 @@ async fn handle_agent_upload(
     bytes_b64: String,
     paste_prefix: Option<String>,
     paste: bool,
+    destination: Option<String>,
     client_id: Option<String>,
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
@@ -1259,7 +1262,8 @@ async fn handle_agent_upload(
         return;
     }
 
-    match upload::save_image_upload(&cwd, &name, &mime_type, &bytes_b64).await {
+    let save_to_cwd = destination.as_deref() == Some("cwd");
+    match upload::save_upload(&cwd, &name, &mime_type, &bytes_b64, save_to_cwd).await {
         Ok(path) => {
             if paste {
                 let paste_text = upload::paste_text_for_path(&cwd, &path, paste_prefix.as_deref());
@@ -1282,10 +1286,10 @@ async fn handle_agent_upload(
             if let Ok(s) = serde_json::to_string(&uploaded) {
                 let _ = out_tx.send(WsOutbound::Json(s)).await;
             }
-            tracing::info!(%agent_id, path = %path.display(), "image upload saved");
+            tracing::info!(%agent_id, path = %path.display(), "upload saved");
         }
         Err(e) => {
-            tracing::warn!(%agent_id, error = %e, "image upload failed");
+            tracing::warn!(%agent_id, error = %e, "upload failed");
             send_error(out_tx, Some(agent_id), "upload_failed", &e).await;
         }
     }

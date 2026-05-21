@@ -30,6 +30,7 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_UPLOAD_NAME_LENGTH = 255
 MAX_UPLOAD_MIME_LENGTH = 128
 MAX_UPLOAD_CLIENT_ID_LENGTH = 128
+UPLOAD_DESTINATION_CWD = "cwd"
 TERMINAL_UI_AGENT_BINS = {"codex", "claude", "claude-code", "opencode", "aider"}
 
 
@@ -50,26 +51,36 @@ async def _touch_agent_input(agent_id: str) -> None:
         await session.commit()
 
 
-def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
-    name = str(obj.get("name") or "image").strip()[:MAX_UPLOAD_NAME_LENGTH] or "image"
+def _decode_upload(obj: dict) -> tuple[str, str, str, str | None]:
+    destination = obj.get("destination")
+    destination = destination if destination == UPLOAD_DESTINATION_CWD else None
+    default_name = "file" if destination == UPLOAD_DESTINATION_CWD else "image"
+    name = str(obj.get("name") or default_name).strip()[:MAX_UPLOAD_NAME_LENGTH] or default_name
     mime_type = str(obj.get("mime_type") or "").strip().lower()[:MAX_UPLOAD_MIME_LENGTH]
-    if not mime_type.startswith("image/"):
+    if not mime_type:
+        mime_type = "application/octet-stream"
+    if destination != UPLOAD_DESTINATION_CWD and not mime_type.startswith("image/"):
         raise UploadValidationError("Only image files can be pasted or dropped here.")
 
     raw_b64 = obj.get("bytes_b64")
     if not isinstance(raw_b64, str) or not raw_b64:
-        raise UploadValidationError("Image upload was empty.")
+        raise UploadValidationError("Upload was empty.")
     try:
         data = base64.b64decode(raw_b64, validate=True)
     except (binascii.Error, ValueError) as e:
-        raise UploadValidationError("Image upload was not valid base64.") from e
+        raise UploadValidationError("Upload was not valid base64.") from e
 
     if not data:
-        raise UploadValidationError("Image upload was empty.")
+        raise UploadValidationError("Upload was empty.")
     if len(data) > MAX_UPLOAD_BYTES:
-        raise UploadValidationError("Image is too large; the limit is 20 MB.")
+        raise UploadValidationError("Upload is too large; the limit is 20 MB.")
 
-    return name, mime_type, base64.b64encode(data).decode("ascii")
+    return name, mime_type, base64.b64encode(data).decode("ascii"), destination
+
+
+def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
+    name, mime_type, bytes_b64, _destination = _decode_upload(obj)
+    return name, mime_type, bytes_b64
 
 
 def _upload_paste_prefix(argv: list[str]) -> str:
@@ -421,7 +432,7 @@ async def browser_ws(
                         log.warning("snapshot forward failed: %s", e)
                 elif ftype == "upload":
                     try:
-                        name, mime_type, bytes_b64 = _decode_image_upload(obj)
+                        name, mime_type, bytes_b64, destination = _decode_upload(obj)
                     except UploadValidationError as e:
                         await conn.send_text({"type": "upload.error", "message": str(e)})
                         continue
@@ -450,6 +461,7 @@ async def browser_ws(
                                 "bytes_b64": bytes_b64,
                                 "paste_prefix": _upload_paste_prefix(agent_argv),
                                 "paste": bool(obj.get("paste", True)),
+                                "destination": destination,
                                 "client_id": client_id,
                             }
                         )
@@ -458,7 +470,7 @@ async def browser_ws(
                         await conn.send_text(
                             {
                                 "type": "upload.error",
-                                "message": "Image upload could not reach the daemon.",
+                                "message": "Upload could not reach the daemon.",
                             }
                         )
     except WebSocketDisconnect:
