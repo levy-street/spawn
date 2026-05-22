@@ -216,14 +216,14 @@ class AgentCreate(BaseModel):
     cwd: str
     argv: list[str] | None = None
     env: dict[str, str] | None = None
-    cols: int = 120
-    rows: int = 32
+    cols: int = Field(default=120, ge=20, le=400)
+    rows: int = Field(default=32, ge=5, le=200)
     create_cwd: bool = True
 
 
 class AgentRestart(BaseModel):
-    cols: int = 120
-    rows: int = 32
+    cols: int = Field(default=120, ge=20, le=400)
+    rows: int = Field(default=32, ge=5, le=200)
     create_cwd: bool = True
 
 

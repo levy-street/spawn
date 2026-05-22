@@ -6,6 +6,9 @@ opencode, aider, …) on the host.
 
 ## Build
 
+Requires Erlang/OTP 27 or newer, `rebar3`, and a C/C++ build toolchain for the
+`erlexec` PTY port program.
+
 ```sh
 rebar3 release
 rebar3 escriptize

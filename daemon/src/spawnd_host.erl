@@ -2,6 +2,9 @@
 
 -export([fs_list/1, tools_check/1, tool_install/1, save_upload/1, expand_path/1]).
 
+-define(INSTALL_TIMEOUT_MS, 170000).
+-define(VERSION_TIMEOUT_MS, 2000).
+
 fs_list(Path0) ->
     Path = expand_path(Path0),
     Parent =
@@ -35,7 +38,7 @@ tools_check(Targets) ->
 
 tool_install(Target) ->
     Install = maps:get(<<"install">>, Target, <<>>),
-    Capture = shell_capture(Install, 180000),
+    Capture = shell_capture(Install, ?INSTALL_TIMEOUT_MS),
     Status = tool_status(Target),
     maps:merge(Capture, #{
         <<"preset_id">> => maps:get(<<"preset_id">>, Target, <<>>),
@@ -54,12 +57,13 @@ save_upload(Obj) ->
         case Destination of
             <<"cwd">> -> expand_path(Cwd);
             _ -> filename:join([expand_path(Cwd), ".spawn", "attachments"])
-        end,
+    end,
     ok = filelib:ensure_dir(filename:join(Base, "x")),
-    Path = filename:join(Base, binary_to_list(Name)),
     Bytes = base64:decode(maps:get(<<"bytes_b64">>, Obj)),
-    ok = file:write_file(Path, Bytes),
-    list_to_binary(Path).
+    case write_unique(Base, binary_to_list(Name), Bytes) of
+        {ok, Path} -> list_to_binary(Path);
+        {error, Reason} -> error({upload_failed, Reason})
+    end.
 
 entry(Dir, Name) ->
     Path = filename:join(Dir, Name),
@@ -74,6 +78,11 @@ is_dir(Path) ->
 tool_status(Target) ->
     Command = maps:get(<<"command">>, Target, <<>>),
     Path = which(Command),
+    Version =
+        case Path of
+            null -> null;
+            _ -> version(Command)
+        end,
     #{
         <<"preset_id">> => maps:get(<<"preset_id">>, Target, <<>>),
         <<"preset_name">> => maps:get(<<"preset_name">>, Target, <<>>),
@@ -82,7 +91,7 @@ tool_status(Target) ->
         <<"install">> => maps:get(<<"install">>, Target, null),
         <<"installed">> => Path =/= null,
         <<"path">> => Path,
-        <<"version">> => version(Command),
+        <<"version">> => Version,
         <<"latest_version">> => null,
         <<"update_available">> => null,
         <<"error">> => null
@@ -101,27 +110,91 @@ version(<<>>) ->
     null;
 version(Command) ->
     Cmd = shell_quote(Command) ++ " --version 2>&1 | sed -n '1p'",
-    case string:trim(os:cmd(Cmd)) of
-        [] -> null;
-        Line -> list_to_binary(Line)
+    Capture = shell_capture(Cmd, ?VERSION_TIMEOUT_MS),
+    case string:trim(maps:get(<<"output">>, Capture, <<>>)) of
+        <<>> -> null;
+        Line -> Line
     end.
 
 shell_capture(Install, _Timeout) when Install =:= <<>>; Install =:= null ->
     #{<<"success">> => false, <<"exit_code">> => null, <<"output">> => <<>>, <<"error">> => <<"preset has no install command">>};
-shell_capture(Install, _Timeout) ->
-    Cmd = binary_to_list(Install) ++ " 2>&1; printf '\\n__spawn_exit__$?'",
-    Output = os:cmd(Cmd),
-    {Text, Code} = split_exit(Output),
-    #{<<"success">> => Code =:= 0, <<"exit_code">> => Code, <<"output">> => list_to_binary(Text), <<"error">> => null}.
+shell_capture(Install, Timeout) ->
+    run_shell_capture(Install, Timeout).
 
-split_exit(Output) ->
-    Marker = "__spawn_exit__",
-    case string:split(Output, Marker, trailing) of
-        [Text, Code0] ->
-            {Text, list_to_integer(string:trim(Code0))};
-        _ ->
-            {Output, null}
+run_shell_capture(Install, Timeout) ->
+    Script = temp_script_path(),
+    ok = file:write_file(Script, iolist_to_binary(["#!/bin/sh\n", to_list(Install), "\n"])),
+    ok = file:change_mode(Script, 8#700),
+    Port = open_port(
+        {spawn_executable, "/bin/sh"},
+        [binary, exit_status, stderr_to_stdout, use_stdio, {args, ["-c", shell_quote(Script)]}]
+    ),
+    collect_shell_capture(Port, Script, max(1, Timeout), []).
+
+collect_shell_capture(Port, Script, Timeout, Chunks) ->
+    receive
+        {Port, {data, Data}} ->
+            collect_shell_capture(Port, Script, Timeout, [Data | Chunks]);
+        {Port, {exit_status, ExitCode}} ->
+            _ = file:delete(Script),
+            #{
+                <<"success">> => ExitCode =:= 0,
+                <<"exit_code">> => ExitCode,
+                <<"output">> => iolist_to_binary(lists:reverse(Chunks)),
+                <<"error">> => null
+            }
+    after Timeout ->
+        kill_port_process_tree(Port),
+        Output = drain_shell_capture(Port, 1000, Chunks),
+        _ = file:delete(Script),
+        #{
+            <<"success">> => false,
+            <<"exit_code">> => null,
+            <<"output">> => Output,
+            <<"error">> => <<"install timed out">>
+        }
     end.
+
+drain_shell_capture(Port, Timeout, Chunks) ->
+    receive
+        {Port, {data, Data}} ->
+            drain_shell_capture(Port, Timeout, [Data | Chunks]);
+        {Port, {exit_status, _ExitCode}} ->
+            iolist_to_binary(lists:reverse(Chunks))
+    after Timeout ->
+        iolist_to_binary(lists:reverse(Chunks))
+    end.
+
+kill_port_process_tree(Port) ->
+    Pid =
+        case erlang:port_info(Port, os_pid) of
+            {os_pid, OsPid} when is_integer(OsPid) -> OsPid;
+            _ -> undefined
+        end,
+    case Pid of
+        undefined ->
+            _ = catch port_close(Port),
+            ok;
+        _ ->
+            _ = os:cmd(kill_tree_command(Pid, "TERM")),
+            _ = os:cmd(kill_tree_command(Pid, "KILL")),
+            _ = catch port_close(Port),
+            ok
+    end.
+
+kill_tree_command(Pid, Signal) ->
+    lists:flatten(
+        io_lib:format(
+            "kill_tree() { for child in $(pgrep -P \"$1\" 2>/dev/null); do kill_tree \"$child\" \"$2\"; done; kill -\"$2\" \"$1\" 2>/dev/null || true; }; kill_tree ~B ~s",
+            [Pid, Signal]
+        )
+    ).
+
+temp_script_path() ->
+    filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-install-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ).
 
 expand_path(undefined) ->
     spawnd_config:home_dir();
@@ -147,7 +220,161 @@ safe_name(Name) ->
     Clean = [C || C <- filename:basename(Name), C =/= $/, C =/= 0],
     list_to_binary(case Clean of [] -> "upload"; _ -> Clean end).
 
+write_unique(Base, Name, Bytes) ->
+    {Root, Ext} = split_extension(Name),
+    write_unique(Base, Root, Ext, Bytes, 0).
+
+write_unique(Base, Root, Ext, Bytes, Attempt) ->
+    Name =
+        case Attempt of
+            0 -> Root ++ Ext;
+            _ -> Root ++ "-" ++ integer_to_list(Attempt + 1) ++ Ext
+        end,
+    Path = filename:join(Base, Name),
+    case file:write_file(Path, Bytes, [write, binary, exclusive]) of
+        ok -> {ok, Path};
+        {error, eexist} -> write_unique(Base, Root, Ext, Bytes, Attempt + 1);
+        Error -> Error
+    end.
+
+split_extension(Name) ->
+    Ext = filename:extension(Name),
+    RootLen = length(Name) - length(Ext),
+    Root0 = lists:sublist(Name, RootLen),
+    Root = case Root0 of [] -> "upload"; _ -> Root0 end,
+    {Root, Ext}.
+
 shell_quote(Bin) when is_binary(Bin) ->
     shell_quote(binary_to_list(Bin));
 shell_quote(Str) ->
     "'" ++ string:replace(Str, "'", "'\\''", all) ++ "'".
+
+to_list(Bin) when is_binary(Bin) ->
+    binary_to_list(Bin);
+to_list(List) when is_list(List) ->
+    List.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+save_upload_uses_non_overwriting_paths_test() ->
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-upload-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Obj = #{
+        <<"cwd">> => list_to_binary(Base),
+        <<"name">> => <<"note.txt">>,
+        <<"destination">> => <<"cwd">>,
+        <<"bytes_b64">> => base64:encode(<<"one">>)
+    },
+    Path1 = save_upload(Obj),
+    Path2 = save_upload(Obj#{<<"bytes_b64">> => base64:encode(<<"two">>)}),
+    ?assertNotEqual(Path1, Path2),
+    ?assertEqual(<<"one">>, read_file(Path1)),
+    ?assertEqual(<<"two">>, read_file(Path2)),
+    _ = file:del_dir_r(Base),
+    ok.
+
+save_upload_sanitizes_names_test() ->
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-upload-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Path = save_upload(#{
+        <<"cwd">> => list_to_binary(Base),
+        <<"name">> => <<"../unsafe.txt">>,
+        <<"destination">> => <<"cwd">>,
+        <<"bytes_b64">> => base64:encode(<<"ok">>)
+    }),
+    ?assertEqual(list_to_binary(filename:join(Base, "unsafe.txt")), Path),
+    ?assertEqual(<<"ok">>, read_file(Path)),
+    _ = file:del_dir_r(Base),
+    ok.
+
+shell_capture_parses_success_exit_code_test() ->
+    Result = shell_capture(<<"printf hi">>, 1000),
+    ?assertMatch(#{<<"success">> := true, <<"exit_code">> := 0}, Result),
+    ?assertEqual(<<"hi">>, maps:get(<<"output">>, Result)).
+
+shell_capture_parses_failure_exit_code_test() ->
+    Result = shell_capture(<<"false">>, 1000),
+    ?assertMatch(#{<<"success">> := false, <<"exit_code">> := 1}, Result).
+
+shell_capture_enforces_timeout_test() ->
+    Started = erlang:monotonic_time(millisecond),
+    Result = shell_capture(<<"printf before; sleep 5; printf after">>, 100),
+    Elapsed = erlang:monotonic_time(millisecond) - Started,
+    ?assertMatch(
+        #{
+            <<"success">> := false,
+            <<"exit_code">> := null,
+            <<"error">> := <<"install timed out">>
+        },
+        Result
+    ),
+    ?assert(Elapsed < 3000).
+
+missing_tool_status_does_not_report_shell_error_as_version_test() ->
+    Missing = <<
+        "spawnd-definitely-missing-command-",
+        (integer_to_binary(erlang:unique_integer([positive])))/binary
+    >>,
+    [Status] = tools_check([
+        #{
+            <<"preset_id">> => <<"missing">>,
+            <<"preset_name">> => <<"missing">>,
+            <<"agent_kind">> => <<"shell">>,
+            <<"command">> => Missing
+        }
+    ]),
+    ?assertEqual(false, maps:get(<<"installed">>, Status)),
+    ?assertEqual(null, maps:get(<<"path">>, Status)),
+    ?assertEqual(null, maps:get(<<"version">>, Status)).
+
+tool_version_probe_times_out_test() ->
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-tool-version-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = filelib:ensure_dir(filename:join(Base, "x")),
+    Command = "spawnd-slow-version",
+    Script = filename:join(Base, Command),
+    ok = file:write_file(Script, <<"#!/bin/sh\nsleep 5\nprintf late\n">>),
+    ok = file:change_mode(Script, 8#755),
+    OldPath = os:getenv("PATH"),
+    os:putenv("PATH", Base ++ ":" ++ path_or_empty(OldPath)),
+    Started = erlang:monotonic_time(millisecond),
+    try
+        [Status] = tools_check([
+            #{
+                <<"preset_id">> => <<"slow">>,
+                <<"preset_name">> => <<"slow">>,
+                <<"agent_kind">> => <<"shell">>,
+                <<"command">> => list_to_binary(Command)
+            }
+        ]),
+        Elapsed = erlang:monotonic_time(millisecond) - Started,
+        ?assertEqual(true, maps:get(<<"installed">>, Status)),
+        ?assertEqual(list_to_binary(Script), maps:get(<<"path">>, Status)),
+        ?assertEqual(null, maps:get(<<"version">>, Status)),
+        ?assert(Elapsed < 3500)
+    after
+        restore_path(OldPath),
+        _ = file:del_dir_r(Base)
+    end.
+
+path_or_empty(false) ->
+    "";
+path_or_empty(Path) ->
+    Path.
+
+restore_path(false) ->
+    os:unsetenv("PATH");
+restore_path(Path) ->
+    os:putenv("PATH", Path).
+
+read_file(Path) when is_binary(Path) ->
+    {ok, Bytes} = file:read_file(binary_to_list(Path)),
+    Bytes.
+-endif.

@@ -13,16 +13,26 @@ from .. import auth as auth_mod
 from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, Host
+from ..redis import get_backend
 from .activity import should_record_agent_output
 from .broker import DaemonConn, get_broker
 from .frames import KIND_OUTPUT, decode_binary_frame
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
+SPAWN_FAILED_EXIT_CODE = 127
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _error_message(value: object, fallback: str) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return fallback
 
 
 async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) -> Host | None:
@@ -70,6 +80,31 @@ async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) ->
 async def _touch_host(session: AsyncSession, host: Host) -> None:
     host.last_seen_at = _utcnow()
     await session.commit()
+
+
+async def _mark_agent_spawn_failed(host_id: str, agent_id: str, message: object) -> bool:
+    msg = _error_message(message, "agent launch failed")
+    now = _utcnow()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None or agent.host_id != host_id:
+            return False
+        agent.status = "exited"
+        agent.exit_code = SPAWN_FAILED_EXIT_CODE
+        agent.exited_at = now
+        agent.last_output_at = now
+        await session.commit()
+
+    output = f"\r\nspawn: failed to launch agent: {msg}\r\n".encode("utf-8", "replace")
+    await transcript.append(agent_id, output)
+    await get_backend().publish(agent_id, output)
+    await get_backend().publish_agent_event(
+        agent_id,
+        {"type": "agent.exit", "exit_code": SPAWN_FAILED_EXIT_CODE, "signal": None},
+    )
+    await get_broker().detach_agent(agent_id)
+    return True
 
 
 @router.websocket("/ws/daemon")
@@ -127,8 +162,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 # Fan-out via pubsub (single source of truth; works the same
                 # in single-worker dev and multi-worker prod). Browsers
                 # subscribe in `ws/browser.py`.
-                from ..redis import get_backend
-
                 await get_backend().publish(frame.agent_id, frame.payload)
 
             elif data_text is not None:
@@ -158,7 +191,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             host_obj.last_seen_at = _utcnow()
                             host_obj.status = "online"
                             await session.commit()
-                    await conn.send_text({"type": "registered", "host_id": host.id})
+                    try:
+                        await conn.send_text({"type": "registered", "host_id": host.id})
+                    except Exception as e:  # noqa: BLE001
+                        log.info("daemon registration ack skipped after close host=%s: %s", host.id, e)
+                        break
 
                 elif ftype == "host.fs.list_result":
                     request_id = obj.get("request_id")
@@ -196,13 +233,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 agent.status = "running"
                                 await session.commit()
                                 await broker.attach_agent_to_daemon(aid, conn)
-                                for b in broker.browsers_for(aid):
-                                    try:
-                                        await b.send_text(
-                                            {"type": "agent.status", "status": "running"}
-                                        )
-                                    except Exception:
-                                        pass
+                                await get_backend().publish_agent_event(
+                                    aid,
+                                    {"type": "agent.status", "status": "running"},
+                                )
 
                 elif ftype == "agent.exit":
                     aid = obj.get("agent_id")
@@ -216,13 +250,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 agent.exit_code = code
                                 agent.exited_at = _utcnow()
                                 await session.commit()
-                        for b in broker.browsers_for(aid):
-                            try:
-                                await b.send_text(
-                                    {"type": "agent.exit", "exit_code": code, "signal": sig}
-                                )
-                            except Exception:
-                                pass
+                        await get_backend().publish_agent_event(
+                            aid,
+                            {"type": "agent.exit", "exit_code": code, "signal": sig},
+                        )
                         await broker.detach_agent(aid)
 
                 elif ftype == "agent.uploaded":
@@ -235,14 +266,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             if agent is None or agent.host_id != host.id:
                                 log.warning("upload ack for unknown agent=%s", aid)
                                 continue
-                        for b in broker.browsers_for(aid):
-                            try:
-                                payload = {"type": "upload.saved", "path": path}
-                                if isinstance(client_id, str):
-                                    payload["client_id"] = client_id
-                                await b.send_text(payload)
-                            except Exception:
-                                pass
+                        payload = {"type": "upload.saved", "path": path}
+                        if isinstance(client_id, str):
+                            payload["client_id"] = client_id
+                        await get_backend().publish_agent_event(aid, payload)
 
                 elif ftype == "agent.snapshot":
                     aid = obj.get("agent_id")
@@ -253,21 +280,25 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             if agent is None or agent.host_id != host.id:
                                 log.warning("snapshot for unknown agent=%s", aid)
                                 continue
-                        await broker.resolve_snapshot(aid, bytes_b64)
+                        request_id = obj.get("request_id")
+                        await broker.resolve_snapshot(
+                            aid,
+                            bytes_b64,
+                            request_id=request_id if isinstance(request_id, str) else None,
+                        )
 
                 elif ftype == "error":
                     aid = obj.get("agent_id")
                     if obj.get("code") == "upload_failed" and aid:
-                        for b in broker.browsers_for(aid):
-                            try:
-                                await b.send_text(
-                                    {
-                                        "type": "upload.error",
-                                        "message": obj.get("message") or "Image upload failed.",
-                                    }
-                                )
-                            except Exception:
-                                pass
+                        await get_backend().publish_agent_event(
+                            aid,
+                            {
+                                "type": "upload.error",
+                                "message": obj.get("message") or "Image upload failed.",
+                            },
+                        )
+                    elif obj.get("code") == "spawn_failed" and isinstance(aid, str):
+                        await _mark_agent_spawn_failed(host.id, aid, obj.get("message"))
                     log.warning(
                         "daemon error host=%s agent=%s code=%s msg=%s",
                         host.id,

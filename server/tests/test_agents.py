@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -98,26 +99,173 @@ async def test_agent_create_defaults_name_from_host_and_cwd(client):
 
     from spawn_server.db import get_sessionmaker
     from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
 
     sm = get_sessionmaker()
     async with sm() as session:
         user = (
             await session.execute(select(User).where(User.email == "default-name@example.com"))
         ).scalar_one()
-        host = Host(owner_user_id=user.id, name="dream", status="offline")
+        host = Host(owner_user_id=user.id, name="dream", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    try:
+        r = await client.post(
+            "/api/agents",
+            json={"host_id": host_id, "cwd": "/home/oem/projects/spawn", "argv": ["codex"]},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["name"] == "dream - spawn"
+        assert body["host_name"] == "dream"
+    finally:
+        await broker.unregister_daemon(daemon)
+
+
+async def test_agent_create_spawn_failed_error_marks_exited_and_notifies(client):
+    token = await _signup(client, "create-spawn-failed@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server import transcript
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.broker import DaemonConn, get_broker
+    from spawn_server.ws.daemon import SPAWN_FAILED_EXIT_CODE, _mark_agent_spawn_failed
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "create-spawn-failed@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    agent_id: str | None = None
+    try:
+        r = await client.post(
+            "/api/agents",
+            json={"host_id": host_id, "cwd": "/repo", "argv": ["missing-spawn-binary"]},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        agent_id = r.json()["id"]
+        assert broker.get_daemon_for_agent(agent_id) is daemon
+
+        async with get_backend().subscribe_agent_events(agent_id) as events:
+            assert await _mark_agent_spawn_failed(
+                host_id,
+                agent_id,
+                "executable not found and no install command is configured",
+            )
+            event = await asyncio.wait_for(anext(events), timeout=1)
+
+        assert event == {
+            "type": "agent.exit",
+            "exit_code": SPAWN_FAILED_EXIT_CODE,
+            "signal": None,
+        }
+        assert broker.get_daemon_for_agent(agent_id) is None
+
+        r = await client.get(f"/api/agents/{agent_id}", headers=auth)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "exited"
+        assert body["activity_state"] == "exited"
+        assert body["exit_code"] == SPAWN_FAILED_EXIT_CODE
+        assert body["exited_at"] is not None
+        assert body["last_output_at"] is not None
+
+        history = await transcript.read(agent_id)
+        assert b"spawn: failed to launch agent: executable not found" in history
+    finally:
+        if agent_id is not None:
+            await transcript.clear(agent_id)
+        await broker.unregister_daemon(daemon)
+
+
+async def test_agent_create_rejects_unreachable_host(client):
+    token = await _signup(client, "create-offline@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "create-offline@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="offline", status="offline")
         session.add(host)
         await session.commit()
         host_id = host.id
 
     r = await client.post(
         "/api/agents",
-        json={"host_id": host_id, "cwd": "/home/oem/projects/spawn", "argv": ["codex"]},
+        json={"host_id": host_id, "cwd": "/repo", "argv": ["codex"]},
         headers=auth,
     )
-    assert r.status_code == 201, r.text
-    body = r.json()
-    assert body["name"] == "dream - spawn"
-    assert body["host_name"] == "dream"
+    assert r.status_code == 409, r.text
+
+
+async def test_agent_create_rejects_blank_executable_and_bad_size(client):
+    token = await _signup(client, "create-invalid-argv@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "create-invalid-argv@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "argv": ["  "]},
+        headers=auth,
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "resolved argv is empty"
+
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "argv": ["bash"], "cols": 10},
+        headers=auth,
+    )
+    assert r.status_code == 422, r.text
+
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "argv": ["bash"], "rows": 500},
+        headers=auth,
+    )
+    assert r.status_code == 422, r.text
 
 
 async def test_agent_activity_fields(client):

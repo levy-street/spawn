@@ -114,10 +114,7 @@ export function AppShell({
             <ul className="space-y-1">
               {NAV.map((item) => {
                 const Icon = item.icon;
-                const active =
-                  item.href === "/"
-                    ? pathname === "/"
-                    : pathname === item.href || pathname.startsWith(`${item.href}/`);
+                const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
                 return (
                   <li key={item.href}>
                     <Link
@@ -184,7 +181,7 @@ export function AppShell({
             )}
           >
             <div className="flex h-12 items-center justify-between px-4">
-              <Link href="/" className="text-base font-semibold tracking-tight">
+              <Link href="/dash" className="text-base font-semibold">
                 spawn
               </Link>
               <Button

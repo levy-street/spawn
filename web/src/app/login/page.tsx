@@ -26,7 +26,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
+      router.replace("/dash");
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Login failed";
       setError(message);

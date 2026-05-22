@@ -28,6 +28,13 @@ def _clean_optional(value: str | None) -> str | None:
     return clean or None
 
 
+def _clean_argv(value: list[str] | None) -> list[str]:
+    argv = list(value or [])
+    if not argv or not argv[0].strip():
+        raise HTTPException(status_code=400, detail="default argv is required")
+    return argv
+
+
 async def _commit_preset(session: AsyncSession) -> None:
     try:
         await session.commit()
@@ -65,7 +72,7 @@ async def create_preset(
         owner_user_id=user.id,
         name=_clean_required(body.name, "preset name"),
         agent_kind=_clean_required(body.agent_kind, "agent kind"),
-        default_argv=list(body.default_argv),
+        default_argv=_clean_argv(body.default_argv),
         env_template=dict(body.env_template),
         install=_clean_optional(body.install),
     )
@@ -97,7 +104,7 @@ async def update_preset(
             raise HTTPException(status_code=400, detail="agent kind is required")
         p.agent_kind = _clean_required(body.agent_kind, "agent kind")
     if "default_argv" in fields:
-        p.default_argv = list(body.default_argv or [])
+        p.default_argv = _clean_argv(body.default_argv)
     if "env_template" in fields:
         p.env_template = dict(body.env_template or {})
     if "install" in fields:

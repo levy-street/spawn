@@ -52,8 +52,7 @@ BUILTIN_PRESETS: list[dict] = [
 
 
 async def seed_builtin_presets(session: AsyncSession) -> None:
-    """Insert any missing built-in presets, and backfill `install` on existing
-    rows that were seeded before the install column existed."""
+    """Insert missing built-ins and keep immutable built-in rows current."""
     existing = (
         (await session.execute(select(Preset).where(Preset.owner_user_id.is_(None))))
         .scalars()
@@ -76,8 +75,15 @@ async def seed_builtin_presets(session: AsyncSession) -> None:
             )
             changed = True
         else:
-            if row.install is None and spec.get("install"):
-                row.install = spec["install"]
-                changed = True
+            updates = {
+                "agent_kind": spec["agent_kind"],
+                "default_argv": list(spec["default_argv"]),
+                "env_template": dict(spec["env_template"]),
+                "install": spec.get("install"),
+            }
+            for field, value in updates.items():
+                if getattr(row, field) != value:
+                    setattr(row, field, value)
+                    changed = True
     if changed:
         await session.commit()

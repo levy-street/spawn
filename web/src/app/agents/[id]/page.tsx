@@ -16,6 +16,7 @@ import { useEffect, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
+import { Composer } from "@/components/terminal/Composer";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
@@ -50,10 +51,24 @@ function AgentTerminal() {
   const termRef = useRef<TerminalHandle>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
+  const [coarsePointer, setCoarsePointer] = useState(false);
+  const [mobileRawMode, setMobileRawMode] = useState(false);
 
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
     if (desktop) requestAnimationFrame(() => termRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(pointer: coarse)");
+    const sync = () => setCoarsePointer(media.matches);
+    sync();
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", sync);
+      return () => media.removeEventListener("change", sync);
+    }
+    media.addListener(sync);
+    return () => media.removeListener(sync);
   }, []);
 
   useEffect(() => {
@@ -142,6 +157,7 @@ function AgentTerminal() {
   });
 
   if (!id) return null;
+  const rawInput = !coarsePointer || mobileRawMode;
 
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
@@ -273,13 +289,27 @@ function AgentTerminal() {
         <Terminal
           ref={termRef}
           agentId={id}
-          rawInput
+          rawInput={rawInput}
           mobileReturnMode="newline"
           mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
           imagePasteMode={q.data && agentKind(q.data) === "codex" ? "bracketed-path" : "deferred"}
           onDisplayControl={setDisplayState}
         />
       </div>
+
+      {coarsePointer && (
+        <Composer
+          rawMode={mobileRawMode}
+          onToggleRaw={(next) => {
+            setMobileRawMode(next);
+            requestAnimationFrame(() => termRef.current?.focus());
+          }}
+          onSend={(text) => {
+            termRef.current?.sendInput(`${text}\r`);
+            requestAnimationFrame(() => termRef.current?.focus());
+          }}
+        />
+      )}
 
       <ModifierBar
         className="hidden [@media(pointer:coarse)]:flex"

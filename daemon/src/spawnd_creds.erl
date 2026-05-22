@@ -33,16 +33,90 @@ logout() ->
 
 status(ServerOpt) ->
     Creds = load(),
-    Server = spawnd_config:server_url(ServerOpt),
     Configured = maps:get(<<"server_url">>, Creds, <<"(none)">>),
+    Server = effective_server(ServerOpt, Configured),
     HostId = maps:get(<<"host_id">>, Creds, <<"(none)">>),
     LoggedIn =
         case maps:get(<<"access_token">>, Creds, <<>>) of
             <<>> -> <<"no">>;
             _ -> <<"yes">>
         end,
-    io:format("server:     ~s~n", [Server]),
-    io:format("configured: ~s~n", [Configured]),
-    io:format("logged in:  ~s~n", [LoggedIn]),
-    io:format("host_id:    ~s~n", [HostId]),
+    io:put_chars(
+        io_lib:format(
+            "server:     ~s~nconfigured: ~s~nlogged in:  ~s~nhost_id:    ~s~n",
+            [Server, Configured, LoggedIn, HostId]
+        )
+    ),
     ok.
+
+effective_server(ServerOpt, _Configured) when ServerOpt =/= undefined ->
+    spawnd_config:server_url(ServerOpt);
+effective_server(undefined, Configured) ->
+    case os:getenv("SPAWN_SERVER_URL") of
+        false ->
+            case Configured of
+                <<"(none)">> -> spawnd_config:server_url(undefined);
+                <<>> -> spawnd_config:server_url(undefined);
+                _ -> spawnd_config:server_url(Configured)
+            end;
+        Env ->
+            spawnd_config:server_url(Env)
+    end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+effective_server_uses_configured_server_without_override_test() ->
+    with_env_unset(
+        "SPAWN_SERVER_URL",
+        fun() ->
+            ?assertEqual(
+                <<"http://localhost:3002">>,
+                effective_server(undefined, <<"http://localhost:3002/">>)
+            )
+        end
+    ).
+
+effective_server_prefers_cli_override_test() ->
+    with_env(
+        "SPAWN_SERVER_URL",
+        "http://env.example",
+        fun() ->
+            ?assertEqual(
+                <<"https://cli.example">>,
+                effective_server(<<"https://cli.example/">>, <<"http://configured.example">>)
+            )
+        end
+    ).
+
+effective_server_prefers_env_over_configured_server_test() ->
+    with_env(
+        "SPAWN_SERVER_URL",
+        "http://env.example/",
+        fun() ->
+            ?assertEqual(
+                <<"http://env.example">>,
+                effective_server(undefined, <<"http://configured.example">>)
+            )
+        end
+    ).
+
+with_env(Name, Value, Fun) ->
+    Previous = os:getenv(Name),
+    os:putenv(Name, Value),
+    try Fun()
+    after restore_env(Name, Previous)
+    end.
+
+with_env_unset(Name, Fun) ->
+    Previous = os:getenv(Name),
+    os:unsetenv(Name),
+    try Fun()
+    after restore_env(Name, Previous)
+    end.
+
+restore_env(Name, false) ->
+    os:unsetenv(Name);
+restore_env(Name, Value) ->
+    os:putenv(Name, Value).
+-endif.

@@ -5,7 +5,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "spawn",
-  description: "Multi-tenant control plane for CLI coding agents.",
+  description: "Run coding agents on your own machines from a shared web control plane.",
   applicationName: "spawn",
   manifest: "/manifest.webmanifest",
   appleWebApp: {

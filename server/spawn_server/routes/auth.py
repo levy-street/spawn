@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..config import get_settings
+from ..csrf import CSRF_COOKIE, issue_csrf_token
 from ..db import get_session
 from ..models import User
 
@@ -18,13 +19,22 @@ router = APIRouter(prefix="/api", tags=["auth"])
 def _set_session_cookie(response: Response, token: str) -> None:
     # HTTP-only web session. Secure should be true in prod (set behind a proxy).
     settings = get_settings()
+    secure = settings.public_url.startswith("https://")
     response.set_cookie(
         "spawn_session",
         token,
         max_age=60 * 60 * 24 * settings.jwt_refresh_ttl_days,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="strict",
+        secure=secure,
+    )
+    response.set_cookie(
+        CSRF_COOKIE,
+        issue_csrf_token(),
+        max_age=60 * 60 * 24 * settings.jwt_refresh_ttl_days,
+        httponly=False,
+        samesite="strict",
+        secure=secure,
     )
 
 
@@ -69,7 +79,9 @@ async def login(
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(response: Response) -> None:
-    response.delete_cookie("spawn_session", samesite="lax", secure=False)
+    secure = get_settings().public_url.startswith("https://")
+    response.delete_cookie("spawn_session", samesite="strict", secure=secure)
+    response.delete_cookie(CSRF_COOKIE, samesite="strict", secure=secure)
 
 
 @router.get("/me", response_model=schemas.MeResponse)

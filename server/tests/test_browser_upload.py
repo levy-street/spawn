@@ -8,9 +8,10 @@ import pytest
 
 from spawn_server.ws.browser import (
     UploadValidationError,
-    _decode_upload,
     _decode_image_upload,
+    _decode_upload,
     _prefer_transcript_history,
+    _should_request_daemon_snapshot,
     _upload_paste_prefix,
 )
 
@@ -86,3 +87,16 @@ def test_upload_paste_prefix(argv, prefix):
 )
 def test_prefer_transcript_history(argv, prefer_transcript):
     assert _prefer_transcript_history(argv) is prefer_transcript
+
+
+@pytest.mark.parametrize(
+    ("status", "request_snapshot"),
+    [
+        ("starting", True),
+        ("running", True),
+        ("exited", False),
+        ("killed", False),
+    ],
+)
+def test_should_request_daemon_snapshot_skips_terminal_states(status, request_snapshot):
+    assert _should_request_daemon_snapshot(status, ["bash", "-l"]) is request_snapshot

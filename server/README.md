@@ -1,8 +1,9 @@
 # spawn-server
 
-The control-plane server for `spawn`. FastAPI + SQLAlchemy 2.0 (async) +
-Postgres + Redis. Brokers REST and WebSocket traffic between the web app and
-the per-host Erlang/OTP daemons (`spawnd`).
+The control-plane server for `spawn`. FastAPI + SQLAlchemy 2.0 (async), with
+SQLite for local development and Postgres/Redis for production-style
+deployments. It brokers REST and WebSocket traffic between the web app and the
+per-host Erlang/OTP daemons (`spawnd`).
 
 See `../docs/DESIGN.md` for the full architecture and `../proto/README.md` for
 the wire protocol this server implements.
@@ -15,10 +16,17 @@ uv sync
 
 # copy env template (from repo root)
 cp ../.env.example .env
-# fill in SPAWN_VAULT_KEY (32 random bytes hex) and SPAWN_JWT_SECRET
+# set SPAWN_JWT_SECRET for shared or production environments
 
-# start postgres + redis (use ../infra/ compose if present, or your own)
-# then run migrations
+# optional for local single-process development:
+# export SPAWN_DATABASE_URL=sqlite+aiosqlite:///./data/spawn.db
+# export SPAWN_USE_INPROCESS_PUBSUB=1
+
+# for Postgres/Redis deployments, start those services and set:
+# export SPAWN_DATABASE_URL=postgresql+asyncpg://...
+# export SPAWN_REDIS_URL=redis://...
+
+# run migrations
 uv run alembic upgrade head
 
 # run dev server
@@ -32,9 +40,10 @@ uv run alembic revision -m "describe change" --autogenerate
 uv run alembic upgrade head
 ```
 
-The initial migration `0001_initial.py` creates `users`, `hosts`,
-`credentials`, `presets`, `agents`, `device_codes` and seeds the built-in
-presets. Built-in presets are also re-seeded idempotently on app startup.
+The initial migration `0001_initial.py` creates `users`, `hosts`, `presets`,
+`agents`, and `device_codes`, then seeds the built-in presets. Later migrations
+add preset install metadata, agent display/activity fields, host tool policies,
+and pinning. Built-in presets are re-synchronized idempotently on app startup.
 
 ## Tests
 

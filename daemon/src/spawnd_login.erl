@@ -12,13 +12,18 @@ run(ServerOpt, HostNameOpt) ->
         <<"arch">> => list_to_binary(erlang:system_info(system_architecture)),
         <<"version">> => <<"0.2.0">>
     },
-    {ok, Start} = post_json(spawnd_config:api_url(Server, "/api/auth/device/start"), Body, []),
-    UserCode = maps:get(<<"user_code">>, Start),
-    Verification = maps:get(<<"verification_uri">>, Start),
-    DeviceCode = maps:get(<<"device_code">>, Start),
-    Interval = maps:get(<<"interval">>, Start, 5),
-    io:format("spawn: open ~s and enter code ~s~n", [Verification, UserCode]),
-    poll(Server, DeviceCode, Interval).
+    case post_json(spawnd_config:api_url(Server, "/api/auth/device/start"), Body, []) of
+        {ok, Start} ->
+            case decode_start(Start) of
+                {ok, UserCode, Verification, DeviceCode, Interval} ->
+                    io:format("spawn: open ~s and enter code ~s~n", [Verification, UserCode]),
+                    poll(Server, DeviceCode, Interval);
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
 
 poll(Server, DeviceCode, Interval) ->
     timer:sleep(Interval * 1000),
@@ -68,3 +73,47 @@ host_name(Name) ->
 os_name() ->
     {Family, Name} = os:type(),
     list_to_binary(io_lib:format("~p/~p", [Family, Name])).
+
+decode_start(#{
+    <<"user_code">> := UserCode,
+    <<"verification_uri">> := Verification,
+    <<"device_code">> := DeviceCode,
+    <<"interval">> := Interval
+}) ->
+    {ok, UserCode, Verification, DeviceCode, Interval};
+decode_start(#{
+    <<"user_code">> := UserCode,
+    <<"verification_uri">> := Verification,
+    <<"device_code">> := DeviceCode
+}) ->
+    {ok, UserCode, Verification, DeviceCode, 5};
+decode_start(_) ->
+    {error, invalid_device_start_response}.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+decode_start_defaults_interval_test() ->
+    ?assertEqual(
+        {ok, <<"ABCD-EFGH">>, <<"http://localhost/device">>, <<"device-token">>, 5},
+        decode_start(#{
+            <<"user_code">> => <<"ABCD-EFGH">>,
+            <<"verification_uri">> => <<"http://localhost/device">>,
+            <<"device_code">> => <<"device-token">>
+        })
+    ).
+
+decode_start_uses_server_interval_test() ->
+    ?assertEqual(
+        {ok, <<"ABCD-EFGH">>, <<"http://localhost/device">>, <<"device-token">>, 7},
+        decode_start(#{
+            <<"user_code">> => <<"ABCD-EFGH">>,
+            <<"verification_uri">> => <<"http://localhost/device">>,
+            <<"device_code">> => <<"device-token">>,
+            <<"interval">> => 7
+        })
+    ).
+
+decode_start_rejects_malformed_response_test() ->
+    ?assertEqual({error, invalid_device_start_response}, decode_start(#{})).
+-endif.

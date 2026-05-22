@@ -36,7 +36,7 @@ mobile design notes.
 ## Local dev (quickstart)
 
 System prerequisites: `docker`, Python 3.13 (`uv` installs interpreters on
-demand), Erlang/OTP + `rebar3`, Bun 1.x, and C/C++ build tools for the
+demand), Erlang/OTP 27+ + `rebar3`, Bun 1.x, and C/C++ build tools for the
 `erlexec` PTY port program.
 
 ## Daemon install
@@ -48,14 +48,41 @@ web URL:
 curl -fsSL https://spawn.example.com/install.sh | sh
 ```
 
-The script installs prerequisites where it can, builds the OTP daemon from
-source, runs the device-code login flow, then starts a user `systemd` service
-when available with a background fallback. The hosted script defaults to
-`SPAWN_PUBLIC_URL`; override it explicitly when needed:
+The script downloads a prebuilt, self-contained OTP release for the host
+OS/architecture, runs the device-code login flow, then starts a user `systemd`
+service when available with a background fallback. The installer detects
+`linux-x86_64`, `linux-arm64`, `darwin-x86_64`, and `darwin-arm64`; Windows
+hosts run the Linux daemon inside WSL. The hosted web route serves artifacts
+from `SPAWN_DAEMON_ARTIFACT_DIR` or `dist/spawnd` when present, and otherwise
+can only serve the release built for the web server's own OS/architecture.
+
+Build a prebuilt artifact on a matching host with:
+
+```bash
+scripts/package-spawnd.sh
+```
+
+The package script emits `spawnd-$target.tar.gz` under `dist/spawnd` by
+default. Run it on each OS/architecture you want to publish; Erlang releases
+are not cross-compiled by this repo.
+
+The hosted script defaults to `SPAWN_PUBLIC_URL`; override it explicitly when
+needed:
 
 ```bash
 curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spawn.example.com
 ```
+
+If the hosted prebuilt for a host is unavailable, build on the target host
+instead:
+
+```bash
+curl -fsSL https://spawn.example.com/install.sh | sh -s -- --build-from-source
+```
+
+Source builds require Erlang/OTP 27 or newer because the daemon depends on
+current `erlexec` releases. Ubuntu 24.04's default `apt` Erlang package is OTP
+25, so use the prebuilt artifact path there or install a newer OTP first.
 
 ```bash
 # 0. One-time: copy env template
@@ -89,6 +116,94 @@ End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
 approve the device code on `/device`, see the host appear on `/hosts`, then
 spawn a `shell` preset agent and watch xterm.js attach to it.
 
+For the already-running local stack, the repeatable smoke script exercises the
+installed daemon wrapper, local control socket, REST API, browser websocket,
+PTY input/output, duplicate upload handling, restart, host tool policy, and
+host tool install paths. It also launches the built-in provider presets against
+fake provider binaries so `claude`, `codex`, `opencode`, `aider`, and `shell`
+argv wiring are covered without requiring real provider credentials:
+
+```bash
+scripts/smoke-local.sh
+```
+
+To run the installed provider CLIs through the real daemon-backed agent path
+without relying on fake binaries, run:
+
+```bash
+scripts/smoke-provider-clis.sh
+```
+
+To exercise the real web client in headless Chromium, including the public
+landing and install pages, authenticated Hosts status and rename flow, New
+Agent form, and an agent terminal render across desktop and mobile terminal
+controls, terminal file upload, Agents grid rename/archive actions, plus the
+Settings preset manager, run:
+
+```bash
+scripts/smoke-web-ui.sh
+```
+
+To verify the Redis-backed multi-worker path, including REST/browser traffic
+landing on a different FastAPI worker than the daemon websocket and terminal
+display ownership moving between browser connections on different workers, run:
+
+```bash
+scripts/smoke-cross-worker.sh
+```
+
+To verify the production deploy script without touching a real host, run:
+
+```bash
+scripts/smoke-deploy-prod.sh
+```
+
+To run read-only readiness checks against the real production host before or
+after a deploy, run:
+
+```bash
+scripts/check-prod-readiness.sh spawnd-prod
+```
+
+To verify a fresh `spawnd login` device-code approval, isolated credential
+save/status/logout flow, run:
+
+```bash
+scripts/smoke-device-login.sh
+```
+
+To verify installer platform detection, native Windows rejection, the prebuilt
+artifact path for Linux/macOS/WSL-like shells, and the OTP source-build guard
+in a local Ubuntu container, run:
+
+```bash
+scripts/smoke-install-linux.sh
+```
+
+To build real Linux prebuilt daemon artifacts in Docker and prove they install
+and run in a minimal Ubuntu runtime without Erlang/rebar3, run:
+
+```bash
+scripts/smoke-linux-artifact.sh
+SPAWN_LINUX_ARTIFACT_PLATFORMS=linux/amd64 scripts/smoke-linux-artifact.sh
+```
+
+To run the full local verification suite in the expected order, use the
+orchestrator:
+
+```bash
+scripts/smoke-all.sh
+```
+
+Heavy Docker artifact and read-only production checks are opt-in:
+
+```bash
+SPAWN_SMOKE_ALL_LINUX_ARTIFACTS=1 \
+SPAWN_SMOKE_ALL_LINUX_AMD64=1 \
+SPAWN_SMOKE_ALL_PROD_HOST=spawnd-prod \
+scripts/smoke-all.sh
+```
+
 ## Production deploy
 
 Production infrastructure is bootstrapped from the Levy Street Ansible repo:
@@ -109,7 +224,7 @@ scripts/deploy-prod.sh
 
 The host can be any alias from the caller's `~/.ssh/config`. The deploy script
 fetches the same branch from `origin` on the production machine, rebuilds the
-server/web/hosted daemon artifacts, runs database migrations, and restarts the
+server/web/current-host daemon artifact, runs database migrations, and restarts the
 configured services. It refuses to run when the local checkout has uncommitted
 changes or commits that have not been pushed.
 
@@ -140,24 +255,22 @@ agent's host and saved directly into the agent working directory using
 sanitized, non-overwriting filenames. Image paste/attachment behavior remains
 separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
 
-## Known limits in this scaffold
+## Known Limits
 
-- **Single uvicorn worker only.** Cross-worker live PTY fan-out via Redis
-  pubsub is published by the daemon WS but not yet subscribed in the
-  browser WS — the wiring is in place but the consumer task is a follow-up.
-  History replay still works cross-worker.
-- **No CSRF protection on cookie auth yet.** Add SameSite=Strict cookies +
-  CSRF tokens before any non-localhost deployment.
 - **shadcn components are hand-rolled** (Tailwind v4 + React 19 ergonomics
   ahead of the official CLI). The API matches shadcn's so swapping later is
   mechanical.
 - **PWA icons are placeholders.** Replace `web/public/icon-{192,512}.png`
   before shipping.
-- **No agent transcripts persisted** beyond the 256 KB ring buffer.
+- **Transcript retention is bounded.** Agent output is persisted to rotated
+  transcript files for replay, but old scrollback is dropped once the per-agent
+  size limit is reached.
 - **Agent provider auth is per host.** Each host needs its own
   `claude /login` / `codex login` / etc. There is no central credential
   store; this is a deliberate non-goal for spawn.
 
-## Project status
+## Project Status
 
-Pre-alpha scaffold. See `docs/DESIGN.md` for the roadmap.
+Active prototype with local daemon install, authenticated web UI, direct
+subprocess agents, transcript replay, host target checks/installs, and deploy
+helpers. See `docs/DESIGN.md` for remaining hardening work.

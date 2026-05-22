@@ -12,6 +12,7 @@ import { z } from "zod";
 // we go through Next.js rewrites, so /api/* is same-origin. In dev where the
 // FastAPI server is on a different port, set NEXT_PUBLIC_SPAWN_API_URL.
 const API_URL = process.env.NEXT_PUBLIC_SPAWN_API_URL ?? "";
+const CSRF_COOKIE = "spawn_csrf";
 
 export class ApiError extends Error {
   constructor(
@@ -30,11 +31,13 @@ export async function api<T>(
   init: RequestInit & { schema?: z.ZodType<T> } = {},
 ): Promise<T> {
   const { schema, headers, ...rest } = init;
+  const csrfToken = csrfHeader(rest.method);
   const res = await fetch(`${API_URL}${path}`, {
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
+      ...csrfToken,
       ...headers,
     },
     ...rest,
@@ -61,6 +64,23 @@ export async function api<T>(
   if (res.status === 204) return undefined as T;
   const data = await res.json();
   return schema ? schema.parse(data) : (data as T);
+}
+
+function csrfHeader(method: string | undefined): Record<string, string> {
+  const normalized = (method ?? "GET").toUpperCase();
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(normalized)) return {};
+  const token = readCookie(CSRF_COOKIE);
+  return token ? { "X-CSRF-Token": token } : {};
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const part of document.cookie.split(";")) {
+    const cookie = part.trim();
+    if (cookie.startsWith(prefix)) return decodeURIComponent(cookie.slice(prefix.length));
+  }
+  return null;
 }
 
 // ---------- Schemas ----------

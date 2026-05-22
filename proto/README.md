@@ -61,7 +61,7 @@ Host shape:
 |--------|----------------------|-----------------------------------------------------------------------------------|
 | GET    | `/api/agents`        | list current user's unarchived agents (optional `?host_id=...`, `?include_archived=true`) |
 | GET    | `/api/agents/{id}`   |                                                                                   |
-| POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, create_cwd?}` — at least one of preset_id or argv |
+| POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, cols?, rows?, create_cwd?}` — at least one of preset_id or argv; `argv[0]` must be non-empty; `cols` 20–400, `rows` 5–200 |
 | PATCH  | `/api/agents/{id}`   | rename/pin/archive: `{name?, pinned?, archived?}`                                 |
 | POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
 | DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
@@ -80,6 +80,11 @@ Agent shape:
   "status": "starting" | "running" | "exited" | "killed",
   "started_at": "...",
   "exited_at": "...|null",
+  "last_output_at": "...|null",
+  "last_input_at": "...|null",
+  "last_activity_at": "...|null",
+  "activity_state": "starting|active|quiet|waiting|input_sent|exited|killed|unknown",
+  "activity_label": "Awaiting input",
   "exit_code": "int|null",
   "pinned_at": "...|null",
   "archived_at": "...|null"
@@ -91,12 +96,14 @@ Agent shape:
 | Method | Path             | Body                                                          |
 |--------|------------------|---------------------------------------------------------------|
 | GET    | `/api/presets`   | list (built-ins + user-defined)                               |
-| POST   | `/api/presets`   | `{name, agent_kind, default_argv, env_template}`              |
+| POST   | `/api/presets`   | `{name, agent_kind, default_argv, env_template?, install?}`   |
+| PATCH  | `/api/presets/{id}` | update user preset fields                                  |
 | DELETE | `/api/presets/{id}` |                                                            |
 
 Each preset may also carry an optional `install` shell command. The daemon
 runs it (via `bash -c`) when `argv[0]` isn't on PATH, streaming stdout into
 the agent's PTY so the user sees install progress in the terminal view.
+`default_argv` must contain a non-empty command at index 0.
 
 Built-in presets (server-seeded, `owner_user_id = null`):
 - **claude-code** — `argv=["claude"]`, install `npm install -g @anthropic-ai/claude-code`

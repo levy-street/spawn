@@ -203,6 +203,44 @@ async def test_host_tools_require_online_daemon(client):
     assert r.status_code == 409
 
 
+async def test_host_daemon_status_timeout_degrades_to_payload(client, monkeypatch):
+    token = await _signup(client, "host-daemon-timeout@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.routes import hosts as hosts_mod
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "host-daemon-timeout@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="slow-daemon", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    class TimeoutBroker:
+        def get_daemon_for_host(self, _host_id):
+            return object()
+
+        async def request_daemon_status_for_host(self, _host_id):
+            return None
+
+    monkeypatch.setattr(hosts_mod, "get_broker", lambda: TimeoutBroker())
+
+    r = await client.get(f"/api/hosts/{host_id}/daemon", headers=auth)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "online"
+    assert body["agents"] == []
+    assert body["update"]["ok"] is False
+    assert body["update"]["changes"] == "host daemon status timed out"
+
+
 async def test_host_tool_policy_auto_update_schedules_install(client):
     token = await _signup(client, "host-tools-auto@example.com")
     auth = {"Authorization": f"Bearer {token}"}

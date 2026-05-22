@@ -17,39 +17,50 @@
 - **Stack**: Python 3.13, FastAPI, SQLAlchemy 2.0 + Alembic, asyncpg,
   Pydantic v2, argon2 for password hashing, PyJWT for short-lived tokens,
   redis-py for pubsub.
-- **State**: Postgres for durable state (users, hosts, agents, presets,
-  audit). Redis for pub/sub between WS workers (so a frontend connected to
-  worker A can receive PTY bytes from a daemon connected to worker B).
+- **State**: Postgres for durable state (users, hosts, agents, presets, host
+  tool policies). Redis for WS worker coordination: PTY byte fan-out, browser
+  text events, daemon command envelopes, request/response frames, and terminal
+  display ownership/geometry. On-disk rotated transcripts provide replay after
+  a server restart.
 - **Public surface**:
   - HTTP/JSON REST under `/api/...`
   - `/ws/daemon` — daemon WebSocket
   - `/ws/browser` — browser WebSocket (per-agent attach)
-- **Bridge logic**: server holds a routing map `agent_id -> daemon_conn` and
-  `agent_id -> {browser_conn, ...}`. PTY output frames from a daemon fan out
-  to subscribed browsers; PTY input from a browser routes to the owning
-  daemon. Server also keeps a Redis ring buffer of the last 256 KB of PTY
-  output per agent for replay on reconnect.
+- **Bridge logic**: server holds a local routing map `agent_id -> daemon_conn`
+  and `agent_id -> {browser_conn, ...}` as a fast path. PTY output frames from
+  a daemon are appended to transcript storage and published through Redis;
+  browser websockets subscribe to that stream. Browser input, host/agent
+  commands, host status/tool requests, snapshot responses, upload acks, agent
+  status/exit events, and display-control updates also cross workers through
+  Redis channels, so a browser or REST request can land on a different worker
+  than the daemon WS.
 
-### `spawnd` — Rust
+### `spawnd` — Erlang/OTP
 
-- **Stack**: tokio, tokio-tungstenite, clap, serde / serde_json, anyhow,
-  portable-pty, keyring (with file fallback in `~/.config/spawn/`).
+- **Stack**: Erlang/OTP release, `gun` for outbound websockets, `erlexec` for
+  direct subprocess and PTY management, and a small escript CLI for login,
+  status, logout, local control, and self-test commands.
 - **CLI**:
-  - `spawnd login` — interactive device-code flow against the server. Stores
-    a long-lived daemon token in OS keyring.
-  - `spawnd run` — foreground; connects WSS, registers, services frames.
+  - `spawnd login` — interactive device-code flow against the server. Stores a
+    long-lived daemon token in `~/.config/spawn/credentials.json`.
+  - release wrapper `spawnd foreground` / `spawnd daemon` — starts the OTP
+    daemon, connects WSS, registers, and services frames.
   - `spawnd logout` — wipes stored token.
-  - `spawnd status` — prints connection / agent state.
-- **Process model**: each agent runs inside its own detached `tmux` session
-  (`spawn-<uuid>`), so an agent survives `spawnd` crashes/restarts. The
-  daemon attaches a PTY to the tmux pane to stream I/O.
+  - `spawnd status` — prints configured server/login state.
+  - `spawnd agents`, `spawnd kill <id>`, `spawnd update-check`, `spawnd
+    self-test` — local control socket commands against the running daemon.
+- **Process model**: each agent is an OTP-supervised worker that owns one
+  direct OS subprocess attached to a PTY through `erlexec`. There is no tmux
+  layer. The registry tracks live workers, restart waits for the old process to
+  exit before starting the replacement, and stale unregister/monitor messages
+  are ignored so a restarted agent is not removed accidentally.
 - **Agent environment**: the daemon launches the agent under the host user's
   process env (HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally),
   overlaid with the `env` from `agent.create`. spawn does not manage agent
   credentials; each agent CLI handles its own login on the host.
-- **Reconnect**: on WS disconnect, daemon retries with exponential backoff.
-  On reconnect, sends a `register` frame with `existing_agents: [...]` so the
-  server resyncs its routing map without killing the tmux sessions.
+- **Reconnect**: on WS disconnect or heartbeat timeout, daemon reconnects and
+  sends a `register` frame with `existing_agents: [...]` so the server resyncs
+  its routing map for still-running OTP agent workers.
 
 ### `spawn-web` — Next.js 15 PWA
 
@@ -57,13 +68,15 @@
   Bun. xterm.js + `@xterm/addon-fit` + `@xterm/addon-web-links`. TanStack
   Query for REST. Native WebSocket for streaming.
 - **Pages**:
-  - `/` — dashboard (active agents, recent activity).
+  - `/` — public landing page.
+  - `/dash` — dashboard (active agents, recent activity).
+  - `/download` — hosted daemon installer instructions.
   - `/login`, `/signup`, `/device` (device-code approval).
   - `/hosts` — list of registered daemons with status, last-seen, kill/rename.
   - `/agents` — grid + detail. New-agent modal: pick host, pick preset,
     optional cwd / argv override.
   - `/agents/[id]` — full terminal view + composer + modifier bar.
-  - `/settings` — account, daemons, danger zone.
+  - `/settings` — account, preset management, and danger-zone placeholder.
 - **Mobile**:
   - Composer pattern: textarea above terminal with Send button. Toggle to raw
     mode for power users.
@@ -76,7 +89,10 @@
 ## Auth model
 
 - **Web users**: email + argon2id password. Sessions are JWTs in HTTP-only
-  cookies, 30-day refresh / 15-min access.
+  SameSite=Strict cookies, 30-day refresh / 15-min access. Unsafe
+  cookie-authenticated API requests also require the readable `spawn_csrf`
+  cookie to be echoed in `X-CSRF-Token`; bearer-token API clients are not
+  subject to the browser CSRF check.
 - **Daemons**: device-code flow.
   1. Daemon `POST /api/auth/device/start` → `{device_code, user_code,
      verification_uri, interval, expires_in}`.
@@ -105,10 +121,13 @@
 users(id, email, password_hash, created_at)
 hosts(id, owner_user_id, name, os, arch, version, status, last_seen_at)
 presets(id, owner_user_id|null, name, agent_kind, default_argv jsonb,
-        env_template jsonb)
+        env_template jsonb, install)
   -- owner_user_id null = built-in preset visible to all users
 agents(id, owner_user_id, host_id, preset_id|null, cwd, argv jsonb, env jsonb,
-       status, started_at, exited_at, exit_code)
+       status, started_at, exited_at, exit_code, last_output_at, last_input_at,
+       pinned_at, archived_at)
+host_tool_policies(id, owner_user_id, host_id, preset_id, auto_update,
+                   last_checked_at, last_auto_update_at, last_auto_update_error)
 device_codes(device_code, user_code, host_name, status, user_id|null,
              expires_at)
 ```
@@ -127,11 +146,13 @@ device_codes(device_code, user_code, host_name, status, user_id|null,
 
 ## Roadmap
 
-1. **Skeleton** — three workspaces wired up; `docker compose up`,
-   `uvicorn`, `cargo run`, `bun dev` all green; auth + daemon registration
-   end-to-end. *(this scaffold)*
-2. **Spawn one agent** — agent.create → tmux/PTY in daemon → xterm.js in
-   browser. Resize, reconnect, replay.
-3. **Mobile polish** — composer, modifier bar, PWA install, container queries.
-4. **Multi-agent UX** — grid, swipe-between, kill/restart, transcripts.
-5. **Hardening** — audit log, daemon auto-update, rate limiting, observability.
+1. **Core runtime** — server, web app, Erlang/OTP daemon, device login, daemon
+   registration, direct PTY agents, transcript replay, and host target checks.
+2. **Install/deploy** — hosted installer, prebuilt daemon artifacts, production
+   deploy helper, and Redis-backed multi-worker websocket routing.
+3. **Mobile polish** — composer, modifier bar, PWA install prompts, and
+   container-query refinements.
+4. **Multi-agent UX** — grid views, swipe-between flows, richer bulk actions,
+   and better long-running-agent affordances.
+5. **Hardening** — audit log, daemon auto-update rollout policy, rate limiting,
+   observability, and broader provider/OS compatibility testing.

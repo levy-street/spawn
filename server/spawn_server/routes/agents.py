@@ -145,30 +145,30 @@ async def _dispatch_agent_launch(
     cols: int,
     rows: int,
     create_cwd: bool,
-) -> None:
+) -> bool:
     broker = get_broker()
     daemon = broker.get_daemon_for_host(host.id)
-    if daemon is None:
-        log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
-        return
-
-    await broker.attach_agent_to_daemon(agent.id, daemon)
+    if daemon is not None:
+        await broker.attach_agent_to_daemon(agent.id, daemon)
+    payload = {
+        "type": frame_type,
+        "agent_id": agent.id,
+        "cwd": agent.cwd,
+        "argv": agent.argv,
+        "env": agent.env,
+        "install": preset.install if preset is not None else None,
+        "cols": cols,
+        "rows": rows,
+        "create_cwd": create_cwd,
+    }
     try:
-        await daemon.send_text(
-            {
-                "type": frame_type,
-                "agent_id": agent.id,
-                "cwd": agent.cwd,
-                "argv": agent.argv,
-                "env": agent.env,
-                "install": preset.install if preset is not None else None,
-                "cols": cols,
-                "rows": rows,
-                "create_cwd": create_cwd,
-            }
-        )
+        sent = await broker.send_text_to_host(host.id, payload)
+        if not sent:
+            log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
+        return sent
     except Exception as e:  # noqa: BLE001
         log.warning("%s dispatch failed: %s", frame_type, e)
+        return False
 
 
 @router.patch("/{agent_id}", response_model=schemas.AgentOut)
@@ -212,7 +212,7 @@ async def create_agent(
     preset = await _resolve_agent_preset(session, body.preset_id, user)
 
     argv = list(body.argv) if body.argv else (list(preset.default_argv) if preset else [])
-    if not argv:
+    if not argv or not argv[0].strip():
         raise HTTPException(status_code=400, detail="resolved argv is empty")
 
     env: dict[str, str] = {}
@@ -238,7 +238,7 @@ async def create_agent(
 
     # Dispatch agent.create to the daemon. spawn does not manage agent
     # credentials — the agent CLI on the host handles its own auth.
-    await _dispatch_agent_launch(
+    dispatched = await _dispatch_agent_launch(
         frame_type="agent.create",
         agent=agent,
         host=host,
@@ -247,6 +247,10 @@ async def create_agent(
         rows=body.rows,
         create_cwd=body.create_cwd,
     )
+    if not dispatched:
+        await session.delete(agent)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host daemon is offline")
 
     return _to_out(agent, host.name)
 
@@ -266,11 +270,18 @@ async def restart_agent(
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
 
-    daemon = get_broker().get_daemon_for_host(host.id)
-    if daemon is None:
+    if get_broker().get_daemon_for_host(host.id) is None and host.status != "online":
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
     preset = await _resolve_agent_preset(session, agent.preset_id, user)
+    previous = {
+        "status": agent.status,
+        "started_at": agent.started_at,
+        "exited_at": agent.exited_at,
+        "exit_code": agent.exit_code,
+        "last_output_at": agent.last_output_at,
+        "last_input_at": agent.last_input_at,
+    }
     now = _utcnow()
     agent.status = "starting"
     agent.started_at = now
@@ -281,7 +292,7 @@ async def restart_agent(
     await session.commit()
     await session.refresh(agent)
 
-    await _dispatch_agent_launch(
+    dispatched = await _dispatch_agent_launch(
         frame_type="agent.restart",
         agent=agent,
         host=host,
@@ -290,6 +301,15 @@ async def restart_agent(
         rows=body.rows,
         create_cwd=body.create_cwd,
     )
+    if not dispatched:
+        agent.status = previous["status"]
+        agent.started_at = previous["started_at"]
+        agent.exited_at = previous["exited_at"]
+        agent.exit_code = previous["exit_code"]
+        agent.last_output_at = previous["last_output_at"]
+        agent.last_input_at = previous["last_input_at"]
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host daemon is offline")
     return _to_out(agent, host.name)
 
 
@@ -302,14 +322,14 @@ async def delete_agent(
     a = await session.get(Agent, agent_id)
     if a is None or a.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="agent not found")
-    daemon = get_broker().get_daemon_for_agent(agent_id) or get_broker().get_daemon_for_host(
-        a.host_id
-    )
-    if daemon is not None:
-        try:
-            await daemon.send_text({"type": "agent.kill", "agent_id": agent_id, "signal": "TERM"})
-        except Exception as e:  # noqa: BLE001
-            log.warning("agent.kill dispatch failed: %s", e)
+    try:
+        await get_broker().send_text_to_agent(
+            agent_id,
+            a.host_id,
+            {"type": "agent.kill", "agent_id": agent_id, "signal": "TERM"},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("agent.kill dispatch failed: %s", e)
     await get_broker().detach_agent(agent_id)
     await session.delete(a)
     await session.commit()

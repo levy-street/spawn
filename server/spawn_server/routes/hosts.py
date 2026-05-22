@@ -161,6 +161,14 @@ def _merge_tool_policy(status: schemas.HostToolStatus, policy: HostToolPolicy) -
     status.last_auto_update_error = policy.last_auto_update_error
 
 
+def _daemon_status_unavailable(message: str) -> schemas.HostDaemonStatus:
+    return schemas.HostDaemonStatus(
+        status="online",
+        agents=[],
+        update=schemas.HostDaemonUpdateStatus(ok=False, changes=message),
+    )
+
+
 def _should_auto_update(
     status: schemas.HostToolStatus, policy: HostToolPolicy, now: datetime
 ) -> bool:
@@ -192,17 +200,13 @@ async def _run_auto_update(
 ) -> None:
     key = (user_id, host_id, preset_id)
     try:
-        daemon = get_broker().get_daemon_for_host(host_id)
-        if daemon is None:
-            error = "host daemon is offline"
-        else:
-            raw_result = await get_broker().request_tool_install(daemon, target=target)
-            result = (
-                schemas.HostToolInstallResult.model_validate(raw_result.get("result", raw_result))
-                if raw_result is not None
-                else None
-            )
-            error = _auto_update_error_from_result(result)
+        raw_result = await get_broker().request_tool_install_for_host(host_id, target=target)
+        result = (
+            schemas.HostToolInstallResult.model_validate(raw_result.get("result", raw_result))
+            if raw_result is not None
+            else None
+        )
+        error = _auto_update_error_from_result(result)
     except Exception as e:  # noqa: BLE001
         log.warning("auto update failed host=%s preset=%s: %s", host_id, preset_id, e)
         error = str(e)
@@ -245,11 +249,8 @@ async def run_auto_update_checks_once() -> None:
         )
 
     for host_id, items in by_host.items():
-        daemon = get_broker().get_daemon_for_host(host_id)
-        if daemon is None:
-            continue
         targets = [target for _, _, _, target in items]
-        result = await get_broker().request_tool_check(daemon, targets=targets)
+        result = await get_broker().request_tool_check_for_host(host_id, targets=targets)
         if result is None:
             continue
         checked = schemas.HostToolList.model_validate(result)
@@ -390,14 +391,13 @@ async def list_host_dirs(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.HostDirList:
-    await _get_owned_host(session, host_id, user)
+    host = await _get_owned_host(session, host_id, user)
     await session.commit()
 
-    daemon = get_broker().get_daemon_for_host(host_id)
-    if daemon is None:
+    if get_broker().get_daemon_for_host(host_id) is None and host.status != "online":
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    result = await get_broker().request_dir_list(daemon, path=path)
+    result = await get_broker().request_dir_list_for_host(host_id, path=path)
     if result is None:
         raise HTTPException(status_code=504, detail="host directory listing timed out")
     return schemas.HostDirList.model_validate(result)
@@ -409,10 +409,9 @@ async def list_host_tools(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.HostToolList:
-    await _get_owned_host(session, host_id, user)
+    host = await _get_owned_host(session, host_id, user)
 
-    daemon = get_broker().get_daemon_for_host(host_id)
-    if daemon is None:
+    if get_broker().get_daemon_for_host(host_id) is None and host.status != "online":
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
     presets = await _list_accessible_presets(session, user)
@@ -421,7 +420,7 @@ async def list_host_tools(
     targets = [target.model_dump() for target in targets_by_preset.values()]
     await session.commit()
 
-    result = await get_broker().request_tool_check(daemon, targets=targets)
+    result = await get_broker().request_tool_check_for_host(host_id, targets=targets)
     if result is None:
         raise HTTPException(status_code=504, detail="host tool check timed out")
     checked = schemas.HostToolList.model_validate(result)
@@ -458,16 +457,15 @@ async def get_host_daemon_status(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.HostDaemonStatus:
-    await _get_owned_host(session, host_id, user)
+    host = await _get_owned_host(session, host_id, user)
     await session.commit()
 
-    daemon = get_broker().get_daemon_for_host(host_id)
-    if daemon is None:
+    if get_broker().get_daemon_for_host(host_id) is None and host.status != "online":
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    result = await get_broker().request_daemon_status(daemon)
+    result = await get_broker().request_daemon_status_for_host(host_id)
     if result is None:
-        raise HTTPException(status_code=504, detail="host daemon status timed out")
+        return _daemon_status_unavailable("host daemon status timed out")
     return schemas.HostDaemonStatus.model_validate(result)
 
 
@@ -478,7 +476,7 @@ async def install_host_tool(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.HostToolInstallResult:
-    await _get_owned_host(session, host_id, user)
+    host = await _get_owned_host(session, host_id, user)
     preset = await _get_accessible_preset(session, preset_id, user)
     target = _preset_to_tool_target(preset)
 
@@ -486,11 +484,10 @@ async def install_host_tool(
         raise HTTPException(status_code=400, detail="preset has no install command")
     await session.commit()
 
-    daemon = get_broker().get_daemon_for_host(host_id)
-    if daemon is None:
+    if get_broker().get_daemon_for_host(host_id) is None and host.status != "online":
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    result = await get_broker().request_tool_install(daemon, target=target.model_dump())
+    result = await get_broker().request_tool_install_for_host(host_id, target=target.model_dump())
     if result is None:
         raise HTTPException(status_code=504, detail="host tool install timed out")
     return schemas.HostToolInstallResult.model_validate(result.get("result", result))

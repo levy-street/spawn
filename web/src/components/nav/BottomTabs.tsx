@@ -1,14 +1,15 @@
 "use client";
 
-import { LayoutGrid, Server, Settings, Sparkles } from "lucide-react";
+import { Download, LayoutGrid, Server, Settings, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
 export const NAV = [
-  { href: "/", label: "Dash", icon: LayoutGrid },
+  { href: "/dash", label: "Dash", icon: LayoutGrid },
   { href: "/hosts", label: "Hosts", icon: Server },
   { href: "/agents", label: "Agents", icon: Sparkles },
+  { href: "/download", label: "Install", icon: Download },
   { href: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
@@ -22,10 +23,7 @@ export function BottomTabs() {
       <ul className="flex items-stretch justify-between px-2">
         {NAV.map((item) => {
           const Icon = item.icon;
-          const active =
-            item.href === "/"
-              ? pathname === "/"
-              : pathname === item.href || pathname.startsWith(`${item.href}/`);
+          const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
           return (
             <li key={item.href} className="flex-1">
               <Link

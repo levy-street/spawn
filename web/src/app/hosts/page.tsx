@@ -39,7 +39,12 @@ export default function HostsPage() {
 
 function HostsList() {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
+  const q = useQuery({
+    queryKey: ["hosts"],
+    queryFn: hosts.list,
+    refetchInterval: 10_000,
+    staleTime: 5_000,
+  });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -86,11 +91,16 @@ function HostsList() {
 
   return (
     <div className="mx-auto w-full max-w-3xl p-4">
-      <header className="mb-4 flex items-center justify-between">
+      <header className="mb-4 flex items-center justify-between gap-3">
         <h1 className="text-xl font-semibold">Hosts</h1>
-        <Button asChild variant="outline">
-          <Link href="/device">Approve a daemon</Link>
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button asChild variant="outline">
+            <Link href="/download">Install daemon</Link>
+          </Button>
+          <Button asChild variant="outline">
+            <Link href="/device">Approve a daemon</Link>
+          </Button>
+        </div>
       </header>
 
       {q.isLoading && <p className="text-sm text-muted-foreground">Loading hosts...</p>}
@@ -109,14 +119,18 @@ function HostsList() {
           <CardHeader>
             <CardTitle>No hosts yet</CardTitle>
             <CardDescription>
-              Install <code>spawnd</code> on a machine, run <code>spawnd login</code>, and approve
-              the device code from{" "}
-              <Link href="/device" className="underline">
-                /device
+              Install <code>spawnd</code> on a machine, then approve its device code from{" "}
+              <Link href="/device" className="underline underline-offset-4">
+                Approve a daemon
               </Link>
               .
             </CardDescription>
           </CardHeader>
+          <CardContent>
+            <Button asChild>
+              <Link href="/download">Install daemon</Link>
+            </Button>
+          </CardContent>
         </Card>
       )}
 
@@ -263,10 +277,14 @@ function HostDaemonPanel({ host }: { host: Host }) {
 
 function DaemonSummary({ daemon }: { daemon: HostDaemonStatus }) {
   const clean = daemon.update?.clean;
+  const updateFailed = daemon.update?.ok === false;
   return (
     <span className="ml-2 inline-flex flex-wrap gap-x-3 gap-y-1">
       <span>{daemon.agents.length} local agents</span>
-      {clean !== undefined && clean !== null && (
+      {updateFailed && (
+        <span className="text-amber-500">{daemon.update?.changes ?? "status unavailable"}</span>
+      )}
+      {!updateFailed && clean !== undefined && clean !== null && (
         <span className={clean ? "text-green-500" : "text-amber-500"}>
           {clean ? "update clean" : "local changes present"}
         </span>

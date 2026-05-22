@@ -100,6 +100,10 @@ def _prefer_transcript_history(argv: list[str]) -> bool:
     return False
 
 
+def _should_request_daemon_snapshot(agent_status: str, argv: list[str]) -> bool:
+    return agent_status in {"starting", "running"} and not _prefer_transcript_history(argv)
+
+
 def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
     return {
         "type": "display.control",
@@ -141,16 +145,18 @@ async def _send_initial_history(
     agent_id: str,
     host_id: str,
     agent_argv: list[str],
+    agent_status: str,
     initial_cols: int | None,
     initial_rows: int | None,
     resize_before_snapshot: bool,
 ) -> None:
     broker = get_broker()
-    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
-    if daemon is not None and not _prefer_transcript_history(agent_argv):
+    if _should_request_daemon_snapshot(agent_status, agent_argv):
         try:
             if resize_before_snapshot and initial_cols is not None and initial_rows is not None:
-                await daemon.send_text(
+                await broker.send_text_to_agent(
+                    agent_id,
+                    host_id,
                     {
                         "type": "agent.resize",
                         "agent_id": agent_id,
@@ -158,7 +164,12 @@ async def _send_initial_history(
                         "rows": initial_rows,
                     }
                 )
-            snapshot = await broker.request_snapshot(agent_id, daemon, lines=5000, timeout=2.0)
+            snapshot = await broker.request_snapshot_for_host(
+                host_id,
+                agent_id,
+                lines=5000,
+                timeout=2.0,
+            )
             if snapshot:
                 await conn.send_text({"type": "history", "bytes_b64": snapshot})
                 return
@@ -254,6 +265,7 @@ async def browser_ws(
             agent_id=agent_id,
             host_id=host_id,
             agent_argv=agent_argv,
+            agent_status=agent_status,
             initial_cols=display_state.cols if display_state.cols is not None else initial_cols,
             initial_rows=display_state.rows if display_state.rows is not None else initial_rows,
             resize_before_snapshot=display_state.owner,
@@ -289,6 +301,41 @@ async def browser_ws(
     except TimeoutError:
         pass
 
+    event_ready = asyncio.Event()
+
+    async def _pump_agent_events() -> None:
+        try:
+            async with get_backend().subscribe_agent_events(agent_id) as stream:
+                event_ready.set()
+                async for event in stream:
+                    try:
+                        if event.get("type") == "_display.state":
+                            await conn.send_text(
+                                _display_control_payload(
+                                    BrowserDisplayState(
+                                        owner=event.get("owner_conn_id") == conn.id,
+                                        cols=event.get("cols"),
+                                        rows=event.get("rows"),
+                                        viewers=int(event.get("viewers") or 0),
+                                    )
+                                )
+                            )
+                        else:
+                            await conn.send_text(event)
+                    except Exception as e:
+                        log.warning("agent event forward to browser failed: %s", e)
+                        return
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent event subscribe loop crashed: %s", e)
+        finally:
+            event_ready.set()
+
+    event_task = asyncio.create_task(_pump_agent_events())
+    try:
+        await asyncio.wait_for(event_ready.wait(), timeout=1.0)
+    except TimeoutError:
+        pass
+
     # The history payload is a rendered daemon snapshot, not a live terminal
     # attach state. Once the browser is subscribed to live bytes, ask the
     # daemon to repaint the current screen so xterm's viewport is current.
@@ -305,16 +352,12 @@ async def browser_ws(
 
             if data_bytes is not None:
                 # Wrap in 0x02 + agent_id and forward to owning daemon.
-                daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                    host_id
-                )
-                if daemon is None:
-                    log.warning("no daemon for agent=%s host=%s", agent_id, host_id)
-                    continue
                 try:
                     frame = encode_binary_frame(KIND_INPUT, agent_id, data_bytes)
-                    await daemon.send_bytes(frame)
-                    await _touch_agent_input(agent_id)
+                    if await broker.send_bytes_to_agent(agent_id, host_id, frame):
+                        await _touch_agent_input(agent_id)
+                    else:
+                        log.warning("no daemon for agent=%s host=%s", agent_id, host_id)
                 except Exception as e:
                     log.warning("forward to daemon failed: %s", e)
 
@@ -334,24 +377,20 @@ async def browser_ws(
                     )
                     if display_state is None:
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.resize",
-                                    "agent_id": agent_id,
-                                    "cols": cols,
-                                    "rows": rows,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("resize forward failed: %s", e)
+                    try:
+                        suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
+                        await broker.send_text_to_agent(
+                            agent_id,
+                            host_id,
+                            {
+                                "type": "agent.resize",
+                                "agent_id": agent_id,
+                                "cols": cols,
+                                "rows": rows,
+                            },
+                        )
+                    except Exception as e:
+                        log.warning("resize forward failed: %s", e)
                     await _broadcast_display_control(agent_id)
                 elif ftype == "take_control":
                     cols = _clamp_message_size(obj, "cols", 80, 20, 400)
@@ -361,24 +400,20 @@ async def browser_ws(
                         cols=cols,
                         rows=rows,
                     )
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.resize",
-                                    "agent_id": agent_id,
-                                    "cols": display_state.cols,
-                                    "rows": display_state.rows,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("take control resize forward failed: %s", e)
+                    try:
+                        suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
+                        await broker.send_text_to_agent(
+                            agent_id,
+                            host_id,
+                            {
+                                "type": "agent.resize",
+                                "agent_id": agent_id,
+                                "cols": display_state.cols,
+                                "rows": display_state.rows,
+                            },
+                        )
+                    except Exception as e:
+                        log.warning("take control resize forward failed: %s", e)
                     await _broadcast_display_control(agent_id)
                     await _request_agent_redraw(agent_id, host_id)
                 elif ftype == "scroll":
@@ -386,36 +421,27 @@ async def browser_ws(
                     lines = max(-200, min(200, raw_lines))
                     if lines == 0:
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.scroll",
-                                    "agent_id": agent_id,
-                                    "lines": lines,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("scroll forward failed: %s", e)
+                    try:
+                        suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
+                        await broker.send_text_to_agent(
+                            agent_id,
+                            host_id,
+                            {
+                                "type": "agent.scroll",
+                                "agent_id": agent_id,
+                                "lines": lines,
+                            },
+                        )
+                    except Exception as e:
+                        log.warning("scroll forward failed: %s", e)
                 elif ftype == "snapshot":
                     raw_lines = int(obj.get("lines") or 5000)
                     lines = max(100, min(10000, raw_lines))
                     plain = bool(obj.get("plain", False))
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is None:
-                        continue
                     try:
-                        snapshot = await broker.request_snapshot(
+                        snapshot = await broker.request_snapshot_for_host(
+                            host_id,
                             agent_id,
-                            daemon,
                             lines=lines,
                             plain=plain,
                             timeout=2.0,
@@ -442,16 +468,10 @@ async def browser_ws(
                     else:
                         client_id = None
 
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is None:
-                        await conn.send_text(
-                            {"type": "upload.error", "message": "No daemon is connected."}
-                        )
-                        continue
                     try:
-                        await daemon.send_text(
+                        sent = await broker.send_text_to_agent(
+                            agent_id,
+                            host_id,
                             {
                                 "type": "agent.upload",
                                 "agent_id": agent_id,
@@ -463,7 +483,7 @@ async def browser_ws(
                                 "paste": bool(obj.get("paste", True)),
                                 "destination": destination,
                                 "client_id": client_id,
-                            }
+                            },
                         )
                     except Exception as e:
                         log.warning("upload forward failed: %s", e)
@@ -473,16 +493,22 @@ async def browser_ws(
                                 "message": "Upload could not reach the daemon.",
                             }
                         )
+                        continue
+                    if not sent:
+                        await conn.send_text(
+                            {"type": "upload.error", "message": "No daemon is connected."}
+                        )
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
         log.exception("browser ws crashed: %s", e)
     finally:
-        pump_task.cancel()
-        try:
-            await pump_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for task in (pump_task, event_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await broker.detach_browser(conn)
         await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)
@@ -509,13 +535,12 @@ def _clamp_message_size(
 
 
 async def _request_agent_redraw(agent_id: str, host_id: str) -> None:
-    daemon = get_broker().get_daemon_for_agent(agent_id) or get_broker().get_daemon_for_host(
-        host_id
-    )
-    if daemon is None:
-        return
     try:
         suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
-        await daemon.send_text({"type": "agent.redraw", "agent_id": agent_id})
+        await get_broker().send_text_to_agent(
+            agent_id,
+            host_id,
+            {"type": "agent.redraw", "agent_id": agent_id},
+        )
     except Exception as e:
         log.warning("redraw forward failed: %s", e)

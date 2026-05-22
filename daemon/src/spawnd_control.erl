@@ -36,6 +36,8 @@ handle_call({request, {kill, AgentId}}, _From, State) ->
     {reply, Reply, State};
 handle_call({request, <<"update-check">>}, _From, State) ->
     {reply, spawnd_update:check(), State};
+handle_call({request, <<"self-test">>}, _From, State) ->
+    {reply, run_self_check(), State};
 handle_call({request, _}, _From, State) ->
     {reply, #{<<"ok">> => false, <<"error">> => <<"unknown command">>}, State}.
 
@@ -88,6 +90,8 @@ serve(Socket) ->
                         request({kill, AgentId});
                     {ok, #{<<"command">> := <<"update-check">>}} ->
                         spawnd_update:check();
+                    {ok, #{<<"command">> := <<"self-test">>}} ->
+                        run_self_check();
                     _ ->
                         #{<<"ok">> => false, <<"error">> => <<"bad request">>}
                 end;
@@ -101,6 +105,40 @@ port() ->
     case os:getenv("SPAWND_CONTROL_PORT") of
         false -> 8346;
         Value -> list_to_integer(Value)
+    end.
+
+run_self_check() ->
+    AgentId = <<"00000000-0000-0000-0000-00000000ffff">>,
+    Spec = #{
+        agent_id => AgentId,
+        argv => [<<"/bin/sh">>, <<"-lc">>, <<"printf ok">>],
+        cwd => <<"/tmp">>,
+        env => #{},
+        cols => 80,
+        rows => 24,
+        notify => self(),
+        report => false
+    },
+    case spawnd_agent_sup:start_agent(Spec) of
+        {ok, Pid} ->
+            receive
+                {agent_started, AgentId, OsPid} when is_integer(OsPid) ->
+                    wait_self_test_exit(AgentId, Pid)
+            after 2000 ->
+                exit(Pid, kill),
+                #{<<"ok">> => false, <<"error">> => <<"timeout waiting for start">>}
+            end;
+        Error ->
+            #{<<"ok">> => false, <<"error">> => list_to_binary(io_lib:format("~p", [Error]))}
+    end.
+
+wait_self_test_exit(AgentId, Pid) ->
+    receive
+        {agent_exit, AgentId, _Reason} ->
+            #{<<"ok">> => true}
+    after 3000 ->
+        exit(Pid, kill),
+        #{<<"ok">> => false, <<"error">> => <<"timeout waiting for exit">>}
     end.
 
 -ifdef(TEST).

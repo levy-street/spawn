@@ -1,10 +1,13 @@
 -module(spawnd_ws).
 -behaviour(gen_server).
 
+-include_lib("kernel/include/file.hrl").
+
 -export([start_link/0, send_json/1, send_binary/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--define(HEARTBEAT_MS, 30000).
+-define(HEARTBEAT_MS, 10000).
+-define(HEARTBEAT_TIMEOUT_MS, 5000).
 -define(RECONNECT_MS, 2000).
 -define(KIND_INPUT, 16#02).
 
@@ -12,7 +15,9 @@
     conn = undefined,
     stream = undefined,
     server = undefined,
-    token = undefined
+    token = undefined,
+    heartbeat_ref = undefined,
+    heartbeat_timer = undefined
 }).
 
 start_link() ->
@@ -56,6 +61,10 @@ handle_info(heartbeat, State = #state{conn = undefined}) ->
 handle_info(heartbeat, State) ->
     send_json(#{<<"type">> => <<"host.heartbeat">>}),
     erlang:send_after(?HEARTBEAT_MS, self(), heartbeat),
+    {noreply, schedule_heartbeat_timeout(State)};
+handle_info({heartbeat_timeout, Ref}, State = #state{heartbeat_ref = Ref}) ->
+    {noreply, reset_and_reconnect(State)};
+handle_info({heartbeat_timeout, _Ref}, State) ->
     {noreply, State};
 handle_info({gun_upgrade, Conn, Stream, [<<"websocket">>], _Headers}, State = #state{conn = Conn, stream = Stream}) ->
     register_host(),
@@ -70,11 +79,17 @@ handle_info({gun_error, _Conn, _Stream, Reason}, State) ->
 handle_info({gun_down, _Conn, _Proto, _Reason, _Killed, _Unprocessed}, State) ->
     {noreply, reset_and_reconnect(State)};
 handle_info({gun_ws, _Conn, _Stream, {text, Bin}}, State) ->
-    handle_text(Bin),
-    {noreply, State};
+    case handle_text(Bin) of
+        heartbeat_ack -> {noreply, cancel_heartbeat_timeout(State)};
+        _ -> {noreply, State}
+    end;
 handle_info({gun_ws, _Conn, _Stream, {binary, Bin}}, State) ->
     handle_binary(Bin),
     {noreply, State};
+handle_info({gun_ws, _Conn, _Stream, close}, State) ->
+    {noreply, reset_and_reconnect(State)};
+handle_info({gun_ws, _Conn, _Stream, {close, _Code, _Reason}}, State) ->
+    {noreply, reset_and_reconnect(State)};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -130,10 +145,11 @@ open_ws(WsUrl, Token) ->
             case gun:await_up(Conn, 10000) of
                 {ok, _Proto} ->
                     Headers = [
-                        {<<"authorization">>, <<"Bearer ", Token/binary>>},
-                        {<<"sec-websocket-protocol">>, <<"spawn.v1">>}
+                        {<<"authorization">>, <<"Bearer ", Token/binary>>}
                     ],
-                    Stream = gun:ws_upgrade(Conn, Path, Headers),
+                    Stream = gun:ws_upgrade(Conn, Path, Headers, #{
+                        protocols => [{<<"spawn.v1">>, gun_ws_h}]
+                    }),
                     {ok, Conn, Stream};
                 Error ->
                     {error, Error}
@@ -146,9 +162,22 @@ default_port("wss") -> 443;
 default_port("ws") -> 80.
 
 reset_and_reconnect(State = #state{conn = Conn}) ->
+    State1 = cancel_heartbeat_timeout(State),
     catch gun:close(Conn),
     erlang:send_after(?RECONNECT_MS, self(), connect),
-    State#state{conn = undefined, stream = undefined}.
+    State1#state{conn = undefined, stream = undefined}.
+
+schedule_heartbeat_timeout(State0) ->
+    State = cancel_heartbeat_timeout(State0),
+    Ref = make_ref(),
+    Timer = erlang:send_after(?HEARTBEAT_TIMEOUT_MS, self(), {heartbeat_timeout, Ref}),
+    State#state{heartbeat_ref = Ref, heartbeat_timer = Timer}.
+
+cancel_heartbeat_timeout(State = #state{heartbeat_timer = undefined}) ->
+    State#state{heartbeat_ref = undefined};
+cancel_heartbeat_timeout(State = #state{heartbeat_timer = Timer}) ->
+    _ = erlang:cancel_timer(Timer),
+    State#state{heartbeat_ref = undefined, heartbeat_timer = undefined}.
 
 register_host() ->
     Host = host_name(),
@@ -164,13 +193,12 @@ register_host() ->
 
 handle_text(Bin) ->
     case spawnd_json:decode(Bin) of
+        {ok, #{<<"type">> := <<"host.heartbeat">>}} -> heartbeat_ack;
         {ok, Obj} -> dispatch(Obj);
         _ -> ok
     end.
 
 dispatch(#{<<"type">> := <<"registered">>}) ->
-    ok;
-dispatch(#{<<"type">> := <<"host.heartbeat">>}) ->
     ok;
 dispatch(Obj = #{<<"type">> := <<"host.fs.list">>}) ->
     Req = maps:get(<<"request_id">>, Obj),
@@ -193,7 +221,7 @@ dispatch(Obj = #{<<"type">> := <<"host.tools.install">>}) ->
     send_json(#{
         <<"type">> => <<"host.tools.install_result">>,
         <<"request_id">> => Req,
-        <<"result">> => spawnd_host:tool_install(Target)
+        <<"result">> => safe_tool_install(Target)
     });
 dispatch(Obj = #{<<"type">> := <<"host.daemon.status">>}) ->
     Req = maps:get(<<"request_id">>, Obj),
@@ -215,13 +243,13 @@ dispatch(Obj = #{<<"type">> := Type}) when Type =:= <<"agent.create">>; Type =:=
         cols => maps:get(<<"cols">>, Obj, 120),
         rows => maps:get(<<"rows">>, Obj, 32)
     },
-    case Type of
-        <<"agent.restart">> -> kill_existing(AgentId);
-        _ -> ok
-    end,
     case ensure_agent_executable(Obj) of
         ok ->
-            case spawnd_registry:create(AgentId, Spec) of
+            Result = case Type of
+                <<"agent.restart">> -> spawnd_registry:restart(AgentId, Spec);
+                _ -> spawnd_registry:create(AgentId, Spec)
+            end,
+            case Result of
                 {ok, _Pid} -> ok;
                 Error -> send_error(AgentId, <<"spawn_failed">>, io_lib:format("~p", [Error]))
             end;
@@ -238,27 +266,40 @@ dispatch(Obj = #{<<"type">> := <<"agent.snapshot">>, <<"agent_id">> := AgentId})
     Lines = maps:get(<<"lines">>, Obj, 5000),
     with_agent(AgentId, fun(Pid) ->
         Bytes = spawnd_agent:snapshot(Pid, Lines),
-        send_json(#{
+        Reply0 = #{
             <<"type">> => <<"agent.snapshot">>,
             <<"agent_id">> => AgentId,
             <<"bytes_b64">> => base64:encode(Bytes)
-        })
+        },
+        Reply =
+            case maps:get(<<"request_id">>, Obj, undefined) of
+                undefined -> Reply0;
+                Req -> Reply0#{<<"request_id">> => Req}
+            end,
+        send_json(Reply)
     end);
 dispatch(#{<<"type">> := <<"agent.redraw">>, <<"agent_id">> := AgentId}) ->
     with_agent(AgentId, fun(Pid) -> spawnd_agent:redraw(Pid) end);
 dispatch(Obj = #{<<"type">> := <<"agent.upload">>, <<"agent_id">> := AgentId}) ->
     with_agent(AgentId, fun(Pid) ->
-        Path = spawnd_host:save_upload(Obj),
-        case maps:get(<<"paste">>, Obj, true) of
-            false -> ok;
-            _ -> spawnd_agent:stdin(Pid, Path)
-        end,
-        send_json(#{
-            <<"type">> => <<"agent.uploaded">>,
-            <<"agent_id">> => AgentId,
-            <<"path">> => Path,
-            <<"client_id">> => maps:get(<<"client_id">>, Obj, null)
-        })
+        case catch spawnd_host:save_upload(Obj) of
+            Path when is_binary(Path) ->
+                case maps:get(<<"paste">>, Obj, true) of
+                    false ->
+                        ok;
+                    _ ->
+                        Prefix = upload_paste_prefix(Obj),
+                        spawnd_agent:stdin(Pid, <<Prefix/binary, Path/binary>>)
+                end,
+                send_json(#{
+                    <<"type">> => <<"agent.uploaded">>,
+                    <<"agent_id">> => AgentId,
+                    <<"path">> => Path,
+                    <<"client_id">> => maps:get(<<"client_id">>, Obj, null)
+                });
+            {'EXIT', Reason} ->
+                send_error(AgentId, <<"upload_failed">>, io_lib:format("~p", [Reason]))
+        end
     end);
 dispatch(_Obj) ->
     ok.
@@ -288,37 +329,109 @@ send_error(AgentId, Code, Message) ->
         <<"message">> => iolist_to_binary(Message)
     }).
 
+upload_paste_prefix(Obj) ->
+    case maps:get(<<"paste_prefix">>, Obj, <<>>) of
+        Prefix when is_binary(Prefix) -> Prefix;
+        _ -> <<>>
+    end.
+
+safe_tool_install(Target) ->
+    case catch spawnd_host:tool_install(Target) of
+        Result when is_map(Result) ->
+            Result;
+        {'EXIT', Reason} ->
+            #{
+                <<"preset_id">> => maps:get(<<"preset_id">>, Target, <<>>),
+                <<"preset_name">> => maps:get(<<"preset_name">>, Target, <<>>),
+                <<"agent_kind">> => maps:get(<<"agent_kind">>, Target, <<>>),
+                <<"command">> => maps:get(<<"command">>, Target, <<>>),
+                <<"install">> => maps:get(<<"install">>, Target, null),
+                <<"success">> => false,
+                <<"exit_code">> => null,
+                <<"output">> => <<>>,
+                <<"error">> => iolist_to_binary(io_lib:format("~p", [Reason]))
+            }
+    end.
+
 maybe_create_cwd(true, Cwd) ->
     filelib:ensure_dir(filename:join(spawnd_host:expand_path(Cwd), "x"));
 maybe_create_cwd(_, _) ->
     ok.
 
-ensure_agent_executable(#{<<"argv">> := [Exe | _], <<"install">> := Install}) ->
-    case executable_exists(Exe) of
+ensure_agent_executable(Obj = #{<<"argv">> := [Exe | _], <<"install">> := Install}) ->
+    Env = env_list(maps:get(<<"env">>, Obj, #{})),
+    case executable_exists(Exe, Env) of
         true -> ok;
         false when is_binary(Install), byte_size(Install) > 0 ->
-            _ = os:cmd(binary_to_list(Install) ++ " 2>&1"),
-            case executable_exists(Exe) of
+            _ = spawnd_host:tool_install(#{
+                <<"preset_id">> => maps:get(<<"preset_id">>, Obj, <<>>),
+                <<"preset_name">> => maps:get(<<"preset_name">>, Obj, <<>>),
+                <<"agent_kind">> => maps:get(<<"agent_kind">>, Obj, <<>>),
+                <<"command">> => Exe,
+                <<"install">> => Install
+            }),
+            case executable_exists(Exe, Env) of
                 true -> ok;
                 false -> {error, <<"install completed but executable is still not on PATH">>}
             end;
         false ->
             {error, <<"executable not found and no install command is configured">>}
     end;
-ensure_agent_executable(#{<<"argv">> := [Exe | _]}) ->
-    case executable_exists(Exe) of
+ensure_agent_executable(Obj = #{<<"argv">> := [Exe | _]}) ->
+    Env = env_list(maps:get(<<"env">>, Obj, #{})),
+    case executable_exists(Exe, Env) of
         true -> ok;
         false -> {error, <<"executable not found">>}
     end;
 ensure_agent_executable(_) ->
     {error, <<"argv is empty">>}.
 
-executable_exists(Exe0) ->
+executable_exists(Exe0, Env) ->
     Exe = case is_binary(Exe0) of true -> binary_to_list(Exe0); false -> Exe0 end,
     case filename:pathtype(Exe) of
         absolute -> filelib:is_file(Exe);
-        _ -> os:find_executable(Exe) =/= false
+        _ -> find_in_agent_path(Exe, Env) =/= false orelse os:find_executable(Exe) =/= false
     end.
+
+find_in_agent_path(Exe, Env) ->
+    case lists:keyfind("PATH", 1, Env) of
+        {"PATH", Path} -> find_in_path(Exe, Path);
+        false -> false
+    end.
+
+find_in_path(Exe, Path) ->
+    lists:foldl(
+        fun
+            (_Dir, Found) when Found =/= false ->
+                Found;
+            ("", false) ->
+                false;
+            (Dir, false) ->
+                Candidate = filename:join(Dir, Exe),
+                case file:read_file_info(Candidate) of
+                    {ok, #file_info{type = regular, mode = Mode}} when Mode band 8#111 =/= 0 ->
+                        Candidate;
+                    _ ->
+                        false
+                end
+        end,
+        false,
+        string:split(Path, ":", all)
+    ).
+
+env_list(Env) when is_map(Env) ->
+    [{binary_or_list(K), binary_or_list(V)} || {K, V} <- maps:to_list(Env)];
+env_list(Env) when is_list(Env) ->
+    [{binary_or_list(K), binary_or_list(V)} || {K, V} <- Env];
+env_list(_) ->
+    [].
+
+binary_or_list(Bin) when is_binary(Bin) ->
+    binary_to_list(Bin);
+binary_or_list(List) when is_list(List) ->
+    List;
+binary_or_list(Other) ->
+    binary_to_list(iolist_to_binary(io_lib:format("~p", [Other]))).
 
 host_name() ->
     case inet:gethostname() of
@@ -329,3 +442,46 @@ host_name() ->
 os_name() ->
     {Family, Name} = os:type(),
     list_to_binary(io_lib:format("~p/~p", [Family, Name])).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+ensure_agent_executable_uses_agent_path_env_test() ->
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-ws-path-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = filelib:ensure_dir(filename:join(Base, "x")),
+    Command = "spawnd-ws-path-command",
+    Script = filename:join(Base, Command),
+    ok = file:write_file(Script, <<"#!/bin/sh\nexit 0\n">>),
+    ok = file:change_mode(Script, 8#755),
+    OldPath = os:getenv("PATH"),
+    try
+        ?assertEqual(
+            ok,
+            ensure_agent_executable(#{
+                <<"argv">> => [list_to_binary(Command)],
+                <<"env">> => #{<<"PATH">> => list_to_binary(Base ++ ":" ++ path_or_empty(OldPath))},
+                <<"install">> => <<"false">>
+            })
+        )
+    after
+        _ = file:del_dir_r(Base)
+    end.
+
+ensure_agent_executable_reports_missing_command_test() ->
+    Missing = <<
+        "spawnd-ws-missing-command-",
+        (integer_to_binary(erlang:unique_integer([positive])))/binary
+    >>,
+    ?assertMatch(
+        {error, <<"executable not found", _/binary>>},
+        ensure_agent_executable(#{<<"argv">> => [Missing], <<"env">> => #{}})
+    ).
+
+path_or_empty(false) ->
+    "";
+path_or_empty(Path) ->
+    Path.
+-endif.

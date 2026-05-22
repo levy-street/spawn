@@ -25,11 +25,11 @@ main(Args0) ->
         ["status" | _] ->
             halt_result(spawnd_creds:status(Server));
         ["agents" | _] ->
-            print_json(remote_or_error(#{<<"command">> => <<"agents">>}));
+            print_json_result(remote_or_error(#{<<"command">> => <<"agents">>}));
         ["kill", AgentId | _] ->
-            print_json(remote_or_error(#{<<"command">> => <<"kill">>, <<"agent_id">> => list_to_binary(AgentId)}));
+            print_json_result(remote_or_error(#{<<"command">> => <<"kill">>, <<"agent_id">> => list_to_binary(AgentId)}));
         ["update-check" | _] ->
-            print_json(remote_or_error(#{<<"command">> => <<"update-check">>}));
+            print_json_result(remote_or_error(#{<<"command">> => <<"update-check">>}));
         ["self-test" | _] ->
             halt_result(self_test());
         _ ->
@@ -52,9 +52,14 @@ option_value(Opt, [_ | Rest], Default) ->
 option_value(_Opt, [], Default) ->
     Default.
 
-print_json(Term) ->
+print_json_result(Term) ->
     io:format("~s~n", [spawnd_json:encode(Term)]),
-    halt(0).
+    halt(json_exit_code(Term)).
+
+json_exit_code(#{<<"ok">> := false}) ->
+    1;
+json_exit_code(_) ->
+    0.
 
 remote_or_error(Request) ->
     case spawnd_control:request_remote(Request) of
@@ -77,20 +82,17 @@ usage() ->
     io:format("Usage: spawnd [--server URL] login|run|logout|status|agents|kill AGENT_ID|update-check|self-test~n").
 
 self_test() ->
-    {ok, _} = application:ensure_all_started(erlexec),
-    Spec = #{
-        agent_id => <<"00000000-0000-0000-0000-000000000001">>,
-        argv => [<<"/bin/sh">>, <<"-lc">>, <<"printf ok">>],
-        cwd => <<"/tmp">>,
-        env => #{},
-        cols => 80,
-        rows => 24,
-        notify => self()
-    },
-    {ok, Pid} = spawnd_agent:start_link(Spec),
-    receive
-        {agent_started, _, _} -> ok
-    after 2000 ->
-        exit(Pid, kill),
-        {error, timeout_waiting_for_start}
+    case spawnd_control:request_remote(#{<<"command">> => <<"self-test">>}) of
+        {ok, #{<<"ok">> := true}} -> ok;
+        {ok, Reply} -> {error, Reply};
+        Error -> Error
     end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+json_exit_code_reflects_ok_false_test() ->
+    ?assertEqual(1, json_exit_code(#{<<"ok">> => false, <<"error">> => <<"nope">>})),
+    ?assertEqual(0, json_exit_code(#{<<"ok">> => true})),
+    ?assertEqual(0, json_exit_code(#{<<"agents">> => []})).
+-endif.

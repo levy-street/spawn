@@ -1,10 +1,13 @@
 -module(spawnd_agent).
 -behaviour(gen_server).
 
+-include_lib("kernel/include/file.hrl").
+
 -export([start_link/1, stdin/2, resize/3, snapshot/2, redraw/1, stop_agent/1, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(MAX_BUFFER, 2097152).
+-define(STOP_TIMEOUT_MS, 3000).
 
 -record(state, {
     agent_id,
@@ -16,7 +19,8 @@
     proc_pid = undefined,
     os_pid = undefined,
     buffer = <<>>,
-    notify = undefined
+    notify = undefined,
+    report = true
 }).
 
 start_link(Spec) ->
@@ -49,11 +53,13 @@ init(Spec) ->
     Cols = maps:get(cols, Spec, 120),
     Rows = maps:get(rows, Spec, 32),
     Notify = maps:get(notify, Spec, undefined),
+    Report = maps:get(report, Spec, true),
     case Argv of
         [] ->
             {stop, empty_argv};
         [Exe0 | Args] ->
-            Exe = resolve_executable(Exe0),
+            EnvList = normalize_env(Env),
+            Exe = resolve_executable(Exe0, EnvList),
             Cmd = [Exe | [binary_or_list(A) || A <- Args]],
             Opts = [
                 stdin,
@@ -62,14 +68,14 @@ init(Spec) ->
                 pty,
                 monitor,
                 kill_group,
-                {kill_timeout, 5},
+                {kill_timeout, 1},
                 {winsz, {Rows, Cols}},
                 {cd, binary_or_list(Cwd)},
-                {env, normalize_env(Env)}
+                {env, EnvList}
             ],
             case exec:run_link(Cmd, Opts) of
                 {ok, ProcPid, OsPid} ->
-                    spawnd_ws:send_json(#{
+                    maybe_report(Report, #{
                         <<"type">> => <<"agent.started">>,
                         <<"agent_id">> => AgentId,
                         <<"pid">> => OsPid
@@ -84,7 +90,8 @@ init(Spec) ->
                         cols = Cols,
                         proc_pid = ProcPid,
                         os_pid = OsPid,
-                        notify = Notify
+                        notify = Notify,
+                        report = Report
                     }};
                 {error, Reason} ->
                     {stop, Reason}
@@ -106,28 +113,21 @@ handle_cast(redraw, State = #state{os_pid = OsPid, rows = Rows, cols = Cols}) ->
     _ = exec:winsz(OsPid, Rows, Cols),
     {noreply, State};
 handle_cast(stop_agent, State = #state{os_pid = OsPid}) ->
-    _ = exec:stop(OsPid),
-    {noreply, State}.
+    Reason =
+        case catch exec:stop_and_wait(OsPid, ?STOP_TIMEOUT_MS) of
+            {'EXIT', Error} -> Error;
+            Result -> Result
+        end,
+    finish_exit(Reason, State#state{os_pid = undefined}).
 
 handle_info({stdout, _OsPid, Data}, State) ->
     output(Data, State);
 handle_info({stderr, _OsPid, Data}, State) ->
     output(Data, State);
-handle_info({'DOWN', _OsPid, process, _Pid, Reason}, State = #state{agent_id = AgentId}) ->
-    {ExitCode, Signal} = decode_exit(Reason),
-    spawnd_ws:send_json(#{
-        <<"type">> => <<"agent.exit">>,
-        <<"agent_id">> => AgentId,
-        <<"exit_code">> => ExitCode,
-        <<"signal">> => Signal
-    }),
-    maybe_notify(State#state.notify, {agent_exit, AgentId, Reason}),
-    spawnd_registry:unregister(AgentId),
-    {stop, normal, State};
-handle_info({'EXIT', _Pid, Reason}, State = #state{agent_id = AgentId}) ->
-    maybe_notify(State#state.notify, {agent_exit, AgentId, Reason}),
-    spawnd_registry:unregister(AgentId),
-    {stop, normal, State};
+handle_info({'DOWN', _OsPid, process, _Pid, Reason}, State) ->
+    finish_exit(Reason, State);
+handle_info({'EXIT', _Pid, Reason}, State) ->
+    finish_exit(Reason, State);
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -140,9 +140,24 @@ terminate(_Reason, #state{os_pid = OsPid}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-output(Data0, State = #state{agent_id = AgentId, buffer = Buffer}) ->
+finish_exit(Reason, State = #state{agent_id = AgentId, report = Report}) ->
+    {ExitCode, Signal} = decode_exit(Reason),
+    maybe_report(Report, #{
+        <<"type">> => <<"agent.exit">>,
+        <<"agent_id">> => AgentId,
+        <<"exit_code">> => ExitCode,
+        <<"signal">> => Signal
+    }),
+    maybe_notify(State#state.notify, {agent_exit, AgentId, Reason}),
+    spawnd_registry:unregister(AgentId, self()),
+    {stop, normal, State#state{os_pid = undefined}}.
+
+output(Data0, State = #state{agent_id = AgentId, buffer = Buffer, report = Report}) ->
     Data = iolist_to_binary(Data0),
-    spawnd_ws:send_binary(spawnd_frames:encode_output(AgentId, Data)),
+    case Report of
+        true -> spawnd_ws:send_binary(spawnd_frames:encode_output(AgentId, Data));
+        false -> ok
+    end,
     {noreply, State#state{buffer = trim_buffer(<<Buffer/binary, Data/binary>>)}}.
 
 trim_buffer(Bin) when byte_size(Bin) =< ?MAX_BUFFER ->
@@ -181,21 +196,59 @@ binary_or_list(List) when is_list(List) ->
 binary_or_list(Other) ->
     binary_to_list(iolist_to_binary(io_lib:format("~p", [Other]))).
 
-resolve_executable(Exe0) ->
+resolve_executable(Exe0, Env) ->
     Exe = binary_or_list(Exe0),
     case filename:pathtype(Exe) of
         absolute -> Exe;
         _ ->
-            case os:find_executable(Exe) of
-                false -> Exe;
+            case find_in_agent_path(Exe, Env) of
+                false ->
+                    case os:find_executable(Exe) of
+                        false -> Exe;
+                        Path -> Path
+                    end;
                 Path -> Path
             end
     end.
+
+find_in_agent_path(Exe, Env) ->
+    case lists:keyfind("PATH", 1, Env) of
+        {"PATH", Path} -> find_in_path(Exe, Path);
+        false -> false
+    end.
+
+find_in_path(Exe, Path) ->
+    lists:foldl(
+        fun
+            (_Dir, Found) when Found =/= false ->
+                Found;
+            ("", false) ->
+                false;
+            (Dir, false) ->
+                Candidate = filename:join(Dir, Exe),
+                case filelib:is_regular(Candidate) andalso filelib:is_file(Candidate) of
+                    true ->
+                        case file:read_file_info(Candidate) of
+                            {ok, #file_info{mode = Mode}} when Mode band 8#111 =/= 0 -> Candidate;
+                            _ -> false
+                        end;
+                    false ->
+                        false
+                end
+        end,
+        false,
+        string:split(Path, ":", all)
+    ).
 
 maybe_notify(undefined, _Msg) ->
     ok;
 maybe_notify(Pid, Msg) when is_pid(Pid) ->
     Pid ! Msg,
+    ok.
+
+maybe_report(true, Msg) ->
+    spawnd_ws:send_json(Msg);
+maybe_report(false, _Msg) ->
     ok.
 
 -ifdef(TEST).
@@ -258,8 +311,84 @@ hot_code_change_keeps_subprocess_alive_test() ->
     spawnd_agent:stop_agent(Pid),
     receive
         {agent_exit, <<"00000000-0000-0000-0000-000000000002">>, _Reason} -> ok
-    after 3000 ->
+    after 4500 ->
         exit(Pid, kill),
         ?assert(false)
     end.
+
+stop_agent_waits_for_subprocess_exit_test() ->
+    {ok, _} = application:ensure_all_started(erlexec),
+    AgentId = <<"00000000-0000-0000-0000-000000000003">>,
+    Spec = #{
+        agent_id => AgentId,
+        argv => [<<"/bin/sh">>, <<"-lc">>, <<"while :; do sleep 1; done">>],
+        cwd => <<"/tmp">>,
+        env => #{},
+        cols => 80,
+        rows => 24,
+        notify => self(),
+        report => false
+    },
+    {ok, Pid} = spawnd_agent:start_link(Spec),
+    receive
+        {agent_started, AgentId, _OsPid} -> ok
+    after 2000 ->
+        exit(Pid, kill),
+        ?assert(false)
+    end,
+    spawnd_agent:stop_agent(Pid),
+    receive
+        {agent_exit, AgentId, _Reason} -> ok
+    after 4500 ->
+        exit(Pid, kill),
+        ?assert(false)
+    end.
+
+relative_executable_uses_agent_path_env_test() ->
+    {ok, _} = application:ensure_all_started(erlexec),
+    AgentId = <<"00000000-0000-0000-0000-000000000004">>,
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-agent-path-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = filelib:ensure_dir(filename:join(Base, "x")),
+    Command = "spawnd-agent-path-command",
+    Script = filename:join(Base, Command),
+    ok = file:write_file(Script, <<"#!/bin/sh\nsleep 1\n">>),
+    ok = file:change_mode(Script, 8#755),
+    OldPath = os:getenv("PATH"),
+    Spec = #{
+        agent_id => AgentId,
+        argv => [list_to_binary(Command)],
+        cwd => <<"/tmp">>,
+        env => #{
+            <<"PATH">> => list_to_binary(Base ++ ":" ++ path_or_empty(OldPath))
+        },
+        cols => 80,
+        rows => 24,
+        notify => self(),
+        report => false
+    },
+    try
+        {ok, Pid} = spawnd_agent:start_link(Spec),
+        receive
+            {agent_started, AgentId, _OsPid} -> ok
+        after 2000 ->
+            exit(Pid, kill),
+            ?assert(false)
+        end,
+        receive
+            {agent_exit, AgentId, _Reason} -> ok
+        after 3000 ->
+            exit(Pid, kill),
+            ?assert(false)
+        end
+    after
+        _ = file:del_dir_r(Base)
+    end.
+
+path_or_empty(false) ->
+    "";
+path_or_empty(Path) ->
+    Path.
 -endif.

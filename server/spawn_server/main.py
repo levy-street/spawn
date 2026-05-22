@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
+from .csrf import csrf_middleware
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .presets import seed_builtin_presets
 from .redis import lifespan_shutdown as redis_shutdown
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.middleware("http")(csrf_middleware)
 
     app.include_router(auth_routes.router)
     app.include_router(device_routes.router)

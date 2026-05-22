@@ -21,6 +21,9 @@ Environment:
                           Set to empty when the SSH user can manage services.
   SPAWN_DEPLOY_BUILD      Run dependency sync/build/migrations. Default: 1
                           Set to 0 to only pull and restart.
+  SPAWN_DEPLOY_ARTIFACT_DIR
+                          Directory for hosted spawnd artifacts.
+                          Default: dist/spawnd
 EOF
 }
 
@@ -74,6 +77,7 @@ remote_path="${SPAWN_DEPLOY_PATH:-/opt/spawn}"
 services="${SPAWN_DEPLOY_SERVICES:-spawn-server spawn-web}"
 sudo_cmd="${SPAWN_DEPLOY_SUDO-sudo -n}"
 run_build="${SPAWN_DEPLOY_BUILD:-1}"
+artifact_dir="${SPAWN_DEPLOY_ARTIFACT_DIR:-dist/spawnd}"
 
 printf 'deploy-prod: deploying %s to %s:%s\n' "$remote_ref" "$host" "$remote_path"
 
@@ -84,6 +88,7 @@ env_prefix="$(
   quote_env SPAWN_DEPLOY_SERVICES "$services"
   quote_env SPAWN_DEPLOY_SUDO "$sudo_cmd"
   quote_env SPAWN_DEPLOY_BUILD "$run_build"
+  quote_env SPAWN_DEPLOY_ARTIFACT_DIR "$artifact_dir"
 )"
 
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
@@ -140,11 +145,7 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   fi
 
   if [[ -f daemon/rebar.config ]]; then
-    if command -v rebar3 >/dev/null 2>&1; then
-      (cd daemon && rebar3 release && rebar3 escriptize)
-    else
-      die "rebar3 is required to build the hosted spawnd daemon"
-    fi
+    scripts/package-spawnd.sh --out-dir "$SPAWN_DEPLOY_ARTIFACT_DIR" >/dev/null
   fi
 fi
 

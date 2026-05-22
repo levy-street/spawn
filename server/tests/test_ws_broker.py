@@ -168,6 +168,49 @@ async def test_broker_promotes_next_browser_when_owner_detaches():
 
 
 @pytest.mark.asyncio
+async def test_broker_display_control_uses_shared_backend_when_available(app):
+    broker = get_broker()
+
+    agent_id = "00000000-0000-4000-8000-0000000000d4"
+    first = BrowserConn(
+        user_id="user-1",
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    second = BrowserConn(
+        user_id="user-1",
+        agent_id=agent_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+
+    first_state = await broker.attach_browser(first, cols=132, rows=43)
+    second_state = await broker.attach_browser(second, cols=60, rows=20)
+
+    assert first_state.owner is True
+    assert second_state.owner is False
+    assert second_state.cols == 132
+    assert second_state.rows == 43
+    assert second_state.viewers == 2
+
+    ignored = await broker.update_display_size(second, cols=61, rows=21)
+    assert ignored is None
+
+    taken = await broker.take_display_control(second, cols=61, rows=21)
+    assert taken.owner is True
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[first].owner is False
+    assert states[second].owner is True
+    assert states[first].cols == 61
+    assert states[first].rows == 21
+
+    await broker.detach_browser(second)
+    states = dict(await broker.display_states_for_agent(agent_id))
+    assert states[first].owner is True
+
+    await broker.detach_browser(first)
+
+
+@pytest.mark.asyncio
 async def test_broker_routes_browser_to_daemon():
     broker = get_broker()
 
@@ -225,9 +268,12 @@ async def test_broker_snapshot_request_roundtrip():
     await asyncio.sleep(0)
 
     sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123}
+    assert sent["type"] == "agent.snapshot"
+    assert sent["agent_id"] == agent_id
+    assert sent["lines"] == 123
+    assert isinstance(sent["request_id"], str)
 
-    await broker.resolve_snapshot(agent_id, "aGVsbG8=")
+    await broker.resolve_snapshot(agent_id, "aGVsbG8=", request_id=sent["request_id"])
     assert await task == "aGVsbG8="
 
     await broker.unregister_daemon(daemon)
@@ -251,14 +297,13 @@ async def test_broker_plain_snapshot_request_roundtrip():
     await asyncio.sleep(0)
 
     sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent == {
-        "type": "agent.snapshot",
-        "agent_id": agent_id,
-        "lines": 321,
-        "plain": True,
-    }
+    assert sent["type"] == "agent.snapshot"
+    assert sent["agent_id"] == agent_id
+    assert sent["lines"] == 321
+    assert sent["plain"] is True
+    assert isinstance(sent["request_id"], str)
 
-    await broker.resolve_snapshot(agent_id, "cGxhaW4=")
+    await broker.resolve_snapshot(agent_id, "cGxhaW4=", request_id=sent["request_id"])
     assert await task == "cGxhaW4="
 
     await broker.unregister_daemon(daemon)
@@ -412,3 +457,105 @@ async def test_pubsub_publish_subscribe_roundtrip(app):
         pass
 
     assert received == [b"hello ", b"world"]
+
+
+@pytest.mark.asyncio
+async def test_agent_event_publish_subscribe_roundtrip(app):
+    from spawn_server.redis import get_backend
+
+    backend = get_backend()
+    agent_id = "00000000-0000-4000-8000-0000000000bc"
+
+    async with backend.subscribe_agent_events(agent_id) as stream:
+        await backend.publish_agent_event(agent_id, {"type": "agent.status", "status": "running"})
+        assert await asyncio.wait_for(anext(stream), timeout=1) == {
+            "type": "agent.status",
+            "status": "running",
+        }
+
+
+@pytest.mark.asyncio
+async def test_remote_host_command_publish_roundtrip(app):
+    from spawn_server.redis import get_backend
+
+    broker = get_broker()
+    host_id = "remote-host-command"
+    payload = {"type": "agent.redraw", "agent_id": "00000000-0000-4000-8000-0000000000f1"}
+
+    async with get_backend().subscribe_host_commands(host_id) as stream:
+        assert await broker.send_text_to_host(host_id, payload) is True
+        received = await asyncio.wait_for(anext(stream), timeout=1)
+
+    assert received == {"kind": "text", "payload": payload}
+
+
+@pytest.mark.asyncio
+async def test_registered_daemon_consumes_remote_host_commands(app):
+    from spawn_server.redis import get_backend
+
+    broker = get_broker()
+    host_id = "host-command-pump"
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(
+        host_id=host_id,
+        user_id="user-1",
+        websocket=daemon_ws,  # type: ignore[arg-type]
+    )
+    await broker.register_daemon(daemon)
+    try:
+        subscribers = 0
+        for _ in range(100):
+            subscribers = await get_backend().publish_host_command(
+                host_id,
+                {"kind": "text", "payload": {"type": "host.daemon.status", "request_id": "r1"}},
+            )
+            if subscribers >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert subscribers >= 1
+        for _ in range(100):
+            if daemon_ws.sent_text:
+                break
+            await asyncio.sleep(0.01)
+        assert json.loads(daemon_ws.sent_text[-1]) == {
+            "type": "host.daemon.status",
+            "request_id": "r1",
+        }
+    finally:
+        await broker.unregister_daemon(daemon)
+
+
+@pytest.mark.asyncio
+async def test_remote_daemon_status_request_uses_response_channel(app):
+    from spawn_server.redis import get_backend
+
+    broker = get_broker()
+    host_id = "remote-status-host"
+    ready = asyncio.Event()
+
+    async def fake_daemon() -> None:
+        async with get_backend().subscribe_host_commands(host_id) as stream:
+            ready.set()
+            command = await asyncio.wait_for(anext(stream), timeout=1)
+            payload = command["payload"]
+            assert payload["type"] == "host.daemon.status"
+            request_id = payload["request_id"]
+            await get_backend().publish_request_response(
+                request_id,
+                {
+                    "type": "host.daemon.status_result",
+                    "request_id": request_id,
+                    "status": "online",
+                    "agents": [],
+                    "update": {"ok": True, "clean": True},
+                },
+            )
+
+    daemon_task = asyncio.create_task(fake_daemon())
+    await ready.wait()
+    result = await broker.request_daemon_status_for_host(host_id, timeout=1)
+    await daemon_task
+
+    assert result is not None
+    assert result["type"] == "host.daemon.status_result"
+    assert result["status"] == "online"
