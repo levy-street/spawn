@@ -18,6 +18,7 @@
     server = undefined,
     token = undefined,
     reconnect_ms = ?INITIAL_RECONNECT_MS,
+    reconnect_timer = undefined,
     heartbeat_ref = undefined,
     heartbeat_timer = undefined
 }).
@@ -55,8 +56,10 @@ handle_cast({send_binary, Bin}, State = #state{conn = Conn, stream = Stream}) wh
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(connect, State = #state{conn = undefined}) ->
+    {noreply, connect(State#state{reconnect_timer = undefined})};
 handle_info(connect, State) ->
-    {noreply, connect(State)};
+    {noreply, State#state{reconnect_timer = undefined}};
 handle_info(heartbeat, State = #state{conn = undefined}) ->
     {noreply, schedule_reconnect(State)};
 handle_info(heartbeat, State) ->
@@ -164,12 +167,14 @@ reset_and_reconnect(State = #state{conn = Conn}) ->
     catch gun:close(Conn),
     schedule_reconnect(State1#state{conn = undefined, stream = undefined}).
 
+schedule_reconnect(State = #state{reconnect_timer = Timer}) when Timer =/= undefined ->
+    State;
 schedule_reconnect(State = #state{reconnect_ms = Delay}) ->
-    erlang:send_after(Delay, self(), connect),
-    State#state{reconnect_ms = next_reconnect_ms(Delay)}.
+    Timer = erlang:send_after(Delay, self(), connect),
+    State#state{reconnect_ms = next_reconnect_ms(Delay), reconnect_timer = Timer}.
 
 reset_backoff(State) ->
-    State#state{reconnect_ms = ?INITIAL_RECONNECT_MS}.
+    State#state{reconnect_ms = ?INITIAL_RECONNECT_MS, reconnect_timer = undefined}.
 
 next_reconnect_ms(Delay) when Delay >= ?MAX_RECONNECT_MS ->
     ?MAX_RECONNECT_MS;
@@ -495,6 +500,26 @@ next_reconnect_ms_uses_exponential_cap_test() ->
     ?assertEqual(60000, next_reconnect_ms(32000)),
     ?assertEqual(60000, next_reconnect_ms(60000)),
     ?assertEqual(60000, next_reconnect_ms(120000)).
+
+schedule_reconnect_does_not_queue_duplicate_connects_test() ->
+    State1 = schedule_reconnect(#state{reconnect_ms = 1}),
+    State2 = schedule_reconnect(State1),
+    ?assertEqual(State1#state.reconnect_timer, State2#state.reconnect_timer),
+    receive
+        connect -> ok
+    after 100 ->
+        ?assert(false)
+    end,
+    receive
+        connect -> ?assert(false)
+    after 20 ->
+        ok
+    end.
+
+stale_connect_timer_is_ignored_when_connected_test() ->
+    {noreply, State} = handle_info(connect, #state{conn = connected, reconnect_timer = timer}),
+    ?assertEqual(connected, State#state.conn),
+    ?assertEqual(undefined, State#state.reconnect_timer).
 
 path_or_empty(false) ->
     "";
