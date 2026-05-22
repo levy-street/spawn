@@ -33,6 +33,7 @@ also accepts `Bearer` for API testing).
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
 | GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
+| GET    | `/api/hosts/{id}/daemon` | query local daemon status and update readiness |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
@@ -136,7 +137,7 @@ Agent IDs are big-endian 16-byte UUIDs.
  "host_name": "gpu-box-1",
  "os": "linux",
  "arch": "x86_64",
- "version": "0.1.0",
+ "version": "0.2.0",
  "home_dir": "/home/me",
  "existing_agents": ["uuid", ...]}
 
@@ -197,6 +198,12 @@ Agent IDs are big-endian 16-byte UUIDs.
    "error": null,
    "status": null}}
 
+{"type": "host.daemon.status_result",
+ "request_id": "uuid",
+ "status": "online",
+ "agents": [{"agent_id": "uuid", "pid": "12345"}],
+ "update": {"ok": true, "clean": true, "changes": null}}
+
 {"type": "error",
  "agent_id": "uuid|null",
  "code": "spawn_failed|invalid_credential|...",
@@ -232,13 +239,15 @@ Agent IDs are big-endian 16-byte UUIDs.
    "command": "codex",
    "install": "npm install -g @openai/codex"}}
 
+{"type": "host.daemon.status",
+ "request_id": "uuid"}
+
 {"type": "agent.create",
  "agent_id": "uuid",
  "cwd": "/home/me/projects/foo",
  "argv": ["claude"],
  "env": {"FOO": "bar"},
  "install": "npm install -g @anthropic-ai/claude-code",
- "tmux_session": "spawn-<uuid>",
  "cols": 120,
  "rows": 32,
  "create_cwd": true}
@@ -249,7 +258,6 @@ Agent IDs are big-endian 16-byte UUIDs.
  "argv": ["claude"],
  "env": {"FOO": "bar"},
  "install": "npm install -g @anthropic-ai/claude-code",
- "tmux_session": "spawn-<uuid>",
  "cols": 120,
  "rows": 32,
  "create_cwd": true}
@@ -294,8 +302,8 @@ distinguish healthy idle connections from dead sockets.
 - Auth: session cookie (or `?token=` for testing).
 - Subprotocol: `spawn.v1`.
 - `cols` and `rows` are optional initial browser dimensions. When present,
-  the server resizes the tmux attach before producing the initial history
-  snapshot.
+  the server resizes the daemon-managed PTY before producing the initial
+  history snapshot.
 
 ### Browser → server
 

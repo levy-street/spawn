@@ -21,6 +21,7 @@ import { Input } from "@/components/ui/input";
 import {
   ApiError,
   type Host,
+  type HostDaemonStatus,
   type HostToolInstallResult,
   type HostToolStatus,
   hosts,
@@ -209,6 +210,7 @@ function HostsList() {
                     </Button>
                   </div>
                 </div>
+                <HostDaemonPanel host={h} />
                 <HostToolsPanel host={h} />
               </CardContent>
             </Card>
@@ -216,6 +218,60 @@ function HostsList() {
         ))}
       </ul>
     </div>
+  );
+}
+
+function HostDaemonPanel({ host }: { host: Host }) {
+  const daemonQ = useQuery({
+    queryKey: ["host-daemon", host.id],
+    queryFn: () => hosts.daemonStatus(host.id),
+    enabled: host.status === "online",
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+  });
+
+  if (host.status !== "online") return null;
+
+  const daemon = daemonQ.data;
+  return (
+    <div className="rounded-md border border-border px-3 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0 text-xs text-muted-foreground">
+          <span className="font-medium uppercase">Daemon</span>
+          {daemonQ.isLoading && <span className="ml-2">Checking...</span>}
+          {daemonQ.error && (
+            <span className="ml-2 text-destructive">
+              {daemonQ.error instanceof ApiError ? daemonQ.error.message : String(daemonQ.error)}
+            </span>
+          )}
+          {daemon && <DaemonSummary daemon={daemon} />}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={`Refresh daemon status for ${host.name}`}
+          title="Refresh daemon status"
+          onClick={() => daemonQ.refetch()}
+          disabled={daemonQ.isFetching}
+        >
+          <RefreshCw className={`size-4 ${daemonQ.isFetching ? "animate-spin" : ""}`} />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function DaemonSummary({ daemon }: { daemon: HostDaemonStatus }) {
+  const clean = daemon.update?.clean;
+  return (
+    <span className="ml-2 inline-flex flex-wrap gap-x-3 gap-y-1">
+      <span>{daemon.agents.length} local agents</span>
+      {clean !== undefined && clean !== null && (
+        <span className={clean ? "text-green-500" : "text-amber-500"}>
+          {clean ? "update clean" : "local changes present"}
+        </span>
+      )}
+    </span>
   );
 }
 

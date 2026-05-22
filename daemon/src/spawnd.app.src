@@ -1,0 +1,8 @@
+{application, spawnd,
+ [{description, "spawn daemon"},
+  {vsn, "0.2.0"},
+  {registered, [spawnd_registry, spawnd_ws, spawnd_control]},
+  {mod, {spawnd_app, []}},
+  {applications, [kernel, stdlib, inets, ssl, crypto, public_key, sasl, erlexec, gun, thoas]},
+  {env, []},
+  {modules, []}]}.

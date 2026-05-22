@@ -89,7 +89,7 @@ env_prefix="$(
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
 set -euo pipefail
 
-export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 die() {
   printf 'remote deploy: %s\n' "$*" >&2
@@ -139,11 +139,11 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
     die "bun is required for web dependency sync and build"
   fi
 
-  if [[ -f daemon/Cargo.toml ]]; then
-    if command -v cargo >/dev/null 2>&1; then
-      (cd daemon && cargo build --release --locked)
+  if [[ -f daemon/rebar.config ]]; then
+    if command -v rebar3 >/dev/null 2>&1; then
+      (cd daemon && rebar3 release && rebar3 escriptize)
     else
-      die "cargo is required to build the hosted spawnd binary"
+      die "rebar3 is required to build the hosted spawnd daemon"
     fi
   fi
 fi

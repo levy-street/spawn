@@ -159,6 +159,23 @@ class HostToolPolicyOut(BaseModel):
     last_auto_update_error: str | None = None
 
 
+class HostDaemonAgentStatus(BaseModel):
+    agent_id: str
+    pid: str | None = None
+
+
+class HostDaemonUpdateStatus(BaseModel):
+    ok: bool = True
+    clean: bool | None = None
+    changes: str | None = None
+
+
+class HostDaemonStatus(BaseModel):
+    status: str = "online"
+    agents: list[HostDaemonAgentStatus] = Field(default_factory=list)
+    update: HostDaemonUpdateStatus | None = None
+
+
 # ---------- presets ----------
 
 

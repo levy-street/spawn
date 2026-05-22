@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from spawn_server.ws.activity import output_payload_is_meaningful, should_record_agent_output
 
 
-def test_tmux_status_only_output_is_not_activity():
+def test_legacy_status_only_output_is_not_activity():
     payload = (
         b"\x1b[?25l\x1b[30m\x1b[42m\x1b[38;1H"
         b'[spawn-bb10:node*        "minecraft-jepa-curios" 04:54 08-May-26'
@@ -18,7 +18,7 @@ def test_tmux_status_only_output_is_not_activity():
     assert not should_record_agent_output("status-only-agent", datetime(2026, 1, 1, tzinfo=UTC), payload)
 
 
-def test_partial_tmux_status_output_is_not_activity():
+def test_partial_legacy_status_output_is_not_activity():
     payload = b'           "minecraft-jepa-curios" 04:49 08-May-26\x1b(B\x1b[m'
 
     assert not output_payload_is_meaningful(payload)
@@ -42,7 +42,7 @@ def test_real_output_is_activity_and_still_throttled():
     )
 
 
-def test_real_output_with_tmux_status_tail_is_activity():
+def test_real_output_with_legacy_status_tail_is_activity():
     payload = (
         b"Working for 12s\r\n"
         b"\x1b[30m\x1b[42m\x1b[38;1H"

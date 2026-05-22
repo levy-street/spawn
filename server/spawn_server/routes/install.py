@@ -19,12 +19,12 @@ DEFAULT_BRANCH = "master"
 
 @router.get("/api/install/spawnd/{target}")
 async def spawnd_binary(target: str) -> FileResponse:
-    """Serve the locally-built daemon binary for quick installs."""
+    """Serve the locally-built daemon CLI escript for quick installs."""
 
     if target != "linux-x86_64":
         raise HTTPException(status_code=404, detail="unsupported daemon target")
 
-    binary = Path(__file__).resolve().parents[3] / "daemon" / "target" / "release" / "spawnd"
+    binary = Path(__file__).resolve().parents[3] / "daemon" / "_build" / "default" / "bin" / "spawnd"
     if not binary.is_file():
         raise HTTPException(status_code=404, detail="daemon binary is not available")
 
@@ -177,44 +177,44 @@ INSTALL_SCRIPT = dedent(
       elif need sudo; then
         sudo "$@"
       else
-        die "need root privileges to install packages; install tmux, git, curl, and build tools manually, then rerun"
+        die "need root privileges to install packages; install curl, Erlang/OTP, rebar3, git, and build tools manually, then rerun"
       fi
     }
 
     install_runtime_prereqs() {
-      if need tmux && need curl; then
+      if need curl; then
         return
       fi
 
       say "installing runtime prerequisites"
       OS_NAME=$(uname -s 2>/dev/null || printf unknown)
       if [ "$OS_NAME" = "Darwin" ]; then
-        need brew || die "Homebrew is required to install missing prerequisites on macOS"
-        brew install tmux curl
+        need brew || die "Homebrew is required to install missing runtime prerequisites on macOS"
+        brew install curl
         return
       fi
 
       if need apt-get; then
         as_root apt-get update
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          tmux curl ca-certificates
+          curl ca-certificates
       elif need dnf; then
-        as_root dnf install -y tmux curl ca-certificates
+        as_root dnf install -y curl ca-certificates
       elif need yum; then
-        as_root yum install -y tmux curl ca-certificates
+        as_root yum install -y curl ca-certificates
       elif need pacman; then
-        as_root pacman -Sy --needed --noconfirm tmux curl ca-certificates
+        as_root pacman -Sy --needed --noconfirm curl ca-certificates
       elif need zypper; then
-        as_root zypper --non-interactive install tmux curl ca-certificates
+        as_root zypper --non-interactive install curl ca-certificates
       elif need apk; then
-        as_root apk add --no-cache tmux curl ca-certificates
+        as_root apk add --no-cache curl ca-certificates
       else
-        die "unsupported package manager; install tmux and curl manually, then rerun"
+        die "unsupported package manager; install curl manually, then rerun"
       fi
     }
 
     install_build_prereqs() {
-      if need git && (need cc || need gcc || need clang); then
+      if need git && need erl && need rebar3 && (need cc || need gcc || need clang); then
         return
       fi
 
@@ -222,90 +222,95 @@ INSTALL_SCRIPT = dedent(
       OS_NAME=$(uname -s 2>/dev/null || printf unknown)
       if [ "$OS_NAME" = "Darwin" ]; then
         need brew || die "Homebrew is required to install missing build prerequisites on macOS"
-        brew install git
+        brew install git erlang rebar3
         return
       fi
 
       if need apt-get; then
         as_root apt-get update
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          git build-essential pkg-config
+          git build-essential pkg-config erlang rebar3
       elif need dnf; then
-        as_root dnf install -y git gcc gcc-c++ make pkgconf-pkg-config
+        as_root dnf install -y git gcc gcc-c++ make pkgconf-pkg-config erlang rebar3
       elif need yum; then
-        as_root yum install -y git gcc gcc-c++ make pkgconfig
+        as_root yum install -y git gcc gcc-c++ make pkgconfig erlang rebar3
       elif need pacman; then
-        as_root pacman -Sy --needed --noconfirm git base-devel pkgconf
+        as_root pacman -Sy --needed --noconfirm git base-devel pkgconf erlang rebar3
       elif need zypper; then
-        as_root zypper --non-interactive install git gcc gcc-c++ make pkg-config
+        as_root zypper --non-interactive install git gcc gcc-c++ make pkg-config erlang rebar3
       elif need apk; then
-        as_root apk add --no-cache git build-base pkgconf
+        as_root apk add --no-cache git build-base pkgconf erlang rebar3
       else
-        die "unsupported package manager; install git and build tools manually, then rerun"
+        die "unsupported package manager; install Erlang/OTP, rebar3, git, and build tools manually, then rerun"
       fi
-    }
-
-    ensure_rust() {
-      if need cargo; then
-        return
-      fi
-
-      say "installing Rust toolchain"
-      need curl || die "curl is required to install Rust"
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-      if [ -f "$HOME/.cargo/env" ]; then
-        # shellcheck disable=SC1090
-        . "$HOME/.cargo/env"
-      fi
-      need cargo || die "cargo was not found after rustup install"
     }
 
     install_spawnd() {
       say "building spawnd from $REPO#$BRANCH"
-      export PATH="$BIN_DIR:$HOME/.cargo/bin:$PATH"
+      export PATH="$BIN_DIR:$PATH"
       mkdir -p "$BIN_DIR"
+      APP_DIR="$INSTALL_ROOT/lib/spawnd"
+      STAGE_DIR="$INSTALL_ROOT/lib/spawnd.next.$$"
+      PREV_DIR="$INSTALL_ROOT/lib/spawnd.previous"
+      TMP_BIN="$BIN.tmp.$$"
 
       TMP_BASE=${TMPDIR:-/tmp}
       TMP_DIR="$TMP_BASE/spawn-install.$$"
       rm -rf "$TMP_DIR"
       mkdir -p "$TMP_DIR"
-      trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
+      trap 'rm -rf "$TMP_DIR" "$STAGE_DIR" "$TMP_BIN"' EXIT INT TERM
 
       git clone --depth 1 --branch "$BRANCH" "$REPO" "$TMP_DIR/spawn"
-      cargo install --path "$TMP_DIR/spawn/daemon" --locked --root "$INSTALL_ROOT" --force
-      [ -x "$BIN" ] || die "spawnd did not install to $BIN"
-    }
+      (cd "$TMP_DIR/spawn/daemon" && rebar3 release && rebar3 escriptize)
+      rm -rf "$STAGE_DIR"
+      mkdir -p "$STAGE_DIR"
+      cp -R "$TMP_DIR/spawn/daemon/_build/default/rel/spawnd" "$STAGE_DIR/rel"
+      cp "$TMP_DIR/spawn/daemon/_build/default/bin/spawnd" "$STAGE_DIR/spawnd_cli"
+      chmod 755 "$STAGE_DIR/spawnd_cli"
+      "$STAGE_DIR/spawnd_cli" --version >/dev/null 2>&1 || die "staged spawnd CLI cannot run"
+      [ -x "$STAGE_DIR/rel/bin/spawnd" ] || die "staged spawnd release is missing"
 
-    host_target() {
-      OS_NAME=$(uname -s 2>/dev/null || printf unknown)
-      ARCH_NAME=$(uname -m 2>/dev/null || printf unknown)
-      case "$OS_NAME:$ARCH_NAME" in
-        Linux:x86_64|Linux:amd64)
-          printf '%s\n' linux-x86_64
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
+      cat > "$TMP_BIN" <<EOF
+#!/bin/sh
+APP_DIR="$APP_DIR"
+SERVER=""
+    if [ "\${1:-}" = "--server" ]; then
+      SERVER=\$2
+      shift 2
+    fi
+    if [ -n "\$SERVER" ]; then
+      export SPAWN_SERVER_URL="\$SERVER"
+    fi
+    case "\${1:-}" in
+      run)
+        shift
+        exec "$APP_DIR/rel/bin/spawnd" foreground
+        ;;
+      *)
+        exec "$APP_DIR/spawnd_cli" "\$@"
+        ;;
+esac
+EOF
+      chmod 755 "$TMP_BIN"
 
-    install_prebuilt_spawnd() {
-      TARGET=$(host_target) || return 1
-      URL="${SERVER%/}/api/install/spawnd/$TARGET"
-      TMP_BIN="$BIN.tmp.$$"
-      say "downloading prebuilt spawnd for $TARGET"
-      if curl -fsSL "$URL" -o "$TMP_BIN"; then
-        chmod 755 "$TMP_BIN"
-        if "$TMP_BIN" --version >/dev/null 2>&1; then
-          mv "$TMP_BIN" "$BIN"
-          return 0
-        fi
-        rm -f "$TMP_BIN"
-        say "prebuilt daemon is not compatible with this host"
-        return 1
+      rm -rf "$PREV_DIR"
+      if [ -d "$APP_DIR" ]; then
+        mv "$APP_DIR" "$PREV_DIR"
       fi
-      rm -f "$TMP_BIN"
-      return 1
+      if ! mv "$STAGE_DIR" "$APP_DIR"; then
+        if [ -d "$PREV_DIR" ]; then
+          mv "$PREV_DIR" "$APP_DIR"
+        fi
+        die "could not promote staged spawnd release"
+      fi
+      if ! mv "$TMP_BIN" "$BIN"; then
+        rm -rf "$APP_DIR"
+        if [ -d "$PREV_DIR" ]; then
+          mv "$PREV_DIR" "$APP_DIR"
+        fi
+        die "could not install spawnd wrapper"
+      fi
+      [ -x "$BIN" ] || die "spawnd did not install to $BIN"
     }
 
     start_systemd_service() {
@@ -316,21 +321,21 @@ INSTALL_SCRIPT = dedent(
       SERVICE_DIR="$HOME/.config/systemd/user"
       mkdir -p "$SERVICE_DIR"
       cat > "$SERVICE_DIR/spawnd.service" <<EOF
-    [Unit]
-    Description=spawn daemon
-    After=network-online.target
-    Wants=network-online.target
+[Unit]
+Description=spawn daemon
+After=network-online.target
+Wants=network-online.target
 
-    [Service]
-    Type=simple
-    ExecStart=$BIN --server $SERVER run
-    Restart=always
-    RestartSec=2
-    Environment=PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+[Service]
+Type=simple
+ExecStart=$BIN --server $SERVER run
+Restart=always
+RestartSec=2
+Environment=PATH=$BIN_DIR:/usr/local/bin:/usr/bin:/bin
 
-    [Install]
-    WantedBy=default.target
-    EOF
+[Install]
+WantedBy=default.target
+EOF
 
       systemctl --user daemon-reload
       systemctl --user enable --now spawnd.service
@@ -349,12 +354,8 @@ INSTALL_SCRIPT = dedent(
 
     install_runtime_prereqs
     mkdir -p "$BIN_DIR"
-    if ! install_prebuilt_spawnd; then
-      say "prebuilt daemon unavailable; falling back to source build"
-      install_build_prereqs
-      ensure_rust
-      install_spawnd
-    fi
+    install_build_prereqs
+    install_spawnd
     "$BIN" --version >/dev/null 2>&1 || die "installed spawnd cannot run on this host"
 
     say "installed $("$BIN" --version 2>/dev/null || printf spawnd) at $BIN"

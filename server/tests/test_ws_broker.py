@@ -348,6 +348,36 @@ async def test_broker_tool_install_request_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_broker_daemon_status_request_roundtrip():
+    broker = get_broker()
+
+    daemon_ws = FakeWS()
+    daemon = DaemonConn(
+        host_id="host-daemon-status",
+        user_id="user-1",
+        websocket=daemon_ws,  # type: ignore[arg-type]
+    )
+    await broker.register_daemon(daemon)
+
+    task = asyncio.create_task(broker.request_daemon_status(daemon, timeout=1))
+    await asyncio.sleep(0)
+
+    sent = json.loads(daemon_ws.sent_text[-1])
+    assert sent["type"] == "host.daemon.status"
+    payload = {
+        "type": "host.daemon.status_result",
+        "request_id": sent["request_id"],
+        "status": "online",
+        "agents": [{"agent_id": "00000000-0000-4000-8000-000000000011", "pid": "123"}],
+        "update": {"ok": True, "clean": True},
+    }
+    await broker.resolve_daemon_status(sent["request_id"], payload)
+    assert await task == payload
+
+    await broker.unregister_daemon(daemon)
+
+
+@pytest.mark.asyncio
 async def test_pubsub_publish_subscribe_roundtrip(app):
     """publish() on one side reaches subscribe() on the other (in-proc pubsub)."""
     from spawn_server.redis import get_backend

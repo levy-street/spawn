@@ -162,7 +162,6 @@ async def _dispatch_agent_launch(
                 "argv": agent.argv,
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
-                "tmux_session": f"spawn-{agent.id}",
                 "cols": cols,
                 "rows": rows,
                 "create_cwd": create_cwd,

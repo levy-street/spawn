@@ -7,13 +7,13 @@ opencode, aider, …) on the host.
 ## Build
 
 ```sh
-cargo build --release
-# -> target/release/spawnd
+rebar3 release
+rebar3 escriptize
+# -> _build/default/rel/spawnd and _build/default/bin/spawnd
 ```
 
-A `tmux` binary on `$PATH` is required at runtime — the daemon launches each
-agent inside its own detached tmux session so the agent survives `spawnd`
-restarts.
+`spawnd` is an Erlang/OTP service. It uses `erlexec` to launch each agent as a
+direct supervised subprocess attached to a PTY; `tmux` is no longer required.
 
 ## Login
 
@@ -36,19 +36,27 @@ spawnd run            # uses stored server URL
 spawnd --server https://other run    # override
 ```
 
+Installed hosts use the wrapper at `~/.local/bin/spawnd`, which starts the
+OTP release for `run` and uses the CLI escript for login/status commands. In a
+dev checkout, run the release directly with
+`_build/default/rel/spawnd/bin/spawnd foreground`.
+
 This is a foreground service. It connects WSS to `<server>/ws/daemon`,
 registers, and processes `agent.create` / `agent.kill` / `agent.resize`
 frames, multiplexing PTY I/O for any number of concurrent agents over the
 single connection. On disconnect it reconnects with exponential backoff
 (1s, 2s, 4s, … capped at 60s) and re-registers with `existing_agents = […]`
-so the server resyncs its routing map without disturbing the running tmux
-sessions.
+so the server resyncs its routing map without disturbing running agent
+supervisors in the current daemon VM.
 
 ## Other commands
 
 ```sh
 spawnd status     # show server URL, host_id, token presence
 spawnd logout     # wipe stored token (and host_id)
+spawnd agents     # query the local daemon control socket
+spawnd kill <id>  # terminate a local agent subprocess
+spawnd update-check # report whether the checkout is clean enough to update
 ```
 
 ## Config
@@ -60,8 +68,7 @@ spawnd logout     # wipe stored token (and host_id)
 | stored creds | Fallback to the URL used at login |
 | default | `https://localhost:8000` |
 
-Credentials live at `~/.config/spawn/credentials.json` (mode 600) and/or in
-your OS keyring under service `spawn`, user `daemon`.
+Credentials live at `~/.config/spawn/credentials.json` (mode 600).
 
 ## Wire protocol
 
@@ -72,16 +79,15 @@ bytes`, with `0x01` for output (daemon→server) and `0x02` for input
 
 ## Process model
 
-Each agent runs in a tmux session named `spawn-<agent_id>`. The daemon
-attaches a PTY to the session via `tmux attach` and reads/writes that PTY.
-On `Ctrl-C`, `spawnd` closes the WS but does **not** kill any tmux session —
-that's the whole point of using tmux. Restart `spawnd run` and it will
-resume streaming.
+Each agent is an OTP worker backed by an `erlexec` OS process. The daemon
+writes browser stdin directly to the PTY, forwards PTY output as binary
+frames, keeps an in-memory snapshot buffer for reconnect history, and sends
+TERM followed by KILL when an agent is stopped.
 
 ## Dev
 
 ```sh
-cargo test          # frame encode/decode + credential materialization
-cargo clippy -- -D warnings
-cargo fmt
+rebar3 eunit
+rebar3 release
+rebar3 escriptize
 ```

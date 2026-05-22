@@ -147,6 +147,27 @@ export const HostToolPolicySchema = z.object({
 });
 export type HostToolPolicy = z.infer<typeof HostToolPolicySchema>;
 
+export const HostDaemonStatusSchema = z.object({
+  status: z.string().default("online"),
+  agents: z
+    .array(
+      z.object({
+        agent_id: z.string(),
+        pid: z.string().nullable().optional(),
+      }),
+    )
+    .default([]),
+  update: z
+    .object({
+      ok: z.boolean().default(true),
+      clean: z.boolean().nullable().optional(),
+      changes: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+});
+export type HostDaemonStatus = z.infer<typeof HostDaemonStatusSchema>;
+
 export const AgentSchema = z.object({
   id: z.string().uuid(),
   name: z.string().nullable().default(null),
@@ -271,6 +292,11 @@ export const hosts = {
     api(`/api/hosts/${id}/tools`, {
       method: "GET",
       schema: HostToolListSchema,
+    }),
+  daemonStatus: (id: string) =>
+    api(`/api/hosts/${id}/daemon`, {
+      method: "GET",
+      schema: HostDaemonStatusSchema,
     }),
   installTool: (id: string, presetId: string) =>
     api(`/api/hosts/${id}/tools/${presetId}/install`, {

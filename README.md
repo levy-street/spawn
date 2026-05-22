@@ -10,17 +10,18 @@ your phone.
 ```
                    ┌────────────────────────┐
    ┌─────────┐     │                        │     ┌─────────────────┐
-   │ Browser │◀───▶│  spawn-server (FastAPI)│◀───▶│ spawnd (Rust)   │
-   │  PWA    │ WSS │   Postgres + Redis     │ WSS │ tmux + PTY      │
+   │ Browser │◀───▶│  spawn-server (FastAPI)│◀───▶│ spawnd (OTP)    │
+   │  PWA    │ WSS │   Postgres + Redis     │ WSS │ erlexec + PTY   │
    └─────────┘     │                        │     │  ↳ claude/codex │
                    └────────────────────────┘     └─────────────────┘
 ```
 
 - **server/** — FastAPI control plane. Auth, host/agent registry, WS broker
   between daemons and browsers.
-- **daemon/** — `spawnd`, a single Rust binary that runs on each remote host.
-  Dials *out* to the server (no inbound ports needed). Manages local agent
-  processes inside `tmux` and streams PTY I/O back over WSS.
+- **daemon/** — `spawnd`, an Erlang/OTP daemon that runs on each remote host.
+  Dials *out* to the server (no inbound ports needed). Supervises local agent
+  subprocesses directly through PTYs, streams I/O back over WSS, and exposes a
+  localhost control socket mirrored by the web Hosts view.
 - **web/** — Next.js 15 PWA. xterm.js terminal, mobile-first composer +
   modifier bar, hosts/agents UI.
 - **proto/** — single source of truth for the WS + REST contract shared by all
@@ -35,8 +36,8 @@ mobile design notes.
 ## Local dev (quickstart)
 
 System prerequisites: `docker`, Python 3.13 (`uv` installs interpreters on
-demand), Rust stable (via `rustup`), Bun 1.x, and **`tmux`** on every host
-that will run `spawnd`.
+demand), Erlang/OTP + `rebar3`, Bun 1.x, and C/C++ build tools for the
+`erlexec` PTY port program.
 
 ## Daemon install
 
@@ -47,11 +48,10 @@ web URL:
 curl -fsSL https://spawn.example.com/install.sh | sh
 ```
 
-The script installs prerequisites where it can, downloads a prebuilt daemon
-when available, falls back to building from source, runs the device-code login
-flow, then starts a user `systemd` service when available with a background
-fallback. The hosted script defaults to `SPAWN_PUBLIC_URL`; override it
-explicitly when needed:
+The script installs prerequisites where it can, builds the OTP daemon from
+source, runs the device-code login flow, then starts a user `systemd` service
+when available with a background fallback. The hosted script defaults to
+`SPAWN_PUBLIC_URL`; override it explicitly when needed:
 
 ```bash
 curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spawn.example.com
@@ -77,10 +77,12 @@ cd ../web
 bun install
 bun dev    # http://localhost:3000
 
-# 4. Daemon (Rust). Default --server is http://localhost:8000.
+# 4. Daemon (Erlang/OTP). Default --server is http://localhost:8000.
 cd ../daemon
-cargo run -- login   # follow the printed URL + code; approve in the web app
-cargo run -- run     # foreground; reconnects on disconnect
+rebar3 release
+rebar3 escriptize
+_build/default/bin/spawnd login   # follow the printed URL + code; approve in the web app
+_build/default/rel/spawnd/bin/spawnd foreground  # foreground; reconnects on disconnect
 ```
 
 End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
@@ -107,7 +109,7 @@ scripts/deploy-prod.sh
 
 The host can be any alias from the caller's `~/.ssh/config`. The deploy script
 fetches the same branch from `origin` on the production machine, rebuilds the
-server/web/hosted daemon binary, runs database migrations, and restarts the
+server/web/hosted daemon artifacts, runs database migrations, and restarts the
 configured services. It refuses to run when the local checkout has uncommitted
 changes or commits that have not been pushed.
 

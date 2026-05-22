@@ -15,10 +15,10 @@ _OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
 _CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CHARSET_RE = re.compile(r"\x1b[()][A-Za-z0-9]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-_TMUX_STATUS_CLOCK_RE = re.compile(
+_LEGACY_STATUS_CLOCK_RE = re.compile(
     r"(?:\[spawn-[^\r\n]*?)?(?:\"[^\r\n\"]+\"\s+)?\d{2}:\d{2}\s+\d{2}-[A-Za-z]{3}-\d{2}"
 )
-_TMUX_STATUS_FRAGMENT_RE = re.compile(r"\[spawn-[^\r\n]*")
+_LEGACY_STATUS_FRAGMENT_RE = re.compile(r"\[spawn-[^\r\n]*")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 _last_output_touch_at: dict[str, datetime] = {}
@@ -57,8 +57,8 @@ def output_payload_is_meaningful(payload: bytes) -> bool:
     text = _OSC_RE.sub("", text)
     text = _CSI_RE.sub("", text)
     text = _CHARSET_RE.sub("", text)
-    text = _TMUX_STATUS_CLOCK_RE.sub("", text)
-    text = _TMUX_STATUS_FRAGMENT_RE.sub("", text)
+    text = _LEGACY_STATUS_CLOCK_RE.sub("", text)
+    text = _LEGACY_STATUS_FRAGMENT_RE.sub("", text)
     text = _CONTROL_RE.sub("", text)
     normalized = _WHITESPACE_RE.sub("", text)
     return len(normalized) >= MIN_MEANINGFUL_OUTPUT_CHARS

@@ -95,7 +95,7 @@ def _upload_paste_prefix(argv: list[str]) -> str:
 def _prefer_transcript_history(argv: list[str]) -> bool:
     # Raw PTY transcripts are chronological, but replaying full-screen TUIs
     # through xterm can restore a current screen without browser scrollback.
-    # Keep using tmux's rendered pane snapshot until we have a proper terminal
+    # Keep using the daemon's rendered pane snapshot until we have a proper terminal
     # recording renderer that can materialize scrollback independently.
     return False
 
@@ -163,7 +163,7 @@ async def _send_initial_history(
                 await conn.send_text({"type": "history", "bytes_b64": snapshot})
                 return
         except Exception as e:
-            log.warning("tmux snapshot request failed: %s", e)
+            log.warning("daemon snapshot request failed: %s", e)
 
     history = await transcript.read(agent_id)
     await conn.send_text(
@@ -289,9 +289,9 @@ async def browser_ws(
     except TimeoutError:
         pass
 
-    # The history payload is a rendered tmux snapshot, not a live terminal
-    # attach state. Once the browser is subscribed to live bytes, force tmux
-    # to repaint the current screen so xterm's current viewport is real tmux
+    # The history payload is a rendered daemon snapshot, not a live terminal
+    # attach state. Once the browser is subscribed to live bytes, ask the
+    # daemon to repaint the current screen so xterm's viewport is current.
     # output at the browser's measured size.
     await _request_agent_redraw(agent_id, host_id)
 

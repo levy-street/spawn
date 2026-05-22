@@ -79,6 +79,7 @@ class Broker:
         self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
+        self._daemon_status_waiters: dict[str, asyncio.Future[dict]] = {}
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -379,6 +380,33 @@ class Broker:
     async def resolve_tool_install(self, request_id: str, payload: dict) -> None:
         async with self._lock:
             fut = self._tool_install_waiters.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(payload)
+
+    async def request_daemon_status(
+        self,
+        daemon: DaemonConn,
+        *,
+        timeout: float = 3.0,
+    ) -> dict | None:
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict] = loop.create_future()
+        async with self._lock:
+            self._daemon_status_waiters[request_id] = fut
+        try:
+            await daemon.send_text({"type": "host.daemon.status", "request_id": request_id})
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except TimeoutError:
+            return None
+        finally:
+            async with self._lock:
+                if self._daemon_status_waiters.get(request_id) is fut:
+                    self._daemon_status_waiters.pop(request_id, None)
+
+    async def resolve_daemon_status(self, request_id: str, payload: dict) -> None:
+        async with self._lock:
+            fut = self._daemon_status_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
 

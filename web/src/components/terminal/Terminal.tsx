@@ -628,7 +628,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
       // Full-screen agent UIs repaint in-place, which makes browser-local
-      // scrollback preserve stale frames. Scrollback is rendered from tmux
+      // scrollback preserve stale frames. Scrollback is rendered from daemon
       // snapshots instead.
       scrollback: 0,
       smoothScrollDuration: 70,
@@ -2150,7 +2150,7 @@ function decodeUtf8(bytes: Uint8Array): string {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // to tmux after transcript replay can echo fragments like "0;276;0c".
+  // to the PTY after transcript replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

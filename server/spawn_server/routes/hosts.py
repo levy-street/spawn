@@ -452,6 +452,25 @@ async def list_host_tools(
     return checked
 
 
+@router.get("/{host_id}/daemon", response_model=schemas.HostDaemonStatus)
+async def get_host_daemon_status(
+    host_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostDaemonStatus:
+    await _get_owned_host(session, host_id, user)
+    await session.commit()
+
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+
+    result = await get_broker().request_daemon_status(daemon)
+    if result is None:
+        raise HTTPException(status_code=504, detail="host daemon status timed out")
+    return schemas.HostDaemonStatus.model_validate(result)
+
+
 @router.post("/{host_id}/tools/{preset_id}/install", response_model=schemas.HostToolInstallResult)
 async def install_host_tool(
     host_id: str,

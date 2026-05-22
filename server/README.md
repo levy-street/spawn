@@ -2,7 +2,7 @@
 
 The control-plane server for `spawn`. FastAPI + SQLAlchemy 2.0 (async) +
 Postgres + Redis. Brokers REST and WebSocket traffic between the web app and
-the per-host Rust daemons (`spawnd`).
+the per-host Erlang/OTP daemons (`spawnd`).
 
 See `../docs/DESIGN.md` for the full architecture and `../proto/README.md` for
 the wire protocol this server implements.
