@@ -180,6 +180,7 @@ EOF
 run_prebuilt_case linux_x86_64 Linux x86_64 linux-x86_64
 run_prebuilt_case linux_arm64 Linux aarch64 linux-arm64
 run_prebuilt_case wsl_like_linux Linux x86_64 linux-x86_64
+run_prebuilt_case darwin_x86_64 Darwin x86_64 darwin-x86_64
 run_prebuilt_case darwin_arm64 Darwin arm64 darwin-arm64
 
 windows_fake_bin="$tmpdir/windows-bin"

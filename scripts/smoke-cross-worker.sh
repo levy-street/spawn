@@ -388,6 +388,11 @@ async def main() -> None:
                 snap = await recv_browser_json(browser, "snapshot")
                 assert base64.b64decode(snap["bytes_b64"]) == b"snapshot over redis"
 
+                await browser.send(json.dumps({"type": "scroll", "lines": -8}))
+                scroll_cmd = await next_daemon_command(daemon, "agent.scroll")
+                assert scroll_cmd["agent_id"] == agent_id
+                assert scroll_cmd["lines"] == -8
+
                 await browser.send(
                     json.dumps(
                         {

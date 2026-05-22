@@ -257,6 +257,44 @@ to_list(List) when is_list(List) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+fs_list_returns_sorted_directory_entries_test() ->
+    Base = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-fs-list-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = filelib:ensure_dir(filename:join(Base, "x")),
+    ok = file:make_dir(filename:join(Base, "zeta")),
+    ok = file:make_dir(filename:join(Base, "alpha")),
+    ok = file:write_file(filename:join(Base, "note.txt"), <<"not a directory">>),
+    Result = fs_list(list_to_binary(Base)),
+    ?assertEqual(list_to_binary(filename:absname(Base)), maps:get(<<"path">>, Result)),
+    ?assertEqual(null, maps:get(<<"error">>, Result)),
+    Entries = maps:get(<<"entries">>, Result),
+    ?assertEqual(
+        [
+            #{
+                <<"name">> => <<"alpha">>,
+                <<"path">> => list_to_binary(filename:join(filename:absname(Base), "alpha"))
+            },
+            #{
+                <<"name">> => <<"zeta">>,
+                <<"path">> => list_to_binary(filename:join(filename:absname(Base), "zeta"))
+            }
+        ],
+        Entries
+    ),
+    _ = file:del_dir_r(Base),
+    ok.
+
+fs_list_reports_nonexistent_path_error_test() ->
+    Path = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "spawnd-missing-dir-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Result = fs_list(list_to_binary(Path)),
+    ?assertEqual([], maps:get(<<"entries">>, Result)),
+    ?assertNotEqual(null, maps:get(<<"error">>, Result)).
+
 save_upload_uses_non_overwriting_paths_test() ->
     Base = filename:join(
         os:getenv("TMPDIR", "/tmp"),

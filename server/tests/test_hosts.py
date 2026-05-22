@@ -203,6 +203,70 @@ async def test_host_tools_require_online_daemon(client):
     assert r.status_code == 409
 
 
+async def test_host_dir_list_roundtrip(client):
+    token = await _signup(client, "host-dirs-route@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "host-dirs-route@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="dir-box", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+
+    task = asyncio.create_task(
+        client.get(f"/api/hosts/{host_id}/dirs?path=/home/me/proj", headers=auth)
+    )
+    for _ in range(100):
+        if fake_ws.sent_text:
+            break
+        if task.done():
+            break
+        await asyncio.sleep(0.01)
+    assert fake_ws.sent_text, (await task).text
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "host.fs.list"
+    assert sent["path"] == "/home/me/proj"
+
+    await broker.resolve_dir_list(
+        sent["request_id"],
+        {
+            "type": "host.fs.list_result",
+            "request_id": sent["request_id"],
+            "path": "/home/me/proj",
+            "home_dir": "/home/me",
+            "parent": "/home/me",
+            "entries": [{"name": "repo", "path": "/home/me/proj/repo"}],
+            "error": None,
+        },
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "path": "/home/me/proj",
+        "home_dir": "/home/me",
+        "parent": "/home/me",
+        "entries": [{"name": "repo", "path": "/home/me/proj/repo"}],
+        "error": None,
+    }
+
+    await broker.unregister_daemon(daemon)
+
+
 async def test_host_daemon_status_timeout_degrades_to_payload(client, monkeypatch):
     token = await _signup(client, "host-daemon-timeout@example.com")
     auth = {"Authorization": f"Bearer {token}"}

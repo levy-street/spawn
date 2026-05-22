@@ -11,6 +11,7 @@ checkout and an already-running local spawn stack.
 Default gates:
   - shell syntax and diff whitespace checks
   - daemon EUnit tests
+  - daemon release and CLI escript build
   - server pytest and ruff
   - web lint
   - local daemon/API/websocket smoke
@@ -88,6 +89,7 @@ run sh -n web/src/app/install.sh/install-template.sh
 run git diff --check
 
 run_shell "cd daemon && rebar3 eunit"
+run_shell "cd daemon && rebar3 release && rebar3 escriptize"
 run_shell "cd server && uv run pytest"
 run_shell "cd server && uv run ruff check spawn_server tests"
 run_shell "cd web && bun run lint"

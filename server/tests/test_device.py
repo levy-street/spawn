@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 
 
 async def test_device_code_happy_path(client):
@@ -79,3 +79,68 @@ async def test_device_code_happy_path(client):
     hosts = r.json()
     assert len(hosts) == 1
     assert hosts[0]["name"] == "gpu-box-1"
+
+
+async def test_device_poll_error_states(client):
+    r = await client.post(
+        "/api/auth/device/start",
+        json={
+            "host_name": "denied-box",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.2.0",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    device_code = body["device_code"]
+
+    r = await client.post("/api/auth/device/poll", json={"device_code": "missing"})
+    assert r.status_code == 200
+    assert r.json() == {"error": "expired_token"}
+
+    first = await client.post("/api/auth/device/poll", json={"device_code": device_code})
+    assert first.status_code == 200
+    assert first.json() == {"error": "authorization_pending"}
+    second = await client.post("/api/auth/device/poll", json={"device_code": device_code})
+    assert second.status_code == 200
+    assert second.json() == {"error": "slow_down"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import DeviceCode
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        dc = (
+            await session.execute(select(DeviceCode).where(DeviceCode.device_code == device_code))
+        ).scalar_one()
+        dc.status = "denied"
+        dc.last_polled_at = datetime.now(UTC) - timedelta(seconds=10)
+        await session.commit()
+
+    denied = await client.post("/api/auth/device/poll", json={"device_code": device_code})
+    assert denied.status_code == 200
+    assert denied.json() == {"error": "denied"}
+
+    expired_start = await client.post(
+        "/api/auth/device/start",
+        json={
+            "host_name": "expired-box",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.2.0",
+        },
+    )
+    expired_code = expired_start.json()["device_code"]
+    async with sm() as session:
+        dc = (
+            await session.execute(select(DeviceCode).where(DeviceCode.device_code == expired_code))
+        ).scalar_one()
+        dc.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    expired = await client.post("/api/auth/device/poll", json={"device_code": expired_code})
+    assert expired.status_code == 200
+    assert expired.json() == {"error": "expired_token"}

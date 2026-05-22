@@ -8,7 +8,8 @@
 
 -define(HEARTBEAT_MS, 10000).
 -define(HEARTBEAT_TIMEOUT_MS, 5000).
--define(RECONNECT_MS, 2000).
+-define(INITIAL_RECONNECT_MS, 1000).
+-define(MAX_RECONNECT_MS, 60000).
 -define(KIND_INPUT, 16#02).
 
 -record(state, {
@@ -16,6 +17,7 @@
     stream = undefined,
     server = undefined,
     token = undefined,
+    reconnect_ms = ?INITIAL_RECONNECT_MS,
     heartbeat_ref = undefined,
     heartbeat_timer = undefined
 }).
@@ -56,8 +58,7 @@ handle_cast(_Msg, State) ->
 handle_info(connect, State) ->
     {noreply, connect(State)};
 handle_info(heartbeat, State = #state{conn = undefined}) ->
-    erlang:send_after(?RECONNECT_MS, self(), connect),
-    {noreply, State};
+    {noreply, schedule_reconnect(State)};
 handle_info(heartbeat, State) ->
     send_json(#{<<"type">> => <<"host.heartbeat">>}),
     erlang:send_after(?HEARTBEAT_MS, self(), heartbeat),
@@ -69,7 +70,7 @@ handle_info({heartbeat_timeout, _Ref}, State) ->
 handle_info({gun_upgrade, Conn, Stream, [<<"websocket">>], _Headers}, State = #state{conn = Conn, stream = Stream}) ->
     register_host(),
     erlang:send_after(?HEARTBEAT_MS, self(), heartbeat),
-    {noreply, State};
+    {noreply, reset_backoff(State)};
 handle_info({gun_response, _Conn, _Stream, _IsFin, Status, _Headers}, State) ->
     io:format(standard_error, "spawn: websocket upgrade failed: ~p~n", [Status]),
     {noreply, reset_and_reconnect(State)};
@@ -112,11 +113,9 @@ connect(State) ->
         end,
     case Token of
         undefined ->
-            erlang:send_after(?RECONNECT_MS, self(), connect),
-            State#state{server = Server, token = Token};
+            schedule_reconnect(State#state{server = Server, token = Token});
         <<>> ->
-            erlang:send_after(?RECONNECT_MS, self(), connect),
-            State#state{server = Server, token = Token};
+            schedule_reconnect(State#state{server = Server, token = Token});
         _ ->
             WsUrl = spawnd_config:ws_url(Server),
             case open_ws(WsUrl, Token) of
@@ -124,8 +123,7 @@ connect(State) ->
                     State#state{conn = Conn, stream = Stream, server = Server, token = Token};
                 {error, Reason} ->
                     io:format(standard_error, "spawn: connect failed: ~p~n", [Reason]),
-                    erlang:send_after(?RECONNECT_MS, self(), connect),
-                    State#state{server = Server, token = Token}
+                    schedule_reconnect(State#state{server = Server, token = Token})
             end
     end.
 
@@ -164,8 +162,19 @@ default_port("ws") -> 80.
 reset_and_reconnect(State = #state{conn = Conn}) ->
     State1 = cancel_heartbeat_timeout(State),
     catch gun:close(Conn),
-    erlang:send_after(?RECONNECT_MS, self(), connect),
-    State1#state{conn = undefined, stream = undefined}.
+    schedule_reconnect(State1#state{conn = undefined, stream = undefined}).
+
+schedule_reconnect(State = #state{reconnect_ms = Delay}) ->
+    erlang:send_after(Delay, self(), connect),
+    State#state{reconnect_ms = next_reconnect_ms(Delay)}.
+
+reset_backoff(State) ->
+    State#state{reconnect_ms = ?INITIAL_RECONNECT_MS}.
+
+next_reconnect_ms(Delay) when Delay >= ?MAX_RECONNECT_MS ->
+    ?MAX_RECONNECT_MS;
+next_reconnect_ms(Delay) ->
+    min(Delay * 2, ?MAX_RECONNECT_MS).
 
 schedule_heartbeat_timeout(State0) ->
     State = cancel_heartbeat_timeout(State0),
@@ -479,6 +488,13 @@ ensure_agent_executable_reports_missing_command_test() ->
         {error, <<"executable not found", _/binary>>},
         ensure_agent_executable(#{<<"argv">> => [Missing], <<"env">> => #{}})
     ).
+
+next_reconnect_ms_uses_exponential_cap_test() ->
+    ?assertEqual(2000, next_reconnect_ms(1000)),
+    ?assertEqual(4000, next_reconnect_ms(2000)),
+    ?assertEqual(60000, next_reconnect_ms(32000)),
+    ?assertEqual(60000, next_reconnect_ms(60000)),
+    ?assertEqual(60000, next_reconnect_ms(120000)).
 
 path_or_empty(false) ->
     "";
