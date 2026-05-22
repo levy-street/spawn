@@ -59,7 +59,10 @@ init(Spec) ->
             {stop, empty_argv};
         [Exe0 | Args] ->
             EnvList = normalize_env(Env),
-            Exe = resolve_executable(Exe0, EnvList),
+            Exe = case spawnd_host:resolve_executable(Exe0, EnvList) of
+                false -> binary_or_list(Exe0);
+                Path -> Path
+            end,
             Cmd = [Exe | [binary_or_list(A) || A <- Args]],
             Opts = [
                 stdin,
@@ -121,9 +124,9 @@ handle_cast(stop_agent, State = #state{os_pid = OsPid}) ->
     finish_exit(Reason, State#state{os_pid = undefined}).
 
 handle_info({stdout, _OsPid, Data}, State) ->
-    output(Data, State);
+    {noreply, output(Data, State)};
 handle_info({stderr, _OsPid, Data}, State) ->
-    output(Data, State);
+    {noreply, output(Data, State)};
 handle_info({'DOWN', _OsPid, process, _Pid, Reason}, State) ->
     finish_exit(Reason, State);
 handle_info({'EXIT', _Pid, Reason}, State) ->
@@ -140,7 +143,8 @@ terminate(_Reason, #state{os_pid = OsPid}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-finish_exit(Reason, State = #state{agent_id = AgentId, report = Report}) ->
+finish_exit(Reason, State0 = #state{agent_id = AgentId, report = Report}) ->
+    State = drain_output(State0),
     {ExitCode, Signal} = decode_exit(Reason),
     maybe_report(Report, #{
         <<"type">> => <<"agent.exit">>,
@@ -158,7 +162,17 @@ output(Data0, State = #state{agent_id = AgentId, buffer = Buffer, report = Repor
         true -> spawnd_ws:send_binary(spawnd_frames:encode_output(AgentId, Data));
         false -> ok
     end,
-    {noreply, State#state{buffer = trim_buffer(<<Buffer/binary, Data/binary>>)}}.
+    State#state{buffer = trim_buffer(<<Buffer/binary, Data/binary>>)}.
+
+drain_output(State) ->
+    receive
+        {stdout, _OsPid, Data} ->
+            drain_output(output(Data, State));
+        {stderr, _OsPid, Data} ->
+            drain_output(output(Data, State))
+    after 25 ->
+        State
+    end.
 
 trim_buffer(Bin) when byte_size(Bin) =< ?MAX_BUFFER ->
     Bin;
@@ -196,50 +210,6 @@ binary_or_list(List) when is_list(List) ->
 binary_or_list(Other) ->
     binary_to_list(iolist_to_binary(io_lib:format("~p", [Other]))).
 
-resolve_executable(Exe0, Env) ->
-    Exe = binary_or_list(Exe0),
-    case filename:pathtype(Exe) of
-        absolute -> Exe;
-        _ ->
-            case find_in_agent_path(Exe, Env) of
-                false ->
-                    case os:find_executable(Exe) of
-                        false -> Exe;
-                        Path -> Path
-                    end;
-                Path -> Path
-            end
-    end.
-
-find_in_agent_path(Exe, Env) ->
-    case lists:keyfind("PATH", 1, Env) of
-        {"PATH", Path} -> find_in_path(Exe, Path);
-        false -> false
-    end.
-
-find_in_path(Exe, Path) ->
-    lists:foldl(
-        fun
-            (_Dir, Found) when Found =/= false ->
-                Found;
-            ("", false) ->
-                false;
-            (Dir, false) ->
-                Candidate = filename:join(Dir, Exe),
-                case filelib:is_regular(Candidate) andalso filelib:is_file(Candidate) of
-                    true ->
-                        case file:read_file_info(Candidate) of
-                            {ok, #file_info{mode = Mode}} when Mode band 8#111 =/= 0 -> Candidate;
-                            _ -> false
-                        end;
-                    false ->
-                        false
-                end
-        end,
-        false,
-        string:split(Path, ":", all)
-    ).
-
 maybe_notify(undefined, _Msg) ->
     ok;
 maybe_notify(Pid, Msg) when is_pid(Pid) ->
@@ -257,6 +227,26 @@ maybe_report(false, _Msg) ->
 tail_lines_test() ->
     ?assertEqual(<<"b\nc">>, tail_lines(<<"a\nb\nc">>, 2)),
     ?assertEqual(<<"a\nb\nc">>, tail_lines(<<"a\nb\nc">>, 10)).
+
+finish_exit_drains_queued_output_test() ->
+    AgentId = <<"00000000-0000-0000-0000-00000000drain">>,
+    self() ! {stdout, 123, <<" final">>},
+    {stop, normal, State} = finish_exit(
+        normal,
+        #state{
+            agent_id = AgentId,
+            os_pid = 123,
+            buffer = <<"before">>,
+            notify = self(),
+            report = false
+        }
+    ),
+    ?assertEqual(<<"before final">>, State#state.buffer),
+    receive
+        {agent_exit, AgentId, normal} -> ok
+    after 1000 ->
+        ?assert(false)
+    end.
 
 direct_subprocess_lifecycle_test() ->
     {ok, _} = application:ensure_all_started(erlexec),

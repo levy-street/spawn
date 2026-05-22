@@ -401,37 +401,7 @@ ensure_agent_executable(_) ->
     {error, <<"argv is empty">>}.
 
 executable_exists(Exe0, Env) ->
-    Exe = case is_binary(Exe0) of true -> binary_to_list(Exe0); false -> Exe0 end,
-    case filename:pathtype(Exe) of
-        absolute -> filelib:is_file(Exe);
-        _ -> find_in_agent_path(Exe, Env) =/= false orelse os:find_executable(Exe) =/= false
-    end.
-
-find_in_agent_path(Exe, Env) ->
-    case lists:keyfind("PATH", 1, Env) of
-        {"PATH", Path} -> find_in_path(Exe, Path);
-        false -> false
-    end.
-
-find_in_path(Exe, Path) ->
-    lists:foldl(
-        fun
-            (_Dir, Found) when Found =/= false ->
-                Found;
-            ("", false) ->
-                false;
-            (Dir, false) ->
-                Candidate = filename:join(Dir, Exe),
-                case file:read_file_info(Candidate) of
-                    {ok, #file_info{type = regular, mode = Mode}} when Mode band 8#111 =/= 0 ->
-                        Candidate;
-                    _ ->
-                        false
-                end
-        end,
-        false,
-        string:split(Path, ":", all)
-    ).
+    spawnd_host:resolve_executable(Exe0, Env) =/= false.
 
 env_list(Env) when is_map(Env) ->
     [{binary_or_list(K), binary_or_list(V)} || {K, V} <- maps:to_list(Env)];
