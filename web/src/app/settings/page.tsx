@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Trash2, X } from "lucide-react";
+import { Check, Copy, KeyRound, Pencil, Trash2, X } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
@@ -10,7 +10,19 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ApiError, type Preset, type PresetCreateInput, presets } from "@/lib/api";
+import {
+  ApiError,
+  auth,
+  type McpServer,
+  type McpServerCreateInput,
+  mcpServers,
+  type Preset,
+  type PresetCreateInput,
+  presets,
+  type Skill,
+  type SkillCreateInput,
+  skills as skillApi,
+} from "@/lib/api";
 import { parseArgv, parseEnvLines } from "@/lib/argv";
 import { logout, useAuth } from "@/lib/auth";
 
@@ -45,6 +57,9 @@ function SettingsView() {
           </Button>
         </CardContent>
       </Card>
+      <McpTokenSettings />
+      <McpServersSettings />
+      <SkillsSettings />
       <PresetsSettings />
       <Card>
         <CardHeader>
@@ -53,6 +68,481 @@ function SettingsView() {
         </CardHeader>
       </Card>
     </div>
+  );
+}
+
+function McpTokenSettings() {
+  const [token, setToken] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const tokenM = useMutation({
+    mutationFn: auth.mcpToken,
+    onSuccess: (result) => {
+      setToken(result.access_token);
+      setCopied(false);
+      setError(null);
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+
+  const copyToken = async () => {
+    if (!token) return;
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Copy failed");
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>MCP token</CardTitle>
+        <CardDescription>Bearer token for MCP clients.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={() => tokenM.mutate()} disabled={tokenM.isPending}>
+            <KeyRound className="size-4" />
+            {tokenM.isPending ? "Generating..." : "Generate token"}
+          </Button>
+          <Button variant="secondary" onClick={copyToken} disabled={!token}>
+            {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+            {copied ? "Copied" : "Copy"}
+          </Button>
+        </div>
+        {token && (
+          <Textarea
+            aria-label="MCP bearer token"
+            readOnly
+            value={token}
+            rows={4}
+            className="font-mono text-xs"
+          />
+        )}
+        {error && (
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function McpServersSettings() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["mcp-servers"], queryFn: mcpServers.list });
+  const [name, setName] = useState("spawn");
+  const [url, setUrl] = useState("");
+  const [headersText, setHeadersText] = useState("");
+  const [enabledByDefault, setEnabledByDefault] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const resetForm = () => {
+    setName("spawn");
+    setUrl("");
+    setHeadersText("");
+    setEnabledByDefault(false);
+    setEditingId(null);
+    setError(null);
+  };
+
+  const editServer = (server: McpServer) => {
+    setName(server.name);
+    setUrl(server.url ?? "");
+    setHeadersText(formatEnvTemplate(server.headers));
+    setEnabledByDefault(server.enabled_by_default);
+    setEditingId(server.id);
+    setError(null);
+  };
+
+  const createM = useMutation({
+    mutationFn: mcpServers.create,
+    onSuccess: () => {
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+  const updateM = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: McpServerCreateInput }) =>
+      mcpServers.update(id, body),
+    onSuccess: () => {
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+  const spawnM = useMutation({
+    mutationFn: () =>
+      mcpServers.createSpawn({ name: "spawn", enabled_by_default: enabledByDefault }),
+    onSuccess: () => {
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+  const removeM = useMutation({
+    mutationFn: mcpServers.remove,
+    onSuccess: (_, removedId) => {
+      if (editingId === removedId) resetForm();
+      qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+
+  const onSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    let headers: Record<string, string>;
+    try {
+      headers = parseEnvLines(headersText);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not parse headers.");
+      return;
+    }
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    if (!url.trim()) {
+      setError("URL is required.");
+      return;
+    }
+    const body: McpServerCreateInput = {
+      name: name.trim(),
+      transport: "streamable_http",
+      url: url.trim(),
+      headers,
+      enabled_by_default: enabledByDefault,
+    };
+    if (editingId) updateM.mutate({ id: editingId, body });
+    else createM.mutate(body);
+  };
+
+  const busy = createM.isPending || updateM.isPending || spawnM.isPending;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>MCP servers</CardTitle>
+        <CardDescription>Manage agent-accessible MCP servers.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <form className="grid gap-3 @md/settings:grid-cols-2" onSubmit={onSubmit}>
+          <div className="space-y-1">
+            <Label htmlFor="mcp-name">Name</Label>
+            <Input
+              id="mcp-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              disabled={busy}
+            />
+          </div>
+          <div className="flex items-end">
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={busy}
+              onClick={() => spawnM.mutate()}
+            >
+              <KeyRound className="size-4" />
+              Add Spawn MCP
+            </Button>
+          </div>
+          <div className="space-y-1 @md/settings:col-span-2">
+            <Label htmlFor="mcp-url">URL</Label>
+            <Input
+              id="mcp-url"
+              value={url}
+              onChange={(event) => setUrl(event.target.value)}
+              placeholder="https://example.com/mcp"
+              disabled={busy}
+            />
+          </div>
+          <div className="space-y-1 @md/settings:col-span-2">
+            <Label htmlFor="mcp-headers">Headers</Label>
+            <Textarea
+              id="mcp-headers"
+              value={headersText}
+              onChange={(event) => setHeadersText(event.target.value)}
+              placeholder="Authorization=Bearer ..."
+              rows={3}
+              disabled={busy}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm @md/settings:col-span-2">
+            <input
+              type="checkbox"
+              checked={enabledByDefault}
+              onChange={(event) => setEnabledByDefault(event.currentTarget.checked)}
+              disabled={busy}
+            />
+            Grant to new agents by default
+          </label>
+          {(error || q.error) && (
+            <p className="text-sm text-destructive @md/settings:col-span-2" role="alert">
+              {error ?? `Failed to load MCP servers: ${String(q.error)}`}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 @md/settings:col-span-2">
+            <Button type="submit" disabled={busy}>
+              {busy ? "Saving..." : editingId ? "Update server" : "Add server"}
+            </Button>
+            {editingId && (
+              <Button type="button" variant="secondary" onClick={resetForm} disabled={busy}>
+                <X className="size-4" />
+                Cancel
+              </Button>
+            )}
+          </div>
+        </form>
+        <div className="divide-y divide-border rounded-md border border-border">
+          {q.isLoading && (
+            <div className="p-3 text-sm text-muted-foreground">Loading MCP servers...</div>
+          )}
+          {!q.isLoading && !q.error && (q.data?.length ?? 0) === 0 && (
+            <div className="p-3 text-sm text-muted-foreground">No MCP servers yet.</div>
+          )}
+          {(q.data ?? []).map((server) => (
+            <div key={server.id} className="flex items-start justify-between gap-3 p-3">
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{server.name}</span>
+                  {server.enabled_by_default && (
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
+                      default
+                    </span>
+                  )}
+                  <span className="text-xs text-muted-foreground">{server.transport}</span>
+                </div>
+                <div className="truncate font-mono text-xs text-muted-foreground">
+                  {server.url ?? server.command ?? "(not configured)"}
+                </div>
+              </div>
+              <div className="flex shrink-0 gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Edit MCP server ${server.name}`}
+                  title="Edit MCP server"
+                  disabled={busy}
+                  onClick={() => editServer(server)}
+                >
+                  <Pencil className="size-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Delete MCP server ${server.name}`}
+                  title="Delete MCP server"
+                  disabled={removeM.isPending}
+                  onClick={() => {
+                    if (confirm(`Delete MCP server ${server.name}?`)) removeM.mutate(server.id);
+                  }}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SkillsSettings() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["skills"], queryFn: skillApi.list });
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [content, setContent] = useState("");
+  const [enabledByDefault, setEnabledByDefault] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const resetForm = () => {
+    setName("");
+    setDescription("");
+    setContent("");
+    setEnabledByDefault(false);
+    setEditingId(null);
+    setError(null);
+  };
+
+  const editSkill = (skill: Skill) => {
+    setName(skill.name);
+    setDescription(skill.description);
+    setContent(skill.content);
+    setEnabledByDefault(skill.enabled_by_default);
+    setEditingId(skill.id);
+    setError(null);
+  };
+
+  const createM = useMutation({
+    mutationFn: skillApi.create,
+    onSuccess: () => {
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["skills"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+  const updateM = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: SkillCreateInput }) => skillApi.update(id, body),
+    onSuccess: () => {
+      resetForm();
+      qc.invalidateQueries({ queryKey: ["skills"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+  const removeM = useMutation({
+    mutationFn: skillApi.remove,
+    onSuccess: (_, removedId) => {
+      if (editingId === removedId) resetForm();
+      qc.invalidateQueries({ queryKey: ["skills"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+  });
+
+  const onSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    if (!content.trim()) {
+      setError("Content is required.");
+      return;
+    }
+    const body: SkillCreateInput = {
+      name: name.trim(),
+      description: description.trim(),
+      content,
+      enabled_by_default: enabledByDefault,
+    };
+    if (editingId) updateM.mutate({ id: editingId, body });
+    else createM.mutate(body);
+  };
+
+  const busy = createM.isPending || updateM.isPending;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Skills</CardTitle>
+        <CardDescription>Manage agent-accessible skills.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <form className="grid gap-3 @md/settings:grid-cols-2" onSubmit={onSubmit}>
+          <div className="space-y-1">
+            <Label htmlFor="skill-name">Name</Label>
+            <Input
+              id="skill-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              disabled={busy}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="skill-description">Description</Label>
+            <Input
+              id="skill-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              disabled={busy}
+            />
+          </div>
+          <div className="space-y-1 @md/settings:col-span-2">
+            <Label htmlFor="skill-content">Content</Label>
+            <Textarea
+              id="skill-content"
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              rows={8}
+              disabled={busy}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm @md/settings:col-span-2">
+            <input
+              type="checkbox"
+              checked={enabledByDefault}
+              onChange={(event) => setEnabledByDefault(event.currentTarget.checked)}
+              disabled={busy}
+            />
+            Grant to new agents by default
+          </label>
+          {(error || q.error) && (
+            <p className="text-sm text-destructive @md/settings:col-span-2" role="alert">
+              {error ?? `Failed to load skills: ${String(q.error)}`}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 @md/settings:col-span-2">
+            <Button type="submit" disabled={busy}>
+              {busy ? "Saving..." : editingId ? "Update skill" : "Add skill"}
+            </Button>
+            {editingId && (
+              <Button type="button" variant="secondary" onClick={resetForm} disabled={busy}>
+                <X className="size-4" />
+                Cancel
+              </Button>
+            )}
+          </div>
+        </form>
+        <div className="divide-y divide-border rounded-md border border-border">
+          {q.isLoading && (
+            <div className="p-3 text-sm text-muted-foreground">Loading skills...</div>
+          )}
+          {!q.isLoading && !q.error && (q.data?.length ?? 0) === 0 && (
+            <div className="p-3 text-sm text-muted-foreground">No skills yet.</div>
+          )}
+          {(q.data ?? []).map((skill) => (
+            <div key={skill.id} className="flex items-start justify-between gap-3 p-3">
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{skill.name}</span>
+                  {skill.enabled_by_default && (
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
+                      default
+                    </span>
+                  )}
+                </div>
+                <div className="truncate text-xs text-muted-foreground">{skill.description}</div>
+              </div>
+              <div className="flex shrink-0 gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Edit skill ${skill.name}`}
+                  title="Edit skill"
+                  disabled={busy}
+                  onClick={() => editSkill(skill)}
+                >
+                  <Pencil className="size-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Delete skill ${skill.name}`}
+                  title="Delete skill"
+                  disabled={removeM.isPending}
+                  onClick={() => {
+                    if (confirm(`Delete skill ${skill.name}?`)) removeM.mutate(skill.id);
+                  }}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

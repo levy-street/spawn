@@ -67,6 +67,7 @@ class BrowserDisplayState:
     cols: int | None
     rows: int | None
     viewers: int
+    changed: bool = False
 
 
 class Broker:
@@ -79,6 +80,7 @@ class Broker:
         self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
+        self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -177,9 +179,10 @@ class Broker:
             self._promote_display_owner_locked(conn.agent_id, state, preferred=conn)
             if state.owner_conn_id != conn.id:
                 return None
+            changed = state.cols != cols or state.rows != rows
             state.cols = cols
             state.rows = rows
-            return self._browser_display_state_locked(conn, state)
+            return self._browser_display_state_locked(conn, state, changed=changed)
 
     async def take_display_control(
         self,
@@ -234,13 +237,14 @@ class Broker:
         state.owner_conn_id = owner.id
 
     def _browser_display_state_locked(
-        self, conn: BrowserConn, state: _DisplayState
+        self, conn: BrowserConn, state: _DisplayState, *, changed: bool = False
     ) -> BrowserDisplayState:
         return BrowserDisplayState(
             owner=state.owner_conn_id == conn.id,
             cols=state.cols,
             rows=state.rows,
             viewers=len(self._browsers_by_agent.get(conn.agent_id, ())),
+            changed=changed,
         )
 
     async def request_snapshot(
@@ -381,6 +385,55 @@ class Broker:
             fut = self._tool_install_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
+
+    async def request_upload(
+        self,
+        agent_id: str,
+        daemon: DaemonConn,
+        *,
+        payload: dict,
+        client_id: str,
+        timeout: float = 30.0,
+    ) -> dict | None:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict] = loop.create_future()
+        async with self._lock:
+            self._upload_waiters[client_id] = (agent_id, fut)
+        try:
+            await daemon.send_text(payload)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except TimeoutError:
+            return None
+        finally:
+            async with self._lock:
+                current = self._upload_waiters.get(client_id)
+                if current is not None and current[1] is fut:
+                    self._upload_waiters.pop(client_id, None)
+
+    async def resolve_upload(self, agent_id: str, client_id: str | None, payload: dict) -> None:
+        if not client_id:
+            return
+        async with self._lock:
+            waiter = self._upload_waiters.pop(client_id, None)
+        if waiter is None:
+            return
+        waiter_agent_id, fut = waiter
+        if waiter_agent_id != agent_id or fut.done():
+            return
+        fut.set_result(payload)
+
+    async def reject_uploads_for_agent(self, agent_id: str, message: str) -> None:
+        async with self._lock:
+            rejected = [
+                (client_id, fut)
+                for client_id, (waiter_agent_id, fut) in self._upload_waiters.items()
+                if waiter_agent_id == agent_id
+            ]
+            for client_id, _ in rejected:
+                self._upload_waiters.pop(client_id, None)
+        for _, fut in rejected:
+            if not fut.done():
+                fut.set_exception(RuntimeError(message))
 
 
 _broker = Broker()

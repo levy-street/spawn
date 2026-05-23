@@ -34,6 +34,19 @@ async def test_signup_login_me(client):
     assert r4.status_code == 200
     assert r4.json()["user"]["email"] == "alice@example.com"
 
+    # Long-lived bearer for MCP clients such as ChatGPT connectors.
+    r_mcp = await client.post("/api/auth/mcp-token", headers={"Authorization": f"Bearer {token}"})
+    assert r_mcp.status_code == 200, r_mcp.text
+    mcp_body = r_mcp.json()
+    assert mcp_body["token_type"] == "Bearer"
+    assert mcp_body["expires_in"] > 60 * 60 * 24
+    r_mcp_me = await client.get(
+        "/api/me",
+        headers={"Authorization": f"Bearer {mcp_body['access_token']}"},
+    )
+    assert r_mcp_me.status_code == 200
+    assert r_mcp_me.json()["user"]["email"] == "alice@example.com"
+
     # /api/me with the HTTP-only session cookie, then logout clears that cookie.
     r_cookie = await client.get("/api/me")
     assert r_cookie.status_code == 200

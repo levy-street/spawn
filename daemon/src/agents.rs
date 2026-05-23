@@ -90,6 +90,23 @@ impl AgentRegistry {
         }
     }
 
+    pub fn session_for(&self, id: Uuid) -> Option<String> {
+        let guard = self.inner.lock().expect("agents lock");
+        guard.get(&id).and_then(|entry| entry.handle.session().ok())
+    }
+
+    pub fn update_session(&self, id: Uuid, next: String) -> bool {
+        let guard = self.inner.lock().expect("agents lock");
+        if let Some(entry) = guard.get(&id) {
+            if let Err(e) = entry.handle.set_session(next) {
+                tracing::warn!(%id, error = %e, "updating agent tmux session failed");
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Snapshot the per-agent forwarder controls so a WS session can
     /// install/clear sinks across all known agents at once.
     pub fn snapshot_controls(&self) -> Vec<(Uuid, ForwarderControl)> {

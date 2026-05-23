@@ -8,10 +8,92 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::process::Command;
+use uuid::Uuid;
+
+const SESSION_PREFIX: &str = "spawn-";
+const DEFAULT_LABEL: &str = "agent";
+const MAX_LABEL_LEN: usize = 48;
 
 /// Returns the canonical tmux session name for an agent.
-pub fn session_name(agent_id: uuid::Uuid) -> String {
-    format!("spawn-{}", agent_id)
+///
+/// The UUID stays in the name so a restarted daemon can rediscover and
+/// reattach sessions even after users rename agents in Spawn.
+pub fn session_name(agent_id: Uuid, label: Option<&str>) -> String {
+    format!(
+        "{SESSION_PREFIX}{}--{}",
+        safe_session_label(label.unwrap_or(DEFAULT_LABEL)),
+        agent_id
+    )
+}
+
+/// Previous stable session name format. Kept for rediscovering existing
+/// agents created before friendly tmux names were introduced.
+pub fn legacy_session_name(agent_id: Uuid) -> String {
+    format!("{SESSION_PREFIX}{agent_id}")
+}
+
+/// Sanitize arbitrary UI names into tmux-friendly, shell-ergonomic labels.
+pub fn safe_session_label(label: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_sep = false;
+
+    for ch in label.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '.' | '_' | '-') {
+            Some(ch)
+        } else if ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | ';' | ',') {
+            Some('-')
+        } else {
+            None
+        };
+
+        let Some(ch) = next else {
+            continue;
+        };
+        if ch == '-' {
+            if last_was_sep || out.is_empty() {
+                continue;
+            }
+            last_was_sep = true;
+        } else {
+            last_was_sep = false;
+        }
+        out.push(ch);
+        if out.len() >= MAX_LABEL_LEN {
+            break;
+        }
+    }
+
+    while out.ends_with('-') || out.ends_with('.') || out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        DEFAULT_LABEL.to_string()
+    } else {
+        out
+    }
+}
+
+/// Extract the Spawn agent UUID from either the new friendly session name or
+/// the legacy `spawn-<uuid>` format.
+pub fn agent_id_from_session(session: &str) -> Option<Uuid> {
+    let suffix = session.strip_prefix(SESSION_PREFIX)?;
+    if let Ok(id) = Uuid::parse_str(suffix) {
+        return Some(id);
+    }
+
+    let bytes = suffix.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    for start in 0..=(bytes.len() - 36) {
+        let candidate = std::str::from_utf8(&bytes[start..start + 36]).ok()?;
+        if let Ok(id) = Uuid::parse_str(candidate) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Start a detached tmux session running the given argv with the given env.
@@ -83,6 +165,28 @@ pub async fn kill_session(session: &str) -> Result<()> {
             "tmux kill-session failed ({}): {}",
             out.status,
             stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+pub async fn rename_session(current: &str, next: &str) -> Result<()> {
+    if current == next {
+        return Ok(());
+    }
+    let out = Command::new("tmux")
+        .arg("rename-session")
+        .arg("-t")
+        .arg(current)
+        .arg(next)
+        .output()
+        .await
+        .context("invoking tmux rename-session")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "tmux rename-session failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(())
@@ -272,4 +376,43 @@ async fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {
         out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_session_label_is_shell_ergonomic() {
+        assert_eq!(safe_session_label("  UI Work / Codex  "), "ui-work-codex");
+        assert_eq!(safe_session_label("!!!"), "agent");
+        assert_eq!(
+            safe_session_label("dream - tiny_shakespeare.clm"),
+            "dream-tiny_shakespeare.clm"
+        );
+    }
+
+    #[test]
+    fn session_name_keeps_label_and_uuid() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        assert_eq!(
+            session_name(id, Some("Palette")),
+            "spawn-palette--00000000-0000-0000-0000-000000000001"
+        );
+    }
+
+    #[test]
+    fn agent_id_from_session_supports_new_and_legacy_names() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        assert_eq!(agent_id_from_session(&legacy_session_name(id)), Some(id));
+        assert_eq!(
+            agent_id_from_session(&session_name(id, Some("UI Work"))),
+            Some(id)
+        );
+        assert_eq!(agent_id_from_session("unrelated"), None);
+        assert_eq!(
+            agent_id_from_session("notes--00000000-0000-0000-0000-000000000001"),
+            None
+        );
+    }
 }

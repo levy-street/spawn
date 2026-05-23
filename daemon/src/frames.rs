@@ -188,6 +188,20 @@ mod tests {
             }
             _ => panic!("expected AgentResize"),
         }
+
+        let rename: Inbound = serde_json::from_str(
+            r#"{"type":"agent.rename","agent_id":"00000000-0000-0000-0000-000000000003","tmux_session":"spawn-palette--00000000-0000-0000-0000-000000000003"}"#,
+        )
+        .unwrap();
+        match rename {
+            Inbound::AgentRename { tmux_session, .. } => {
+                assert_eq!(
+                    tmux_session,
+                    "spawn-palette--00000000-0000-0000-0000-000000000003"
+                );
+            }
+            _ => panic!("expected AgentRename"),
+        }
     }
 
     #[test]

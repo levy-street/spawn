@@ -110,6 +110,11 @@ pub enum Inbound {
         #[serde(default)]
         signal: Option<String>,
     },
+    #[serde(rename = "agent.rename")]
+    AgentRename {
+        agent_id: Uuid,
+        tmux_session: String,
+    },
     #[serde(rename = "agent.resize")]
     AgentResize {
         agent_id: Uuid,
@@ -165,11 +170,40 @@ pub struct AgentCreate {
     /// PATH lookup before launching.
     #[serde(default)]
     pub install: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<AgentMcpServerConfig>,
+    #[serde(default)]
+    pub skills: Vec<AgentSkillConfig>,
     pub tmux_session: String,
     pub cols: u16,
     pub rows: u16,
     #[serde(default)]
     pub create_cwd: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMcpServerConfig {
+    pub id: String,
+    pub name: String,
+    pub transport: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSkillConfig {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

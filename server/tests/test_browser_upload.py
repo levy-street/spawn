@@ -6,12 +6,12 @@ import base64
 
 import pytest
 
+from spawn_server.agent_control import upload_paste_prefix
 from spawn_server.ws.browser import (
     UploadValidationError,
-    _decode_upload,
     _decode_image_upload,
+    _decode_upload,
     _prefer_transcript_history,
-    _upload_paste_prefix,
 )
 
 
@@ -69,7 +69,7 @@ def test_decode_image_upload_rejects_bad_payloads(payload, message):
     ],
 )
 def test_upload_paste_prefix(argv, prefix):
-    assert _upload_paste_prefix(argv) == prefix
+    assert upload_paste_prefix(argv) == prefix
 
 
 @pytest.mark.parametrize(

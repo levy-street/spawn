@@ -38,6 +38,8 @@ class User(Base):
 
     hosts: Mapped[list[Host]] = relationship(back_populates="owner")
     agents: Mapped[list[Agent]] = relationship(back_populates="owner")
+    mcp_servers: Mapped[list[McpServer]] = relationship(back_populates="owner")
+    skills: Mapped[list[Skill]] = relationship(back_populates="owner")
 
 
 class Host(Base):
@@ -141,6 +143,94 @@ class Agent(Base):
 
     owner: Mapped[User] = relationship(back_populates="agents")
     host: Mapped[Host] = relationship(back_populates="agents")
+
+
+class McpServer(Base):
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    transport: Mapped[str] = mapped_column(String(32), nullable=False, default="streamable_http")
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    command: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    args: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    headers: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    enabled_by_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    owner: Mapped[User] = relationship(back_populates="mcp_servers")
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_mcp_servers_owner_name"),
+    )
+
+
+class Skill(Base):
+    __tablename__ = "skills"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    content: Mapped[str] = mapped_column(String(65535), nullable=False)
+    enabled_by_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    owner: Mapped[User] = relationship(back_populates="skills")
+
+    __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_skills_owner_name"),)
+
+
+class AgentMcpServerGrant(Base):
+    __tablename__ = "agent_mcp_server_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    mcp_server_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("mcp_servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "mcp_server_id", name="uq_agent_mcp_server_grants"),
+    )
+
+
+class AgentSkillGrant(Base):
+    __tablename__ = "agent_skill_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    skill_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (UniqueConstraint("agent_id", "skill_id", name="uq_agent_skill_grants"),)
 
 
 class DeviceCode(Base):

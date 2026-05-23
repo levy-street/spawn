@@ -13,10 +13,9 @@
  */
 
 // When this env var is unset/empty, we build the WS URL from the current
-// window.location so deployed/tunnelled single-origin setups Just Work
-// (Next.js rewrites also proxy /ws/*). Override in dev with
-// NEXT_PUBLIC_SPAWN_WS_URL=ws://localhost:8000 if you're running the
-// FastAPI server on a different port.
+// window.location so deployed/tunnelled single-origin setups Just Work.
+// next.config.ts supplies a direct ws://localhost:<api-port> default in dev
+// because browser WS traffic is latency-sensitive and cookies are host-scoped.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
 export const SPAWN_WS_SUBPROTOCOL = "spawn.v1";

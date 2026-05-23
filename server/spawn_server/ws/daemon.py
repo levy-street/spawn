@@ -230,6 +230,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             if agent is None or agent.host_id != host.id:
                                 log.warning("upload ack for unknown agent=%s", aid)
                                 continue
+                        await broker.resolve_upload(
+                            aid,
+                            client_id if isinstance(client_id, str) else None,
+                            {"agent_id": aid, "path": path, "client_id": client_id},
+                        )
                         for b in broker.browsers_for(aid):
                             try:
                                 payload = {"type": "upload.saved", "path": path}
@@ -253,6 +258,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "error":
                     aid = obj.get("agent_id")
                     if obj.get("code") == "upload_failed" and aid:
+                        await broker.reject_uploads_for_agent(
+                            aid,
+                            obj.get("message") or "Upload failed.",
+                        )
                         for b in broker.browsers_for(aid):
                             try:
                                 await b.send_text(

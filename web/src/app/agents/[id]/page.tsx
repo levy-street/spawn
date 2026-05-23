@@ -26,7 +26,7 @@ import {
   agentTitle,
   isAgentArchived,
 } from "@/lib/agents";
-import { agents, hosts } from "@/lib/api";
+import { agentAccess, agents, hosts } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -74,7 +74,25 @@ function AgentTerminal() {
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
+  const accessQ = useQuery({
+    queryKey: ["agent-access", id],
+    queryFn: () => agentAccess.get(id as string),
+    enabled: !!id,
+    refetchInterval: 10_000,
+  });
   const currentTool = toolsQ.data?.tools.find((tool) => tool.preset_id === q.data?.preset_id);
+  const accessSummary = accessQ.data
+    ? [
+        accessQ.data.mcp_servers.length
+          ? `mcp ${accessQ.data.mcp_servers.map((server) => server.name).join(", ")}`
+          : "",
+        accessQ.data.skills.length
+          ? `skills ${accessQ.data.skills.map((skill) => skill.name).join(", ")}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
 
   const renameM = useMutation({
     mutationFn: (name: string) => agents.rename(id as string, name),
@@ -161,6 +179,22 @@ function AgentTerminal() {
                 ? `${agentActivityDetail(q.data)}${isAgentArchived(q.data) ? " · archived" : ""} · ${q.data.cwd}`
                 : ""}
             </div>
+            {q.data?.tmux_session && (
+              <div
+                className="hidden truncate font-mono text-[10px] text-muted-foreground sm:block"
+                title={q.data.tmux_session}
+              >
+                tmux {q.data.tmux_session}
+              </div>
+            )}
+            {accessSummary && (
+              <div
+                className="hidden truncate text-[10px] text-muted-foreground sm:block"
+                title={accessSummary}
+              >
+                {accessSummary}
+              </div>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-1">

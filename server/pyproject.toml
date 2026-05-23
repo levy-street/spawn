@@ -17,6 +17,7 @@ dependencies = [
     "redis>=5.2",
     "python-multipart>=0.0.20",
     "aiosqlite>=0.20",
+    "mcp>=1.16",
 ]
 
 [project.optional-dependencies]

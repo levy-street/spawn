@@ -1,21 +1,226 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { ArrowRight, Download, LogIn, Network, Server, ShieldCheck, Terminal } from "lucide-react";
+import Image from "next/image";
 import Link from "next/link";
-import { AuthGate } from "@/components/auth/AuthGate";
+import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { agentActivityDetail, agentTitle } from "@/lib/agents";
 import { type Agent, agents, type Host, hosts } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+
+const BACKDROP_CELLS = Array.from({ length: 140 }, (_, index) => `cell-${index}`);
 
 export default function HomePage() {
-  return (
-    <AuthGate>
+  const { user } = useAuth();
+
+  if (user) {
+    return (
       <AppShell>
         <Dashboard />
       </AppShell>
-    </AuthGate>
+    );
+  }
+
+  return <LandingPage />;
+}
+
+function LandingPage() {
+  const [origin, setOrigin] = useState("https://spawnd.dev");
+
+  useEffect(() => {
+    setOrigin(window.location.origin);
+  }, []);
+
+  const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
+
+  return (
+    <main className="min-h-vv overflow-hidden bg-[#080808] text-white">
+      <section className="relative min-h-[88svh] overflow-hidden border-border border-b">
+        <TerminalBackdrop />
+
+        <nav className="relative z-10 mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
+          <Link href="/" className="flex items-center gap-3 text-lg font-semibold">
+            <Image src="/icon-192.png" alt="" width={36} height={36} className="rounded-md" />
+            <span>spawn</span>
+          </Link>
+          <div className="flex items-center gap-2">
+            <Button asChild variant="ghost" size="sm">
+              <Link href="/login">
+                <LogIn className="size-4" />
+                Log in
+              </Link>
+            </Button>
+            <Button asChild size="sm">
+              <Link href="/signup">
+                Sign up
+                <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+          </div>
+        </nav>
+
+        <div className="relative z-10 mx-auto flex min-h-[calc(88svh-5rem)] w-full max-w-7xl flex-col justify-center px-4 pb-16 sm:px-6 lg:px-8">
+          <div className="max-w-3xl">
+            <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-white/15 bg-black/45 px-3 py-1 text-sm text-zinc-300">
+              <Network className="size-4 text-sky-300" />
+              Browser control for CLI coding agents
+            </p>
+            <h1 className="text-6xl font-semibold leading-none sm:text-7xl md:text-8xl">spawn</h1>
+            <p className="mt-6 max-w-lg text-balance text-xl leading-8 text-zinc-200 sm:text-2xl sm:leading-9">
+              Run Codex, Claude, shell agents, and host tools across your laptop, workstations, and
+              servers from one fast control plane.
+            </p>
+            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+              <Button asChild size="lg">
+                <Link href="/signup">
+                  <ArrowRight className="size-5" />
+                  Start using spawn
+                </Link>
+              </Button>
+              <Button asChild variant="outline" size="lg">
+                <a href="#install">
+                  <Download className="size-5" />
+                  Install daemon
+                </a>
+              </Button>
+            </div>
+            <div className="mt-8 max-w-2xl rounded-md border border-white/15 bg-black/70 p-3 font-mono text-xs text-zinc-200 shadow-2xl shadow-black/40 sm:text-sm">
+              <span className="mr-2 text-emerald-300">$</span>
+              <code className="break-all">{installCommand}</code>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="install"
+        className="border-border border-b bg-[#0d0d0d] px-4 py-12 sm:px-6 lg:px-8"
+      >
+        <div className="mx-auto grid w-full max-w-7xl gap-8 lg:grid-cols-[1fr_1.1fr]">
+          <div>
+            <p className="mb-3 text-sm font-medium text-amber-300">Host setup</p>
+            <h2 className="text-3xl font-semibold leading-tight sm:text-4xl">
+              One installer for macOS and Linux hosts.
+            </h2>
+            <p className="mt-4 max-w-xl text-base leading-7 text-zinc-300">
+              The hosted script picks a prebuilt daemon for the host, falls back to a source build
+              when needed, runs device-code login, and starts a user service where the OS supports
+              it.
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Capability icon={<Download className="size-5" />} title="Prebuilt first">
+              Downloads a prebuilt daemon binary before attempting any Rust or git build path.
+            </Capability>
+            <Capability icon={<Server className="size-5" />} title="User services">
+              Uses LaunchAgent on macOS and user systemd on Linux with a background fallback.
+            </Capability>
+            <Capability icon={<Terminal className="size-5" />} title="CLI native">
+              Runs your existing agent CLIs in real terminals with durable host registration.
+            </Capability>
+            <Capability icon={<ShieldCheck className="size-5" />} title="Outbound only">
+              Hosts dial the Spawn server over HTTPS/WSS, so no inbound SSH or agent ports are
+              exposed.
+            </Capability>
+          </div>
+        </div>
+      </section>
+
+      <section className="bg-[#101010] px-4 py-10 sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-2xl font-semibold">Bring a host online.</h2>
+            <p className="mt-2 text-sm text-zinc-400">
+              Install the daemon, approve the device code, then start agents from the browser.
+            </p>
+          </div>
+          <Button asChild size="lg">
+            <Link href="/signup">
+              Create account
+              <ArrowRight className="size-5" />
+            </Link>
+          </Button>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function TerminalBackdrop() {
+  return (
+    <div aria-hidden className="absolute inset-0">
+      <div className="absolute inset-0 grid grid-cols-6 opacity-35 sm:grid-cols-10 lg:grid-cols-[repeat(14,minmax(0,1fr))]">
+        {BACKDROP_CELLS.map((cell) => (
+          <div key={cell} className="min-h-14 border-[#171717] border-r border-b" />
+        ))}
+      </div>
+      <div className="absolute top-[14%] right-[-8rem] hidden w-[56rem] rotate-[-3deg] rounded-md border border-white/10 bg-black/70 p-4 shadow-2xl shadow-black/70 md:block">
+        <div className="mb-4 flex items-center gap-2 text-xs text-zinc-500">
+          <span className="size-3 rounded-full bg-rose-400" />
+          <span className="size-3 rounded-full bg-amber-300" />
+          <span className="size-3 rounded-full bg-emerald-400" />
+          <span className="ml-3">spawn / hosts / agents</span>
+        </div>
+        <div className="grid gap-3">
+          <BackdropLine accent="bg-emerald-300" text="dream online - 8 agents - codex ready" />
+          <BackdropLine accent="bg-sky-300" text="nightmare online - gpu queue - nvtop active" />
+          <BackdropLine
+            accent="bg-amber-300"
+            text="macbook online - local review agent - mcp spawn"
+          />
+          <div className="mt-2 h-40 rounded-md border border-white/10 bg-[#050505] p-4 font-mono text-sm text-zinc-300">
+            <p>
+              <span className="text-emerald-300">$</span> spawn agent create --preset codex --host
+              dream
+            </p>
+            <p className="mt-3 text-zinc-500">routing terminal frames over WSS...</p>
+            <p className="mt-3 text-sky-300">agent ready - /Users/jeremy/projects/spawn</p>
+          </div>
+        </div>
+      </div>
+      <div className="absolute bottom-10 left-4 hidden w-[22rem] rounded-md border border-white/10 bg-black/65 p-4 shadow-xl shadow-black/60 sm:left-8 sm:block">
+        <div className="font-mono text-xs leading-6 text-zinc-300">
+          <p className="text-emerald-300">spawnd 0.1.0</p>
+          <p>host registered</p>
+          <p className="text-sky-300">terminal attached</p>
+          <p className="text-amber-300">mcp tools granted</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackdropLine({ accent, text }: { accent: string; text: string }) {
+  return (
+    <div className="flex items-center gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 font-mono text-sm text-zinc-300">
+      <span className={`size-2 rounded-full ${accent}`} />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function Capability({
+  icon,
+  title,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="rounded-md border border-white/10 bg-black/25 p-4">
+      <div className="mb-3 flex size-9 items-center justify-center rounded-md bg-white text-black">
+        {icon}
+      </div>
+      <h3 className="font-semibold">{title}</h3>
+      <p className="mt-2 text-sm leading-6 text-zinc-400">{children}</p>
+    </div>
   );
 }
 

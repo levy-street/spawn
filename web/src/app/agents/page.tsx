@@ -25,7 +25,16 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { agentActivityDetail, agentCommand, agentTitle, isAgentArchived } from "@/lib/agents";
-import { type Agent, ApiError, agents, type Host, hosts, presets } from "@/lib/api";
+import {
+  type Agent,
+  ApiError,
+  agents,
+  type Host,
+  hosts,
+  mcpServers,
+  presets,
+  skills as skillApi,
+} from "@/lib/api";
 import { normalizeCommandText, parseArgv } from "@/lib/argv";
 
 export default function AgentsPage() {
@@ -486,6 +495,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
   const presetsQ = useQuery({ queryKey: ["presets"], queryFn: presets.list });
+  const mcpServersQ = useQuery({ queryKey: ["mcp-servers"], queryFn: mcpServers.list });
+  const skillsQ = useQuery({ queryKey: ["skills"], queryFn: skillApi.list });
 
   const [hostId, setHostId] = useState("");
   const [name, setName] = useState("");
@@ -494,6 +505,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const [argv, setArgv] = useState("");
   const [cols, setCols] = useState("120");
   const [rows, setRows] = useState("32");
+  const [mcpServerIds, setMcpServerIds] = useState<string[]>([]);
+  const [skillIds, setSkillIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastAutoCwd, setLastAutoCwd] = useState("");
   const [presetTouched, setPresetTouched] = useState(false);
@@ -530,6 +543,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const selectedHostHomeDir = selectedHost?.home_dir ?? "/";
   const selectedPreset = presetOptions.find((p) => p.id === presetId);
   const formDisabled = m.isPending || hostsQ.isLoading || presetsQ.isLoading;
+  const mcpOptions = mcpServersQ.data ?? [];
+  const skillOptions = skillsQ.data ?? [];
 
   useEffect(() => {
     if (hostId || hostOptions.length === 0) return;
@@ -540,6 +555,14 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
     if (presetTouched || presetId || argv.trim() || presetOptions.length === 0) return;
     setPresetId((presetOptions.find((p) => p.name === "codex") ?? presetOptions[0]).id);
   }, [argv, presetId, presetOptions, presetTouched]);
+
+  useEffect(() => {
+    setMcpServerIds((current) => mergeDefaults(current, mcpOptions));
+  }, [mcpOptions]);
+
+  useEffect(() => {
+    setSkillIds((current) => mergeDefaults(current, skillOptions));
+  }, [skillOptions]);
 
   useEffect(() => {
     if (!hostId) return;
@@ -584,6 +607,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
       preset_id: presetId || undefined,
       cwd: normalizeCwdForHost(cwd, selectedHostHomeDir),
       argv: argvArr,
+      mcp_server_ids: mcpServerIds,
+      skill_ids: skillIds,
       cols: parsedCols,
       rows: parsedRows,
       create_cwd: true,
@@ -716,6 +741,53 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
               disabled={m.isPending}
             />
           </div>
+          {(mcpOptions.length > 0 || skillOptions.length > 0) && (
+            <div className="space-y-3 rounded-md border border-border p-3 @md/agents:col-span-2">
+              <div className="text-sm font-medium">Access</div>
+              {mcpOptions.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-xs uppercase text-muted-foreground">MCP servers</div>
+                  <div className="flex flex-wrap gap-3">
+                    {mcpOptions.map((server) => (
+                      <label key={server.id} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={mcpServerIds.includes(server.id)}
+                          onChange={(event) =>
+                            setMcpServerIds((current) =>
+                              toggleId(current, server.id, event.currentTarget.checked),
+                            )
+                          }
+                        />
+                        {server.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {skillOptions.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-xs uppercase text-muted-foreground">Skills</div>
+                  <div className="flex flex-wrap gap-3">
+                    {skillOptions.map((skill) => (
+                      <label key={skill.id} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={skillIds.includes(skill.id)}
+                          onChange={(event) =>
+                            setSkillIds((current) =>
+                              toggleId(current, skill.id, event.currentTarget.checked),
+                            )
+                          }
+                        />
+                        {skill.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {(hostsQ.error || presetsQ.error || error) && (
             <p
               id="new-agent-status"
@@ -750,6 +822,23 @@ function normalizeCwdForHost(value: string, homeDir: string): string {
   if (raw.startsWith("~/")) return normalizeAbsolutePath(joinPath(home, raw.slice(2)));
   if (raw.startsWith("/")) return normalizeAbsolutePath(raw);
   return normalizeAbsolutePath(joinPath(home, raw));
+}
+
+function mergeDefaults<T extends { id: string; enabled_by_default: boolean }>(
+  current: string[],
+  options: T[],
+): string[] {
+  const available = new Set(options.map((option) => option.id));
+  const next = current.filter((id) => available.has(id));
+  for (const option of options) {
+    if (option.enabled_by_default && !next.includes(option.id)) next.push(option.id);
+  }
+  return next;
+}
+
+function toggleId(current: string[], id: string, enabled: boolean): string[] {
+  if (enabled) return current.includes(id) ? current : [...current, id];
+  return current.filter((value) => value !== id);
 }
 
 function splitForDirectorySuggestions(

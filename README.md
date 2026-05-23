@@ -47,15 +47,18 @@ web URL:
 curl -fsSL https://spawn.example.com/install.sh | sh
 ```
 
-The script installs prerequisites where it can, downloads a prebuilt daemon
-when available, falls back to building from source, runs the device-code login
-flow, then starts a user `systemd` service when available with a background
-fallback. The hosted script defaults to `SPAWN_PUBLIC_URL`; override it
-explicitly when needed:
+The script installs prerequisites where it can, downloads a prebuilt daemon for
+macOS or Linux when available, falls back to building from source, runs the
+device-code login flow, then starts a macOS LaunchAgent or Linux user `systemd`
+service when available with a background fallback. The hosted script defaults
+to `SPAWN_PUBLIC_URL`; override it explicitly when needed:
 
 ```bash
 curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spawn.example.com
 ```
+
+For CI or smoke tests that should prove the minimal binary path without a Rust
+fallback, add `--prebuilt-only`.
 
 ```bash
 # 0. One-time: copy env template
@@ -68,7 +71,7 @@ docker compose -f infra/docker-compose.yml up -d
 cd server
 uv sync
 uv run alembic upgrade head
-uv run uvicorn spawn_server.main:app --reload --port 8000
+uv run uvicorn spawn_server.main:app --reload --port 8000 --ws websockets-sansio
 # CORS is preconfigured to allow http://localhost:3000
 
 # 3. Web (Bun + Next.js) — sign up here first so the device-code approve flow

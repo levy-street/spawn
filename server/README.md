@@ -22,7 +22,7 @@ cp ../.env.example .env
 uv run alembic upgrade head
 
 # run dev server
-uv run uvicorn spawn_server.main:app --reload --port 8000
+uv run uvicorn spawn_server.main:app --reload --port 8000 --ws websockets-sansio
 ```
 
 ## Migrations

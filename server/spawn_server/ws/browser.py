@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 import logging
 
@@ -12,6 +11,12 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from .. import auth as auth_mod
 from .. import transcript
+from ..agent_control import (
+    MAX_UPLOAD_CLIENT_ID_LENGTH,
+    UploadValidationError,
+    decode_upload,
+    upload_paste_prefix,
+)
 from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
@@ -26,16 +31,6 @@ from .frames import KIND_INPUT, encode_binary_frame
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_UPLOAD_NAME_LENGTH = 255
-MAX_UPLOAD_MIME_LENGTH = 128
-MAX_UPLOAD_CLIENT_ID_LENGTH = 128
-UPLOAD_DESTINATION_CWD = "cwd"
-TERMINAL_UI_AGENT_BINS = {"codex", "claude", "claude-code", "opencode", "aider"}
-
-
-class UploadValidationError(ValueError):
-    pass
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -52,44 +47,17 @@ async def _touch_agent_input(agent_id: str) -> None:
 
 
 def _decode_upload(obj: dict) -> tuple[str, str, str, str | None]:
-    destination = obj.get("destination")
-    destination = destination if destination == UPLOAD_DESTINATION_CWD else None
-    default_name = "file" if destination == UPLOAD_DESTINATION_CWD else "image"
-    name = str(obj.get("name") or default_name).strip()[:MAX_UPLOAD_NAME_LENGTH] or default_name
-    mime_type = str(obj.get("mime_type") or "").strip().lower()[:MAX_UPLOAD_MIME_LENGTH]
-    if not mime_type:
-        mime_type = "application/octet-stream"
-    if destination != UPLOAD_DESTINATION_CWD and not mime_type.startswith("image/"):
-        raise UploadValidationError("Only image files can be pasted or dropped here.")
-
-    raw_b64 = obj.get("bytes_b64")
-    if not isinstance(raw_b64, str) or not raw_b64:
-        raise UploadValidationError("Upload was empty.")
-    try:
-        data = base64.b64decode(raw_b64, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise UploadValidationError("Upload was not valid base64.") from e
-
-    if not data:
-        raise UploadValidationError("Upload was empty.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise UploadValidationError("Upload is too large; the limit is 20 MB.")
-
-    return name, mime_type, base64.b64encode(data).decode("ascii"), destination
+    return decode_upload(
+        name=obj.get("name"),
+        mime_type=obj.get("mime_type"),
+        bytes_b64=obj.get("bytes_b64"),
+        destination=obj.get("destination"),
+    )
 
 
 def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
     name, mime_type, bytes_b64, _destination = _decode_upload(obj)
     return name, mime_type, bytes_b64
-
-
-def _upload_paste_prefix(argv: list[str]) -> str:
-    if not argv:
-        return ""
-    binary = argv[0].rsplit("/", 1)[-1].lower()
-    if binary in TERMINAL_UI_AGENT_BINS:
-        return "@"
-    return ""
 
 
 def _prefer_transcript_history(argv: list[str]) -> bool:
@@ -334,25 +302,26 @@ async def browser_ws(
                     )
                     if display_state is None:
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.resize",
-                                    "agent_id": agent_id,
-                                    "cols": cols,
-                                    "rows": rows,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("resize forward failed: %s", e)
-                    await _broadcast_display_control(agent_id)
+                    if display_state.changed:
+                        daemon = broker.get_daemon_for_agent(
+                            agent_id
+                        ) or broker.get_daemon_for_host(host_id)
+                        if daemon is not None:
+                            try:
+                                suppress_agent_output_activity(
+                                    agent_id, duration=REDRAW_SUPPRESS_WINDOW
+                                )
+                                await daemon.send_text(
+                                    {
+                                        "type": "agent.resize",
+                                        "agent_id": agent_id,
+                                        "cols": cols,
+                                        "rows": rows,
+                                    }
+                                )
+                            except Exception as e:
+                                log.warning("resize forward failed: %s", e)
+                        await _broadcast_display_control(agent_id)
                 elif ftype == "take_control":
                     cols = _clamp_message_size(obj, "cols", 80, 20, 400)
                     rows = _clamp_message_size(obj, "rows", 24, 5, 200)
@@ -459,7 +428,7 @@ async def browser_ws(
                                 "name": name,
                                 "mime_type": mime_type,
                                 "bytes_b64": bytes_b64,
-                                "paste_prefix": _upload_paste_prefix(agent_argv),
+                                "paste_prefix": upload_paste_prefix(agent_argv),
                                 "paste": bool(obj.get("paste", True)),
                                 "destination": destination,
                                 "client_id": client_id,

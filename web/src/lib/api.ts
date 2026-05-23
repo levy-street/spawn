@@ -150,6 +150,7 @@ export type HostToolPolicy = z.infer<typeof HostToolPolicySchema>;
 export const AgentSchema = z.object({
   id: z.string().uuid(),
   name: z.string().nullable().default(null),
+  tmux_session: z.string().nullable().default(null),
   host_id: z.string().uuid(),
   host_name: z.string().nullable().default(null),
   preset_id: z.string().uuid().nullable(),
@@ -172,6 +173,47 @@ export const AgentSchema = z.object({
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
+export const AgentInputResultSchema = z.object({
+  agent_id: z.string().uuid(),
+  bytes: z.number().int(),
+});
+export type AgentInputResult = z.infer<typeof AgentInputResultSchema>;
+
+export const AgentResizeResultSchema = z.object({
+  agent_id: z.string().uuid(),
+  cols: z.number().int(),
+  rows: z.number().int(),
+});
+export type AgentResizeResult = z.infer<typeof AgentResizeResultSchema>;
+
+export const AgentScrollResultSchema = z.object({
+  agent_id: z.string().uuid(),
+  lines: z.number().int(),
+});
+export type AgentScrollResult = z.infer<typeof AgentScrollResultSchema>;
+
+export const AgentRedrawResultSchema = z.object({
+  agent_id: z.string().uuid(),
+  redraw: z.boolean(),
+});
+export type AgentRedrawResult = z.infer<typeof AgentRedrawResultSchema>;
+
+export const AgentSnapshotSchema = z.object({
+  agent_id: z.string().uuid(),
+  bytes_b64: z.string(),
+  plain: z.boolean(),
+  lines: z.number().int(),
+});
+export type AgentSnapshot = z.infer<typeof AgentSnapshotSchema>;
+
+export const AgentUploadResultSchema = z.object({
+  agent_id: z.string().uuid(),
+  path: z.string(),
+  client_id: z.string(),
+  pasted: z.boolean(),
+});
+export type AgentUploadResult = z.infer<typeof AgentUploadResultSchema>;
+
 export const PresetSchema = z.object({
   id: z.string().uuid(),
   owner_user_id: z.string().uuid().nullable(),
@@ -193,11 +235,73 @@ export interface PresetCreateInput {
 
 export type PresetUpdateInput = Partial<PresetCreateInput>;
 
+export const McpServerSchema = z.object({
+  id: z.string().uuid(),
+  owner_user_id: z.string().uuid(),
+  name: z.string(),
+  transport: z.enum(["streamable_http", "stdio"]).or(z.string()),
+  url: z.string().nullable().optional(),
+  command: z.string().nullable().optional(),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string(), z.string()).default({}),
+  headers: z.record(z.string(), z.string()).default({}),
+  enabled_by_default: z.boolean().default(false),
+  created_at: z.string(),
+});
+export type McpServer = z.infer<typeof McpServerSchema>;
+
+export interface McpServerCreateInput {
+  name: string;
+  transport?: "streamable_http" | "stdio";
+  url?: string | null;
+  command?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  enabled_by_default?: boolean;
+}
+
+export type McpServerUpdateInput = Partial<McpServerCreateInput>;
+
+export const SkillSchema = z.object({
+  id: z.string().uuid(),
+  owner_user_id: z.string().uuid(),
+  name: z.string(),
+  description: z.string(),
+  content: z.string(),
+  enabled_by_default: z.boolean().default(false),
+  created_at: z.string(),
+});
+export type Skill = z.infer<typeof SkillSchema>;
+
+export interface SkillCreateInput {
+  name: string;
+  description?: string;
+  content: string;
+  enabled_by_default?: boolean;
+}
+
+export type SkillUpdateInput = Partial<SkillCreateInput>;
+
+export const AgentAccessSchema = z.object({
+  agent_id: z.string().uuid(),
+  mcp_servers: z.array(McpServerSchema).default([]),
+  skills: z.array(SkillSchema).default([]),
+});
+export type AgentAccess = z.infer<typeof AgentAccessSchema>;
+
 export const AuthResponseSchema = z.object({
   access_token: z.string(),
   user: UserSchema,
 });
 export type AuthResponse = z.infer<typeof AuthResponseSchema>;
+
+export const McpTokenResponseSchema = z.object({
+  access_token: z.string(),
+  token_type: z.literal("Bearer"),
+  expires_in: z.number().int(),
+});
+export type McpTokenResponse = z.infer<typeof McpTokenResponseSchema>;
 
 export const DeviceStartResponseSchema = z.object({
   device_code: z.string(),
@@ -227,6 +331,11 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
+  mcpToken: () =>
+    api("/api/auth/mcp-token", {
+      method: "POST",
+      schema: McpTokenResponseSchema,
+    }),
   me: () =>
     api("/api/me", {
       method: "GET",
@@ -308,6 +417,8 @@ export const agents = {
     cwd: string;
     argv?: string[];
     env?: Record<string, string>;
+    mcp_server_ids?: string[];
+    skill_ids?: string[];
     cols?: number;
     rows?: number;
     create_cwd?: boolean;
@@ -329,6 +440,84 @@ export const agents = {
       body: JSON.stringify(body ?? {}),
       schema: AgentSchema,
     }),
+  input: (id: string, body: { text?: string; bytes_b64?: string }) =>
+    api(`/api/agents/${id}/input`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AgentInputResultSchema,
+    }),
+  resize: (id: string, body: { cols: number; rows: number }) =>
+    api(`/api/agents/${id}/resize`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AgentResizeResultSchema,
+    }),
+  scroll: (id: string, body: { lines: number }) =>
+    api(`/api/agents/${id}/scroll`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AgentScrollResultSchema,
+    }),
+  redraw: (id: string) =>
+    api(`/api/agents/${id}/redraw`, {
+      method: "POST",
+      schema: AgentRedrawResultSchema,
+    }),
+  snapshot: (id: string, body?: { lines?: number; plain?: boolean }) =>
+    api(`/api/agents/${id}/snapshot`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+      schema: AgentSnapshotSchema,
+    }),
+  upload: (
+    id: string,
+    body: {
+      name?: string;
+      mime_type?: string;
+      bytes_b64: string;
+      paste?: boolean;
+      destination?: "cwd" | null;
+      client_id?: string;
+    },
+  ) =>
+    api(`/api/agents/${id}/upload`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AgentUploadResultSchema,
+    }),
+  uploadFile: async (
+    id: string,
+    file: File,
+    options?: { paste?: boolean; destination?: "cwd"; client_id?: string },
+  ) => {
+    const body = new FormData();
+    body.set("file", file);
+    if (options?.paste !== undefined) body.set("paste", String(options.paste));
+    if (options?.destination) body.set("destination", options.destination);
+    if (options?.client_id) body.set("client_id", options.client_id);
+    const res = await fetch(`${API_URL}/api/agents/${id}/upload-file`, {
+      method: "POST",
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      body,
+    });
+    if (!res.ok) {
+      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
+      try {
+        payload = await res.json();
+      } catch {
+        // ignore
+      }
+      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
+      throw new ApiError(
+        res.status,
+        payload?.code ?? `http_${res.status}`,
+        payload?.message ?? detailMsg ?? res.statusText,
+        payload?.detail,
+      );
+    }
+    return AgentUploadResultSchema.parse(await res.json());
+  },
   rename: (id: string, name: string | null) => agents.update(id, { name }),
   pin: (id: string) => agents.update(id, { pinned: true }),
   unpin: (id: string) => agents.update(id, { pinned: false }),
@@ -356,6 +545,68 @@ export const presets = {
       schema: PresetSchema,
     }),
   remove: (id: string) => api<void>(`/api/presets/${id}`, { method: "DELETE" }),
+};
+
+export const mcpServers = {
+  list: () =>
+    api("/api/mcp-servers", {
+      method: "GET",
+      schema: z.array(McpServerSchema),
+    }),
+  create: (body: McpServerCreateInput) =>
+    api("/api/mcp-servers", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: McpServerSchema,
+    }),
+  createSpawn: (body?: { name?: string; enabled_by_default?: boolean }) =>
+    api("/api/mcp-servers/spawn", {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+      schema: McpServerSchema,
+    }),
+  update: (id: string, body: McpServerUpdateInput) =>
+    api(`/api/mcp-servers/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: McpServerSchema,
+    }),
+  remove: (id: string) => api<void>(`/api/mcp-servers/${id}`, { method: "DELETE" }),
+};
+
+export const skills = {
+  list: () =>
+    api("/api/skills", {
+      method: "GET",
+      schema: z.array(SkillSchema),
+    }),
+  create: (body: SkillCreateInput) =>
+    api("/api/skills", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: SkillSchema,
+    }),
+  update: (id: string, body: SkillUpdateInput) =>
+    api(`/api/skills/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: SkillSchema,
+    }),
+  remove: (id: string) => api<void>(`/api/skills/${id}`, { method: "DELETE" }),
+};
+
+export const agentAccess = {
+  get: (agentId: string) =>
+    api(`/api/agents/${agentId}/access`, {
+      method: "GET",
+      schema: AgentAccessSchema,
+    }),
+  update: (agentId: string, body: { mcp_server_ids?: string[]; skill_ids?: string[] }) =>
+    api(`/api/agents/${agentId}/access`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: AgentAccessSchema,
+    }),
 };
 
 export { API_URL };

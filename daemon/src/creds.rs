@@ -37,6 +37,10 @@ impl StoredCreds {
 pub fn load() -> Result<StoredCreds> {
     let mut from_file = load_file().unwrap_or_default();
 
+    if keyring_disabled() {
+        return Ok(from_file);
+    }
+
     match keyring_get() {
         Ok(Some(tok)) => from_file.access_token = Some(tok),
         Ok(None) => {}
@@ -51,9 +55,11 @@ pub fn load() -> Result<StoredCreds> {
 /// best-effort copy of the token) to the JSON file, and tries to put the
 /// token in the keyring as well.
 pub fn save(creds: &StoredCreds) -> Result<()> {
-    if let Some(tok) = creds.access_token.as_deref() {
-        if let Err(e) = keyring_set(tok) {
-            tracing::warn!(error = %e, "keyring write failed; token will live in the file fallback only");
+    if !keyring_disabled() {
+        if let Some(tok) = creds.access_token.as_deref() {
+            if let Err(e) = keyring_set(tok) {
+                tracing::warn!(error = %e, "keyring write failed; token will live in the file fallback only");
+            }
         }
     }
     save_file(creds)
@@ -61,8 +67,10 @@ pub fn save(creds: &StoredCreds) -> Result<()> {
 
 /// Wipe stored creds (file + keyring).
 pub async fn logout() -> Result<()> {
-    if let Err(e) = keyring_delete() {
-        tracing::warn!(error = %e, "keyring delete failed (may simply have been absent)");
+    if !keyring_disabled() {
+        if let Err(e) = keyring_delete() {
+            tracing::warn!(error = %e, "keyring delete failed (may simply have been absent)");
+        }
     }
     let path = config::credentials_path()?;
     if path.exists() {
@@ -72,6 +80,16 @@ pub async fn logout() -> Result<()> {
         println!("spawn: no stored credentials");
     }
     Ok(())
+}
+
+fn keyring_disabled() -> bool {
+    std::env::var("SPAWN_DISABLE_KEYRING")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 /// `spawnd status` — print what we know.

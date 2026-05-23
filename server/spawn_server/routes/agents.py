@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas, transcript
+from .. import agent_control, auth, schemas, transcript
 from ..db import get_session
 from ..models import Agent, Host, Preset, User
 from ..ws.broker import get_broker
+from . import capabilities
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 log = logging.getLogger("spawn.routes.agents")
 ACTIVE_OUTPUT_WINDOW = timedelta(seconds=3)
 WAITING_OUTPUT_WINDOW = timedelta(seconds=8)
+TMUX_LABEL_MAX_LENGTH = 48
 
 
 def _utcnow() -> datetime:
@@ -33,6 +36,39 @@ def _last_cwd_dir(cwd: str) -> str:
 
 def _default_agent_name(host_name: str, cwd: str) -> str:
     return f"{host_name} - {_last_cwd_dir(cwd)}"[:128]
+
+
+def _tmux_safe_label(label: str | None) -> str:
+    raw = (label or "agent").strip()
+    out: list[str] = []
+    last_was_sep = False
+    for ch in raw:
+        if ch.isascii() and ch.isalnum():
+            next_ch = ch.lower()
+        elif ch in "._-":
+            next_ch = ch
+        elif ch.isspace() or ch in "/\\:;,":
+            next_ch = "-"
+        else:
+            continue
+
+        if next_ch == "-":
+            if last_was_sep or not out:
+                continue
+            last_was_sep = True
+        else:
+            last_was_sep = False
+        out.append(next_ch)
+        if len(out) >= TMUX_LABEL_MAX_LENGTH:
+            break
+
+    while out and out[-1] in "-._":
+        out.pop()
+    return "".join(out) or "agent"
+
+
+def tmux_session_name(agent: Agent) -> str:
+    return f"spawn-{_tmux_safe_label(agent.name)}--{agent.id}"
 
 
 def _aware(dt: datetime | None) -> datetime | None:
@@ -84,6 +120,7 @@ def _activity(agent: Agent, now: datetime | None = None) -> tuple[str, str]:
 def _to_out(agent: Agent, host_name: str | None = None) -> schemas.AgentOut:
     out = schemas.AgentOut.model_validate(agent)
     out.host_name = host_name
+    out.tmux_session = tmux_session_name(agent)
     out.last_activity_at = _last_activity_at(agent)
     out.activity_state, out.activity_label = _activity(agent)
     return out
@@ -145,6 +182,8 @@ async def _dispatch_agent_launch(
     cols: int,
     rows: int,
     create_cwd: bool,
+    mcp_servers: list[dict] | None = None,
+    skills: list[dict] | None = None,
 ) -> None:
     broker = get_broker()
     daemon = broker.get_daemon_for_host(host.id)
@@ -162,7 +201,9 @@ async def _dispatch_agent_launch(
                 "argv": agent.argv,
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
-                "tmux_session": f"spawn-{agent.id}",
+                "mcp_servers": mcp_servers or [],
+                "skills": skills or [],
+                "tmux_session": tmux_session_name(agent),
                 "cols": cols,
                 "rows": rows,
                 "create_cwd": create_cwd,
@@ -183,7 +224,8 @@ async def patch_agent(
     if a is None or a.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="agent not found")
 
-    if "name" in body.model_fields_set:
+    name_changed = "name" in body.model_fields_set
+    if name_changed:
         next_name = body.name.strip() if body.name is not None else ""
         a.name = next_name or None
     if body.pinned is not None:
@@ -194,6 +236,21 @@ async def patch_agent(
     await session.commit()
     await session.refresh(a)
     host = await session.get(Host, a.host_id)
+    if name_changed:
+        daemon = get_broker().get_daemon_for_agent(a.id) or get_broker().get_daemon_for_host(
+            a.host_id
+        )
+        if daemon is not None:
+            try:
+                await daemon.send_text(
+                    {
+                        "type": "agent.rename",
+                        "agent_id": a.id,
+                        "tmux_session": tmux_session_name(a),
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("agent.rename dispatch failed: %s", e)
     return _to_out(a, host.name if host is not None else None)
 
 
@@ -236,6 +293,27 @@ async def create_agent(
     session.add(agent)
     await session.commit()
     await session.refresh(agent)
+    mcp_server_ids = (
+        await capabilities.default_mcp_server_ids(session, user)
+        if body.mcp_server_ids is None
+        else body.mcp_server_ids
+    )
+    skill_ids = (
+        await capabilities.default_skill_ids(session, user)
+        if body.skill_ids is None
+        else body.skill_ids
+    )
+    await capabilities.set_agent_access(
+        session,
+        user=user,
+        agent=agent,
+        mcp_server_ids=mcp_server_ids,
+        skill_ids=skill_ids,
+    )
+    await session.commit()
+    mcp_servers, skills = await capabilities.get_agent_launch_capabilities(
+        session, user=user, agent_id=agent.id
+    )
 
     # Dispatch agent.create to the daemon. spawn does not manage agent
     # credentials — the agent CLI on the host handles its own auth.
@@ -247,6 +325,8 @@ async def create_agent(
         cols=body.cols,
         rows=body.rows,
         create_cwd=body.create_cwd,
+        mcp_servers=mcp_servers,
+        skills=skills,
     )
 
     return _to_out(agent, host.name)
@@ -281,6 +361,9 @@ async def restart_agent(
     agent.last_input_at = None
     await session.commit()
     await session.refresh(agent)
+    mcp_servers, skills = await capabilities.get_agent_launch_capabilities(
+        session, user=user, agent_id=agent.id
+    )
 
     await _dispatch_agent_launch(
         frame_type="agent.restart",
@@ -290,8 +373,135 @@ async def restart_agent(
         cols=body.cols,
         rows=body.rows,
         create_cwd=body.create_cwd,
+        mcp_servers=mcp_servers,
+        skills=skills,
     )
     return _to_out(agent, host.name)
+
+
+@router.post("/{agent_id}/input", response_model=schemas.AgentInputResult)
+async def input_agent(
+    agent_id: str,
+    body: schemas.AgentInput,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentInputResult:
+    result = await agent_control.send_agent_input(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        text=body.text,
+        bytes_b64=body.bytes_b64,
+    )
+    return schemas.AgentInputResult.model_validate(result)
+
+
+@router.post("/{agent_id}/resize", response_model=schemas.AgentResizeResult)
+async def resize_agent(
+    agent_id: str,
+    body: schemas.AgentResize,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentResizeResult:
+    result = await agent_control.resize_agent(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        cols=body.cols,
+        rows=body.rows,
+    )
+    return schemas.AgentResizeResult.model_validate(result)
+
+
+@router.post("/{agent_id}/scroll", response_model=schemas.AgentScrollResult)
+async def scroll_agent(
+    agent_id: str,
+    body: schemas.AgentScroll,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentScrollResult:
+    result = await agent_control.scroll_agent(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        lines=body.lines,
+    )
+    return schemas.AgentScrollResult.model_validate(result)
+
+
+@router.post("/{agent_id}/redraw", response_model=schemas.AgentRedrawResult)
+async def redraw_agent(
+    agent_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentRedrawResult:
+    result = await agent_control.redraw_agent(session=session, user=user, agent_id=agent_id)
+    return schemas.AgentRedrawResult.model_validate(result)
+
+
+@router.post("/{agent_id}/snapshot", response_model=schemas.AgentSnapshotOut)
+async def snapshot_agent(
+    agent_id: str,
+    body: schemas.AgentSnapshotRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentSnapshotOut:
+    result = await agent_control.snapshot_agent(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        lines=body.lines,
+        plain=body.plain,
+    )
+    return schemas.AgentSnapshotOut.model_validate(result)
+
+
+@router.post("/{agent_id}/upload", response_model=schemas.AgentUploadOut)
+async def upload_agent(
+    agent_id: str,
+    body: schemas.AgentUploadRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentUploadOut:
+    result = await agent_control.upload_agent_file(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        name=body.name,
+        mime_type=body.mime_type,
+        bytes_b64=body.bytes_b64,
+        paste=body.paste,
+        destination=body.destination,
+        client_id=body.client_id,
+    )
+    return schemas.AgentUploadOut.model_validate(result)
+
+
+@router.post("/{agent_id}/upload-file", response_model=schemas.AgentUploadOut)
+async def upload_agent_multipart(
+    agent_id: str,
+    file: UploadFile = File(...),
+    paste: bool = Form(default=True),
+    destination: str | None = Form(default=None),
+    client_id: str | None = Form(default=None),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.AgentUploadOut:
+    data = await file.read(agent_control.MAX_UPLOAD_BYTES + 1)
+    if len(data) > agent_control.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Upload is too large; the limit is 20 MB.")
+    result = await agent_control.upload_agent_file(
+        session=session,
+        user=user,
+        agent_id=agent_id,
+        name=file.filename,
+        mime_type=file.content_type,
+        bytes_b64=base64.b64encode(data).decode("ascii"),
+        paste=paste,
+        destination=destination,
+        client_id=client_id,
+    )
+    return schemas.AgentUploadOut.model_validate(result)
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)

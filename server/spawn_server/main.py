@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .db import dispose_engine, get_sessionmaker, init_engine
+from .mcp import mcp_app, spawn_mcp
 from .presets import seed_builtin_presets
 from .redis import lifespan_shutdown as redis_shutdown
 from .redis import lifespan_startup as redis_startup
 from .routes import agents as agents_routes
 from .routes import auth as auth_routes
+from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
@@ -43,12 +45,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             log.warning("preset seed skipped: %s", e)
     hosts_routes.start_auto_update_checker()
 
-    try:
-        yield
-    finally:
-        await hosts_routes.stop_auto_update_checker()
-        await redis_shutdown()
-        await dispose_engine()
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(spawn_mcp.session_manager.run())
+        try:
+            yield
+        finally:
+            await hosts_routes.stop_auto_update_checker()
+            await redis_shutdown()
+            await dispose_engine()
 
 
 def create_app() -> FastAPI:
@@ -64,6 +68,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(auth_routes.router)
+    app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(agents_routes.router)
@@ -72,10 +77,21 @@ def create_app() -> FastAPI:
 
     app.include_router(daemon_ws.router)
     app.include_router(browser_ws.router)
+    app.mount("/mcp", mcp_app)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/.well-known/oauth-protected-resource/mcp")
+    async def mcp_protected_resource_metadata() -> dict[str, object]:
+        public_url = get_settings().public_url.rstrip("/")
+        return {
+            "resource": f"{public_url}/mcp",
+            "authorization_servers": [f"{public_url}/api"],
+            "scopes_supported": ["spawn"],
+            "bearer_methods_supported": ["header"],
+        }
 
     return app
 

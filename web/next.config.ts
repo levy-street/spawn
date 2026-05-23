@@ -13,8 +13,27 @@ if (!API_PROXY_TARGET) {
   );
 }
 
+function defaultPublicWsUrl(): string {
+  if (process.env.NEXT_PUBLIC_SPAWN_WS_URL !== undefined) {
+    return process.env.NEXT_PUBLIC_SPAWN_WS_URL;
+  }
+  if (process.env.NODE_ENV === "production") return "";
+  const target = new URL(API_PROXY_TARGET);
+  target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+  if (target.hostname === "127.0.0.1" || target.hostname === "0.0.0.0") {
+    target.hostname = "localhost";
+  }
+  target.pathname = "";
+  target.search = "";
+  target.hash = "";
+  return target.toString().replace(/\/$/, "");
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  env: {
+    NEXT_PUBLIC_SPAWN_WS_URL: defaultPublicWsUrl(),
+  },
   async headers() {
     return [
       {
@@ -30,6 +49,12 @@ const nextConfig: NextConfig = {
     return [
       { source: "/api/:path*", destination: `${API_PROXY_TARGET}/api/:path*` },
       { source: "/ws/:path*", destination: `${API_PROXY_TARGET}/ws/:path*` },
+      { source: "/mcp", destination: `${API_PROXY_TARGET}/mcp/` },
+      { source: "/mcp/:path*", destination: `${API_PROXY_TARGET}/mcp/:path*` },
+      {
+        source: "/.well-known/:path*",
+        destination: `${API_PROXY_TARGET}/.well-known/:path*`,
+      },
       { source: "/healthz", destination: `${API_PROXY_TARGET}/healthz` },
       { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
     ];

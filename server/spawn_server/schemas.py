@@ -32,6 +32,12 @@ class TokenResponse(BaseModel):
     user: UserOut
 
 
+class McpTokenResponse(BaseModel):
+    access_token: str
+    token_type: Literal["Bearer"] = "Bearer"
+    expires_in: int
+
+
 class MeResponse(BaseModel):
     user: UserOut
 
@@ -189,6 +195,105 @@ class PresetOut(BaseModel):
     install: str | None = None
 
 
+# ---------- managed MCP servers / skills ----------
+
+
+class McpServerCreate(BaseModel):
+    name: str = Field(max_length=128)
+    transport: Literal["streamable_http", "stdio"] = "streamable_http"
+    url: str | None = Field(default=None, max_length=2048)
+    command: str | None = Field(default=None, max_length=2048)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled_by_default: bool = False
+
+
+class SpawnMcpServerCreate(BaseModel):
+    name: str = Field(default="spawn", max_length=128)
+    enabled_by_default: bool = False
+
+
+class McpServerPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    transport: Literal["streamable_http", "stdio"] | None = None
+    url: str | None = Field(default=None, max_length=2048)
+    command: str | None = Field(default=None, max_length=2048)
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    headers: dict[str, str] | None = None
+    enabled_by_default: bool | None = None
+
+
+class McpServerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    owner_user_id: str
+    name: str
+    transport: str
+    url: str | None = None
+    command: str | None = None
+    args: list[str]
+    env: dict[str, str]
+    headers: dict[str, str]
+    enabled_by_default: bool
+    created_at: datetime
+
+
+class SkillCreate(BaseModel):
+    name: str = Field(max_length=128)
+    description: str = Field(default="", max_length=512)
+    content: str = Field(max_length=65535)
+    enabled_by_default: bool = False
+
+
+class SkillPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    description: str | None = Field(default=None, max_length=512)
+    content: str | None = Field(default=None, max_length=65535)
+    enabled_by_default: bool | None = None
+
+
+class SkillOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    owner_user_id: str
+    name: str
+    description: str
+    content: str
+    enabled_by_default: bool
+    created_at: datetime
+
+
+class AgentAccessPatch(BaseModel):
+    mcp_server_ids: list[str] | None = None
+    skill_ids: list[str] | None = None
+
+
+class AgentAccessOut(BaseModel):
+    agent_id: str
+    mcp_servers: list[McpServerOut] = Field(default_factory=list)
+    skills: list[SkillOut] = Field(default_factory=list)
+
+
+class AgentMcpServerConfig(BaseModel):
+    id: str
+    name: str
+    transport: str
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class AgentSkillConfig(BaseModel):
+    id: str
+    name: str
+    description: str
+    content: str
+
+
 # ---------- agents ----------
 
 
@@ -199,6 +304,8 @@ class AgentCreate(BaseModel):
     cwd: str
     argv: list[str] | None = None
     env: dict[str, str] | None = None
+    mcp_server_ids: list[str] | None = None
+    skill_ids: list[str] | None = None
     cols: int = 120
     rows: int = 32
     create_cwd: bool = True
@@ -208,6 +315,69 @@ class AgentRestart(BaseModel):
     cols: int = 120
     rows: int = 32
     create_cwd: bool = True
+
+
+class AgentInput(BaseModel):
+    text: str | None = None
+    bytes_b64: str | None = None
+
+
+class AgentInputResult(BaseModel):
+    agent_id: str
+    bytes: int
+
+
+class AgentResize(BaseModel):
+    cols: int = Field(default=120, ge=20, le=400)
+    rows: int = Field(default=32, ge=5, le=200)
+
+
+class AgentResizeResult(BaseModel):
+    agent_id: str
+    cols: int
+    rows: int
+
+
+class AgentScroll(BaseModel):
+    lines: int = Field(ge=-200, le=200)
+
+
+class AgentScrollResult(BaseModel):
+    agent_id: str
+    lines: int
+
+
+class AgentRedrawResult(BaseModel):
+    agent_id: str
+    redraw: bool
+
+
+class AgentSnapshotRequest(BaseModel):
+    lines: int = Field(default=5000, ge=100, le=10000)
+    plain: bool = False
+
+
+class AgentSnapshotOut(BaseModel):
+    agent_id: str
+    bytes_b64: str
+    plain: bool
+    lines: int
+
+
+class AgentUploadRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=255)
+    mime_type: str | None = Field(default=None, max_length=128)
+    bytes_b64: str
+    paste: bool = True
+    destination: Literal["cwd"] | None = None
+    client_id: str | None = Field(default=None, max_length=128)
+
+
+class AgentUploadOut(BaseModel):
+    agent_id: str
+    path: str
+    client_id: str
+    pasted: bool
 
 
 class AgentPatch(BaseModel):
@@ -220,6 +390,7 @@ class AgentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str | None = None
+    tmux_session: str | None = None
     host_id: str
     host_name: str | None = None
     preset_id: str | None = None

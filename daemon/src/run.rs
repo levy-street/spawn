@@ -2,6 +2,7 @@
 //! frames forever (with reconnect + exponential backoff).
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -280,6 +281,12 @@ async fn dispatch_loop(
                 Inbound::AgentKill { agent_id, signal } => {
                     handle_agent_kill(agent_id, signal, registry).await;
                 }
+                Inbound::AgentRename {
+                    agent_id,
+                    tmux_session,
+                } => {
+                    handle_agent_rename(agent_id, tmux_session, registry, out_tx).await;
+                }
                 Inbound::AgentResize {
                     agent_id,
                     cols,
@@ -340,7 +347,10 @@ async fn dispatch_loop(
                 payload,
             } => {
                 if kind == frames::KIND_PTY_INPUT {
-                    let session = tmux::session_name(agent_id);
+                    let Some(session) = registry.session_for(agent_id) else {
+                        tracing::debug!(%agent_id, "ignoring stdin for unknown agent");
+                        continue;
+                    };
                     tmux::cancel_copy_mode(&session).await;
                     let found = registry.with_handle(agent_id, |h| {
                         if let Err(e) = h.write_stdin(&payload) {
@@ -975,8 +985,15 @@ async fn handle_agent_create(
     // agent CLI finds its own credentials), overlaid with any per-agent
     // env from the create frame. spawn does not inject credentials.
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    normalize_agent_env(&mut env);
     for (k, v) in &create.env {
         env.insert(k.clone(), v.clone());
+    }
+    if let Err(e) = materialize_agent_capabilities(&create, &mut env) {
+        let msg = format!("\r\n\x1b[31m[spawn] capability setup failed: {e:#}\x1b[0m\r\n");
+        send_pty_text(agent_id, out_tx, &msg).await;
+        send_spawn_failed_exit(agent_id, out_tx, "capability setup failed").await;
+        return;
     }
 
     // Pre-flight: if argv[0] isn't on PATH, try the install command (if any)
@@ -1048,8 +1065,15 @@ async fn handle_agent_create(
     let launch_cwd_str = launch_cwd.to_string_lossy().into_owned();
 
     // launch
+    let session = create.tmux_session.trim();
+    let tmux_session = if session.is_empty() {
+        tmux::session_name(agent_id, None)
+    } else {
+        session.to_string()
+    };
     let launched_res = pty::launch(pty::LaunchSpec {
         agent_id,
+        session: &tmux_session,
         cwd: &launch_cwd_str,
         cols: create.cols,
         rows: create.rows,
@@ -1129,20 +1153,341 @@ async fn handle_agent_create(
     });
 }
 
+fn normalize_agent_env(env: &mut BTreeMap<String, String>) {
+    env.remove("NO_COLOR");
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+    env.entry("CLICOLOR".into()).or_insert_with(|| "1".into());
+}
+
+fn materialize_agent_capabilities(
+    create: &AgentCreate,
+    env: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if create.mcp_servers.is_empty() && create.skills.is_empty() {
+        return Ok(());
+    }
+
+    let root = config::config_dir()?
+        .join("agents")
+        .join(create.agent_id.to_string());
+    if root.exists() {
+        fs::remove_dir_all(&root).with_context(|| format!("clearing {}", root.display()))?;
+    }
+    fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+
+    let mcp_file = root.join("mcp_servers.json");
+    let skills_file = root.join("skills.json");
+    let skills_dir = root.join("skills");
+    fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("creating {}", skills_dir.display()))?;
+
+    let mcp_json = serde_json::json!({ "servers": create.mcp_servers });
+    fs::write(&mcp_file, serde_json::to_vec_pretty(&mcp_json)?)
+        .with_context(|| format!("writing {}", mcp_file.display()))?;
+    fs::write(&skills_file, serde_json::to_vec_pretty(&create.skills)?)
+        .with_context(|| format!("writing {}", skills_file.display()))?;
+
+    for skill in &create.skills {
+        let dir = skills_dir.join(safe_file_component(&skill.name));
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("SKILL.md");
+        fs::write(
+            &path,
+            skill_markdown(&skill.name, &skill.description, &skill.content),
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
+    }
+
+    env.insert(
+        "SPAWN_AGENT_CONFIG_DIR".into(),
+        root.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "SPAWN_MCP_SERVERS_FILE".into(),
+        mcp_file.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "SPAWN_SKILLS_FILE".into(),
+        skills_file.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "SPAWN_SKILLS_DIR".into(),
+        skills_dir.to_string_lossy().into_owned(),
+    );
+
+    if is_codex_argv(&create.argv) {
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home)
+            .with_context(|| format!("creating {}", codex_home.display()))?;
+        write_codex_projection(&codex_home, &skills_dir, create)?;
+        link_codex_auth_state(&codex_home)?;
+        env.insert(
+            "CODEX_HOME".into(),
+            codex_home.to_string_lossy().into_owned(),
+        );
+    }
+
+    Ok(())
+}
+
+fn is_codex_argv(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|bin| Path::new(bin).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("codex"))
+}
+
+fn write_codex_projection(
+    codex_home: &Path,
+    skills_dir: &Path,
+    create: &AgentCreate,
+) -> Result<()> {
+    let mut config = String::from("# Generated by spawnd for this Spawn agent.\n");
+    for server in &create.mcp_servers {
+        config.push_str("\n[mcp_servers.");
+        config.push_str(&toml_quoted_key(&server.name));
+        config.push_str("]\n");
+        match server.transport.as_str() {
+            "stdio" => {
+                if let Some(command) = server.command.as_deref().filter(|value| !value.is_empty()) {
+                    config.push_str("command = ");
+                    config.push_str(&toml_string(command));
+                    config.push('\n');
+                }
+                if !server.args.is_empty() {
+                    config.push_str("args = ");
+                    config.push_str(&toml_string_array(&server.args));
+                    config.push('\n');
+                }
+                if !server.env.is_empty() {
+                    config.push_str("env = ");
+                    config.push_str(&toml_string_map(&server.env));
+                    config.push('\n');
+                }
+            }
+            _ => {
+                if let Some(url) = server.url.as_deref().filter(|value| !value.is_empty()) {
+                    config.push_str("url = ");
+                    config.push_str(&toml_string(url));
+                    config.push('\n');
+                }
+                if !server.headers.is_empty() {
+                    config.push_str("http_headers = ");
+                    config.push_str(&toml_string_map(&server.headers));
+                    config.push('\n');
+                }
+            }
+        }
+    }
+    for skill in &create.skills {
+        let path = skills_dir
+            .join(safe_file_component(&skill.name))
+            .join("SKILL.md");
+        config.push_str("\n[[skills.config]]\npath = ");
+        config.push_str(&toml_string(&path.to_string_lossy()));
+        config.push_str("\nenabled = true\n");
+    }
+    if !create.cwd.trim().is_empty() {
+        config.push_str("\n[projects.");
+        config.push_str(&toml_quoted_key(&create.cwd));
+        config.push_str("]\ntrust_level = \"trusted\"\n");
+    }
+    let path = codex_home.join("config.toml");
+    fs::write(&path, config).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn link_codex_auth_state(codex_home: &Path) -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    let source_home = std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".codex"));
+    for name in [
+        "auth.json",
+        "internal_storage.json",
+        "models_cache.json",
+        "version.json",
+    ] {
+        let source = source_home.join(name);
+        let dest = codex_home.join(name);
+        if !source.exists() || dest.exists() {
+            continue;
+        }
+        link_or_copy(&source, &dest)
+            .with_context(|| format!("projecting Codex auth state {}", source.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_or_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, dest).or_else(|_| fs::copy(source, dest).map(|_| ()))
+}
+
+#[cfg(not(unix))]
+fn link_or_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::copy(source, dest).map(|_| ())
+}
+
+fn skill_markdown(name: &str, description: &str, content: &str) -> String {
+    if content.trim_start().starts_with("---") {
+        return content.to_string();
+    }
+    format!(
+        "---\nname: \"{}\"\ndescription: \"{}\"\n---\n\n{}",
+        yaml_string(name),
+        yaml_string(description),
+        content
+    )
+}
+
+fn safe_file_component(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '-' | '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if last_dash || out.is_empty() {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(next);
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    while out.ends_with(['-', '.', '_']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        "skill".into()
+    } else {
+        out
+    }
+}
+
+fn yaml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn toml_quoted_key(value: &str) -> String {
+    toml_string(value)
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push(' '),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    let parts: Vec<String> = values.iter().map(|value| toml_string(value)).collect();
+    format!("[{}]", parts.join(", "))
+}
+
+fn toml_string_map(values: &BTreeMap<String, String>) -> String {
+    let parts: Vec<String> = values
+        .iter()
+        .map(|(key, value)| format!("{} = {}", toml_quoted_key(key), toml_string(value)))
+        .collect();
+    format!("{{ {} }}", parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::AgentMcpServerConfig;
+
+    #[test]
+    fn codex_projection_uses_codex_http_header_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let skills_dir = temp.path().join("skills");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token".to_string());
+
+        let create = AgentCreate {
+            agent_id: Uuid::new_v4(),
+            cwd: "/tmp".to_string(),
+            argv: vec!["codex".to_string()],
+            env: BTreeMap::new(),
+            install: None,
+            mcp_servers: vec![AgentMcpServerConfig {
+                id: "spawn".to_string(),
+                name: "spawn".to_string(),
+                transport: "streamable_http".to_string(),
+                url: Some("http://localhost:3002/mcp".to_string()),
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                headers,
+            }],
+            skills: vec![],
+            tmux_session: "spawn-test".to_string(),
+            cols: 80,
+            rows: 24,
+            create_cwd: false,
+        };
+
+        write_codex_projection(&codex_home, &skills_dir, &create).expect("write projection");
+        let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+
+        assert!(config.contains("http_headers = { \"Authorization\" = \"Bearer token\" }"));
+        assert!(!config.contains("\nheaders = "));
+        assert!(config.contains("[projects.\"/tmp\"]\ntrust_level = \"trusted\""));
+    }
+}
+
 async fn handle_agent_restart(
     create: AgentCreate,
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let agent_id = create.agent_id;
-    let session = tmux::session_name(agent_id);
     tracing::info!(%agent_id, argv = ?create.argv, "agent.restart");
 
     // Remove the current handle before killing tmux. Its exit task will see
     // that its generation is no longer current and will not emit agent.exit.
-    if let Some(handle) = registry.remove(agent_id) {
+    let session = if let Some(handle) = registry.remove(agent_id) {
+        let session = handle
+            .session()
+            .unwrap_or_else(|_| tmux::legacy_session_name(agent_id));
         handle.control.clear_sink().await;
-    }
+        session
+    } else {
+        let requested = create.tmux_session.trim();
+        if requested.is_empty() {
+            tmux::legacy_session_name(agent_id)
+        } else {
+            requested.to_string()
+        }
+    };
     if let Err(e) = tmux::kill_session(&session).await {
         tracing::debug!(%agent_id, error = %e, "tmux kill-session before restart");
     }
@@ -1164,8 +1509,40 @@ async fn handle_agent_restart(
     send_spawn_failed_exit(agent_id, out_tx, "restart timeout").await;
 }
 
+async fn handle_agent_rename(
+    agent_id: Uuid,
+    tmux_session: String,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    let next = tmux_session.trim();
+    if next.is_empty() {
+        tracing::debug!(%agent_id, "ignoring empty tmux session rename");
+        return;
+    }
+    let Some(current) = registry.session_for(agent_id) else {
+        tracing::debug!(%agent_id, "ignoring rename for unknown agent");
+        return;
+    };
+    if current == next {
+        return;
+    }
+    match tmux::rename_session(&current, next).await {
+        Ok(()) => {
+            registry.update_session(agent_id, next.to_string());
+            tracing::info!(%agent_id, from = %current, to = %next, "tmux session renamed");
+        }
+        Err(e) => {
+            tracing::warn!(%agent_id, from = %current, to = %next, error = %e, "tmux rename failed");
+            send_error(out_tx, Some(agent_id), "rename_failed", &e).await;
+        }
+    }
+}
+
 async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &AgentRegistry) {
-    let session = tmux::session_name(agent_id);
+    let session = registry
+        .session_for(agent_id)
+        .unwrap_or_else(|| tmux::legacy_session_name(agent_id));
     if let Err(e) = tmux::kill_session(&session).await {
         tracing::warn!(%agent_id, error = %e, "tmux kill-session failed");
     }
@@ -1177,28 +1554,32 @@ async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &A
 
 async fn handle_agent_resize(agent_id: Uuid, cols: u16, rows: u16, registry: &AgentRegistry) {
     // Resize the PTY first, then refresh tmux client.
-    let found = registry.with_handle(agent_id, |h| {
-        if let Err(e) = h.resize(cols, rows) {
-            tracing::warn!(%agent_id, error = %e, "PTY resize failed");
-        }
+    let mut changed = false;
+    let found = registry.with_handle(agent_id, |h| match h.resize(cols, rows) {
+        Ok(size_changed) => changed = size_changed,
+        Err(e) => tracing::warn!(%agent_id, error = %e, "PTY resize failed"),
     });
     if !found {
         tracing::debug!(%agent_id, "ignoring resize for unknown agent");
         return;
     }
-    let session = tmux::session_name(agent_id);
-    tmux::refresh_client(&session, cols, rows).await;
+    if changed {
+        if let Some(session) = registry.session_for(agent_id) {
+            tokio::spawn(async move {
+                tmux::refresh_client(&session, cols, rows).await;
+            });
+        }
+    }
 }
 
 async fn handle_agent_scroll(agent_id: Uuid, lines: i16, registry: &AgentRegistry) {
     if lines == 0 {
         return;
     }
-    if !registry.contains(agent_id) {
+    let Some(session) = registry.session_for(agent_id) else {
         tracing::debug!(%agent_id, "ignoring scroll for unknown agent");
         return;
-    }
-    let session = tmux::session_name(agent_id);
+    };
     if let Err(e) = tmux::scroll_history(&session, lines).await {
         tracing::warn!(%agent_id, lines, error = %e, "tmux scroll failed");
     }
@@ -1211,11 +1592,10 @@ async fn handle_agent_snapshot(
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    if !registry.contains(agent_id) {
+    let Some(session) = registry.session_for(agent_id) else {
         tracing::debug!(%agent_id, "ignoring snapshot for unknown agent");
         return;
-    }
-    let session = tmux::session_name(agent_id);
+    };
     match tmux::capture_history(&session, lines, !plain).await {
         Ok(bytes) => {
             let snapshot = Outbound::AgentSnapshot {
@@ -1267,8 +1647,9 @@ async fn handle_agent_upload(
         Ok(path) => {
             if paste {
                 let paste_text = upload::paste_text_for_path(&cwd, &path, paste_prefix.as_deref());
-                let session = tmux::session_name(agent_id);
-                tmux::cancel_copy_mode(&session).await;
+                if let Some(session) = registry.session_for(agent_id) {
+                    tmux::cancel_copy_mode(&session).await;
+                }
                 let found = registry.with_handle(agent_id, |h| {
                     if let Err(e) = h.write_stdin(paste_text.as_bytes()) {
                         tracing::warn!(%agent_id, error = %e, "PTY upload path paste failed");
@@ -1329,22 +1710,19 @@ async fn send_spawn_failed_exit(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound
     }
 }
 
-/// On daemon startup, discover tmux sessions matching `spawn-<uuid>` left
-/// behind by a previous instance and reattach to each. Inserts handles into
-/// the registry and spawns the await-exit task per agent.
+/// On daemon startup, discover tmux sessions containing a Spawn agent UUID
+/// left behind by a previous instance and reattach to each. Inserts handles
+/// into the registry and spawns the await-exit task per agent.
 async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
     let sessions = tmux::list_sessions().await;
     for name in sessions {
-        let Some(suffix) = name.strip_prefix("spawn-") else {
-            continue;
-        };
-        let Ok(agent_id) = Uuid::parse_str(suffix) else {
+        let Some(agent_id) = tmux::agent_id_from_session(&name) else {
             continue;
         };
         if registry.contains(agent_id) {
             continue; // shouldn't happen on a fresh process, but be safe
         }
-        match pty::reattach(agent_id).await {
+        match pty::reattach(agent_id, &name).await {
             Ok(launched) => {
                 let exit_rx = launched.exit_rx;
                 // Wire the rediscovered agent's forwarder to this session.

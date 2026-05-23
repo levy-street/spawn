@@ -1,12 +1,12 @@
 //! Per-agent PTY + tmux session management.
 //!
 //! For each `agent.create`:
-//!   1. `tmux new-session -d -s spawn-<id>` launches the real argv detached,
+//!   1. `tmux new-session -d -s spawn-<name>--<id>` launches the real argv detached,
 //!      with the final env injected via `-e KEY=VAL`. Spawn does not manage
 //!      agent credentials — the daemon's process env (HOME, XDG_CONFIG_HOME,
 //!      PATH, etc.) flows through, and the agent CLI finds whatever it
 //!      logged in with on the host.
-//!   2. We open a portable_pty PTY and spawn `tmux attach -t spawn-<id>`
+//!   2. We open a portable_pty PTY and spawn `tmux attach -t <session>`
 //!      inside it. A blocking reader thread pushes raw PTY bytes into a
 //!      per-agent **outbox** (an unbounded mpsc). A long-lived per-agent
 //!      **forwarder** task encodes those bytes as binary frames and ships
@@ -80,9 +80,8 @@ impl ForwarderControl {
 /// Per-agent runtime handle.
 pub struct AgentHandle {
     pub agent_id: Uuid,
-    /// tmux session name (e.g. "spawn-<uuid>"). Kept for diagnostics.
-    #[allow(dead_code)]
-    pub session: String,
+    /// tmux session name (e.g. "spawn-palette--<uuid>").
+    session: Arc<Mutex<String>>,
     /// Stdin into the PTY (writer half).
     stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Optional token used to cancel the read thread; consumed on shutdown.
@@ -90,6 +89,9 @@ pub struct AgentHandle {
     cancel_tx: Option<oneshot::Sender<()>>,
     /// Master PTY (kept alive so resize works).
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    /// Last size applied through this handle. Used to avoid expensive tmux
+    /// refreshes when browsers repeat the same geometry.
+    size: Arc<Mutex<(u16, u16)>>,
     /// Reader thread pushes raw PTY bytes here. Held alive while the agent
     /// is alive; when dropped, the per-agent forwarder task exits.
     #[allow(dead_code)]
@@ -99,6 +101,22 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    pub fn session(&self) -> Result<String> {
+        self.session
+            .lock()
+            .map(|s| s.clone())
+            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))
+    }
+
+    pub fn set_session(&self, next: String) -> Result<()> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))?;
+        *session = next;
+        Ok(())
+    }
+
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
         let mut stdin = self
             .stdin
@@ -109,7 +127,14 @@ impl AgentHandle {
         Ok(())
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
+        let mut size = self
+            .size
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty size lock poisoned"))?;
+        if *size == (cols, rows) {
+            return Ok(false);
+        }
         let master = self
             .master
             .lock()
@@ -122,7 +147,8 @@ impl AgentHandle {
                 pixel_height: 0,
             })
             .context("resizing PTY")?;
-        Ok(())
+        *size = (cols, rows);
+        Ok(true)
     }
 
     /// Re-apply the current PTY size so the kernel emits a fresh SIGWINCH to
@@ -150,6 +176,7 @@ impl AgentHandle {
 
 pub struct LaunchSpec<'a> {
     pub agent_id: Uuid,
+    pub session: &'a str,
     pub cwd: &'a str,
     pub cols: u16,
     pub rows: u16,
@@ -180,13 +207,11 @@ pub struct ExitReason {
 /// 3) spawn a reader thread (raw bytes -> outbox)
 /// 4) spawn a forwarder task (outbox -> current WS sink)
 pub async fn launch(spec: LaunchSpec<'_>) -> Result<Launched> {
-    let session = tmux::session_name(spec.agent_id);
+    let session = spec.session;
 
-    tmux::new_session_detached(
-        &session, spec.cwd, spec.cols, spec.rows, spec.argv, spec.env,
-    )
-    .await
-    .context("starting tmux session")?;
+    tmux::new_session_detached(session, spec.cwd, spec.cols, spec.rows, spec.argv, spec.env)
+        .await
+        .context("starting tmux session")?;
 
     // If the agent's argv exits within a few hundred ms (bad binary, missing
     // flag, smart-quote garbage), the tmux session is already gone by the
@@ -194,25 +219,24 @@ pub async fn launch(spec: LaunchSpec<'_>) -> Result<Launched> {
     // "can't find session" from `tmux attach`. Detect that case here and
     // surface a clearer error.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if !tmux::has_session(&session).await {
+    if !tmux::has_session(session).await {
         anyhow::bail!(
             "agent process exited before we could attach — check argv: {:?}",
             spec.argv
         );
     }
 
-    attach_to_session(spec.agent_id, &session, spec.cwd, spec.cols, spec.rows)
+    attach_to_session(spec.agent_id, session, spec.cwd, spec.cols, spec.rows)
 }
 
 /// Re-attach to an existing tmux session that was started by a previous
 /// `spawnd` instance. Used during daemon discovery on startup so agents
 /// survive daemon restarts without losing state.
-pub async fn reattach(agent_id: uuid::Uuid) -> Result<Launched> {
-    let session = tmux::session_name(agent_id);
-    if !tmux::has_session(&session).await {
+pub async fn reattach(agent_id: uuid::Uuid, session: &str) -> Result<Launched> {
+    if !tmux::has_session(session).await {
         anyhow::bail!("tmux session {session:?} not found");
     }
-    let (cols, rows) = tmux::window_size(&session).await.unwrap_or((120, 32));
+    let (cols, rows) = tmux::window_size(session).await.unwrap_or((120, 32));
     // We don't know the original cwd; default to the current daemon's working
     // directory (which is typically the user's home). The PTY child only
     // needs cwd to be a valid dir; the agent's actual cwd is preserved by
@@ -222,7 +246,7 @@ pub async fn reattach(agent_id: uuid::Uuid) -> Result<Launched> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "/".to_string());
     tracing::info!(%agent_id, %session, cols, rows, "reattaching to existing tmux session");
-    attach_to_session(agent_id, &session, &cwd, cols, rows)
+    attach_to_session(agent_id, session, &cwd, cols, rows)
 }
 
 /// Shared core: open a portable-pty, run `tmux attach` in it, start the
@@ -296,10 +320,11 @@ fn attach_to_session(
 
     let handle = AgentHandle {
         agent_id,
-        session: session.to_string(),
+        session: Arc::new(Mutex::new(session.to_string())),
         stdin,
         cancel_tx: Some(cancel_tx),
         master,
+        size: Arc::new(Mutex::new((cols, rows))),
         outbox_tx,
         control,
     };
