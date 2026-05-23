@@ -83,10 +83,10 @@ function LandingPage() {
                 </Link>
               </Button>
               <Button asChild variant="outline" size="lg">
-                <a href="#install">
+                <Link href="/download">
                   <Download className="size-5" />
                   Install daemon
-                </a>
+                </Link>
               </Button>
             </div>
             <div className="mt-8 max-w-2xl rounded-md border border-white/15 bg-black/70 p-3 font-mono text-xs text-zinc-200 shadow-2xl shadow-black/40 sm:text-sm">
@@ -140,8 +140,8 @@ function LandingPage() {
             </p>
           </div>
           <Button asChild size="lg">
-            <Link href="/signup">
-              Create account
+            <Link href="/download">
+              Download installer
               <ArrowRight className="size-5" />
             </Link>
           </Button>
