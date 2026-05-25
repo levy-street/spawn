@@ -42,6 +42,43 @@ class MeResponse(BaseModel):
     user: UserOut
 
 
+class AuthProviderOut(BaseModel):
+    id: Literal["google", "microsoft", "github"]
+    name: str
+
+
+class AuthProviderList(BaseModel):
+    providers: list[AuthProviderOut] = Field(default_factory=list)
+
+
+class OAuthClientRegistration(BaseModel):
+    redirect_uris: list[str] = Field(min_length=1)
+    client_name: str = Field(default="Spawn MCP client", max_length=255)
+    token_endpoint_auth_method: Literal["none"] = "none"
+    grant_types: list[str] = Field(default_factory=lambda: ["authorization_code", "refresh_token"])
+    response_types: list[str] = Field(default_factory=lambda: ["code"])
+    scope: str = "spawn"
+
+
+class OAuthClientRegistrationResponse(BaseModel):
+    client_id: str
+    client_id_issued_at: int
+    client_name: str
+    redirect_uris: list[str]
+    token_endpoint_auth_method: str
+    grant_types: list[str]
+    response_types: list[str]
+    scope: str
+
+
+class OAuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: Literal["Bearer"] = "Bearer"
+    expires_in: int
+    scope: str
+    refresh_token: str | None = None
+
+
 # ---------- device code ----------
 
 

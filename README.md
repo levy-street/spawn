@@ -90,6 +90,21 @@ End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
 approve the device code on `/device`, see the host appear on `/hosts`, then
 spawn a `shell` preset agent and watch xterm.js attach to it.
 
+## Login providers
+
+Email/password auth works by default. To also show Google, Microsoft, or GitHub
+sign-in buttons, set the matching `SPAWN_<PROVIDER>_CLIENT_ID` and
+`SPAWN_<PROVIDER>_CLIENT_SECRET` values in `server/.env`. The callback path for
+each provider is:
+
+```text
+${SPAWN_PUBLIC_URL}/api/auth/oauth/<provider>/callback
+```
+
+For example, local Google development uses
+`http://localhost:8000/api/auth/oauth/google/callback`; production uses
+`https://spawnd.dev/api/auth/oauth/google/callback`.
+
 ## Testing
 
 Run the repeatable local test matrix from the repo root:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,16 +16,7 @@ router = APIRouter(prefix="/api", tags=["auth"])
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
-    # HTTP-only web session. Secure should be true in prod (set behind a proxy).
-    settings = get_settings()
-    response.set_cookie(
-        "spawn_session",
-        token,
-        max_age=60 * 60 * 24 * settings.jwt_refresh_ttl_days,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-    )
+    auth.set_session_cookie(response, token)
 
 
 @router.post("/auth/signup", response_model=schemas.TokenResponse)
@@ -34,7 +25,13 @@ async def signup(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> schemas.TokenResponse:
-    user = User(email=body.email, password_hash=auth.hash_password(body.password))
+    email = auth.normalize_email(body.email)
+    existing = (
+        await session.execute(select(User).where(func.lower(User.email) == email))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already in use")
+    user = User(email=email, password_hash=auth.hash_password(body.password))
     session.add(user)
     try:
         await session.commit()
@@ -57,7 +54,10 @@ async def login(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> schemas.TokenResponse:
-    row = (await session.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
+    email = auth.normalize_email(body.email)
+    row = (
+        await session.execute(select(User).where(func.lower(User.email) == email))
+    ).scalar_one_or_none()
     if row is None or not auth.verify_password(body.password, row.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
     access_token = auth.issue_access_token(row.id)
@@ -69,7 +69,11 @@ async def login(
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(response: Response) -> None:
-    response.delete_cookie("spawn_session", samesite="lax", secure=False)
+    response.delete_cookie(
+        "spawn_session",
+        samesite="lax",
+        secure=get_settings().public_url.startswith("https://"),
+    )
 
 
 @router.post("/auth/mcp-token", response_model=schemas.McpTokenResponse)

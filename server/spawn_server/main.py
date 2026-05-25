@@ -17,10 +17,12 @@ from .redis import lifespan_shutdown as redis_shutdown
 from .redis import lifespan_startup as redis_startup
 from .routes import agents as agents_routes
 from .routes import auth as auth_routes
+from .routes import auth_providers as auth_providers_routes
 from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
+from .routes import oauth as oauth_routes
 from .routes import presets as presets_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
@@ -68,12 +70,14 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(auth_routes.router)
+    app.include_router(auth_providers_routes.router)
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(agents_routes.router)
     app.include_router(presets_routes.router)
     app.include_router(install_routes.router)
+    app.include_router(oauth_routes.router)
 
     app.include_router(daemon_ws.router)
     app.include_router(browser_ws.router)
@@ -83,15 +87,23 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/.well-known/oauth-protected-resource/mcp")
-    async def mcp_protected_resource_metadata() -> dict[str, object]:
+    def mcp_resource_metadata() -> dict[str, object]:
         public_url = get_settings().public_url.rstrip("/")
         return {
             "resource": f"{public_url}/mcp",
-            "authorization_servers": [f"{public_url}/api"],
+            "authorization_servers": [public_url],
             "scopes_supported": ["spawn"],
             "bearer_methods_supported": ["header"],
+            "resource_name": "Spawn MCP",
         }
+
+    @app.get("/.well-known/oauth-protected-resource")
+    async def root_protected_resource_metadata() -> dict[str, object]:
+        return mcp_resource_metadata()
+
+    @app.get("/.well-known/oauth-protected-resource/mcp")
+    async def mcp_protected_resource_metadata() -> dict[str, object]:
+        return mcp_resource_metadata()
 
     return app
 

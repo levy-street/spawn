@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     jwt_access_ttl_minutes: int = 15
     jwt_refresh_ttl_days: int = 30
     jwt_daemon_ttl_days: int = 365
+    oauth_authorization_code_ttl_minutes: int = 10
+    oauth_access_ttl_minutes: int = 60
+    oauth_refresh_ttl_days: int = 30
+    oauth_provider_state_ttl_minutes: int = 10
+
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    microsoft_client_id: str | None = None
+    microsoft_client_secret: str | None = None
+    github_client_id: str | None = None
+    github_client_secret: str | None = None
 
     public_url: str = Field(default="http://localhost:8000")
 

@@ -29,6 +29,9 @@ class SpawnTokenVerifier(TokenVerifier):
             return None
         if payload.get("kind") != auth.KIND_ACCESS:
             return None
+        scopes = str(payload.get("scope") or "spawn").split()
+        if "spawn" not in scopes:
+            return None
         sub = payload.get("sub", "")
         if not sub.startswith("user:"):
             return None
@@ -38,7 +41,7 @@ class SpawnTokenVerifier(TokenVerifier):
             user = await session.get(User, user_id)
             if user is None:
                 return None
-        return AccessToken(token=token, client_id=user_id, scopes=["spawn"])
+        return AccessToken(token=token, client_id=user_id, scopes=scopes)
 
 
 def _public_url(path: str) -> AnyHttpUrl:
@@ -59,7 +62,7 @@ spawn_mcp = FastMCP(
     streamable_http_path="/",
     token_verifier=SpawnTokenVerifier(),
     auth=AuthSettings(
-        issuer_url=_public_url("/api"),
+        issuer_url=_public_url(""),
         resource_server_url=_public_url("/mcp"),
         required_scopes=["spawn"],
     ),

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Cookie, Depends, Header, HTTPException, Query, status
+from fastapi import Cookie, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,14 @@ KIND_DAEMON = "daemon"
 
 def hash_password(plaintext: str) -> str:
     return _hasher.hash(plaintext)
+
+
+def hash_random_password() -> str:
+    return hash_password(secrets.token_urlsafe(32))
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
 
 
 def verify_password(plaintext: str, hashed: str) -> bool:
@@ -48,6 +57,20 @@ def issue_access_token(user_id: str) -> str:
 def issue_session_token(user_id: str) -> str:
     s = get_settings()
     return _issue_user_token(user_id, timedelta(days=s.jwt_refresh_ttl_days))
+
+
+def issue_oauth_access_token(user_id: str, client_id: str, scope: str) -> str:
+    s = get_settings()
+    now = _now()
+    payload = {
+        "sub": f"user:{user_id}",
+        "kind": KIND_ACCESS,
+        "client_id": client_id,
+        "scope": scope,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=s.oauth_access_ttl_minutes)).timestamp()),
+    }
+    return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm)
 
 
 def _issue_user_token(user_id: str, ttl: timedelta) -> str:
@@ -83,6 +106,18 @@ def decode_token(token: str) -> dict[str, Any]:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"invalid token: {e}",
         ) from e
+
+
+def set_session_cookie(response: Response, token: str) -> None:
+    settings = get_settings()
+    response.set_cookie(
+        "spawn_session",
+        token,
+        max_age=60 * 60 * 24 * settings.jwt_refresh_ttl_days,
+        httponly=True,
+        samesite="lax",
+        secure=settings.public_url.startswith("https://"),
+    )
 
 
 def _extract_bearer(authorization: str | None) -> str | None:

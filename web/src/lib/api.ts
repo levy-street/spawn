@@ -315,6 +315,17 @@ export const DeviceApproveResponseSchema = z.object({
   host_name: z.string(),
 });
 
+export const AuthProviderSchema = z.object({
+  id: z.enum(["google", "microsoft", "github"]),
+  name: z.string(),
+});
+export type AuthProvider = z.infer<typeof AuthProviderSchema>;
+
+export const AuthProviderListSchema = z.object({
+  providers: z.array(AuthProviderSchema).default([]),
+});
+export type AuthProviderList = z.infer<typeof AuthProviderListSchema>;
+
 // ---------- Endpoints ----------
 
 export const auth = {
@@ -340,6 +351,11 @@ export const auth = {
     api("/api/me", {
       method: "GET",
       schema: z.object({ user: UserSchema }),
+    }),
+  providers: () =>
+    api("/api/auth/providers", {
+      method: "GET",
+      schema: AuthProviderListSchema,
     }),
   approveDevice: (body: { user_code: string }) =>
     api("/api/auth/device/approve", {
