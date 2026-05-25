@@ -497,3 +497,152 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     assert r.json()["path"] == "/repo/notes.txt"
 
     await broker.unregister_daemon(daemon)
+
+
+async def test_agent_multipart_upload_file_dispatches_daemon_frame(client):
+    token = await _signup(client, "agent-multipart-upload@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    import asyncio
+    import base64
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Agent, Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "agent-multipart-upload@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="online")
+        session.add(host)
+        await session.flush()
+        agent = Agent(
+            owner_user_id=user.id,
+            host_id=host.id,
+            cwd="/repo",
+            argv=["codex", "--yolo"],
+            env={},
+            name="palette",
+            status="running",
+        )
+        session.add(agent)
+        await session.commit()
+        host_id = host.id
+        agent_id = agent.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    upload_task = asyncio.create_task(
+        client.post(
+            f"/api/agents/{agent_id}/upload-file",
+            data={"destination": "cwd", "paste": "false", "client_id": "multipart-upload-1"},
+            files={"file": ("notes.txt", b"multipart notes", "text/plain")},
+            headers=auth,
+        )
+    )
+    for _ in range(100):
+        if fake_ws.sent_text:
+            sent = json.loads(fake_ws.sent_text[-1])
+            if sent["type"] == "agent.upload":
+                break
+        await asyncio.sleep(0.01)
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "agent.upload"
+    assert sent["agent_id"] == agent_id
+    assert sent["cwd"] == "/repo"
+    assert sent["name"] == "notes.txt"
+    assert sent["mime_type"] == "text/plain"
+    assert base64.b64decode(sent["bytes_b64"]) == b"multipart notes"
+    assert sent["paste_prefix"] == "@"
+    assert sent["paste"] is False
+    assert sent["destination"] == "cwd"
+    assert sent["client_id"] == "multipart-upload-1"
+    await broker.resolve_upload(
+        agent_id,
+        "multipart-upload-1",
+        {"agent_id": agent_id, "path": "/repo/notes.txt", "client_id": "multipart-upload-1"},
+    )
+    r = await upload_task
+    assert r.status_code == 200, r.text
+    assert r.json()["path"] == "/repo/notes.txt"
+
+    await broker.unregister_daemon(daemon)
+
+
+async def test_agent_multipart_upload_rejects_non_image_without_cwd_destination(client):
+    token = await _signup(client, "agent-multipart-reject@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Agent, Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "agent-multipart-reject@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="online")
+        session.add(host)
+        await session.flush()
+        agent = Agent(
+            owner_user_id=user.id,
+            host_id=host.id,
+            cwd="/repo",
+            argv=["bash"],
+            env={},
+            name="shell",
+            status="running",
+        )
+        session.add(agent)
+        await session.commit()
+        host_id = host.id
+        agent_id = agent.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    r = await client.post(
+        f"/api/agents/{agent_id}/upload-file",
+        files={"file": ("notes.txt", b"not an image", "text/plain")},
+        headers=auth,
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "Only image files can be pasted or dropped here."
+    assert all(json.loads(frame)["type"] != "agent.upload" for frame in fake_ws.sent_text)
+
+    await broker.unregister_daemon(daemon)
+
+
+async def test_agent_multipart_upload_file_rejects_oversize_before_agent_lookup(client, monkeypatch):
+    token = await _signup(client, "agent-multipart-oversize@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from spawn_server import agent_control
+
+    monkeypatch.setattr(agent_control, "MAX_UPLOAD_BYTES", 8)
+
+    r = await client.post(
+        "/api/agents/not-an-agent/upload-file",
+        files={"file": ("too-big.txt", b"123456789", "text/plain")},
+        headers=auth,
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "Upload is too large; the limit is 20 MB."

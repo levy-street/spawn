@@ -96,6 +96,7 @@ class Broker:
                     pass
                 for aid in list(existing.agent_ids):
                     self._daemon_by_agent.pop(aid, None)
+                existing.agent_ids.clear()
             self._daemons_by_host[conn.host_id] = conn
 
     async def unregister_daemon(self, conn: DaemonConn) -> None:
@@ -105,6 +106,7 @@ class Broker:
             for aid in list(conn.agent_ids):
                 if self._daemon_by_agent.get(aid) is conn:
                     self._daemon_by_agent.pop(aid, None)
+            conn.agent_ids.clear()
 
     async def attach_agent_to_daemon(self, agent_id: str, conn: DaemonConn) -> None:
         async with self._lock:

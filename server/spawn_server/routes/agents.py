@@ -291,8 +291,7 @@ async def create_agent(
         status="starting",
     )
     session.add(agent)
-    await session.commit()
-    await session.refresh(agent)
+    await session.flush()
     mcp_server_ids = (
         await capabilities.default_mcp_server_ids(session, user)
         if body.mcp_server_ids is None
@@ -311,6 +310,7 @@ async def create_agent(
         skill_ids=skill_ids,
     )
     await session.commit()
+    await session.refresh(agent)
     mcp_servers, skills = await capabilities.get_agent_launch_capabilities(
         session, user=user, agent_id=agent.id
     )

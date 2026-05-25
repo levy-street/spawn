@@ -23,6 +23,7 @@ class FakeWS:
 
     sent_text: list[str] = field(default_factory=list)
     sent_bytes: list[bytes] = field(default_factory=list)
+    closed: list[tuple[int, str]] = field(default_factory=list)
 
     async def send_text(self, s: str) -> None:
         self.sent_text.append(s)
@@ -31,7 +32,7 @@ class FakeWS:
         self.sent_bytes.append(b)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
-        pass
+        self.closed.append((code, reason))
 
 
 def test_frame_roundtrip():
@@ -206,6 +207,37 @@ async def test_broker_routes_browser_to_daemon():
     assert broker.get_daemon_for_agent(agent_id) is None
 
     await asyncio.sleep(0)  # let any pending tasks settle
+
+
+@pytest.mark.asyncio
+async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassociates_agents():
+    broker = get_broker()
+
+    host_id = "host-reconnect"
+    user_id = "user-1"
+    agent_id = "00000000-0000-4000-8000-0000000000ad"
+    old_ws = FakeWS()
+    old_daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=old_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(old_daemon)
+    await broker.attach_agent_to_daemon(agent_id, old_daemon)
+
+    assert broker.get_daemon_for_agent(agent_id) is old_daemon
+
+    new_ws = FakeWS()
+    new_daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=new_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(new_daemon)
+
+    assert old_ws.closed == [(4000, "superseded")]
+    assert broker.get_daemon_for_host(host_id) is new_daemon
+    assert broker.get_daemon_for_agent(agent_id) is None
+
+    # Mirrors the daemon register(existing_agents=[...]) path after reconnect.
+    await broker.attach_agent_to_daemon(agent_id, new_daemon)
+    assert broker.get_daemon_for_agent(agent_id) is new_daemon
+    assert agent_id in new_daemon.agent_ids
+    assert agent_id not in old_daemon.agent_ids
+
+    await broker.unregister_daemon(new_daemon)
 
 
 @pytest.mark.asyncio

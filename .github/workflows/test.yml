@@ -1,0 +1,76 @@
+name: test
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server tmux
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: server/uv.lock
+
+      - name: Install server dependencies
+        working-directory: server
+        run: |
+          uv python install 3.13
+          uv sync --frozen
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run repeatable test matrix
+        run: scripts/test-all.sh

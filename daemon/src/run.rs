@@ -1419,7 +1419,7 @@ fn toml_string_map(values: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::AgentMcpServerConfig;
+    use crate::proto::{AgentMcpServerConfig, AgentSkillConfig};
 
     #[test]
     fn codex_projection_uses_codex_http_header_key() {
@@ -1461,6 +1461,104 @@ mod tests {
         assert!(config.contains("http_headers = { \"Authorization\" = \"Bearer token\" }"));
         assert!(!config.contains("\nheaders = "));
         assert!(config.contains("[projects.\"/tmp\"]\ntrust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn codex_projection_includes_selected_servers_skills_and_trusted_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let skills_dir = temp.path().join("skills");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::create_dir_all(skills_dir.join("spawn-control")).expect("spawn skill dir");
+        fs::create_dir_all(skills_dir.join("repo-notes")).expect("notes skill dir");
+
+        let mut stdio_env = BTreeMap::new();
+        stdio_env.insert("MCP_TOKEN".to_string(), "stdio-secret".to_string());
+
+        let mut http_headers = BTreeMap::new();
+        http_headers.insert("Authorization".to_string(), "Bearer http-secret".to_string());
+
+        let create = AgentCreate {
+            agent_id: Uuid::new_v4(),
+            cwd: "/work/repo".to_string(),
+            argv: vec!["/opt/homebrew/bin/codex".to_string()],
+            env: BTreeMap::new(),
+            install: None,
+            mcp_servers: vec![
+                AgentMcpServerConfig {
+                    id: "stdio-1".to_string(),
+                    name: "local.tool".to_string(),
+                    transport: "stdio".to_string(),
+                    url: None,
+                    command: Some("spawn-mcp".to_string()),
+                    args: vec!["serve".to_string(), "--stdio".to_string()],
+                    env: stdio_env,
+                    headers: BTreeMap::new(),
+                },
+                AgentMcpServerConfig {
+                    id: "http-1".to_string(),
+                    name: "spawn".to_string(),
+                    transport: "streamable_http".to_string(),
+                    url: Some("https://spawnd.dev/mcp".to_string()),
+                    command: None,
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    headers: http_headers,
+                },
+            ],
+            skills: vec![
+                AgentSkillConfig {
+                    id: "skill-1".to_string(),
+                    name: "spawn control".to_string(),
+                    description: "Operate spawn".to_string(),
+                    content: "Use spawn carefully.".to_string(),
+                },
+                AgentSkillConfig {
+                    id: "skill-2".to_string(),
+                    name: "repo/notes".to_string(),
+                    description: "Repo notes".to_string(),
+                    content: "Remember project conventions.".to_string(),
+                },
+            ],
+            tmux_session: "spawn-test".to_string(),
+            cols: 80,
+            rows: 24,
+            create_cwd: false,
+        };
+
+        write_codex_projection(&codex_home, &skills_dir, &create).expect("write projection");
+        let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+
+        assert!(config.contains("[mcp_servers.\"local.tool\"]"));
+        assert!(config.contains("command = \"spawn-mcp\""));
+        assert!(config.contains("args = [\"serve\", \"--stdio\"]"));
+        assert!(config.contains("env = { \"MCP_TOKEN\" = \"stdio-secret\" }"));
+        assert!(config.contains("[mcp_servers.\"spawn\"]"));
+        assert!(config.contains("url = \"https://spawnd.dev/mcp\""));
+        assert!(config.contains("http_headers = { \"Authorization\" = \"Bearer http-secret\" }"));
+        assert!(!config.contains("unselected"));
+        assert!(!config.contains("\nheaders = "));
+        assert!(config.contains("[[skills.config]]"));
+        assert!(config.contains("spawn-control/SKILL.md"));
+        assert!(config.contains("repo-notes/SKILL.md"));
+        assert!(config.contains("[projects.\"/work/repo\"]\ntrust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn skill_materialization_sanitizes_names_and_does_not_inject_unrelated_secrets() {
+        let markdown = skill_markdown(
+            "Spawn \"Control\"",
+            "Use \\ safely",
+            "Steps do not include MCP bearer tokens.",
+        );
+
+        assert!(markdown.starts_with("---\n"));
+        assert!(markdown.contains("name: \"Spawn \\\"Control\\\"\""));
+        assert!(markdown.contains("description: \"Use \\\\ safely\""));
+        assert!(markdown.contains("Steps do not include MCP bearer tokens."));
+        assert_eq!(safe_file_component("repo/notes & tips"), "repo-notes-tips");
+        assert!(!markdown.contains("Bearer http-secret"));
+        assert!(!markdown.contains("stdio-secret"));
     }
 }
 

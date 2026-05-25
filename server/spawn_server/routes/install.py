@@ -442,6 +442,7 @@ INSTALL_SCRIPT = dedent(
       [ "$USE_SERVICE" = "1" ] || return 1
       need systemctl || return 1
       systemctl --user show-environment >/dev/null 2>&1 || return 1
+      enable_systemd_linger
 
       SERVICE_DIR="$HOME/.config/systemd/user"
       mkdir -p "$SERVICE_DIR"
@@ -453,10 +454,10 @@ INSTALL_SCRIPT = dedent(
 
     [Service]
     Type=simple
-    ExecStart=$BIN --server $SERVER run
+    ExecStart="$BIN" --server "$SERVER" run
     Restart=always
     RestartSec=2
-    Environment=PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+    Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
     [Install]
     WantedBy=default.target
@@ -467,6 +468,20 @@ INSTALL_SCRIPT = dedent(
       say "started user service spawnd.service"
       say "logs: journalctl --user -u spawnd.service -f"
       return 0
+    }
+
+    enable_systemd_linger() {
+      need loginctl || return 0
+      USER_NAME=$(id -un 2>/dev/null || printf '')
+      [ -n "$USER_NAME" ] || return 0
+      if loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null | grep -qx yes; then
+        return 0
+      fi
+      if loginctl enable-linger "$USER_NAME" >/dev/null 2>&1; then
+        say "enabled systemd linger for $USER_NAME"
+      else
+        say "systemd linger is not enabled; spawnd may start after login rather than boot"
+      fi
     }
 
     start_background() {

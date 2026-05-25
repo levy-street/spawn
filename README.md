@@ -90,6 +90,59 @@ End-to-end smoke test: sign up at http://localhost:3000, run `spawnd login`,
 approve the device code on `/device`, see the host appear on `/hosts`, then
 spawn a `shell` preset agent and watch xterm.js attach to it.
 
+## Testing
+
+Run the repeatable local test matrix from the repo root:
+
+```bash
+scripts/test-all.sh
+```
+
+That runs server lint/tests, daemon Rust tests, hosted prebuilt-install smoke,
+local HTTP-surface smoke, real `spawnd login` smoke, local server+daemon
+recovery smoke, real Redis pub/sub smoke, streamable HTTP MCP protocol smoke,
+live browser+daemon smoke, service-manager crash-restart smoke, web lint,
+Playwright browser tests, web production build, and diff hygiene. The Redis
+smoke starts an isolated Redis instance and proves publish/subscribe plus ring
+buffer behavior across separate Python processes using the production backend.
+The MCP smoke uses a real MCP client to create an agent, send terminal input,
+capture a snapshot, upload a file, and delete the agent through `/mcp`. The
+local daemon smoke also launches multiple shell agents concurrently and verifies
+each PTY stream stays isolated. The live browser smoke drives the real Next app
+against a disposable FastAPI server and real daemon, creates an agent through
+the UI, attaches xterm over the browser websocket, sends input, verifies output
+from the tmux session, uploads a file into the agent cwd, and proves a second
+browser tab can take terminal control and send input.
+
+To include non-disruptive Linux host coverage over SSH, set a host alias from
+your local SSH config:
+
+```bash
+SPAWN_REMOTE_LINUX_HOST=dream scripts/test-all.sh
+```
+
+That additionally verifies Linux prebuilt install, user `systemd` restart
+behavior, and systemd linger enable/restore on the remote host.
+
+To include the public HTTP surface of a staged or production deployment:
+
+```bash
+SPAWN_HTTP_SMOKE_URL=https://spawnd.dev scripts/test-all.sh
+```
+
+That verifies the landing page, download page, `/healthz`, `/install.sh`, MCP
+well-known metadata, and the hosted daemon binary for the current machine.
+
+The real reboot persistence check is intentionally gated because it reboots the
+remote machine:
+
+```bash
+SPAWN_ALLOW_REBOOT=1 SPAWN_REMOTE_REBOOT_HOST=dream scripts/test-all.sh
+```
+
+If the remote host needs sudo for reboot, provide `SPAWN_SUDO_PASSWORD` in the
+environment for that command.
+
 ## Production deploy
 
 Production infrastructure is bootstrapped from the Levy Street Ansible repo:
@@ -143,10 +196,11 @@ separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
 
 ## Known limits in this scaffold
 
-- **Single uvicorn worker only.** Cross-worker live PTY fan-out via Redis
-  pubsub is published by the daemon WS but not yet subscribed in the
-  browser WS — the wiring is in place but the consumer task is a follow-up.
-  History replay still works cross-worker.
+- **Single API worker for daemon command/control.** Live PTY output fan-out uses
+  Redis pub/sub and is covered by the real Redis smoke, but input, resize,
+  upload, snapshot, and host-management commands are still process-local to the
+  worker that owns the daemon websocket. Keep production on one API worker until
+  those control messages are moved onto a shared bus.
 - **No CSRF protection on cookie auth yet.** Add SameSite=Strict cookies +
   CSRF tokens before any non-localhost deployment.
 - **shadcn components are hand-rolled** (Tailwind v4 + React 19 ergonomics
@@ -154,7 +208,9 @@ separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
   mechanical.
 - **PWA icons are placeholders.** Replace `web/public/icon-{192,512}.png`
   before shipping.
-- **No agent transcripts persisted** beyond the 256 KB ring buffer.
+- **Agent transcripts are local files.** They survive server restarts on one
+  machine but need shared storage before multiple API hosts can replay the same
+  history.
 - **Agent provider auth is per host.** Each host needs its own
   `claude /login` / `codex login` / etc. There is no central credential
   store; this is a deliberate non-goal for spawn.
