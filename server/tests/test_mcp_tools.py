@@ -93,6 +93,31 @@ async def test_mcp_token_verifier_accepts_user_tokens_only(client):
     assert await verifier.verify_token("not-a-token") is None
 
 
+async def test_mcp_tool_metadata_guides_confirmations_and_terminal_control():
+    from spawn_server import mcp as spawn_mcp_tools
+
+    tools = {tool.name: tool for tool in await spawn_mcp_tools.spawn_mcp.list_tools()}
+
+    assert tools["list_agents"].annotations is not None
+    assert tools["list_agents"].annotations.readOnlyHint is True
+    assert tools["snapshot_agent"].annotations is not None
+    assert tools["snapshot_agent"].annotations.readOnlyHint is True
+
+    send_input = tools["send_agent_input"]
+    assert send_input.annotations is not None
+    assert send_input.annotations.readOnlyHint is False
+    assert send_input.annotations.destructiveHint is False
+    assert send_input.description is not None
+    assert 'text="<prompt>\\r"' in send_input.description
+    assert '"\\n"' in send_input.description
+    assert '"\\x15"' in send_input.description
+    assert "only confirms input delivery" in send_input.description
+
+    assert tools["delete_agent"].annotations is not None
+    assert tools["delete_agent"].annotations.readOnlyHint is False
+    assert tools["delete_agent"].annotations.destructiveHint is True
+
+
 async def test_mcp_tools_can_manage_capabilities_start_agent_and_interact(
     client, monkeypatch
 ):
@@ -159,6 +184,16 @@ async def test_mcp_tools_can_manage_capabilities_start_agent_and_interact(
     assert frame.kind == KIND_INPUT
     assert frame.agent_id == agent["id"]
     assert frame.payload == b"hello from mcp\n"
+
+    manual_submit_result = await spawn_mcp_tools.send_agent_input(
+        agent["id"],
+        text="\x15hello from mcp\r",
+    )
+    assert manual_submit_result == {"agent_id": agent["id"], "bytes": len("\x15hello from mcp\r")}
+    frame = decode_binary_frame(fake_ws.sent_bytes[-1])
+    assert frame.kind == KIND_INPUT
+    assert frame.agent_id == agent["id"]
+    assert frame.payload == b"\x15hello from mcp\r"
 
     snapshot_task = asyncio.create_task(
         spawn_mcp_tools.snapshot_agent(agent["id"], lines=200, plain=True)

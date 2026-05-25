@@ -9,6 +9,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 
 from . import agent_control, auth, schemas
@@ -55,7 +56,16 @@ spawn_mcp = FastMCP(
         "Control Spawn hosts and terminal agents. Use these tools to list hosts, "
         "create or manage agents, send terminal input, capture snapshots, upload "
         "files, inspect host directories, manage agent CLI installs, and grant "
-        "agents access to managed MCP servers and skills."
+        "agents access to managed MCP servers and skills.\n\n"
+        "Terminal input is raw PTY input. To submit a normal prompt or shell command, "
+        "send the text followed by carriage return (`\\r`), for example "
+        "`send_agent_input(agent_id, text=\"hello\\r\")`. Newline (`\\n`) inserts a "
+        "literal line break in terminal editors and TUIs; it does not reliably press "
+        "Enter. To replace unfinished input before submitting, prefix Ctrl-U (`\\x15`) "
+        "then send the prompt and final `\\r`. Use `bytes_b64` for raw control or "
+        "escape sequences that are awkward to express as text. `send_agent_input` "
+        "only confirms delivery; after submitting input, call `snapshot_agent` to "
+        "inspect the agent's terminal output."
     ),
     json_response=True,
     stateless_http=True,
@@ -87,7 +97,22 @@ def _dump(value: Any) -> Any:
     return value
 
 
-@spawn_mcp.tool()
+READ_ONLY_TOOL = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+MUTATING_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+DESTRUCTIVE_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_hosts() -> list[dict[str, Any]]:
     """List Spawn hosts owned by the authenticated user."""
     async with get_sessionmaker()() as session:
@@ -95,7 +120,7 @@ async def list_hosts() -> list[dict[str, Any]]:
         return _dump(await hosts_routes.list_hosts(session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def get_host(host_id: str) -> dict[str, Any]:
     """Get one Spawn host by id."""
     async with get_sessionmaker()() as session:
@@ -103,7 +128,7 @@ async def get_host(host_id: str) -> dict[str, Any]:
         return _dump(await hosts_routes.get_host(host_id, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def rename_host(host_id: str, name: str) -> dict[str, Any]:
     """Rename a Spawn host."""
     async with get_sessionmaker()() as session:
@@ -118,7 +143,7 @@ async def rename_host(host_id: str, name: str) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def delete_host(host_id: str) -> dict[str, Any]:
     """Delete a Spawn host and revoke its connected daemon if present."""
     async with get_sessionmaker()() as session:
@@ -127,7 +152,7 @@ async def delete_host(host_id: str) -> dict[str, Any]:
         return {"host_id": host_id, "deleted": True}
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_host_dirs(host_id: str, path: str | None = None) -> dict[str, Any]:
     """List directories on an online host."""
     async with get_sessionmaker()() as session:
@@ -135,7 +160,7 @@ async def list_host_dirs(host_id: str, path: str | None = None) -> dict[str, Any
         return _dump(await hosts_routes.list_host_dirs(host_id, path=path, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_host_tools(host_id: str) -> dict[str, Any]:
     """Check agent CLI install/update status on a host."""
     async with get_sessionmaker()() as session:
@@ -143,7 +168,7 @@ async def list_host_tools(host_id: str) -> dict[str, Any]:
         return _dump(await hosts_routes.list_host_tools(host_id, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def install_host_tool(host_id: str, preset_id: str) -> dict[str, Any]:
     """Run a preset install/update command on an online host."""
     async with get_sessionmaker()() as session:
@@ -158,7 +183,7 @@ async def install_host_tool(host_id: str, preset_id: str) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def set_host_tool_auto_update(
     host_id: str,
     preset_id: str,
@@ -178,7 +203,7 @@ async def set_host_tool_auto_update(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_presets() -> list[dict[str, Any]]:
     """List built-in and user-defined agent presets."""
     async with get_sessionmaker()() as session:
@@ -186,7 +211,7 @@ async def list_presets() -> list[dict[str, Any]]:
         return _dump(await presets_routes.list_presets(session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def create_preset(
     name: str,
     agent_kind: str,
@@ -207,7 +232,7 @@ async def create_preset(
         return _dump(await presets_routes.create_preset(body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def update_preset(
     preset_id: str,
     name: str | None = None,
@@ -234,7 +259,7 @@ async def update_preset(
         return _dump(await presets_routes.update_preset(preset_id, body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def delete_preset(preset_id: str) -> dict[str, Any]:
     """Delete a user preset."""
     async with get_sessionmaker()() as session:
@@ -243,7 +268,7 @@ async def delete_preset(preset_id: str) -> dict[str, Any]:
         return {"deleted": True, "preset_id": preset_id}
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_mcp_servers() -> list[dict[str, Any]]:
     """List managed MCP servers available to agents."""
     async with get_sessionmaker()() as session:
@@ -251,7 +276,7 @@ async def list_mcp_servers() -> list[dict[str, Any]]:
         return _dump(await capabilities_routes.list_mcp_servers(session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def create_mcp_server(
     name: str,
     transport: str = "streamable_http",
@@ -278,7 +303,7 @@ async def create_mcp_server(
         return _dump(await capabilities_routes.create_mcp_server(body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def create_spawn_mcp_server(
     name: str = "spawn",
     enabled_by_default: bool = False,
@@ -292,7 +317,7 @@ async def create_spawn_mcp_server(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def update_mcp_server(
     server_id: str,
     name: str | None = None,
@@ -322,7 +347,7 @@ async def update_mcp_server(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def delete_mcp_server(server_id: str) -> dict[str, Any]:
     """Delete a managed MCP server definition."""
     async with get_sessionmaker()() as session:
@@ -331,7 +356,7 @@ async def delete_mcp_server(server_id: str) -> dict[str, Any]:
         return {"deleted": True, "mcp_server_id": server_id}
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_skills() -> list[dict[str, Any]]:
     """List managed skills available to agents."""
     async with get_sessionmaker()() as session:
@@ -339,7 +364,7 @@ async def list_skills() -> list[dict[str, Any]]:
         return _dump(await capabilities_routes.list_skills(session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def create_skill(
     name: str,
     content: str,
@@ -358,7 +383,7 @@ async def create_skill(
         return _dump(await capabilities_routes.create_skill(body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def update_skill(
     skill_id: str,
     name: str | None = None,
@@ -378,7 +403,7 @@ async def update_skill(
         return _dump(await capabilities_routes.update_skill(skill_id, body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def delete_skill(skill_id: str) -> dict[str, Any]:
     """Delete a managed skill."""
     async with get_sessionmaker()() as session:
@@ -387,7 +412,7 @@ async def delete_skill(skill_id: str) -> dict[str, Any]:
         return {"deleted": True, "skill_id": skill_id}
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def get_agent_access(agent_id: str) -> dict[str, Any]:
     """Get MCP server and skill grants for an agent."""
     async with get_sessionmaker()() as session:
@@ -399,7 +424,7 @@ async def get_agent_access(agent_id: str) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def set_agent_access(
     agent_id: str,
     mcp_server_ids: list[str] | None = None,
@@ -419,7 +444,7 @@ async def set_agent_access(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def list_agents(
     host_id: str | None = None,
     include_archived: bool = False,
@@ -437,7 +462,7 @@ async def list_agents(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def get_agent(agent_id: str) -> dict[str, Any]:
     """Get one Spawn agent by id."""
     async with get_sessionmaker()() as session:
@@ -445,7 +470,7 @@ async def get_agent(agent_id: str) -> dict[str, Any]:
         return _dump(await agents_routes.get_agent(agent_id, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def create_agent(
     host_id: str,
     cwd: str,
@@ -478,7 +503,7 @@ async def create_agent(
         return _dump(await agents_routes.create_agent(body, session=session, user=user))
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def rename_agent(agent_id: str, name: str) -> dict[str, Any]:
     """Rename an agent and sync its tmux session name."""
     async with get_sessionmaker()() as session:
@@ -493,7 +518,7 @@ async def rename_agent(agent_id: str, name: str) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def pin_agent(agent_id: str, pinned: bool) -> dict[str, Any]:
     """Pin or unpin an agent."""
     async with get_sessionmaker()() as session:
@@ -508,7 +533,7 @@ async def pin_agent(agent_id: str, pinned: bool) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def archive_agent(agent_id: str, archived: bool) -> dict[str, Any]:
     """Archive or unarchive an agent."""
     async with get_sessionmaker()() as session:
@@ -523,7 +548,7 @@ async def archive_agent(agent_id: str, archived: bool) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def restart_agent(
     agent_id: str,
     cols: int = 120,
@@ -543,7 +568,7 @@ async def restart_agent(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=DESTRUCTIVE_TOOL)
 async def delete_agent(agent_id: str) -> dict[str, Any]:
     """Kill and delete an agent."""
     async with get_sessionmaker()() as session:
@@ -552,13 +577,20 @@ async def delete_agent(agent_id: str) -> dict[str, Any]:
         return {"deleted": True, "agent_id": agent_id}
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def send_agent_input(
     agent_id: str,
     text: str | None = None,
     bytes_b64: str | None = None,
 ) -> dict[str, Any]:
-    """Send text or base64-encoded bytes to an agent terminal."""
+    """Send raw PTY input bytes to an agent terminal.
+
+    Use text="<prompt>\\r" to submit a normal prompt or shell command. Use "\\n"
+    only when you want a literal newline inside the terminal input. Prefix "\\x15"
+    to clear unfinished input before typing. Use bytes_b64 for arbitrary control or
+    escape sequences. This tool only confirms input delivery; call snapshot_agent
+    afterward to inspect terminal output.
+    """
     async with get_sessionmaker()() as session:
         user = await _mcp_user(session)
         return await agent_control.send_agent_input(
@@ -570,7 +602,7 @@ async def send_agent_input(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def resize_agent(agent_id: str, cols: int, rows: int) -> dict[str, Any]:
     """Resize an agent terminal."""
     async with get_sessionmaker()() as session:
@@ -584,7 +616,7 @@ async def resize_agent(agent_id: str, cols: int, rows: int) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def scroll_agent(agent_id: str, lines: int) -> dict[str, Any]:
     """Scroll an agent terminal history. Negative scrolls up; positive scrolls down."""
     async with get_sessionmaker()() as session:
@@ -597,7 +629,7 @@ async def scroll_agent(agent_id: str, lines: int) -> dict[str, Any]:
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def redraw_agent(agent_id: str) -> dict[str, Any]:
     """Ask the daemon to redraw an agent terminal."""
     async with get_sessionmaker()() as session:
@@ -605,7 +637,7 @@ async def redraw_agent(agent_id: str) -> dict[str, Any]:
         return await agent_control.redraw_agent(session=session, user=user, agent_id=agent_id)
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=READ_ONLY_TOOL)
 async def snapshot_agent(
     agent_id: str,
     lines: int = 5000,
@@ -623,7 +655,7 @@ async def snapshot_agent(
         )
 
 
-@spawn_mcp.tool()
+@spawn_mcp.tool(annotations=MUTATING_TOOL)
 async def upload_agent_file(
     agent_id: str,
     name: str,
