@@ -39,7 +39,10 @@ spawnd --server https://other run    # override
 This is a foreground service. It connects WSS to `<server>/ws/daemon`,
 registers, and processes `agent.create` / `agent.kill` / `agent.resize`
 frames, multiplexing PTY I/O for any number of concurrent agents over the
-single connection. On disconnect it reconnects with exponential backoff
+single connection. When the browser and daemon can establish WebRTC, terminal
+input/output also flows over a direct `spawn.pty` DataChannel while the
+websocket remains the control plane and transcript/fallback path. On disconnect
+it reconnects with exponential backoff
 (1s, 2s, 4s, … capped at 60s) and re-registers with `existing_agents = […]`
 so the server resyncs its routing map without disturbing the running tmux
 sessions.

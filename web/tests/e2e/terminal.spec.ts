@@ -12,6 +12,7 @@ async function openTerminalWithMockSocket(
     history?: string;
     reconnect?: boolean;
     secondHistory?: string;
+    rtc?: boolean;
   } = {},
 ) {
   await mockAuthenticatedApi(page, { agents: [agent()] });
@@ -30,6 +31,9 @@ async function openTerminalWithMockSocket(
         ...(options.control ?? { owner: true, cols: 100, rows: 30, viewers: 1 }),
       }),
     );
+    if (options.rtc) {
+      ws.send(JSON.stringify({ type: "rtc.config", enabled: true, ice_servers: [] }));
+    }
     ws.send(
       JSON.stringify({
         type: "history",
@@ -97,6 +101,18 @@ test("terminal sends control keys without waiting for a refresh", async ({ page 
 
   await expect.poll(() => binaryText(messages)).toContain("\x03");
   await expect.poll(() => binaryText(messages)).toContain("\r");
+});
+
+test("terminal attempts direct WebRTC transport when advertised", async ({ page }) => {
+  const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n", rtc: true });
+
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "rtc.offer"))
+    .toMatchObject({
+      type: "rtc.offer",
+      session_id: expect.any(String),
+      sdp: expect.stringContaining("v=0"),
+    });
 });
 
 test("viewer can take display control and sends shared geometry", async ({ page }) => {

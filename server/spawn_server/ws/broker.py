@@ -81,6 +81,7 @@ class Broker:
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
         self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
+        self._rtc_browsers: dict[str, BrowserConn] = {}
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -167,6 +168,31 @@ class Broker:
 
     def browsers_for(self, agent_id: str) -> list[BrowserConn]:
         return list(self._browsers_by_agent.get(agent_id, ()))
+
+    async def register_rtc_session(self, session_id: str, conn: BrowserConn) -> None:
+        async with self._lock:
+            self._rtc_browsers[session_id] = conn
+
+    async def unregister_rtc_session(self, session_id: str, conn: BrowserConn | None = None) -> None:
+        async with self._lock:
+            current = self._rtc_browsers.get(session_id)
+            if current is not None and (conn is None or current is conn):
+                self._rtc_browsers.pop(session_id, None)
+
+    async def unregister_rtc_sessions_for(self, conn: BrowserConn) -> list[str]:
+        async with self._lock:
+            session_ids = [
+                session_id
+                for session_id, current in self._rtc_browsers.items()
+                if current is conn
+            ]
+            for session_id in session_ids:
+                self._rtc_browsers.pop(session_id, None)
+            return session_ids
+
+    async def browser_for_rtc_session(self, session_id: str) -> BrowserConn | None:
+        async with self._lock:
+            return self._rtc_browsers.get(session_id)
 
     async def update_display_size(
         self,

@@ -291,6 +291,36 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "client_id": "client-1",
     }
 
+    ws.queue_text({"type": "rtc.offer", "session_id": "rtc-browser-1", "sdp": "v=0\r\n"})
+    await _wait_until(
+        lambda: any(json.loads(item).get("type") == "rtc.offer" for item in daemon_ws.sent_text)
+    )
+    offer = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "rtc.offer"][-1]
+    assert offer == {
+        "type": "rtc.offer",
+        "session_id": "rtc-browser-1",
+        "agent_id": agent_id,
+        "sdp": "v=0\r\n",
+        "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
+    }
+
+    candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
+    ws.queue_text({"type": "rtc.candidate", "session_id": "rtc-browser-1", "candidate": candidate})
+    await _wait_until(
+        lambda: any(json.loads(item).get("type") == "rtc.candidate" for item in daemon_ws.sent_text)
+    )
+    rtc_candidate = [
+        json.loads(item)
+        for item in daemon_ws.sent_text
+        if json.loads(item).get("type") == "rtc.candidate"
+    ][-1]
+    assert rtc_candidate == {
+        "type": "rtc.candidate",
+        "session_id": "rtc-browser-1",
+        "agent_id": agent_id,
+        "candidate": candidate,
+    }
+
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
     await broker.unregister_daemon(daemon)

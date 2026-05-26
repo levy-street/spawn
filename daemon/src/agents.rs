@@ -107,6 +107,11 @@ impl AgentRegistry {
         }
     }
 
+    pub fn control_for(&self, id: Uuid) -> Option<ForwarderControl> {
+        let guard = self.inner.lock().expect("agents lock");
+        guard.get(&id).map(|entry| entry.handle.control.clone())
+    }
+
     /// Snapshot the per-agent forwarder controls so a WS session can
     /// install/clear sinks across all known agents at once.
     pub fn snapshot_controls(&self) -> Vec<(Uuid, ForwarderControl)> {

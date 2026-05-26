@@ -95,7 +95,7 @@ expected_resource = f"{base_url}/mcp"
 if body.get("resource") != expected_resource:
     raise SystemExit(f"unexpected MCP resource metadata: {body!r}")
 servers = body.get("authorization_servers")
-if not isinstance(servers, list) or f"{base_url}/api" not in servers:
+if not isinstance(servers, list) or base_url not in servers:
     raise SystemExit(f"unexpected MCP authorization servers: {body!r}")
 PY
 

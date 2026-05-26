@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,6 +52,15 @@ class Settings(BaseSettings):
     # Used in tests so we don't need Redis available.
     use_inprocess_pubsub: bool = Field(default=False)
 
+    # JSON array of WebRTC RTCIceServer-compatible objects used by browser and
+    # daemon peers for direct terminal streams. STUN-only by default; production
+    # can add TURN credentials with SPAWN_WEBRTC_ICE_SERVERS.
+    webrtc_enabled: bool = Field(default=True)
+    webrtc_ice_servers: str = Field(
+        default='[{"urls":["stun:stun.l.google.com:19302"]}]',
+        description="JSON array of RTCIceServer objects.",
+    )
+
     ringbuffer_max_bytes: int = 256 * 1024  # legacy; kept for API compatibility
 
     # On-disk transcripts give each agent durable scrollback that survives
@@ -61,6 +72,33 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def webrtc_ice_server_list(self) -> list[dict[str, Any]]:
+        try:
+            raw = json.loads(self.webrtc_ice_servers)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            urls = item.get("urls")
+            if isinstance(urls, str):
+                urls = [urls]
+            if not isinstance(urls, list) or not all(isinstance(url, str) for url in urls):
+                continue
+            server: dict[str, Any] = {"urls": urls}
+            username = item.get("username")
+            credential = item.get("credential")
+            if isinstance(username, str):
+                server["username"] = username
+            if isinstance(credential, str):
+                server["credential"] = credential
+            out.append(server)
+        return out
 
 
 @lru_cache

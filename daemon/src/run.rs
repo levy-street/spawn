@@ -23,6 +23,7 @@ use crate::proto::{
     Outbound,
 };
 use crate::pty::{self, WsOutbound};
+use crate::rtc::RtcSessions;
 use crate::tmux;
 use crate::upload;
 use crate::ws::{self, WsInbound};
@@ -50,13 +51,14 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let ws_url = config::ws_url(&server_url)?;
 
     let registry = AgentRegistry::new();
+    let rtc_sessions = RtcSessions::new();
 
     // Ctrl-C handler closes the WS but does NOT kill agent tmux sessions —
     // that's the whole point of using tmux.
     let mut attempt: u32 = 0;
 
     loop {
-        let session_fut = serve_one_connection(&stored, &ws_url, &registry);
+        let session_fut = serve_one_connection(&stored, &ws_url, &registry, &rtc_sessions);
         tokio::pin!(session_fut);
 
         let res = tokio::select! {
@@ -96,6 +98,7 @@ async fn serve_one_connection(
     stored: &StoredCreds,
     ws_url: &url::Url,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
 ) -> Result<()> {
     let token = stored
         .access_token
@@ -178,7 +181,7 @@ async fn serve_one_connection(
     // kernel/tungstenite layer. Scoped so `dispatch_fut`'s borrow of
     // `out_tx` releases before we drop it below.
     let dispatch_result = {
-        let dispatch_fut = dispatch_loop(&mut in_rx, registry, &out_tx);
+        let dispatch_fut = dispatch_loop(&mut in_rx, registry, rtc_sessions, &out_tx);
         tokio::pin!(dispatch_fut);
         tokio::select! {
             r = &mut dispatch_fut => r,
@@ -206,6 +209,7 @@ async fn serve_one_connection(
     // consumed one task to completion (re-awaiting a finished JoinHandle
     // panics).
     clear_session_sinks(registry).await;
+    rtc_sessions.close_all().await;
     heartbeat_task.abort();
     reader_task.abort();
     sender_task.abort();
@@ -248,6 +252,7 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) -> Result<()> {
     while let Some(msg) = in_rx.recv().await {
@@ -339,6 +344,36 @@ async fn dispatch_loop(
                         out_tx,
                     )
                     .await;
+                }
+                Inbound::RtcOffer {
+                    session_id,
+                    agent_id,
+                    sdp,
+                    ice_servers,
+                } => {
+                    rtc_sessions
+                        .handle_offer(
+                            session_id,
+                            agent_id,
+                            sdp,
+                            ice_servers,
+                            registry.clone(),
+                            out_tx.clone(),
+                        )
+                        .await;
+                }
+                Inbound::RtcCandidate {
+                    session_id,
+                    agent_id: _,
+                    candidate,
+                } => {
+                    rtc_sessions.handle_candidate(session_id, candidate).await;
+                }
+                Inbound::RtcClose {
+                    session_id,
+                    agent_id: _,
+                } => {
+                    rtc_sessions.close(&session_id).await;
                 }
             },
             WsInbound::Binary {
@@ -1476,7 +1511,10 @@ mod tests {
         stdio_env.insert("MCP_TOKEN".to_string(), "stdio-secret".to_string());
 
         let mut http_headers = BTreeMap::new();
-        http_headers.insert("Authorization".to_string(), "Bearer http-secret".to_string());
+        http_headers.insert(
+            "Authorization".to_string(),
+            "Bearer http-secret".to_string(),
+        );
 
         let create = AgentCreate {
             agent_id: Uuid::new_v4(),
@@ -1722,6 +1760,7 @@ async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_agent_upload(
     agent_id: Uuid,
     cwd: String,

@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Outbound {
     Register {
         host_name: String,
@@ -63,6 +64,26 @@ pub enum Outbound {
     HostToolsInstallResult {
         request_id: String,
         result: HostToolInstallResult,
+    },
+    #[serde(rename = "rtc.answer")]
+    RtcAnswer {
+        session_id: String,
+        agent_id: Uuid,
+        sdp: String,
+    },
+    #[serde(rename = "rtc.candidate")]
+    RtcCandidate {
+        session_id: String,
+        agent_id: Uuid,
+        candidate: serde_json::Value,
+    },
+    #[serde(rename = "rtc.status")]
+    RtcStatus {
+        session_id: String,
+        agent_id: Uuid,
+        status: String,
+        #[serde(default)]
+        message: Option<String>,
     },
     Error {
         agent_id: Option<Uuid>,
@@ -154,6 +175,34 @@ pub enum Inbound {
         #[serde(default)]
         client_id: Option<String>,
     },
+    #[serde(rename = "rtc.offer")]
+    RtcOffer {
+        session_id: String,
+        agent_id: Uuid,
+        sdp: String,
+        #[serde(default)]
+        ice_servers: Vec<RtcIceServerConfig>,
+    },
+    #[serde(rename = "rtc.candidate")]
+    RtcCandidate {
+        session_id: String,
+        agent_id: Uuid,
+        candidate: serde_json::Value,
+    },
+    #[serde(rename = "rtc.close")]
+    RtcClose {
+        session_id: String,
+        agent_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtcIceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

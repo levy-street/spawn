@@ -6,7 +6,8 @@
  *   - Subprotocol: `spawn.v1`
  *   - Inbound: text JSON ({type:"history", bytes_b64} | {type:"display.control",...} |
  *             {type:"agent.exit",...} | {type:"agent.status",...} |
- *             {type:"upload.saved",...} | {type:"upload.error",...}); binary stdout bytes.
+ *             {type:"upload.saved",...} | {type:"upload.error",...} |
+ *             WebRTC signaling frames); binary stdout bytes.
  *   - Outbound: text JSON ({type:"resize",cols,rows} | {type:"take_control",cols,rows} |
  *              {type:"scroll",lines} | {type:"upload",...});
  *               binary stdin bytes.
@@ -56,7 +57,17 @@ export type InboundMessage =
   | { type: "agent.exit"; exit_code: number | null; signal: string | null }
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
   | { type: "upload.saved"; path: string; client_id?: string }
-  | { type: "upload.error"; message: string };
+  | { type: "upload.error"; message: string }
+  | { type: "rtc.config"; enabled: boolean; ice_servers?: RTCIceServer[] }
+  | { type: "rtc.answer"; session_id: string; agent_id?: string; sdp: string }
+  | { type: "rtc.candidate"; session_id: string; agent_id?: string; candidate: RTCIceCandidateInit }
+  | {
+      type: "rtc.status";
+      session_id?: string;
+      agent_id?: string;
+      status: string;
+      message?: string;
+    };
 
 export function parseInbound(raw: string): InboundMessage | null {
   try {
@@ -75,6 +86,9 @@ export type OutboundMessage =
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
   | { type: "snapshot"; lines?: number; plain?: boolean }
+  | { type: "rtc.offer"; session_id: string; sdp: string }
+  | { type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit }
+  | { type: "rtc.close"; session_id: string }
   | {
       type: "upload";
       name: string;

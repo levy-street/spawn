@@ -19,6 +19,7 @@ mod frames;
 mod login;
 mod proto;
 mod pty;
+mod rtc;
 mod run;
 mod tmux;
 mod upload;

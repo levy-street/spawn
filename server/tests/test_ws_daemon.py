@@ -12,7 +12,7 @@ from sqlalchemy import select
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host, User
-from spawn_server.ws.broker import get_broker
+from spawn_server.ws.broker import BrowserConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 
 
@@ -202,3 +202,73 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     await asyncio.wait_for(task, timeout=1)
     assert get_broker().get_daemon_for_host(host_id) is None
     assert get_broker().get_daemon_for_agent(agent_id) is None
+
+
+async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
+    user_id, _ = await _signup(client, "ws-daemon-rtc@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    browser_ws = FakeDaemonWebSocket()
+    browser_conn = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    await broker.register_rtc_session("rtc-daemon-1", browser_conn)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+
+    ws.queue_text(
+        {
+            "type": "rtc.answer",
+            "session_id": "rtc-daemon-1",
+            "agent_id": agent_id,
+            "sdp": "v=0\r\n",
+        }
+    )
+    await _wait_until(lambda: any(item.get("type") == "rtc.answer" for item in _sent_json(browser_ws)))
+    assert _sent_json(browser_ws)[-1] == {
+        "type": "rtc.answer",
+        "session_id": "rtc-daemon-1",
+        "agent_id": agent_id,
+        "sdp": "v=0\r\n",
+    }
+
+    candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
+    ws.queue_text(
+        {
+            "type": "rtc.candidate",
+            "session_id": "rtc-daemon-1",
+            "agent_id": agent_id,
+            "candidate": candidate,
+        }
+    )
+    await _wait_until(
+        lambda: any(item.get("type") == "rtc.candidate" for item in _sent_json(browser_ws))
+    )
+    assert _sent_json(browser_ws)[-1] == {
+        "type": "rtc.candidate",
+        "session_id": "rtc-daemon-1",
+        "agent_id": agent_id,
+        "candidate": candidate,
+    }
+
+    ws.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": "rtc-daemon-1",
+            "agent_id": agent_id,
+            "status": "connected",
+        }
+    )
+    await _wait_until(lambda: any(item.get("type") == "rtc.status" for item in _sent_json(browser_ws)))
+    assert _sent_json(browser_ws)[-1] == {
+        "type": "rtc.status",
+        "session_id": "rtc-daemon-1",
+        "agent_id": agent_id,
+        "status": "connected",
+    }
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+    await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)

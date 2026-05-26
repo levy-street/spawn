@@ -303,6 +303,38 @@ const command =
 const browser = await chromium.launch();
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  await context.addInitScript(() => {
+    globalThis.__spawnRtcEvents = [];
+    const OriginalRTCPeerConnection = globalThis.RTCPeerConnection;
+    if (!OriginalRTCPeerConnection) return;
+
+    globalThis.RTCPeerConnection = class SpawnObservedPeerConnection extends OriginalRTCPeerConnection {
+      constructor(...args) {
+        super(...args);
+        globalThis.__spawnRtcEvents.push({ type: "pc.created" });
+      }
+
+      createDataChannel(label, options) {
+        const channel = super.createDataChannel(label, options);
+        globalThis.__spawnRtcEvents.push({ type: "dc.created", label });
+        channel.addEventListener("open", () => {
+          globalThis.__spawnRtcEvents.push({ type: "dc.open", label });
+        });
+        channel.addEventListener("message", (event) => {
+          const size =
+            typeof event.data === "string" ? event.data.length : event.data?.byteLength || 0;
+          globalThis.__spawnRtcEvents.push({ type: "dc.message", label, size });
+        });
+        const send = channel.send.bind(channel);
+        channel.send = (data) => {
+          const size = typeof data === "string" ? data.length : data?.byteLength || 0;
+          globalThis.__spawnRtcEvents.push({ type: "dc.send", label, size });
+          return send(data);
+        };
+        return channel;
+      }
+    };
+  });
   const page = await context.newPage();
 
   await page.goto(`${webUrl}/login`);
@@ -346,6 +378,17 @@ try {
   if (redColor === normalColor) {
     throw new Error(`ANSI color did not render differently: ${redColor}`);
   }
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() =>
+          (globalThis.__spawnRtcEvents || []).some(
+            (event) => event.type === "dc.open" && event.label === "spawn.pty",
+          ),
+        ),
+      { timeout: 20_000 },
+    )
+    .toBe(true);
   const match = page.url().match(/\/agents\/([0-9a-f-]{36})/i);
   if (!match) throw new Error(`could not extract agent id from ${page.url()}`);
   const agentId = match[1];
@@ -357,6 +400,34 @@ try {
   await expect(page.locator(".xterm-rows")).toContainText("browser-live:ping", {
     timeout: 20_000,
   });
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const events = globalThis.__spawnRtcEvents || [];
+          return {
+            sends: events.filter((event) => event.type === "dc.send" && event.label === "spawn.pty")
+              .length,
+            messages: events.filter(
+              (event) => event.type === "dc.message" && event.label === "spawn.pty",
+            ).length,
+          };
+        }),
+      { timeout: 20_000 },
+    )
+    .toEqual(expect.objectContaining({ sends: expect.any(Number), messages: expect.any(Number) }));
+  const rtcCounts = await page.evaluate(() => {
+    const events = globalThis.__spawnRtcEvents || [];
+    return {
+      sends: events.filter((event) => event.type === "dc.send" && event.label === "spawn.pty")
+        .length,
+      messages: events.filter((event) => event.type === "dc.message" && event.label === "spawn.pty")
+        .length,
+    };
+  });
+  if (rtcCounts.sends < 1 || rtcCounts.messages < 1) {
+    throw new Error(`WebRTC DataChannel did not carry terminal bytes: ${JSON.stringify(rtcCounts)}`);
+  }
 
   await page.locator('input[type="file"]').setInputFiles({
     name: "live-upload.txt",

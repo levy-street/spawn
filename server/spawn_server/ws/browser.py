@@ -17,6 +17,7 @@ from ..agent_control import (
     decode_upload,
     upload_paste_prefix,
 )
+from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
@@ -76,6 +77,41 @@ def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
         "rows": state.rows,
         "viewers": state.viewers,
     }
+
+
+def _rtc_config_payload() -> dict[str, object]:
+    settings = get_settings()
+    return {
+        "type": "rtc.config",
+        "enabled": settings.webrtc_enabled,
+        "ice_servers": settings.webrtc_ice_server_list,
+    }
+
+
+def _valid_rtc_session_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 128:
+        return None
+    return value
+
+
+def _valid_rtc_sdp(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > 1024 * 1024:
+        return None
+    return value
+
+
+def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    candidate = value.get("candidate")
+    if not isinstance(candidate, str) or len(candidate) > 64 * 1024:
+        return None
+    return dict(value)
 
 
 async def _broadcast_display_control(agent_id: str) -> None:
@@ -217,6 +253,7 @@ async def browser_ws(
     # their own viewport and racing the shared PTY size.
     try:
         await _broadcast_display_control(agent_id)
+        await conn.send_text(_rtc_config_payload())
         await _send_initial_history(
             conn,
             agent_id=agent_id,
@@ -442,6 +479,96 @@ async def browser_ws(
                                 "message": "Upload could not reach the daemon.",
                             }
                         )
+                elif ftype == "rtc.offer":
+                    if not get_settings().webrtc_enabled:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": obj.get("session_id"),
+                                "status": "disabled",
+                                "message": "WebRTC direct terminal transport is disabled.",
+                            }
+                        )
+                        continue
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    sdp = _valid_rtc_sdp(obj.get("sdp"))
+                    if session_id is None or sdp is None:
+                        continue
+                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
+                        host_id
+                    )
+                    if daemon is None:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "status": "unavailable",
+                                "message": "No daemon is connected.",
+                            }
+                        )
+                        continue
+                    await broker.register_rtc_session(session_id, conn)
+                    try:
+                        await daemon.send_text(
+                            {
+                                "type": "rtc.offer",
+                                "session_id": session_id,
+                                "agent_id": agent_id,
+                                "sdp": sdp,
+                                "ice_servers": get_settings().webrtc_ice_server_list,
+                            }
+                        )
+                    except Exception as e:
+                        log.warning("rtc offer forward failed: %s", e)
+                        await broker.unregister_rtc_session(session_id, conn)
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "status": "unavailable",
+                                "message": "WebRTC signaling could not reach the daemon.",
+                            }
+                        )
+                elif ftype == "rtc.candidate":
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    candidate = _valid_rtc_candidate(obj.get("candidate"))
+                    if session_id is None or candidate is None:
+                        continue
+                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
+                        host_id
+                    )
+                    if daemon is None:
+                        continue
+                    try:
+                        await daemon.send_text(
+                            {
+                                "type": "rtc.candidate",
+                                "session_id": session_id,
+                                "agent_id": agent_id,
+                                "candidate": candidate,
+                            }
+                        )
+                    except Exception as e:
+                        log.warning("rtc candidate forward failed: %s", e)
+                elif ftype == "rtc.close":
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    if session_id is None:
+                        continue
+                    await broker.unregister_rtc_session(session_id, conn)
+                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
+                        host_id
+                    )
+                    if daemon is not None:
+                        try:
+                            await daemon.send_text(
+                                {
+                                    "type": "rtc.close",
+                                    "session_id": session_id,
+                                    "agent_id": agent_id,
+                                }
+                            )
+                        except Exception as e:
+                            log.warning("rtc close forward failed: %s", e)
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
@@ -452,6 +579,20 @@ async def browser_ws(
             await pump_task
         except (asyncio.CancelledError, Exception):
             pass
+        session_ids = await broker.unregister_rtc_sessions_for(conn)
+        daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
+        if daemon is not None:
+            for session_id in session_ids:
+                try:
+                    await daemon.send_text(
+                        {
+                            "type": "rtc.close",
+                            "session_id": session_id,
+                            "agent_id": agent_id,
+                        }
+                    )
+                except Exception:
+                    pass
         await broker.detach_browser(conn)
         await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)

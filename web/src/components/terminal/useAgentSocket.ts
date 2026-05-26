@@ -33,6 +33,20 @@ export interface UseAgentSocketOptions {
 
 export type SocketState = "idle" | "connecting" | "open" | "closed" | "error";
 
+type RtcState = {
+  pc: RTCPeerConnection | null;
+  dc: RTCDataChannel | null;
+  sessionId: string | null;
+  open: boolean;
+};
+
+function newRtcSessionId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+}
+
 export function useAgentSocket({
   agentId,
   enabled = true,
@@ -48,6 +62,8 @@ export function useAgentSocket({
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   const wsRef = useRef<WebSocket | null>(null);
+  const rtcRef = useRef<RtcState>({ pc: null, dc: null, sessionId: null, open: false });
+  const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     onData,
@@ -76,6 +92,113 @@ export function useAgentSocket({
     let cancelled = false;
     let attempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcStartInFlight = false;
+
+    const sendJsonOverWs = (msg: unknown) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify(msg));
+      return true;
+    };
+
+    const cleanupRtc = (signal = true) => {
+      const rtc = rtcRef.current;
+      const sessionId = rtc.sessionId;
+      if (signal && sessionId) {
+        sendJsonOverWs({ type: "rtc.close", session_id: sessionId });
+      }
+      try {
+        rtc.dc?.close();
+      } catch {
+        // ignore
+      }
+      try {
+        rtc.pc?.close();
+      } catch {
+        // ignore
+      }
+      rtcRef.current = { pc: null, dc: null, sessionId: null, open: false };
+      pendingRemoteRtcCandidatesRef.current = [];
+      rtcStartInFlight = false;
+    };
+
+    const startRtc = async (iceServers: RTCIceServer[]) => {
+      if (cancelled || rtcStartInFlight || rtcRef.current.pc) return;
+      if (typeof RTCPeerConnection === "undefined") return;
+      rtcStartInFlight = true;
+      const sessionId = newRtcSessionId();
+      const pc = new RTCPeerConnection({ iceServers });
+      const dc = pc.createDataChannel("spawn.pty", { ordered: true });
+      const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+      let offerSent = false;
+      dc.binaryType = "arraybuffer";
+      rtcRef.current = { pc, dc, sessionId, open: false };
+
+      const sendRtcCandidate = (candidate: RTCIceCandidateInit) =>
+        sendJsonOverWs({
+          type: "rtc.candidate",
+          session_id: sessionId,
+          candidate,
+        });
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || cancelled) return;
+        const candidate = event.candidate.toJSON();
+        if (offerSent) {
+          sendRtcCandidate(candidate);
+        } else {
+          pendingLocalCandidates.push(candidate);
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+          cleanupRtc(pc.connectionState !== "closed");
+        }
+      };
+      dc.onopen = () => {
+        const current = rtcRef.current;
+        if (current.sessionId === sessionId) {
+          rtcRef.current = { ...current, open: true };
+        }
+      };
+      dc.onclose = () => {
+        const current = rtcRef.current;
+        if (current.sessionId === sessionId) {
+          rtcRef.current = { ...current, open: false };
+        }
+      };
+      dc.onerror = () => {
+        cleanupRtc();
+      };
+      dc.onmessage = (event) => {
+        const h = handlersRef.current;
+        if (event.data instanceof ArrayBuffer) {
+          h.onData(new Uint8Array(event.data));
+        } else if (event.data instanceof Blob) {
+          void event.data.arrayBuffer().then((buf) => {
+            if (!cancelled) h.onData(new Uint8Array(buf));
+          });
+        }
+      };
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        if (cancelled || rtcRef.current.sessionId !== sessionId) return;
+        if (!sendJsonOverWs({ type: "rtc.offer", session_id: sessionId, sdp: offer.sdp })) {
+          cleanupRtc(false);
+          return;
+        }
+        offerSent = true;
+        for (const candidate of pendingLocalCandidates.splice(0)) {
+          sendRtcCandidate(candidate);
+        }
+      } catch {
+        cleanupRtc();
+      } finally {
+        rtcStartInFlight = false;
+      }
+    };
 
     const connect = () => {
       if (cancelled) return;
@@ -123,15 +246,49 @@ export function useAgentSocket({
             h.onUploadSaved?.(msg.path, msg.client_id);
           } else if (msg.type === "upload.error") {
             h.onUploadError?.(msg.message);
+          } else if (msg.type === "rtc.config") {
+            if (msg.enabled) {
+              void startRtc(msg.ice_servers ?? []);
+            }
+          } else if (msg.type === "rtc.answer") {
+            const current = rtcRef.current;
+            if (current.sessionId === msg.session_id && current.pc) {
+              void current.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
+                const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
+                for (const candidate of pending) {
+                  void current.pc?.addIceCandidate(candidate).catch(() => {});
+                }
+              });
+            }
+          } else if (msg.type === "rtc.candidate") {
+            const current = rtcRef.current;
+            if (current.sessionId === msg.session_id && current.pc) {
+              if (current.pc.remoteDescription) {
+                void current.pc.addIceCandidate(msg.candidate).catch(() => {});
+              } else {
+                pendingRemoteRtcCandidatesRef.current.push(msg.candidate);
+              }
+            }
+          } else if (msg.type === "rtc.status") {
+            if (
+              msg.session_id &&
+              rtcRef.current.sessionId === msg.session_id &&
+              ["failed", "disabled", "unavailable"].includes(msg.status)
+            ) {
+              cleanupRtc(false);
+            }
           }
         } else if (ev.data instanceof ArrayBuffer) {
-          h.onData(new Uint8Array(ev.data));
+          if (!rtcRef.current.open) {
+            h.onData(new Uint8Array(ev.data));
+          }
         }
       };
       ws.onerror = () => {
         setState("error");
       };
       ws.onclose = () => {
+        cleanupRtc(false);
         wsRef.current = null;
         setState("closed");
         scheduleReconnect();
@@ -152,6 +309,7 @@ export function useAgentSocket({
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (wsRef.current) {
         try {
+          cleanupRtc(true);
           wsRef.current.close(1000, "unmount");
         } catch {
           // ignore
@@ -162,9 +320,14 @@ export function useAgentSocket({
   }, [agentId, enabled]);
 
   const sendBinary = (bytes: Uint8Array | string) => {
+    const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    const rtc = rtcRef.current;
+    if (rtc.open && rtc.dc?.readyState === "open") {
+      rtc.dc.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+      return true;
+    }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     // Convert to a fresh ArrayBuffer to satisfy strict BufferSource typing.
     ws.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
     return true;

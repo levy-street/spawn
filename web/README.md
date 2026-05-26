@@ -42,11 +42,14 @@ See repo root `.env.example`:
   same-origin `/api/*` through Next's proxy.
 - `NEXT_PUBLIC_SPAWN_WS_URL` — optional browser WebSocket base URL. Leave unset
   for same-origin `/ws/*` through Next's proxy.
+- `SPAWN_WEBRTC_ICE_SERVERS` — server-side JSON array of ICE servers returned
+  to the browser for direct daemon DataChannel terminal streams. Defaults to a
+  public STUN server; add TURN credentials for reliable off-LAN/mobile use.
 
 ## Structure
 
 - `src/app/` — App Router pages (login/signup/device + protected app shell).
-- `src/components/terminal/` — xterm.js + WS hook + composer + modifier bar.
+- `src/components/terminal/` — xterm.js + WS/WebRTC hook + composer + modifier bar.
 - `src/components/nav/` — `AppShell` (responsive: side rail desktop, top+tab
   bar mobile) and `BottomTabs`.
 - `src/components/ui/` — shadcn-style primitives (Button, Input, Card, ...).

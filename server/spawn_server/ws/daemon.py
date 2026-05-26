@@ -72,6 +72,24 @@ async def _touch_host(session: AsyncSession, host: Host) -> None:
     await session.commit()
 
 
+def _valid_rtc_session_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 128:
+        return None
+    return value
+
+
+def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    candidate = value.get("candidate")
+    if not isinstance(candidate, str) or len(candidate) > 64 * 1024:
+        return None
+    return dict(value)
+
+
 @router.websocket("/ws/daemon")
 async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
     # Pre-accept-time auth check: we accept first because most clients can't read
@@ -254,6 +272,75 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 log.warning("snapshot for unknown agent=%s", aid)
                                 continue
                         await broker.resolve_snapshot(aid, bytes_b64)
+
+                elif ftype == "rtc.answer":
+                    aid = obj.get("agent_id")
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    sdp = obj.get("sdp")
+                    if aid and session_id and isinstance(sdp, str):
+                        async with sm() as session:
+                            agent = await session.get(Agent, aid)
+                            if agent is None or agent.host_id != host.id:
+                                log.warning("rtc answer for unknown agent=%s", aid)
+                                continue
+                        browser = await broker.browser_for_rtc_session(session_id)
+                        if browser is not None:
+                            try:
+                                await browser.send_text(
+                                    {
+                                        "type": "rtc.answer",
+                                        "session_id": session_id,
+                                        "agent_id": aid,
+                                        "sdp": sdp,
+                                    }
+                                )
+                            except Exception as e:
+                                log.warning("rtc answer route failed: %s", e)
+
+                elif ftype == "rtc.candidate":
+                    aid = obj.get("agent_id")
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    candidate = _valid_rtc_candidate(obj.get("candidate"))
+                    if aid and session_id and candidate is not None:
+                        async with sm() as session:
+                            agent = await session.get(Agent, aid)
+                            if agent is None or agent.host_id != host.id:
+                                log.warning("rtc candidate for unknown agent=%s", aid)
+                                continue
+                        browser = await broker.browser_for_rtc_session(session_id)
+                        if browser is not None:
+                            try:
+                                await browser.send_text(
+                                    {
+                                        "type": "rtc.candidate",
+                                        "session_id": session_id,
+                                        "agent_id": aid,
+                                        "candidate": candidate,
+                                    }
+                                )
+                            except Exception as e:
+                                log.warning("rtc candidate route failed: %s", e)
+
+                elif ftype == "rtc.status":
+                    aid = obj.get("agent_id")
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    status_value = obj.get("status")
+                    if aid and session_id and isinstance(status_value, str):
+                        browser = await broker.browser_for_rtc_session(session_id)
+                        if browser is not None:
+                            payload = {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "agent_id": aid,
+                                "status": status_value,
+                            }
+                            message = obj.get("message")
+                            if isinstance(message, str):
+                                payload["message"] = message
+                            try:
+                                await browser.send_text(payload)
+                            except Exception as e:
+                                log.warning("rtc status route failed: %s", e)
 
                 elif ftype == "error":
                     aid = obj.get("agent_id")

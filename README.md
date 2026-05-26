@@ -60,6 +60,11 @@ curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spaw
 For CI or smoke tests that should prove the minimal binary path without a Rust
 fallback, add `--prebuilt-only`.
 
+Interactive terminal sessions prefer a direct browser↔daemon WebRTC
+DataChannel when available, with the server websocket kept as auth/signaling,
+transcript, and fallback relay. Configure STUN/TURN with
+`SPAWN_WEBRTC_ICE_SERVERS`; the default is STUN-only.
+
 ```bash
 # 0. One-time: copy env template
 cp .env.example server/.env

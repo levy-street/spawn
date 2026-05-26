@@ -186,6 +186,22 @@ Agent IDs are big-endian 16-byte UUIDs.
  "agent_id": "uuid",
  "bytes_b64": "..."}
 
+{"type": "rtc.answer",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid",
+ "sdp": "v=0..."}
+
+{"type": "rtc.candidate",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid",
+ "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
+
+{"type": "rtc.status",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid",
+ "status": "connected|failed",
+ "message": "optional detail"}
+
 {"type": "host.fs.list_result",
  "request_id": "uuid",
  "path": "/home/me/projects",
@@ -307,6 +323,21 @@ Agent IDs are big-endian 16-byte UUIDs.
  "paste": false,
  "destination": "cwd",
  "client_id": "browser-upload-id"}
+
+{"type": "rtc.offer",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid",
+ "sdp": "v=0...",
+ "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+
+{"type": "rtc.candidate",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid",
+ "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
+
+{"type": "rtc.close",
+ "session_id": "browser-generated-id",
+ "agent_id": "uuid"}
 ```
 
 The daemon launches the agent argv at `cwd` with the host user's process
@@ -340,17 +371,46 @@ distinguish healthy idle connections from dead sockets.
 ```
 Plus raw binary stdin bytes.
 
+When the server advertises WebRTC support, the browser may additionally send
+`rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
+The server authorizes the browser against the agent, forwards signaling to the
+owning daemon over `/ws/daemon`, and keeps this websocket open as the control
+plane and fallback terminal relay.
+
 ### Server → browser
 
 ```json
+{"type": "rtc.config",
+ "enabled": true,
+ "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 {"type": "history", "bytes_b64": "..."}    // initial replay buffer
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
 {"type": "upload.error", "message": "..."}
+{"type": "rtc.answer", "session_id": "browser-generated-id", "agent_id": "uuid", "sdp": "v=0..."}
+{"type": "rtc.candidate", "session_id": "browser-generated-id", "agent_id": "uuid", "candidate": {"candidate": "..."}}
+{"type": "rtc.status", "session_id": "browser-generated-id", "agent_id": "uuid", "status": "connected|failed"}
 ```
 Plus raw binary stdout bytes.
+
+## Direct terminal DataChannel
+
+The low-latency terminal data plane is an optional WebRTC DataChannel layered
+on top of the websocket control plane.
+
+- The browser creates a DataChannel named `spawn.pty`.
+- Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
+- DataChannel messages are raw binary PTY bytes:
+  - browser → daemon: stdin bytes for the authorized agent
+  - daemon → browser: stdout/stderr PTY bytes for that agent
+- The server-relayed binary PTY path stays active as fallback and transcript
+  source. Browsers should prefer DataChannel output once it is open to avoid
+  duplicate terminal rendering.
+- `SPAWN_WEBRTC_ICE_SERVERS` configures the ICE server list. STUN is enough
+  for many LAN/home-network cases; TURN is required for reliable fallback
+  across restrictive NATs and mobile/corporate networks.
 
 ## Versioning
 

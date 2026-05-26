@@ -21,7 +21,7 @@
 //! Because tmux owns the underlying agent process, the agent also survives
 //! `spawnd` restarts (see `reattach`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +44,7 @@ pub enum WsOutbound {
 /// The thing the WS session hands to a per-agent forwarder so that bytes
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
+pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 
 /// Shared between an agent's forwarder task and the WS session lifecycle.
 /// `slot` holds the current session's outbound sink (or `None` between
@@ -51,6 +52,7 @@ pub type SessionSink = mpsc::Sender<WsOutbound>;
 #[derive(Clone)]
 pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
+    direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSink>>>,
     notify: Arc<Notify>,
 }
 
@@ -58,6 +60,7 @@ impl ForwarderControl {
     fn new() -> Self {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
+            direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -74,6 +77,22 @@ impl ForwarderControl {
     /// the agent's outbox in the meantime.
     pub async fn clear_sink(&self) {
         *self.slot.lock().await = None;
+    }
+
+    /// Add a direct terminal transport sink, such as a browser WebRTC
+    /// DataChannel. These sinks receive raw PTY output bytes without the
+    /// daemon->server->browser relay hop.
+    pub async fn add_direct_sink(&self, id: String, sink: DirectSink) {
+        self.direct_sinks.lock().await.insert(id, sink);
+    }
+
+    pub async fn remove_direct_sink(&self, id: &str) {
+        self.direct_sinks.lock().await.remove(id);
+    }
+
+    async fn send_direct(&self, chunk: &[u8]) {
+        let mut sinks = self.direct_sinks.lock().await;
+        sinks.retain(|_, sink| sink.send(chunk.to_vec()).is_ok());
     }
 }
 
@@ -405,6 +424,7 @@ async fn run_forwarder(
     control: ForwarderControl,
 ) {
     while let Some(chunk) = outbox_rx.recv().await {
+        control.send_direct(&chunk).await;
         let frame = frames::encode_pty_output(agent_id, &chunk);
         // Loop until the chunk is sent (or wait for a sink to be installed).
         loop {
