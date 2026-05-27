@@ -309,7 +309,7 @@ Agent IDs are big-endian 16-byte UUIDs.
 
 {"type": "agent.scroll", "agent_id": "uuid", "lines": -8}
 
-{"type": "agent.snapshot", "agent_id": "uuid", "lines": 5000}
+{"type": "agent.snapshot", "agent_id": "uuid", "lines": 100000}
 
 {"type": "agent.redraw", "agent_id": "uuid"}
 
@@ -370,6 +370,10 @@ distinguish healthy idle connections from dead sockets.
 {"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 ```
 Plus raw binary stdin bytes.
+
+`scroll` / `agent.scroll` is retained for legacy/manual tmux copy-mode
+operations. Normal browser UI scrollback is local to xterm and should not send
+scroll frames or mutate daemon-side viewport state.
 
 When the server advertises WebRTC support, the browser may additionally send
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.

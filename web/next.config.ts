@@ -17,16 +17,7 @@ function defaultPublicWsUrl(): string {
   if (process.env.NEXT_PUBLIC_SPAWN_WS_URL !== undefined) {
     return process.env.NEXT_PUBLIC_SPAWN_WS_URL;
   }
-  if (process.env.NODE_ENV === "production") return "";
-  const target = new URL(API_PROXY_TARGET);
-  target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
-  if (target.hostname === "127.0.0.1" || target.hostname === "0.0.0.0") {
-    target.hostname = "localhost";
-  }
-  target.pathname = "";
-  target.search = "";
-  target.hash = "";
-  return target.toString().replace(/\/$/, "");
+  return "";
 }
 
 const nextConfig: NextConfig = {

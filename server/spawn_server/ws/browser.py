@@ -32,6 +32,9 @@ from .frames import KIND_INPUT, encode_binary_frame
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
+TERMINAL_SCROLLBACK_LINES = 100_000
+DAEMON_SNAPSHOT_LINES = 10_000
+INITIAL_SNAPSHOT_TIMEOUT = 5.0
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -63,9 +66,9 @@ def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
 
 def _prefer_transcript_history(argv: list[str]) -> bool:
     # Raw PTY transcripts are chronological, but replaying full-screen TUIs
-    # through xterm can restore a current screen without browser scrollback.
-    # Keep using tmux's rendered pane snapshot until we have a proper terminal
-    # recording renderer that can materialize scrollback independently.
+    # can preserve alternate-screen repaint noise. Keep using tmux's rendered
+    # pane snapshot until we have a proper terminal recording renderer that can
+    # materialize clean scrollback independently.
     return False
 
 
@@ -162,7 +165,9 @@ async def _send_initial_history(
                         "rows": initial_rows,
                     }
                 )
-            snapshot = await broker.request_snapshot(agent_id, daemon, lines=5000, timeout=2.0)
+            snapshot = await broker.request_snapshot(
+                agent_id, daemon, lines=DAEMON_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
+            )
             if snapshot:
                 await conn.send_text({"type": "history", "bytes_b64": snapshot})
                 return
@@ -410,8 +415,8 @@ async def browser_ws(
                         except Exception as e:
                             log.warning("scroll forward failed: %s", e)
                 elif ftype == "snapshot":
-                    raw_lines = int(obj.get("lines") or 5000)
-                    lines = max(100, min(10000, raw_lines))
+                    raw_lines = int(obj.get("lines") or DAEMON_SNAPSHOT_LINES)
+                    lines = max(100, min(DAEMON_SNAPSHOT_LINES, raw_lines))
                     plain = bool(obj.get("plain", False))
                     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
                         host_id

@@ -13,7 +13,7 @@ from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
 from spawn_server.ws.broker import DaemonConn, get_broker
-from spawn_server.ws.browser import browser_ws
+from spawn_server.ws.browser import DAEMON_SNAPSHOT_LINES, browser_ws
 from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 
 
@@ -187,6 +187,45 @@ async def test_browser_ws_replays_transcript_history_and_status(client, tmp_path
         "type": "agent.status",
         "status": "quiet",
     }
+
+
+async def test_browser_ws_seeds_native_scrollback_from_full_daemon_snapshot(client):
+    user_id, token = await _signup(client, "ws-browser-daemon-history@example.com")
+    host_id, agent_id = await _create_host_and_agent(user_id)
+
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None, cols=120, rows=32)  # type: ignore[arg-type]
+    )
+    await _wait_until(
+        lambda: any(json.loads(item).get("type") == "agent.snapshot" for item in daemon_ws.sent_text)
+    )
+
+    snapshot_request = [
+        json.loads(item)
+        for item in daemon_ws.sent_text
+        if json.loads(item).get("type") == "agent.snapshot"
+    ][-1]
+    assert snapshot_request == {
+        "type": "agent.snapshot",
+        "agent_id": agent_id,
+        "lines": DAEMON_SNAPSHOT_LINES,
+    }
+
+    await broker.resolve_snapshot(agent_id, base64.b64encode(b"daemon history\n").decode("ascii"))
+    await _wait_until(lambda: len(_messages_of_type(ws, "history")) >= 1)
+    history = _messages_of_type(ws, "history")[-1]
+    assert base64.b64decode(history["bytes_b64"]) == b"daemon history\n"
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+    await broker.unregister_daemon(daemon)
 
 
 async def test_browser_ws_display_control_tracks_owner_and_viewer_takeover(client):

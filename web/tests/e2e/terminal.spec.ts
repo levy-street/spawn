@@ -1,4 +1,4 @@
-import { expect, type Page, test, type WebSocketRoute } from "@playwright/test";
+import { devices, expect, type Page, test, type WebSocketRoute } from "@playwright/test";
 import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 
 function b64(value: string) {
@@ -77,13 +77,67 @@ function jsonMessages(messages: Array<string | Buffer>) {
     .filter(Boolean);
 }
 
+function liveTerminal(page: Page) {
+  return page.getByTestId("terminal-live-host").locator(".xterm");
+}
+
+function liveTerminalRows(page: Page) {
+  return page.getByTestId("terminal-live-host").locator(".xterm-rows");
+}
+
+async function scrollbackOverlayMetrics(page: Page) {
+  return page
+    .getByTestId("terminal-scrollback-overlay")
+    .locator(".xterm-viewport")
+    .evaluate((el) => {
+      return {
+        scrollTop: el.scrollTop,
+        maxTop: Math.max(0, el.scrollHeight - el.clientHeight),
+      };
+    });
+}
+
+async function dragTouchInTerminal(page: Page, startYRatio: number, endYRatio: number) {
+  const box = await liveTerminal(page).boundingBox();
+  if (!box) throw new Error("terminal is not visible");
+  const x = Math.round(box.x + box.width / 2);
+  const startY = Math.round(box.y + box.height * startYRatio);
+  const endY = Math.round(box.y + box.height * endYRatio);
+  const client = await page.context().newCDPSession(page);
+
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x, y: startY, id: 1 }],
+  });
+  for (let i = 1; i <= 10; i += 1) {
+    const y = Math.round(startY + ((endY - startY) * i) / 10);
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x, y, id: 1 }],
+    });
+    await page.waitForTimeout(16);
+  }
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: [],
+  });
+}
+
+function longHistory(lines: number) {
+  return `${Array.from({ length: lines }, (_, i) => {
+    return `history-${String(i).padStart(3, "0")}`;
+  }).join("\n")}\n`;
+}
+
 test("terminal renders ANSI color and sends keystrokes without refresh", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page);
 
-  await expect(page.locator(".xterm-rows")).toContainText("RED");
-  const redColor = await page.locator(".xterm-rows span", { hasText: "RED" }).evaluate((node) => {
-    return window.getComputedStyle(node).color;
-  });
+  await expect(liveTerminalRows(page)).toContainText("RED");
+  const redColor = await liveTerminalRows(page)
+    .locator("span", { hasText: "RED" })
+    .evaluate((node) => {
+      return window.getComputedStyle(node).color;
+    });
   expect(redColor).not.toBe("rgb(229, 229, 229)");
 
   await page.getByLabel("Agent terminal").click();
@@ -168,7 +222,115 @@ test("terminal sends resize and file upload frames over the agent socket", async
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {
   const { sockets } = await openTerminalWithMockSocket(page, { reconnect: true });
 
-  await expect(page.locator(".xterm-rows")).toContainText("RED");
+  await expect(liveTerminalRows(page)).toContainText("RED");
   await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
-  await expect(page.locator(".xterm-rows")).toContainText("after reconnect");
+  await expect(liveTerminalRows(page)).toContainText("after reconnect");
+});
+
+test("terminal scrollback opens from cached snapshots without waiting for a round trip", async ({
+  page,
+}) => {
+  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    history: longHistory(160),
+  });
+  const terminal = page.getByLabel("Agent terminal");
+  await expect(terminal).toBeVisible();
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -30);
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("history-");
+  expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
+
+  sockets[0]?.send(Buffer.from("\x1b[2A\rLIVE-WHILE-SCROLLED"));
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-WHILE-SCROLLED");
+
+  await page.mouse.wheel(0, 5000);
+  await expect(overlay).not.toBeVisible();
+  await expect(liveTerminalRows(page)).toContainText("LIVE-WHILE-SCROLLED");
+  await terminal.click();
+  await page.keyboard.type("z");
+  await expect.poll(() => binaryText(messages)).toContain("z");
+});
+
+test("terminal wheel in alternate screen scrolls locally instead of sending prompt arrows", async ({
+  page,
+}) => {
+  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    history: `\x1b[?1049h${longHistory(160).replaceAll("\n", "\r\n")}ALT SCREEN\r\n`,
+  });
+
+  await expect(liveTerminalRows(page)).toContainText("ALT SCREEN");
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -900);
+
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "snapshot"))
+    .toMatchObject({
+      type: "snapshot",
+      lines: 10000,
+      plain: false,
+    });
+  sockets[0]?.send(
+    JSON.stringify({
+      type: "snapshot",
+      bytes_b64: b64(`${longHistory(160)}ALT SCREEN\n`),
+      plain: false,
+    }),
+  );
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("history-");
+  await expect
+    .poll(async () => {
+      const metrics = await scrollbackOverlayMetrics(page);
+      return metrics.maxTop > 0 && metrics.scrollTop < metrics.maxTop - 1;
+    })
+    .toBe(true);
+  expect(binaryText(messages)).not.toContain("\x1b[A");
+  expect(binaryText(messages)).not.toContain("\x1b[B");
+  expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
+});
+
+test.describe("mobile terminal touch", () => {
+  const mobile = devices["iPhone 14 Pro"];
+  test.use({
+    deviceScaleFactor: mobile.deviceScaleFactor,
+    hasTouch: mobile.hasTouch,
+    isMobile: mobile.isMobile,
+    userAgent: mobile.userAgent,
+    viewport: mobile.viewport,
+  });
+
+  test("touch scrollback opens, stays live, and returns to live input", async ({ page }) => {
+    const { messages, sockets } = await openTerminalWithMockSocket(page, {
+      history: longHistory(240),
+    });
+    await expect(page.getByLabel("Agent terminal")).toBeVisible();
+
+    await dragTouchInTerminal(page, 0.52, 0.6);
+
+    const overlay = page.getByTestId("terminal-scrollback-overlay");
+    await expect(overlay).toBeVisible();
+    await expect(overlay.locator(".xterm-rows")).toContainText("history-");
+    await expect
+      .poll(async () => {
+        const metrics = await scrollbackOverlayMetrics(page);
+        return metrics.maxTop > 0 && metrics.scrollTop < metrics.maxTop - 1;
+      })
+      .toBe(true);
+    expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
+
+    sockets[0]?.send(Buffer.from("\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED"));
+    await expect(overlay.locator(".xterm-rows")).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
+
+    await dragTouchInTerminal(page, 0.6, 0.35);
+    await expect(overlay).not.toBeVisible();
+    await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
+  });
 });

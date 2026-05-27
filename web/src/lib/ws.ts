@@ -15,8 +15,7 @@
 
 // When this env var is unset/empty, we build the WS URL from the current
 // window.location so deployed/tunnelled single-origin setups Just Work.
-// next.config.ts supplies a direct ws://localhost:<api-port> default in dev
-// because browser WS traffic is latency-sensitive and cookies are host-scoped.
+// The Next rewrite proxies /ws/* to the API server in local development.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
 export const SPAWN_WS_SUBPROTOCOL = "spawn.v1";

@@ -10,14 +10,12 @@ import Image from "next/image";
 import {
   type ChangeEvent,
   type ClipboardEvent,
-  type CSSProperties,
   type DragEvent,
   forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -27,6 +25,8 @@ import type { DisplayControlState } from "@/lib/ws";
 const TERMINAL_FONT_SIZE = 13;
 const TERMINAL_LINE_HEIGHT = 1.2;
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
+const TERMINAL_SCROLLBACK_LINES = 100_000;
+const TERMINAL_SNAPSHOT_LINES = 10_000;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -44,18 +44,8 @@ type MobileReturnMode = "submit" | "newline";
 type ImagePasteMode = "deferred" | "bracketed-path";
 type PendingAttachmentStatus = "uploading" | "ready" | "error";
 type ScrollAnchor = { viewportY: number; atBottom: boolean };
-type ScrollbackSnapshotOptions = { reset?: boolean };
 type TerminalGeometry = { cols: number; rows: number };
-type AnsiStyle = {
-  fg?: string;
-  bg?: string;
-  bold?: boolean;
-  dim?: boolean;
-  italic?: boolean;
-  underline?: boolean;
-};
-type AnsiSegment = { key: string; text: string; style: AnsiStyle };
-type AnsiRow = { key: string; segments: AnsiSegment[] };
+type ScrollbackSnapshotPurpose = "overlay" | "cache";
 
 type PendingAttachment = {
   id: string;
@@ -156,6 +146,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumFrame: number | null;
     momentumLastTime: number;
     scrollRemainderPx: number;
+    openedScrollback: boolean;
   }>({
     active: false,
     startX: 0,
@@ -172,6 +163,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumFrame: null,
     momentumLastTime: 0,
     scrollRemainderPx: 0,
+    openedScrollback: false,
   });
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
@@ -183,99 +175,168 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     rows: number;
   } | null>(null);
   const socketStartedRef = useRef(false);
+  const scrollbackOverlayRef = useRef<HTMLDivElement>(null);
   const scrollbackTerminalHostRef = useRef<HTMLDivElement>(null);
-  const mobileScrollbackViewportRef = useRef<HTMLDivElement>(null);
   const scrollbackTermRef = useRef<XTerm | null>(null);
   const scrollbackVisibleRef = useRef(false);
-  const mobileViewerHistoryRef = useRef(false);
-  const scrollbackTextRef = useRef("");
-  const scrollbackSnapshotRequestedRef = useRef(false);
-  const scrollbackStickToBottomRef = useRef(false);
-  const scrollbackPendingDeltaPxRef = useRef(0);
   const scrollbackReadyRef = useRef(false);
   const scrollbackSnapshotInFlightRef = useRef(false);
-  const scrollbackIgnoreSnapshotCountRef = useRef(0);
-  const scrollbackPendingLiveBytesRef = useRef<Uint8Array[]>([]);
-  const requestScrollbackSnapshotRef = useRef<(options?: ScrollbackSnapshotOptions) => void>(
+  const scrollbackSnapshotPurposeRef = useRef<ScrollbackSnapshotPurpose | null>(null);
+  const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
+  const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
+  const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
+  const scrollbackRenderGenerationRef = useRef(0);
+  const scrollbackCacheDirtyRef = useRef(true);
+  const scrollbackOverlayHasSnapshotRef = useRef(false);
+  const scrollbackPendingDeltaPxRef = useRef(0);
+  const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
+  const prepareScrollbackSnapshotRef = useRef<() => void>(() => {});
+  const revealRenderedScrollbackRef = useRef<() => boolean>(() => false);
+  const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
+  const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
   const [scrollbackReady, setScrollbackReady] = useState(false);
-  const [scrollbackText, setScrollbackText] = useState("");
-  const [mobileViewerHistory, setMobileViewerHistory] = useState(false);
 
-  const mobileScrollbackRows = useMemo(() => {
-    if (!mobileViewerHistory || !scrollbackVisible || scrollbackText.length === 0) return [];
-    return parseAnsiRows(scrollbackText);
-  }, [mobileViewerHistory, scrollbackText, scrollbackVisible]);
+  const applyScrollbackOverlayVisibility = useCallback((visible: boolean) => {
+    const overlay = scrollbackOverlayRef.current;
+    if (!overlay) return;
+    overlay.style.visibility = visible ? "visible" : "hidden";
+    overlay.setAttribute("aria-hidden", visible ? "false" : "true");
+  }, []);
 
-  const invalidateScrollbackSnapshot = useCallback(() => {
-    scrollbackSnapshotRequestedRef.current = false;
-    scrollbackPendingLiveBytesRef.current = [];
-    if (scrollbackSnapshotInFlightRef.current && scrollbackIgnoreSnapshotCountRef.current === 0) {
-      scrollbackIgnoreSnapshotCountRef.current = 1;
-    }
-    if (scrollbackTextRef.current !== "") {
-      scrollbackTextRef.current = "";
-      setScrollbackText("");
-    }
+  const setScrollbackReadyState = useCallback(
+    (ready: boolean) => {
+      applyScrollbackOverlayVisibility(scrollbackVisibleRef.current && ready);
+      if (scrollbackReadyRef.current === ready) return;
+      scrollbackReadyRef.current = ready;
+      setScrollbackReady(ready);
+    },
+    [applyScrollbackOverlayVisibility],
+  );
+
+  const getScrollbackViewport = useCallback(() => {
+    return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
   }, []);
 
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
-    invalidateScrollbackSnapshot();
     scrollbackVisibleRef.current = false;
-    scrollbackStickToBottomRef.current = false;
+    scrollbackSnapshotBytesRef.current = null;
+    scrollbackOverlayHasSnapshotRef.current = false;
     scrollbackPendingDeltaPxRef.current = 0;
-    scrollbackReadyRef.current = false;
-    mobileViewerHistoryRef.current = false;
-    scrollbackTermRef.current?.scrollToBottom();
-    setScrollbackReady(false);
-    setMobileViewerHistory(false);
+    setScrollbackReadyState(false);
     setScrollbackVisible(false);
+    scrollbackTermRef.current?.scrollToBottom();
     termRef.current?.scrollToBottom();
-  }, [invalidateScrollbackSnapshot]);
+    if (scrollbackCacheDirtyRef.current) scheduleScrollbackCacheRefreshRef.current(100);
+  }, [setScrollbackReadyState]);
 
-  const getScrollbackViewport = useCallback(() => {
-    if (mobileViewerHistoryRef.current) return mobileScrollbackViewportRef.current;
-    return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
-  }, []);
+  const updateScrollbackReveal = useCallback(
+    (overlay: HTMLElement) => {
+      const maxTop = maxElementScrollTop(overlay);
+      const reveal =
+        maxTop > 0 && overlay.scrollTop < maxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
+      setScrollbackReadyState(reveal);
+    },
+    [setScrollbackReadyState],
+  );
 
-  const updateScrollbackReveal = useCallback((overlay: HTMLElement) => {
-    const maxTop = maxElementScrollTop(overlay);
-    const reveal =
-      maxTop > 0 && overlay.scrollTop < maxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
-    if (reveal === scrollbackReadyRef.current) return;
-    scrollbackReadyRef.current = reveal;
-    setScrollbackReady(reveal);
-  }, []);
+  const renderScrollbackSnapshot = useCallback(
+    (bytes: Uint8Array | null, reveal: boolean) => {
+      const historyTerm = scrollbackTermRef.current;
+      if (!bytes || !historyTerm) return;
+      const generation = scrollbackRenderGenerationRef.current + 1;
+      scrollbackRenderGenerationRef.current = generation;
 
-  const flushScrollbackOverlayPosition = useCallback(() => {
+      const { cols, rows } = lastSizeRef.current;
+      historyTerm.reset();
+      historyTerm.resize(cols, rows);
+      historyTerm.write(formatSnapshotForXterm(decodeUtf8(bytes)), () => {
+        requestAnimationFrame(() => {
+          if (scrollbackRenderGenerationRef.current !== generation) return;
+          historyTerm.scrollToBottom();
+          requestAnimationFrame(() => {
+            if (scrollbackRenderGenerationRef.current !== generation) return;
+            scrollbackRenderedSnapshotBytesRef.current = bytes;
+            const overlay = getScrollbackViewport();
+            if (!overlay) return;
+            if (!reveal && !scrollbackVisibleRef.current) {
+              overlay.scrollTop = maxElementScrollTop(overlay);
+              return;
+            }
+            scrollbackOverlayHasSnapshotRef.current = true;
+            const pendingDelta = scrollbackPendingDeltaPxRef.current;
+            if (pendingDelta !== 0) {
+              scrollElementPixels(overlay, pendingDelta);
+              scrollbackPendingDeltaPxRef.current = 0;
+            }
+            updateScrollbackReveal(overlay);
+          });
+        });
+      });
+    },
+    [getScrollbackViewport, updateScrollbackReveal],
+  );
+  renderScrollbackSnapshotRef.current = renderScrollbackSnapshot;
+
+  const revealRenderedScrollback = useCallback(() => {
     const overlay = getScrollbackViewport();
-    const text = scrollbackTextRef.current;
-    if (!overlay || text.length === 0) return;
-    const maxTop = maxElementScrollTop(overlay);
-    const needsScroll = textHasMoreRowsThanViewport(text, lastSizeRef.current.rows);
-
-    if (scrollbackStickToBottomRef.current) {
-      if (maxTop <= 0 && needsScroll) return;
-      overlay.scrollTop = maxTop;
-      scrollbackStickToBottomRef.current = false;
-    }
-
+    const bytes = scrollbackSnapshotBytesRef.current ?? scrollbackCachedSnapshotBytesRef.current;
+    if (!overlay || !bytes || scrollbackRenderedSnapshotBytesRef.current !== bytes) return false;
+    scrollbackOverlayHasSnapshotRef.current = true;
     const pendingDelta = scrollbackPendingDeltaPxRef.current;
     if (pendingDelta !== 0) {
-      if (maxTop > 0) {
-        scrollElementPixels(overlay, pendingDelta);
-        scrollbackPendingDeltaPxRef.current = 0;
-      } else if (scrollbackTextRef.current.length > 0) {
-        scrollbackPendingDeltaPxRef.current = 0;
-      }
+      scrollElementPixels(overlay, pendingDelta);
+      scrollbackPendingDeltaPxRef.current = 0;
     }
-
     updateScrollbackReveal(overlay);
+    return true;
   }, [getScrollbackViewport, updateScrollbackReveal]);
+  revealRenderedScrollbackRef.current = revealRenderedScrollback;
+
+  const prepareScrollbackSnapshot = useCallback(() => {
+    const bytes = scrollbackCachedSnapshotBytesRef.current;
+    if (
+      !bytes ||
+      scrollbackVisibleRef.current ||
+      scrollbackRenderedSnapshotBytesRef.current === bytes
+    ) {
+      return;
+    }
+    renderScrollbackSnapshotRef.current(bytes, false);
+  }, []);
+  prepareScrollbackSnapshotRef.current = prepareScrollbackSnapshot;
+
+  const writeScrollbackLiveBytes = useCallback(
+    (bytes: Uint8Array) => {
+      const historyTerm = scrollbackTermRef.current;
+      if (!historyTerm || scrollbackRenderedSnapshotBytesRef.current === null) return;
+      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) return;
+
+      const overlay = getScrollbackViewport();
+      const wasVisible = scrollbackVisibleRef.current;
+      const previousTop = overlay?.scrollTop ?? 0;
+      const previousMaxTop = overlay ? maxElementScrollTop(overlay) : 0;
+      const shouldStickToBottom =
+        !wasVisible ||
+        previousTop >= previousMaxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
+
+      historyTerm.write(bytes, () => {
+        const nextOverlay = getScrollbackViewport();
+        if (!nextOverlay) return;
+        const nextMaxTop = maxElementScrollTop(nextOverlay);
+        nextOverlay.scrollTop = shouldStickToBottom
+          ? nextMaxTop
+          : Math.max(0, Math.min(nextMaxTop, previousTop));
+        if (wasVisible && scrollbackVisibleRef.current) updateScrollbackReveal(nextOverlay);
+      });
+    },
+    [getScrollbackViewport, updateScrollbackReveal],
+  );
 
   const showUploadStatus = useCallback((message: string) => {
     setUploadStatus(message);
@@ -340,30 +401,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeReadyAttachmentPrefix],
   );
 
-  const writeScrollbackLiveBytes = useCallback(
-    (bytes: Uint8Array) => {
-      const historyTerm = scrollbackTermRef.current;
-      if (!historyTerm) return false;
-
-      const viewport = getScrollbackViewport();
-      const preserveTop = scrollbackReadyRef.current && viewport !== null;
-      const scrollTop = viewport?.scrollTop ?? 0;
-
-      historyTerm.write(bytes, () => {
-        const nextViewport = getScrollbackViewport();
-        if (preserveTop && nextViewport) {
-          nextViewport.scrollTop = Math.min(maxElementScrollTop(nextViewport), scrollTop);
-          updateScrollbackReveal(nextViewport);
-        } else {
-          historyTerm.scrollToBottom();
-          if (nextViewport) updateScrollbackReveal(nextViewport);
-        }
-      });
-      return true;
-    },
-    [getScrollbackViewport, updateScrollbackReveal],
-  );
-
   const applyDisplayControl = useCallback(
     (state: DisplayControlState) => {
       const geometry =
@@ -393,7 +430,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const viewportY = buffer.viewportY;
         try {
           term.resize(geometry.cols, geometry.rows);
-          scrollbackTermRef.current?.resize(geometry.cols, geometry.rows);
         } catch {
           return;
         }
@@ -402,7 +438,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestAnimationFrame(() => layoutTerminalSurfaceRef.current(atBottom));
         if (atBottom) {
           term.scrollToBottom();
-          scrollbackTermRef.current?.scrollToBottom();
         } else {
           term.scrollToLine(Math.max(0, Math.min(term.buffer.active.baseY, viewportY)));
         }
@@ -416,45 +451,40 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     enabled: socketInitialSize !== null,
     initialSize: socketInitialSize,
     onData: (bytes) => {
-      if (scrollbackVisibleRef.current) {
-        const canWriteLive =
-          !scrollbackSnapshotInFlightRef.current &&
-          scrollbackTextRef.current.length > 0 &&
-          scrollbackTermRef.current !== null;
-        if (canWriteLive) {
-          writeScrollbackLiveBytes(bytes);
-        } else {
-          scrollbackPendingLiveBytesRef.current.push(bytes);
-        }
-      } else {
-        invalidateScrollbackSnapshot();
-      }
+      scrollbackCacheDirtyRef.current = true;
+      scheduleScrollbackCacheRefreshRef.current();
+      writeScrollbackLiveBytes(bytes);
       termRef.current?.write(bytes);
     },
     onHistory: (bytes) => {
       const term = termRef.current;
       if (!term) return;
-      scrollbackSnapshotRequestedRef.current = false;
+      if (containsAlternateBufferSwitch(bytes)) {
+        scrollbackCachedSnapshotBytesRef.current = null;
+        scrollbackCacheDirtyRef.current = true;
+        scheduleScrollbackCacheRefreshRef.current(0);
+      } else {
+        scrollbackCachedSnapshotBytesRef.current = bytes;
+        scrollbackCacheDirtyRef.current = false;
+        requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
+      }
       term.reset();
-      term.write(wrapSnapshotForXterm(decodeUtf8(bytes)));
+      term.write(wrapSnapshotForXterm(decodeUtf8(bytes)), () => {
+        term.scrollToBottom();
+      });
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes) => {
-      if (scrollbackIgnoreSnapshotCountRef.current > 0) {
-        scrollbackIgnoreSnapshotCountRef.current -= 1;
-        scrollbackSnapshotInFlightRef.current = false;
-        scrollbackTextRef.current = "";
-        setScrollbackText("");
-        if (scrollbackVisibleRef.current) {
-          requestAnimationFrame(() => requestScrollbackSnapshotRef.current({ reset: true }));
-        }
-        return;
-      }
-
-      const decoded = normalizeSnapshotText(decodeUtf8(bytes));
       scrollbackSnapshotInFlightRef.current = false;
-      scrollbackTextRef.current = decoded;
-      setScrollbackText(decoded);
+      scrollbackSnapshotPurposeRef.current = null;
+      scrollbackCachedSnapshotBytesRef.current = bytes;
+      scrollbackCacheDirtyRef.current = false;
+      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) {
+        scrollbackSnapshotBytesRef.current = bytes;
+        renderScrollbackSnapshotRef.current(bytes, true);
+      } else if (!scrollbackVisibleRef.current) {
+        requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
+      }
     },
     onExit: (code, sig) => {
       const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
@@ -503,40 +533,73 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
 
-  const requestScrollbackSnapshot = useCallback((options: ScrollbackSnapshotOptions = {}) => {
-    if (socketRef.current.state !== "open") return;
-    if (scrollbackSnapshotInFlightRef.current) return;
+  const requestSnapshot = useCallback((purpose: ScrollbackSnapshotPurpose) => {
+    if (socketRef.current.state !== "open" || scrollbackSnapshotInFlightRef.current) return false;
 
-    const reset = options.reset ?? true;
-    scrollbackSnapshotRequestedRef.current = true;
     scrollbackSnapshotInFlightRef.current = true;
-    if (reset) {
-      scrollbackPendingLiveBytesRef.current = [];
-      scrollbackTextRef.current = "";
-      setScrollbackText("");
-    }
-    const sent = socketRef.current.sendJson({ type: "snapshot", lines: 10000, plain: false });
+    scrollbackSnapshotPurposeRef.current = purpose;
+    const sent = socketRef.current.sendJson({
+      type: "snapshot",
+      lines: TERMINAL_SNAPSHOT_LINES,
+      plain: false,
+    });
     if (!sent) {
       scrollbackSnapshotInFlightRef.current = false;
+      scrollbackSnapshotPurposeRef.current = null;
+      return false;
     }
+    return true;
   }, []);
+
+  const scheduleScrollbackCacheRefresh = useCallback(
+    (delayMs = 350) => {
+      if (scrollbackCacheRefreshTimerRef.current) {
+        clearTimeout(scrollbackCacheRefreshTimerRef.current);
+      }
+      scrollbackCacheRefreshTimerRef.current = setTimeout(() => {
+        scrollbackCacheRefreshTimerRef.current = null;
+        if (scrollbackVisibleRef.current || !scrollbackCacheDirtyRef.current) return;
+        requestSnapshot("cache");
+      }, delayMs);
+    },
+    [requestSnapshot],
+  );
+  scheduleScrollbackCacheRefreshRef.current = scheduleScrollbackCacheRefresh;
+
+  const requestScrollbackSnapshot = useCallback(
+    (initialDeltaY = 0) => {
+      if (initialDeltaY !== 0) {
+        scrollbackPendingDeltaPxRef.current += initialDeltaY;
+      }
+
+      if (!scrollbackVisibleRef.current) {
+        scrollbackVisibleRef.current = true;
+        scrollbackOverlayHasSnapshotRef.current = false;
+        scrollbackSnapshotBytesRef.current = scrollbackCachedSnapshotBytesRef.current;
+        setScrollbackReadyState(false);
+        setScrollbackVisible(true);
+      }
+
+      if (scrollbackSnapshotBytesRef.current) {
+        if (!revealRenderedScrollbackRef.current()) {
+          requestAnimationFrame(() => {
+            if (!revealRenderedScrollbackRef.current()) {
+              renderScrollbackSnapshotRef.current(scrollbackSnapshotBytesRef.current, true);
+            }
+          });
+        }
+      }
+
+      if (scrollbackCacheDirtyRef.current || !scrollbackSnapshotBytesRef.current) {
+        requestSnapshot("overlay");
+      }
+      return true;
+    },
+    [requestSnapshot, setScrollbackReadyState],
+  );
   requestScrollbackSnapshotRef.current = requestScrollbackSnapshot;
 
-  useEffect(() => {
-    if (socket.state !== "open" || !coarsePointerRef.current) return;
-    if (!scrollbackSnapshotRequestedRef.current) requestScrollbackSnapshot({ reset: true });
-  }, [requestScrollbackSnapshot, socket.state]);
-
   useLayoutEffect(() => {
-    if (!scrollbackVisible || scrollbackText.length === 0) return;
-    flushScrollbackOverlayPosition();
-    const frame = requestAnimationFrame(flushScrollbackOverlayPosition);
-    return () => cancelAnimationFrame(frame);
-  }, [flushScrollbackOverlayPosition, scrollbackText, scrollbackVisible]);
-
-  useLayoutEffect(() => {
-    if (!scrollbackVisible) return;
-    if (mobileViewerHistory) return;
     const host = scrollbackTerminalHostRef.current;
     if (!host || scrollbackTermRef.current) return;
 
@@ -548,7 +611,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      scrollback: 10000,
+      scrollback: TERMINAL_SNAPSHOT_LINES,
+      smoothScrollDuration: 0,
       theme: {
         background: "#0a0a0a",
         foreground: "#e5e5e5",
@@ -561,39 +625,22 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (viewport) {
       viewport.style.scrollbarWidth = "none";
       viewport.style.touchAction = "none";
+      viewport.style.overscrollBehavior = "contain";
     }
+    prepareScrollbackSnapshotRef.current();
 
     return () => {
       historyTerm.dispose();
       if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
     };
-  }, [getScrollbackViewport, mobileViewerHistory, scrollbackVisible]);
+  }, [getScrollbackViewport]);
 
-  useLayoutEffect(() => {
-    if (!scrollbackVisible || scrollbackText.length === 0) return;
-    if (mobileViewerHistory) return;
-    const historyTerm = scrollbackTermRef.current;
-    if (!historyTerm) return;
-
-    const { cols, rows } = lastSizeRef.current;
-    historyTerm.reset();
-    historyTerm.resize(cols, rows);
-    historyTerm.write(formatSnapshotForXterm(scrollbackText), () => {
-      const pendingLiveBytes = scrollbackPendingLiveBytesRef.current;
-      scrollbackPendingLiveBytesRef.current = [];
-      requestAnimationFrame(() => {
-        historyTerm.scrollToBottom();
-        for (const pendingBytes of pendingLiveBytes) writeScrollbackLiveBytes(pendingBytes);
-        flushScrollbackOverlayPosition();
-      });
-    });
-  }, [
-    flushScrollbackOverlayPosition,
-    mobileViewerHistory,
-    scrollbackText,
-    scrollbackVisible,
-    writeScrollbackLiveBytes,
-  ]);
+  useEffect(() => {
+    if (socket.state !== "open") return;
+    if (!scrollbackCachedSnapshotBytesRef.current || scrollbackCacheDirtyRef.current) {
+      scheduleScrollbackCacheRefresh(0);
+    }
+  }, [scheduleScrollbackCacheRefresh, socket.state]);
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
@@ -608,6 +655,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   useEffect(() => {
     return () => {
+      if (scrollbackCacheRefreshTimerRef.current) {
+        clearTimeout(scrollbackCacheRefreshTimerRef.current);
+        scrollbackCacheRefreshTimerRef.current = null;
+      }
       pendingAttachmentsRef.current.forEach((attachment) => {
         URL.revokeObjectURL(attachment.previewUrl);
       });
@@ -627,11 +678,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      // Full-screen agent UIs repaint in-place, which makes browser-local
-      // scrollback preserve stale frames. Scrollback is rendered from tmux
-      // snapshots instead.
-      scrollback: 0,
-      smoothScrollDuration: 70,
+      // Keep a large local buffer for transcript replay and non-wheel access.
+      // Wheel/touch scrollback is rendered from fresh daemon snapshots so it
+      // reflects the current tmux pane rather than browser replay artifacts.
+      scrollback: TERMINAL_SCROLLBACK_LINES,
+      scrollOnUserInput: true,
+      smoothScrollDuration: 0,
       theme: {
         background: "#0a0a0a",
         foreground: "#e5e5e5",
@@ -651,49 +703,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const terminalViewport = terminalViewportRef.current;
     const terminalSurface = terminalSurfaceRef.current;
     const terminalElement = containerRef.current;
+    const terminalTouchTarget = terminalViewport;
     terminalViewport.style.touchAction = "none";
     terminalElement.style.touchAction = "none";
-
-    const hideMobileScrollbackOverlay = () => {
-      if (!scrollbackVisibleRef.current) return;
-      invalidateScrollbackSnapshot();
-      scrollbackVisibleRef.current = false;
-      scrollbackStickToBottomRef.current = false;
-      scrollbackPendingDeltaPxRef.current = 0;
-      scrollbackReadyRef.current = false;
-      mobileViewerHistoryRef.current = false;
-      scrollbackTermRef.current?.scrollToBottom();
-      setScrollbackReady(false);
-      setMobileViewerHistory(false);
-      setScrollbackVisible(false);
-      term.scrollToBottom();
-    };
-
-    const flushMobileScrollbackOverlayPosition = () => {
-      const overlay = getScrollbackViewport();
-      const text = scrollbackTextRef.current;
-      if (!overlay || text.length === 0) return;
-      const maxTop = maxElementScrollTop(overlay);
-      const needsScroll = textHasMoreRowsThanViewport(text, term.rows);
-
-      if (scrollbackStickToBottomRef.current) {
-        if (maxTop <= 0 && needsScroll) return;
-        overlay.scrollTop = maxTop;
-        scrollbackStickToBottomRef.current = false;
-      }
-
-      const pendingDelta = scrollbackPendingDeltaPxRef.current;
-      if (pendingDelta !== 0) {
-        if (maxTop > 0) {
-          scrollElementPixels(overlay, pendingDelta);
-          scrollbackPendingDeltaPxRef.current = 0;
-        } else if (scrollbackTextRef.current.length > 0) {
-          scrollbackPendingDeltaPxRef.current = 0;
-        }
-      }
-
-      updateScrollbackReveal(overlay);
-    };
+    terminalTouchTarget.style.touchAction = "none";
 
     const rememberRowHeight = (rowHeight: number) => {
       if (rowHeight <= 0) return terminalRowHeightRef.current;
@@ -796,6 +809,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       };
     };
 
+    const scrollTerminalViewportPixels = (deltaY: number) => {
+      const viewport = getViewport();
+      if (!viewport) return false;
+      return scrollElementPixels(viewport, deltaY);
+    };
+
     const maxScrollTop = (viewport: HTMLElement) => {
       return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
     };
@@ -816,72 +835,38 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return true;
     };
 
-    const scrollViewportRows = (rows: number) => {
-      if (rows === 0) return 0;
-      const viewport = getViewport();
-      if (!viewport) return 0;
-      const rowHeight = getRowHeight();
-      const maxTop = maxScrollTop(viewport);
-      if (rowHeight <= 0 || maxTop <= 0) return 0;
-
-      const maxRow = Math.round(maxTop / rowHeight);
-      const beforeRow = Math.round(viewport.scrollTop / rowHeight);
-      const nextRow = Math.max(0, Math.min(maxRow, beforeRow + rows));
-      if (nextRow === beforeRow) return 0;
-
-      viewport.scrollTop = nextRow * rowHeight;
-      return nextRow - beforeRow;
-    };
-
-    const maxOverlayScrollTop = (overlay: HTMLElement) => {
-      return maxElementScrollTop(overlay);
-    };
+    const activeBufferIsAlternate = () => term.buffer.active.type === "alternate";
 
     const overlayIsAtBottom = (overlay: HTMLElement) => {
-      return overlay.scrollTop >= maxOverlayScrollTop(overlay) - 0.5;
+      return overlay.scrollTop >= maxElementScrollTop(overlay) - 0.5;
     };
 
     const scrollOverlayPixels = (deltaY: number) => {
       const overlay = getScrollbackViewport();
       if (!overlay || deltaY === 0) return false;
-      const maxTop = maxOverlayScrollTop(overlay);
-      if (maxTop <= 0) return false;
-      const before = overlay.scrollTop;
-      const next = Math.max(0, Math.min(maxTop, before + deltaY));
-      if (Math.abs(next - before) < 0.5) return false;
-      overlay.scrollTop = next;
+      const moved = scrollElementPixels(overlay, deltaY);
       updateScrollbackReveal(overlay);
-      return true;
+      return moved;
     };
 
-    const showScrollbackOverlay = (initialDeltaY = 0, force = false) => {
-      if (!force && !coarsePointerRef.current) return false;
-      const wasVisible = scrollbackVisibleRef.current;
-      const useMobileViewerHistory = usesViewerPanFrame();
-      if (mobileViewerHistoryRef.current !== useMobileViewerHistory) {
-        mobileViewerHistoryRef.current = useMobileViewerHistory;
-        setMobileViewerHistory(useMobileViewerHistory);
+    const handleScrollbackOverlayWheel = (amount: number) => {
+      const overlay = getScrollbackViewport();
+      if (!overlay) {
+        requestScrollbackSnapshotRef.current(amount);
+        return true;
       }
 
-      if (!wasVisible) {
-        scrollbackVisibleRef.current = true;
-        scrollbackStickToBottomRef.current = true;
-        scrollbackPendingDeltaPxRef.current = initialDeltaY;
-        scrollbackReadyRef.current = false;
-        setScrollbackReady(false);
-        setScrollbackVisible(true);
-      } else if (initialDeltaY !== 0) {
-        scrollbackPendingDeltaPxRef.current += initialDeltaY;
+      if (amount > 0 && overlayIsAtBottom(overlay)) {
+        hideScrollbackOverlay();
+        return true;
       }
 
-      if (!scrollbackSnapshotRequestedRef.current) {
-        requestScrollbackSnapshotRef.current();
+      const moved = scrollOverlayPixels(amount);
+      if (moved && amount > 0 && overlayIsAtBottom(overlay)) {
+        hideScrollbackOverlay();
+      } else if (!moved && maxElementScrollTop(overlay) <= 0) {
+        requestScrollbackSnapshotRef.current(amount);
       }
-
-      requestAnimationFrame(() => {
-        flushMobileScrollbackOverlayPosition();
-      });
-
       return true;
     };
 
@@ -891,34 +876,38 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (amount === 0) return true;
 
       if (scrollbackVisibleRef.current) {
-        const overlay = getScrollbackViewport();
-        if (!overlay) {
-          showScrollbackOverlay(amount, true);
-        } else if (amount > 0 && overlayIsAtBottom(overlay)) {
-          hideMobileScrollbackOverlay();
-        } else {
-          const moved = scrollOverlayPixels(amount);
-          if (moved && amount > 0 && overlayIsAtBottom(overlay)) {
-            hideMobileScrollbackOverlay();
-          } else if (!moved && maxOverlayScrollTop(overlay) <= 0) {
-            showScrollbackOverlay(amount, true);
-          }
-        }
+        handleScrollbackOverlayWheel(amount);
         event.preventDefault();
         event.stopPropagation();
         return false;
+      }
+
+      if (usesViewerPanFrame()) {
+        const frameScroll = scrollViewerPanFrame(
+          event.shiftKey ? amount : wheelEventToPixelsX(event),
+          amount,
+        );
+        if (frameScroll.movedX || frameScroll.movedY) {
+          event.preventDefault();
+          event.stopPropagation();
+          return false;
+        }
       }
 
       if (amount < 0) {
-        showScrollbackOverlay(amount, true);
+        requestScrollbackSnapshotRef.current(amount);
         event.preventDefault();
         event.stopPropagation();
         return false;
       }
 
-      event.preventDefault();
-      event.stopPropagation();
-      return false;
+      if (activeBufferIsAlternate()) {
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      }
+
+      return true;
     });
 
     const canScrollViewport = (deltaY: number) => {
@@ -932,57 +921,50 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
 
-      if (coarsePointerRef.current) {
-        if (scrollbackVisibleRef.current) {
+      if (scrollbackVisibleRef.current) {
+        if (deltaY > 0) {
           const overlay = getScrollbackViewport();
-          if (overlay && deltaY > 0 && overlayIsAtBottom(overlay)) {
-            hideMobileScrollbackOverlay();
+          if (overlay && overlayIsAtBottom(overlay)) {
+            hideScrollbackOverlay();
             state.scrollRemainderPx = 0;
             return false;
           }
-          if (scrollOverlayPixels(deltaY)) {
-            if (overlay && deltaY > 0 && overlayIsAtBottom(overlay)) {
-              hideMobileScrollbackOverlay();
-              state.scrollRemainderPx = 0;
-            }
-            return true;
-          }
-          return Boolean(
-            overlay && (maxOverlayScrollTop(overlay) > 0 || scrollbackTextRef.current.length === 0),
-          );
         }
-
-        if (usesViewerPanFrame()) {
-          const mostlyVertical = Math.abs(deltaY) >= Math.abs(deltaX);
-          if (mostlyVertical && deltaY < 0 && showScrollbackOverlay(deltaY)) {
-            state.scrollRemainderPx = 0;
-            return true;
-          }
-
-          const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
-          return frameScroll.movedX || frameScroll.movedY;
+        state.scrollRemainderPx = 0;
+        const moved = scrollOverlayPixels(deltaY);
+        const overlay = getScrollbackViewport();
+        if (moved && deltaY > 0 && overlay && overlayIsAtBottom(overlay)) {
+          hideScrollbackOverlay();
         }
+        return moved || scrollbackSnapshotInFlightRef.current;
+      }
 
-        if (deltaY < 0 && showScrollbackOverlay(deltaY)) {
+      if (coarsePointerRef.current && usesViewerPanFrame()) {
+        const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
+        if (frameScroll.movedX || frameScroll.movedY) {
           state.scrollRemainderPx = 0;
           return true;
         }
       }
 
-      const rowHeight = getRowHeight();
-      if (rowHeight <= 0) return false;
-
-      state.scrollRemainderPx += deltaY;
-      const rows = Math.trunc(state.scrollRemainderPx / rowHeight);
-      if (rows === 0) return canScrollViewport(deltaY);
-
-      const scrolledRows = scrollViewportRows(rows);
-      if (scrolledRows === 0) {
+      if (deltaY < 0) {
+        requestScrollbackSnapshotRef.current(deltaY);
+        state.openedScrollback = true;
         state.scrollRemainderPx = 0;
-        return false;
+        return true;
       }
 
-      state.scrollRemainderPx -= scrolledRows * rowHeight;
+      if (activeBufferIsAlternate()) {
+        state.scrollRemainderPx = 0;
+        return true;
+      }
+
+      if (!scrollTerminalViewportPixels(deltaY)) {
+        state.scrollRemainderPx = 0;
+        return canScrollViewport(deltaY);
+      }
+
+      state.scrollRemainderPx = 0;
       return true;
     };
 
@@ -1006,7 +988,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return false;
       }
       lastMobileReturnAtRef.current = performance.now();
-      hideMobileScrollbackOverlay();
+      hideScrollbackOverlay();
       socketRef.current.sendBinary(mobileReturnBytesRef.current);
       if (term.textarea) term.textarea.value = "";
       return true;
@@ -1085,6 +1067,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       touchScrollRef.current.pendingTapFocus = false;
       touchScrollRef.current.pointerCaptured = false;
       touchScrollRef.current.scrollRemainderPx = 0;
+      touchScrollRef.current.openedScrollback = false;
     };
 
     const moveTouchScroll = (x: number, y: number, time: number) => {
@@ -1121,6 +1104,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
       state.pendingTapFocus = false;
+      if (state.openedScrollback) {
+        state.openedScrollback = false;
+        state.velocityPxPerMs = 0;
+        state.samples = [];
+        state.scrollRemainderPx = 0;
+        return;
+      }
       state.velocityPxPerMs = clamp(
         estimateTouchVelocity() * TOUCH_MOMENTUM_BOOST,
         -TOUCH_MOMENTUM_MAX_PX_PER_MS,
@@ -1162,12 +1152,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!justSent) interceptMobileReturn(event);
     };
 
+    let pointerTouchActive = false;
+    let lastPointerTouchAt = 0;
+    const markPointerTouch = () => {
+      lastPointerTouchAt = performance.now();
+    };
+    const shouldIgnoreFallbackTouch = () => {
+      return pointerTouchActive || performance.now() - lastPointerTouchAt < 350;
+    };
+
     const onPointerDown = (event: PointerEvent) => {
       if (event.pointerType !== "touch" || !event.isPrimary) return;
+      pointerTouchActive = true;
+      markPointerTouch();
       touchScrollRef.current.activePointerId = event.pointerId;
       startTouchScroll(event.clientX, event.clientY, event.timeStamp || performance.now());
       try {
-        terminalElement.setPointerCapture(event.pointerId);
+        terminalTouchTarget.setPointerCapture(event.pointerId);
         touchScrollRef.current.pointerCaptured = true;
       } catch {
         touchScrollRef.current.pointerCaptured = false;
@@ -1181,6 +1182,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       ) {
         return;
       }
+      markPointerTouch();
       const events = event.getCoalescedEvents?.() ?? [event];
       for (const e of events) {
         moveTouchScroll(e.clientX, e.clientY, e.timeStamp || performance.now());
@@ -1198,11 +1200,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
       const hadCapture = touchScrollRef.current.pointerCaptured;
+      pointerTouchActive = false;
+      markPointerTouch();
       touchScrollRef.current.activePointerId = null;
       touchScrollRef.current.pointerCaptured = false;
       if (hadCapture) {
         try {
-          terminalElement.releasePointerCapture(event.pointerId);
+          terminalTouchTarget.releasePointerCapture(event.pointerId);
         } catch {
           // ignore
         }
@@ -1214,6 +1218,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     const onTouchStart = (event: TouchEvent) => {
+      if (shouldIgnoreFallbackTouch()) return;
       if (event.touches.length !== 1) {
         touchScrollRef.current.active = false;
         touchScrollRef.current.velocityPxPerMs = 0;
@@ -1229,6 +1234,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     const onTouchMove = (event: TouchEvent) => {
+      if (shouldIgnoreFallbackTouch()) {
+        stopXtermTouchMove(event);
+        return;
+      }
       const touch = event.touches[0];
       if (!touch || event.touches.length !== 1) return;
       moveTouchScroll(touch.clientX, touch.clientY, event.timeStamp || performance.now());
@@ -1238,19 +1247,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     const onTouchEnd = () => {
+      if (shouldIgnoreFallbackTouch()) return;
       endTouchScroll();
     };
 
     const onClick = (event: MouseEvent) => {
       if (!touchScrollRef.current.pendingTapFocus) return;
       touchScrollRef.current.pendingTapFocus = false;
-      hideMobileScrollbackOverlay();
+      hideScrollbackOverlay();
       term.focus();
       event.preventDefault();
       event.stopPropagation();
     };
 
-    terminalElement.addEventListener("click", onClick, { capture: true });
+    terminalTouchTarget.addEventListener("click", onClick, { capture: true });
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       if (event.key !== "Enter" && event.key !== "Return") return true;
@@ -1261,30 +1271,28 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const usePointerEvents = window.PointerEvent !== undefined;
     if (usePointerEvents) {
-      terminalElement.addEventListener("touchmove", stopXtermTouchMove, {
+      terminalTouchTarget.addEventListener("pointerdown", onPointerDown, {
         capture: true,
         passive: false,
       });
-      terminalElement.addEventListener("pointerdown", onPointerDown, {
+      terminalTouchTarget.addEventListener("pointermove", onPointerMove, {
         capture: true,
         passive: false,
       });
-      terminalElement.addEventListener("pointermove", onPointerMove, {
-        capture: true,
-        passive: false,
-      });
-      terminalElement.addEventListener("pointerup", onPointerEnd, { capture: true });
-      terminalElement.addEventListener("pointercancel", onPointerEnd, { capture: true });
-      terminalElement.addEventListener("lostpointercapture", onPointerEnd, { capture: true });
-    } else {
-      terminalElement.addEventListener("touchstart", onTouchStart, {
-        capture: true,
-        passive: true,
-      });
-      terminalElement.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
-      terminalElement.addEventListener("touchend", onTouchEnd, { capture: true });
-      terminalElement.addEventListener("touchcancel", onTouchEnd, { capture: true });
+      terminalTouchTarget.addEventListener("pointerup", onPointerEnd, { capture: true });
+      terminalTouchTarget.addEventListener("pointercancel", onPointerEnd, { capture: true });
+      terminalTouchTarget.addEventListener("lostpointercapture", onPointerEnd, { capture: true });
     }
+    terminalTouchTarget.addEventListener("touchstart", onTouchStart, {
+      capture: true,
+      passive: true,
+    });
+    terminalTouchTarget.addEventListener("touchmove", onTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    terminalTouchTarget.addEventListener("touchend", onTouchEnd, { capture: true });
+    terminalTouchTarget.addEventListener("touchcancel", onTouchEnd, { capture: true });
 
     const captureScrollAnchor = (): ScrollAnchor => {
       const buffer = term.buffer.active;
@@ -1385,25 +1393,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     return () => {
       ro.disconnect();
-      terminalElement.removeEventListener("click", onClick, { capture: true });
+      terminalTouchTarget.removeEventListener("click", onClick, { capture: true });
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });
       term.textarea?.removeEventListener("input", onInput, { capture: true });
       if (usePointerEvents) {
-        terminalElement.removeEventListener("touchmove", stopXtermTouchMove, { capture: true });
-        terminalElement.removeEventListener("pointerdown", onPointerDown, { capture: true });
-        terminalElement.removeEventListener("pointermove", onPointerMove, { capture: true });
-        terminalElement.removeEventListener("pointerup", onPointerEnd, { capture: true });
-        terminalElement.removeEventListener("pointercancel", onPointerEnd, { capture: true });
-        terminalElement.removeEventListener("lostpointercapture", onPointerEnd, {
+        terminalTouchTarget.removeEventListener("pointerdown", onPointerDown, { capture: true });
+        terminalTouchTarget.removeEventListener("pointermove", onPointerMove, { capture: true });
+        terminalTouchTarget.removeEventListener("pointerup", onPointerEnd, { capture: true });
+        terminalTouchTarget.removeEventListener("pointercancel", onPointerEnd, { capture: true });
+        terminalTouchTarget.removeEventListener("lostpointercapture", onPointerEnd, {
           capture: true,
         });
-      } else {
-        terminalElement.removeEventListener("touchstart", onTouchStart, { capture: true });
-        terminalElement.removeEventListener("touchmove", onTouchMove, { capture: true });
-        terminalElement.removeEventListener("touchend", onTouchEnd, { capture: true });
-        terminalElement.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       }
+      terminalTouchTarget.removeEventListener("touchstart", onTouchStart, { capture: true });
+      terminalTouchTarget.removeEventListener("touchmove", onTouchMove, { capture: true });
+      terminalTouchTarget.removeEventListener("touchend", onTouchEnd, { capture: true });
+      terminalTouchTarget.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       stopTouchMomentum();
       if (resizeTimer) clearTimeout(resizeTimer);
       onDataDisposableRef.current?.dispose();
@@ -1416,7 +1422,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
-  }, [getScrollbackViewport, invalidateScrollbackSnapshot, updateScrollbackReveal]);
+  }, [getScrollbackViewport, hideScrollbackOverlay, updateScrollbackReveal]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {
@@ -1757,70 +1763,31 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ref={terminalSurfaceRef}
           className="relative size-full min-h-full min-w-full bg-[var(--color-terminal-bg)]"
         >
-          <div ref={containerRef} className="size-full touch-none" />
-        </div>
-      </div>
-      {scrollbackVisible && mobileViewerHistory && (
-        <div
-          className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
-          style={{
-            visibility: scrollbackReady ? "visible" : "hidden",
-          }}
-        >
           <div
-            ref={mobileScrollbackViewportRef}
-            className="size-full touch-none overflow-hidden"
-            style={{
-              WebkitOverflowScrolling: "touch",
-              overscrollBehavior: "contain",
-              scrollbarWidth: "none",
-            }}
-          >
-            <div
-              className="inline-block min-w-full bg-[var(--color-terminal-bg)]"
-              style={{
-                fontFamily:
-                  'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                fontSize: TERMINAL_FONT_SIZE,
-                lineHeight: `${TERMINAL_LINE_HEIGHT_PX}px`,
-              }}
-            >
-              {mobileScrollbackRows.map((row) => (
-                <div
-                  key={row.key}
-                  className="whitespace-pre"
-                  style={{
-                    height: `${TERMINAL_LINE_HEIGHT_PX}px`,
-                  }}
-                >
-                  {row.segments.map((segment) => (
-                    <span key={segment.key} style={ansiStyleToCss(segment.style)}>
-                      {segment.text}
-                    </span>
-                  ))}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-      {scrollbackVisible && !mobileViewerHistory && (
-        <div
-          className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
-          style={{
-            visibility: scrollbackReady ? "visible" : "hidden",
-          }}
-        >
-          <div
-            ref={scrollbackTerminalHostRef}
+            ref={containerRef}
+            data-testid="terminal-live-host"
             className="size-full touch-none"
-            style={{
-              WebkitOverflowScrolling: "touch",
-              overscrollBehavior: "contain",
-            }}
           />
         </div>
-      )}
+      </div>
+      <div
+        ref={scrollbackOverlayRef}
+        data-testid="terminal-scrollback-overlay"
+        aria-hidden={!scrollbackVisible}
+        className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
+        style={{
+          visibility: scrollbackVisible && scrollbackReady ? "visible" : "hidden",
+        }}
+      >
+        <div
+          ref={scrollbackTerminalHostRef}
+          className="size-full touch-none"
+          style={{
+            WebkitOverflowScrolling: "touch",
+            overscrollBehavior: "contain",
+          }}
+        />
+      </div>
       {pendingAttachments.length > 0 && (
         <div className="pointer-events-auto absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] gap-2 overflow-x-auto rounded-md border border-border bg-background/90 p-1 shadow-lg backdrop-blur">
           {pendingAttachments.map((attachment) => (
@@ -1897,6 +1864,14 @@ function wheelEventToPixels(event: WheelEvent, rows: number): number {
       : event.deltaY;
 }
 
+function wheelEventToPixelsX(event: WheelEvent): number {
+  return event.deltaMode === WheelEvent.DOM_DELTA_LINE
+    ? event.deltaX * TERMINAL_LINE_HEIGHT_PX
+    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+      ? event.deltaX * TERMINAL_LINE_HEIGHT_PX
+      : event.deltaX;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -1915,237 +1890,24 @@ function scrollElementPixels(element: HTMLElement, deltaY: number): boolean {
   return true;
 }
 
-function textHasMoreRowsThanViewport(text: string, rows: number): boolean {
-  if (rows <= 0) return true;
-  let lineCount = 1;
-  for (let i = 0; i < text.length; i += 1) {
-    if (text.charCodeAt(i) !== 10) continue;
-    lineCount += 1;
-    if (lineCount > rows) return true;
-  }
-  return false;
-}
-
-function normalizeSnapshotText(input: string): string {
-  const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
-  return normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
-}
-
-function formatSnapshotForXterm(input: string): string {
-  // `capture-pane -p` returns already-rendered rows. Disable xterm autowrap so
-  // exact-width rows do not gain an extra wrapped line while replaying them.
-  return wrapSnapshotForXterm(input.split("\n").join("\r\n"));
-}
-
 function wrapSnapshotForXterm(input: string): string {
   return `\x1b[?7l${input}\x1b[?7h`;
 }
 
-function parseAnsiRows(input: string): AnsiRow[] {
-  const rows: AnsiRow[] = [];
-  let row: AnsiSegment[] = [];
-  let style: AnsiStyle = {};
-  let segmentText = "";
-  let rowIndex = 0;
-  let segmentIndex = 0;
-
-  const flushSegment = () => {
-    if (segmentText.length === 0) return;
-    row.push({ key: `s${rowIndex}-${segmentIndex}`, text: segmentText, style: { ...style } });
-    segmentIndex += 1;
-    segmentText = "";
-  };
-
-  const flushRow = () => {
-    flushSegment();
-    rows.push({ key: `r${rowIndex}`, segments: row });
-    rowIndex += 1;
-    segmentIndex = 0;
-    row = [];
-  };
-
-  for (let i = 0; i < input.length; i += 1) {
-    const char = input[i];
-    if (char === "\n") {
-      flushRow();
-      continue;
-    }
-    if (char === "\r") continue;
-    if (char !== "\x1b") {
-      segmentText += char;
-      continue;
-    }
-
-    const next = input[i + 1];
-    if (next === "[") {
-      const end = findAnsiFinal(input, i + 2);
-      if (end === -1) continue;
-      const final = input[end];
-      if (final === "m") {
-        flushSegment();
-        style = applySgr(style, input.slice(i + 2, end));
-      }
-      i = end;
-      continue;
-    }
-
-    if (next === "]") {
-      const end = findOscEnd(input, i + 2);
-      if (end === -1) continue;
-      i = end;
-      continue;
-    }
-
-    if ((next === "(" || next === ")") && input[i + 2] !== undefined) {
-      i += 2;
-    } else if (next !== undefined) {
-      i += 1;
-    }
-  }
-
-  flushRow();
-  return rows;
-}
-
-function findAnsiFinal(input: string, start: number): number {
-  for (let i = start; i < input.length; i += 1) {
-    const code = input.charCodeAt(i);
-    if (code >= 0x40 && code <= 0x7e) return i;
-  }
-  return -1;
-}
-
-function findOscEnd(input: string, start: number): number {
-  for (let i = start; i < input.length; i += 1) {
-    if (input[i] === "\x07") return i;
-    if (input[i] === "\x1b" && input[i + 1] === "\\") return i + 1;
-  }
-  return -1;
-}
-
-function applySgr(current: AnsiStyle, paramsText: string): AnsiStyle {
-  const params = paramsText
-    .split(";")
-    .map((part) => (part === "" ? 0 : Number(part)))
-    .filter((value) => Number.isFinite(value));
-  if (params.length === 0) params.push(0);
-
-  let next: AnsiStyle = { ...current };
-  for (let i = 0; i < params.length; i += 1) {
-    const code = params[i] ?? 0;
-    if (code === 0) {
-      next = {};
-    } else if (code === 1) {
-      next.bold = true;
-      next.dim = false;
-    } else if (code === 2) {
-      next.dim = true;
-      next.bold = false;
-    } else if (code === 3) {
-      next.italic = true;
-    } else if (code === 4) {
-      next.underline = true;
-    } else if (code === 22) {
-      next.bold = false;
-      next.dim = false;
-    } else if (code === 23) {
-      next.italic = false;
-    } else if (code === 24) {
-      next.underline = false;
-    } else if (code === 39) {
-      next.fg = undefined;
-    } else if (code === 49) {
-      next.bg = undefined;
-    } else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
-      next.fg = ANSI_COLORS[code] ?? next.fg;
-    } else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
-      next.bg = ANSI_COLORS[code] ?? next.bg;
-    } else if ((code === 38 || code === 48) && params[i + 1] === 5) {
-      const color = color256(params[i + 2] ?? 0);
-      if (code === 38) next.fg = color;
-      else next.bg = color;
-      i += 2;
-    } else if ((code === 38 || code === 48) && params[i + 1] === 2) {
-      const color = rgbColor(params[i + 2] ?? 0, params[i + 3] ?? 0, params[i + 4] ?? 0);
-      if (code === 38) next.fg = color;
-      else next.bg = color;
-      i += 4;
-    }
-  }
-  return next;
-}
-
-const ANSI_COLORS: Record<number, string> = {
-  30: "#000000",
-  31: "#cd3131",
-  32: "#0dbc79",
-  33: "#e5e510",
-  34: "#2472c8",
-  35: "#bc3fbc",
-  36: "#11a8cd",
-  37: "#e5e5e5",
-  40: "#000000",
-  41: "#cd3131",
-  42: "#0dbc79",
-  43: "#e5e510",
-  44: "#2472c8",
-  45: "#bc3fbc",
-  46: "#11a8cd",
-  47: "#e5e5e5",
-  90: "#666666",
-  91: "#f14c4c",
-  92: "#23d18b",
-  93: "#f5f543",
-  94: "#3b8eea",
-  95: "#d670d6",
-  96: "#29b8db",
-  97: "#ffffff",
-  100: "#666666",
-  101: "#f14c4c",
-  102: "#23d18b",
-  103: "#f5f543",
-  104: "#3b8eea",
-  105: "#d670d6",
-  106: "#29b8db",
-  107: "#ffffff",
-};
-
-function color256(value: number): string {
-  const n = clamp(Math.round(value), 0, 255);
-  if (n < 16) return ANSI_COLORS[n < 8 ? 30 + n : 90 + n - 8] ?? "#e5e5e5";
-  if (n >= 232) {
-    const level = 8 + (n - 232) * 10;
-    return rgbColor(level, level, level);
-  }
-  const index = n - 16;
-  const r = Math.floor(index / 36);
-  const g = Math.floor((index % 36) / 6);
-  const b = index % 6;
-  const scale = [0, 95, 135, 175, 215, 255];
-  return rgbColor(scale[r] ?? 0, scale[g] ?? 0, scale[b] ?? 0);
-}
-
-function rgbColor(r: number, g: number, b: number): string {
-  return `rgb(${clamp(Math.round(r), 0, 255)}, ${clamp(Math.round(g), 0, 255)}, ${clamp(
-    Math.round(b),
-    0,
-    255,
-  )})`;
-}
-
-function ansiStyleToCss(style: AnsiStyle): CSSProperties {
-  return {
-    backgroundColor: style.bg,
-    color: style.fg,
-    fontStyle: style.italic ? "italic" : undefined,
-    fontWeight: style.bold ? 700 : undefined,
-    opacity: style.dim ? 0.65 : undefined,
-    textDecorationLine: style.underline ? "underline" : undefined,
-  };
+function formatSnapshotForXterm(input: string): string {
+  const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
+  return wrapSnapshotForXterm(normalized.split("\n").join("\r\n"));
 }
 
 function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
+}
+
+function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
+  const text = decodeUtf8(bytes);
+  return ["1049", "1047", "1048"].some(
+    (mode) => text.includes(`\u001b[?${mode}h`) || text.includes(`\u001b[?${mode}l`),
+  );
 }
 
 function stripDeviceAttributeResponses(data: string): string {
