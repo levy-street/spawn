@@ -189,6 +189,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackCacheDirtyRef = useRef(true);
   const scrollbackOverlayHasSnapshotRef = useRef(false);
   const scrollbackPendingDeltaPxRef = useRef(0);
+  const scrollbackUserScrollGenerationRef = useRef(0);
+  const scrollbackDesiredScrollTopRef = useRef<number | null>(null);
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
@@ -222,12 +224,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
   }, []);
 
+  const recordScrollbackUserPosition = useCallback((overlay: HTMLElement) => {
+    scrollbackUserScrollGenerationRef.current += 1;
+    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+  }, []);
+
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
     scrollbackVisibleRef.current = false;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
     scrollbackPendingDeltaPxRef.current = 0;
+    scrollbackDesiredScrollTopRef.current = null;
+    scrollbackUserScrollGenerationRef.current += 1;
     setScrollbackReadyState(false);
     setScrollbackVisible(false);
     scrollbackTermRef.current?.scrollToBottom();
@@ -274,6 +283,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               scrollElementPixels(overlay, pendingDelta);
               scrollbackPendingDeltaPxRef.current = 0;
             }
+            scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
             updateScrollbackReveal(overlay);
           });
         });
@@ -293,6 +303,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollElementPixels(overlay, pendingDelta);
       scrollbackPendingDeltaPxRef.current = 0;
     }
+    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
     updateScrollbackReveal(overlay);
     return true;
   }, [getScrollbackViewport, updateScrollbackReveal]);
@@ -321,6 +332,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const wasVisible = scrollbackVisibleRef.current;
       const previousTop = overlay?.scrollTop ?? 0;
       const previousMaxTop = overlay ? maxElementScrollTop(overlay) : 0;
+      const scrollGeneration = scrollbackUserScrollGenerationRef.current;
       const shouldStickToBottom =
         !wasVisible ||
         previousTop >= previousMaxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
@@ -329,9 +341,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const nextOverlay = getScrollbackViewport();
         if (!nextOverlay) return;
         const nextMaxTop = maxElementScrollTop(nextOverlay);
-        nextOverlay.scrollTop = shouldStickToBottom
-          ? nextMaxTop
-          : Math.max(0, Math.min(nextMaxTop, previousTop));
+        const nextTop =
+          scrollbackUserScrollGenerationRef.current !== scrollGeneration &&
+          scrollbackDesiredScrollTopRef.current !== null
+            ? scrollbackDesiredScrollTopRef.current
+            : shouldStickToBottom
+              ? nextMaxTop
+              : previousTop;
+        nextOverlay.scrollTop = Math.max(0, Math.min(nextMaxTop, nextTop));
         if (wasVisible && scrollbackVisibleRef.current) updateScrollbackReveal(nextOverlay);
       });
     },
@@ -845,6 +862,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const overlay = getScrollbackViewport();
       if (!overlay || deltaY === 0) return false;
       const moved = scrollElementPixels(overlay, deltaY);
+      if (moved) recordScrollbackUserPosition(overlay);
       updateScrollbackReveal(overlay);
       return moved;
     };
@@ -1422,7 +1440,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
-  }, [getScrollbackViewport, hideScrollbackOverlay, updateScrollbackReveal]);
+  }, [
+    getScrollbackViewport,
+    hideScrollbackOverlay,
+    recordScrollbackUserPosition,
+    updateScrollbackReveal,
+  ]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {

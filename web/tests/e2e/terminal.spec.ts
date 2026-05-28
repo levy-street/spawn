@@ -248,9 +248,32 @@ test("terminal scrollback opens from cached snapshots without waiting for a roun
   await expect(overlay).toBeVisible();
   await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-WHILE-SCROLLED");
 
+  const beforeStreamingScroll = await scrollbackOverlayMetrics(page);
+  sockets[0]?.send(
+    Buffer.from(
+      Array.from({ length: 80 }, (_, i) => `STREAMING-${String(i).padStart(2, "0")}`).join("\n") +
+        "\n",
+    ),
+  );
+  await page.mouse.wheel(0, -600);
+  await expect
+    .poll(async () => {
+      const metrics = await scrollbackOverlayMetrics(page);
+      return metrics.scrollTop < beforeStreamingScroll.scrollTop - 100;
+    })
+    .toBe(true);
+  const afterStreamingScroll = await scrollbackOverlayMetrics(page);
+  await page.waitForTimeout(200);
+  await expect
+    .poll(async () => {
+      const metrics = await scrollbackOverlayMetrics(page);
+      return metrics.scrollTop <= afterStreamingScroll.scrollTop + 20;
+    })
+    .toBe(true);
+
   await page.mouse.wheel(0, 5000);
   await expect(overlay).not.toBeVisible();
-  await expect(liveTerminalRows(page)).toContainText("LIVE-WHILE-SCROLLED");
+  await expect(liveTerminalRows(page)).toContainText("STREAMING-79");
   await terminal.click();
   await page.keyboard.type("z");
   await expect.poll(() => binaryText(messages)).toContain("z");
