@@ -178,55 +178,6 @@ async def test_agent_create_defaults_name_from_host_and_cwd(client):
     assert body["tmux_session"] == f"spawn-dream-spawn--{body['id']}"
 
 
-async def test_agent_create_normalizes_legacy_codex_yolo_arg(client):
-    token = await _signup(client, "agent-codex-yolo@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, Preset, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "agent-codex-yolo@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="dream", status="online")
-        preset = (
-            await session.execute(select(Preset).where(Preset.name == "codex"))
-        ).scalar_one()
-        session.add(host)
-        await session.commit()
-        host_id = host.id
-        preset_id = preset.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-
-    r = await client.post(
-        "/api/agents",
-        json={
-            "host_id": host_id,
-            "preset_id": preset_id,
-            "cwd": "/home/oem/projects/jrpg-data",
-            "argv": ["codex", "--yolo"],
-        },
-        headers=auth,
-    )
-    assert r.status_code == 201, r.text
-    expected = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
-    assert r.json()["argv"] == expected
-    sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "agent.create"
-    assert sent["argv"] == expected
-
-    await broker.unregister_daemon(daemon)
-
-
 async def test_agent_create_dispatches_managed_mcp_servers_and_skills(client):
     token = await _signup(client, "agent-capabilities@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -398,7 +349,7 @@ async def test_agent_restart_dispatches_existing_agent(client):
     assert sent["cols"] == 100
     assert sent["rows"] == 40
     assert sent["cwd"] == "/repo"
-    assert sent["argv"] == ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+    assert sent["argv"] == ["codex", "--yolo"]
     assert sent["tmux_session"] == f"spawn-agent--{agent_id}"
 
     await broker.unregister_daemon(daemon)

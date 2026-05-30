@@ -21,8 +21,6 @@ log = logging.getLogger("spawn.routes.agents")
 ACTIVE_OUTPUT_WINDOW = timedelta(seconds=3)
 WAITING_OUTPUT_WINDOW = timedelta(seconds=8)
 TMUX_LABEL_MAX_LENGTH = 48
-CODEX_LEGACY_YOLO_FLAG = "--yolo"
-CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 
 
 def _utcnow() -> datetime:
@@ -38,19 +36,6 @@ def _last_cwd_dir(cwd: str) -> str:
 
 def _default_agent_name(host_name: str, cwd: str) -> str:
     return f"{host_name} - {_last_cwd_dir(cwd)}"[:128]
-
-
-def _is_codex_argv(argv: list[str]) -> bool:
-    if not argv:
-        return False
-    binary = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return "codex" in binary
-
-
-def _normalize_agent_argv(argv: list[str]) -> list[str]:
-    if not _is_codex_argv(argv):
-        return argv
-    return [CODEX_BYPASS_FLAG if arg == CODEX_LEGACY_YOLO_FLAG else arg for arg in argv]
 
 
 def _tmux_safe_label(label: str | None) -> str:
@@ -213,7 +198,7 @@ async def _dispatch_agent_launch(
                 "type": frame_type,
                 "agent_id": agent.id,
                 "cwd": agent.cwd,
-                "argv": _normalize_agent_argv(list(agent.argv)),
+                "argv": agent.argv,
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
                 "mcp_servers": mcp_servers or [],
@@ -285,7 +270,6 @@ async def create_agent(
     preset = await _resolve_agent_preset(session, body.preset_id, user)
 
     argv = list(body.argv) if body.argv else (list(preset.default_argv) if preset else [])
-    argv = _normalize_agent_argv(argv)
     if not argv:
         raise HTTPException(status_code=400, detail="resolved argv is empty")
 
@@ -370,7 +354,6 @@ async def restart_agent(
     preset = await _resolve_agent_preset(session, agent.preset_id, user)
     now = _utcnow()
     agent.status = "starting"
-    agent.argv = _normalize_agent_argv(list(agent.argv))
     agent.started_at = now
     agent.exited_at = None
     agent.exit_code = None

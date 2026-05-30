@@ -708,9 +708,7 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
             <Label htmlFor="agent-argv">argv override</Label>
             <Input
               id="agent-argv"
-              placeholder={
-                selectedPreset ? "(use preset)" : "codex --dangerously-bypass-approvals-and-sandbox"
-              }
+              placeholder={selectedPreset ? "(use preset)" : "codex"}
               value={argv}
               onChange={(e) => setArgv(e.target.value)}
               autoCapitalize="none"

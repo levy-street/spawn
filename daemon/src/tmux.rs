@@ -127,9 +127,8 @@ pub async fn new_session_detached(
         cmd.arg("-e").arg(format!("{k}={v}"));
     }
 
-    cmd.arg("--");
-    for a in argv {
-        cmd.arg(a);
+    for arg in agent_command_args(argv, env) {
+        cmd.arg(arg);
     }
 
     cmd.stdin(Stdio::null())
@@ -145,6 +144,22 @@ pub async fn new_session_detached(
         ));
     }
     Ok(())
+}
+
+fn agent_command_args(argv: &[String], env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut args = vec!["--".to_string()];
+
+    // tmux applies most -e variables to the pane process, but on some hosts
+    // PATH is reset to a built-in default. Route only PATH through env(1) so
+    // command lookup sees the same PATH that daemon preflight validated,
+    // without exposing arbitrary secret env vars in the command argv.
+    if let Some(path) = env.get("PATH").filter(|path| !path.is_empty()) {
+        args.push("/usr/bin/env".to_string());
+        args.push(format!("PATH={path}"));
+    }
+
+    args.extend(argv.iter().cloned());
+    args
 }
 
 pub async fn kill_session(session: &str) -> Result<()> {
@@ -413,6 +428,42 @@ mod tests {
         assert_eq!(
             agent_id_from_session("notes--00000000-0000-0000-0000-000000000001"),
             None
+        );
+    }
+
+    #[test]
+    fn agent_command_wraps_path_without_exposing_other_env() {
+        let argv = vec![
+            "codex".to_string(),
+            "--model".to_string(),
+            "gpt-5".to_string(),
+        ];
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            "/home/oem/.nvm/versions/node/v20.20.2/bin:/usr/bin".to_string(),
+        );
+        env.insert("MCP_TOKEN".to_string(), "secret".to_string());
+
+        assert_eq!(
+            agent_command_args(&argv, &env),
+            vec![
+                "--",
+                "/usr/bin/env",
+                "PATH=/home/oem/.nvm/versions/node/v20.20.2/bin:/usr/bin",
+                "codex",
+                "--model",
+                "gpt-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_command_uses_argv_directly_without_path() {
+        let argv = vec!["bash".to_string(), "-l".to_string()];
+        assert_eq!(
+            agent_command_args(&argv, &BTreeMap::new()),
+            vec!["--", "bash", "-l"]
         );
     }
 }
