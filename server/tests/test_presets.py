@@ -20,7 +20,7 @@ async def test_user_preset_can_be_updated(client):
             "agent_kind": "codex",
             "default_argv": ["codex"],
             "env_template": {"FOO": "bar"},
-            "install": "npm install -g @openai/codex",
+            "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
         },
         headers=auth,
     )

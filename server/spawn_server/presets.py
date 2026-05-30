@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Preset
 
+CODEX_INSTALL_COMMAND = "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+
 # Sourced from proto/README.md "Built-in presets" table.
 # spawn does not manage agent credentials; each agent CLI handles its own
 # auth interactively on the host (e.g. `claude /login`). The optional
@@ -24,7 +26,7 @@ BUILTIN_PRESETS: list[dict] = [
         "agent_kind": "codex",
         "default_argv": ["codex"],
         "env_template": {},
-        "install": "npm install -g @openai/codex",
+        "install": CODEX_INSTALL_COMMAND,
     },
     {
         "name": "opencode",
@@ -52,8 +54,7 @@ BUILTIN_PRESETS: list[dict] = [
 
 
 async def seed_builtin_presets(session: AsyncSession) -> None:
-    """Insert any missing built-in presets, and backfill `install` on existing
-    rows that were seeded before the install column existed."""
+    """Insert missing built-ins and keep server-owned preset metadata current."""
     existing = (
         (await session.execute(select(Preset).where(Preset.owner_user_id.is_(None))))
         .scalars()
@@ -76,8 +77,9 @@ async def seed_builtin_presets(session: AsyncSession) -> None:
             )
             changed = True
         else:
-            if row.install is None and spec.get("install"):
-                row.install = spec["install"]
+            install = spec.get("install")
+            if row.install != install:
+                row.install = install
                 changed = True
     if changed:
         await session.commit()

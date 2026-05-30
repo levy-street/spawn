@@ -77,6 +77,12 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
             )
             assert json.loads(presets["codex"]["default_argv"]) == ["codex"]
             assert presets["codex"]["install"] is None
+            conn.execute(
+                text(
+                    "update presets set install = 'npm install -g @openai/codex' "
+                    "where owner_user_id is null and name = 'codex'"
+                )
+            )
     finally:
         engine.dispose()
 
@@ -104,7 +110,7 @@ asyncio.run(main())
             install = conn.execute(
                 text("select install from presets where owner_user_id is null and name = 'codex'")
             ).scalar_one()
-            assert install == "npm install -g @openai/codex"
+            assert install == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
             count = conn.execute(
                 text("select count(*) from presets where owner_user_id is null")
             ).scalar_one()

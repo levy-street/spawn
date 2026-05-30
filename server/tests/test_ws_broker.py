@@ -352,7 +352,7 @@ async def test_broker_tool_install_request_roundtrip():
         "preset_name": "codex",
         "agent_kind": "codex",
         "command": "codex",
-        "install": "npm install -g @openai/codex",
+        "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
     }
     task = asyncio.create_task(broker.request_tool_install(daemon, target=target, timeout=1))
     await asyncio.sleep(0)
