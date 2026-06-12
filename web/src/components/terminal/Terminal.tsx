@@ -27,6 +27,19 @@ const TERMINAL_LINE_HEIGHT = 1.2;
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
 const TERMINAL_SCROLLBACK_LINES = 100_000;
 const TERMINAL_SNAPSHOT_LINES = 10_000;
+// Defer the deep (10k-line) scrollback warm so connecting to an agent paints
+// the small connect-time history first instead of competing with a multi-MB
+// capture transfer and offscreen render.
+const SCROLLBACK_WARM_DELAY_MS = 1_200;
+// Server-side captures can time out without a reply; clear the in-flight
+// flag eventually or scrollback fetches would wedge for the whole session.
+const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
+// The cache refresh debounces on output, but a continuously-streaming agent
+// would postpone it forever — bound how stale the cache is allowed to get.
+const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
+// Never re-render the overlay underneath an actively-scrolling user: the
+// reset+rewrite collapses the scroll range mid-gesture and yanks the view.
+const SCROLLBACK_RERENDER_IDLE_MS = 350;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -182,6 +195,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackReadyRef = useRef(false);
   const scrollbackSnapshotInFlightRef = useRef(false);
   const scrollbackSnapshotPurposeRef = useRef<ScrollbackSnapshotPurpose | null>(null);
+  const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
@@ -195,6 +209,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackDesiredScrollTopRef = useRef<number | null>(null);
   const scrollbackRestoreBottomOffsetPxRef = useRef<number | null>(null);
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollbackCacheRefreshDeadlineRef = useRef<number | null>(null);
+  const scrollbackLastUserScrollAtRef = useRef(0);
+  const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
@@ -232,6 +249,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const recordScrollbackUserPosition = useCallback((overlay: HTMLElement) => {
     scrollbackUserScrollGenerationRef.current += 1;
     scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+    scrollbackLastUserScrollAtRef.current = Date.now();
   }, []);
 
   const syncLiveTerminalFromSnapshot = useCallback((bytes: Uint8Array | null): boolean => {
@@ -268,6 +286,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
+    if (scrollbackRerenderTimerRef.current) {
+      clearTimeout(scrollbackRerenderTimerRef.current);
+      scrollbackRerenderTimerRef.current = null;
+    }
     const synced = syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     // tmux stays the authority on screen content and cursor position; after a
     // local rewrite, ask it to repaint so any drift self-corrects.
@@ -411,6 +433,37 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [getScrollbackViewport, updateScrollbackReveal],
   );
 
+  // Re-render the overlay from a fresh snapshot only once the user pauses
+  // scrolling: the reset+rewrite collapses the scroll range mid-write, so
+  // rendering underneath an active gesture yanks the view to stale content.
+  const renderOverlaySnapshotWhenIdle = useCallback(() => {
+    if (scrollbackRerenderTimerRef.current) {
+      clearTimeout(scrollbackRerenderTimerRef.current);
+      scrollbackRerenderTimerRef.current = null;
+    }
+    const attempt = () => {
+      scrollbackRerenderTimerRef.current = null;
+      if (!scrollbackVisibleRef.current) return;
+      const bytes = scrollbackSnapshotBytesRef.current;
+      if (!bytes || scrollbackRenderedSnapshotBytesRef.current === bytes) return;
+      const sinceScroll = Date.now() - scrollbackLastUserScrollAtRef.current;
+      if (sinceScroll < SCROLLBACK_RERENDER_IDLE_MS) {
+        scrollbackRerenderTimerRef.current = setTimeout(
+          attempt,
+          SCROLLBACK_RERENDER_IDLE_MS - sinceScroll,
+        );
+        return;
+      }
+      const overlay = getScrollbackViewport();
+      if (overlay && scrollbackOverlayHasSnapshotRef.current) {
+        scrollbackRestoreBottomOffsetPxRef.current =
+          maxElementScrollTop(overlay) - overlay.scrollTop;
+      }
+      renderScrollbackSnapshotRef.current(bytes, true);
+    };
+    attempt();
+  }, [getScrollbackViewport]);
+
   const showUploadStatus = useCallback((message: string) => {
     setUploadStatus(message);
     if (uploadStatusTimerRef.current) clearTimeout(uploadStatusTimerRef.current);
@@ -540,10 +593,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (containsAlternateBufferSwitch(bytes)) {
         scrollbackCachedSnapshotBytesRef.current = null;
         scrollbackCacheDirtyRef.current = true;
-        scheduleScrollbackCacheRefreshRef.current(0);
+        scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       } else {
+        // The connect-time history is a shallow capture: seed the overlay so
+        // scrollback opens instantly, but leave the cache dirty so the full
+        // depth is fetched once the terminal is interactive.
         scrollbackCachedSnapshotBytesRef.current = bytes;
-        scrollbackCacheDirtyRef.current = false;
+        scrollbackCacheDirtyRef.current = true;
+        scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
       term.reset();
@@ -553,6 +610,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes) => {
+      if (scrollbackSnapshotTimeoutRef.current) {
+        clearTimeout(scrollbackSnapshotTimeoutRef.current);
+        scrollbackSnapshotTimeoutRef.current = null;
+      }
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
@@ -567,14 +628,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackCacheDirtyRef.current = dirty;
       if (dirty) scheduleScrollbackCacheRefreshRef.current();
       if (scrollbackVisibleRef.current) {
-        const overlay = getScrollbackViewport();
-        if (overlay && scrollbackOverlayHasSnapshotRef.current) {
-          scrollbackRestoreBottomOffsetPxRef.current =
-            maxElementScrollTop(overlay) - overlay.scrollTop;
-        }
         scrollbackSnapshotBytesRef.current = bytes;
-        renderScrollbackSnapshotRef.current(bytes, true);
-      } else if (!scrollbackVisibleRef.current) {
+        renderOverlaySnapshotWhenIdle();
+      } else {
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
     },
@@ -641,19 +697,40 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotPurposeRef.current = null;
       return false;
     }
+    if (scrollbackSnapshotTimeoutRef.current) clearTimeout(scrollbackSnapshotTimeoutRef.current);
+    scrollbackSnapshotTimeoutRef.current = setTimeout(() => {
+      scrollbackSnapshotTimeoutRef.current = null;
+      scrollbackSnapshotInFlightRef.current = false;
+      scrollbackSnapshotPurposeRef.current = null;
+    }, SCROLLBACK_SNAPSHOT_TIMEOUT_MS);
     return true;
   }, []);
 
   const scheduleScrollbackCacheRefresh = useCallback(
     (delayMs = 350) => {
+      // Debounce on output, but bound the postponement: an agent that streams
+      // faster than the debounce window would otherwise starve the refresh
+      // forever, leaving the scrollback cache minutes stale.
+      const now = Date.now();
+      if (scrollbackCacheRefreshDeadlineRef.current === null) {
+        scrollbackCacheRefreshDeadlineRef.current = now + SCROLLBACK_REFRESH_MAX_WAIT_MS;
+      }
+      const fireIn = Math.min(
+        delayMs,
+        Math.max(0, scrollbackCacheRefreshDeadlineRef.current - now),
+      );
       if (scrollbackCacheRefreshTimerRef.current) {
         clearTimeout(scrollbackCacheRefreshTimerRef.current);
       }
       scrollbackCacheRefreshTimerRef.current = setTimeout(() => {
         scrollbackCacheRefreshTimerRef.current = null;
+        scrollbackCacheRefreshDeadlineRef.current = null;
         if (scrollbackVisibleRef.current || !scrollbackCacheDirtyRef.current) return;
-        requestSnapshot("cache");
-      }, delayMs);
+        if (!requestSnapshot("cache") && scrollbackSnapshotInFlightRef.current) {
+          // Another capture is pending; try again once it resolves or times out.
+          scheduleScrollbackCacheRefreshRef.current(500);
+        }
+      }, fireIn);
     },
     [requestSnapshot],
   );
@@ -756,7 +833,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   useEffect(() => {
     if (socket.state !== "open") return;
     if (!scrollbackCachedSnapshotBytesRef.current || scrollbackCacheDirtyRef.current) {
-      scheduleScrollbackCacheRefresh(0);
+      scheduleScrollbackCacheRefresh(SCROLLBACK_WARM_DELAY_MS);
     }
   }, [scheduleScrollbackCacheRefresh, socket.state]);
 
