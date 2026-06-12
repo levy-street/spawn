@@ -49,14 +49,9 @@ test("settings can create MCP servers, spawn MCP, and skills", async ({ page }) 
   await expect(page.getByText("existing docs")).toBeVisible();
   await expect(page.getByText("existing review")).toBeVisible();
 
-  await page.getByRole("button", { name: "Add Spawn MCP" }).click();
-  await expect
-    .poll(() => spawnMcpBody)
-    .toMatchObject({
-      name: "spawn",
-      enabled_by_default: false,
-    });
-
+  // Create the custom server before "Add Spawn MCP": that button's success
+  // handler resets the form asynchronously, which would race the fills below
+  // and clobber the typed name with the default.
   await page.locator("#mcp-name").fill("docs");
   await page.locator("#mcp-url").fill("https://docs.example/mcp");
   await page.locator("#mcp-headers").fill("Authorization=Bearer token\nX_TEAM=spawn");
@@ -68,6 +63,14 @@ test("settings can create MCP servers, spawn MCP, and skills", async ({ page }) 
       transport: "streamable_http",
       url: "https://docs.example/mcp",
       headers: { Authorization: "Bearer token", X_TEAM: "spawn" },
+      enabled_by_default: false,
+    });
+
+  await page.getByRole("button", { name: "Add Spawn MCP" }).click();
+  await expect
+    .poll(() => spawnMcpBody)
+    .toMatchObject({
+      name: "spawn",
       enabled_by_default: false,
     });
 
