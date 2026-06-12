@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -20,6 +21,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -29,6 +31,17 @@ use crate::pty::WsOutbound;
 use crate::tmux;
 
 const DATA_CHANNEL_LABEL: &str = "spawn.pty";
+
+/// Peer connections that never reach `Connected` within this window are
+/// reaped. Closing is the daemon's own defense: `rtc.close` delivery from the
+/// browser/server is best-effort, and every unreaped peer connection holds
+/// multiple UDP sockets (ICE host candidates + mDNS) until closed — webrtc-rs
+/// does NOT release them on drop.
+const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Grace period for a connected peer that reports `Disconnected` (transient
+/// network blips) before the daemon closes it.
+const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Default, Clone)]
 pub struct RtcSessions {
@@ -109,33 +122,106 @@ impl RtcSessions {
             .context("creating peer connection")?,
         );
 
+        // Track the peer connection BEFORE negotiation so every exit path —
+        // including negotiation errors below — can reach it and close it.
+        self.peers
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&pc));
+
         install_ice_handler(&pc, session_id.clone(), agent_id, out_tx.clone());
         install_data_channel_handler(&pc, session_id.clone(), agent_id, registry, out_tx.clone());
+        self.install_reaper(&pc, session_id.clone(), agent_id);
 
-        let offer = RTCSessionDescription::offer(sdp).context("decoding offer sdp")?;
-        pc.set_remote_description(offer)
-            .await
-            .context("setting remote offer")?;
-        let answer = pc.create_answer(None).await.context("creating answer")?;
-        pc.set_local_description(answer)
-            .await
-            .context("setting local answer")?;
-        let local = pc
-            .local_description()
-            .await
-            .context("local answer missing")?;
+        let local_sdp = match negotiate(&pc, sdp).await {
+            Ok(local_sdp) => local_sdp,
+            Err(e) => {
+                self.close_if_same(&session_id, &pc).await;
+                return Err(e);
+            }
+        };
 
-        self.peers.lock().await.insert(session_id.clone(), pc);
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
                 session_id,
                 agent_id,
-                sdp: local.sdp,
+                sdp: local_sdp,
             },
         )
         .await;
         Ok(())
+    }
+
+    /// Self-defense against missed `rtc.close` signals: close the peer if it
+    /// fails, stays disconnected past a grace period, or never connects at
+    /// all. The handlers hold only weak references so they don't keep the
+    /// peer connection (and its sockets) alive on their own.
+    fn install_reaper(&self, pc: &Arc<RTCPeerConnection>, session_id: String, agent_id: Uuid) {
+        let weak = Arc::downgrade(pc);
+
+        {
+            let sessions = self.clone();
+            let session_id = session_id.clone();
+            let weak = weak.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RTC_CONNECT_TIMEOUT).await;
+                let Some(pc) = weak.upgrade() else { return };
+                if pc.connection_state() != RTCPeerConnectionState::Connected {
+                    tracing::debug!(%agent_id, %session_id, "rtc peer never connected; reaping");
+                    sessions.close_if_same(&session_id, &pc).await;
+                }
+            });
+        }
+
+        let sessions = self.clone();
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let sessions = sessions.clone();
+            let session_id = session_id.clone();
+            let weak = weak.clone();
+            Box::pin(async move {
+                match state {
+                    RTCPeerConnectionState::Failed => {
+                        let Some(pc) = weak.upgrade() else { return };
+                        // Close from a separate task: closing the peer from
+                        // inside its own event handler can deadlock.
+                        tokio::spawn(async move {
+                            tracing::debug!(%agent_id, %session_id, "rtc peer failed; reaping");
+                            sessions.close_if_same(&session_id, &pc).await;
+                        });
+                    }
+                    RTCPeerConnectionState::Disconnected => {
+                        let Some(pc) = weak.upgrade() else { return };
+                        tokio::spawn(async move {
+                            tokio::time::sleep(RTC_DISCONNECTED_GRACE).await;
+                            if pc.connection_state() == RTCPeerConnectionState::Disconnected {
+                                tracing::debug!(
+                                    %agent_id, %session_id,
+                                    "rtc peer stayed disconnected; reaping"
+                                );
+                                sessions.close_if_same(&session_id, &pc).await;
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            })
+        }));
+    }
+
+    /// Close `pc`, removing its map entry only if the entry still refers to
+    /// this same instance (a newer offer may have replaced it).
+    async fn close_if_same(&self, session_id: &str, pc: &Arc<RTCPeerConnection>) {
+        {
+            let mut peers = self.peers.lock().await;
+            if peers
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, pc))
+            {
+                peers.remove(session_id);
+            }
+        }
+        let _ = pc.close().await;
     }
 
     pub async fn handle_candidate(&self, session_id: String, candidate: serde_json::Value) {
@@ -168,6 +254,22 @@ impl RtcSessions {
             let _ = pc.close().await;
         }
     }
+}
+
+async fn negotiate(pc: &Arc<RTCPeerConnection>, sdp: String) -> Result<String> {
+    let offer = RTCSessionDescription::offer(sdp).context("decoding offer sdp")?;
+    pc.set_remote_description(offer)
+        .await
+        .context("setting remote offer")?;
+    let answer = pc.create_answer(None).await.context("creating answer")?;
+    pc.set_local_description(answer)
+        .await
+        .context("setting local answer")?;
+    let local = pc
+        .local_description()
+        .await
+        .context("local answer missing")?;
+    Ok(local.sdp)
 }
 
 fn install_ice_handler(
