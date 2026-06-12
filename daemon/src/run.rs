@@ -382,6 +382,9 @@ async fn dispatch_loop(
                 payload,
             } => {
                 if kind == frames::KIND_PTY_INPUT {
+                    if !registry.contains(agent_id) {
+                        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+                    }
                     let Some(session) = registry.session_for(agent_id) else {
                         tracing::debug!(%agent_id, "ignoring stdin for unknown agent");
                         continue;
@@ -1689,6 +1692,10 @@ async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &A
 }
 
 async fn handle_agent_resize(agent_id: Uuid, cols: u16, rows: u16, registry: &AgentRegistry) {
+    if !registry.contains(agent_id) {
+        tracing::debug!(%agent_id, "ignoring resize for unknown agent");
+        return;
+    }
     // Resize the PTY first, then refresh tmux client.
     let mut changed = false;
     let found = registry.with_handle(agent_id, |h| match h.resize(cols, rows) {
@@ -1728,8 +1735,17 @@ async fn handle_agent_snapshot(
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
+    if !registry.contains(agent_id) {
+        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+    }
     let Some(session) = registry.session_for(agent_id) else {
         tracing::debug!(%agent_id, "ignoring snapshot for unknown agent");
+        send_snapshot_text(
+            agent_id,
+            out_tx,
+            "\r\n[spawn] agent is not attached to this daemon and no matching tmux session was found\r\n",
+        )
+        .await;
         return;
     };
     match tmux::capture_history(&session, lines, !plain).await {
@@ -1750,6 +1766,10 @@ async fn handle_agent_snapshot(
 }
 
 async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
+    if !registry.contains(agent_id) {
+        tracing::debug!(%agent_id, "ignoring redraw for unknown agent");
+        return;
+    }
     let found = registry.with_handle(agent_id, |h| {
         if let Err(e) = h.nudge_redraw() {
             tracing::debug!(%agent_id, error = %e, "nudge_redraw failed");
@@ -1775,8 +1795,11 @@ async fn handle_agent_upload(
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     if !registry.contains(agent_id) {
-        tracing::debug!(%agent_id, "ignoring upload for unknown agent");
-        return;
+        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+        if !registry.contains(agent_id) {
+            tracing::debug!(%agent_id, "ignoring upload for unknown agent");
+            return;
+        }
     }
 
     let save_to_cwd = destination.as_deref() == Some("cwd");
@@ -1847,6 +1870,106 @@ async fn send_spawn_failed_exit(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound
     }
 }
 
+async fn send_snapshot_text(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, text: &str) {
+    let snapshot = Outbound::AgentSnapshot {
+        agent_id,
+        bytes_b64: STANDARD.encode(text.as_bytes()),
+    };
+    if let Ok(s) = serde_json::to_string(&snapshot) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
+    }
+}
+
+async fn spawn_exit_forwarder(
+    agent_id: Uuid,
+    generation: u64,
+    exit_rx: tokio::sync::oneshot::Receiver<pty::ExitReason>,
+    registry: AgentRegistry,
+    out_tx: mpsc::Sender<WsOutbound>,
+) {
+    let reason = exit_rx.await.unwrap_or(pty::ExitReason {
+        exit_code: None,
+        signal: None,
+    });
+    if registry
+        .remove_if_generation(agent_id, generation)
+        .is_none()
+    {
+        tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
+        return;
+    }
+    let exit = Outbound::AgentExit {
+        agent_id,
+        exit_code: reason.exit_code,
+        signal: reason.signal,
+    };
+    if let Ok(s) = serde_json::to_string(&exit) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
+    }
+}
+
+async fn attach_existing_agent(
+    agent_id: Uuid,
+    session: &str,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    notify_started: bool,
+) -> Result<()> {
+    if registry.contains(agent_id) {
+        return Ok(());
+    }
+    let launched = pty::reattach(agent_id, session).await?;
+    let pid = launched.pid;
+    let exit_rx = launched.exit_rx;
+
+    launched.handle.control.set_sink(out_tx.clone()).await;
+    let generation = registry.insert(launched.handle);
+
+    if notify_started {
+        let started = Outbound::AgentStarted { agent_id, pid };
+        let _ = out_tx
+            .send(WsOutbound::Json(serde_json::to_string(&started).unwrap()))
+            .await;
+    }
+
+    tokio::spawn(spawn_exit_forwarder(
+        agent_id,
+        generation,
+        exit_rx,
+        registry.clone(),
+        out_tx.clone(),
+    ));
+    Ok(())
+}
+
+async fn ensure_agent_attached(
+    agent_id: Uuid,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) -> bool {
+    if registry.contains(agent_id) {
+        return true;
+    }
+    let Some(session) = tmux::list_sessions().await.into_iter().find(|name| {
+        tmux::agent_id_from_session(name)
+            .map(|id| id == agent_id)
+            .unwrap_or(false)
+    }) else {
+        tracing::debug!(%agent_id, "no tmux session found for unknown agent");
+        return false;
+    };
+    match attach_existing_agent(agent_id, &session, registry, out_tx, true).await {
+        Ok(()) => {
+            tracing::info!(%agent_id, %session, "lazily reattached existing agent");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%agent_id, %session, error = %e, "lazy agent reattach failed");
+            false
+        }
+    }
+}
+
 /// On daemon startup, discover tmux sessions containing a Spawn agent UUID
 /// left behind by a previous instance and reattach to each. Inserts handles
 /// into the registry and spawns the await-exit task per agent.
@@ -1859,35 +1982,8 @@ async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sen
         if registry.contains(agent_id) {
             continue; // shouldn't happen on a fresh process, but be safe
         }
-        match pty::reattach(agent_id, &name).await {
-            Ok(launched) => {
-                let exit_rx = launched.exit_rx;
-                // Wire the rediscovered agent's forwarder to this session.
-                launched.handle.control.set_sink(out_tx.clone()).await;
-                let generation = registry.insert(launched.handle);
-                let registry_clone = registry.clone();
-                let out_tx_clone = out_tx.clone();
-                tokio::spawn(async move {
-                    let reason = exit_rx.await.unwrap_or(pty::ExitReason {
-                        exit_code: None,
-                        signal: None,
-                    });
-                    if registry_clone
-                        .remove_if_generation(agent_id, generation)
-                        .is_none()
-                    {
-                        tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
-                        return;
-                    }
-                    let exit = Outbound::AgentExit {
-                        agent_id,
-                        exit_code: reason.exit_code,
-                        signal: reason.signal,
-                    };
-                    if let Ok(s) = serde_json::to_string(&exit) {
-                        let _ = out_tx_clone.send(WsOutbound::Json(s)).await;
-                    }
-                });
+        match attach_existing_agent(agent_id, &name, registry, out_tx, false).await {
+            Ok(()) => {
                 tracing::info!(%agent_id, "rediscovered existing agent");
             }
             Err(e) => {
