@@ -101,7 +101,7 @@ the agent's PTY so the user sees install progress in the terminal view.
 
 Built-in presets (server-seeded, `owner_user_id = null`):
 - **claude-code** — `argv=["claude"]`, install `npm install -g @anthropic-ai/claude-code`
-- **codex** — `argv=["codex"]`, install `npm install -g @openai/codex`
+- **codex** — `argv=["codex"]`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
 - **opencode** — `argv=["opencode"]`, install `npm install -g opencode-ai`
 - **aider-sonnet** — `argv=["aider","--model","claude-sonnet-4-6"]`, install `pipx install aider-chat || pip install --user aider-chat`
 - **shell** — `argv=["bash","-l"]`, no install needed
@@ -217,7 +217,7 @@ Agent IDs are big-endian 16-byte UUIDs.
    "preset_name": "codex",
    "agent_kind": "codex",
    "command": "codex",
-   "install": "npm install -g @openai/codex",
+   "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
    "installed": true,
    "path": "/usr/local/bin/codex",
    "version": "codex 1.2.3",
@@ -232,7 +232,7 @@ Agent IDs are big-endian 16-byte UUIDs.
    "preset_name": "codex",
    "agent_kind": "codex",
    "command": "codex",
-   "install": "npm install -g @openai/codex",
+   "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
    "success": true,
    "exit_code": 0,
    "output": "...",
@@ -263,7 +263,7 @@ Agent IDs are big-endian 16-byte UUIDs.
    "preset_name": "codex",
    "agent_kind": "codex",
    "command": "codex",
-   "install": "npm install -g @openai/codex"}]}
+   "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"}]}
 
 {"type": "host.tools.install",
  "request_id": "uuid",
@@ -272,7 +272,7 @@ Agent IDs are big-endian 16-byte UUIDs.
    "preset_name": "codex",
    "agent_kind": "codex",
    "command": "codex",
-   "install": "npm install -g @openai/codex"}}
+   "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"}}
 
 {"type": "agent.create",
  "agent_id": "uuid",

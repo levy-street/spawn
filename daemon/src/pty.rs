@@ -2,10 +2,10 @@
 //!
 //! For each `agent.create`:
 //!   1. `tmux new-session -d -s spawn-<name>--<id>` launches the real argv detached,
-//!      with the final env injected via `-e KEY=VAL`. Spawn does not manage
-//!      agent credentials — the daemon's process env (HOME, XDG_CONFIG_HOME,
-//!      PATH, etc.) flows through, and the agent CLI finds whatever it
-//!      logged in with on the host.
+//!      with the final env injected into the pane process. Spawn does not
+//!      manage agent credentials — the daemon's process env (HOME,
+//!      XDG_CONFIG_HOME, PATH, etc.) flows through, and the agent CLI finds
+//!      whatever it logged in with on the host.
 //!   2. We open a portable_pty PTY and spawn `tmux attach -t <session>`
 //!      inside it. A blocking reader thread pushes raw PTY bytes into a
 //!      per-agent **outbox** (an unbounded mpsc). A long-lived per-agent

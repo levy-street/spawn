@@ -1,7 +1,7 @@
 //! `spawnd run` — foreground service loop. Connects WSS, registers, services
 //! frames forever (with reconnect + exponential backoff).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -33,6 +33,7 @@ const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
+const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let stored = creds::load().context("loading stored credentials")?;
@@ -527,7 +528,8 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
         };
     }
 
-    let path = binary_path(&command).await;
+    let env = resolved_command_env().await;
+    let path = binary_path(&command, &env).await;
     let Some(path) = path else {
         return HostToolStatus {
             preset_id: target.preset_id,
@@ -544,11 +546,11 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
         };
     };
 
-    let (version, error) = match read_tool_version(&command).await {
+    let (version, error) = match read_tool_version(&command, &env).await {
         Ok(version) => (version, None),
         Err(e) => (None, Some(format!("version check failed: {e:#}"))),
     };
-    let latest_version = latest_tool_version(target.install.as_deref()).await;
+    let latest_version = latest_tool_version(target.install.as_deref(), &env).await;
     let update_available = match (version.as_deref(), latest_version.as_deref()) {
         (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
         _ => None,
@@ -586,7 +588,14 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
         };
     }
 
-    let capture = run_shell_capture(&install, TOOL_INSTALL_TIMEOUT, TOOL_OUTPUT_LIMIT).await;
+    let env = resolved_command_env().await;
+    let capture = run_shell_capture(
+        &install,
+        TOOL_INSTALL_TIMEOUT,
+        TOOL_OUTPUT_LIMIT,
+        Some(&env),
+    )
+    .await;
     let status = Some(check_host_tool(target.clone()).await);
     HostToolInstallResult {
         preset_id: target.preset_id,
@@ -602,9 +611,10 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
     }
 }
 
-async fn binary_path(bin: &str) -> Option<String> {
+async fn binary_path(bin: &str, env: &BTreeMap<String, String>) -> Option<String> {
     let output = Command::new("which")
         .arg(bin)
+        .envs(env)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -621,14 +631,18 @@ async fn binary_path(bin: &str) -> Option<String> {
     }
 }
 
-async fn read_tool_version(command: &str) -> Result<Option<String>> {
+async fn read_tool_version(
+    command: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<Option<String>> {
     for args in [
         &["--version"][..],
         &["version"][..],
         &["-V"][..],
         &["-v"][..],
     ] {
-        let capture = run_program_capture(command, args, TOOL_VERSION_TIMEOUT, 4096).await;
+        let capture =
+            run_program_capture(command, args, TOOL_VERSION_TIMEOUT, 4096, Some(env)).await;
         if capture.success {
             if let Some(version) = first_meaningful_line(&capture.output) {
                 return Ok(Some(version));
@@ -638,7 +652,10 @@ async fn read_tool_version(command: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-async fn latest_tool_version(install: Option<&str>) -> Option<String> {
+async fn latest_tool_version(
+    install: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
     let install = install?.trim();
     if install.is_empty() {
         return None;
@@ -650,6 +667,7 @@ async fn latest_tool_version(install: Option<&str>) -> Option<String> {
             &["view", &package, "version"],
             TOOL_VERSION_TIMEOUT,
             4096,
+            Some(env),
         )
         .await;
         if capture.success {
@@ -663,6 +681,7 @@ async fn latest_tool_version(install: Option<&str>) -> Option<String> {
             &["-m", "pip", "index", "versions", &package],
             TOOL_VERSION_TIMEOUT,
             4096,
+            Some(env),
         )
         .await;
         if capture.success {
@@ -820,15 +839,20 @@ async fn run_program_capture(
     args: &[&str],
     timeout: Duration,
     output_limit: usize,
+    env: Option<&BTreeMap<String, String>>,
 ) -> CommandCapture {
-    let child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    if let Some(env) = env {
+        command.envs(env);
+    }
+
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             return CommandCapture {
@@ -866,16 +890,21 @@ async fn run_shell_capture(
     command: &str,
     timeout: Duration,
     output_limit: usize,
+    env: Option<&BTreeMap<String, String>>,
 ) -> CommandCapture {
-    let child = match Command::new("bash")
+    let mut shell = Command::new("bash");
+    shell
         .arg("-c")
-        .arg(format!("{command} 2>&1"))
+        .arg(format!("exec 2>&1; {command}"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    if let Some(env) = env {
+        shell.envs(env);
+    }
+
+    let child = match shell.spawn() {
         Ok(child) => child,
         Err(e) => {
             return CommandCapture {
@@ -1023,7 +1052,7 @@ async fn handle_agent_create(
     // agent CLI finds its own credentials), overlaid with any per-agent
     // env from the create frame. spawn does not inject credentials.
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_agent_env(&mut env);
+    normalize_agent_env(&mut env).await;
     for (k, v) in &create.env {
         env.insert(k.clone(), v.clone());
     }
@@ -1047,7 +1076,7 @@ async fn handle_agent_create(
         send_spawn_failed_exit(agent_id, out_tx, "empty argv").await;
         return;
     }
-    if !binary_exists(&bin).await {
+    if !binary_exists(&bin, &env).await {
         match create.install.as_deref() {
             Some(install_cmd) if !install_cmd.trim().is_empty() => {
                 let header = format!(
@@ -1055,12 +1084,12 @@ async fn handle_agent_create(
                      $ {install_cmd}\r\n"
                 );
                 send_pty_text(agent_id, out_tx, &header).await;
-                let installed = run_install(agent_id, install_cmd, out_tx).await;
+                let installed = run_install(agent_id, install_cmd, out_tx, &env).await;
                 if !installed {
                     send_spawn_failed_exit(agent_id, out_tx, "install failed").await;
                     return;
                 }
-                if !binary_exists(&bin).await {
+                if !binary_exists(&bin, &env).await {
                     let msg = format!(
                         "\x1b[31m[spawn] install completed but {bin:?} is still not on PATH. \
                          Check the install command for this preset.\x1b[0m\r\n"
@@ -1191,11 +1220,134 @@ async fn handle_agent_create(
     });
 }
 
-fn normalize_agent_env(env: &mut BTreeMap<String, String>) {
+async fn resolved_command_env() -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    normalize_agent_env(&mut env).await;
+    env
+}
+
+async fn normalize_agent_env(env: &mut BTreeMap<String, String>) {
     env.remove("NO_COLOR");
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env.entry("CLICOLOR".into()).or_insert_with(|| "1".into());
+    enrich_path_from_user_shell(env).await;
+}
+
+async fn enrich_path_from_user_shell(env: &mut BTreeMap<String, String>) {
+    let mut preferred = shell_path_entries(env).await;
+    preferred.extend(common_user_bin_entries(env));
+    prepend_path_entries(env, preferred);
+}
+
+async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    for shell in candidate_shells(env) {
+        let mut entries = Vec::new();
+        for mode in ["-ic", "-lc"] {
+            if let Some(path) = probe_shell_path(&shell, mode, env).await {
+                entries.extend(std::env::split_paths(&path));
+            }
+        }
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    Vec::new()
+}
+
+async fn probe_shell_path(
+    shell: &Path,
+    mode: &str,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut command = Command::new(shell);
+    command
+        .arg(mode)
+        .arg("printf '%s\\n' \"$PATH\"")
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(SHELL_PATH_PROBE_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn candidate_shells(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push = |path: PathBuf| {
+        if !path.is_absolute() || !path.exists() {
+            return;
+        }
+        if seen.insert(path.clone()) {
+            candidates.push(path);
+        }
+    };
+
+    if let Some(shell) = env.get("SHELL").filter(|value| !value.trim().is_empty()) {
+        push(PathBuf::from(shell));
+    }
+    for shell in [
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/sh",
+        "/usr/bin/sh",
+    ] {
+        push(PathBuf::from(shell));
+    }
+
+    candidates
+}
+
+fn common_user_bin_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    let Some(home) = env.get("HOME").filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    [
+        home.join(".local/bin"),
+        home.join("bin"),
+        home.join(".bun/bin"),
+        home.join(".cargo/bin"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn prepend_path_entries(env: &mut BTreeMap<String, String>, preferred: Vec<PathBuf>) {
+    let existing = env
+        .get("PATH")
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in preferred.into_iter().chain(existing) {
+        if entry.as_os_str().is_empty() || !seen.insert(entry.clone()) {
+            continue;
+        }
+        merged.push(entry);
+    }
+
+    if let Ok(joined) = std::env::join_paths(merged) {
+        env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+    }
 }
 
 fn materialize_agent_capabilities(
@@ -1601,6 +1753,73 @@ mod tests {
         assert!(!markdown.contains("Bearer http-secret"));
         assert!(!markdown.contains("stdio-secret"));
     }
+
+    #[test]
+    fn path_enrichment_prefers_shell_path_and_keeps_service_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let shell_bin = home.join(".nvm/versions/node/v22/bin");
+        let service_bin = PathBuf::from("/usr/bin");
+        let fallback_bin = PathBuf::from("/bin");
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "PATH".to_string(),
+            std::env::join_paths([service_bin.clone(), fallback_bin.clone()])
+                .expect("join service path")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let mut preferred = vec![shell_bin.clone()];
+        preferred.extend(common_user_bin_entries(&env));
+        prepend_path_entries(&mut env, preferred);
+
+        let path = env.get("PATH").expect("path");
+        let entries = std::env::split_paths(path).collect::<Vec<_>>();
+        assert_eq!(entries[0], shell_bin);
+        assert_eq!(entries[1], home.join(".local/bin"));
+        assert!(entries.iter().any(|entry| entry == &service_bin));
+        assert!(entries.iter().any(|entry| entry == &fallback_bin));
+    }
+
+    #[tokio::test]
+    async fn path_enrichment_reads_interactive_shell_startup_path() {
+        let bash = PathBuf::from("/bin/bash");
+        if !bash.exists() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let shell_bin = home.join("shell-only-bin");
+        fs::create_dir_all(&shell_bin).expect("shell bin");
+        fs::write(
+            home.join(".bashrc"),
+            format!("export PATH=\"{}:$PATH\"\n", shell_bin.display()),
+        )
+        .expect("bashrc");
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert("SHELL".to_string(), bash.to_string_lossy().into_owned());
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+
+        normalize_agent_env(&mut env).await;
+
+        let path = env.get("PATH").expect("path");
+        let entries = std::env::split_paths(path).collect::<Vec<_>>();
+        let shell_pos = entries
+            .iter()
+            .position(|entry| entry == &shell_bin)
+            .expect("shell path entry");
+        let service_pos = entries
+            .iter()
+            .position(|entry| entry == &PathBuf::from("/usr/bin"))
+            .expect("service path entry");
+        assert!(shell_pos < service_pos);
+    }
 }
 
 async fn handle_agent_restart(
@@ -1994,31 +2213,31 @@ async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sen
 }
 
 /// Returns true if `bin` resolves to something on PATH.
-async fn binary_exists(bin: &str) -> bool {
-    tokio::process::Command::new("which")
-        .arg(bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+async fn binary_exists(bin: &str, env: &BTreeMap<String, String>) -> bool {
+    binary_path(bin, env).await.is_some()
 }
 
-/// Run `bash -c "<install_cmd> 2>&1"` and stream stdout into the agent's PTY
+/// Run `bash -c "exec 2>&1; <install_cmd>"` and stream output into the agent's PTY
 /// frame channel. Returns true on a successful exit status.
-async fn run_install(agent_id: Uuid, install_cmd: &str, out_tx: &mpsc::Sender<WsOutbound>) -> bool {
+async fn run_install(
+    agent_id: Uuid,
+    install_cmd: &str,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    env: &BTreeMap<String, String>,
+) -> bool {
     use tokio::io::AsyncReadExt;
 
-    let mut child = match tokio::process::Command::new("bash")
+    let mut shell = tokio::process::Command::new("bash");
+    shell
         .arg("-c")
-        .arg(format!("{install_cmd} 2>&1"))
+        .arg(format!("exec 2>&1; {install_cmd}"))
+        .envs(env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+
+    let mut child = match shell.spawn() {
         Ok(c) => c,
         Err(e) => {
             send_pty_text(

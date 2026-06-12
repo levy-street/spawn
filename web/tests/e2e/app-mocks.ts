@@ -31,9 +31,9 @@ export const preset = {
   owner_user_id: null,
   name: "codex",
   agent_kind: "codex",
-  default_argv: ["codex", "--yolo"],
+  default_argv: ["codex"],
   env_template: {},
-  install: "npm install -g @openai/codex",
+  install: "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
 };
 
 export function agent(overrides: Record<string, unknown> = {}) {
@@ -45,7 +45,7 @@ export function agent(overrides: Record<string, unknown> = {}) {
     host_name: "Mac",
     preset_id: PRESET_ID,
     cwd: "/Users/tester/projects/spawn",
-    argv: ["codex", "--yolo"],
+    argv: ["codex"],
     env: {},
     status: "running",
     started_at: CREATED_AT,
