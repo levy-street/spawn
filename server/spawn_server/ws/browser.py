@@ -34,7 +34,15 @@ router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
 TERMINAL_SCROLLBACK_LINES = 100_000
 DAEMON_SNAPSHOT_LINES = 10_000
+# The connect-time history only needs to paint the current screen plus a few
+# pages of context; deep history loads on demand through the scrollback
+# overlay. Capturing 10k styled lines here made switching to long-running
+# agents take multiple seconds.
+INITIAL_SNAPSHOT_LINES = 400
 INITIAL_SNAPSHOT_TIMEOUT = 1.0
+# Fallback when no daemon snapshot is available: ship only the transcript
+# tail. Long-running agents accumulate up to 64 MB of transcript.
+TRANSCRIPT_FALLBACK_MAX_BYTES = 512 * 1024
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -166,7 +174,7 @@ async def _send_initial_history(
                     }
                 )
             snapshot = await broker.request_snapshot(
-                agent_id, daemon, lines=DAEMON_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
+                agent_id, daemon, lines=INITIAL_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
             )
             if snapshot:
                 await conn.send_text({"type": "history", "bytes_b64": snapshot})
@@ -174,7 +182,7 @@ async def _send_initial_history(
         except Exception as e:
             log.warning("tmux snapshot request failed: %s", e)
 
-    history = await transcript.read(agent_id)
+    history = await transcript.read(agent_id, max_bytes=TRANSCRIPT_FALLBACK_MAX_BYTES)
     await conn.send_text(
         {"type": "history", "bytes_b64": base64.b64encode(history).decode("ascii")}
     )

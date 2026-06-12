@@ -13,7 +13,7 @@ from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
 from spawn_server.ws.broker import DaemonConn, get_broker
-from spawn_server.ws.browser import DAEMON_SNAPSHOT_LINES, browser_ws
+from spawn_server.ws.browser import INITIAL_SNAPSHOT_LINES, browser_ws
 from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 
 
@@ -189,7 +189,7 @@ async def test_browser_ws_replays_transcript_history_and_status(client, tmp_path
     }
 
 
-async def test_browser_ws_seeds_native_scrollback_from_full_daemon_snapshot(client):
+async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client):
     user_id, token = await _signup(client, "ws-browser-daemon-history@example.com")
     host_id, agent_id = await _create_host_and_agent(user_id)
 
@@ -215,7 +215,7 @@ async def test_browser_ws_seeds_native_scrollback_from_full_daemon_snapshot(clie
     assert snapshot_request == {
         "type": "agent.snapshot",
         "agent_id": agent_id,
-        "lines": DAEMON_SNAPSHOT_LINES,
+        "lines": INITIAL_SNAPSHOT_LINES,
     }
 
     await broker.resolve_snapshot(agent_id, base64.b64encode(b"daemon history\n").decode("ascii"))

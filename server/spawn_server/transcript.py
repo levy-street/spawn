@@ -53,19 +53,40 @@ async def append(agent_id: str, data: bytes) -> None:
             f.write(data)
 
 
-async def read(agent_id: str) -> bytes:
-    """Return the agent's full transcript (rotated tail + current head),
-    capped to fit recent history. Order: oldest → newest so xterm renders
-    sequentially."""
+async def read(agent_id: str, max_bytes: int | None = None) -> bytes:
+    """Return the agent's transcript (rotated tail + current head), ordered
+    oldest → newest so xterm renders sequentially. With ``max_bytes``, only
+    the newest tail is read from disk — long-running agents accumulate tens
+    of megabytes, which would otherwise be shipped to the browser whole."""
     async with _locks[agent_id]:
-        chunks: list[bytes] = []
-        # .log.1 is older; .log is newer.
-        for idx in (1, 0):
+        if max_bytes is None:
+            chunks: list[bytes] = []
+            # .log.1 is older; .log is newer.
+            for idx in (1, 0):
+                try:
+                    chunks.append(_path(agent_id, idx).read_bytes())
+                except FileNotFoundError:
+                    continue
+            return b"".join(chunks)
+
+        parts: list[bytes] = []
+        remaining = max_bytes
+        # Newest file first; stop once the budget is filled.
+        for idx in (0, 1):
+            if remaining <= 0:
+                break
+            path = _path(agent_id, idx)
             try:
-                chunks.append(_path(agent_id, idx).read_bytes())
+                size = path.stat().st_size
             except FileNotFoundError:
                 continue
-        return b"".join(chunks)
+            take = min(size, remaining)
+            with open(path, "rb") as f:
+                f.seek(size - take)
+                parts.append(f.read(take))
+            remaining -= take
+        parts.reverse()
+        return b"".join(parts)
 
 
 async def clear(agent_id: str) -> None:
