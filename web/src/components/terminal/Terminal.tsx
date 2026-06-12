@@ -187,10 +187,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderGenerationRef = useRef(0);
   const scrollbackCacheDirtyRef = useRef(true);
+  const scrollbackLiveBytesAtRef = useRef(0);
+  const scrollbackSnapshotRequestedAtRef = useRef(0);
   const scrollbackOverlayHasSnapshotRef = useRef(false);
   const scrollbackPendingDeltaPxRef = useRef(0);
   const scrollbackUserScrollGenerationRef = useRef(0);
   const scrollbackDesiredScrollTopRef = useRef<number | null>(null);
+  const scrollbackRestoreBottomOffsetPxRef = useRef<number | null>(null);
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
@@ -229,8 +232,44 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
   }, []);
 
+  const syncLiveTerminalFromSnapshot = useCallback((bytes: Uint8Array | null): boolean => {
+    const term = termRef.current;
+    if (
+      !term ||
+      !bytes ||
+      scrollbackCacheDirtyRef.current ||
+      scrollbackCachedSnapshotBytesRef.current !== bytes
+    ) {
+      return false;
+    }
+    // An alternate-screen app (vim, htop, full-screen TUIs) owns the live
+    // viewport and repaints incrementally; rewriting it from a flattened
+    // snapshot would desync the buffer and cursor from the app's state.
+    if (term.buffer.active.type === "alternate") return false;
+
+    const { cols, rows } = lastSizeRef.current;
+    try {
+      term.resize(cols, rows);
+    } catch {
+      // The live terminal can be mid-dispose during route changes; the next
+      // socket history frame will seed the replacement instance.
+    }
+    // Clear via escape sequences instead of term.reset(): reset() also wipes
+    // terminal modes (bracketed paste, mouse reporting, application cursor
+    // keys) that the agent still believes are active, garbling input until
+    // the next full repaint.
+    term.write(`\x1b[0m\x1b[H\x1b[2J\x1b[3J${formatSnapshotForXterm(decodeUtf8(bytes))}`, () => {
+      term.scrollToBottom();
+    });
+    return true;
+  }, []);
+
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
+    const synced = syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
+    // tmux stays the authority on screen content and cursor position; after a
+    // local rewrite, ask it to repaint so any drift self-corrects.
+    if (synced) socketRef.current.sendJson({ type: "redraw" });
     scrollbackVisibleRef.current = false;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
@@ -242,7 +281,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackTermRef.current?.scrollToBottom();
     termRef.current?.scrollToBottom();
     if (scrollbackCacheDirtyRef.current) scheduleScrollbackCacheRefreshRef.current(100);
-  }, [setScrollbackReadyState]);
+  }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot]);
 
   const updateScrollbackReveal = useCallback(
     (overlay: HTMLElement) => {
@@ -278,6 +317,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               return;
             }
             scrollbackOverlayHasSnapshotRef.current = true;
+            const restoreBottomOffset = scrollbackRestoreBottomOffsetPxRef.current;
+            scrollbackRestoreBottomOffsetPxRef.current = null;
+            if (restoreBottomOffset !== null) {
+              const maxTop = maxElementScrollTop(overlay);
+              overlay.scrollTop = Math.max(0, maxTop - restoreBottomOffset);
+            }
             const pendingDelta = scrollbackPendingDeltaPxRef.current;
             if (pendingDelta !== 0) {
               scrollElementPixels(overlay, pendingDelta);
@@ -469,6 +514,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     initialSize: socketInitialSize,
     onData: (bytes) => {
       scrollbackCacheDirtyRef.current = true;
+      scrollbackLiveBytesAtRef.current = Date.now();
       scheduleScrollbackCacheRefreshRef.current();
       writeScrollbackLiveBytes(bytes);
       termRef.current?.write(bytes);
@@ -486,7 +532,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
       term.reset();
-      term.write(wrapSnapshotForXterm(decodeUtf8(bytes)), () => {
+      term.write(formatSnapshotForXterm(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
       });
     },
@@ -495,8 +541,22 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
-      scrollbackCacheDirtyRef.current = false;
-      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) {
+      // Snapshots and live PTY bytes travel over different transports (ws vs
+      // WebRTC DataChannel), so arrival order is not capture order. If live
+      // bytes arrived since this snapshot was requested, the capture may not
+      // contain them — keep the cache dirty and converge with a follow-up
+      // refresh rather than risk rolling the live terminal back.
+      const dirty =
+        scrollbackLiveBytesAtRef.current !== 0 &&
+        scrollbackLiveBytesAtRef.current >= scrollbackSnapshotRequestedAtRef.current;
+      scrollbackCacheDirtyRef.current = dirty;
+      if (dirty) scheduleScrollbackCacheRefreshRef.current();
+      if (scrollbackVisibleRef.current) {
+        const overlay = getScrollbackViewport();
+        if (overlay && scrollbackOverlayHasSnapshotRef.current) {
+          scrollbackRestoreBottomOffsetPxRef.current =
+            maxElementScrollTop(overlay) - overlay.scrollTop;
+        }
         scrollbackSnapshotBytesRef.current = bytes;
         renderScrollbackSnapshotRef.current(bytes, true);
       } else if (!scrollbackVisibleRef.current) {
@@ -555,6 +615,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     scrollbackSnapshotInFlightRef.current = true;
     scrollbackSnapshotPurposeRef.current = purpose;
+    scrollbackSnapshotRequestedAtRef.current = Date.now();
     const sent = socketRef.current.sendJson({
       type: "snapshot",
       lines: TERMINAL_SNAPSHOT_LINES,

@@ -264,7 +264,11 @@ async def test_browser_ws_display_control_tracks_owner_and_viewer_takeover(clien
     await asyncio.wait_for(second_task, timeout=1)
 
 
-async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_daemon(client):
+async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_daemon(
+    client, monkeypatch
+):
+    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, token = await _signup(client, "ws-browser-forward@example.com")
     host_id, agent_id = await _create_host_and_agent(user_id)
 
@@ -329,6 +333,17 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "destination": "cwd",
         "client_id": "client-1",
     }
+
+    ws.queue_text({"type": "redraw"})
+    await _wait_until(
+        lambda: any(json.loads(item).get("type") == "agent.redraw" for item in daemon_ws.sent_text)
+    )
+    redraw = [
+        json.loads(item)
+        for item in daemon_ws.sent_text
+        if json.loads(item).get("type") == "agent.redraw"
+    ][-1]
+    assert redraw == {"type": "agent.redraw", "agent_id": agent_id}
 
     ws.queue_text({"type": "rtc.offer", "session_id": "rtc-browser-1", "sdp": "v=0\r\n"})
     await _wait_until(

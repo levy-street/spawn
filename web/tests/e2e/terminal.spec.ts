@@ -279,6 +279,83 @@ test("terminal scrollback opens from cached snapshots without waiting for a roun
   await expect.poll(() => binaryText(messages)).toContain("z");
 });
 
+test("terminal reconciles stale live content when returning from a fresh scrollback snapshot", async ({
+  page,
+}) => {
+  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    history: `${longHistory(160)}WRONG-LIVE-BOTTOM\n`,
+  });
+  const terminal = page.getByLabel("Agent terminal");
+  await expect(terminal).toBeVisible();
+  await expect(liveTerminalRows(page)).toContainText("WRONG-LIVE-BOTTOM");
+
+  sockets[0]?.send(Buffer.from("\r\nDIRTY-LIVE-BYTE\n"));
+  await expect(liveTerminalRows(page)).toContainText("DIRTY-LIVE-BYTE");
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -300);
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "snapshot").length)
+    .toBeGreaterThanOrEqual(1);
+
+  const freshSnapshot = `${Array.from({ length: 160 }, (_, i) => {
+    return `RIGHT-SNAPSHOT-${String(i).padStart(3, "0")}`;
+  }).join("\n")}\nRIGHT-SNAPSHOT-BOTTOM\n`;
+  sockets[0]?.send(
+    JSON.stringify({
+      type: "snapshot",
+      bytes_b64: b64(freshSnapshot),
+      plain: false,
+    }),
+  );
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("RIGHT-SNAPSHOT-");
+
+  await page.mouse.wheel(0, 5000);
+  await expect(overlay).not.toBeVisible();
+  await expect(liveTerminalRows(page)).toContainText("RIGHT-SNAPSHOT-BOTTOM");
+  // After a local rewrite the browser asks tmux to repaint the true screen.
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "redraw"))
+    .toBe(true);
+});
+
+test("returning from scrollback over an alternate-screen app leaves the live terminal untouched", async ({
+  page,
+}) => {
+  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    history: `\x1b[?1049h${longHistory(160).replaceAll("\n", "\r\n")}ALT-SCREEN-LIVE\r\n`,
+  });
+
+  await expect(liveTerminalRows(page)).toContainText("ALT-SCREEN-LIVE");
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -300);
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "snapshot").length)
+    .toBeGreaterThanOrEqual(1);
+  sockets[0]?.send(
+    JSON.stringify({
+      type: "snapshot",
+      bytes_b64: b64(`${longHistory(160)}FLAT-SNAPSHOT-BOTTOM\n`),
+      plain: false,
+    }),
+  );
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("history-");
+
+  await page.mouse.wheel(0, 5000);
+  await expect(overlay).not.toBeVisible();
+  // The TUI owns the alternate screen: no snapshot rewrite, no redraw nudge.
+  await expect(liveTerminalRows(page)).toContainText("ALT-SCREEN-LIVE");
+  await expect(liveTerminalRows(page)).not.toContainText("FLAT-SNAPSHOT-BOTTOM");
+  expect(jsonMessages(messages).some((message) => message?.type === "redraw")).toBe(false);
+});
+
 test("terminal wheel in alternate screen scrolls locally instead of sending prompt arrows", async ({
   page,
 }) => {

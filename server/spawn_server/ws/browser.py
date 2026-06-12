@@ -34,7 +34,7 @@ router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
 TERMINAL_SCROLLBACK_LINES = 100_000
 DAEMON_SNAPSHOT_LINES = 10_000
-INITIAL_SNAPSHOT_TIMEOUT = 5.0
+INITIAL_SNAPSHOT_TIMEOUT = 1.0
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -414,6 +414,11 @@ async def browser_ws(
                             )
                         except Exception as e:
                             log.warning("scroll forward failed: %s", e)
+                elif ftype == "redraw":
+                    # Browser asks tmux to repaint the current screen — used
+                    # after closing the scrollback overlay so the live
+                    # terminal reflects the authoritative pane state.
+                    await _request_agent_redraw(agent_id, host_id)
                 elif ftype == "snapshot":
                     raw_lines = int(obj.get("lines") or DAEMON_SNAPSHOT_LINES)
                     lines = max(100, min(DAEMON_SNAPSHOT_LINES, raw_lines))
