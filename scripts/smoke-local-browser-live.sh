@@ -80,7 +80,10 @@ PY
     wait "$server_pid" 2>/dev/null || true
   fi
   if [[ -d "$tmux_tmp" ]]; then
-    TMUX_TMPDIR="$tmux_tmp" tmux kill-server >/dev/null 2>&1 || true
+    # env -u TMUX: when this script runs inside a tmux pane, the tmux client
+    # prefers $TMUX over TMUX_TMPDIR — without unsetting it, kill-server would
+    # target the OUTER (possibly production) tmux server.
+    env -u TMUX TMUX_TMPDIR="$tmux_tmp" tmux kill-server >/dev/null 2>&1 || true
   fi
   if [[ "$status" != "0" ]]; then
     for log in "${server_log:-}" "${web_log:-}" "${daemon_log:-}" "${browser_log:-}"; do
@@ -166,6 +169,7 @@ printf '%s\n' "smoke-local-browser-live: starting API server on $base_url"
     SPAWN_PUBLIC_URL="$web_url" \
     SPAWN_CORS_ORIGINS="$web_url" \
     SPAWN_TRANSCRIPT_DIR="$tmp_dir/transcripts" \
+    SPAWN_WEBRTC_ENABLED=1 \
     uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port"
 ) >"$server_log" 2>&1 &
 server_pid=$!
@@ -231,7 +235,10 @@ user_token="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 host_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["host_id"])' <<<"$creds")"
 
 printf '%s\n' "smoke-local-browser-live: starting spawnd for host $host_id"
-HOME="$daemon_home" \
+# env -u TMUX keeps a script run from inside a tmux pane from leaking the
+# outer server's socket into the sandboxed daemon's tmux invocations.
+env -u TMUX \
+  HOME="$daemon_home" \
   SPAWN_DISABLE_KEYRING=1 \
   TMUX_TMPDIR="$tmux_tmp" \
   daemon/target/debug/spawnd --server "$base_url" run \

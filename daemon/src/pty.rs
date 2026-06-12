@@ -295,6 +295,13 @@ fn attach_to_session(
     if let Ok(p) = std::env::var("PATH") {
         cmd.env("PATH", p);
     }
+    // Match the socket resolution of every other tmux invocation: honor the
+    // daemon's TMUX_TMPDIR, never an inherited $TMUX, so an attach from a
+    // daemon started inside a tmux pane can't target the outer server.
+    cmd.env_remove("TMUX");
+    if let Ok(t) = std::env::var("TMUX_TMPDIR") {
+        cmd.env("TMUX_TMPDIR", t);
+    }
     cmd.cwd(cwd);
 
     let child = pair

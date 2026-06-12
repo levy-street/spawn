@@ -14,6 +14,16 @@ const SESSION_PREFIX: &str = "spawn-";
 const DEFAULT_LABEL: &str = "agent";
 const MAX_LABEL_LEN: usize = 48;
 
+/// Base `tmux` invocation. Strips any inherited `$TMUX` so a daemon launched
+/// from inside a tmux pane (dev shells, smoke tests) resolves sockets via its
+/// own `TMUX_TMPDIR` instead of silently targeting the outer server — which
+/// would let a sandboxed daemon discover, resize, or kill production sessions.
+fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.env_remove("TMUX");
+    cmd
+}
+
 /// Returns the canonical tmux session name for an agent.
 ///
 /// The UUID stays in the name so a restarted daemon can rediscover and
@@ -110,7 +120,7 @@ pub async fn new_session_detached(
         anyhow::bail!("argv is empty; cannot launch agent");
     }
 
-    let mut cmd = Command::new("tmux");
+    let mut cmd = tmux_command();
     cmd.arg("new-session")
         .arg("-d")
         .arg("-s")
@@ -148,7 +158,7 @@ pub async fn new_session_detached(
 }
 
 pub async fn kill_session(session: &str) -> Result<()> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .arg("kill-session")
         .arg("-t")
         .arg(session)
@@ -174,7 +184,7 @@ pub async fn rename_session(current: &str, next: &str) -> Result<()> {
     if current == next {
         return Ok(());
     }
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .arg("rename-session")
         .arg("-t")
         .arg(current)
@@ -194,7 +204,7 @@ pub async fn rename_session(current: &str, next: &str) -> Result<()> {
 
 #[allow(dead_code)]
 pub async fn has_session(session: &str) -> bool {
-    Command::new("tmux")
+    tmux_command()
         .arg("has-session")
         .arg("-t")
         .arg(session)
@@ -210,7 +220,7 @@ pub async fn has_session(session: &str) -> bool {
 /// List existing tmux session names. Used to rediscover spawn agents after
 /// a daemon restart.
 pub async fn list_sessions() -> Vec<String> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .stdin(Stdio::null())
         .output()
@@ -231,7 +241,7 @@ pub async fn list_sessions() -> Vec<String> {
 /// Read the current size of the session's first window. Returns None if the
 /// session is gone or tmux output is unparseable.
 pub async fn window_size(session: &str) -> Option<(u16, u16)> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args([
             "display-message",
             "-p",
@@ -258,7 +268,7 @@ pub async fn window_size(session: &str) -> Option<(u16, u16)> {
 /// Resize the tmux window. We ignore the result — if tmux is gone the PTY
 /// will EOF anyway and the agent will be reported as exited.
 pub async fn refresh_client(session: &str, cols: u16, rows: u16) {
-    let _ = Command::new("tmux")
+    let _ = tmux_command()
         .args([
             "refresh-client",
             "-t",
@@ -326,7 +336,7 @@ pub async fn capture_history(session: &str, lines: u16, styled: bool) -> Result<
         args.push("-N");
     }
     args.extend(["-p", "-t", session, "-S", &start]);
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -360,7 +370,7 @@ pub async fn cancel_copy_mode(session: &str) {
 }
 
 async fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
