@@ -53,8 +53,8 @@ class Settings(BaseSettings):
     use_inprocess_pubsub: bool = Field(default=False)
 
     # JSON array of WebRTC RTCIceServer-compatible objects used by browser and
-    # daemon peers for direct terminal streams. STUN-only by default; production
-    # can add TURN credentials with SPAWN_WEBRTC_ICE_SERVERS.
+    # daemon peers for direct terminal streams. STUN-only is best-effort across
+    # restrictive NATs; production should add TURN credentials for reliability.
     webrtc_enabled: bool = Field(default=True)
     webrtc_ice_servers: str = Field(
         default='[{"urls":["stun:stun.l.google.com:19302"]}]',

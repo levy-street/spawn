@@ -412,9 +412,10 @@ on top of the websocket control plane.
 - The server-relayed binary PTY path stays active as fallback and transcript
   source. Browsers should prefer DataChannel output once it is open to avoid
   duplicate terminal rendering.
-- `SPAWN_WEBRTC_ICE_SERVERS` configures the ICE server list. STUN is enough
-  for many LAN/home-network cases; TURN is required for reliable fallback
-  across restrictive NATs and mobile/corporate networks.
+- `SPAWN_WEBRTC_ENABLED` enables the direct path, and
+  `SPAWN_WEBRTC_ICE_SERVERS` configures the ICE server list. STUN is enough for
+  many LAN/home-network cases; TURN is required for reliable fallback across
+  restrictive NATs and mobile/corporate networks.
 
 ## Versioning
 

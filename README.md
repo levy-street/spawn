@@ -63,7 +63,8 @@ fallback, add `--prebuilt-only`.
 Interactive terminal sessions prefer a direct browser↔daemon WebRTC
 DataChannel when available, with the server websocket kept as auth/signaling,
 transcript, and fallback relay. Configure STUN/TURN with
-`SPAWN_WEBRTC_ICE_SERVERS`; the default is STUN-only.
+`SPAWN_WEBRTC_ICE_SERVERS`; the default is STUN-only. Add TURN credentials for
+reliable off-LAN, mobile, and corporate-network direct transport.
 
 ```bash
 # 0. One-time: copy env template

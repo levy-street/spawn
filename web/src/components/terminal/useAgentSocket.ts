@@ -40,6 +40,11 @@ type RtcState = {
   open: boolean;
 };
 
+const RTC_CONNECT_TIMEOUT_MS = 10_000;
+const RTC_DISCONNECTED_GRACE_MS = 5_000;
+const RTC_RELAY_DUPLICATE_WINDOW_MS = 2_000;
+const RTC_RELAY_FALLBACK_DELAY_MS = 750;
+
 function newRtcSessionId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
@@ -93,6 +98,11 @@ export function useAgentSocket({
     let attempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcStartInFlight = false;
+    let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcRelayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastRtcDataAt = 0;
+    const pendingRelayChunks: Uint8Array[] = [];
 
     const sendJsonOverWs = (msg: unknown) => {
       const ws = wsRef.current;
@@ -101,9 +111,28 @@ export function useAgentSocket({
       return true;
     };
 
+    const clearRtcConnectTimer = () => {
+      if (rtcConnectTimer) clearTimeout(rtcConnectTimer);
+      rtcConnectTimer = null;
+    };
+
+    const clearRtcDisconnectedTimer = () => {
+      if (rtcDisconnectedTimer) clearTimeout(rtcDisconnectedTimer);
+      rtcDisconnectedTimer = null;
+    };
+
+    const clearRelayFallback = () => {
+      if (rtcRelayFallbackTimer) clearTimeout(rtcRelayFallbackTimer);
+      rtcRelayFallbackTimer = null;
+      pendingRelayChunks.splice(0);
+    };
+
     const cleanupRtc = (signal = true) => {
       const rtc = rtcRef.current;
       const sessionId = rtc.sessionId;
+      clearRtcConnectTimer();
+      clearRtcDisconnectedTimer();
+      clearRelayFallback();
       if (signal && sessionId) {
         sendJsonOverWs({ type: "rtc.close", session_id: sessionId });
       }
@@ -120,6 +149,20 @@ export function useAgentSocket({
       rtcRef.current = { pc: null, dc: null, sessionId: null, open: false };
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
+      lastRtcDataAt = 0;
+    };
+
+    const scheduleRelayFallback = (bytes: Uint8Array) => {
+      pendingRelayChunks.push(bytes);
+      if (rtcRelayFallbackTimer) return;
+      rtcRelayFallbackTimer = setTimeout(() => {
+        rtcRelayFallbackTimer = null;
+        const chunks = pendingRelayChunks.splice(0);
+        cleanupRtc(true);
+        for (const chunk of chunks) {
+          handlersRef.current.onData(chunk);
+        }
+      }, RTC_RELAY_FALLBACK_DELAY_MS);
     };
 
     const startRtc = async (iceServers: RTCIceServer[]) => {
@@ -133,6 +176,11 @@ export function useAgentSocket({
       let offerSent = false;
       dc.binaryType = "arraybuffer";
       rtcRef.current = { pc, dc, sessionId, open: false };
+      rtcConnectTimer = setTimeout(() => {
+        if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
+          cleanupRtc(true);
+        }
+      }, RTC_CONNECT_TIMEOUT_MS);
 
       const sendRtcCandidate = (candidate: RTCIceCandidateInit) =>
         sendJsonOverWs({
@@ -151,7 +199,21 @@ export function useAgentSocket({
         }
       };
       pc.onconnectionstatechange = () => {
-        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+        if (pc.connectionState === "connected") {
+          clearRtcDisconnectedTimer();
+          return;
+        }
+        if (pc.connectionState === "disconnected") {
+          if (!rtcDisconnectedTimer) {
+            rtcDisconnectedTimer = setTimeout(() => {
+              if (rtcRef.current.sessionId === sessionId && pc.connectionState === "disconnected") {
+                cleanupRtc(true);
+              }
+            }, RTC_DISCONNECTED_GRACE_MS);
+          }
+          return;
+        }
+        if (["failed", "closed"].includes(pc.connectionState)) {
           cleanupRtc(pc.connectionState !== "closed");
         }
       };
@@ -159,6 +221,7 @@ export function useAgentSocket({
         const current = rtcRef.current;
         if (current.sessionId === sessionId) {
           rtcRef.current = { ...current, open: true };
+          clearRtcConnectTimer();
         }
       };
       dc.onclose = () => {
@@ -172,6 +235,8 @@ export function useAgentSocket({
       };
       dc.onmessage = (event) => {
         const h = handlersRef.current;
+        lastRtcDataAt = Date.now();
+        clearRelayFallback();
         if (event.data instanceof ArrayBuffer) {
           h.onData(new Uint8Array(event.data));
         } else if (event.data instanceof Blob) {
@@ -281,6 +346,8 @@ export function useAgentSocket({
         } else if (ev.data instanceof ArrayBuffer) {
           if (!rtcRef.current.open) {
             h.onData(new Uint8Array(ev.data));
+          } else if (Date.now() - lastRtcDataAt > RTC_RELAY_DUPLICATE_WINDOW_MS) {
+            scheduleRelayFallback(new Uint8Array(ev.data));
           }
         }
       };
