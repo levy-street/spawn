@@ -356,6 +356,41 @@ test("returning from scrollback over an alternate-screen app leaves the live ter
   expect(jsonMessages(messages).some((message) => message?.type === "redraw")).toBe(false);
 });
 
+test("scrollback overlay supports mouse text selection and still closes at bottom", async ({
+  page,
+}) => {
+  await openTerminalWithMockSocket(page, {
+    history: longHistory(160),
+  });
+  await expect(liveTerminalRows(page)).toContainText("history-159");
+
+  // The history snapshot is cached clean, so scrollback opens locally
+  // without a snapshot round trip.
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -300);
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("history-");
+
+  // Drag across a row: the overlay terminal (not the live one) should own
+  // the selection now that it receives pointer events.
+  const box = await overlay.boundingBox();
+  if (!box) throw new Error("overlay is not visible");
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + 20, y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 200, y, { steps: 8 });
+  await page.mouse.up();
+  await expect
+    .poll(async () => (await overlay.locator(".xterm-selection div").count()) > 0)
+    .toBe(true);
+
+  // Wheel-down at the bottom still exits scrollback mode.
+  await page.mouse.wheel(0, 5000);
+  await expect(overlay).not.toBeVisible();
+});
+
 test("terminal wheel in alternate screen scrolls locally instead of sending prompt arrows", async ({
   page,
 }) => {

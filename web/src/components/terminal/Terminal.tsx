@@ -202,6 +202,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const revealRenderedScrollbackRef = useRef<() => boolean>(() => false);
   const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
+  const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
   const [scrollbackReady, setScrollbackReady] = useState(false);
@@ -280,6 +281,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     setScrollbackVisible(false);
     scrollbackTermRef.current?.scrollToBottom();
     termRef.current?.scrollToBottom();
+    // Selecting text focuses the overlay terminal; hand focus back to the
+    // live terminal so typing resumes. Skip on touch devices, where focusing
+    // would pop the virtual keyboard.
+    if (
+      !coarsePointerRef.current &&
+      scrollbackTerminalHostRef.current?.contains(document.activeElement)
+    ) {
+      termRef.current?.focus();
+    }
     if (scrollbackCacheDirtyRef.current) scheduleScrollbackCacheRefreshRef.current(100);
   }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot]);
 
@@ -697,8 +707,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         cursor: "#0a0a0a",
       },
     });
+    historyTerm.loadAddon(new WebLinksAddon());
     historyTerm.open(host);
     scrollbackTermRef.current = historyTerm;
+    // Route wheel through the shared scrollback logic (close-at-bottom,
+    // snapshot refresh) instead of xterm's native buffer scrolling.
+    historyTerm.attachCustomWheelEventHandler((event) => scrollbackWheelHandlerRef.current(event));
+    const copySelectionOnMouseUp = () => {
+      const selection = historyTerm.getSelection();
+      if (!selection) return;
+      void navigator.clipboard?.writeText(selection).catch(() => {});
+    };
+    host.addEventListener("mouseup", copySelectionOnMouseUp);
     const viewport = getScrollbackViewport();
     if (viewport) {
       viewport.style.scrollbarWidth = "none";
@@ -708,6 +728,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     prepareScrollbackSnapshotRef.current();
 
     return () => {
+      host.removeEventListener("mouseup", copySelectionOnMouseUp);
       historyTerm.dispose();
       if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
     };
@@ -947,6 +968,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestScrollbackSnapshotRef.current(amount);
       }
       return true;
+    };
+
+    // The overlay receives pointer events directly (text selection, links),
+    // so its wheel events no longer reach the live terminal underneath.
+    // Route them through the same scrollback logic.
+    scrollbackWheelHandlerRef.current = (event) => {
+      if (event.ctrlKey) return true;
+      const amount = wheelEventToPixels(event, term.rows);
+      if (amount === 0) return true;
+      handleScrollbackOverlayWheel(amount);
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
     };
 
     term.attachCustomWheelEventHandler((event) => {
@@ -1339,7 +1373,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       event.stopPropagation();
     };
 
-    terminalTouchTarget.addEventListener("click", onClick, { capture: true });
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       if (event.key !== "Enter" && event.key !== "Return") return true;
@@ -1348,30 +1381,46 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.textarea?.addEventListener("beforeinput", onBeforeInput, { capture: true });
     term.textarea?.addEventListener("input", onInput, { capture: true });
 
+    const copyLiveSelectionOnMouseUp = () => {
+      const selection = term.getSelection();
+      if (!selection) return;
+      void navigator.clipboard?.writeText(selection).catch(() => {});
+    };
+    terminalElement.addEventListener("mouseup", copyLiveSelectionOnMouseUp);
+
+    // The scrollback overlay accepts pointer events for text selection and
+    // links, so the touch-scroll machinery must listen there too — touch
+    // events over the visible overlay no longer reach the live viewport.
+    const touchTargets: HTMLElement[] = scrollbackOverlayRef.current
+      ? [terminalTouchTarget, scrollbackOverlayRef.current]
+      : [terminalTouchTarget];
     const usePointerEvents = window.PointerEvent !== undefined;
-    if (usePointerEvents) {
-      terminalTouchTarget.addEventListener("pointerdown", onPointerDown, {
+    for (const target of touchTargets) {
+      target.addEventListener("click", onClick, { capture: true });
+      if (usePointerEvents) {
+        target.addEventListener("pointerdown", onPointerDown, {
+          capture: true,
+          passive: false,
+        });
+        target.addEventListener("pointermove", onPointerMove, {
+          capture: true,
+          passive: false,
+        });
+        target.addEventListener("pointerup", onPointerEnd, { capture: true });
+        target.addEventListener("pointercancel", onPointerEnd, { capture: true });
+        target.addEventListener("lostpointercapture", onPointerEnd, { capture: true });
+      }
+      target.addEventListener("touchstart", onTouchStart, {
+        capture: true,
+        passive: true,
+      });
+      target.addEventListener("touchmove", onTouchMove, {
         capture: true,
         passive: false,
       });
-      terminalTouchTarget.addEventListener("pointermove", onPointerMove, {
-        capture: true,
-        passive: false,
-      });
-      terminalTouchTarget.addEventListener("pointerup", onPointerEnd, { capture: true });
-      terminalTouchTarget.addEventListener("pointercancel", onPointerEnd, { capture: true });
-      terminalTouchTarget.addEventListener("lostpointercapture", onPointerEnd, { capture: true });
+      target.addEventListener("touchend", onTouchEnd, { capture: true });
+      target.addEventListener("touchcancel", onTouchEnd, { capture: true });
     }
-    terminalTouchTarget.addEventListener("touchstart", onTouchStart, {
-      capture: true,
-      passive: true,
-    });
-    terminalTouchTarget.addEventListener("touchmove", onTouchMove, {
-      capture: true,
-      passive: false,
-    });
-    terminalTouchTarget.addEventListener("touchend", onTouchEnd, { capture: true });
-    terminalTouchTarget.addEventListener("touchcancel", onTouchEnd, { capture: true });
 
     const captureScrollAnchor = (): ScrollAnchor => {
       const buffer = term.buffer.active;
@@ -1472,23 +1521,27 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     return () => {
       ro.disconnect();
-      terminalTouchTarget.removeEventListener("click", onClick, { capture: true });
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });
       term.textarea?.removeEventListener("input", onInput, { capture: true });
-      if (usePointerEvents) {
-        terminalTouchTarget.removeEventListener("pointerdown", onPointerDown, { capture: true });
-        terminalTouchTarget.removeEventListener("pointermove", onPointerMove, { capture: true });
-        terminalTouchTarget.removeEventListener("pointerup", onPointerEnd, { capture: true });
-        terminalTouchTarget.removeEventListener("pointercancel", onPointerEnd, { capture: true });
-        terminalTouchTarget.removeEventListener("lostpointercapture", onPointerEnd, {
-          capture: true,
-        });
+      terminalElement.removeEventListener("mouseup", copyLiveSelectionOnMouseUp);
+      for (const target of touchTargets) {
+        target.removeEventListener("click", onClick, { capture: true });
+        if (usePointerEvents) {
+          target.removeEventListener("pointerdown", onPointerDown, { capture: true });
+          target.removeEventListener("pointermove", onPointerMove, { capture: true });
+          target.removeEventListener("pointerup", onPointerEnd, { capture: true });
+          target.removeEventListener("pointercancel", onPointerEnd, { capture: true });
+          target.removeEventListener("lostpointercapture", onPointerEnd, {
+            capture: true,
+          });
+        }
+        target.removeEventListener("touchstart", onTouchStart, { capture: true });
+        target.removeEventListener("touchmove", onTouchMove, { capture: true });
+        target.removeEventListener("touchend", onTouchEnd, { capture: true });
+        target.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       }
-      terminalTouchTarget.removeEventListener("touchstart", onTouchStart, { capture: true });
-      terminalTouchTarget.removeEventListener("touchmove", onTouchMove, { capture: true });
-      terminalTouchTarget.removeEventListener("touchend", onTouchEnd, { capture: true });
-      terminalTouchTarget.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+      scrollbackWheelHandlerRef.current = () => true;
       stopTouchMomentum();
       if (resizeTimer) clearTimeout(resizeTimer);
       onDataDisposableRef.current?.dispose();
@@ -1858,7 +1911,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         ref={scrollbackOverlayRef}
         data-testid="terminal-scrollback-overlay"
         aria-hidden={!scrollbackVisible}
-        className="pointer-events-none absolute inset-0 z-10 bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
+        className="pointer-events-auto absolute inset-0 z-10 touch-none bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
         style={{
           visibility: scrollbackVisible && scrollbackReady ? "visible" : "hidden",
         }}
