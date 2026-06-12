@@ -356,6 +356,35 @@ test("returning from scrollback over an alternate-screen app leaves the live ter
   expect(jsonMessages(messages).some((message) => message?.type === "redraw")).toBe(false);
 });
 
+test("resizing invalidates cached scrollback so history re-wraps at the new width", async ({
+  page,
+}) => {
+  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    history: longHistory(160),
+  });
+  await expect(liveTerminalRows(page)).toContainText("history-159");
+  const snapshotCount = () =>
+    jsonMessages(messages).filter((message) => message?.type === "snapshot").length;
+  const baseline = snapshotCount();
+
+  // Resize re-wraps the tmux pane; the cached capture is now stale-width and
+  // must be re-fetched in the background.
+  await page.setViewportSize({ width: 700, height: 500 });
+  await expect.poll(snapshotCount).toBeGreaterThan(baseline);
+
+  const rewrapped = `${Array.from({ length: 160 }, (_, i) => {
+    return `REWRAPPED-${String(i).padStart(3, "0")}`;
+  }).join("\n")}\n`;
+  sockets[0]?.send(JSON.stringify({ type: "snapshot", bytes_b64: b64(rewrapped), plain: false }));
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -300);
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("REWRAPPED-");
+  await expect(overlay.locator(".xterm-rows")).not.toContainText("history-");
+});
+
 test("scrollback overlay supports mouse text selection and still closes at bottom", async ({
   page,
 }) => {

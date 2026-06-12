@@ -203,6 +203,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
   const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
+  const invalidateScrollbackForResizeRef = useRef<() => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
   const [scrollbackReady, setScrollbackReady] = useState(false);
@@ -500,12 +501,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const buffer = term.buffer.active;
         const atBottom = buffer.viewportY >= buffer.baseY;
         const viewportY = buffer.viewportY;
+        const last = lastSizeRef.current;
         try {
           term.resize(geometry.cols, geometry.rows);
         } catch {
           return;
         }
         lastSizeRef.current = geometry;
+        if (geometry.cols !== last.cols || geometry.rows !== last.rows) {
+          invalidateScrollbackForResizeRef.current();
+        }
         layoutTerminalSurfaceRef.current(atBottom);
         requestAnimationFrame(() => layoutTerminalSurfaceRef.current(atBottom));
         if (atBottom) {
@@ -686,6 +691,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [requestSnapshot, setScrollbackReadyState],
   );
   requestScrollbackSnapshotRef.current = requestScrollbackSnapshot;
+
+  // A resize re-wraps the tmux pane, so any cached capture is laid out at the
+  // old width. Drop the rendered copy and fetch a fresh capture at the new
+  // geometry instead of presenting stale-width history.
+  const invalidateScrollbackForResize = useCallback(() => {
+    scrollbackCacheDirtyRef.current = true;
+    scrollbackRenderedSnapshotBytesRef.current = null;
+    if (scrollbackVisibleRef.current) {
+      requestSnapshot("overlay");
+    } else {
+      scheduleScrollbackCacheRefresh();
+    }
+  }, [requestSnapshot, scheduleScrollbackCacheRefresh]);
+  invalidateScrollbackForResizeRef.current = invalidateScrollbackForResize;
 
   useLayoutEffect(() => {
     const host = scrollbackTerminalHostRef.current;
@@ -1448,13 +1467,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         setSocketInitialSize({ cols, rows });
         return;
       }
-      if (displayOwnerRef.current !== true) {
-        lastSizeRef.current = { cols, rows };
-        return;
-      }
       const last = lastSizeRef.current;
-      if (cols !== last.cols || rows !== last.rows) {
-        lastSizeRef.current = { cols, rows };
+      if (cols === last.cols && rows === last.rows) return;
+      lastSizeRef.current = { cols, rows };
+      invalidateScrollbackForResizeRef.current();
+      if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
       }
     };
@@ -1466,12 +1483,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ? displayGeometryRef.current
           : null;
       if (followerGeometry) {
+        const last = lastSizeRef.current;
         try {
           term.resize(followerGeometry.cols, followerGeometry.rows);
         } catch {
           return;
         }
         lastSizeRef.current = followerGeometry;
+        if (followerGeometry.cols !== last.cols || followerGeometry.rows !== last.rows) {
+          invalidateScrollbackForResizeRef.current();
+        }
         layoutTerminalSurface(anchor?.atBottom ?? true);
         requestAnimationFrame(() => layoutTerminalSurface(anchor?.atBottom ?? true));
         if (anchor) {
@@ -1788,7 +1809,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         socket.sendBinary(data);
       },
       resize: (cols, rows) => {
+        const last = lastSizeRef.current;
         lastSizeRef.current = { cols, rows };
+        if (cols !== last.cols || rows !== last.rows) {
+          invalidateScrollbackForResizeRef.current();
+        }
         if (displayOwnerRef.current === true) {
           socket.sendJson({ type: "resize", cols, rows });
         } else {
@@ -1821,7 +1846,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           // Keep the current size if fit is unavailable.
         }
         const { cols, rows } = term;
+        const last = lastSizeRef.current;
         lastSizeRef.current = { cols, rows };
+        if (cols !== last.cols || rows !== last.rows) {
+          invalidateScrollbackForResizeRef.current();
+        }
         socket.sendJson({ type: "take_control", cols, rows });
         term.focus();
       },
