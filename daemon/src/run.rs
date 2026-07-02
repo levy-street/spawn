@@ -231,14 +231,13 @@ async fn install_session_sinks(registry: &AgentRegistry, out_tx: &mpsc::Sender<W
     for (_, control) in registry.snapshot_controls() {
         control.set_sink(out_tx.clone()).await;
     }
-    // Snapshot ids and call nudge through the registry so we don't have to
-    // reach into AgentHandle internals.
+    // Force a repaint for every agent so freshly-connected clients see the
+    // current screen. refresh-client works even when the geometry is
+    // unchanged, unlike a same-size SIGWINCH nudge.
     for id in registry.ids() {
-        registry.with_handle(id, |h| {
-            if let Err(e) = h.nudge_redraw() {
-                tracing::debug!(%id, error = %e, "nudge_redraw failed");
-            }
-        });
+        if let Some(session) = registry.session_for(id) {
+            tmux::force_repaint(&session).await;
+        }
     }
 }
 
@@ -2015,18 +2014,14 @@ async fn handle_agent_snapshot(
 }
 
 async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
-    if !registry.contains(agent_id) {
+    let Some(session) = registry.session_for(agent_id) else {
         tracing::debug!(%agent_id, "ignoring redraw for unknown agent");
         return;
-    }
-    let found = registry.with_handle(agent_id, |h| {
-        if let Err(e) = h.nudge_redraw() {
-            tracing::debug!(%agent_id, error = %e, "nudge_redraw failed");
-        }
-    });
-    if !found {
-        tracing::debug!(%agent_id, "ignoring redraw for unknown agent");
-    }
+    };
+    // A full client repaint restores cursor position AND terminal modes in
+    // the browser's freshly-seeded xterm; a same-size SIGWINCH nudge is a
+    // silent no-op after a refresh at unchanged geometry.
+    tmux::force_repaint(&session).await;
 }
 
 #[allow(clippy::too_many_arguments)]

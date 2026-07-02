@@ -249,9 +249,10 @@ impl AgentHandle {
     }
 
     /// Re-apply the current PTY size so the kernel emits a fresh SIGWINCH to
-    /// `tmux attach`, which prompts tmux to re-emit the current pane state.
-    /// Used after WS reconnect so browsers see the latest screen even when
-    /// codex/etc. would otherwise be idle.
+    /// `tmux attach`. NOTE: the kernel only signals when the size CHANGES, so
+    /// this is a no-op at unchanged geometry — prefer tmux::refresh_client
+    /// for forcing repaints.
+    #[allow(dead_code)]
     pub fn nudge_redraw(&self) -> Result<()> {
         let master = self
             .master

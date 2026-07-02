@@ -384,6 +384,15 @@ pub async fn cancel_copy_mode(session: &str) {
     let _ = run_tmux(["send-keys", "-t", session, "-X", "cancel"]).await;
 }
 
+/// Force tmux to repaint the whole client screen. Unlike re-applying the PTY
+/// size (which only produces SIGWINCH — and therefore a repaint — when the
+/// size actually CHANGES), this works unconditionally, which matters after a
+/// browser refresh at unchanged geometry: the freshly-seeded xterm needs a
+/// full repaint to restore cursor position and terminal modes.
+pub async fn force_repaint(session: &str) {
+    let _ = run_tmux(["refresh-client", "-t", session]).await;
+}
+
 /// Whether the session's active pane is in a mode (copy-mode etc.). Returns
 /// None if tmux can't be queried.
 pub async fn pane_in_mode(session: &str) -> Option<bool> {
