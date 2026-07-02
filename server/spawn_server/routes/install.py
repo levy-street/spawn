@@ -457,6 +457,11 @@ INSTALL_SCRIPT = dedent(
     ExecStart="$BIN" --server "$SERVER" run
     Restart=always
     RestartSec=2
+    # Only kill spawnd itself on stop/restart: the tmux server holding every
+    # agent session lives in this cgroup and must survive daemon updates.
+    KillMode=process
+    # Headroom against fd exhaustion taking the host offline.
+    LimitNOFILE=65536
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
     [Install]
