@@ -19,13 +19,7 @@ import { AppShell } from "@/components/nav/AppShell";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
-import {
-  agentActivityDetail,
-  agentCommand,
-  agentKind,
-  agentTitle,
-  isAgentArchived,
-} from "@/lib/agents";
+import { agentActivityDetail, agentCommand, agentTitle, isAgentArchived } from "@/lib/agents";
 import { agentAccess, agents, hosts } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -303,6 +297,9 @@ function AgentTerminal() {
       )}
       {actionError && <p className="px-4 py-2 text-sm text-destructive">{actionError}</p>}
 
+      {/* imagePasteMode: Claude and Codex both convert a bracketed-pasted
+          image path into their native attachment pill ([Image #1]), and
+          pasting the path is also the sane behavior for plain shells. */}
       <div className="relative min-h-0 flex-1 @container/term">
         <Terminal
           ref={termRef}
@@ -310,7 +307,7 @@ function AgentTerminal() {
           rawInput
           mobileReturnMode="newline"
           mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
-          imagePasteMode={q.data && agentKind(q.data) === "codex" ? "bracketed-path" : "deferred"}
+          imagePasteMode="bracketed-path"
           onDisplayControl={setDisplayState}
         />
       </div>
