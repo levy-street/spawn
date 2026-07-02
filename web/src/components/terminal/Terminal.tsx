@@ -212,7 +212,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackPendingDeltaPxRef = useRef(0);
   const scrollbackUserScrollGenerationRef = useRef(0);
   const scrollbackDesiredScrollTopRef = useRef<number | null>(null);
-  const scrollbackRestoreBottomOffsetPxRef = useRef<number | null>(null);
+  const scrollbackRestoreLineRef = useRef<number | null>(null);
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackCacheRefreshDeadlineRef = useRef<number | null>(null);
   const scrollbackLastUserScrollAtRef = useRef(0);
@@ -220,6 +220,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
+  // Last trustworthy reader position (buffer line of the viewport top),
+  // recorded only while no rewrite is collapsing the buffer. Rebuilt content
+  // only grows at the bottom, so a line anchor keeps the reader's lines
+  // steady; positions are tracked in xterm's internal line space because raw
+  // DOM scrollTop writes race with xterm's own viewport syncing under
+  // concurrent writes.
+  const scrollbackStableLineRef = useRef<number | null>(null);
   const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
   const recentDcChunksSizeRef = useRef(0);
   const dcActiveRef = useRef(false);
@@ -261,6 +268,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackUserScrollGenerationRef.current += 1;
     scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
     scrollbackLastUserScrollAtRef.current = Date.now();
+    if (!scrollbackRenderInFlightRef.current) {
+      scrollbackStableLineRef.current = scrollbackTermRef.current?.buffer.active.viewportY ?? null;
+    }
   }, []);
 
   // Live DataChannel chunks newer than the snapshot's capture offset. The
@@ -351,6 +361,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (synced) socketRef.current.sendJson({ type: "redraw" });
     scrollbackVisibleRef.current = false;
     scrollbackRenderInFlightRef.current = false;
+    scrollbackStableLineRef.current = null;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
     scrollbackPendingDeltaPxRef.current = 0;
@@ -379,9 +390,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // out under the reader. The render's own completion callback re-runs
       // this with the rebuilt buffer.
       if (scrollbackRenderInFlightRef.current) return;
-      const maxTop = maxElementScrollTop(overlay);
-      const reveal =
-        maxTop > 0 && overlay.scrollTop < maxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
+      const buffer = scrollbackTermRef.current?.buffer.active;
+      const reveal = buffer ? buffer.baseY > 0 && buffer.viewportY < buffer.baseY : false;
       setScrollbackReadyState(reveal);
     },
     [setScrollbackReadyState],
@@ -394,6 +404,26 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const generation = scrollbackRenderGenerationRef.current + 1;
       scrollbackRenderGenerationRef.current = generation;
       scrollbackRenderInFlightRef.current = true;
+      console.log(
+        `[sbdbg] render start gen=${generation} reveal=${reveal} visible=${scrollbackVisibleRef.current} hasSnap=${scrollbackOverlayHasSnapshotRef.current} restore=${scrollbackRestoreLineRef.current} bytes=${bytes.length}`,
+      );
+
+      // A visible re-render must preserve the reader's place even when the
+      // idle-gate didn't stage an explicit restore. Measure the distance
+      // from the bottom before the rewrite collapses the buffer — unless a
+      // previous rewrite is still in flight, in which case the live buffer
+      // is untrustworthy and the last stable position wins.
+      if (
+        scrollbackVisibleRef.current &&
+        scrollbackOverlayHasSnapshotRef.current &&
+        scrollbackRestoreLineRef.current === null
+      ) {
+        if (scrollbackRenderInFlightRef.current) {
+          scrollbackRestoreLineRef.current = scrollbackStableLineRef.current;
+        } else {
+          scrollbackRestoreLineRef.current = historyTerm.buffer.active.viewportY;
+        }
+      }
 
       const { cols, rows } = lastSizeRef.current;
       historyTerm.reset();
@@ -410,32 +440,47 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         historyTerm.write(piece);
       }
       historyTerm.write(writeQueue[writeQueue.length - 1] as string | Uint8Array, () => {
+        // Two frames let xterm's renderer settle the viewport height, but
+        // ALL scroll mutations happen atomically in the final frame: a
+        // half-applied scrollToBottom from a render superseded mid-sequence
+        // used to pin the overlay to the bottom, which the next render then
+        // captured as the position to preserve, hiding the overlay under an
+        // actively-reading user.
         requestAnimationFrame(() => {
           if (scrollbackRenderGenerationRef.current !== generation) return;
-          historyTerm.scrollToBottom();
           requestAnimationFrame(() => {
             if (scrollbackRenderGenerationRef.current !== generation) return;
             scrollbackRenderInFlightRef.current = false;
             scrollbackRenderedSnapshotBytesRef.current = bytes;
             const overlay = getScrollbackViewport();
+            console.log(
+              `[sbdbg] render done gen=${generation} overlay=${!!overlay} visible=${scrollbackVisibleRef.current}`,
+            );
             if (!overlay) return;
             if (!reveal && !scrollbackVisibleRef.current) {
+              historyTerm.scrollToBottom();
               overlay.scrollTop = maxElementScrollTop(overlay);
               return;
             }
             scrollbackOverlayHasSnapshotRef.current = true;
-            const restoreBottomOffset = scrollbackRestoreBottomOffsetPxRef.current;
-            scrollbackRestoreBottomOffsetPxRef.current = null;
-            if (restoreBottomOffset !== null) {
-              const maxTop = maxElementScrollTop(overlay);
-              overlay.scrollTop = Math.max(0, maxTop - restoreBottomOffset);
+            const restoreLine = scrollbackRestoreLineRef.current;
+            scrollbackRestoreLineRef.current = null;
+            if (restoreLine !== null) {
+              historyTerm.scrollToLine(restoreLine);
+            } else {
+              historyTerm.scrollToBottom();
             }
             const pendingDelta = scrollbackPendingDeltaPxRef.current;
-            if (pendingDelta !== 0) {
-              scrollElementPixels(overlay, pendingDelta);
-              scrollbackPendingDeltaPxRef.current = 0;
-            }
+            const pendingLines = Math.trunc(
+              pendingDelta / Math.max(1, terminalRowHeightRef.current),
+            );
+            if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+            scrollbackPendingDeltaPxRef.current = 0;
             scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+            scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
+            console.log(
+              `[sbdbg] positioned gen=${generation} st=${Math.round(overlay.scrollTop)} max=${Math.round(maxElementScrollTop(overlay))}`,
+            );
             updateScrollbackReveal(overlay);
           });
         });
@@ -448,14 +493,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const revealRenderedScrollback = useCallback(() => {
     const overlay = getScrollbackViewport();
     const bytes = scrollbackSnapshotBytesRef.current ?? scrollbackCachedSnapshotBytesRef.current;
+    // A rewrite in flight owns the scroll position and the banked wheel
+    // deltas; consuming them against the collapsing buffer loses them.
+    if (scrollbackRenderInFlightRef.current) return false;
     if (!overlay || !bytes || scrollbackRenderedSnapshotBytesRef.current !== bytes) return false;
     scrollbackOverlayHasSnapshotRef.current = true;
+    const historyTerm = scrollbackTermRef.current;
     const pendingDelta = scrollbackPendingDeltaPxRef.current;
-    if (pendingDelta !== 0) {
-      scrollElementPixels(overlay, pendingDelta);
-      scrollbackPendingDeltaPxRef.current = 0;
-    }
+    const pendingLines = Math.trunc(pendingDelta / Math.max(1, terminalRowHeightRef.current));
+    if (historyTerm && pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+    scrollbackPendingDeltaPxRef.current = 0;
     scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+    scrollbackStableLineRef.current = historyTerm?.buffer.active.viewportY ?? null;
     updateScrollbackReveal(overlay);
     return true;
   }, [getScrollbackViewport, updateScrollbackReveal]);
@@ -480,28 +529,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!historyTerm || scrollbackRenderedSnapshotBytesRef.current === null) return;
       if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) return;
 
-      const overlay = getScrollbackViewport();
+      // xterm's own viewport semantics do the right thing here: writes
+      // follow the bottom when the viewport is at the live edge and hold the
+      // reader's lines steady when scrolled up. Reaching around them with
+      // DOM scrollTop writes races the viewport sync and teleports the view.
       const wasVisible = scrollbackVisibleRef.current;
-      const previousTop = overlay?.scrollTop ?? 0;
-      const previousMaxTop = overlay ? maxElementScrollTop(overlay) : 0;
-      const scrollGeneration = scrollbackUserScrollGenerationRef.current;
-      const shouldStickToBottom =
-        !wasVisible ||
-        previousTop >= previousMaxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
-
       historyTerm.write(bytes, () => {
-        const nextOverlay = getScrollbackViewport();
-        if (!nextOverlay) return;
-        const nextMaxTop = maxElementScrollTop(nextOverlay);
-        const nextTop =
-          scrollbackUserScrollGenerationRef.current !== scrollGeneration &&
-          scrollbackDesiredScrollTopRef.current !== null
-            ? scrollbackDesiredScrollTopRef.current
-            : shouldStickToBottom
-              ? nextMaxTop
-              : previousTop;
-        nextOverlay.scrollTop = Math.max(0, Math.min(nextMaxTop, nextTop));
-        if (wasVisible && scrollbackVisibleRef.current) updateScrollbackReveal(nextOverlay);
+        if (!wasVisible || !scrollbackVisibleRef.current) return;
+        const overlay = getScrollbackViewport();
+        if (overlay) updateScrollbackReveal(overlay);
       });
     },
     [getScrollbackViewport, updateScrollbackReveal],
@@ -528,10 +564,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         );
         return;
       }
-      const overlay = getScrollbackViewport();
-      if (overlay && scrollbackOverlayHasSnapshotRef.current) {
-        scrollbackRestoreBottomOffsetPxRef.current =
-          maxElementScrollTop(overlay) - overlay.scrollTop;
+      if (scrollbackOverlayHasSnapshotRef.current) {
+        scrollbackRestoreLineRef.current = scrollbackRenderInFlightRef.current
+          ? scrollbackStableLineRef.current
+          : (scrollbackTermRef.current?.buffer.active.viewportY ?? null);
       }
       renderScrollbackSnapshotRef.current(bytes, true);
     };
@@ -826,11 +862,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheRefreshTimerRef.current = null;
         scrollbackCacheRefreshDeadlineRef.current = null;
         if (!scrollbackCacheDirtyRef.current) return;
-        // With DataChannel offset anchoring, re-rendering under an open
-        // overlay is lossless, so keep refreshing while it's visible; on the
-        // relay path (no anchor) a visible re-render can drop in-flight
-        // bytes, so preserve the old suppression there.
-        if (scrollbackVisibleRef.current && !dcActiveRef.current) return;
+        // No refresh under an open overlay: the open render is made exact by
+        // replaying DataChannel bytes past the capture offset, and direct
+        // live appends keep it complete from then on — a mid-read rewrite
+        // would only flash and reflow content under the reader.
+        if (scrollbackVisibleRef.current) return;
         if (!requestSnapshot("cache") && scrollbackSnapshotInFlightRef.current) {
           // Another capture is pending; try again once it resolves or times out.
           scheduleScrollbackCacheRefreshRef.current(500);
@@ -851,6 +887,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackVisibleRef.current = true;
         scrollbackOverlayHasSnapshotRef.current = false;
         scrollbackSnapshotBytesRef.current = scrollbackCachedSnapshotBytesRef.current;
+        // Null = start at the live edge; renders that overlap the open
+        // scroll to bottom plus whatever wheel deltas banked.
+        scrollbackStableLineRef.current = null;
         setScrollbackReadyState(false);
         setScrollbackVisible(true);
       }
@@ -865,7 +904,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
       }
 
-      if (scrollbackCacheDirtyRef.current || !scrollbackSnapshotBytesRef.current) {
+      // An offset-anchored cached snapshot renders exactly (live bytes past
+      // the capture offset are replayed on top), so no fresh capture is
+      // needed even when live output has arrived since.
+      const cachedAnchored =
+        scrollbackSnapshotBytesRef.current !== null &&
+        scrollbackSnapshotOffsetsRef.current.get(scrollbackSnapshotBytesRef.current) !== undefined;
+      if (
+        !scrollbackSnapshotBytesRef.current ||
+        (scrollbackCacheDirtyRef.current && !cachedAnchored)
+      ) {
         requestSnapshot("overlay");
       }
       return true;
@@ -1137,14 +1185,37 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const activeBufferIsAlternate = () => term.buffer.active.type === "alternate";
 
-    const overlayIsAtBottom = (overlay: HTMLElement) => {
-      return overlay.scrollTop >= maxElementScrollTop(overlay) - 0.5;
+    const overlayIsAtBottom = (_overlay: HTMLElement) => {
+      // Mid-rewrite the buffer is collapsed and everything looks like
+      // "bottom"; never close the overlay off that reading.
+      if (scrollbackRenderInFlightRef.current) return false;
+      const buffer = scrollbackTermRef.current?.buffer.active;
+      return buffer ? buffer.viewportY >= buffer.baseY : true;
     };
 
+    let overlayWheelRemainderPx = 0;
     const scrollOverlayPixels = (deltaY: number) => {
       const overlay = getScrollbackViewport();
-      if (!overlay || deltaY === 0) return false;
-      const moved = scrollElementPixels(overlay, deltaY);
+      const historyTerm = scrollbackTermRef.current;
+      if (!overlay || !historyTerm || deltaY === 0) return false;
+      // Scrolling the buffer while a rewrite is collapsing it is a lost
+      // update; bank the delta and let the render's completion apply it on
+      // top of the restored position.
+      if (scrollbackRenderInFlightRef.current) {
+        scrollbackPendingDeltaPxRef.current += deltaY;
+        scrollbackLastUserScrollAtRef.current = Date.now();
+        return true;
+      }
+      // Scroll through xterm's internal line state: raw DOM scrollTop writes
+      // race with the viewport syncing xterm performs on concurrent writes.
+      overlayWheelRemainderPx += deltaY;
+      const rowHeight = Math.max(1, terminalRowHeightRef.current);
+      const lines = Math.trunc(overlayWheelRemainderPx / rowHeight);
+      if (lines === 0) return true;
+      overlayWheelRemainderPx -= lines * rowHeight;
+      const before = historyTerm.buffer.active.viewportY;
+      historyTerm.scrollLines(lines);
+      const moved = historyTerm.buffer.active.viewportY !== before;
       if (moved) recordScrollbackUserPosition(overlay);
       updateScrollbackReveal(overlay);
       return moved;
@@ -1165,7 +1236,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const moved = scrollOverlayPixels(amount);
       if (moved && amount > 0 && overlayIsAtBottom(overlay)) {
         hideScrollbackOverlay();
-      } else if (!moved && maxElementScrollTop(overlay) <= 0) {
+      } else if (!moved && (scrollbackTermRef.current?.buffer.active.baseY ?? 0) <= 0) {
         requestScrollbackSnapshotRef.current(amount);
       }
       return true;
