@@ -52,7 +52,13 @@ export interface DisplayControlState {
 export type InboundMessage =
   | { type: "history"; bytes_b64: string }
   | ({ type: "display.control" } & DisplayControlState)
-  | { type: "snapshot"; bytes_b64: string; plain?: boolean }
+  | {
+      type: "snapshot";
+      bytes_b64: string;
+      plain?: boolean;
+      dc_offset?: number;
+      rtc_session_id?: string;
+    }
   | { type: "agent.exit"; exit_code: number | null; signal: string | null }
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
   | { type: "upload.saved"; path: string; client_id?: string }
@@ -84,7 +90,7 @@ export type OutboundMessage =
   | { type: "resize"; cols: number; rows: number }
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
-  | { type: "snapshot"; lines?: number; plain?: boolean }
+  | { type: "snapshot"; lines?: number; plain?: boolean; rtc_session_id?: string }
   | { type: "rtc.offer"; session_id: string; sdp: string }
   | { type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit }
   | { type: "rtc.close"; session_id: string }

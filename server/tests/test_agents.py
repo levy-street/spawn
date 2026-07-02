@@ -453,7 +453,7 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
         await asyncio.sleep(0.01)
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123, "plain": True}
-    await broker.resolve_snapshot(agent_id, base64.b64encode(b"screen").decode("ascii"))
+    await broker.resolve_snapshot(agent_id, {"bytes_b64": base64.b64encode(b"screen").decode("ascii")})
     r = await snapshot_task
     assert r.status_code == 200, r.text
     assert base64.b64decode(r.json()["bytes_b64"]) == b"screen"

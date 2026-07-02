@@ -211,7 +211,7 @@ async def test_mcp_tools_can_manage_capabilities_start_agent_and_interact(
     }
     await broker.resolve_snapshot(
         agent["id"],
-        base64.b64encode(b"mcp snapshot").decode("ascii"),
+        {"bytes_b64": base64.b64encode(b"mcp snapshot").decode("ascii")},
     )
     snapshot = await snapshot_task
     assert base64.b64decode(snapshot["bytes_b64"]) == b"mcp snapshot"

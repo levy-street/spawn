@@ -138,6 +138,8 @@ mod tests {
         let snapshot = Outbound::AgentSnapshot {
             agent_id: Uuid::nil(),
             bytes_b64: "b2s=".into(),
+            dc_offset: Some(42),
+            rtc_session_id: Some("sess-1".into()),
         };
         let s = serde_json::to_string(&snapshot).unwrap();
         assert!(s.contains("\"type\":\"agent.snapshot\""));

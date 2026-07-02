@@ -259,8 +259,8 @@ async def test_broker_snapshot_request_roundtrip():
     sent = json.loads(daemon_ws.sent_text[-1])
     assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123}
 
-    await broker.resolve_snapshot(agent_id, "aGVsbG8=")
-    assert await task == "aGVsbG8="
+    await broker.resolve_snapshot(agent_id, {"bytes_b64": "aGVsbG8="})
+    assert await task == {"bytes_b64": "aGVsbG8="}
 
     await broker.unregister_daemon(daemon)
 
@@ -290,8 +290,8 @@ async def test_broker_plain_snapshot_request_roundtrip():
         "plain": True,
     }
 
-    await broker.resolve_snapshot(agent_id, "cGxhaW4=")
-    assert await task == "cGxhaW4="
+    await broker.resolve_snapshot(agent_id, {"bytes_b64": "cGxhaW4="})
+    assert await task == {"bytes_b64": "cGxhaW4="}
 
     await broker.unregister_daemon(daemon)
 

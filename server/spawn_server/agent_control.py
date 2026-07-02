@@ -184,9 +184,9 @@ async def snapshot_agent(
         plain=plain,
         timeout=timeout,
     )
-    if snapshot is None:
+    if snapshot is None or not snapshot.get("bytes_b64"):
         raise HTTPException(status_code=504, detail="agent snapshot timed out")
-    return {"agent_id": agent.id, "bytes_b64": snapshot, "plain": plain, "lines": lines}
+    return {"agent_id": agent.id, "bytes_b64": snapshot["bytes_b64"], "plain": plain, "lines": lines}
 
 
 async def upload_agent_file(

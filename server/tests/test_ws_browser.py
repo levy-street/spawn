@@ -218,7 +218,7 @@ async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client)
         "lines": INITIAL_SNAPSHOT_LINES,
     }
 
-    await broker.resolve_snapshot(agent_id, base64.b64encode(b"daemon history\n").decode("ascii"))
+    await broker.resolve_snapshot(agent_id, {"bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii")})
     await _wait_until(lambda: len(_messages_of_type(ws, "history")) >= 1)
     history = _messages_of_type(ws, "history")[-1]
     assert base64.b64decode(history["bytes_b64"]) == b"daemon history\n"

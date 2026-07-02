@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -46,13 +47,22 @@ pub enum WsOutbound {
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 
+/// A direct terminal sink plus a cumulative count of PTY bytes queued to it.
+/// The counter lets snapshot responses carry the stream position at capture
+/// time, so browsers can order snapshot content against live DataChannel
+/// bytes (which outrun the relayed snapshot response).
+struct DirectSinkEntry {
+    sink: DirectSink,
+    bytes_sent: Arc<AtomicU64>,
+}
+
 /// Shared between an agent's forwarder task and the WS session lifecycle.
 /// `slot` holds the current session's outbound sink (or `None` between
 /// sessions). `notify` wakes the forwarder when a sink becomes available.
 #[derive(Clone)]
 pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
-    direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSink>>>,
+    direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
     notify: Arc<Notify>,
 }
 
@@ -83,16 +93,41 @@ impl ForwarderControl {
     /// DataChannel. These sinks receive raw PTY output bytes without the
     /// daemon->server->browser relay hop.
     pub async fn add_direct_sink(&self, id: String, sink: DirectSink) {
-        self.direct_sinks.lock().await.insert(id, sink);
+        self.direct_sinks.lock().await.insert(
+            id,
+            DirectSinkEntry {
+                sink,
+                bytes_sent: Arc::new(AtomicU64::new(0)),
+            },
+        );
     }
 
     pub async fn remove_direct_sink(&self, id: &str) {
         self.direct_sinks.lock().await.remove(id);
     }
 
+    /// Cumulative bytes queued to the given direct sink, or None if the sink
+    /// is not registered.
+    pub async fn direct_sink_offset(&self, id: &str) -> Option<u64> {
+        self.direct_sinks
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.bytes_sent.load(Ordering::Relaxed))
+    }
+
     async fn send_direct(&self, chunk: &[u8]) {
         let mut sinks = self.direct_sinks.lock().await;
-        sinks.retain(|_, sink| sink.send(chunk.to_vec()).is_ok());
+        sinks.retain(|_, entry| {
+            if entry.sink.send(chunk.to_vec()).is_ok() {
+                entry
+                    .bytes_sent
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 

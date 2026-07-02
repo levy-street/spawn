@@ -76,7 +76,7 @@ class Broker:
         self._daemon_by_agent: dict[str, DaemonConn] = {}
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
         self._display_by_agent: dict[str, _DisplayState] = {}
-        self._snapshot_waiters: dict[str, set[asyncio.Future[str]]] = defaultdict(set)
+        self._snapshot_waiters: dict[str, set[asyncio.Future[dict]]] = defaultdict(set)
         self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
@@ -283,9 +283,10 @@ class Broker:
         lines: int = 5000,
         plain: bool = False,
         timeout: float = 2.0,
-    ) -> str | None:
+        rtc_session_id: str | None = None,
+    ) -> dict | None:
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[str] = loop.create_future()
+        fut: asyncio.Future[dict] = loop.create_future()
         async with self._lock:
             self._snapshot_waiters[agent_id].add(fut)
         try:
@@ -296,6 +297,8 @@ class Broker:
             }
             if plain:
                 payload["plain"] = True
+            if rtc_session_id:
+                payload["rtc_session_id"] = rtc_session_id
             await daemon.send_text(payload)
             return await asyncio.wait_for(fut, timeout=timeout)
         except TimeoutError:
@@ -308,12 +311,12 @@ class Broker:
                     if not waiters:
                         self._snapshot_waiters.pop(agent_id, None)
 
-    async def resolve_snapshot(self, agent_id: str, bytes_b64: str) -> None:
+    async def resolve_snapshot(self, agent_id: str, payload: dict) -> None:
         async with self._lock:
             waiters = list(self._snapshot_waiters.pop(agent_id, ()))
         for fut in waiters:
             if not fut.done():
-                fut.set_result(bytes_b64)
+                fut.set_result(payload)
 
     async def request_dir_list(
         self,

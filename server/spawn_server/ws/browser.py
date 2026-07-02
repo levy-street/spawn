@@ -176,8 +176,8 @@ async def _send_initial_history(
             snapshot = await broker.request_snapshot(
                 agent_id, daemon, lines=INITIAL_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
             )
-            if snapshot:
-                await conn.send_text({"type": "history", "bytes_b64": snapshot})
+            if snapshot and snapshot.get("bytes_b64"):
+                await conn.send_text({"type": "history", "bytes_b64": snapshot["bytes_b64"]})
                 return
         except Exception as e:
             log.warning("tmux snapshot request failed: %s", e)
@@ -436,6 +436,7 @@ async def browser_ws(
                     )
                     if daemon is None:
                         continue
+                    rtc_session_id = _valid_rtc_session_id(obj.get("rtc_session_id"))
                     try:
                         snapshot = await broker.request_snapshot(
                             agent_id,
@@ -443,15 +444,19 @@ async def browser_ws(
                             lines=lines,
                             plain=plain,
                             timeout=2.0,
+                            rtc_session_id=rtc_session_id,
                         )
-                        if snapshot:
-                            await conn.send_text(
-                                {
-                                    "type": "snapshot",
-                                    "bytes_b64": snapshot,
-                                    "plain": plain,
-                                }
-                            )
+                        if snapshot and snapshot.get("bytes_b64"):
+                            reply: dict[str, object] = {
+                                "type": "snapshot",
+                                "bytes_b64": snapshot["bytes_b64"],
+                                "plain": plain,
+                            }
+                            if snapshot.get("dc_offset") is not None:
+                                reply["dc_offset"] = snapshot["dc_offset"]
+                            if snapshot.get("rtc_session_id"):
+                                reply["rtc_session_id"] = snapshot["rtc_session_id"]
+                            await conn.send_text(reply)
                     except Exception as e:
                         log.warning("snapshot forward failed: %s", e)
                 elif ftype == "upload":

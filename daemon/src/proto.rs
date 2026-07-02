@@ -41,7 +41,19 @@ pub enum Outbound {
         client_id: Option<String>,
     },
     #[serde(rename = "agent.snapshot")]
-    AgentSnapshot { agent_id: Uuid, bytes_b64: String },
+    AgentSnapshot {
+        agent_id: Uuid,
+        bytes_b64: String,
+        /// Cumulative bytes queued to the requesting browser's direct
+        /// DataChannel sink at capture time; lets the client order the
+        /// snapshot against live DataChannel bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dc_offset: Option<u64>,
+        /// Echo of the requester's RTC session id so a browser can ignore
+        /// offsets stamped for a stale session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rtc_session_id: Option<String>,
+    },
     #[serde(rename = "host.fs.list_result")]
     HostFsListResult {
         request_id: String,
@@ -154,6 +166,8 @@ pub enum Inbound {
         lines: Option<u16>,
         #[serde(default)]
         plain: Option<bool>,
+        #[serde(default)]
+        rtc_session_id: Option<String>,
     },
     #[serde(rename = "agent.redraw")]
     AgentRedraw {

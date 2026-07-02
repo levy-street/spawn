@@ -271,7 +271,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             if agent is None or agent.host_id != host.id:
                                 log.warning("snapshot for unknown agent=%s", aid)
                                 continue
-                        await broker.resolve_snapshot(aid, bytes_b64)
+                        await broker.resolve_snapshot(
+                            aid,
+                            {
+                                "bytes_b64": bytes_b64,
+                                "dc_offset": obj.get("dc_offset"),
+                                "rtc_session_id": obj.get("rtc_session_id"),
+                            },
+                        )
 
                 elif ftype == "rtc.answer":
                     aid = obj.get("agent_id")

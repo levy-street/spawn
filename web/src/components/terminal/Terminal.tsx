@@ -40,6 +40,11 @@ const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
 // Never re-render the overlay underneath an actively-scrolling user: the
 // reset+rewrite collapses the scroll range mid-gesture and yanks the view.
 const SCROLLBACK_RERENDER_IDLE_MS = 350;
+// Recent live DataChannel chunks kept for replay on top of offset-anchored
+// snapshots. Snapshots travel the slow relay path while live bytes ride the
+// DataChannel, so a fresh capture can lag chunks already rendered locally;
+// replaying chunks past the capture's stream offset makes re-renders exact.
+const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -212,6 +217,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackCacheRefreshDeadlineRef = useRef<number | null>(null);
   const scrollbackLastUserScrollAtRef = useRef(0);
   const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Daemon-stamped DataChannel stream offset for each snapshot payload.
+  const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
+  const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
+  const recentDcChunksSizeRef = useRef(0);
+  const dcActiveRef = useRef(false);
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
@@ -252,37 +262,81 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackLastUserScrollAtRef.current = Date.now();
   }, []);
 
-  const syncLiveTerminalFromSnapshot = useCallback((bytes: Uint8Array | null): boolean => {
-    const term = termRef.current;
-    if (
-      !term ||
-      !bytes ||
-      scrollbackCacheDirtyRef.current ||
-      scrollbackCachedSnapshotBytesRef.current !== bytes
-    ) {
-      return false;
+  // Live DataChannel chunks newer than the snapshot's capture offset. The
+  // first replayed chunk may straddle the offset; slice off the part the
+  // capture already contains.
+  const takeDcReplaySlices = useCallback((bytes: Uint8Array): Uint8Array[] => {
+    const anchor = scrollbackSnapshotOffsetsRef.current.get(bytes);
+    if (anchor === undefined) return [];
+    const slices: Uint8Array[] = [];
+    let covered = false;
+    for (const chunk of recentDcChunksRef.current) {
+      if (chunk.offsetAfter <= anchor) {
+        covered = true;
+        continue;
+      }
+      const start = chunk.offsetAfter - chunk.bytes.length;
+      if (start <= anchor) {
+        covered = true;
+        slices.push(anchor > start ? chunk.bytes.subarray(anchor - start) : chunk.bytes);
+      } else if (!covered && slices.length === 0) {
+        // The buffer no longer reaches back to the capture offset; a replay
+        // would leave a hole. Render the snapshot alone and let the next
+        // refresh converge.
+        scrollbackCacheDirtyRef.current = true;
+        scheduleScrollbackCacheRefreshRef.current();
+        return [];
+      } else {
+        slices.push(chunk.bytes);
+      }
     }
-    // An alternate-screen app (vim, htop, full-screen TUIs) owns the live
-    // viewport and repaints incrementally; rewriting it from a flattened
-    // snapshot would desync the buffer and cursor from the app's state.
-    if (term.buffer.active.type === "alternate") return false;
-
-    const { cols, rows } = lastSizeRef.current;
-    try {
-      term.resize(cols, rows);
-    } catch {
-      // The live terminal can be mid-dispose during route changes; the next
-      // socket history frame will seed the replacement instance.
-    }
-    // Clear via escape sequences instead of term.reset(): reset() also wipes
-    // terminal modes (bracketed paste, mouse reporting, application cursor
-    // keys) that the agent still believes are active, garbling input until
-    // the next full repaint.
-    term.write(`\x1b[0m\x1b[H\x1b[2J\x1b[3J${formatSnapshotForXterm(decodeUtf8(bytes))}`, () => {
-      term.scrollToBottom();
-    });
-    return true;
+    return slices;
   }, []);
+
+  const syncLiveTerminalFromSnapshot = useCallback(
+    (bytes: Uint8Array | null): boolean => {
+      const term = termRef.current;
+      if (
+        !term ||
+        !bytes ||
+        scrollbackCacheDirtyRef.current ||
+        scrollbackCachedSnapshotBytesRef.current !== bytes
+      ) {
+        return false;
+      }
+      // An alternate-screen app (vim, htop, full-screen TUIs) owns the live
+      // viewport and repaints incrementally; rewriting it from a flattened
+      // snapshot would desync the buffer and cursor from the app's state.
+      if (term.buffer.active.type === "alternate") return false;
+
+      const { cols, rows } = lastSizeRef.current;
+      try {
+        term.resize(cols, rows);
+      } catch {
+        // The live terminal can be mid-dispose during route changes; the next
+        // socket history frame will seed the replacement instance.
+      }
+      // Clear via escape sequences instead of term.reset(): reset() also wipes
+      // terminal modes (bracketed paste, mouse reporting, application cursor
+      // keys) that the agent still believes are active, garbling input until
+      // the next full repaint.
+      term.write(`\x1b[0m\x1b[H\x1b[2J\x1b[3J${formatSnapshotForXterm(decodeUtf8(bytes))}`);
+      // Replay live DataChannel bytes newer than the capture so the rewrite
+      // can't roll the live terminal back behind what the user already saw.
+      const replaySlices = takeDcReplaySlices(bytes);
+      for (const slice of replaySlices.slice(0, -1)) {
+        term.write(slice);
+      }
+      term.write(
+        replaySlices.length > 0 ? (replaySlices[replaySlices.length - 1] as Uint8Array) : "",
+        () => {
+          term.scrollToBottom();
+        },
+      );
+      return true;
+    },
+    [takeDcReplaySlices],
+  );
 
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
@@ -336,7 +390,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const { cols, rows } = lastSizeRef.current;
       historyTerm.reset();
       historyTerm.resize(cols, rows);
-      historyTerm.write(formatSnapshotForXterm(decodeUtf8(bytes)), () => {
+      // Queue the snapshot and any newer live chunks back-to-back so nothing
+      // that arrives mid-render can interleave; the callback rides the last
+      // queued write.
+      const replaySlices = takeDcReplaySlices(bytes);
+      const writeQueue: (string | Uint8Array)[] = [
+        formatSnapshotForXterm(decodeUtf8(bytes)),
+        ...replaySlices,
+      ];
+      for (const piece of writeQueue.slice(0, -1)) {
+        historyTerm.write(piece);
+      }
+      historyTerm.write(writeQueue[writeQueue.length - 1] as string | Uint8Array, () => {
         requestAnimationFrame(() => {
           if (scrollbackRenderGenerationRef.current !== generation) return;
           historyTerm.scrollToBottom();
@@ -367,7 +432,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         });
       });
     },
-    [getScrollbackViewport, updateScrollbackReveal],
+    [getScrollbackViewport, takeDcReplaySlices, updateScrollbackReveal],
   );
   renderScrollbackSnapshotRef.current = renderScrollbackSnapshot;
 
@@ -580,7 +645,25 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     agentId,
     enabled: socketInitialSize !== null,
     initialSize: socketInitialSize,
-    onData: (bytes) => {
+    onData: (bytes, dcOffsetAfter) => {
+      if (typeof dcOffsetAfter === "number") {
+        dcActiveRef.current = true;
+        recentDcChunksRef.current.push({ offsetAfter: dcOffsetAfter, bytes });
+        recentDcChunksSizeRef.current += bytes.length;
+        while (
+          recentDcChunksSizeRef.current > SCROLLBACK_DC_REPLAY_BUFFER_BYTES &&
+          recentDcChunksRef.current.length > 1
+        ) {
+          const evicted = recentDcChunksRef.current.shift();
+          if (evicted) recentDcChunksSizeRef.current -= evicted.bytes.length;
+        }
+      } else if (dcActiveRef.current) {
+        // Transport fell back to the relay; DataChannel offsets no longer
+        // describe this stream.
+        dcActiveRef.current = false;
+        recentDcChunksRef.current = [];
+        recentDcChunksSizeRef.current = 0;
+      }
       scrollbackCacheDirtyRef.current = true;
       scrollbackLiveBytesAtRef.current = Date.now();
       scheduleScrollbackCacheRefreshRef.current();
@@ -609,7 +692,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
     },
     onDisplayControl: applyDisplayControl,
-    onSnapshot: (bytes) => {
+    onSnapshot: (bytes, _plain, dcOffset) => {
       if (scrollbackSnapshotTimeoutRef.current) {
         clearTimeout(scrollbackSnapshotTimeoutRef.current);
         scrollbackSnapshotTimeoutRef.current = null;
@@ -617,16 +700,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
-      // Snapshots and live PTY bytes travel over different transports (ws vs
-      // WebRTC DataChannel), so arrival order is not capture order. If live
-      // bytes arrived since this snapshot was requested, the capture may not
-      // contain them — keep the cache dirty and converge with a follow-up
-      // refresh rather than risk rolling the live terminal back.
-      const dirty =
-        scrollbackLiveBytesAtRef.current !== 0 &&
-        scrollbackLiveBytesAtRef.current >= scrollbackSnapshotRequestedAtRef.current;
-      scrollbackCacheDirtyRef.current = dirty;
-      if (dirty) scheduleScrollbackCacheRefreshRef.current();
+      if (typeof dcOffset === "number") {
+        // Offset-anchored snapshot: renders are made exact by replaying live
+        // DataChannel bytes past the capture offset, so the cache converges
+        // immediately.
+        scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
+        scrollbackCacheDirtyRef.current = false;
+      } else {
+        // Snapshots and live PTY bytes travel over different transports (ws
+        // vs WebRTC DataChannel), so arrival order is not capture order. If
+        // live bytes arrived since this snapshot was requested, the capture
+        // may not contain them — keep the cache dirty and converge with a
+        // follow-up refresh rather than risk rolling the live terminal back.
+        const dirty =
+          scrollbackLiveBytesAtRef.current !== 0 &&
+          scrollbackLiveBytesAtRef.current >= scrollbackSnapshotRequestedAtRef.current;
+        scrollbackCacheDirtyRef.current = dirty;
+        if (dirty) scheduleScrollbackCacheRefreshRef.current();
+      }
       if (scrollbackVisibleRef.current) {
         scrollbackSnapshotBytesRef.current = bytes;
         renderOverlaySnapshotWhenIdle();
@@ -725,7 +816,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackCacheRefreshTimerRef.current = setTimeout(() => {
         scrollbackCacheRefreshTimerRef.current = null;
         scrollbackCacheRefreshDeadlineRef.current = null;
-        if (scrollbackVisibleRef.current || !scrollbackCacheDirtyRef.current) return;
+        if (!scrollbackCacheDirtyRef.current) return;
+        // With DataChannel offset anchoring, re-rendering under an open
+        // overlay is lossless, so keep refreshing while it's visible; on the
+        // relay path (no anchor) a visible re-render can drop in-flight
+        // bytes, so preserve the old suppression there.
+        if (scrollbackVisibleRef.current && !dcActiveRef.current) return;
         if (!requestSnapshot("cache") && scrollbackSnapshotInFlightRef.current) {
           // Another capture is pending; try again once it resolves or times out.
           scheduleScrollbackCacheRefreshRef.current(500);

@@ -307,11 +307,13 @@ async fn dispatch_loop(
                     agent_id,
                     lines,
                     plain,
+                    rtc_session_id,
                 } => {
                     handle_agent_snapshot(
                         agent_id,
                         lines.unwrap_or(5_000),
                         plain.unwrap_or(false),
+                        rtc_session_id,
                         registry,
                         out_tx,
                     )
@@ -1951,6 +1953,7 @@ async fn handle_agent_snapshot(
     agent_id: Uuid,
     lines: u16,
     plain: bool,
+    rtc_session_id: Option<String>,
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
@@ -1967,11 +1970,25 @@ async fn handle_agent_snapshot(
         .await;
         return;
     };
+    // Sample the requester's DataChannel stream position BEFORE capturing:
+    // tmux renders bytes into the pane before (or as) they reach our PTY
+    // reader, so anything counted here is guaranteed to appear in the
+    // capture. The client can then replay DataChannel bytes past this offset
+    // on top of the snapshot without dropping output.
+    let dc_offset = match &rtc_session_id {
+        Some(id) => match registry.control_for(agent_id) {
+            Some(control) => control.direct_sink_offset(id).await,
+            None => None,
+        },
+        None => None,
+    };
     match tmux::capture_history(&session, lines, !plain).await {
         Ok(bytes) => {
             let snapshot = Outbound::AgentSnapshot {
                 agent_id,
                 bytes_b64: STANDARD.encode(bytes),
+                dc_offset,
+                rtc_session_id,
             };
             if let Ok(s) = serde_json::to_string(&snapshot) {
                 let _ = out_tx.send(WsOutbound::Json(s)).await;
@@ -2093,6 +2110,8 @@ async fn send_snapshot_text(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, t
     let snapshot = Outbound::AgentSnapshot {
         agent_id,
         bytes_b64: STANDARD.encode(text.as_bytes()),
+        dc_offset: None,
+        rtc_session_id: None,
     };
     if let Ok(s) = serde_json::to_string(&snapshot) {
         let _ = out_tx.send(WsOutbound::Json(s)).await;
