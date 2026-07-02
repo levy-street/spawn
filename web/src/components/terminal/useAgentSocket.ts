@@ -21,12 +21,17 @@ export interface UseAgentSocketOptions {
   agentId: string;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
-  onData: (bytes: Uint8Array) => void;
+  /** dcOffsetAfter is the cumulative DataChannel byte count including this
+   *  chunk; undefined for bytes that arrived over the WS relay. */
+  onData: (bytes: Uint8Array, dcOffsetAfter?: number) => void;
   onHistory?: (bytes: Uint8Array) => void;
   onDisplayControl?: (state: DisplayControlState) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
   onStatus?: (status: string) => void;
-  onSnapshot?: (bytes: Uint8Array, plain: boolean) => void;
+  /** dcOffset is the daemon-side DataChannel byte count at capture time for
+   *  the CURRENT rtc session, or null when the snapshot has no usable anchor
+   *  (relay mode, stale session). */
+  onSnapshot?: (bytes: Uint8Array, plain: boolean, dcOffset?: number | null) => void;
   onUploadSaved?: (path: string, clientId?: string) => void;
   onUploadError?: (message: string) => void;
 }
@@ -38,12 +43,18 @@ type RtcState = {
   dc: RTCDataChannel | null;
   sessionId: string | null;
   open: boolean;
+  /** Cumulative PTY bytes received over this session's DataChannel. */
+  bytesReceived: number;
 };
 
 const RTC_CONNECT_TIMEOUT_MS = 10_000;
 const RTC_DISCONNECTED_GRACE_MS = 5_000;
 const RTC_RELAY_DUPLICATE_WINDOW_MS = 2_000;
 const RTC_RELAY_FALLBACK_DELAY_MS = 750;
+// A failed WebRTC attempt used to strand the session on the relay path until
+// the next WS reconnect; retry with backoff instead.
+const RTC_RETRY_BASE_DELAY_MS = 5_000;
+const RTC_RETRY_MAX_DELAY_MS = 60_000;
 
 function newRtcSessionId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -67,7 +78,13 @@ export function useAgentSocket({
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   const wsRef = useRef<WebSocket | null>(null);
-  const rtcRef = useRef<RtcState>({ pc: null, dc: null, sessionId: null, open: false });
+  const rtcRef = useRef<RtcState>({
+    pc: null,
+    dc: null,
+    sessionId: null,
+    open: false,
+    bytesReceived: 0,
+  });
   const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
@@ -101,6 +118,9 @@ export function useAgentSocket({
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRelayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcRetryAttempts = 0;
+    let lastRtcIceServers: RTCIceServer[] | null = null;
     let lastRtcDataAt = 0;
     const pendingRelayChunks: Uint8Array[] = [];
 
@@ -127,7 +147,7 @@ export function useAgentSocket({
       pendingRelayChunks.splice(0);
     };
 
-    const cleanupRtc = (signal = true) => {
+    const cleanupRtc = (signal = true, retry = false) => {
       const rtc = rtcRef.current;
       const sessionId = rtc.sessionId;
       clearRtcConnectTimer();
@@ -146,10 +166,28 @@ export function useAgentSocket({
       } catch {
         // ignore
       }
-      rtcRef.current = { pc: null, dc: null, sessionId: null, open: false };
+      rtcRef.current = { pc: null, dc: null, sessionId: null, open: false, bytesReceived: 0 };
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
+      if (retry) scheduleRtcRetry();
+    };
+
+    // A transient WebRTC failure (network switch, slow ICE) must not strand
+    // the session on the relay path until the next WS reconnect.
+    const scheduleRtcRetry = () => {
+      if (cancelled || rtcRetryTimer || !lastRtcIceServers) return;
+      const delay = Math.min(
+        RTC_RETRY_MAX_DELAY_MS,
+        RTC_RETRY_BASE_DELAY_MS * 2 ** rtcRetryAttempts,
+      );
+      rtcRetryAttempts += 1;
+      rtcRetryTimer = setTimeout(() => {
+        rtcRetryTimer = null;
+        if (cancelled || rtcRef.current.pc) return;
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        if (lastRtcIceServers) void startRtc(lastRtcIceServers);
+      }, delay);
     };
 
     const scheduleRelayFallback = (bytes: Uint8Array) => {
@@ -158,7 +196,7 @@ export function useAgentSocket({
       rtcRelayFallbackTimer = setTimeout(() => {
         rtcRelayFallbackTimer = null;
         const chunks = pendingRelayChunks.splice(0);
-        cleanupRtc(true);
+        cleanupRtc(true, true);
         for (const chunk of chunks) {
           handlersRef.current.onData(chunk);
         }
@@ -175,10 +213,10 @@ export function useAgentSocket({
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       let offerSent = false;
       dc.binaryType = "arraybuffer";
-      rtcRef.current = { pc, dc, sessionId, open: false };
+      rtcRef.current = { pc, dc, sessionId, open: false, bytesReceived: 0 };
       rtcConnectTimer = setTimeout(() => {
         if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
-          cleanupRtc(true);
+          cleanupRtc(true, true);
         }
       }, RTC_CONNECT_TIMEOUT_MS);
 
@@ -207,14 +245,14 @@ export function useAgentSocket({
           if (!rtcDisconnectedTimer) {
             rtcDisconnectedTimer = setTimeout(() => {
               if (rtcRef.current.sessionId === sessionId && pc.connectionState === "disconnected") {
-                cleanupRtc(true);
+                cleanupRtc(true, true);
               }
             }, RTC_DISCONNECTED_GRACE_MS);
           }
           return;
         }
         if (["failed", "closed"].includes(pc.connectionState)) {
-          cleanupRtc(pc.connectionState !== "closed");
+          cleanupRtc(pc.connectionState !== "closed", rtcRef.current.sessionId === sessionId);
         }
       };
       dc.onopen = () => {
@@ -222,6 +260,11 @@ export function useAgentSocket({
         if (current.sessionId === sessionId) {
           rtcRef.current = { ...current, open: true };
           clearRtcConnectTimer();
+          rtcRetryAttempts = 0;
+          // The daemon starts mirroring PTY bytes onto this channel from its
+          // side of the open handshake; treat relay copies that race the
+          // first DataChannel byte as duplicates from the start.
+          lastRtcDataAt = Date.now();
         }
       };
       dc.onclose = () => {
@@ -231,17 +274,26 @@ export function useAgentSocket({
         }
       };
       dc.onerror = () => {
-        cleanupRtc();
+        cleanupRtc(true, true);
+      };
+      const deliverDcChunk = (bytes: Uint8Array) => {
+        const h = handlersRef.current;
+        const current = rtcRef.current;
+        if (current.sessionId === sessionId) {
+          current.bytesReceived += bytes.length;
+          h.onData(bytes, current.bytesReceived);
+        } else {
+          h.onData(bytes);
+        }
       };
       dc.onmessage = (event) => {
-        const h = handlersRef.current;
         lastRtcDataAt = Date.now();
         clearRelayFallback();
         if (event.data instanceof ArrayBuffer) {
-          h.onData(new Uint8Array(event.data));
+          deliverDcChunk(new Uint8Array(event.data));
         } else if (event.data instanceof Blob) {
           void event.data.arrayBuffer().then((buf) => {
-            if (!cancelled) h.onData(new Uint8Array(buf));
+            if (!cancelled) deliverDcChunk(new Uint8Array(buf));
           });
         }
       };
@@ -302,7 +354,15 @@ export function useAgentSocket({
               viewers: msg.viewers,
             });
           } else if (msg.type === "snapshot") {
-            h.onSnapshot?.(base64ToBytes(msg.bytes_b64), Boolean(msg.plain));
+            const current = rtcRef.current;
+            const dcOffset =
+              current.open &&
+              current.sessionId &&
+              msg.rtc_session_id === current.sessionId &&
+              typeof msg.dc_offset === "number"
+                ? msg.dc_offset
+                : null;
+            h.onSnapshot?.(base64ToBytes(msg.bytes_b64), Boolean(msg.plain), dcOffset);
           } else if (msg.type === "agent.exit") {
             h.onExit?.(msg.exit_code, msg.signal);
           } else if (msg.type === "agent.status") {
@@ -313,7 +373,11 @@ export function useAgentSocket({
             h.onUploadError?.(msg.message);
           } else if (msg.type === "rtc.config") {
             if (msg.enabled) {
-              void startRtc(msg.ice_servers ?? []);
+              lastRtcIceServers = msg.ice_servers ?? [];
+              rtcRetryAttempts = 0;
+              void startRtc(lastRtcIceServers);
+            } else {
+              lastRtcIceServers = null;
             }
           } else if (msg.type === "rtc.answer") {
             const current = rtcRef.current;
@@ -340,7 +404,7 @@ export function useAgentSocket({
               rtcRef.current.sessionId === msg.session_id &&
               ["failed", "disabled", "unavailable"].includes(msg.status)
             ) {
-              cleanupRtc(false);
+              cleanupRtc(false, msg.status !== "disabled");
             }
           }
         } else if (ev.data instanceof ArrayBuffer) {
@@ -374,6 +438,7 @@ export function useAgentSocket({
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
       if (wsRef.current) {
         try {
           cleanupRtc(true);
@@ -403,7 +468,18 @@ export function useAgentSocket({
   const sendJson = (msg: unknown) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(msg));
+    // Stamp snapshot requests with the live RTC session so the daemon can
+    // return the DataChannel stream offset at capture time.
+    const rtc = rtcRef.current;
+    const payload =
+      typeof msg === "object" &&
+      msg !== null &&
+      (msg as { type?: string }).type === "snapshot" &&
+      rtc.open &&
+      rtc.sessionId
+        ? { ...(msg as Record<string, unknown>), rtc_session_id: rtc.sessionId }
+        : msg;
+    ws.send(JSON.stringify(payload));
     return true;
   };
 
