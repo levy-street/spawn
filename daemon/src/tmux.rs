@@ -234,23 +234,33 @@ pub async fn has_session(session: &str) -> bool {
 
 /// List existing tmux session names. Used to rediscover spawn agents after
 /// a daemon restart.
-pub async fn list_sessions() -> Vec<String> {
+///
+/// `Ok(vec![])` means tmux answered and there are no sessions; `Err` means we
+/// could not ask (spawn failure, or an unexpected tmux error). Callers must
+/// not treat `Err` as "session gone" — under fd pressure or load, a transient
+/// subprocess failure here used to make live agents report their tmux
+/// session as lost.
+pub async fn list_sessions() -> anyhow::Result<Vec<String>> {
     let out = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .stdin(Stdio::null())
         .output()
-        .await;
-    let Ok(out) = out else {
-        return Vec::new();
-    };
+        .await
+        .map_err(|e| anyhow::anyhow!("spawning tmux list-sessions: {e}"))?;
     if !out.status.success() {
-        return Vec::new();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // "no server running" / "error connecting to ..." mean an honest
+        // empty answer: the tmux server simply isn't up.
+        if stderr.contains("no server running") || stderr.contains("error connecting to") {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("tmux list-sessions failed ({}): {}", out.status, stderr.trim());
     }
-    String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect())
 }
 
 /// Read the current size of the session's first window. Returns None if the

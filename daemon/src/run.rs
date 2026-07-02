@@ -1969,17 +1969,28 @@ async fn handle_agent_snapshot(
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    if !registry.contains(agent_id) {
-        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
-    }
+    let attach_outcome = ensure_agent_attached(agent_id, registry, out_tx).await;
     let Some(session) = registry.session_for(agent_id) else {
-        tracing::debug!(%agent_id, "ignoring snapshot for unknown agent");
-        send_snapshot_text(
-            agent_id,
-            out_tx,
-            "\r\n[spawn] agent is not attached to this daemon and no matching tmux session was found\r\n",
-        )
-        .await;
+        if attach_outcome == AttachOutcome::NoSession {
+            tracing::debug!(%agent_id, "snapshot for agent with no tmux session");
+            send_snapshot_text(
+                agent_id,
+                out_tx,
+                "\r\n[spawn] agent is not attached to this daemon and no matching tmux session was found\r\n",
+            )
+            .await;
+        } else {
+            // Don't fabricate "session lost" content for a transient failure;
+            // an error frame lets the server time the request out instead.
+            tracing::warn!(%agent_id, "snapshot skipped: attach state unknown");
+            send_error(
+                out_tx,
+                Some(agent_id),
+                "snapshot_failed",
+                &anyhow::anyhow!("agent attach state unknown (transient tmux failure)"),
+            )
+            .await;
+        }
         return;
     };
     // Sample the requester's DataChannel stream position BEFORE capturing:
@@ -2188,30 +2199,69 @@ async fn attach_existing_agent(
     Ok(())
 }
 
+/// Outcome of a lazy attach attempt, distinguishing "the session is truly
+/// gone" from "we couldn't find out right now".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachOutcome {
+    Attached,
+    /// tmux answered: no session for this agent exists.
+    NoSession,
+    /// Transient failure (tmux unreachable, attach error) — state unknown.
+    Unknown,
+}
+
 async fn ensure_agent_attached(
     agent_id: Uuid,
     registry: &AgentRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
-) -> bool {
+) -> AttachOutcome {
     if registry.contains(agent_id) {
-        return true;
+        return AttachOutcome::Attached;
     }
-    let Some(session) = tmux::list_sessions().await.into_iter().find(|name| {
+    // Serialize lazy attaches: snapshot bursts and stdin dispatch racing here
+    // would double-attach and displace each other's handles in the registry,
+    // orphaning a live tmux-attach pipeline.
+    let _guard = registry.lock_attach().await;
+    if registry.contains(agent_id) {
+        return AttachOutcome::Attached;
+    }
+    let sessions = match tmux::list_sessions().await {
+        Ok(sessions) => sessions,
+        Err(first_err) => {
+            // A transient subprocess failure must not read as "session gone";
+            // ask once more before declaring the state unknown.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            match tmux::list_sessions().await {
+                Ok(sessions) => sessions,
+                Err(retry_err) => {
+                    tracing::warn!(
+                        %agent_id,
+                        first = %first_err,
+                        retry = %retry_err,
+                        "tmux list-sessions failed twice; attach state unknown"
+                    );
+                    return AttachOutcome::Unknown;
+                }
+            }
+        }
+    };
+    let Some(session) = sessions.into_iter().find(|name| {
         tmux::agent_id_from_session(name)
             .map(|id| id == agent_id)
             .unwrap_or(false)
     }) else {
         tracing::debug!(%agent_id, "no tmux session found for unknown agent");
-        return false;
+        return AttachOutcome::NoSession;
     };
     match attach_existing_agent(agent_id, &session, registry, out_tx, true).await {
         Ok(()) => {
             tracing::info!(%agent_id, %session, "lazily reattached existing agent");
-            true
+            AttachOutcome::Attached
         }
         Err(e) => {
             tracing::warn!(%agent_id, %session, error = %e, "lazy agent reattach failed");
-            false
+            // The session exists; we just failed to attach right now.
+            AttachOutcome::Unknown
         }
     }
 }
@@ -2220,7 +2270,14 @@ async fn ensure_agent_attached(
 /// left behind by a previous instance and reattach to each. Inserts handles
 /// into the registry and spawns the await-exit task per agent.
 async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
-    let sessions = tmux::list_sessions().await;
+    let sessions = match tmux::list_sessions().await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            // Lazy per-agent attach still recovers agents on demand.
+            tracing::warn!(error = %e, "startup tmux discovery failed; skipping rediscovery");
+            return;
+        }
+    };
     for name in sessions {
         let Some(agent_id) = tmux::agent_id_from_session(&name) else {
             continue;

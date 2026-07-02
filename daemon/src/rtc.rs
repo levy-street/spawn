@@ -14,7 +14,9 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
@@ -111,7 +113,27 @@ impl RtcSessions {
         media_engine
             .register_default_codecs()
             .context("registering WebRTC codecs")?;
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let mut setting_engine = SettingEngine::default();
+        // webrtc-rs 0.17 leaks one mDNS socket plus an immortal resolver task
+        // per peer connection in the default QueryOnly mode (its close signal
+        // for .local resolution is an unwired TODO upstream), so every browser
+        // visit pinned ~12 fds until the daemon hit its fd limit and the host
+        // dropped offline. Browser .local candidates never resolve across
+        // networks anyway — direct connects use our real host candidates or
+        // srflx/TURN.
+        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // ICE also gathers candidate sockets per interface; virtual bridges
+        // multiply the socket count ~7x for candidates nothing can reach.
+        setting_engine.set_interface_filter(Box::new(|name: &str| {
+            !(name.starts_with("docker")
+                || name.starts_with("br-")
+                || name.starts_with("veth")
+                || name == "lo")
+        }));
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
+            .build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers: ice_servers.into_iter().map(to_webrtc_ice_server).collect(),

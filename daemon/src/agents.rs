@@ -18,6 +18,11 @@ pub struct AgentRegistry {
     /// from a previous daemon process this lifetime?". The first WS session
     /// of the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
+    /// Serializes lazy reattach: concurrent snapshot bursts and inbound stdin
+    /// both attach on demand, and racing attaches displace each other's
+    /// handles in `insert`, orphaning a live `tmux attach` pipeline (and its
+    /// PTY fds) until the session dies.
+    attach_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RegistryEntry {
@@ -34,6 +39,11 @@ impl AgentRegistry {
     /// return false. Used to gate one-shot tmux discovery.
     pub fn claim_discovery(&self) -> bool {
         !self.discovery_done.swap(true, Ordering::SeqCst)
+    }
+
+    /// Guard held for the duration of a lazy reattach (tmux lookup + attach).
+    pub async fn lock_attach(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.attach_lock.lock().await
     }
 
     pub fn contains(&self, id: Uuid) -> bool {
