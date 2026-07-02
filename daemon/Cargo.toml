@@ -39,10 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 portable-pty = "0.8"
 bytes = "1"
 base64 = "0.22"
-webrtc = "0.8"
-# webrtc 0.8 pulls time through rcgen; keep Rust 1.86-compatible until the
-# daemon release pipeline moves to a newer toolchain.
-time = "=0.3.44"
+webrtc = "0.17"
 
 # misc
 url = "2"

@@ -18,7 +18,6 @@ use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -403,18 +402,10 @@ fn install_data_channel_handler(
 }
 
 fn to_webrtc_ice_server(config: RtcIceServerConfig) -> RTCIceServer {
-    let username = config.username.unwrap_or_default();
-    let credential = config.credential.unwrap_or_default();
-    let credential_type = if !username.is_empty() || !credential.is_empty() {
-        RTCIceCredentialType::Password
-    } else {
-        RTCIceCredentialType::Unspecified
-    };
     RTCIceServer {
         urls: config.urls,
-        username,
-        credential,
-        credential_type,
+        username: config.username.unwrap_or_default(),
+        credential: config.credential.unwrap_or_default(),
     }
 }
 
