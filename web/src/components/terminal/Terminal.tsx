@@ -227,6 +227,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
+  // Set when the terminal width changes: the next anchored snapshot rewrites
+  // the live buffer so seeded history reflows at the new width.
+  const historyReseedPendingRef = useRef(false);
   // Last trustworthy reader position (buffer line of the viewport top),
   // recorded only while no rewrite is collapsing the buffer. Rebuilt content
   // only grows at the bottom, so a line anchor keeps the reader's lines
@@ -774,6 +777,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           scrollbackLiveBytesAtRef.current >= scrollbackSnapshotRequestedAtRef.current;
         scrollbackCacheDirtyRef.current = dirty;
         if (dirty) scheduleScrollbackCacheRefreshRef.current();
+      }
+      if (
+        historyReseedPendingRef.current &&
+        typeof dcOffset === "number" &&
+        !scrollbackVisibleRef.current
+      ) {
+        // A width change left seeded history wrapped at the old width;
+        // rewrite the live buffer from this anchored capture so it reflows.
+        // Stays pending until a rewrite actually succeeds (alternate-screen
+        // apps and replay-coverage gaps defer it to a later snapshot).
+        if (syncLiveTerminalFromSnapshot(bytes)) {
+          historyReseedPendingRef.current = false;
+          socketRef.current.sendJson({ type: "redraw" });
+        }
       }
       if (scrollbackVisibleRef.current) {
         scrollbackSnapshotBytesRef.current = bytes;
@@ -1755,6 +1772,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
       }
+      // History already written into the live buffer keeps its old wrap
+      // after a width change (tmux reflows its own copy, not ours). Once a
+      // fresh offset-anchored capture arrives, rewrite the live buffer from
+      // it so history reflows at the new width too.
+      historyReseedPendingRef.current = true;
     };
 
     const fitTerminal = (preserveScroll: boolean) => {
