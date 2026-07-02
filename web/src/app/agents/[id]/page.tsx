@@ -158,8 +158,14 @@ function AgentTerminal() {
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
       <header className="flex items-center justify-between border-b border-border bg-background/95 px-3 py-2 pad-safe-x">
-        <div className="flex min-w-0 items-center gap-2">
-          <Button variant="ghost" size="icon" onClick={() => router.back()} aria-label="Back">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0 sm:size-10"
+            onClick={() => router.back()}
+            aria-label="Back"
+          >
             <ArrowLeft className="size-4" />
           </Button>
           {q.data && <AgentKindIcon agent={q.data} />}
@@ -191,7 +197,7 @@ function AgentTerminal() {
             )}
           </div>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           {currentTool?.update_available && (
             <Button
               variant="secondary"
@@ -223,12 +229,13 @@ function AgentTerminal() {
             state={displayState}
             onTakeControl={() => termRef.current?.takeControl()}
           />
-          <Button asChild variant="ghost" size="sm">
+          <Button asChild variant="ghost" size="sm" className="hidden sm:inline-flex">
             <Link href="/agents">All agents</Link>
           </Button>
           <Button
             variant="ghost"
             size="icon"
+            className="size-8 sm:size-10"
             aria-label="Rename agent"
             title="Rename agent"
             disabled={!q.data || renameM.isPending}
@@ -245,6 +252,7 @@ function AgentTerminal() {
           <Button
             variant="ghost"
             size="icon"
+            className="size-8 sm:size-10"
             aria-label="Restart agent"
             title="Restart agent"
             disabled={!q.data || restartM.isPending}
@@ -258,6 +266,7 @@ function AgentTerminal() {
             <Button
               variant="ghost"
               size="icon"
+              className="size-8 sm:size-10"
               aria-label="Unarchive agent"
               title="Unarchive agent"
               disabled={unarchiveM.isPending}
@@ -269,6 +278,7 @@ function AgentTerminal() {
             <Button
               variant="ghost"
               size="icon"
+              className="size-8 sm:size-10"
               aria-label="Archive agent"
               title="Archive agent"
               disabled={!q.data || archiveM.isPending}
@@ -280,6 +290,7 @@ function AgentTerminal() {
           <Button
             variant="destructive"
             size="icon"
+            className="size-8 sm:size-10"
             aria-label="Delete agent"
             title="Delete agent"
             disabled={deleteM.isPending}

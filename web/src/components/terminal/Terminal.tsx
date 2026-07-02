@@ -2344,13 +2344,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       >
         <Upload className="size-4" aria-hidden="true" />
       </button>
+      {/* Live region stays mounted so screen readers hear transitions; the
+          visible chip only appears when there is something worth saying —
+          a healthy "open" connection is the norm, not news. */}
       <div
-        className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-muted-foreground"
+        className={
+          socket.state !== "open" || exitBanner || uploadStatus
+            ? "pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-muted-foreground"
+            : "sr-only"
+        }
         aria-live="polite"
       >
-        {socket.state}
-        {exitBanner ? ` · ${exitBanner}` : ""}
-        {uploadStatus ? ` · ${uploadStatus}` : ""}
+        {[socket.state !== "open" ? socket.state : null, exitBanner, uploadStatus]
+          .filter(Boolean)
+          .join(" · ")}
       </div>
     </div>
   );

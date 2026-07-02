@@ -520,7 +520,7 @@ test.describe("terminal usability audit", () => {
       await dragTouchInTerminal(page, 0.62, 0.35);
       await expect(overlay).not.toBeVisible();
       await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
-      await page.getByRole("button", { name: "Tab" }).click();
+      await page.getByRole("button", { name: "Tab", exact: true }).click();
       await page.getByRole("button", { name: "Ctrl-C" }).click();
       await page.getByRole("button", { name: "Send" }).click();
       await expect.poll(() => binaryText(messages)).toContain("\t");

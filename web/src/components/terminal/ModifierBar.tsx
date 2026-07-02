@@ -30,6 +30,7 @@ interface Key {
 const CONTROL_KEYS: Key[] = [
   { label: "Esc", bytes: "\x1b", hint: "Escape" },
   { label: "Tab", bytes: "\t", hint: "Tab" },
+  { label: "⇧Tab", bytes: "\x1b[Z", hint: "Shift+Tab" },
   { label: "^C", bytes: "\x03", hint: "Ctrl-C" },
   { label: <ArrowUp className="size-4" />, bytes: "\x1b[A", hint: "Up" },
   { label: <ArrowDown className="size-4" />, bytes: "\x1b[B", hint: "Down" },
