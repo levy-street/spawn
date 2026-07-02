@@ -282,8 +282,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Live DataChannel chunks newer than the snapshot's capture offset. The
   // first replayed chunk may straddle the offset; slice off the part the
-  // capture already contains.
-  const takeDcReplaySlices = useCallback((bytes: Uint8Array): Uint8Array[] => {
+  // capture already contains. Returns null when the ring buffer no longer
+  // reaches back to the offset — a replay would leave a hole, and callers
+  // that rewrite authoritative content must not proceed on stale bytes.
+  const takeDcReplaySlices = useCallback((bytes: Uint8Array): Uint8Array[] | null => {
     const anchor = scrollbackSnapshotOffsetsRef.current.get(bytes);
     if (anchor === undefined) return [];
     const slices: Uint8Array[] = [];
@@ -298,12 +300,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         covered = true;
         slices.push(anchor > start ? chunk.bytes.subarray(anchor - start) : chunk.bytes);
       } else if (!covered && slices.length === 0) {
-        // The buffer no longer reaches back to the capture offset; a replay
-        // would leave a hole. Render the snapshot alone and let the next
-        // refresh converge.
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current();
-        return [];
+        return null;
       } else {
         slices.push(chunk.bytes);
       }
@@ -327,6 +326,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // snapshot would desync the buffer and cursor from the app's state.
       if (term.buffer.active.type === "alternate") return false;
 
+      // Compute the replay BEFORE writing anything: if the ring buffer can't
+      // cover the gap between the snapshot's capture offset and now (e.g.
+      // the overlay was open for a long stretch of heavy output), rewriting
+      // would roll the live terminal back to overlay-open-time content. The
+      // live terminal kept receiving every byte, so skipping is always safe.
+      const replaySlices = takeDcReplaySlices(bytes);
+      if (replaySlices === null) return false;
+
       const { cols, rows } = lastSizeRef.current;
       try {
         term.resize(cols, rows);
@@ -339,9 +346,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // keys) that the agent still believes are active, garbling input until
       // the next full repaint.
       term.write(`\x1b[0m\x1b[H\x1b[2J\x1b[3J${formatSnapshotForXterm(decodeUtf8(bytes))}`);
-      // Replay live DataChannel bytes newer than the capture so the rewrite
-      // can't roll the live terminal back behind what the user already saw.
-      const replaySlices = takeDcReplaySlices(bytes);
       for (const slice of replaySlices.slice(0, -1)) {
         term.write(slice);
       }
@@ -437,8 +441,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       historyTerm.resize(cols, rows);
       // Queue the snapshot and any newer live chunks back-to-back so nothing
       // that arrives mid-render can interleave; the callback rides the last
-      // queued write.
-      const replaySlices = takeDcReplaySlices(bytes);
+      // queued write. A coverage gap (null) renders the snapshot alone —
+      // best effort for the overlay; the scheduled refresh converges it.
+      const replaySlices = takeDcReplaySlices(bytes) ?? [];
       const writeQueue: (string | Uint8Array)[] = [
         formatSnapshotForXterm(decodeUtf8(bytes)),
         ...replaySlices,
