@@ -173,6 +173,11 @@ async def _send_initial_history(
                         "rows": initial_rows,
                     }
                 )
+                # tmux rewraps asynchronously after the PTY resize; give it a
+                # beat so the connect-time capture reflects the new width
+                # instead of racing the reflow (lines wrapped at the stale
+                # width otherwise persist in scrollback until overwritten).
+                await asyncio.sleep(0.15)
             snapshot = await broker.request_snapshot(
                 agent_id, daemon, lines=INITIAL_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
             )
