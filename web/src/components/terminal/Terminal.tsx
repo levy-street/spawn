@@ -37,6 +37,13 @@ const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
 // The cache refresh debounces on output, but a continuously-streaming agent
 // would postpone it forever — bound how stale the cache is allowed to get.
 const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
+// Without a DataChannel, snapshots share the relay WebSocket with keystroke
+// echoes: a multi-hundred-KB capture every couple of seconds head-of-line
+// blocks typing on slow links. Refresh far less often and capture fewer
+// lines; opening scrollback still fetches the full depth once.
+const SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS = 5_000;
+const SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS = 20_000;
+const SCROLLBACK_RELAY_CACHE_LINES = 2_000;
 // Never re-render the overlay underneath an actively-scrolling user: the
 // reset+rewrite collapses the scroll range mid-gesture and yanks the view.
 const SCROLLBACK_RERENDER_IDLE_MS = 350;
@@ -825,7 +832,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackSnapshotRequestedAtRef.current = Date.now();
     const sent = socketRef.current.sendJson({
       type: "snapshot",
-      lines: TERMINAL_SNAPSHOT_LINES,
+      lines:
+        purpose === "cache" && !dcActiveRef.current
+          ? SCROLLBACK_RELAY_CACHE_LINES
+          : TERMINAL_SNAPSHOT_LINES,
       plain: false,
     });
     if (!sent) {
@@ -843,16 +853,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
 
   const scheduleScrollbackCacheRefresh = useCallback(
-    (delayMs = 350) => {
+    (delayMs?: number) => {
       // Debounce on output, but bound the postponement: an agent that streams
       // faster than the debounce window would otherwise starve the refresh
       // forever, leaving the scrollback cache minutes stale.
+      const relayMode = !dcActiveRef.current;
+      const debounce = delayMs ?? (relayMode ? SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS : 350);
+      const maxWait = relayMode
+        ? SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS
+        : SCROLLBACK_REFRESH_MAX_WAIT_MS;
       const now = Date.now();
       if (scrollbackCacheRefreshDeadlineRef.current === null) {
-        scrollbackCacheRefreshDeadlineRef.current = now + SCROLLBACK_REFRESH_MAX_WAIT_MS;
+        scrollbackCacheRefreshDeadlineRef.current = now + maxWait;
       }
       const fireIn = Math.min(
-        delayMs,
+        debounce,
         Math.max(0, scrollbackCacheRefreshDeadlineRef.current - now),
       );
       if (scrollbackCacheRefreshTimerRef.current) {
