@@ -675,6 +675,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
         if (state.owner) {
           fitTerminalRef.current(true);
+          // Ownership is confirmed asynchronously; a refit that landed
+          // before this message recorded its size locally but never sent it
+          // (resize only goes out while owner). Converge the PTY on our
+          // geometry unconditionally — the daemon dedupes same-size resizes.
+          const { cols, rows } = lastSizeRef.current;
+          socketRef.current.sendJson({ type: "resize", cols, rows });
           return;
         }
 
