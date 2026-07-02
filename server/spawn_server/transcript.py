@@ -34,23 +34,30 @@ def _max_bytes_per_file() -> int:
     return get_settings().transcript_max_bytes_per_file
 
 
+def _append_blocking(agent_id: str, data: bytes) -> None:
+    path = _path(agent_id, 0)
+    try:
+        sz = path.stat().st_size
+    except FileNotFoundError:
+        sz = 0
+    if sz >= _max_bytes_per_file():
+        # Rotate: <id>.log -> <id>.log.1 (overwriting any older .1).
+        try:
+            path.replace(_path(agent_id, 1))
+        except FileNotFoundError:
+            pass
+    with open(path, "ab") as f:
+        f.write(data)
+
+
 async def append(agent_id: str, data: bytes) -> None:
     if not data:
         return
     async with _locks[agent_id]:
-        path = _path(agent_id, 0)
-        try:
-            sz = path.stat().st_size
-        except FileNotFoundError:
-            sz = 0
-        if sz >= _max_bytes_per_file():
-            # Rotate: <id>.log -> <id>.log.1 (overwriting any older .1).
-            try:
-                path.replace(_path(agent_id, 1))
-            except FileNotFoundError:
-                pass
-        with open(path, "ab") as f:
-            f.write(data)
+        # The stat/open/write are synchronous filesystem calls; keep them off
+        # the event loop so a slow disk can't stall every websocket on this
+        # worker.
+        await asyncio.to_thread(_append_blocking, agent_id, data)
 
 
 async def read(agent_id: str, max_bytes: int | None = None) -> bytes:

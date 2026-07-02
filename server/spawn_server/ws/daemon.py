@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 import logging
 from datetime import UTC, datetime
@@ -125,22 +127,34 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     log.warning("daemon sent non-output binary frame kind=%s", frame.kind)
                     continue
 
-                # Authorize: agent must belong to this host.
-                async with sm() as session:
-                    agent = await session.get(Agent, frame.agent_id)
-                    if agent is None or agent.host_id != host.id:
-                        log.warning("daemon stream for unknown agent=%s", frame.agent_id)
-                        continue
-                    now = _utcnow()
-                    if should_record_agent_output(str(frame.agent_id), now, frame.payload):
-                        agent.last_output_at = now
-                    host_obj = await session.get(Host, host.id)
-                    if host_obj is not None:
-                        host_obj.last_seen_at = now
-                    await session.commit()
+                # Authorize: agent must belong to this host. The broker's
+                # attach map is the fast path; fall back to the DB only for
+                # agents this connection hasn't streamed before (e.g. frames
+                # arriving before the register/started bookkeeping settles).
+                if frame.agent_id not in conn.agent_ids:
+                    async with sm() as session:
+                        agent = await session.get(Agent, frame.agent_id)
+                        if agent is None or agent.host_id != host.id:
+                            log.warning("daemon stream for unknown agent=%s", frame.agent_id)
+                            continue
+                    await broker.attach_agent_to_daemon(frame.agent_id, conn)
+
+                # Touch activity timestamps at most once per throttle window;
+                # a DB commit per output chunk head-of-line blocks the relay.
+                now = _utcnow()
+                if should_record_agent_output(str(frame.agent_id), now, frame.payload):
+                    async with sm() as session:
+                        agent = await session.get(Agent, frame.agent_id)
+                        if agent is not None:
+                            agent.last_output_at = now
+                        host_obj = await session.get(Host, host.id)
+                        if host_obj is not None:
+                            host_obj.last_seen_at = now
+                        await session.commit()
 
                 # Persist to the agent's on-disk transcript first so a server
-                # restart doesn't lose recent history.
+                # restart doesn't lose recent history. The file write is
+                # synchronous I/O; keep it off the event loop.
                 await transcript.append(frame.agent_id, frame.payload)
                 # Fan-out via pubsub (single source of truth; works the same
                 # in single-worker dev and multi-worker prod). Browsers
