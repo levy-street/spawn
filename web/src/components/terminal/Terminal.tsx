@@ -2172,7 +2172,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     event.preventDefault();
     dragDepthRef.current = 0;
     setDropActive(false);
-    void uploadFilesToCwd(files);
+    // Dropped images feed the prompt like a local terminal drop (attachment
+    // chip / pasted path per agent kind); only non-image files take the
+    // save-to-working-directory path, keeping plain uploads intentional.
+    const images = files.filter(isImageFile);
+    const others = files.filter((file) => !isImageFile(file));
+    if (images.length > 0) void uploadImages(images);
+    if (others.length > 0) void uploadFilesToCwd(others);
   };
 
   const onFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -2271,7 +2277,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       {dropActive && (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center border-2 border-dashed border-primary/70 bg-background/35 backdrop-blur-[1px]">
           <div className="rounded-md border border-border bg-card/95 px-3 py-2 text-sm text-foreground shadow-lg">
-            Drop files
+            Drop images into the prompt &middot; other files save to the working directory
           </div>
         </div>
       )}
