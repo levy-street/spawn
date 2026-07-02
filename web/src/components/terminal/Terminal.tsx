@@ -1668,6 +1668,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       if (event.key !== "Enter" && event.key !== "Return") return true;
+      // Plain terminals can't distinguish Shift+Enter from Enter; send the
+      // ESC+CR sequence TUIs like Claude Code bind to "insert newline" (the
+      // same mapping their /terminal-setup installs in iTerm/VS Code).
+      if (event.shiftKey && rawInputRef.current) {
+        hideScrollbackOverlay();
+        socketRef.current.sendBinary(ALT_ENTER);
+        return false;
+      }
       return !interceptMobileReturn(event);
     });
     term.textarea?.addEventListener("beforeinput", onBeforeInput, { capture: true });
