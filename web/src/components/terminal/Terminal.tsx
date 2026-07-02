@@ -219,6 +219,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
+  const scrollbackRenderInFlightRef = useRef(false);
   const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
   const recentDcChunksSizeRef = useRef(0);
   const dcActiveRef = useRef(false);
@@ -349,6 +350,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     // local rewrite, ask it to repaint so any drift self-corrects.
     if (synced) socketRef.current.sendJson({ type: "redraw" });
     scrollbackVisibleRef.current = false;
+    scrollbackRenderInFlightRef.current = false;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
     scrollbackPendingDeltaPxRef.current = 0;
@@ -372,6 +374,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const updateScrollbackReveal = useCallback(
     (overlay: HTMLElement) => {
+      // While a reset+rewrite is in flight the buffer is transiently
+      // collapsed; deciding visibility against it would blink the overlay
+      // out under the reader. The render's own completion callback re-runs
+      // this with the rebuilt buffer.
+      if (scrollbackRenderInFlightRef.current) return;
       const maxTop = maxElementScrollTop(overlay);
       const reveal =
         maxTop > 0 && overlay.scrollTop < maxTop - Math.max(1, terminalRowHeightRef.current * 0.75);
@@ -386,6 +393,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!bytes || !historyTerm) return;
       const generation = scrollbackRenderGenerationRef.current + 1;
       scrollbackRenderGenerationRef.current = generation;
+      scrollbackRenderInFlightRef.current = true;
 
       const { cols, rows } = lastSizeRef.current;
       historyTerm.reset();
@@ -407,6 +415,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           historyTerm.scrollToBottom();
           requestAnimationFrame(() => {
             if (scrollbackRenderGenerationRef.current !== generation) return;
+            scrollbackRenderInFlightRef.current = false;
             scrollbackRenderedSnapshotBytesRef.current = bytes;
             const overlay = getScrollbackViewport();
             if (!overlay) return;
