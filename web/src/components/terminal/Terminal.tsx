@@ -2371,7 +2371,12 @@ function wrapSnapshotForXterm(input: string): string {
 
 function formatSnapshotForXterm(input: string): string {
   const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
-  return wrapSnapshotForXterm(normalized.split("\n").join("\r\n"));
+  // tmux captures terminate the final row with a newline; writing it would
+  // scroll the terminal one row past the content and desync subsequent
+  // app-relative drawing by one row (e.g. input echo landing on the status
+  // bar row). Leave the cursor on the last content row instead.
+  const trimmed = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+  return wrapSnapshotForXterm(trimmed.split("\n").join("\r\n"));
 }
 
 function decodeUtf8(bytes: Uint8Array): string {
