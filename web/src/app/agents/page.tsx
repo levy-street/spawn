@@ -47,6 +47,80 @@ export default function AgentsPage() {
   );
 }
 
+const PREVIEW_LINES = 10;
+const PREVIEW_POLL_MS = 10_000;
+const PREVIEW_FETCH_CHUNK = 6;
+
+/**
+ * The daemon reports a dead/lost tmux session as snapshot *content* — this
+ * exact sentence and nothing else. Match the whole payload, not a substring:
+ * a live agent's scrollback can legitimately contain this text (e.g. while
+ * debugging spawn itself).
+ */
+const LOST_SESSION_MARKER =
+  "[spawn] agent is not attached to this daemon and no matching tmux session was found";
+
+// tmux appends stray SGR resets even in plain mode; strip CSI/OSC sequences
+// and control bytes before deciding which lines are blank.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
+const ANSI_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
+const CONTROL_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
+
+function decodeSnapshotTail(bytesB64: string): string | null {
+  const raw = atob(bytesB64);
+  const bytes = Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+  const text = new TextDecoder("utf-8", { fatal: false })
+    .decode(bytes)
+    .replace(ANSI_RE, "")
+    .replace(CONTROL_RE, "");
+  if (text.trim() === LOST_SESSION_MARKER) return null;
+  const lines = text.split(/\r?\n/).map((line) => line.trimEnd());
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.slice(-PREVIEW_LINES).join("\n");
+}
+
+/**
+ * Polls plain-text tmux tails for the running agents via the REST snapshot
+ * endpoint. Fetches in small chunks to stay gentle on the daemons; pauses
+ * automatically while the tab is hidden (react-query default).
+ */
+function useAgentTails(agentList: Agent[]): Record<string, string | null> {
+  const runningIds = useMemo(
+    () =>
+      agentList
+        .filter((a) => a.status === "running" && !isAgentArchived(a))
+        .map((a) => a.id)
+        .sort(),
+    [agentList],
+  );
+
+  const tailsQ = useQuery({
+    queryKey: ["agent-tails", runningIds],
+    enabled: runningIds.length > 0,
+    refetchInterval: PREVIEW_POLL_MS,
+    placeholderData: (previous) => previous,
+    queryFn: async () => {
+      const map: Record<string, string | null> = {};
+      for (let i = 0; i < runningIds.length; i += PREVIEW_FETCH_CHUNK) {
+        const chunk = runningIds.slice(i, i + PREVIEW_FETCH_CHUNK);
+        const results = await Promise.allSettled(
+          chunk.map(async (id) => {
+            const snapshot = await agents.snapshot(id, { lines: 100, plain: true });
+            return [id, decodeSnapshotTail(snapshot.bytes_b64)] as const;
+          }),
+        );
+        for (const result of results) {
+          if (result.status === "fulfilled") map[result.value[0]] = result.value[1];
+        }
+      }
+      return map;
+    },
+  });
+
+  return tailsQ.data ?? {};
+}
+
 function AgentsView() {
   const qc = useQueryClient();
   const [creating, setCreating] = useState(false);
@@ -59,6 +133,7 @@ function AgentsView() {
     queryFn: () => agents.list({ include_archived: includeArchived }),
     refetchInterval: 5_000,
   });
+  const tails = useAgentTails(q.data ?? []);
 
   const invalidateAgents = () => {
     qc.invalidateQueries({ queryKey: ["agents"] });
@@ -161,6 +236,7 @@ function AgentsView() {
         {(q.data ?? []).map((a: Agent) => (
           <AgentCard
             key={a.id}
+            tail={tails[a.id]}
             agent={a}
             editing={editingId === a.id}
             draftName={draftName}
@@ -193,8 +269,10 @@ function AgentsView() {
   );
 }
 
+// biome-ignore lint/nursery/useMaxParams: existing card prop surface
 function AgentCard({
   agent,
+  tail,
   editing,
   draftName,
   busy,
@@ -208,6 +286,7 @@ function AgentCard({
   onDelete,
 }: {
   agent: Agent;
+  tail?: string | null;
   editing: boolean;
   draftName: string;
   busy: boolean;
@@ -277,6 +356,25 @@ function AgentCard({
             </Link>
           )}
         </CardHeader>
+        <Link
+          href={`/agents/${agent.id}`}
+          aria-label={`Open ${agentTitle(agent)} terminal`}
+          className="mx-4 mb-3 block h-[9.5rem] overflow-hidden rounded border border-border/70 bg-[var(--color-terminal-bg)] px-2.5 py-2 transition-colors hover:border-foreground/25"
+        >
+          <pre className="flex h-full flex-col justify-end overflow-hidden whitespace-pre font-mono text-[11px] leading-[1.4] text-zinc-300">
+            {tail ? (
+              tail
+            ) : (
+              <span className="text-zinc-600">
+                {tail === null
+                  ? "· tmux session lost ·"
+                  : agent.status === "running"
+                    ? "· connecting ·"
+                    : `· ${agent.status} ·`}
+              </span>
+            )}
+          </pre>
+        </Link>
         <CardContent className="flex items-end justify-between gap-3 pt-0">
           <Link href={`/agents/${agent.id}`} className="min-w-0 text-xs text-muted-foreground">
             <span className="block truncate">{agent.cwd}</span>
