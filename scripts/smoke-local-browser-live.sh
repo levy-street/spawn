@@ -368,18 +368,18 @@ try {
   if (!terminalBox || terminalBox.width < 600 || terminalBox.height < 300) {
     throw new Error(`terminal layout too small: ${JSON.stringify(terminalBox)}`);
   }
-  await expect(page.locator(".xterm-rows")).toContainText("browser-live-ready", {
+  await expect(page.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live-ready", {
     timeout: 20_000,
   });
-  await expect(page.locator(".xterm-rows")).toContainText("LIVE_RED", {
+  await expect(page.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("LIVE_RED", {
     timeout: 20_000,
   });
   const normalColor = await page
-    .locator(".xterm-rows span", { hasText: "browser-live-ready" })
+    .locator('[data-testid="terminal-live-host"] .xterm-rows span', { hasText: "browser-live-ready" })
     .first()
     .evaluate((node) => window.getComputedStyle(node).color);
   const redColor = await page
-    .locator(".xterm-rows span", { hasText: "LIVE_RED" })
+    .locator('[data-testid="terminal-live-host"] .xterm-rows span', { hasText: "LIVE_RED" })
     .first()
     .evaluate((node) => window.getComputedStyle(node).color);
   if (redColor === normalColor) {
@@ -404,7 +404,7 @@ try {
   await page.getByLabel("Agent terminal").click();
   await page.keyboard.type("ping");
   await page.keyboard.press("Enter");
-  await expect(page.locator(".xterm-rows")).toContainText("browser-live:ping", {
+  await expect(page.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:ping", {
     timeout: 20_000,
   });
   await expect
@@ -458,7 +458,7 @@ try {
   await secondPage.getByLabel("Agent terminal").click();
   await secondPage.keyboard.type("second");
   await secondPage.keyboard.press("Enter");
-  await expect(secondPage.locator(".xterm-rows")).toContainText("browser-live:second", {
+  await expect(secondPage.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:second", {
     timeout: 20_000,
   });
   await secondPage.close();
