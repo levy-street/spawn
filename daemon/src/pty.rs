@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -64,7 +64,17 @@ pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
     direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
     notify: Arc<Notify>,
+    /// Cached `#{pane_in_mode}` so the stdin hot path never has to spawn a
+    /// tmux subprocess per keystroke; refreshed lazily in the background.
+    copy_mode: Arc<AtomicBool>,
+    copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
+
+/// How stale the cached copy-mode flag may get before a background refresh
+/// is kicked off. A keystroke landing within this window of the user
+/// entering copy-mode may slip through uncancelled — the same best-effort
+/// semantics the old always-cancel had for its own races.
+const COPY_MODE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl ForwarderControl {
     fn new() -> Self {
@@ -72,7 +82,40 @@ impl ForwarderControl {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            copy_mode: Arc::new(AtomicBool::new(false)),
+            copy_mode_checked_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Cached answer to "is the pane in copy-mode?", kicking off a background
+    /// refresh when the cache is stale. Never blocks on tmux.
+    pub fn copy_mode_cached(&self, session: &str) -> bool {
+        let needs_refresh = match self.copy_mode_checked_at.lock() {
+            Ok(mut guard) => match *guard {
+                Some(at) if at.elapsed() < COPY_MODE_CACHE_TTL => false,
+                _ => {
+                    *guard = Some(std::time::Instant::now());
+                    true
+                }
+            },
+            Err(_) => false,
+        };
+        if needs_refresh {
+            let flag = Arc::clone(&self.copy_mode);
+            let session = session.to_string();
+            tokio::spawn(async move {
+                if let Some(in_mode) = tmux::pane_in_mode(&session).await {
+                    flag.store(in_mode, Ordering::Relaxed);
+                }
+            });
+        }
+        self.copy_mode.load(Ordering::Relaxed)
+    }
+
+    /// Record that copy-mode was just cancelled without waiting for the next
+    /// background refresh.
+    pub fn clear_copy_mode(&self) {
+        self.copy_mode.store(false, Ordering::Relaxed);
     }
 
     /// Install the current WS session's outbound sink. Wakes the forwarder

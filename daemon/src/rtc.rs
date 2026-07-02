@@ -335,8 +335,14 @@ fn install_data_channel_handler(
                     if msg.is_string {
                         return;
                     }
+                    // Cached check: never pay a tmux subprocess per keystroke.
                     if let Some(session) = registry.session_for(agent_id) {
-                        tmux::cancel_copy_mode(&session).await;
+                        if let Some(control) = registry.control_for(agent_id) {
+                            if control.copy_mode_cached(&session) {
+                                tmux::cancel_copy_mode(&session).await;
+                                control.clear_copy_mode();
+                            }
+                        }
                     }
                     let found = registry.with_handle(agent_id, |h| {
                         if let Err(e) = h.write_stdin(&msg.data) {

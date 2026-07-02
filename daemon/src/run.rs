@@ -309,15 +309,22 @@ async fn dispatch_loop(
                     plain,
                     rtc_session_id,
                 } => {
-                    handle_agent_snapshot(
-                        agent_id,
-                        lines.unwrap_or(5_000),
-                        plain.unwrap_or(false),
-                        rtc_session_id,
-                        registry,
-                        out_tx,
-                    )
-                    .await;
+                    // Captures can take a while on deep panes; run them off
+                    // the dispatch loop so queued stdin frames aren't delayed
+                    // behind them.
+                    let registry = registry.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        handle_agent_snapshot(
+                            agent_id,
+                            lines.unwrap_or(5_000),
+                            plain.unwrap_or(false),
+                            rtc_session_id,
+                            &registry,
+                            &out_tx,
+                        )
+                        .await;
+                    });
                 }
                 Inbound::AgentRedraw { agent_id } => {
                     handle_agent_redraw(agent_id, registry).await;
@@ -392,7 +399,13 @@ async fn dispatch_loop(
                         tracing::debug!(%agent_id, "ignoring stdin for unknown agent");
                         continue;
                     };
-                    tmux::cancel_copy_mode(&session).await;
+                    // Cached check: never pay a tmux subprocess per keystroke.
+                    if let Some(control) = registry.control_for(agent_id) {
+                        if control.copy_mode_cached(&session) {
+                            tmux::cancel_copy_mode(&session).await;
+                            control.clear_copy_mode();
+                        }
+                    }
                     let found = registry.with_handle(agent_id, |h| {
                         if let Err(e) = h.write_stdin(&payload) {
                             tracing::warn!(%agent_id, error = %e, "PTY stdin write failed");

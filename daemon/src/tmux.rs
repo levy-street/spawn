@@ -384,6 +384,21 @@ pub async fn cancel_copy_mode(session: &str) {
     let _ = run_tmux(["send-keys", "-t", session, "-X", "cancel"]).await;
 }
 
+/// Whether the session's active pane is in a mode (copy-mode etc.). Returns
+/// None if tmux can't be queried.
+pub async fn pane_in_mode(session: &str) -> Option<bool> {
+    let out = tmux_command()
+        .args(["display-message", "-p", "-t", session, "-F", "#{pane_in_mode}"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
 async fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {
     let out = tmux_command()
         .args(args)
