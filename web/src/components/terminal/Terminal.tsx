@@ -52,6 +52,9 @@ const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // DataChannel, so a fresh capture can lag chunks already rendered locally;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
+// How long after a local live-buffer rewrite a keystroke still triggers a
+// covering repaint (the rewrite->repaint cursor desync window plus slack).
+const LIVE_REWRITE_ECHO_GUARD_MS = 5_000;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -230,6 +233,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
+  // Timestamp of the last local live-buffer rewrite; keystrokes shortly
+  // after request an extra repaint to cover stale-cursor echo artifacts.
+  const liveRewriteAtRef = useRef(0);
   // Last trustworthy reader position (buffer line of the viewport top),
   // recorded only while no rewrite is collapsing the buffer. Rebuilt content
   // only grows at the bottom, so a line anchor keeps the reader's lines
@@ -358,6 +364,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           term.scrollToBottom();
         },
       );
+      liveRewriteAtRef.current = Date.now();
       return true;
     },
     [takeDcReplaySlices],
@@ -750,6 +757,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       term.write(formatSnapshotForXterm(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
       });
+      liveRewriteAtRef.current = Date.now();
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset) => {
@@ -2089,6 +2097,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
+      // A local buffer rewrite parks the real cursor away from where the app
+      // believes it is until the requested repaint lands; a keystroke inside
+      // that window can echo a glyph at the stale position. One extra repaint
+      // right after the keystroke paints over it within a frame or two.
+      if (
+        liveRewriteAtRef.current !== 0 &&
+        Date.now() - liveRewriteAtRef.current < LIVE_REWRITE_ECHO_GUARD_MS
+      ) {
+        liveRewriteAtRef.current = 0;
+        socket.sendJson({ type: "redraw" });
+      }
     });
     return () => {
       onDataDisposableRef.current?.dispose();
