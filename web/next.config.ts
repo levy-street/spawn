@@ -22,6 +22,12 @@ function defaultPublicWsUrl(): string {
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  experimental: {
+    // Next buffers proxied request bodies (rewrites share the middleware
+    // pipeline) with a 10MB default, silently truncating larger uploads. The
+    // file explorer allows 32MB files; leave headroom.
+    middlewareClientMaxBodySize: 64 * 1024 * 1024,
+  },
   env: {
     NEXT_PUBLIC_SPAWN_WS_URL: defaultPublicWsUrl(),
   },
