@@ -15,7 +15,18 @@ export function AgentKindIcon({
   className?: string;
   iconClassName?: string;
 }) {
-  const kind = agentKind(agent);
+  return <KindIcon kind={agentKind(agent)} className={className} iconClassName={iconClassName} />;
+}
+
+export function KindIcon({
+  kind,
+  className,
+  iconClassName,
+}: {
+  kind: AgentKind;
+  className?: string;
+  iconClassName?: string;
+}) {
   return (
     <span
       className={cn(

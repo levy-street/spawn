@@ -69,7 +69,7 @@ export function isAgentArchived(agent: Agent): boolean {
   return agent.archived_at !== null;
 }
 
-function relativeTime(value: string | null | undefined): string | null {
+export function relativeTime(value: string | null | undefined): string | null {
   if (!value) return null;
   const time = Date.parse(value);
   if (!Number.isFinite(time)) return null;

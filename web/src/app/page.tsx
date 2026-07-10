@@ -237,7 +237,7 @@ function Dashboard() {
       <header className="mb-4 flex items-center justify-between">
         <h1 className="text-xl font-semibold">Dashboard</h1>
         <Button asChild>
-          <Link href="/agents">New agent</Link>
+          <Link href="/agents/new">New agent</Link>
         </Button>
       </header>
 

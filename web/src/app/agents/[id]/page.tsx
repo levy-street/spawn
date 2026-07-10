@@ -6,11 +6,13 @@ import {
   ArchiveRestore,
   ArrowLeft,
   Download,
+  MoreHorizontal,
   Pencil,
+  Pin,
+  PinOff,
   RotateCcw,
   Trash2,
 } from "lucide-react";
-import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
@@ -19,7 +21,15 @@ import { AppShell } from "@/components/nav/AppShell";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
-import { agentActivityDetail, agentCommand, agentTitle, isAgentArchived } from "@/lib/agents";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { AgentStatusDot } from "@/components/ui/status";
+import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
 import { agentAccess, agents, hosts } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -44,6 +54,8 @@ function AgentTerminal() {
   const termRef = useRef<TerminalHandle>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState("");
 
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
@@ -53,6 +65,7 @@ function AgentTerminal() {
   useEffect(() => {
     if (!id) return;
     setDisplayState(null);
+    setEditingName(false);
   }, [id]);
 
   const q = useQuery({
@@ -75,53 +88,58 @@ function AgentTerminal() {
     refetchInterval: 10_000,
   });
   const currentTool = toolsQ.data?.tools.find((tool) => tool.preset_id === q.data?.preset_id);
-  const accessSummary = accessQ.data?.skills.length
-    ? `skills ${accessQ.data.skills.map((skill) => skill.name).join(", ")}`
-    : "";
+  const skillsSummary = accessQ.data?.skills.length
+    ? accessQ.data.skills.map((skill) => skill.name).join(", ")
+    : null;
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["agents"] });
+    qc.invalidateQueries({ queryKey: ["hosts"] });
+    qc.invalidateQueries({ queryKey: ["agent", id] });
+  };
 
   const renameM = useMutation({
     mutationFn: (name: string) => agents.rename(id as string, name),
     onSuccess: () => {
       setActionError(null);
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      qc.invalidateQueries({ queryKey: ["agent", id] });
+      setEditingName(false);
+      invalidate();
     },
     onError: (err) => setActionError(String(err)),
   });
-
+  const pinM = useMutation({
+    mutationFn: (pinned: boolean) =>
+      pinned ? agents.pin(id as string) : agents.unpin(id as string),
+    onSuccess: () => {
+      setActionError(null);
+      invalidate();
+    },
+    onError: (err) => setActionError(String(err)),
+  });
   const archiveM = useMutation({
     mutationFn: () => agents.archive(id as string),
     onSuccess: () => {
       setActionError(null);
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      qc.invalidateQueries({ queryKey: ["hosts"] });
-      qc.invalidateQueries({ queryKey: ["agent", id] });
+      invalidate();
     },
     onError: (err) => setActionError(String(err)),
   });
-
   const unarchiveM = useMutation({
     mutationFn: () => agents.unarchive(id as string),
     onSuccess: () => {
       setActionError(null);
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      qc.invalidateQueries({ queryKey: ["hosts"] });
-      qc.invalidateQueries({ queryKey: ["agent", id] });
+      invalidate();
     },
     onError: (err) => setActionError(String(err)),
   });
-
   const deleteM = useMutation({
     mutationFn: () => agents.remove(id as string),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      qc.invalidateQueries({ queryKey: ["hosts"] });
-      qc.invalidateQueries({ queryKey: ["agent", id] });
+      invalidate();
       router.push("/agents");
     },
     onError: (err) => setActionError(String(err)),
   });
-
   const restartM = useMutation({
     mutationFn: () => {
       const size = termRef.current?.getSize();
@@ -129,12 +147,10 @@ function AgentTerminal() {
     },
     onSuccess: () => {
       setActionError(null);
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      qc.invalidateQueries({ queryKey: ["agent", id] });
+      invalidate();
     },
     onError: (err) => setActionError(String(err)),
   });
-
   const updateToolM = useMutation({
     mutationFn: () => hosts.installTool(q.data!.host_id, q.data!.preset_id!),
     onSuccess: () => {
@@ -144,55 +160,81 @@ function AgentTerminal() {
     onError: (err) => setActionError(String(err)),
   });
 
+  const submitRename = () => {
+    const next = draftName.trim();
+    if (!q.data || !next || next === q.data.name) {
+      setEditingName(false);
+      return;
+    }
+    renameM.mutate(next);
+  };
+
   if (!id) return null;
+  const agent = q.data;
+  const archived = agent ? isAgentArchived(agent) : false;
 
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
-      <header className="flex items-center justify-between border-b border-border bg-background/95 px-3 py-2 pad-safe-x">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8 shrink-0 sm:size-10"
-            onClick={() => router.back()}
-            aria-label="Back"
-          >
-            <ArrowLeft className="size-4" />
-          </Button>
-          {q.data && <AgentKindIcon agent={q.data} />}
-          <div className="min-w-0">
-            <div className="truncate text-sm font-medium">{q.data ? agentTitle(q.data) : id}</div>
-            <div className="truncate font-mono text-[11px] text-muted-foreground">
-              {q.data ? agentCommand(q.data) : "loading..."}
-            </div>
-            <div className="truncate text-[11px] text-muted-foreground">
-              {q.data
-                ? `${agentActivityDetail(q.data)}${isAgentArchived(q.data) ? " · archived" : ""} · ${q.data.cwd}`
-                : ""}
-            </div>
-            {q.data?.tmux_session && (
-              <div
-                className="hidden truncate font-mono text-[10px] text-muted-foreground sm:block"
-                title={q.data.tmux_session}
-              >
-                tmux {q.data.tmux_session}
-              </div>
-            )}
-            {accessSummary && (
-              <div
-                className="hidden truncate text-[10px] text-muted-foreground sm:block"
-                title={accessSummary}
-              >
-                {accessSummary}
-              </div>
-            )}
+      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 shrink-0"
+          onClick={() => router.back()}
+          aria-label="Back"
+        >
+          <ArrowLeft className="size-4" />
+        </Button>
+
+        {agent && (
+          <span className="relative shrink-0">
+            <AgentKindIcon agent={agent} />
+            <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
+          </span>
+        )}
+
+        <div className="min-w-0 flex-1">
+          {editingName ? (
+            <Input
+              aria-label="Agent name"
+              autoFocus
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              onBlur={submitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitRename();
+                if (e.key === "Escape") setEditingName(false);
+              }}
+              className="h-7 max-w-64 text-sm"
+              disabled={renameM.isPending}
+            />
+          ) : (
+            <button
+              type="button"
+              className="block max-w-full truncate rounded px-0.5 text-left text-sm font-medium leading-5 hover:bg-accent/50"
+              title="Rename agent"
+              onClick={() => {
+                if (!agent) return;
+                setDraftName(agent.name ?? agentTitle(agent));
+                setEditingName(true);
+              }}
+            >
+              {agent ? agentTitle(agent) : "…"}
+            </button>
+          )}
+          <div className="truncate px-0.5 text-[11px] leading-4 text-muted-foreground">
+            {agent
+              ? `${agentActivityDetail(agent)}${archived ? " · archived" : ""} · ${agent.host_name ?? "?"} · ${agent.cwd}`
+              : "loading…"}
           </div>
         </div>
+
         <div className="flex shrink-0 items-center gap-1">
           {currentTool?.update_available && (
             <Button
               variant="secondary"
               size="sm"
+              className="hidden sm:inline-flex"
               disabled={updateToolM.isPending}
               title={
                 currentTool.latest_version
@@ -202,95 +244,122 @@ function AgentTerminal() {
               onClick={() => updateToolM.mutate()}
             >
               <Download className="size-4" />
-              <span className="hidden sm:inline">
-                {updateToolM.isPending
-                  ? "Updating..."
-                  : currentTool.auto_update
-                    ? "Auto updating"
-                    : "Update available"}
-              </span>
+              {updateToolM.isPending
+                ? "Updating..."
+                : currentTool.auto_update
+                  ? "Auto updating"
+                  : "Update"}
             </Button>
-          )}
-          {!currentTool?.update_available && currentTool?.auto_update && (
-            <span className="hidden whitespace-nowrap rounded border border-border px-2 py-1 text-xs text-muted-foreground sm:inline">
-              Auto update on
-            </span>
           )}
           <TerminalDisplayControl
             state={displayState}
             onTakeControl={() => termRef.current?.takeControl()}
           />
-          <Button asChild variant="ghost" size="sm" className="hidden sm:inline-flex">
-            <Link href="/agents">All agents</Link>
-          </Button>
           <Button
             variant="ghost"
             size="icon"
-            className="size-8 sm:size-10"
-            aria-label="Rename agent"
-            title="Rename agent"
-            disabled={!q.data || renameM.isPending}
-            onClick={() => {
-              if (!q.data) return;
-              const next = prompt("Rename agent", q.data.name ?? agentTitle(q.data));
-              if (next === null) return;
-              const name = next.trim();
-              if (name) renameM.mutate(name);
-            }}
-          >
-            <Pencil className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8 sm:size-10"
+            className="size-8"
             aria-label="Restart agent"
             title="Restart agent"
-            disabled={!q.data || restartM.isPending}
+            disabled={!agent || restartM.isPending}
             onClick={() => {
               if (confirm("Restart this agent?")) restartM.mutate();
             }}
           >
             <RotateCcw className={`size-4 ${restartM.isPending ? "animate-spin" : ""}`} />
           </Button>
-          {q.data && isAgentArchived(q.data) ? (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 sm:size-10"
-              aria-label="Unarchive agent"
-              title="Unarchive agent"
-              disabled={unarchiveM.isPending}
-              onClick={() => unarchiveM.mutate()}
-            >
-              <ArchiveRestore className="size-4" />
-            </Button>
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 sm:size-10"
-              aria-label="Archive agent"
-              title="Archive agent"
-              disabled={!q.data || archiveM.isPending}
-              onClick={() => archiveM.mutate()}
-            >
-              <Archive className="size-4" />
-            </Button>
-          )}
-          <Button
-            variant="destructive"
-            size="icon"
-            className="size-8 sm:size-10"
-            aria-label="Delete agent"
-            title="Delete agent"
-            disabled={deleteM.isPending}
-            onClick={() => {
-              if (confirm("Delete this agent?")) deleteM.mutate();
-            }}
+          <DropdownMenu
+            menuClassName="w-64"
+            renderTrigger={(props) => (
+              <Button
+                {...props}
+                variant="ghost"
+                size="icon"
+                className="size-8"
+                aria-label="Agent actions"
+              >
+                <MoreHorizontal className="size-4" />
+              </Button>
+            )}
           >
-            <Trash2 className="size-4" />
-          </Button>
+            <DropdownMenuItem
+              disabled={!agent || renameM.isPending}
+              onSelect={() => {
+                if (!agent) return;
+                setDraftName(agent.name ?? agentTitle(agent));
+                setEditingName(true);
+              }}
+            >
+              <Pencil className="size-4" aria-hidden />
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!agent || pinM.isPending}
+              onSelect={() => pinM.mutate(!agent?.pinned_at)}
+            >
+              {agent?.pinned_at ? (
+                <PinOff className="size-4" aria-hidden />
+              ) : (
+                <Pin className="size-4" aria-hidden />
+              )}
+              {agent?.pinned_at ? "Unpin" : "Pin"}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!agent || archiveM.isPending || unarchiveM.isPending}
+              onSelect={() => (archived ? unarchiveM.mutate() : archiveM.mutate())}
+            >
+              {archived ? (
+                <ArchiveRestore className="size-4" aria-hidden />
+              ) : (
+                <Archive className="size-4" aria-hidden />
+              )}
+              {archived ? "Unarchive" : "Archive"}
+            </DropdownMenuItem>
+            {currentTool?.update_available && (
+              <DropdownMenuItem
+                className="sm:hidden"
+                disabled={updateToolM.isPending}
+                onSelect={() => updateToolM.mutate()}
+              >
+                <Download className="size-4" aria-hidden />
+                Update {currentTool.preset_name}
+              </DropdownMenuItem>
+            )}
+            {agent && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="space-y-1">
+                  <div className="truncate font-mono" title={agent.argv.join(" ")}>
+                    {agent.argv.join(" ")}
+                  </div>
+                  <div className="truncate font-mono" title={agent.cwd}>
+                    {agent.cwd}
+                  </div>
+                  {agent.tmux_session && (
+                    <div className="truncate font-mono" title={agent.tmux_session}>
+                      tmux {agent.tmux_session}
+                    </div>
+                  )}
+                  {skillsSummary && (
+                    <div className="truncate" title={skillsSummary}>
+                      skills: {skillsSummary}
+                    </div>
+                  )}
+                </DropdownMenuLabel>
+              </>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              destructive
+              disabled={deleteM.isPending}
+              onSelect={() => {
+                if (confirm("Delete this agent?")) deleteM.mutate();
+              }}
+            >
+              <Trash2 className="size-4" aria-hidden />
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenu>
         </div>
       </header>
 

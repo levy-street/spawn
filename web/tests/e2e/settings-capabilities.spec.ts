@@ -58,11 +58,13 @@ test("new agent form sends selected skills", async ({ page }) => {
     },
   });
 
-  await page.goto("/agents");
-  await page.getByRole("button", { name: "New agent" }).click();
-  await expect(page.getByLabel("review skill")).toBeChecked();
+  await page.goto("/agents/new");
+  await expect(page.getByRole("button", { name: "review skill" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await page.getByLabel("Name").fill("capability-check");
-  await page.getByRole("button", { name: "Spawn" }).click();
+  await page.getByRole("button", { name: "Spawn agent" }).click();
 
   await expect
     .poll(() => createdBody)

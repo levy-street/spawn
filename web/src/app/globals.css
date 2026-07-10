@@ -76,6 +76,26 @@ body {
   user-select: text;
 }
 
+/* Swift, decelerating easing shared by shell chrome animations. */
+@layer utilities {
+  .ease-swift {
+    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+}
+
+/* Honor reduced-motion globally: collapse all transitions/animations to
+ * near-instant so the shell stays fully usable without motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}
+
 @layer utilities {
   .pad-safe-top {
     padding-top: var(--safe-top);

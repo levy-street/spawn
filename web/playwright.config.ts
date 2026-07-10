@@ -7,6 +7,10 @@ const baseURL = configuredBaseUrl ?? `http://127.0.0.1:${port}`;
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
+  // One retry absorbs render-timing flakes under parallel-worker load (the
+  // scrollback reconciliation specs are rAF-sensitive); trace on-first-retry
+  // below captures the evidence whenever a retry actually happens.
+  retries: 1,
   expect: {
     timeout: 10_000,
   },

@@ -24,7 +24,7 @@ test("logged-in root shows the dashboard", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByRole("main").getByText("Hosts")).toBeVisible();
   await expect(page.getByText("Recent agents")).toBeVisible();
-  await expect(page.getByText(host.name)).toBeVisible();
+  await expect(page.getByRole("main").getByText(host.name)).toBeVisible();
 });
 
 test("new agent form posts with the authenticated session context", async ({ page }) => {
@@ -40,10 +40,13 @@ test("new agent form posts with the authenticated session context", async ({ pag
     },
   });
 
-  await page.goto("/agents");
-  await page.getByRole("button", { name: "New agent" }).click();
+  await page.goto("/agents/new");
+  await expect(page.getByRole("button", { name: host.name })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await page.getByLabel("Name").fill("review");
-  await page.getByRole("button", { name: "Spawn" }).click();
+  await page.getByRole("button", { name: "Spawn agent" }).click();
 
   await expect
     .poll(() => createdBody)
@@ -69,9 +72,8 @@ test("agent create permission errors are rendered as controlled form errors", as
     },
   });
 
-  await page.goto("/agents");
-  await page.getByRole("button", { name: "New agent" }).click();
-  await page.getByRole("button", { name: "Spawn" }).click();
+  await page.goto("/agents/new");
+  await page.getByRole("button", { name: "Spawn agent" }).click();
 
   await expect(page.getByText("CSRF token missing or invalid")).toBeVisible();
 });
