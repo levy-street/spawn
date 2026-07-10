@@ -88,8 +88,16 @@ export type Host = z.infer<typeof HostSchema>;
 export const HostDirEntrySchema = z.object({
   name: z.string(),
   path: z.string(),
+  is_dir: z.boolean().nullable().optional(),
+  size: z.number().int().nullable().optional(),
+  modified_at: z.number().int().nullable().optional(),
 });
 export type HostDirEntry = z.infer<typeof HostDirEntrySchema>;
+
+export const HostFileOpSchema = z.object({
+  path: z.string().nullable().optional(),
+});
+export type HostFileOp = z.infer<typeof HostFileOpSchema>;
 
 export const HostDirListSchema = z.object({
   path: z.string(),
@@ -378,6 +386,90 @@ export const hosts = {
       schema: HostDirListSchema,
     });
   },
+  files: (id: string, path?: string) => {
+    const search = new URLSearchParams();
+    if (path) search.set("path", path);
+    const qs = search.size ? `?${search.toString()}` : "";
+    return api(`/api/hosts/${id}/files${qs}`, {
+      method: "GET",
+      schema: HostDirListSchema,
+    });
+  },
+  downloadFile: async (id: string, path: string): Promise<Blob> => {
+    const search = new URLSearchParams({ path });
+    const res = await fetch(`${API_URL}/api/hosts/${id}/files/download?${search.toString()}`, {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
+      try {
+        payload = await res.json();
+      } catch {
+        // ignore
+      }
+      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
+      throw new ApiError(
+        res.status,
+        payload?.code ?? `http_${res.status}`,
+        payload?.message ?? detailMsg ?? res.statusText,
+        payload?.detail,
+      );
+    }
+    return res.blob();
+  },
+  uploadFile: async (
+    id: string,
+    file: File,
+    options: { dir: string; overwrite?: boolean },
+  ): Promise<HostFileOp> => {
+    const body = new FormData();
+    body.set("file", file);
+    body.set("dir", options.dir);
+    if (options.overwrite) body.set("overwrite", "true");
+    const res = await fetch(`${API_URL}/api/hosts/${id}/files/upload`, {
+      method: "POST",
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      body,
+    });
+    if (!res.ok) {
+      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
+      try {
+        payload = await res.json();
+      } catch {
+        // ignore
+      }
+      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
+      throw new ApiError(
+        res.status,
+        payload?.code ?? `http_${res.status}`,
+        payload?.message ?? detailMsg ?? res.statusText,
+        payload?.detail,
+      );
+    }
+    return HostFileOpSchema.parse(await res.json());
+  },
+  mkdir: (id: string, path: string) =>
+    api(`/api/hosts/${id}/files/mkdir`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+      schema: HostFileOpSchema,
+    }),
+  deleteFile: (id: string, body: { path: string; recursive?: boolean }) =>
+    api(`/api/hosts/${id}/files/delete`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: HostFileOpSchema,
+    }),
+  transferFile: (
+    id: string,
+    body: { path: string; dest_host_id: string; dest_dir: string; overwrite?: boolean },
+  ) =>
+    api(`/api/hosts/${id}/files/transfer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: HostFileOpSchema,
+    }),
   tools: (id: string) =>
     api(`/api/hosts/${id}/tools`, {
       method: "GET",

@@ -78,6 +78,7 @@ class Broker:
         self._display_by_agent: dict[str, _DisplayState] = {}
         self._snapshot_waiters: dict[str, set[asyncio.Future[dict]]] = defaultdict(set)
         self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
+        self._fs_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
         self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
@@ -323,6 +324,7 @@ class Broker:
         daemon: DaemonConn,
         *,
         path: str | None = None,
+        include_files: bool = False,
         timeout: float = 3.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
@@ -334,6 +336,8 @@ class Broker:
             payload: dict[str, object] = {"type": "host.fs.list", "request_id": request_id}
             if path is not None:
                 payload["path"] = path
+            if include_files:
+                payload["include_files"] = True
             await daemon.send_text(payload)
             return await asyncio.wait_for(fut, timeout=timeout)
         except TimeoutError:
@@ -346,6 +350,80 @@ class Broker:
     async def resolve_dir_list(self, request_id: str, payload: dict) -> None:
         async with self._lock:
             fut = self._dir_list_waiters.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(payload)
+
+    async def _request_fs(
+        self,
+        daemon: DaemonConn,
+        payload: dict[str, object],
+        *,
+        timeout: float,
+    ) -> dict | None:
+        request_id = str(uuid.uuid4())
+        payload["request_id"] = request_id
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict] = loop.create_future()
+        async with self._lock:
+            self._fs_waiters[request_id] = fut
+        try:
+            await daemon.send_text(payload)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except TimeoutError:
+            return None
+        finally:
+            async with self._lock:
+                if self._fs_waiters.get(request_id) is fut:
+                    self._fs_waiters.pop(request_id, None)
+
+    async def request_fs_read(
+        self, daemon: DaemonConn, *, path: str, timeout: float = 60.0
+    ) -> dict | None:
+        return await self._request_fs(
+            daemon, {"type": "host.fs.read", "path": path}, timeout=timeout
+        )
+
+    async def request_fs_write(
+        self,
+        daemon: DaemonConn,
+        *,
+        dir: str,
+        name: str,
+        bytes_b64: str,
+        overwrite: bool = False,
+        timeout: float = 60.0,
+    ) -> dict | None:
+        return await self._request_fs(
+            daemon,
+            {
+                "type": "host.fs.write",
+                "dir": dir,
+                "name": name,
+                "bytes_b64": bytes_b64,
+                "overwrite": overwrite,
+            },
+            timeout=timeout,
+        )
+
+    async def request_fs_mkdir(
+        self, daemon: DaemonConn, *, path: str, timeout: float = 10.0
+    ) -> dict | None:
+        return await self._request_fs(
+            daemon, {"type": "host.fs.mkdir", "path": path}, timeout=timeout
+        )
+
+    async def request_fs_remove(
+        self, daemon: DaemonConn, *, path: str, recursive: bool = False, timeout: float = 30.0
+    ) -> dict | None:
+        return await self._request_fs(
+            daemon,
+            {"type": "host.fs.remove", "path": path, "recursive": recursive},
+            timeout=timeout,
+        )
+
+    async def resolve_fs_result(self, request_id: str, payload: dict) -> None:
+        async with self._lock:
+            fut = self._fs_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
 

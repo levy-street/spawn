@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 
@@ -69,10 +69,19 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
     // the bare TCP; for `wss://` we'd need a TLS upgrade — supported by
     // `client_async_tls_with_config`, deferred until the deployment uses
     // wss in earnest.
+    // Explorer fs.read/fs.write payloads can be ~43MB of base64 in a single
+    // frame (the server's websockets stack doesn't fragment sends), so lift
+    // tungstenite's 16MiB-frame / 64MiB-message defaults.
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(96 * 1024 * 1024),
+        max_frame_size: Some(96 * 1024 * 1024),
+        ..WebSocketConfig::default()
+    };
+
     let (stream, response) = match scheme {
         "ws" => {
             let maybe_tls = MaybeTlsStream::Plain(tcp);
-            tokio_tungstenite::client_async(req, maybe_tls)
+            tokio_tungstenite::client_async_with_config(req, maybe_tls, Some(ws_config))
                 .await
                 .context("ws handshake")?
         }
@@ -81,7 +90,7 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
             // connect + TLS. We can't preconfigure keepalive here without
             // pulling in tokio-rustls directly; revisit when the public
             // deployment switches to TLS.
-            tokio_tungstenite::connect_async(req)
+            tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
                 .await
                 .context("ws connect (tls)")?
         }

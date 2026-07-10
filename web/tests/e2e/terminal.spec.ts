@@ -196,8 +196,23 @@ test("owner sees additional viewer count", async ({ page }) => {
   await expect(page.getByText("2 viewers")).toBeVisible();
 });
 
-test("terminal sends resize and file upload frames over the agent socket", async ({ page }) => {
+test("terminal sends resize frames and uploads files over REST", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page);
+  const uploads: Array<Record<string, unknown>> = [];
+  await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    uploads.push(body);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: {
+        agent_id: AGENT_ID,
+        path: "/Users/tester/projects/spawn/note.txt",
+        client_id: String(body.client_id ?? ""),
+        pasted: false,
+      },
+    });
+  });
 
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
@@ -207,16 +222,14 @@ test("terminal sends resize and file upload frames over the agent socket", async
     .locator('input[type="file"]')
     .setInputFiles({ name: "note.txt", mimeType: "text/plain", buffer: Buffer.from("hello file") });
 
-  await expect
-    .poll(() => jsonMessages(messages).find((message) => message?.type === "upload"))
-    .toMatchObject({
-      type: "upload",
-      destination: "cwd",
-      name: "note.txt",
-      mime_type: "text/plain",
-      bytes_b64: Buffer.from("hello file").toString("base64"),
-      paste: false,
-    });
+  await expect.poll(() => uploads.at(-1)).toMatchObject({
+    destination: "cwd",
+    name: "note.txt",
+    mime_type: "text/plain",
+    bytes_b64: Buffer.from("hello file").toString("base64"),
+    paste: false,
+  });
+  await expect(page.getByText("Uploaded /Users/tester/projects/spawn/note.txt")).toBeVisible();
 });
 
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {

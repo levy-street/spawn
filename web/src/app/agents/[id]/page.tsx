@@ -6,6 +6,7 @@ import {
   ArchiveRestore,
   ArrowLeft,
   Download,
+  FolderOpen,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -334,6 +335,14 @@ function AgentTerminal() {
               )}
               {agent?.pinned_at ? "Unpin" : "Pin"}
             </DropdownMenuItem>
+            {agent && (
+              <DropdownMenuItem
+                href={`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`}
+              >
+                <FolderOpen className="size-4" aria-hidden />
+                Browse files
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem
               disabled={!agent || archiveM.isPending || unarchiveM.isPending}
               onSelect={() => (archived ? unarchiveM.mutate() : archiveM.mutate())}

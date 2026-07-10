@@ -1,7 +1,15 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, MoreHorizontal, Pencil, Server, SquarePen, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  FolderOpen,
+  MoreHorizontal,
+  Pencil,
+  Server,
+  SquarePen,
+  Trash2,
+} from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
@@ -141,6 +149,12 @@ function HostDetail() {
               <Badge variant="outline">offline</Badge>
             ))}
         </div>
+        <Button asChild variant="outline" size="sm" className="shrink-0">
+          <Link href={`/hosts/${id}/files`}>
+            <FolderOpen className="size-4" />
+            <span className="hidden sm:inline">Files</span>
+          </Link>
+        </Button>
         <Button asChild size="sm" className="shrink-0">
           <Link href={`/agents/new?host=${id}`}>
             <SquarePen className="size-4" />

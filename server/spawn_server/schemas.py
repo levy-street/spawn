@@ -107,6 +107,9 @@ class HostPatch(BaseModel):
 class HostDirEntry(BaseModel):
     name: str
     path: str
+    is_dir: bool | None = None
+    size: int | None = None
+    modified_at: int | None = None
 
 
 class HostDirList(BaseModel):
@@ -115,6 +118,26 @@ class HostDirList(BaseModel):
     parent: str | None = None
     entries: list[HostDirEntry] = Field(default_factory=list)
     error: str | None = None
+
+
+class HostFileOpOut(BaseModel):
+    path: str | None = None
+
+
+class HostFileMkdirRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+
+
+class HostFileDeleteRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    recursive: bool = False
+
+
+class HostFileTransferRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    dest_host_id: str = Field(min_length=1, max_length=64)
+    dest_dir: str = Field(min_length=1, max_length=1024)
+    overwrite: bool = False
 
 
 class HostToolTarget(BaseModel):

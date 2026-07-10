@@ -20,6 +20,7 @@ import {
   useState,
 } from "react";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
+import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_FONT_SIZE = 13;
@@ -714,6 +715,36 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [onDisplayControl],
   );
 
+  const handleUploadSaved = useCallback(
+    (path: string, clientId?: string | null) => {
+      const targetId = clientId
+        ? pendingAttachmentsRef.current.find((attachment) => attachment.id === clientId)?.id
+        : pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
+      if (!targetId) {
+        showUploadStatus(`Uploaded ${compactPath(path)}`);
+        termRef.current?.focus();
+        return;
+      }
+
+      if (imagePasteMode === "bracketed-path") {
+        removePendingAttachment(targetId);
+        socketRef.current.sendBinary(bracketedPaste(shellSingleQuote(path)));
+        showUploadStatus("Image pasted");
+        termRef.current?.focus();
+        return;
+      }
+
+      const promptText = `@${compactPath(path)}`;
+      updatePendingAttachments((attachments) => {
+        return attachments.map((attachment) =>
+          attachment.id === targetId ? { ...attachment, promptText, status: "ready" } : attachment,
+        );
+      });
+      showUploadStatus("Image attached");
+    },
+    [imagePasteMode, removePendingAttachment, showUploadStatus, updatePendingAttachments],
+  );
+
   const socket = useAgentSocket({
     agentId,
     enabled: socketInitialSize !== null,
@@ -824,32 +855,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onUploadError: (message) => {
       showUploadStatus(message);
     },
-    onUploadSaved: (path, clientId) => {
-      const targetId = clientId
-        ? pendingAttachmentsRef.current.find((attachment) => attachment.id === clientId)?.id
-        : pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
-      if (!targetId) {
-        showUploadStatus(`Uploaded ${compactPath(path)}`);
-        termRef.current?.focus();
-        return;
-      }
-
-      if (imagePasteMode === "bracketed-path") {
-        removePendingAttachment(targetId);
-        socketRef.current.sendBinary(bracketedPaste(shellSingleQuote(path)));
-        showUploadStatus("Image pasted");
-        termRef.current?.focus();
-        return;
-      }
-
-      const promptText = `@${compactPath(path)}`;
-      updatePendingAttachments((attachments) => {
-        return attachments.map((attachment) =>
-          attachment.id === targetId ? { ...attachment, promptText, status: "ready" } : attachment,
-        );
-      });
-      showUploadStatus("Image attached");
-    },
+    onUploadSaved: handleUploadSaved,
   });
 
   // Stash the socket in a ref so the once-on-mount bootstrap useEffect can
@@ -1925,26 +1931,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         ]);
         try {
           const bytes_b64 = await fileToBase64(file);
-          const ok = socketRef.current.sendJson({
-            type: "upload",
+          const result = await agentsApi.upload(agentId, {
             client_id: clientId,
             name: file.name || defaultImageName(file),
             mime_type: mimeTypeForFile(file),
             bytes_b64,
             paste: false,
           });
-          if (!ok) {
-            showUploadStatus("Terminal is not connected.");
-            updatePendingAttachments((attachments) =>
-              attachments.map((attachment) =>
-                attachment.id === clientId ? { ...attachment, status: "error" } : attachment,
-              ),
-            );
-            return;
-          }
           sent += 1;
-        } catch {
-          showUploadStatus(`${file.name || "Image"} could not be read.`);
+          handleUploadSaved(result.path, result.client_id);
+        } catch (error) {
+          showUploadStatus(
+            error instanceof Error && error.message
+              ? error.message
+              : `${file.name || "Image"} could not be uploaded.`,
+          );
           updatePendingAttachments((attachments) =>
             attachments.map((attachment) =>
               attachment.id === clientId ? { ...attachment, status: "error" } : attachment,
@@ -1953,11 +1954,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
       }
       if (sent > 0) {
-        showUploadStatus(sent === 1 ? "Attaching image..." : `Attaching ${sent} images...`);
         termRef.current?.focus();
       }
     },
-    [showUploadStatus, updatePendingAttachments],
+    [agentId, handleUploadSaved, showUploadStatus, updatePendingAttachments],
   );
 
   const uploadFilesToCwd = useCallback(
@@ -1974,8 +1974,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         try {
           const bytes_b64 = await fileToBase64(file);
-          const ok = socketRef.current.sendJson({
-            type: "upload",
+          const result = await agentsApi.upload(agentId, {
             client_id: makeClientId(),
             destination: "cwd",
             name: file.name || "file",
@@ -1983,21 +1982,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             bytes_b64,
             paste: false,
           });
-          if (!ok) {
-            showUploadStatus("Terminal is not connected.");
-            return;
-          }
           sent += 1;
-        } catch {
-          showUploadStatus(`${file.name || "File"} could not be read.`);
+          showUploadStatus(`Uploaded ${compactPath(result.path)}`);
+        } catch (error) {
+          showUploadStatus(
+            error instanceof Error && error.message
+              ? error.message
+              : `${file.name || "File"} could not be uploaded.`,
+          );
         }
       }
       if (sent > 0) {
-        showUploadStatus(sent === 1 ? "Saving file..." : `Saving ${sent} files...`);
         termRef.current?.focus();
       }
     },
-    [showUploadStatus],
+    [agentId, showUploadStatus],
   );
 
   const pasteFromClipboard = useCallback(async () => {

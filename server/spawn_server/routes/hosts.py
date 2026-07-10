@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -401,6 +403,163 @@ async def list_host_dirs(
     if result is None:
         raise HTTPException(status_code=504, detail="host directory listing timed out")
     return schemas.HostDirList.model_validate(result)
+
+
+MAX_FS_BYTES = 32 * 1024 * 1024
+
+
+async def _online_daemon(session: AsyncSession, host_id: str, user: User):
+    await _get_owned_host(session, host_id, user)
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+    return daemon
+
+
+def _fs_op_out(result: dict | None, *, timeout_detail: str) -> schemas.HostFileOpOut:
+    if result is None:
+        raise HTTPException(status_code=504, detail=timeout_detail)
+    error = result.get("error")
+    if error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return schemas.HostFileOpOut(path=result.get("path"))
+
+
+@router.get("/{host_id}/files", response_model=schemas.HostDirList)
+async def list_host_files(
+    host_id: str,
+    path: str | None = Query(default=None, max_length=1024),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostDirList:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    result = await get_broker().request_dir_list(
+        daemon, path=path, include_files=True, timeout=10.0
+    )
+    if result is None:
+        raise HTTPException(status_code=504, detail="host file listing timed out")
+    return schemas.HostDirList.model_validate(result)
+
+
+@router.get("/{host_id}/files/download")
+async def download_host_file(
+    host_id: str,
+    path: str = Query(min_length=1, max_length=1024),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> Response:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    result = await get_broker().request_fs_read(daemon, path=path)
+    if result is None:
+        raise HTTPException(status_code=504, detail="host file download timed out")
+    error = result.get("error")
+    if error:
+        raise HTTPException(status_code=400, detail=str(error))
+    try:
+        data = base64.b64decode(result.get("bytes_b64") or "")
+    except Exception:
+        raise HTTPException(status_code=502, detail="host sent an invalid file payload") from None
+
+    name = str(result.get("name") or path.rsplit("/", 1)[-1] or "file")
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}'
+            )
+        },
+    )
+
+
+@router.post("/{host_id}/files/upload", response_model=schemas.HostFileOpOut)
+async def upload_host_file(
+    host_id: str,
+    file: UploadFile = File(...),
+    dir: str = Form(min_length=1, max_length=1024),
+    overwrite: bool = Form(default=False),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostFileOpOut:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    data = await file.read(MAX_FS_BYTES + 1)
+    if len(data) > MAX_FS_BYTES:
+        raise HTTPException(status_code=400, detail="Upload is too large; the limit is 32 MB.")
+
+    result = await get_broker().request_fs_write(
+        daemon,
+        dir=dir,
+        name=file.filename or "file",
+        bytes_b64=base64.b64encode(data).decode("ascii"),
+        overwrite=overwrite,
+    )
+    return _fs_op_out(result, timeout_detail="host file upload timed out")
+
+
+@router.post("/{host_id}/files/mkdir", response_model=schemas.HostFileOpOut)
+async def mkdir_host_file(
+    host_id: str,
+    body: schemas.HostFileMkdirRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostFileOpOut:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    result = await get_broker().request_fs_mkdir(daemon, path=body.path)
+    return _fs_op_out(result, timeout_detail="host mkdir timed out")
+
+
+@router.post("/{host_id}/files/delete", response_model=schemas.HostFileOpOut)
+async def delete_host_file(
+    host_id: str,
+    body: schemas.HostFileDeleteRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostFileOpOut:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    result = await get_broker().request_fs_remove(
+        daemon, path=body.path, recursive=body.recursive
+    )
+    return _fs_op_out(result, timeout_detail="host delete timed out")
+
+
+@router.post("/{host_id}/files/transfer", response_model=schemas.HostFileOpOut)
+async def transfer_host_file(
+    host_id: str,
+    body: schemas.HostFileTransferRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostFileOpOut:
+    src_daemon = await _online_daemon(session, host_id, user)
+    dest_daemon = await _online_daemon(session, body.dest_host_id, user)
+    await session.commit()
+
+    read = await get_broker().request_fs_read(src_daemon, path=body.path)
+    if read is None:
+        raise HTTPException(status_code=504, detail="source host file read timed out")
+    error = read.get("error")
+    if error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    name = str(read.get("name") or body.path.rsplit("/", 1)[-1] or "file")
+    result = await get_broker().request_fs_write(
+        dest_daemon,
+        dir=body.dest_dir,
+        name=name,
+        bytes_b64=str(read.get("bytes_b64") or ""),
+        overwrite=body.overwrite,
+    )
+    return _fs_op_out(result, timeout_detail="destination host file write timed out")
 
 
 @router.get("/{host_id}/tools", response_model=schemas.HostToolList)

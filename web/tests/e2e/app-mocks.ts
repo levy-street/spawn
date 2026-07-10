@@ -95,10 +95,36 @@ export function screen(overrides: Record<string, unknown> = {}) {
   };
 }
 
+export function fileEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    name: "notes.txt",
+    path: "/Users/tester/notes.txt",
+    is_dir: false,
+    size: 2048,
+    modified_at: 1750000000,
+    ...overrides,
+  };
+}
+
+export function fileListing(overrides: Record<string, unknown> = {}) {
+  return {
+    path: "/Users/tester",
+    home_dir: "/Users/tester",
+    parent: "/Users",
+    entries: [
+      fileEntry({ name: "projects", path: "/Users/tester/projects", is_dir: true, size: null }),
+      fileEntry(),
+    ],
+    error: null,
+    ...overrides,
+  };
+}
+
 export async function mockAuthenticatedApi(
   page: Page,
   options: {
     agents?: unknown[];
+    hosts?: unknown[];
     screens?: unknown[];
     updateScreen?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     createScreen?: (body: unknown, route: Route) => Promise<void> | void;
@@ -108,9 +134,15 @@ export async function mockAuthenticatedApi(
     createSkill?: (body: unknown, route: Route) => Promise<void> | void;
     updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     deleteSkill?: (id: string, route: Route) => Promise<void> | void;
+    files?: (hostId: string, path: string | null) => unknown;
+    fileUpload?: (hostId: string, route: Route) => Promise<void> | void;
+    fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+    fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+    fileTransfer?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   } = {},
 ) {
   const agents = options.agents ?? [];
+  const hostList = options.hosts ?? [host];
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
   await page.route("**/api/**", async (route) => {
@@ -124,7 +156,67 @@ export async function mockAuthenticatedApi(
       return;
     }
     if (path === "/api/hosts") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: [host] });
+      await route.fulfill({ status: 200, contentType: "application/json", json: hostList });
+      return;
+    }
+    const filesMatch = path.match(/^\/api\/hosts\/([^/]+)\/files(?:\/([a-z]+))?$/);
+    if (filesMatch) {
+      const [, hostId, op] = filesMatch;
+      if (!op && method === "GET") {
+        const listing =
+          options.files?.(hostId, url.searchParams.get("path")) ?? fileListing();
+        await route.fulfill({ status: 200, contentType: "application/json", json: listing });
+        return;
+      }
+      if (op === "download" && method === "GET") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/octet-stream",
+          headers: { "Content-Disposition": 'attachment; filename="notes.txt"' },
+          body: Buffer.from("hi"),
+        });
+        return;
+      }
+      if (op === "upload" && method === "POST") {
+        if (options.fileUpload) {
+          await options.fileUpload(hostId, route);
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          json: { path: "/Users/tester/upload.txt" },
+        });
+        return;
+      }
+      if ((op === "mkdir" || op === "delete" || op === "transfer") && method === "POST") {
+        const body = await request.postDataJSON();
+        const handler =
+          op === "mkdir"
+            ? options.fileMkdir
+            : op === "delete"
+              ? options.fileDelete
+              : options.fileTransfer;
+        if (handler) {
+          await handler(hostId, body, route);
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          json: { path: (body as { path?: string }).path ?? null },
+        });
+        return;
+      }
+    }
+    if (path.match(/^\/api\/hosts\/[^/]+$/) && method === "GET") {
+      const id = path.split("/").at(-1) ?? "";
+      const match = (hostList as Array<{ id?: string }>).find((h) => h.id === id);
+      await route.fulfill({
+        status: match ? 200 : 404,
+        contentType: "application/json",
+        json: match ?? { detail: "host not found" },
+      });
       return;
     }
     if (path === `/api/hosts/${HOST_ID}/tools`) {

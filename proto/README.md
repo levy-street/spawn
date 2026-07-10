@@ -227,7 +227,24 @@ Agent IDs are big-endian 16-byte UUIDs.
  "path": "/home/me/projects",
  "home_dir": "/home/me",
  "parent": "/home/me",
- "entries": [{"name": "foo", "path": "/home/me/projects/foo"}],
+ "entries": [{"name": "foo",
+              "path": "/home/me/projects/foo",
+              "is_dir": true,
+              "size": null,
+              "modified_at": 1750000000}],
+ "error": null}
+
+{"type": "host.fs.read_result",
+ "request_id": "uuid",
+ "path": "/home/me/projects/a.txt",
+ "name": "a.txt",
+ "size": 2,
+ "bytes_b64": "aGk=",
+ "error": null}
+
+{"type": "host.fs.op_result",
+ "request_id": "uuid",
+ "path": "/home/me/projects/a.txt",
  "error": null}
 
 {"type": "host.tools.check_result",
@@ -274,7 +291,28 @@ Agent IDs are big-endian 16-byte UUIDs.
 
 {"type": "host.fs.list",
  "request_id": "uuid",
- "path": "/home/me/projects"}
+ "path": "/home/me/projects",
+ "include_files": false}
+
+{"type": "host.fs.read",
+ "request_id": "uuid",
+ "path": "/home/me/projects/a.txt"}
+
+{"type": "host.fs.write",
+ "request_id": "uuid",
+ "dir": "/home/me/projects",
+ "name": "a.txt",
+ "bytes_b64": "aGk=",
+ "overwrite": false}
+
+{"type": "host.fs.mkdir",
+ "request_id": "uuid",
+ "path": "/home/me/projects/new-dir"}
+
+{"type": "host.fs.remove",
+ "request_id": "uuid",
+ "path": "/home/me/projects/old",
+ "recursive": false}
 
 {"type": "host.tools.check",
  "request_id": "uuid",

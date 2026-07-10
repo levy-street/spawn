@@ -8,6 +8,35 @@ use uuid::Uuid;
 
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
+/// Cap for explorer fs.read / fs.write payloads (raw bytes, pre-base64).
+pub const MAX_FS_BYTES: usize = 32 * 1024 * 1024;
+
+/// Save raw bytes into `dir` under a sanitized `name`. When `overwrite` is
+/// false a free `name-N.ext` variant is chosen instead of clobbering.
+pub async fn save_file_in_dir(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<PathBuf> {
+    if bytes.len() > MAX_FS_BYTES {
+        anyhow::bail!("file exceeds 32 MB");
+    }
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating directory {}", dir.display()))?;
+    let file_name = sanitized_file_name(name, "", "file", false);
+    let path = if overwrite {
+        dir.join(&file_name)
+    } else {
+        available_upload_path(dir, &file_name).await?
+    };
+    fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("writing file {}", path.display()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 async fn save_image_upload(
     cwd: &str,
@@ -189,6 +218,29 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn save_file_in_dir_respects_overwrite_flag() {
+        let dir = std::env::temp_dir().join(format!("spawn-fs-test-{}", Uuid::new_v4().simple()));
+
+        let first = save_file_in_dir(&dir, "../notes 1.txt", b"one", false)
+            .await
+            .unwrap();
+        assert_eq!(first, dir.join("notes_1.txt"));
+
+        let second = save_file_in_dir(&dir, "notes 1.txt", b"two", false)
+            .await
+            .unwrap();
+        assert_eq!(second, dir.join("notes_1-2.txt"));
+
+        let third = save_file_in_dir(&dir, "notes 1.txt", b"three", true)
+            .await
+            .unwrap();
+        assert_eq!(third, first);
+        assert_eq!(fs::read(&first).await.unwrap(), b"three");
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
 
     #[test]
     fn sanitizes_upload_names() {

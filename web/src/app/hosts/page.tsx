@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, Download, KeySquare, Server } from "lucide-react";
+import { ChevronRight, Download, FolderOpen, KeySquare, Server } from "lucide-react";
 import Link from "next/link";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
@@ -106,10 +106,10 @@ function HostsList() {
 function HostRow({ host }: { host: Host }) {
   const lastSeen = relativeTime(host.last_seen_at);
   return (
-    <li className="border-b border-border last:border-b-0">
+    <li className="group/hostrow relative border-b border-border last:border-b-0">
       <Link
         href={`/hosts/${host.id}`}
-        className="group flex items-center gap-3 px-4 py-3.5 transition-colors hover:bg-accent/40"
+        className="group flex items-center gap-3 px-4 py-3.5 pr-12 transition-colors hover:bg-accent/40"
       >
         <span className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
           <Server className="size-4" aria-hidden />
@@ -146,6 +146,14 @@ function HostRow({ host }: { host: Host }) {
           className="size-4 shrink-0 text-muted-foreground/50 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground"
           aria-hidden
         />
+      </Link>
+      <Link
+        href={`/hosts/${host.id}/files`}
+        aria-label={`${host.name} files`}
+        title="Browse files"
+        className="absolute right-9 top-1/2 grid size-7 -translate-y-1/2 place-items-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover/hostrow:opacity-100 [@media(pointer:coarse)]:opacity-100"
+      >
+        <FolderOpen className="size-4" aria-hidden />
       </Link>
     </li>
   );

@@ -270,11 +270,211 @@ async def test_host_dirs_roundtrip_requires_owned_online_daemon(client):
         "path": "/repo",
         "home_dir": "/home/oem",
         "parent": "/",
-        "entries": [{"name": "src", "path": "/repo/src"}],
+        "entries": [
+            {"name": "src", "path": "/repo/src", "is_dir": None, "size": None, "modified_at": None}
+        ],
         "error": None,
     }
 
     await broker.unregister_daemon(daemon)
+
+
+async def test_host_files_listing_download_and_ops(client):
+    import base64
+
+    token = await _signup(client, "host-files@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "host-files@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="files-box", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+
+    # Listing requests include files and pass metadata through.
+    task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/files?path=/repo", headers=auth))
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.list")
+    assert sent["include_files"] is True
+    await broker.resolve_dir_list(
+        sent["request_id"],
+        {
+            "path": "/repo",
+            "home_dir": "/home/oem",
+            "parent": "/",
+            "entries": [
+                {"name": "src", "path": "/repo/src", "is_dir": True},
+                {
+                    "name": "a.txt",
+                    "path": "/repo/a.txt",
+                    "is_dir": False,
+                    "size": 2,
+                    "modified_at": 1750000000,
+                },
+            ],
+        },
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    entries = r.json()["entries"]
+    assert entries[1]["size"] == 2
+    assert entries[1]["modified_at"] == 1750000000
+
+    # Download decodes the daemon payload and sets a filename.
+    start = len(fake_ws.sent_text)
+    task = asyncio.create_task(
+        client.get(f"/api/hosts/{host_id}/files/download?path=/repo/a.txt", headers=auth)
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.read", start=start)
+    assert sent["path"] == "/repo/a.txt"
+    await broker.resolve_fs_result(
+        sent["request_id"],
+        {
+            "request_id": sent["request_id"],
+            "path": "/repo/a.txt",
+            "name": "a.txt",
+            "size": 2,
+            "bytes_b64": base64.b64encode(b"hi").decode(),
+        },
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    assert r.content == b"hi"
+    assert 'filename="a.txt"' in r.headers["content-disposition"]
+
+    # Upload turns multipart into an fs.write frame.
+    start = len(fake_ws.sent_text)
+    task = asyncio.create_task(
+        client.post(
+            f"/api/hosts/{host_id}/files/upload",
+            headers=auth,
+            data={"dir": "/repo"},
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.write", start=start)
+    assert sent["dir"] == "/repo"
+    assert sent["name"] == "notes.txt"
+    assert base64.b64decode(sent["bytes_b64"]) == b"hello"
+    await broker.resolve_fs_result(
+        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/notes.txt"}
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    assert r.json() == {"path": "/repo/notes.txt"}
+
+    # mkdir + delete round-trip; daemon errors surface as 400s.
+    start = len(fake_ws.sent_text)
+    task = asyncio.create_task(
+        client.post(
+            f"/api/hosts/{host_id}/files/mkdir", headers=auth, json={"path": "/repo/new"}
+        )
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.mkdir", start=start)
+    await broker.resolve_fs_result(
+        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/new"}
+    )
+    assert (await task).status_code == 200
+
+    start = len(fake_ws.sent_text)
+    task = asyncio.create_task(
+        client.post(
+            f"/api/hosts/{host_id}/files/delete",
+            headers=auth,
+            json={"path": "/repo/new", "recursive": True},
+        )
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.remove", start=start)
+    assert sent["recursive"] is True
+    await broker.resolve_fs_result(
+        sent["request_id"],
+        {"request_id": sent["request_id"], "path": "/repo/new", "error": "permission denied"},
+    )
+    r = await task
+    assert r.status_code == 400
+    assert "permission denied" in r.json()["detail"]
+
+    await broker.unregister_daemon(daemon)
+
+
+async def test_host_file_transfer_pulls_from_source_and_pushes_to_dest(client):
+    import base64
+
+    token = await _signup(client, "host-transfer@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "host-transfer@example.com"))
+        ).scalar_one()
+        src = Host(owner_user_id=user.id, name="src-box", status="online")
+        dest = Host(owner_user_id=user.id, name="dest-box", status="online")
+        session.add_all([src, dest])
+        await session.commit()
+        src_id = src.id
+        dest_id = dest.id
+
+    broker = get_broker()
+    src_ws = _FakeWS()
+    dest_ws = _FakeWS()
+    src_daemon = DaemonConn(host_id=src_id, user_id="user", websocket=src_ws)  # type: ignore[arg-type]
+    dest_daemon = DaemonConn(host_id=dest_id, user_id="user", websocket=dest_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(src_daemon)
+    await broker.register_daemon(dest_daemon)
+
+    task = asyncio.create_task(
+        client.post(
+            f"/api/hosts/{src_id}/files/transfer",
+            headers=auth,
+            json={"path": "/repo/a.txt", "dest_host_id": dest_id, "dest_dir": "/inbox"},
+        )
+    )
+    read_frame = await _wait_for_text_frame(src_ws, "host.fs.read")
+    await broker.resolve_fs_result(
+        read_frame["request_id"],
+        {
+            "request_id": read_frame["request_id"],
+            "path": "/repo/a.txt",
+            "name": "a.txt",
+            "size": 2,
+            "bytes_b64": base64.b64encode(b"hi").decode(),
+        },
+    )
+    write_frame = await _wait_for_text_frame(dest_ws, "host.fs.write")
+    assert write_frame["dir"] == "/inbox"
+    assert write_frame["name"] == "a.txt"
+    assert base64.b64decode(write_frame["bytes_b64"]) == b"hi"
+    await broker.resolve_fs_result(
+        write_frame["request_id"],
+        {"request_id": write_frame["request_id"], "path": "/inbox/a.txt"},
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    assert r.json() == {"path": "/inbox/a.txt"}
+
+    await broker.unregister_daemon(src_daemon)
+    await broker.unregister_daemon(dest_daemon)
 
 
 async def test_host_tool_policy_auto_update_schedules_install(client):

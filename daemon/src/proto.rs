@@ -67,6 +67,27 @@ pub enum Outbound {
         #[serde(default)]
         error: Option<String>,
     },
+    #[serde(rename = "host.fs.read_result")]
+    HostFsReadResult {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        bytes_b64: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    #[serde(rename = "host.fs.op_result")]
+    HostFsOpResult {
+        request_id: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
     #[serde(rename = "host.tools.check_result")]
     HostToolsCheckResult {
         request_id: String,
@@ -121,6 +142,34 @@ pub enum Inbound {
         request_id: String,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
+        include_files: bool,
+    },
+    #[serde(rename = "host.fs.read")]
+    HostFsRead {
+        request_id: String,
+        path: String,
+    },
+    #[serde(rename = "host.fs.write")]
+    HostFsWrite {
+        request_id: String,
+        dir: String,
+        name: String,
+        bytes_b64: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    #[serde(rename = "host.fs.mkdir")]
+    HostFsMkdir {
+        request_id: String,
+        path: String,
+    },
+    #[serde(rename = "host.fs.remove")]
+    HostFsRemove {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        recursive: bool,
     },
     #[serde(rename = "host.tools.check")]
     HostToolsCheck {
@@ -254,6 +303,13 @@ pub struct AgentSkillConfig {
 pub struct HostDirEntry {
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_dir: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Unix epoch seconds of last modification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
