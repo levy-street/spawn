@@ -441,66 +441,65 @@ function HostFiles() {
                       {formatModified(entry.modified_at)}
                     </span>
                   </div>
-                  <div className="absolute right-1.5 top-1/2 -translate-y-1/2">
-                    <DropdownMenu
-                      renderTrigger={(props) => (
-                        <Button
-                          {...props}
-                          variant="ghost"
-                          size="icon"
-                          className="size-7 opacity-0 transition-opacity focus-visible:opacity-100 group-hover/filerow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
-                          aria-label={`${entry.name} actions`}
-                        >
-                          <MoreHorizontal className="size-4" />
-                        </Button>
-                      )}
-                    >
-                      {!isDir && (
-                        <DropdownMenuItem onSelect={() => void download(entry)}>
-                          <Download className="size-4" aria-hidden />
-                          Download
-                        </DropdownMenuItem>
-                      )}
-                      {!isDir && otherHosts.length > 0 && (
-                        <>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuLabel>Send to host</DropdownMenuLabel>
-                          {otherHosts.map((other) => (
-                            <DropdownMenuItem
-                              key={other.id}
-                              disabled={other.status !== "online"}
-                              onSelect={() =>
-                                transferM.mutate({
-                                  entry,
-                                  destHostId: other.id,
-                                  destDir: other.home_dir ?? "~",
-                                })
-                              }
-                            >
-                              <ArrowRightLeft className="size-4" aria-hidden />
-                              {other.name}
-                              {other.status !== "online" && (
-                                <span className="ml-auto text-[11px] text-muted-foreground">
-                                  offline
-                                </span>
-                              )}
-                            </DropdownMenuItem>
-                          ))}
-                        </>
-                      )}
-                      {!isDir && <DropdownMenuSeparator />}
-                      <DropdownMenuItem
-                        destructive
-                        onSelect={() => {
-                          const detail = isDir ? `${entry.name} and everything in it` : entry.name;
-                          if (confirm(`Delete ${detail}?`)) deleteM.mutate(entry);
-                        }}
+                  <DropdownMenu
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2"
+                    renderTrigger={(props) => (
+                      <Button
+                        {...props}
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 opacity-0 transition-opacity focus-visible:opacity-100 group-hover/filerow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
+                        aria-label={`${entry.name} actions`}
                       >
-                        <Trash2 className="size-4" aria-hidden />
-                        Delete
+                        <MoreHorizontal className="size-4" />
+                      </Button>
+                    )}
+                  >
+                    {!isDir && (
+                      <DropdownMenuItem onSelect={() => void download(entry)}>
+                        <Download className="size-4" aria-hidden />
+                        Download
                       </DropdownMenuItem>
-                    </DropdownMenu>
-                  </div>
+                    )}
+                    {!isDir && otherHosts.length > 0 && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuLabel>Send to host</DropdownMenuLabel>
+                        {otherHosts.map((other) => (
+                          <DropdownMenuItem
+                            key={other.id}
+                            disabled={other.status !== "online"}
+                            onSelect={() =>
+                              transferM.mutate({
+                                entry,
+                                destHostId: other.id,
+                                destDir: other.home_dir ?? "~",
+                              })
+                            }
+                          >
+                            <ArrowRightLeft className="size-4" aria-hidden />
+                            {other.name}
+                            {other.status !== "online" && (
+                              <span className="ml-auto text-[11px] text-muted-foreground">
+                                offline
+                              </span>
+                            )}
+                          </DropdownMenuItem>
+                        ))}
+                      </>
+                    )}
+                    {!isDir && <DropdownMenuSeparator />}
+                    <DropdownMenuItem
+                      destructive
+                      onSelect={() => {
+                        const detail = isDir ? `${entry.name} and everything in it` : entry.name;
+                        if (confirm(`Delete ${detail}?`)) deleteM.mutate(entry);
+                      }}
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                      Delete
+                    </DropdownMenuItem>
+                  </DropdownMenu>
                 </li>
               );
             })}
