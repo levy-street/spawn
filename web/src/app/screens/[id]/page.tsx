@@ -2,14 +2,12 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft,
   ChevronDown,
   Columns3,
   ExternalLink,
   Grid2x2,
   Maximize2,
   Minimize2,
-  MoreHorizontal,
   PanelLeft,
   Pencil,
   Plus,
@@ -33,7 +31,6 @@ import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
-import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -43,7 +40,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle } from "@/lib/agents";
-import { type Agent, ApiError, agents, type ScreenLayout, screens } from "@/lib/api";
+import { type Agent, ApiError, agents, type Screen, screens } from "@/lib/api";
 import {
   AGENT_DRAG_MIME,
   dragHasAgent,
@@ -70,7 +67,7 @@ import { cn } from "@/lib/utils";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
-const MAX_PANES_PER_TAB = 8;
+const MAX_PANES_PER_SCREEN = 8;
 const WIDE_CONTAINER_PX = 672;
 
 export default function ScreenDetailPage() {
@@ -90,8 +87,7 @@ function ScreenView({ id }: { id: string }) {
   const router = useRouter();
   const qc = useQueryClient();
 
-  const [layout, setLayout] = useState<ScreenLayout | null>(null);
-  const [activeTab, setActiveTab] = useState(0);
+  const [root, setRoot] = useState<LayoutNode | null | undefined>(undefined);
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -104,6 +100,7 @@ function ScreenView({ id }: { id: string }) {
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   });
+  const screensQ = useQuery({ queryKey: ["screens"], queryFn: screens.list });
   const agentsQ = useQuery({
     queryKey: ["agents"],
     queryFn: () => agents.list(),
@@ -116,18 +113,30 @@ function ScreenView({ id }: { id: string }) {
 
   // Seed the editable layout once per screen; PATCH responses stay canonical.
   useEffect(() => {
-    if (q.data && layout === null) {
-      setLayout(q.data.layout.tabs.length ? q.data.layout : { tabs: [{ name: null, root: null }] });
-    }
-  }, [q.data, layout]);
+    if (q.data && root === undefined) setRoot(q.data.layout.root ?? null);
+  }, [q.data, root]);
+
+  // Remember the last screen for the /screens switchboard.
+  useEffect(() => {
+    window.localStorage.setItem("spawn.screens.last", id);
+  }, [id]);
 
   const onError = (err: unknown) => setError(err instanceof ApiError ? err.message : String(err));
 
   const saveM = useMutation({
-    mutationFn: (next: ScreenLayout) => screens.update(id, { layout: next }),
+    mutationFn: (next: LayoutNode | null) => screens.update(id, { layout: { root: next } }),
     onSuccess: (saved) => {
       setError(null);
       qc.setQueryData(["screen", id], saved);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+    },
+    onError,
+  });
+  const otherScreenM = useMutation({
+    mutationFn: ({ screenId, nextRoot }: { screenId: string; nextRoot: LayoutNode | null }) =>
+      screens.update(screenId, { layout: { root: nextRoot } }),
+    onSuccess: () => {
+      setError(null);
       qc.invalidateQueries({ queryKey: ["screens"] });
     },
     onError,
@@ -142,31 +151,42 @@ function ScreenView({ id }: { id: string }) {
     },
     onError,
   });
+  const createM = useMutation({
+    mutationFn: () => {
+      const existing = new Set((screensQ.data ?? []).map((screen) => screen.name));
+      let n = (screensQ.data?.length ?? 0) + 1;
+      while (existing.has(`Screen ${n}`)) n += 1;
+      return screens.create({ name: `Screen ${n}`, layout: { root: null } });
+    },
+    onSuccess: (created) => {
+      qc.invalidateQueries({ queryKey: ["screens"] });
+      router.push(`/screens/${created.id}`);
+    },
+    onError,
+  });
   const deleteM = useMutation({
     mutationFn: () => screens.remove(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["screens"] });
-      router.push("/screens");
+      const remaining = (screensQ.data ?? []).filter((screen) => screen.id !== id);
+      router.push(remaining.length > 0 ? `/screens/${remaining[0].id}` : "/screens");
     },
     onError,
   });
 
-  const commit = (next: ScreenLayout) => {
-    setLayout(next);
+  const commit = (next: LayoutNode | null) => {
+    setRoot(next);
     saveM.mutate(next);
   };
 
   const screen = q.data;
-  const tabs = layout?.tabs ?? [];
-  const tabIndex = Math.min(activeTab, Math.max(0, tabs.length - 1));
-  const tab = tabs[tabIndex];
-  const root = tab?.root ?? null;
-  const tabAgentIds = useMemo(() => collectAgentIds(root), [root]);
+  const currentRoot = root === undefined ? null : root;
+  const screenAgentIds = useMemo(() => collectAgentIds(currentRoot), [currentRoot]);
 
-  // Zoom is per-tab and ephemeral; clear it when the pane leaves the tab.
+  // Zoom is ephemeral; clear it when the pane leaves the screen.
   useEffect(() => {
-    if (zoomedId && !tabAgentIds.includes(zoomedId)) setZoomedId(null);
-  }, [tabAgentIds, zoomedId]);
+    if (zoomedId && !screenAgentIds.includes(zoomedId)) setZoomedId(null);
+  }, [screenAgentIds, zoomedId]);
 
   const submitRename = () => {
     const next = draftName.trim();
@@ -177,176 +197,151 @@ function ScreenView({ id }: { id: string }) {
     renameM.mutate(next);
   };
 
-  const setTabRoot = (index: number, nextRoot: LayoutNode | null) => {
-    if (!layout) return;
-    commit({
-      tabs: layout.tabs.map((t, i) => (i === index ? { ...t, root: nextRoot } : t)),
-    });
-  };
-
-  /** Insert or move `agentId` relative to `targetId` (null = tab root edge). */
+  /** Insert or move `agentId` relative to `targetId` within this screen. */
   const placeAgent = (
-    index: number,
     agentId: string,
     targetId: string | null,
     side: Side | "center",
-    sourceTab: number | null,
+    sourceScreen: string | null,
   ) => {
-    if (!layout) return;
-    const targetRoot = layout.tabs[index]?.root ?? null;
-    const inTab = collectAgentIds(targetRoot).includes(agentId);
+    const inScreen = screenAgentIds.includes(agentId);
 
-    if (inTab) {
+    if (inScreen) {
       if (targetId === null || targetId === agentId) return;
-      setTabRoot(index, movePane(targetRoot, agentId, targetId, side));
+      commit(movePane(currentRoot, agentId, targetId, side));
       return;
     }
-    if (side === "center") return; // swap only applies to panes already in the tab
-    if (countPanes(targetRoot) >= MAX_PANES_PER_TAB) {
-      setError(`A tab holds at most ${MAX_PANES_PER_TAB} panes — remove one first.`);
+    if (side === "center") return; // swap only applies to panes already here
+    if (countPanes(currentRoot) >= MAX_PANES_PER_SCREEN) {
+      setError(`A screen holds at most ${MAX_PANES_PER_SCREEN} panes — remove one first.`);
       return;
     }
     setError(null);
+    commit(insertAtEdge(currentRoot, targetId, side, agentId));
 
-    // Cross-tab move: pull the pane out of its source tab in the same commit.
-    if (sourceTab !== null && sourceTab !== index && layout.tabs[sourceTab]) {
-      commit({
-        tabs: layout.tabs.map((t, i) => {
-          if (i === sourceTab) return { ...t, root: removePane(t.root ?? null, agentId) };
-          if (i === index)
-            return { ...t, root: insertAtEdge(t.root ?? null, targetId, side, agentId) };
-          return t;
-        }),
-      });
+    // Pane dragged over from another screen: pull it out of the source too.
+    if (sourceScreen && sourceScreen !== id) {
+      const source = (screensQ.data ?? []).find((item) => item.id === sourceScreen);
+      if (source) {
+        otherScreenM.mutate({
+          screenId: sourceScreen,
+          nextRoot: removePane(source.layout.root ?? null, agentId),
+        });
+      }
+    }
+  };
+
+  /** Drop on another screen's tab pill: file the agent into that screen. */
+  const sendToScreen = (target: Screen, agentId: string, sourceScreen: string | null) => {
+    if (target.id === id) {
+      placeAgent(agentId, null, "right", sourceScreen);
       return;
     }
-    setTabRoot(index, insertAtEdge(targetRoot, targetId, side, agentId));
+    const targetRoot = target.layout.root ?? null;
+    if (collectAgentIds(targetRoot).includes(agentId)) return;
+    if (countPanes(targetRoot) >= MAX_PANES_PER_SCREEN) {
+      setError(`${target.name} already holds ${MAX_PANES_PER_SCREEN} panes.`);
+      return;
+    }
+    setError(null);
+    otherScreenM.mutate({
+      screenId: target.id,
+      nextRoot: insertAtEdge(targetRoot, null, "right", agentId),
+    });
+    if (sourceScreen === id && screenAgentIds.includes(agentId)) {
+      commit(removePane(currentRoot, agentId));
+    }
   };
 
   const arrange = (build: (ids: string[]) => LayoutNode | null) => {
-    setTabRoot(tabIndex, build(tabAgentIds));
-  };
-
-  const addTab = () => {
-    if (!layout || layout.tabs.length >= 8) return;
-    commit({ tabs: [...layout.tabs, { name: null, root: null }] });
-    setActiveTab(layout.tabs.length);
-  };
-  const renameTab = (index: number) => {
-    if (!layout) return;
-    const current = layout.tabs[index];
-    const next = prompt("Rename tab", current?.name ?? `Tab ${index + 1}`);
-    if (next === null) return;
-    commit({
-      tabs: layout.tabs.map((t, i) => (i === index ? { ...t, name: next.trim() || null } : t)),
-    });
-  };
-  const closeTab = (index: number) => {
-    if (!layout || layout.tabs.length <= 1) return;
-    commit({ tabs: layout.tabs.filter((_, i) => i !== index) });
-    setActiveTab(Math.max(0, tabIndex - (index <= tabIndex ? 1 : 0)));
+    commit(build(screenAgentIds));
   };
 
   const candidates = (agentsQ.data ?? []).filter(
-    (agent) => !tabAgentIds.includes(agent.id) && agent.archived_at === null,
+    (agent) => !screenAgentIds.includes(agent.id) && agent.archived_at === null,
   );
+  const allScreens = screensQ.data ?? [];
 
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
-        <Button
-          asChild
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0"
-          aria-label="All screens"
-        >
-          <Link href="/screens">
-            <ArrowLeft className="size-4" />
-          </Link>
-        </Button>
-
-        {editingName ? (
-          <Input
-            aria-label="Screen name"
-            autoFocus
-            value={draftName}
-            onChange={(e) => setDraftName(e.target.value)}
-            onBlur={submitRename}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") submitRename();
-              if (e.key === "Escape") setEditingName(false);
-            }}
-            className="h-7 max-w-48 text-sm"
-            disabled={renameM.isPending}
-          />
-        ) : (
-          <button
-            type="button"
-            className="max-w-48 shrink-0 truncate rounded px-0.5 text-sm font-semibold tracking-tight hover:bg-accent/50"
-            title="Rename screen"
-            onClick={() => {
-              if (!screen) return;
-              setDraftName(screen.name);
-              setEditingName(true);
-            }}
-          >
-            {screen?.name ?? "…"}
-          </button>
-        )}
-
-        {/* Tab strip */}
+        {/* Screens as tabs */}
         <div
           role="tablist"
-          aria-label="Screen tabs"
+          aria-label="Screens"
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto px-1"
         >
-          {tabs.map((t, i) => {
-            const active = i === tabIndex;
-            const label = t.name?.trim() || `Tab ${i + 1}`;
+          {allScreens.map((item) => {
+            const active = item.id === id;
             return (
-              <TabPill
-                // biome-ignore lint/suspicious/noArrayIndexKey: tabs are positional; reordering is not supported
-                key={`tab-${i}`}
+              <ScreenTabPill
+                key={item.id}
                 active={active}
-                onDropAgent={(agentId, sourceTab) =>
-                  placeAgent(i, agentId, null, "right", sourceTab)
-                }
+                onDropAgent={(agentId, sourceScreen) => sendToScreen(item, agentId, sourceScreen)}
               >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  className="max-w-40 truncate py-1.5 pl-3 pr-1.5"
-                  onClick={() => setActiveTab(i)}
-                >
-                  {label}
-                </button>
-                {active ? (
+                {active && editingName ? (
+                  <Input
+                    aria-label="Screen name"
+                    autoFocus
+                    value={draftName}
+                    onChange={(e) => setDraftName(e.target.value)}
+                    onBlur={submitRename}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") submitRename();
+                      if (e.key === "Escape") setEditingName(false);
+                    }}
+                    className="mx-1 h-6 w-36 text-xs"
+                    disabled={renameM.isPending}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    className={cn("max-w-44 truncate py-1.5 pl-3", active ? "pr-1.5" : "pr-3")}
+                    onClick={() => {
+                      if (!active) router.push(`/screens/${item.id}`);
+                    }}
+                    onDoubleClick={() => {
+                      if (!active || !screen) return;
+                      setDraftName(screen.name);
+                      setEditingName(true);
+                    }}
+                  >
+                    {item.name}
+                  </button>
+                )}
+                {active && !editingName && (
                   <DropdownMenu
                     align="start"
                     renderTrigger={(props) => (
                       <button
                         {...props}
                         type="button"
-                        aria-label={`${label} tab options`}
+                        aria-label={`${item.name} options`}
                         className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:text-foreground"
                       >
                         <ChevronDown className="size-3" aria-hidden />
                       </button>
                     )}
                   >
-                    <DropdownMenuItem onSelect={() => renameTab(i)}>
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        if (!screen) return;
+                        setDraftName(screen.name);
+                        setEditingName(true);
+                      }}
+                    >
                       <Pencil className="size-4" aria-hidden />
-                      Rename tab
+                      Rename screen
                     </DropdownMenuItem>
-                    {candidates.length > 0 && tabAgentIds.length < MAX_PANES_PER_TAB && (
+                    {candidates.length > 0 && screenAgentIds.length < MAX_PANES_PER_SCREEN && (
                       <AddAgentItems
                         candidates={candidates}
-                        onAdd={(agentId) => placeAgent(i, agentId, null, "right", null)}
+                        onAdd={(agentId) => placeAgent(agentId, null, "right", null)}
                       />
                     )}
-                    {tabAgentIds.length > 1 && (
+                    {screenAgentIds.length > 1 && (
                       <>
                         <DropdownMenuSeparator />
                         <DropdownMenuLabel>Arrange</DropdownMenuLabel>
@@ -373,24 +368,25 @@ function ScreenView({ id }: { id: string }) {
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       destructive
-                      disabled={tabs.length <= 1}
-                      onSelect={() => closeTab(i)}
+                      disabled={deleteM.isPending}
+                      onSelect={() => {
+                        if (screen && confirm(`Delete screen ${screen.name}?`)) deleteM.mutate();
+                      }}
                     >
-                      <X className="size-4" aria-hidden />
-                      Close tab
+                      <Trash2 className="size-4" aria-hidden />
+                      Delete screen
                     </DropdownMenuItem>
                   </DropdownMenu>
-                ) : (
-                  <span className="w-1.5" aria-hidden />
                 )}
-              </TabPill>
+              </ScreenTabPill>
             );
           })}
           <button
             type="button"
-            aria-label="New tab"
-            title="New tab"
-            onClick={addTab}
+            aria-label="Add screen"
+            title="Add screen"
+            disabled={createM.isPending}
+            onClick={() => createM.mutate()}
             className="grid size-7 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
           >
             <Plus className="size-4" aria-hidden />
@@ -400,51 +396,12 @@ function ScreenView({ id }: { id: string }) {
         <span
           className={cn(
             "hidden shrink-0 text-[11px] text-muted-foreground transition-opacity sm:inline",
-            saveM.isPending ? "opacity-100" : "opacity-0",
+            saveM.isPending || otherScreenM.isPending ? "opacity-100" : "opacity-0",
           )}
-          aria-hidden={!saveM.isPending}
+          aria-hidden={!(saveM.isPending || otherScreenM.isPending)}
         >
           Saving…
         </span>
-        <DropdownMenu
-          renderTrigger={(props) => (
-            <Button
-              {...props}
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label="Screen actions"
-            >
-              <MoreHorizontal className="size-4" />
-            </Button>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              if (!screen) return;
-              setDraftName(screen.name);
-              setEditingName(true);
-            }}
-          >
-            <Pencil className="size-4" aria-hidden />
-            Rename screen
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={addTab}>
-            <Plus className="size-4" aria-hidden />
-            New tab
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            destructive
-            disabled={deleteM.isPending}
-            onSelect={() => {
-              if (screen && confirm(`Delete screen ${screen.name}?`)) deleteM.mutate();
-            }}
-          >
-            <Trash2 className="size-4" aria-hidden />
-            Delete screen
-          </DropdownMenuItem>
-        </DropdownMenu>
       </header>
 
       {(error || q.error) && (
@@ -453,24 +410,19 @@ function ScreenView({ id }: { id: string }) {
         </p>
       )}
 
-      {tab && (
-        <PaneArea
-          key={`${id}-${tabIndex}`}
-          root={root}
-          agentsById={agentsById}
-          candidates={candidates}
-          tabIndex={tabIndex}
-          zoomedId={zoomedId}
-          focusedId={focusedId}
-          paneCount={tabAgentIds.length}
-          onFocusPane={setFocusedId}
-          onToggleZoom={(agentId) => setZoomedId((z) => (z === agentId ? null : agentId))}
-          onRootChange={(next) => setTabRoot(tabIndex, next)}
-          onPlaceAgent={(agentId, targetId, side, sourceTab) =>
-            placeAgent(tabIndex, agentId, targetId, side, sourceTab)
-          }
-        />
-      )}
+      <PaneArea
+        root={currentRoot}
+        agentsById={agentsById}
+        candidates={candidates}
+        screenId={id}
+        zoomedId={zoomedId}
+        focusedId={focusedId}
+        paneCount={screenAgentIds.length}
+        onFocusPane={setFocusedId}
+        onToggleZoom={(agentId) => setZoomedId((z) => (z === agentId ? null : agentId))}
+        onRootChange={commit}
+        onPlaceAgent={placeAgent}
+      />
     </div>
   );
 }
@@ -496,17 +448,17 @@ function AddAgentItems({
   );
 }
 
-function TabPill({
+function ScreenTabPill({
   active,
   onDropAgent,
   children,
 }: {
   active: boolean;
-  onDropAgent: (agentId: string, sourceTab: number | null) => void;
+  onDropAgent: (agentId: string, sourceScreen: string | null) => void;
   children: ReactNode;
 }) {
-  const { active: dropActive, dropProps } = useAgentDrop((agentId, _title, sourceTab) =>
-    onDropAgent(agentId, sourceTab),
+  const { active: dropActive, dropProps } = useAgentDrop((agentId, _title, sourceScreen) =>
+    onDropAgent(agentId, sourceScreen),
   );
   return (
     <span
@@ -532,7 +484,7 @@ type PaneAreaProps = {
   root: LayoutNode | null;
   agentsById: Map<string, Agent>;
   candidates: Agent[];
-  tabIndex: number;
+  screenId: string;
   zoomedId: string | null;
   focusedId: string | null;
   paneCount: number;
@@ -543,7 +495,7 @@ type PaneAreaProps = {
     agentId: string,
     targetId: string | null,
     side: Side | "center",
-    sourceTab: number | null,
+    sourceScreen: string | null,
   ) => void;
 };
 
@@ -567,9 +519,9 @@ function PaneArea(props: PaneAreaProps) {
   const areaRef = useRef<HTMLDivElement>(null);
   const wide = useIsWide(areaRef);
 
-  // Empty tab: whole area is one drop target plus a picker tile.
+  // Empty screen: whole area is one drop target plus a picker tile.
   const { active: emptyDropActive, dropProps: emptyDropProps } = useAgentDrop(
-    (agentId, _title, sourceTab) => onPlaceAgent(agentId, null, "right", sourceTab),
+    (agentId, _title, sourceScreen) => onPlaceAgent(agentId, null, "right", sourceScreen),
   );
 
   if (!root) {
@@ -784,7 +736,7 @@ function ScreenPane({
 }: { agentId: string; stacked?: boolean } & PaneAreaProps) {
   const {
     agentsById,
-    tabIndex,
+    screenId,
     zoomedId,
     focusedId,
     paneCount,
@@ -826,10 +778,9 @@ function ScreenPane({
     const dropZone = zoneFromEvent(event, dragIsPane(event.dataTransfer));
     setZone(null);
     const droppedId = event.dataTransfer.getData(AGENT_DRAG_MIME);
-    const sourceRaw = event.dataTransfer.getData(PANE_SRC_MIME);
-    const sourceTab = sourceRaw === "" ? Number.NaN : Number.parseInt(sourceRaw, 10);
+    const sourceScreen = event.dataTransfer.getData(PANE_SRC_MIME) || null;
     if (!droppedId || droppedId === agentId) return;
-    onPlaceAgent(droppedId, agentId, dropZone, Number.isInteger(sourceTab) ? sourceTab : null);
+    onPlaceAgent(droppedId, agentId, dropZone, sourceScreen);
   };
 
   return (
@@ -856,7 +807,7 @@ function ScreenPane({
         />
       )}
 
-      {/* Mini pane header — draggable to rearrange or move across tabs.
+      {/* Mini pane header — draggable to rearrange or move across screens.
           Double-click mirrors the zoom button; every action has a button
           equivalent, so the handler is a pointer convenience only. */}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: drag handle with button equivalents */}
@@ -864,7 +815,7 @@ function ScreenPane({
         draggable={Boolean(agent)}
         onDragStart={(event) => {
           if (!agent) return;
-          setAgentDragData(event.dataTransfer, agentId, agentTitle(agent), tabIndex);
+          setAgentDragData(event.dataTransfer, agentId, agentTitle(agent), screenId);
         }}
         onDoubleClick={() => !stacked && onToggleZoom(agentId)}
         className="flex h-8 shrink-0 cursor-grab items-center gap-1.5 border-b border-border/70 bg-card/60 px-2 active:cursor-grabbing"
@@ -893,7 +844,7 @@ function ScreenPane({
               <button
                 type="button"
                 aria-label={zoomed ? "Restore pane" : "Zoom pane"}
-                title={zoomed ? "Restore" : "Zoom (fill the tab)"}
+                title={zoomed ? "Restore" : "Zoom (fill the screen)"}
                 onClick={() => onToggleZoom(agentId)}
                 className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
               >

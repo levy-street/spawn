@@ -134,14 +134,13 @@ Codex auth state when present.
 
 ### Screens
 
-Saved multi-terminal arrangements: named split-tree layouts of agents,
-organized in tabs. A layout node is either a pane or a binary split:
+Saved multi-terminal arrangements: each screen is one named split-tree
+layout of agents. A layout node is either a pane or a binary split:
 
 ```json
-{"tabs": [{"name": "build|null",
-           "root": {"type": "split", "direction": "row", "ratio": 0.6,
-                    "a": {"type": "pane", "agent_id": "uuid"},
-                    "b": {"type": "pane", "agent_id": "uuid"}}}]}
+{"root": {"type": "split", "direction": "row", "ratio": 0.6,
+          "a": {"type": "pane", "agent_id": "uuid"},
+          "b": {"type": "pane", "agent_id": "uuid"}}}
 ```
 
 | Method | Path | Body |
@@ -153,8 +152,8 @@ organized in tabs. A layout node is either a pane or a binary split:
 | DELETE | `/api/screens/{id}` | |
 
 Layouts are sanitized on write: panes referencing agents the caller does
-not own are pruned (splits collapse to the surviving child), tabs cap at
-8 panes, split ratios are clamped to 0.05–0.95.
+not own are pruned (splits collapse to the surviving child), screens cap
+at 8 panes, split ratios are clamped to 0.05–0.95.
 
 ## Daemon WebSocket — `/ws/daemon`
 

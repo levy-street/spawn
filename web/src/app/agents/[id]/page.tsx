@@ -167,18 +167,13 @@ function AgentTerminal() {
       return screens.create({
         name,
         layout: {
-          tabs: [
-            {
-              name: null,
-              root: {
-                type: "split",
-                direction: "row",
-                ratio: 0.5,
-                a: { type: "pane", agent_id: id as string },
-                b: { type: "pane", agent_id: droppedId },
-              },
-            },
-          ],
+          root: {
+            type: "split",
+            direction: "row",
+            ratio: 0.5,
+            a: { type: "pane", agent_id: id as string },
+            b: { type: "pane", agent_id: droppedId },
+          },
         },
       });
     },

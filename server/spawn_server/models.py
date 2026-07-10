@@ -255,10 +255,10 @@ class Screen(Base):
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # {"tabs": [{"name": str|None, "root": <split tree>}, ...]} — a split tree
-    # is {"type": "pane", "agent_id": ...} or {"type": "split", "direction":
-    # "row"|"column", "ratio": 0.1..0.9, "a": <node>, "b": <node>}. Kept as
-    # loose JSON so layout evolution doesn't need migrations.
+    # {"root": <split tree>|null} — a split tree is {"type": "pane",
+    # "agent_id": ...} or {"type": "split", "direction": "row"|"column",
+    # "ratio": ..., "a": <node>, "b": <node>}. Kept as loose JSON so layout
+    # evolution doesn't need migrations.
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

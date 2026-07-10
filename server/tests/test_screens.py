@@ -53,14 +53,14 @@ async def test_screen_crud_and_cross_user_scoping(client):
     root = _split("row", _pane(agent_one), _pane(agent_two), ratio=0.7)
     created = await client.post(
         "/api/screens",
-        json={"name": "  daily drive  ", "layout": {"tabs": [{"name": "main", "root": root}]}},
+        json={"name": "  daily drive  ", "layout": {"root": root}},
         headers=a_auth,
     )
     assert created.status_code == 201, created.text
     screen = created.json()
     assert screen["name"] == "daily drive"
-    assert screen["layout"]["tabs"][0]["root"]["ratio"] == 0.7
-    assert screen["layout"]["tabs"][0]["root"]["a"]["agent_id"] == agent_one
+    assert screen["layout"]["root"]["ratio"] == 0.7
+    assert screen["layout"]["root"]["a"]["agent_id"] == agent_one
     screen_id = screen["id"]
 
     listed = await client.get("/api/screens", headers=a_auth)
@@ -96,22 +96,22 @@ async def test_screen_layout_prunes_foreign_agents_and_collapses_splits(client):
     root = _split("row", _pane(own_agent), _pane(foreign_agent))
     created = await client.post(
         "/api/screens",
-        json={"name": "mixed", "layout": {"tabs": [{"root": root}]}},
+        json={"name": "mixed", "layout": {"root": root}},
         headers=a_auth,
     )
     assert created.status_code == 201, created.text
-    pruned = created.json()["layout"]["tabs"][0]["root"]
+    pruned = created.json()["layout"]["root"]
     assert pruned == {"type": "pane", "agent_id": own_agent}
 
     # Duplicate panes for one agent keep only the first occurrence.
     dup_root = _split("column", _pane(own_agent), _pane(own_agent))
     patched = await client.patch(
         f"/api/screens/{created.json()['id']}",
-        json={"layout": {"tabs": [{"root": dup_root}]}},
+        json={"layout": {"root": dup_root}},
         headers=a_auth,
     )
     assert patched.status_code == 200
-    assert patched.json()["layout"]["tabs"][0]["root"] == {
+    assert patched.json()["layout"]["root"] == {
         "type": "pane",
         "agent_id": own_agent,
     }
@@ -128,7 +128,7 @@ async def test_screen_layout_limits(client):
         root = _split("row", root, _pane(agent_id))
     too_many = await client.post(
         "/api/screens",
-        json={"name": "too many", "layout": {"tabs": [{"root": root}]}},
+        json={"name": "too many", "layout": {"root": root}},
         headers=auth,
     )
     assert too_many.status_code == 400
@@ -140,9 +140,7 @@ async def test_screen_layout_limits(client):
         json={
             "name": "bad ratio",
             "layout": {
-                "tabs": [
-                    {"root": _split("row", _pane(agent_ids[0]), _pane(agent_ids[1]), ratio=0.01)}
-                ]
+                "root": _split("row", _pane(agent_ids[0]), _pane(agent_ids[1]), ratio=0.01)
             },
         },
         headers=auth,

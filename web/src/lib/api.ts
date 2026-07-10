@@ -274,14 +274,8 @@ export const LayoutNodeSchema: z.ZodType<import("@/lib/layout").LayoutNode> = z.
   ]),
 ) as z.ZodType<import("@/lib/layout").LayoutNode>;
 
-export const ScreenTabSchema = z.object({
-  name: z.string().nullable().optional(),
-  root: LayoutNodeSchema.nullable().default(null),
-});
-export type ScreenTab = z.infer<typeof ScreenTabSchema>;
-
 export const ScreenLayoutSchema = z.object({
-  tabs: z.array(ScreenTabSchema).default([]),
+  root: LayoutNodeSchema.nullable().default(null),
 });
 export type ScreenLayout = z.infer<typeof ScreenLayoutSchema>;
 

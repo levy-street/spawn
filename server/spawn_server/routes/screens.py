@@ -12,7 +12,7 @@ from ..models import Agent, Screen, User
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
 
-MAX_PANES_PER_TAB = 8
+MAX_PANES_PER_SCREEN = 8
 MAX_SPLIT_DEPTH = 12
 
 
@@ -73,17 +73,14 @@ def _prune(
 async def _sanitize_layout(
     session: AsyncSession, user: User, layout: schemas.ScreenLayout
 ) -> dict:
+    if _depth(layout.root) > MAX_SPLIT_DEPTH:
+        raise HTTPException(status_code=400, detail="layout is nested too deeply")
     referenced: list[str] = []
-    for tab in layout.tabs:
-        if _depth(tab.root) > MAX_SPLIT_DEPTH:
-            raise HTTPException(status_code=400, detail="layout is nested too deeply")
-        ids: list[str] = []
-        _collect_agent_ids(tab.root, ids)
-        if len(ids) > MAX_PANES_PER_TAB:
-            raise HTTPException(
-                status_code=400, detail=f"a tab holds at most {MAX_PANES_PER_TAB} panes"
-            )
-        referenced.extend(ids)
+    _collect_agent_ids(layout.root, referenced)
+    if len(referenced) > MAX_PANES_PER_SCREEN:
+        raise HTTPException(
+            status_code=400, detail=f"a screen holds at most {MAX_PANES_PER_SCREEN} panes"
+        )
 
     owned: set[str] = set()
     if referenced:
@@ -98,12 +95,7 @@ async def _sanitize_layout(
             .scalars()
             .all()
         )
-    return schemas.ScreenLayout(
-        tabs=[
-            schemas.ScreenTab(name=tab.name, root=_prune(tab.root, owned, set()))
-            for tab in layout.tabs
-        ]
-    ).model_dump(mode="json")
+    return schemas.ScreenLayout(root=_prune(layout.root, owned, set())).model_dump(mode="json")
 
 
 @router.get("", response_model=list[schemas.ScreenOut])

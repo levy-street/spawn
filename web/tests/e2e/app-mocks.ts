@@ -81,18 +81,13 @@ export function screen(overrides: Record<string, unknown> = {}) {
     id: SCREEN_ID,
     name: "daily drive",
     layout: {
-      tabs: [
-        {
-          name: null,
-          root: {
-            type: "split",
-            direction: "row",
-            ratio: 0.5,
-            a: { type: "pane", agent_id: AGENT_ID },
-            b: { type: "pane", agent_id: AGENT_B_ID },
-          },
-        },
-      ],
+      root: {
+        type: "split",
+        direction: "row",
+        ratio: 0.5,
+        a: { type: "pane", agent_id: AGENT_ID },
+        b: { type: "pane", agent_id: AGENT_B_ID },
+      },
     },
     created_at: CREATED_AT,
     updated_at: CREATED_AT,

@@ -4,7 +4,7 @@ import { type DragEvent, useRef, useState } from "react";
 
 /** Custom mime for dragging agents out of the sidebar tree. */
 export const AGENT_DRAG_MIME = "application/x-spawn-agent";
-/** Set when the drag source is an existing pane; carries the source tab index. */
+/** Set when the drag source is an existing pane; carries the source screen id. */
 export const PANE_SRC_MIME = "application/x-spawn-pane-src";
 
 export function dragHasAgent(dataTransfer: DataTransfer | null): boolean {
@@ -15,23 +15,21 @@ export function setAgentDragData(
   dataTransfer: DataTransfer,
   agentId: string,
   title: string,
-  sourceTab?: number,
+  sourceScreen?: string,
 ) {
   dataTransfer.setData(AGENT_DRAG_MIME, agentId);
   dataTransfer.setData("text/plain", title);
-  if (sourceTab !== undefined) dataTransfer.setData(PANE_SRC_MIME, String(sourceTab));
-  dataTransfer.effectAllowed = sourceTab === undefined ? "copy" : "move";
+  if (sourceScreen !== undefined) dataTransfer.setData(PANE_SRC_MIME, sourceScreen);
+  dataTransfer.effectAllowed = sourceScreen === undefined ? "copy" : "move";
 }
 
 export function dragIsPane(dataTransfer: DataTransfer | null): boolean {
   return !!dataTransfer && Array.from(dataTransfer.types).includes(PANE_SRC_MIME);
 }
 
-export function paneSourceTab(dataTransfer: DataTransfer): number | null {
+export function paneSourceScreen(dataTransfer: DataTransfer): string | null {
   const raw = dataTransfer.getData(PANE_SRC_MIME);
-  if (raw === "") return null;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isInteger(parsed) ? parsed : null;
+  return raw === "" ? null : raw;
 }
 
 /**
@@ -40,7 +38,7 @@ export function paneSourceTab(dataTransfer: DataTransfer): number | null {
  * highlight stable until the drag truly exits the zone.
  */
 export function useAgentDrop(
-  onDropAgent: (agentId: string, title: string, sourceTab: number | null) => void,
+  onDropAgent: (agentId: string, title: string, sourceScreen: string | null) => void,
 ) {
   const [active, setActive] = useState(false);
   const depth = useRef(0);
@@ -70,7 +68,7 @@ export function useAgentDrop(
       setActive(false);
       const agentId = event.dataTransfer.getData(AGENT_DRAG_MIME);
       const title = event.dataTransfer.getData("text/plain");
-      if (agentId) onDropAgent(agentId, title, paneSourceTab(event.dataTransfer));
+      if (agentId) onDropAgent(agentId, title, paneSourceScreen(event.dataTransfer));
     },
   };
 

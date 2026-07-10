@@ -375,13 +375,8 @@ class LayoutSplit(BaseModel):
 LayoutNode = Annotated[LayoutPane | LayoutSplit, Field(discriminator="type")]
 
 
-class ScreenTab(BaseModel):
-    name: str | None = Field(default=None, max_length=64)
-    root: LayoutNode | None = None
-
-
 class ScreenLayout(BaseModel):
-    tabs: list[ScreenTab] = Field(default_factory=list, max_length=8)
+    root: LayoutNode | None = None
 
 
 class ScreenCreate(BaseModel):

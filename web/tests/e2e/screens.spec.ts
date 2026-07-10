@@ -4,6 +4,7 @@ import { AGENT_B_ID, AGENT_ID, agent, mockAuthenticatedApi, SCREEN_ID, screen } 
 
 const agentA = agent({ name: "alpha" });
 const agentB = agent({ id: AGENT_B_ID, name: "beta", argv: ["bash", "-l"] });
+const SCREEN_B_ID = "00000000-0000-4000-8000-000000000009";
 
 function paneNode(agentId: string) {
   return { type: "pane", agent_id: agentId };
@@ -29,10 +30,10 @@ async function dragAgent(
   await target.dispatchEvent("drop", { dataTransfer, ...coords });
 }
 
-test("screens list shows saved arrangements and creates a new screen", async ({ page }) => {
+test("empty state offers the first screen and forwards to it", async ({ page }) => {
   let createdBody: Record<string, unknown> | null = null;
   await mockAuthenticatedApi(page, {
-    screens: [screen()],
+    screens: [],
     createScreen: async (body, route) => {
       createdBody = body as Record<string, unknown>;
       await route.fulfill({
@@ -44,27 +45,30 @@ test("screens list shows saved arrangements and creates a new screen", async ({ 
   });
 
   await page.goto("/screens");
-  await expect(page.getByRole("heading", { name: "Screens" })).toBeVisible();
-  await expect(page.getByText("daily drive")).toBeVisible();
-  await expect(page.getByText("1 tab · 2 agents")).toBeVisible();
-
-  await page.getByRole("button", { name: "New screen" }).click();
-  await expect.poll(() => createdBody).toMatchObject({ name: "Screen 2" });
+  await expect(page.getByRole("heading", { name: "No screens yet" })).toBeVisible();
+  await page.getByRole("button", { name: "Add screen" }).click();
+  await expect.poll(() => createdBody).toMatchObject({ name: "Screen 1" });
   await page.waitForURL(`**/screens/${SCREEN_ID}`);
 });
 
-test("screen renders split panes with mini headers and a resizable divider", async ({ page }) => {
+test("screens render as tabs along the top and switch on click", async ({ page }) => {
   await mockAuthenticatedApi(page, {
     agents: [agentA, agentB],
-    screens: [screen()],
+    screens: [screen(), screen({ id: SCREEN_B_ID, name: "second", layout: { root: null } })],
   });
 
   await page.goto(`/screens/${SCREEN_ID}`);
-  await expect(page.getByRole("button", { name: "daily drive" })).toBeVisible();
-  await expect(page.getByRole("tab", { name: "Tab 1" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "daily drive" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
   await expect(page.getByRole("region", { name: "alpha" })).toBeVisible();
   await expect(page.getByRole("region", { name: "beta" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Resize panes" })).toBeVisible();
+
+  await page.getByRole("tab", { name: "second" }).click();
+  await page.waitForURL(`**/screens/${SCREEN_B_ID}`);
+  await expect(page.getByRole("button", { name: "Add agent" })).toBeVisible();
 });
 
 test("dragging the divider persists the new split ratio", async ({ page }) => {
@@ -92,10 +96,8 @@ test("dragging the divider persists the new split ratio", async ({ page }) => {
 
   await expect
     .poll(() => {
-      const last = patches.at(-1) as
-        | { layout?: { tabs: Array<{ root: { ratio: number } }> } }
-        | undefined;
-      return last?.layout?.tabs[0]?.root?.ratio;
+      const last = patches.at(-1) as { layout?: { root: { ratio: number } } } | undefined;
+      return last?.layout?.root?.ratio;
     })
     .toBeLessThan(0.5);
 });
@@ -104,7 +106,7 @@ test("edge drops split the target pane on the chosen side", async ({ page }) => 
   const patches: Array<Record<string, unknown>> = [];
   await mockAuthenticatedApi(page, {
     agents: [agentA, agentB],
-    screens: [screen({ layout: { tabs: [{ name: null, root: paneNode(AGENT_ID) }] } })],
+    screens: [screen({ layout: { root: paneNode(AGENT_ID) } })],
     updateScreen: async (_id, body, route) => {
       patches.push(body as Record<string, unknown>);
       await route.fulfill({
@@ -126,22 +128,18 @@ test("edge drops split the target pane on the chosen side", async ({ page }) => 
     .poll(() => patches.at(-1))
     .toMatchObject({
       layout: {
-        tabs: [
-          {
-            root: {
-              type: "split",
-              direction: "column",
-              a: { type: "pane", agent_id: AGENT_ID },
-              b: { type: "pane", agent_id: AGENT_B_ID },
-            },
-          },
-        ],
+        root: {
+          type: "split",
+          direction: "column",
+          a: { type: "pane", agent_id: AGENT_ID },
+          b: { type: "pane", agent_id: AGENT_B_ID },
+        },
       },
     });
   await expect(page.getByRole("region", { name: "beta" })).toBeVisible();
 });
 
-test("center drop swaps two panes that are already in the tab", async ({ page }) => {
+test("center drop swaps two panes that are already on the screen", async ({ page }) => {
   const patches: Array<Record<string, unknown>> = [];
   await mockAuthenticatedApi(page, {
     agents: [agentA, agentB],
@@ -157,7 +155,6 @@ test("center drop swaps two panes that are already in the tab", async ({ page })
   });
 
   await page.goto(`/screens/${SCREEN_ID}`);
-  // Drag beta's pane header onto the center of alpha's pane -> swap.
   const betaHeader = page.getByRole("region", { name: "beta" }).locator("div").first();
   await dragAgent(page, betaHeader, page.getByRole("region", { name: "alpha" }), {
     x: 0.5,
@@ -168,21 +165,46 @@ test("center drop swaps two panes that are already in the tab", async ({ page })
     .poll(() => patches.at(-1))
     .toMatchObject({
       layout: {
-        tabs: [
-          {
-            root: {
-              type: "split",
-              direction: "row",
-              a: { type: "pane", agent_id: AGENT_B_ID },
-              b: { type: "pane", agent_id: AGENT_ID },
-            },
-          },
-        ],
+        root: {
+          type: "split",
+          direction: "row",
+          a: { type: "pane", agent_id: AGENT_B_ID },
+          b: { type: "pane", agent_id: AGENT_ID },
+        },
       },
     });
 });
 
-test("zoom fills the tab with one pane and restores", async ({ page }) => {
+test("dropping a pane on another screen's tab moves it across screens", async ({ page }) => {
+  const patches: Array<{ id: string; body: Record<string, unknown> }> = [];
+  await mockAuthenticatedApi(page, {
+    agents: [agentA, agentB],
+    screens: [screen(), screen({ id: SCREEN_B_ID, name: "second", layout: { root: null } })],
+    updateScreen: async (id, body, route) => {
+      patches.push({ id, body: body as Record<string, unknown> });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...screen(), ...(body as Record<string, unknown>) },
+      });
+    },
+  });
+
+  await page.goto(`/screens/${SCREEN_ID}`);
+  const betaHeader = page.getByRole("region", { name: "beta" }).locator("div").first();
+  await dragAgent(page, betaHeader, page.getByRole("tab", { name: "second" }));
+
+  // Target screen gains the pane; the current screen loses it.
+  await expect
+    .poll(() => patches.find((p) => p.id === SCREEN_B_ID)?.body)
+    .toMatchObject({ layout: { root: { type: "pane", agent_id: AGENT_B_ID } } });
+  await expect
+    .poll(() => patches.find((p) => p.id === SCREEN_ID)?.body)
+    .toMatchObject({ layout: { root: { type: "pane", agent_id: AGENT_ID } } });
+  await expect(page.getByRole("region", { name: "beta" })).toHaveCount(0);
+});
+
+test("zoom fills the screen with one pane and restores", async ({ page }) => {
   await mockAuthenticatedApi(page, {
     agents: [agentA, agentB],
     screens: [screen()],
@@ -219,23 +241,19 @@ test("arrange presets rebuild the split tree", async ({ page }) => {
   });
 
   await page.goto(`/screens/${SCREEN_ID}`);
-  await page.getByRole("button", { name: "Tab 1 tab options" }).click();
+  await page.getByRole("button", { name: "daily drive options" }).click();
   await page.getByRole("menuitem", { name: "Even rows" }).click();
 
   await expect
     .poll(() => patches.at(-1))
     .toMatchObject({
       layout: {
-        tabs: [
-          {
-            root: {
-              type: "split",
-              direction: "column",
-              a: { type: "pane", agent_id: AGENT_ID },
-              b: { type: "pane", agent_id: AGENT_B_ID },
-            },
-          },
-        ],
+        root: {
+          type: "split",
+          direction: "column",
+          a: { type: "pane", agent_id: AGENT_ID },
+          b: { type: "pane", agent_id: AGENT_B_ID },
+        },
       },
     });
 });
@@ -266,16 +284,12 @@ test("dropping an agent on another agent's terminal creates a split screen", asy
     .toMatchObject({
       name: "palette · beta",
       layout: {
-        tabs: [
-          {
-            root: {
-              type: "split",
-              direction: "row",
-              a: { type: "pane", agent_id: AGENT_ID },
-              b: { type: "pane", agent_id: AGENT_B_ID },
-            },
-          },
-        ],
+        root: {
+          type: "split",
+          direction: "row",
+          a: { type: "pane", agent_id: AGENT_ID },
+          b: { type: "pane", agent_id: AGENT_B_ID },
+        },
       },
     });
   await page.waitForURL(`**/screens/${SCREEN_ID}`);
