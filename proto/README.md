@@ -410,7 +410,14 @@ distinguish healthy idle connections from dead sockets.
 ## Browser WebSocket — `/ws/browser?agent_id=<uuid>&cols=<n>&rows=<n>`
 
 - Auth: session cookie (or `?token=` for testing).
-- Subprotocol: `spawn.v1`.
+- Subprotocol: clients offer `spawn.v2, spawn.v1` in preference order; the
+  server selects `spawn.v2` when WebRTC is enabled, else `spawn.v1`.
+  - **`spawn.v2`** (docs/TRUST.md Phase 1): the WS is control + signaling
+    only. The server never sends binary frames (live PTY output flows over
+    the WebRTC DataChannel exclusively) and closes the socket with code
+    `4002` if the browser sends one. All JSON frames below are unchanged.
+  - **`spawn.v1`** (legacy): binary frames relay PTY bytes in both
+    directions through the server. Kept for rollout compatibility.
 - `cols` and `rows` are optional initial browser dimensions. When present,
   the server resizes the tmux attach before producing the initial history
   snapshot.
@@ -467,13 +474,20 @@ on top of the websocket control plane.
   source. Browsers should prefer DataChannel output once it is open to avoid
   duplicate terminal rendering.
 - `SPAWN_WEBRTC_ENABLED` enables the direct path, and
-  `SPAWN_WEBRTC_ICE_SERVERS` configures the ICE server list. STUN is enough for
-  many LAN/home-network cases; TURN is required for reliable fallback across
-  restrictive NATs and mobile/corporate networks.
+  `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
+  enough for many LAN/home-network cases; TURN is required for reliable
+  fallback across restrictive NATs and mobile/corporate networks.
+- `SPAWN_TURN_URLS` + `SPAWN_TURN_SECRET` (+ `SPAWN_TURN_TTL_SECONDS`) point
+  at a coturn running with `use-auth-secret`; the server mints ephemeral
+  per-session HMAC credentials and appends them to the ICE list in
+  `rtc.config` (browser) and `rtc.offer.ice_servers` (daemon). The relay
+  only ever carries DTLS ciphertext between the peers.
 
 ## Versioning
 
-- The WS subprotocol literal `spawn.v1` is the version handle. A future
-  breaking change uses `spawn.v2`. Server SHOULD support both during a
-  rollout window.
+- The WS subprotocol literal is the version handle. The browser WS
+  negotiates `spawn.v2` (DataChannel-only PTY) with `spawn.v1` as the
+  legacy relay fallback; the daemon WS remains `spawn.v1` until the
+  daemon-owned-data migration (docs/TRUST.md Phase 2). Server SHOULD
+  support both during a rollout window.
 - REST endpoints under `/api/` are versioned by additive evolution.

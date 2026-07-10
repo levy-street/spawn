@@ -21,6 +21,7 @@ from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
+from ..turn import ice_servers_for_session
 from .activity import (
     REDRAW_SUPPRESS_WINDOW,
     should_record_agent_input,
@@ -90,12 +91,12 @@ def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
     }
 
 
-def _rtc_config_payload() -> dict[str, object]:
+def _rtc_config_payload(user_id: str) -> dict[str, object]:
     settings = get_settings()
     return {
         "type": "rtc.config",
         "enabled": settings.webrtc_enabled,
-        "ice_servers": settings.webrtc_ice_server_list,
+        "ice_servers": ice_servers_for_session(settings, label=user_id),
     }
 
 
@@ -229,6 +230,11 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
     return user
 
 
+# App-specific close code: a spawn.v2 browser sent a binary frame. Live PTY
+# bytes are DataChannel-only on v2 (docs/TRUST.md Phase 1).
+WS_CLOSE_BINARY_ON_V2 = 4002
+
+
 @router.websocket("/ws/browser")
 async def browser_ws(
     websocket: WebSocket,
@@ -237,7 +243,15 @@ async def browser_ws(
     cols: int | None = Query(default=None),
     rows: int | None = Query(default=None),
 ) -> None:
-    await websocket.accept(subprotocol="spawn.v1")
+    # spawn.v2 removes the plaintext PTY relay: the server never sends binary
+    # frames to the browser and rejects binary input; live terminal bytes flow
+    # peer-to-peer over the WebRTC DataChannel. v1 keeps the legacy relay for
+    # older clients during rollout, and is also what we fall back to when
+    # WebRTC is administratively disabled (a v2 accept would leave the client
+    # with no live path at all).
+    offered = websocket.scope.get("subprotocols") or []
+    v2 = get_settings().webrtc_enabled and "spawn.v2" in offered
+    await websocket.accept(subprotocol="spawn.v2" if v2 else "spawn.v1")
     user = await _resolve_user(websocket, token)
     if user is None:
         return
@@ -271,7 +285,7 @@ async def browser_ws(
     # their own viewport and racing the shared PTY size.
     try:
         await _broadcast_display_control(agent_id)
-        await conn.send_text(_rtc_config_payload())
+        await conn.send_text(_rtc_config_payload(user.id))
         await _send_initial_history(
             conn,
             agent_id=agent_id,
@@ -306,11 +320,13 @@ async def browser_ws(
         finally:
             pump_ready.set()
 
-    pump_task = asyncio.create_task(_pump_pubsub())
-    try:
-        await asyncio.wait_for(pump_ready.wait(), timeout=1.0)
-    except TimeoutError:
-        pass
+    pump_task: asyncio.Task[None] | None = None
+    if not v2:
+        pump_task = asyncio.create_task(_pump_pubsub())
+        try:
+            await asyncio.wait_for(pump_ready.wait(), timeout=1.0)
+        except TimeoutError:
+            pass
 
     # The history payload is a rendered tmux snapshot, not a live terminal
     # attach state. Once the browser is subscribed to live bytes, force tmux
@@ -327,7 +343,18 @@ async def browser_ws(
             data_bytes = msg.get("bytes")
 
             if data_bytes is not None:
-                # Wrap in 0x02 + agent_id and forward to owning daemon.
+                if v2:
+                    log.warning(
+                        "binary frame from spawn.v2 browser agent=%s user=%s; closing",
+                        agent_id,
+                        user.id,
+                    )
+                    await websocket.close(
+                        code=WS_CLOSE_BINARY_ON_V2,
+                        reason="binary frames are not allowed on spawn.v2",
+                    )
+                    break
+                # v1 legacy relay: wrap in 0x02 + agent_id, forward to daemon.
                 daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
                     host_id
                 )
@@ -543,7 +570,9 @@ async def browser_ws(
                                 "session_id": session_id,
                                 "agent_id": agent_id,
                                 "sdp": sdp,
-                                "ice_servers": get_settings().webrtc_ice_server_list,
+                                "ice_servers": ice_servers_for_session(
+                                    get_settings(), label=user.id
+                                ),
                             }
                         )
                     except Exception as e:
@@ -602,11 +631,12 @@ async def browser_ws(
     except Exception as e:  # noqa: BLE001
         log.exception("browser ws crashed: %s", e)
     finally:
-        pump_task.cancel()
-        try:
-            await pump_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        if pump_task is not None:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
         session_ids = await broker.unregister_rtc_sessions_for(conn)
         daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
         if daemon is not None:

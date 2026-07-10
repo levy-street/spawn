@@ -862,6 +862,31 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // reach it without re-running every render.
   const socketRef = useRef(socket);
   socketRef.current = socket;
+
+  // On spawn.v2 the DataChannel is the only live path. When it (re)opens,
+  // force a tmux repaint so output produced between the history snapshot and
+  // channel-open lands on screen; the daemon only mirrors bytes from the
+  // open handshake onward.
+  const dcWasOpenRef = useRef(false);
+  useEffect(() => {
+    if (socket.v2 && socket.dcOpen && !dcWasOpenRef.current) {
+      agentsApi.redraw(agentId).catch(() => {});
+    }
+    dcWasOpenRef.current = socket.dcOpen;
+  }, [socket.v2, socket.dcOpen, agentId]);
+
+  // Only surface "waiting for the direct channel" after a grace period —
+  // the DC normally opens within a second or two of attach.
+  const [channelPending, setChannelPending] = useState(false);
+  useEffect(() => {
+    const pending = socket.v2 && socket.state === "open" && !socket.dcOpen;
+    if (!pending) {
+      setChannelPending(false);
+      return;
+    }
+    const timer = setTimeout(() => setChannelPending(true), 1_500);
+    return () => clearTimeout(timer);
+  }, [socket.v2, socket.state, socket.dcOpen]);
   rawInputRef.current = rawInput;
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
@@ -2348,13 +2373,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           a healthy "open" connection is the norm, not news. */}
       <div
         className={
-          socket.state !== "open" || exitBanner || uploadStatus
+          socket.state !== "open" || channelPending || exitBanner || uploadStatus
             ? "pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-muted-foreground"
             : "sr-only"
         }
         aria-live="polite"
       >
-        {[socket.state !== "open" ? socket.state : null, exitBanner, uploadStatus]
+        {[
+          socket.state !== "open" ? socket.state : null,
+          channelPending ? "connecting direct channel…" : null,
+          exitBanner,
+          uploadStatus,
+        ]
           .filter(Boolean)
           .join(" · ")}
       </div>

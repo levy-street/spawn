@@ -58,6 +58,16 @@ class Settings(BaseSettings):
         description="JSON array of RTCIceServer objects.",
     )
 
+    # coturn with `use-auth-secret`: the server mints ephemeral per-session
+    # credentials (RFC 5766 REST-API convention) instead of shipping a static
+    # username/password in webrtc_ice_servers. Empty urls disables TURN.
+    turn_urls: str = Field(
+        default="",
+        description="Comma-separated TURN URIs, e.g. turn:host:3478?transport=udp",
+    )
+    turn_secret: str | None = Field(default=None)
+    turn_ttl_seconds: int = Field(default=24 * 3600)
+
     ringbuffer_max_bytes: int = 256 * 1024  # legacy; kept for API compatibility
 
     # On-disk transcripts give each agent durable scrollback that survives
@@ -69,6 +79,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def turn_url_list(self) -> list[str]:
+        return [u.strip() for u in self.turn_urls.split(",") if u.strip()]
 
     @property
     def webrtc_ice_server_list(self) -> list[dict[str, Any]]:

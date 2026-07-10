@@ -6,7 +6,7 @@ import {
   buildAgentWsUrl,
   type DisplayControlState,
   parseInbound,
-  SPAWN_WS_SUBPROTOCOL,
+  spawnWsSubprotocols,
 } from "@/lib/ws";
 
 /**
@@ -55,6 +55,10 @@ const RTC_RELAY_FALLBACK_DELAY_MS = 750;
 // the next WS reconnect; retry with backoff instead.
 const RTC_RETRY_BASE_DELAY_MS = 5_000;
 const RTC_RETRY_MAX_DELAY_MS = 60_000;
+// On spawn.v2 there is no relay to fall back to; keystrokes typed before the
+// DataChannel opens are held briefly and flushed on open. Cap the buffer so a
+// dead channel can't grow it without bound.
+const MAX_PENDING_INPUT_BYTES = 64 * 1024;
 
 function newRtcSessionId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -77,7 +81,15 @@ export function useAgentSocket({
   onUploadError,
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
+  // True when the negotiated subprotocol is spawn.v2 (DataChannel-only PTY).
+  const [v2, setV2] = useState(false);
+  // True while the spawn.pty DataChannel is open — on v2 this IS the live
+  // terminal path, so callers surface it as connection state.
+  const [dcOpen, setDcOpen] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const wsV2Ref = useRef(false);
+  const pendingInputRef = useRef<Uint8Array[]>([]);
+  const pendingInputBytesRef = useRef(0);
   const rtcRef = useRef<RtcState>({
     pc: null,
     dc: null,
@@ -170,6 +182,7 @@ export function useAgentSocket({
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
+      setDcOpen(false);
       if (retry) scheduleRtcRetry();
     };
 
@@ -208,7 +221,15 @@ export function useAgentSocket({
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
       const sessionId = newRtcSessionId();
-      const pc = new RTCPeerConnection({ iceServers });
+      // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
+      // survive networks where no direct path exists (docs/TRUST.md Phase 1).
+      const forceRelay =
+        typeof window !== "undefined" &&
+        (window as { __spawnRtcForceRelay?: boolean }).__spawnRtcForceRelay === true;
+      const pc = new RTCPeerConnection({
+        iceServers,
+        iceTransportPolicy: forceRelay ? "relay" : "all",
+      });
       const dc = pc.createDataChannel("spawn.pty", { ordered: true });
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       let offerSent = false;
@@ -265,12 +286,31 @@ export function useAgentSocket({
           // side of the open handshake; treat relay copies that race the
           // first DataChannel byte as duplicates from the start.
           lastRtcDataAt = Date.now();
+          setDcOpen(true);
+          // Flush keystrokes typed before the channel came up (v2 has no
+          // relay to carry them). Order is preserved: this runs before any
+          // subsequent sendBinary can see the channel as open.
+          const queued = pendingInputRef.current.splice(0);
+          pendingInputBytesRef.current = 0;
+          for (const chunk of queued) {
+            try {
+              dc.send(
+                chunk.buffer.slice(
+                  chunk.byteOffset,
+                  chunk.byteOffset + chunk.byteLength,
+                ) as ArrayBuffer,
+              );
+            } catch {
+              break;
+            }
+          }
         }
       };
       dc.onclose = () => {
         const current = rtcRef.current;
         if (current.sessionId === sessionId) {
           rtcRef.current = { ...current, open: false };
+          setDcOpen(false);
         }
       };
       dc.onerror = () => {
@@ -322,9 +362,7 @@ export function useAgentSocket({
       setState("connecting");
       let ws: WebSocket;
       try {
-        ws = new WebSocket(buildAgentWsUrl(agentId, initialSizeRef.current), [
-          SPAWN_WS_SUBPROTOCOL,
-        ]);
+        ws = new WebSocket(buildAgentWsUrl(agentId, initialSizeRef.current), spawnWsSubprotocols());
       } catch {
         setState("error");
         scheduleReconnect();
@@ -335,6 +373,10 @@ export function useAgentSocket({
 
       ws.onopen = () => {
         attempt = 0;
+        // The selected subprotocol decides the data plane: v2 servers never
+        // relay PTY bytes, so the DataChannel is the only live path.
+        wsV2Ref.current = ws.protocol === "spawn.v2";
+        setV2(wsV2Ref.current);
         setState("open");
       };
       ws.onmessage = (ev) => {
@@ -408,6 +450,9 @@ export function useAgentSocket({
             }
           }
         } else if (ev.data instanceof ArrayBuffer) {
+          // v2 servers never send binary; drop anything that shows up rather
+          // than double-rendering against the DataChannel stream.
+          if (wsV2Ref.current) return;
           if (!rtcRef.current.open) {
             h.onData(new Uint8Array(ev.data));
           } else if (Date.now() - lastRtcDataAt > RTC_RELAY_DUPLICATE_WINDOW_MS) {
@@ -458,6 +503,13 @@ export function useAgentSocket({
       rtc.dc.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
       return true;
     }
+    if (wsV2Ref.current) {
+      // No relay on v2: hold input until the DataChannel (re)opens.
+      if (pendingInputBytesRef.current + buf.byteLength > MAX_PENDING_INPUT_BYTES) return false;
+      pendingInputRef.current.push(buf.slice());
+      pendingInputBytesRef.current += buf.byteLength;
+      return true;
+    }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     // Convert to a fresh ArrayBuffer to satisfy strict BufferSource typing.
@@ -483,5 +535,5 @@ export function useAgentSocket({
     return true;
   };
 
-  return { state, sendBinary, sendJson };
+  return { state, v2, dcOpen, sendBinary, sendJson };
 }

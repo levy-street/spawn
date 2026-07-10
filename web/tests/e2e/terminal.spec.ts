@@ -13,8 +13,16 @@ async function openTerminalWithMockSocket(
     reconnect?: boolean;
     secondHistory?: string;
     rtc?: boolean;
+    /** Playwright's WS mock always selects the first offered subprotocol, so
+     *  specs exercising the v1 relay must pin the client to spawn.v1. */
+    v2?: boolean;
   } = {},
 ) {
+  if (!options.v2) {
+    await page.addInitScript(() => {
+      (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
+    });
+  }
   await mockAuthenticatedApi(page, { agents: [agent()] });
   const messages: Array<string | Buffer> = [];
   const sockets: WebSocketRoute[] = [];
@@ -222,14 +230,39 @@ test("terminal sends resize frames and uploads files over REST", async ({ page }
     .locator('input[type="file"]')
     .setInputFiles({ name: "note.txt", mimeType: "text/plain", buffer: Buffer.from("hello file") });
 
-  await expect.poll(() => uploads.at(-1)).toMatchObject({
-    destination: "cwd",
-    name: "note.txt",
-    mime_type: "text/plain",
-    bytes_b64: Buffer.from("hello file").toString("base64"),
-    paste: false,
-  });
+  await expect
+    .poll(() => uploads.at(-1))
+    .toMatchObject({
+      destination: "cwd",
+      name: "note.txt",
+      mime_type: "text/plain",
+      bytes_b64: Buffer.from("hello file").toString("base64"),
+      paste: false,
+    });
   await expect(page.getByText("Uploaded /Users/tester/projects/spawn/note.txt")).toBeVisible();
+});
+
+test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({
+  page,
+}) => {
+  const { messages } = await openTerminalWithMockSocket(page, { v2: true, rtc: true });
+
+  // Control frames still ride the WS on v2.
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
+    .toBe(true);
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "rtc.offer"))
+    .toBe(true);
+
+  await page.getByLabel("Agent terminal").click();
+  await page.keyboard.type("secret input");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(300);
+
+  // No DataChannel exists in the mock, so input is queued client-side; the
+  // relay path must never carry it.
+  expect(binaryText(messages)).toBe("");
 });
 
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {

@@ -163,8 +163,7 @@ export async function mockAuthenticatedApi(
     if (filesMatch) {
       const [, hostId, op] = filesMatch;
       if (!op && method === "GET") {
-        const listing =
-          options.files?.(hostId, url.searchParams.get("path")) ?? fileListing();
+        const listing = options.files?.(hostId, url.searchParams.get("path")) ?? fileListing();
         await route.fulfill({ status: 200, contentType: "application/json", json: listing });
         return;
       }

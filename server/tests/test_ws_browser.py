@@ -18,11 +18,18 @@ from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 
 
 class FakeBrowserWebSocket:
-    def __init__(self, *, authorization: str | None = None, cookies: dict[str, str] | None = None):
+    def __init__(
+        self,
+        *,
+        authorization: str | None = None,
+        cookies: dict[str, str] | None = None,
+        subprotocols: list[str] | None = None,
+    ):
         self.headers: dict[str, str] = {}
         if authorization is not None:
             self.headers["authorization"] = authorization
         self.cookies = cookies or {}
+        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v1"]}
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -442,3 +449,69 @@ async def test_browser_ws_fans_out_live_bytes_and_isolates_agents(client):
         for ws in first_agent_sockets + second_agent_sockets:
             ws.queue_disconnect()
         await asyncio.gather(*(asyncio.wait_for(task, timeout=1) for task in tasks))
+
+
+async def test_browser_ws_v2_never_relays_pty_bytes(client):
+    """spawn.v2 (docs/TRUST.md Phase 1): no binary in either direction."""
+    from spawn_server.redis import get_backend
+
+    user_id, token = await _signup(client, "ws-browser-v2@example.com")
+    _host_id, agent_id = await _create_host_and_agent(user_id)
+
+    ws = FakeBrowserWebSocket(
+        authorization=f"Bearer {token}", subprotocols=["spawn.v2", "spawn.v1"]
+    )
+    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30))  # type: ignore[arg-type]
+
+    try:
+        await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
+        assert ws.accepted_subprotocol == "spawn.v2"
+        # Control frames still flow: signaling config reaches the browser.
+        assert len(_messages_of_type(ws, "rtc.config")) == 1
+
+        # v2 browsers are never subscribed to the PTY pubsub feed.
+        backend = get_backend()
+        assert backend.inproc is not None
+        assert len(backend.inproc._subs.get(f"spawn:agent:{agent_id}", ())) == 0
+        await backend.publish(agent_id, b"live-output\n")
+        await asyncio.sleep(0.05)
+        assert ws.sent_bytes == []
+    finally:
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=1)
+
+
+async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
+    user_id, token = await _signup(client, "ws-browser-v2-input@example.com")
+    _host_id, agent_id = await _create_host_and_agent(user_id)
+
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30))  # type: ignore[arg-type]
+
+    await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
+    ws.queue_bytes(b"stdin over the relay")
+    await asyncio.wait_for(task, timeout=1)
+
+    assert ws.closed is not None
+    assert ws.closed[0] == 4002
+
+
+async def test_browser_ws_v2_falls_back_to_v1_when_webrtc_disabled(client, monkeypatch):
+    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "false")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    try:
+        user_id, token = await _signup(client, "ws-browser-v2-nortc@example.com")
+        _host_id, agent_id = await _create_host_and_agent(user_id)
+
+        ws = FakeBrowserWebSocket(
+            authorization=f"Bearer {token}", subprotocols=["spawn.v2", "spawn.v1"]
+        )
+        ws.queue_disconnect()
+        await browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
+
+        # A v2 accept with WebRTC off would leave the client with no live
+        # path at all; the server keeps such clients on the v1 relay.
+        assert ws.accepted_subprotocol == "spawn.v1"
+    finally:
+        monkeypatch.delenv("SPAWN_WEBRTC_ENABLED", raising=False)
+        get_settings.cache_clear()  # type: ignore[attr-defined]

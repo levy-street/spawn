@@ -237,6 +237,17 @@ Each phase ships independently; the product works throughout.
 *Delivers: "server does not relay PTY data" (policy claim; transcripts
 still server-side).*
 
+*Status 2026-07-10: shipped for spawn.v2 clients.* coturn (already on the
+prod box) now runs `use-auth-secret`; the server mints ephemeral HMAC
+credentials per session (`turn.py`) instead of shipping a static TURN
+password to every browser. The browser WS negotiates `spawn.v2`: the
+server never sends binary PTY frames to v2 browsers (no pubsub pump) and
+closes with code 4002 if one arrives; the web client is DataChannel-only
+for live PTY, queueing input until the channel opens. `spawn.v1` (and the
+daemon-bound `0x02` input path only it uses) remains for rollout compat —
+retiring it, plus the daemon→server `0x01` output leg that still feeds
+server-side transcripts, is Phase 2 work.
+
 - Stand up coturn; control plane mints ephemeral HMAC TURN credentials
   per session (time-limited, per RFC 5766 REST-API convention) and
   delivers them in the existing `rtc.config` / `rtc.offer.ice_servers`

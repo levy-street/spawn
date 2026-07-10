@@ -18,7 +18,23 @@
 // The Next rewrite proxies /ws/* to the API server in local development.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
-export const SPAWN_WS_SUBPROTOCOL = "spawn.v1";
+// Offered in preference order. On spawn.v2 the WS is control/signaling only:
+// the server never relays PTY bytes (binary frames are a protocol error) and
+// live terminal data flows exclusively over the WebRTC DataChannel
+// (docs/TRUST.md Phase 1). spawn.v1 keeps the legacy relay for old servers.
+export const SPAWN_WS_SUBPROTOCOLS = ["spawn.v2", "spawn.v1"];
+
+export function spawnWsSubprotocols(): string[] {
+  // Test hook: Playwright's WS mock always selects the first offered
+  // subprotocol, so relay-path specs pin the client to v1 explicitly.
+  if (
+    typeof window !== "undefined" &&
+    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1
+  ) {
+    return ["spawn.v1"];
+  }
+  return SPAWN_WS_SUBPROTOCOLS;
+}
 
 function originForWs(): string {
   if (WS_URL) return WS_URL;
