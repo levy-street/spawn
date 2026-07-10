@@ -16,10 +16,16 @@ pub fn server_url(cli_value: Option<String>) -> Result<Url> {
     Url::parse(&raw).with_context(|| format!("invalid server URL {raw:?}"))
 }
 
-/// Returns `~/.config/spawn/`, creating it if missing.
+/// Returns the daemon config dir, creating it if missing. Defaults to
+/// `~/.config/spawn/`; `SPAWN_CONFIG_DIR` overrides it so multiple daemons
+/// (e.g. one per server) can coexist on a host without sharing credentials.
 pub fn config_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("cannot resolve user config dir")?;
-    let dir = base.join("spawn");
+    let dir = match std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::config_dir()
+            .context("cannot resolve user config dir")?
+            .join("spawn"),
+    };
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
