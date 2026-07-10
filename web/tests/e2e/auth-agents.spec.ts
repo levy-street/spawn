@@ -77,3 +77,30 @@ test("agent create permission errors are rendered as controlled form errors", as
 
   await expect(page.getByText("CSRF token missing or invalid")).toBeVisible();
 });
+
+test("sidebar agent rows expose actions via kebab menu", async ({ page }) => {
+  const patches: Array<{ id: string; body: Record<string, unknown> }> = [];
+  await mockAuthenticatedApi(page, {
+    agents: [agent()],
+    updateAgent: async (id, body, route) => {
+      patches.push({ id, body: body as Record<string, unknown> });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: agent({ id, ...(body as Record<string, unknown>) }),
+      });
+    },
+  });
+
+  await page.goto("/agents");
+  const row = page.locator("aside").getByRole("link", { name: /palette/ });
+  await row.hover();
+  const kebab = page.locator("aside").getByRole("button", { name: "palette actions" });
+  await expect(kebab).toBeVisible();
+  await kebab.click();
+  await page.getByRole("menuitem", { name: "Pin" }).click();
+
+  await expect
+    .poll(() => patches.at(-1))
+    .toMatchObject({ body: { pinned: true } });
+});

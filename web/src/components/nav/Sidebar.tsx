@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
   LogOut,
+  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
@@ -17,19 +18,9 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import {
-  Fragment,
-  type MouseEvent as ReactMouseEvent,
-  type ReactNode,
-  type PointerEvent as ReactPointerEvent,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { Fragment, type ReactNode, useMemo, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
-import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -45,8 +36,6 @@ import { setAgentDragData } from "@/lib/dnd";
 import { cn } from "@/lib/utils";
 
 export const SIDEBAR_RAIL_WIDTH = 56;
-
-const ACTION_TOOLBAR_BOUNDARY_OVERLAP = 8;
 
 /**
  * Geometry contract that keeps collapse/expand smooth: every row is a fixed
@@ -277,20 +266,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     [agentsQ.data, hostsQ.data],
   );
 
-  const [actionTarget, setActionTarget] = useState<{
-    agentId: string;
-    left: number;
-    top: number;
-  } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const closeActionsTimer = useRef<number | null>(null);
-  const longPressTimer = useRef<number | null>(null);
-  const suppressClickAgentId = useRef<string | null>(null);
-
-  const allAgents = useMemo(() => groups.flatMap((group) => group.agents), [groups]);
-  const actionAgent = actionTarget
-    ? (allAgents.find((agent) => agent.id === actionTarget.agentId) ?? null)
-    : null;
 
   const invalidate = (id?: string) => {
     qc.invalidateQueries({ queryKey: ["agents"] });
@@ -309,7 +285,6 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   const archiveM = useMutation({
     mutationFn: (id: string) => agents.archive(id),
     onSuccess: (_agent, id) => {
-      setActionTarget(null);
       setActionError(null);
       invalidate(id);
       if (pathname === `/agents/${id}`) router.push("/agents");
@@ -319,7 +294,6 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   const deleteM = useMutation({
     mutationFn: (id: string) => agents.remove(id),
     onSuccess: (_result, id) => {
-      setActionTarget(null);
       setActionError(null);
       invalidate(id);
       if (pathname === `/agents/${id}`) router.push("/agents");
@@ -351,64 +325,6 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     restartM.isPending ||
     pinM.isPending;
 
-  useEffect(() => {
-    if (actionTarget && !actionAgent) setActionTarget(null);
-  }, [actionAgent, actionTarget]);
-
-  useEffect(() => {
-    return () => {
-      if (closeActionsTimer.current) window.clearTimeout(closeActionsTimer.current);
-      if (longPressTimer.current) window.clearTimeout(longPressTimer.current);
-    };
-  }, []);
-
-  const cancelCloseActions = () => {
-    if (!closeActionsTimer.current) return;
-    window.clearTimeout(closeActionsTimer.current);
-    closeActionsTimer.current = null;
-  };
-  const scheduleCloseActions = () => {
-    cancelCloseActions();
-    closeActionsTimer.current = window.setTimeout(() => {
-      setActionTarget(null);
-      closeActionsTimer.current = null;
-    }, 140);
-  };
-  const cancelLongPress = () => {
-    if (!longPressTimer.current) return;
-    window.clearTimeout(longPressTimer.current);
-    longPressTimer.current = null;
-  };
-  const openActions = (agent: Agent, element: HTMLElement) => {
-    cancelCloseActions();
-    const rowRect = element.getBoundingClientRect();
-    const asideRect = element.closest("aside")?.getBoundingClientRect();
-    setActionTarget({
-      agentId: agent.id,
-      left: (asideRect?.right ?? rowRect.right) - ACTION_TOOLBAR_BOUNDARY_OVERLAP,
-      top: Math.min(Math.max(rowRect.top + rowRect.height / 2, 36), window.innerHeight - 36),
-    });
-  };
-  const onRowPointerEnter = (agent: Agent, event: ReactPointerEvent<HTMLElement>) => {
-    if (event.pointerType === "touch") return;
-    openActions(agent, event.currentTarget);
-  };
-  const onRowPointerDown = (agent: Agent, event: ReactPointerEvent<HTMLElement>) => {
-    if (event.pointerType !== "touch") return;
-    const element = event.currentTarget;
-    cancelLongPress();
-    longPressTimer.current = window.setTimeout(() => {
-      suppressClickAgentId.current = agent.id;
-      openActions(agent, element);
-      longPressTimer.current = null;
-    }, 500);
-  };
-  const onAgentClick = (agent: Agent, event: ReactMouseEvent<HTMLAnchorElement>) => {
-    if (suppressClickAgentId.current !== agent.id) return;
-    suppressClickAgentId.current = null;
-    event.preventDefault();
-    event.stopPropagation();
-  };
   const promptRename = (agent: Agent) => {
     const next = prompt("Rename agent", agent.name ?? agentTitle(agent));
     if (next === null) return;
@@ -458,19 +374,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
             {group.agents.map((agent) => {
               const active = pathname === `/agents/${agent.id}`;
               return (
-                <li
-                  key={agent.id}
-                  className="my-0.5"
-                  onPointerEnter={(event) => onRowPointerEnter(agent, event)}
-                  onPointerLeave={(event) => {
-                    if (event.pointerType !== "touch") scheduleCloseActions();
-                  }}
-                  onPointerDown={(event) => onRowPointerDown(agent, event)}
-                  onPointerUp={cancelLongPress}
-                  onPointerCancel={cancelLongPress}
-                  onFocus={(event) => openActions(agent, event.currentTarget)}
-                  onBlur={scheduleCloseActions}
-                >
+                <li key={agent.id} className="group/agentrow relative my-0.5">
                   <RailTooltip
                     label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}`}
                     disabled={!collapsed}
@@ -478,14 +382,11 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
                     <Link
                       href={`/agents/${agent.id}`}
                       aria-current={active ? "page" : undefined}
-                      onClick={(event) => onAgentClick(agent, event)}
                       draggable
                       onDragStart={(event) => {
                         setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
-                        cancelLongPress();
-                        setActionTarget(null);
                       }}
-                      className={cn(rowClass(active), "h-10")}
+                      className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
                     >
                       <IconSlot>
                         <span className="relative">
@@ -497,8 +398,14 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
                         </span>
                       </IconSlot>
                       <RowLabel collapsed={collapsed}>
-                        <span className="block truncate text-xs font-medium leading-4">
-                          {agentTitle(agent)}
+                        <span className="flex items-center gap-1 text-xs font-medium leading-4">
+                          <span className="truncate">{agentTitle(agent)}</span>
+                          {agent.pinned_at && (
+                            <Pin
+                              className="size-3 shrink-0 text-muted-foreground"
+                              aria-label="Pinned"
+                            />
+                          )}
                         </span>
                         <span className="block truncate text-[10px] leading-3 opacity-70">
                           {agentActivityDetail(agent)}
@@ -506,88 +413,74 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
                       </RowLabel>
                     </Link>
                   </RailTooltip>
+                  {!collapsed && (
+                    <DropdownMenu
+                      className="absolute right-1 top-1/2 -translate-y-1/2"
+                      menuClassName="w-44"
+                      renderTrigger={(props) => (
+                        <button
+                          {...props}
+                          type="button"
+                          aria-label={`${agentTitle(agent)} actions`}
+                          className={cn(
+                            "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
+                            "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
+                          )}
+                        >
+                          <MoreHorizontal className="size-3.5" aria-hidden />
+                        </button>
+                      )}
+                    >
+                      <DropdownMenuItem disabled={busy} onSelect={() => promptRename(agent)}>
+                        <Pencil className="size-4" aria-hidden />
+                        Rename
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={busy}
+                        onSelect={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
+                      >
+                        {agent.pinned_at ? (
+                          <PinOff className="size-4" aria-hidden />
+                        ) : (
+                          <Pin className="size-4" aria-hidden />
+                        )}
+                        {agent.pinned_at ? "Unpin" : "Pin"}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={busy}
+                        onSelect={() => {
+                          if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
+                        }}
+                      >
+                        <RotateCcw className="size-4" aria-hidden />
+                        Restart
+                      </DropdownMenuItem>
+                      <DropdownMenuItem disabled={busy} onSelect={() => archiveM.mutate(agent.id)}>
+                        <Archive className="size-4" aria-hidden />
+                        Archive
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        destructive
+                        disabled={busy}
+                        onSelect={() => {
+                          if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
+                        }}
+                      >
+                        <Trash2 className="size-4" aria-hidden />
+                        Delete
+                      </DropdownMenuItem>
+                    </DropdownMenu>
+                  )}
                 </li>
               );
             })}
           </Fragment>
         ))}
-        {!agentsQ.isLoading && allAgents.length === 0 && !collapsed && (
+        {!agentsQ.isLoading && groups.length === 0 && !collapsed && (
           <li className="px-1.5 py-1 text-xs text-muted-foreground">No agents yet</li>
         )}
       </ul>
-
-      {actionAgent && (
-        <div
-          role="toolbar"
-          aria-label={`${agentTitle(actionAgent)} actions`}
-          className="fixed z-40 flex -translate-y-1/2 items-center rounded-lg border border-border bg-popover/95 p-0.5 shadow-lg shadow-black/40 backdrop-blur animate-in fade-in-0 zoom-in-95 duration-100"
-          style={{ left: actionTarget?.left, top: actionTarget?.top }}
-          onPointerEnter={cancelCloseActions}
-          onPointerLeave={scheduleCloseActions}
-          onFocus={cancelCloseActions}
-          onBlur={scheduleCloseActions}
-        >
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            aria-label={`Rename ${agentTitle(actionAgent)}`}
-            title="Rename agent"
-            disabled={busy}
-            onClick={() => promptRename(actionAgent)}
-          >
-            <Pencil className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn("size-7", actionAgent.pinned_at && "text-primary")}
-            aria-label={`${actionAgent.pinned_at ? "Unpin" : "Pin"} ${agentTitle(actionAgent)}`}
-            title={actionAgent.pinned_at ? "Unpin agent" : "Pin agent"}
-            disabled={busy}
-            onClick={() => pinM.mutate({ id: actionAgent.id, pinned: !actionAgent.pinned_at })}
-          >
-            {actionAgent.pinned_at ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            aria-label={`Restart ${agentTitle(actionAgent)}`}
-            title="Restart agent"
-            disabled={busy}
-            onClick={() => {
-              if (confirm(`Restart ${agentTitle(actionAgent)}?`)) restartM.mutate(actionAgent.id);
-            }}
-          >
-            <RotateCcw className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            aria-label={`Archive ${agentTitle(actionAgent)}`}
-            title="Archive agent"
-            disabled={busy}
-            onClick={() => archiveM.mutate(actionAgent.id)}
-          >
-            <Archive className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7 text-destructive hover:text-destructive"
-            aria-label={`Delete ${agentTitle(actionAgent)}`}
-            title="Delete agent"
-            disabled={busy}
-            onClick={() => {
-              if (confirm(`Delete ${agentTitle(actionAgent)}?`)) deleteM.mutate(actionAgent.id);
-            }}
-          >
-            <Trash2 className="size-3.5" />
-          </Button>
-        </div>
-      )}
     </section>
   );
 }
@@ -614,8 +507,15 @@ function groupAgentsByHost(agentList: Agent[], hostList: Host[]): HostGroup[] {
     const aOnline = a.host?.status === "online" ? 0 : 1;
     const bOnline = b.host?.status === "online" ? 0 : 1;
     if (aOnline !== bOnline) return aOnline - bOnline;
+    // Surface the host you touched last so its agents sit on top.
+    const byRecency = groupRecency(b) - groupRecency(a);
+    if (byRecency !== 0) return byRecency;
     return a.hostName.localeCompare(b.hostName);
   });
+}
+
+function groupRecency(group: HostGroup): number {
+  return Math.max(0, ...group.agents.map(lastInputTime));
 }
 
 function compareAgents(a: Agent, b: Agent): number {

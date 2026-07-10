@@ -104,6 +104,7 @@ export async function mockAuthenticatedApi(
     createScreen?: (body: unknown, route: Route) => Promise<void> | void;
     skills?: unknown[];
     createAgent?: (body: unknown, route: Route) => Promise<void> | void;
+    updateAgent?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     createSkill?: (body: unknown, route: Route) => Promise<void> | void;
     updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     deleteSkill?: (id: string, route: Route) => Promise<void> | void;
@@ -251,6 +252,20 @@ export async function mockAuthenticatedApi(
         status: 201,
         contentType: "application/json",
         json: agent(await request.postDataJSON()),
+      });
+      return;
+    }
+    if (path.match(/^\/api\/agents\/[^/]+$/) && method === "PATCH") {
+      const id = path.split("/").at(-1) ?? "";
+      const body = await request.postDataJSON();
+      if (options.updateAgent) {
+        await options.updateAgent(id, body, route);
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: agent({ id, ...(body as Record<string, unknown>) }),
       });
       return;
     }
