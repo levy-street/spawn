@@ -30,7 +30,7 @@ export function KindIcon({
   return (
     <span
       className={cn(
-        "inline-flex size-7 shrink-0 items-center justify-center rounded-md border text-foreground",
+        "inline-flex size-7 shrink-0 items-center justify-center overflow-hidden rounded-lg shadow-sm ring-1 ring-inset ring-white/10",
         classForKind(kind),
         className,
       )}
@@ -38,7 +38,13 @@ export function KindIcon({
       title={agentKindLabel(kind)}
       aria-label={agentKindLabel(kind)}
     >
-      <BrandMark kind={kind} className={cn("size-3.5", iconClassName)} />
+      {kind === "codex" ? (
+        // The Codex mark ships its own white rounded plate — render it
+        // full-bleed so the tile *is* the app icon.
+        <CodexMark className="size-full" />
+      ) : (
+        <BrandMark kind={kind} className={cn("size-4", iconClassName)} />
+      )}
     </span>
   );
 }
@@ -99,7 +105,7 @@ function ClaudeCodeMark({ className }: { className?: string }) {
       <path
         clipRule="evenodd"
         d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"
-        fill="#D97757"
+        fill="currentColor"
         fillRule="evenodd"
       />
     </svg>
@@ -118,16 +124,16 @@ function OpenCodeMark({ className }: { className?: string }) {
 function classForKind(kind: AgentKind): string {
   switch (kind) {
     case "codex":
-      return "border-indigo-400/30 bg-white text-foreground";
+      return "bg-white ring-black/10";
     case "claude":
-      return "border-[#D97757]/35 bg-[#D97757]/10 text-[#D97757]";
+      return "bg-[#D97757] text-white";
     case "opencode":
-      return "border-zinc-200/40 bg-white text-black";
+      return "bg-black text-white ring-white/20";
     case "aider":
-      return "border-fuchsia-500/30 bg-fuchsia-500/15 text-fuchsia-200";
+      return "bg-gradient-to-br from-fuchsia-500 to-purple-700 text-white";
     case "shell":
-      return "border-zinc-500/30 bg-zinc-500/15 text-zinc-200";
+      return "bg-zinc-800 text-emerald-300";
     default:
-      return "border-border bg-muted text-muted-foreground";
+      return "bg-muted text-muted-foreground ring-border";
   }
 }

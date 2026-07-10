@@ -152,11 +152,22 @@ export function Sidebar({
       {/* Primary nav */}
       <nav aria-label="Primary" className="px-2.5">
         <ul className="space-y-0.5">
-          <li>
+          <li className="pb-1.5">
             <RailTooltip label="New agent" disabled={!collapsed}>
-              <Link href="/agents/new" className={rowClass(pathname === "/agents/new")}>
+              {/* Inverted primary row — the one call-to-action in the rail. */}
+              <Link
+                href="/agents/new"
+                className={cn(
+                  "group/new flex h-9 w-full items-center rounded-lg bg-primary text-sm font-medium text-primary-foreground shadow-sm transition-[background-color,box-shadow]",
+                  "hover:bg-primary/90 hover:shadow-md",
+                  pathname === "/agents/new" && "ring-2 ring-ring/40",
+                )}
+              >
                 <IconSlot>
-                  <SquarePen className="size-4" aria-hidden />
+                  <SquarePen
+                    className="size-4 transition-transform duration-150 group-hover/new:scale-110"
+                    aria-hidden
+                  />
                 </IconSlot>
                 <RowLabel collapsed={collapsed}>New agent</RowLabel>
               </Link>

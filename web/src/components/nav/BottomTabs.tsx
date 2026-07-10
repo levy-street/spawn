@@ -1,6 +1,6 @@
 "use client";
 
-import { LayoutGrid, Server, Settings, Sparkles } from "lucide-react";
+import { Layers, LayoutGrid, Server, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
@@ -9,7 +9,7 @@ export const NAV = [
   { href: "/", label: "Dash", icon: LayoutGrid },
   { href: "/hosts", label: "Hosts", icon: Server },
   { href: "/agents", label: "Agents", icon: Sparkles },
-  { href: "/settings", label: "Settings", icon: Settings },
+  { href: "/presets", label: "Presets", icon: Layers },
 ] as const;
 
 export function BottomTabs() {

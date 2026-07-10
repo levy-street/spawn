@@ -1,12 +1,12 @@
 "use client";
 
+import { Settings } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { type ReactNode, type PointerEvent as ReactPointerEvent, useEffect, useState } from "react";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
 import { Button } from "@/components/ui/button";
-import { logout } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
 const SIDEBAR_DEFAULT_WIDTH = 264;
@@ -121,14 +121,10 @@ export function AppShell({
               <Link href="/" className="text-base font-semibold tracking-tight">
                 spawn
               </Link>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  void logout();
-                }}
-              >
-                Log out
+              <Button asChild variant="ghost" size="icon" aria-label="Settings">
+                <Link href="/settings">
+                  <Settings className="size-4.5" />
+                </Link>
               </Button>
             </div>
           </header>
