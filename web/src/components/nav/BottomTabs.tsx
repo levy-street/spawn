@@ -9,7 +9,7 @@ export const NAV = [
   { href: "/", label: "Dash", icon: LayoutGrid },
   { href: "/hosts", label: "Hosts", icon: Server },
   { href: "/agents", label: "Agents", icon: Sparkles },
-  { href: "/views", label: "Views", icon: PanelsTopLeft },
+  { href: "/screens", label: "Screens", icon: PanelsTopLeft },
   { href: "/presets", label: "Presets", icon: Layers },
 ] as const;
 

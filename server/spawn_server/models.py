@@ -247,16 +247,18 @@ class DeviceCode(Base):
     )
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-class View(Base):
-    __tablename__ = "views"
+class Screen(Base):
+    __tablename__ = "screens"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     owner_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # {"tabs": [{"name": str|None, "agent_ids": [uuid, ...]}, ...]} — kept as
-    # loose JSON so richer split trees don't need a migration.
+    # {"tabs": [{"name": str|None, "root": <split tree>}, ...]} — a split tree
+    # is {"type": "pane", "agent_id": ...} or {"type": "split", "direction":
+    # "row"|"column", "ratio": 0.1..0.9, "a": <node>, "b": <node>}. Kept as
+    # loose JSON so layout evolution doesn't need migrations.
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

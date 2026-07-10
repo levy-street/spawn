@@ -30,7 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
-import { agentAccess, agents, hosts, views } from "@/lib/api";
+import { agentAccess, agents, hosts, screens } from "@/lib/api";
 import { useAgentDrop } from "@/lib/dnd";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -164,14 +164,27 @@ function AgentTerminal() {
     mutationFn: ({ droppedId, droppedTitle }: { droppedId: string; droppedTitle: string }) => {
       const current = q.data ? agentTitle(q.data) : "agent";
       const name = `${current} · ${droppedTitle || "split"}`.slice(0, 128);
-      return views.create({
+      return screens.create({
         name,
-        layout: { tabs: [{ name: null, agent_ids: [id as string, droppedId] }] },
+        layout: {
+          tabs: [
+            {
+              name: null,
+              root: {
+                type: "split",
+                direction: "row",
+                ratio: 0.5,
+                a: { type: "pane", agent_id: id as string },
+                b: { type: "pane", agent_id: droppedId },
+              },
+            },
+          ],
+        },
       });
     },
     onSuccess: (created) => {
-      qc.invalidateQueries({ queryKey: ["views"] });
-      router.push(`/views/${created.id}`);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+      router.push(`/screens/${created.id}`);
     },
     onError: (err) => setActionError(String(err)),
   });

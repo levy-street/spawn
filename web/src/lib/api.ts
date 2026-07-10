@@ -261,25 +261,38 @@ export const AgentAccessSchema = z.object({
 });
 export type AgentAccess = z.infer<typeof AgentAccessSchema>;
 
-export const ViewTabSchema = z.object({
+export const LayoutNodeSchema: z.ZodType<import("@/lib/layout").LayoutNode> = z.lazy(() =>
+  z.discriminatedUnion("type", [
+    z.object({ type: z.literal("pane"), agent_id: z.string().uuid() }),
+    z.object({
+      type: z.literal("split"),
+      direction: z.enum(["row", "column"]),
+      ratio: z.number().min(0.05).max(0.95),
+      a: LayoutNodeSchema,
+      b: LayoutNodeSchema,
+    }),
+  ]),
+) as z.ZodType<import("@/lib/layout").LayoutNode>;
+
+export const ScreenTabSchema = z.object({
   name: z.string().nullable().optional(),
-  agent_ids: z.array(z.string().uuid()).default([]),
+  root: LayoutNodeSchema.nullable().default(null),
 });
-export type ViewTab = z.infer<typeof ViewTabSchema>;
+export type ScreenTab = z.infer<typeof ScreenTabSchema>;
 
-export const ViewLayoutSchema = z.object({
-  tabs: z.array(ViewTabSchema).default([]),
+export const ScreenLayoutSchema = z.object({
+  tabs: z.array(ScreenTabSchema).default([]),
 });
-export type ViewLayout = z.infer<typeof ViewLayoutSchema>;
+export type ScreenLayout = z.infer<typeof ScreenLayoutSchema>;
 
-export const ViewSchema = z.object({
+export const ScreenSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
-  layout: ViewLayoutSchema,
+  layout: ScreenLayoutSchema,
   created_at: z.string(),
   updated_at: z.string(),
 });
-export type View = z.infer<typeof ViewSchema>;
+export type Screen = z.infer<typeof ScreenSchema>;
 
 export const AuthResponseSchema = z.object({
   access_token: z.string(),
@@ -562,30 +575,30 @@ export const skills = {
   remove: (id: string) => api<void>(`/api/skills/${id}`, { method: "DELETE" }),
 };
 
-export const views = {
+export const screens = {
   list: () =>
-    api("/api/views", {
+    api("/api/screens", {
       method: "GET",
-      schema: z.array(ViewSchema),
+      schema: z.array(ScreenSchema),
     }),
   get: (id: string) =>
-    api(`/api/views/${id}`, {
+    api(`/api/screens/${id}`, {
       method: "GET",
-      schema: ViewSchema,
+      schema: ScreenSchema,
     }),
-  create: (body: { name: string; layout?: ViewLayout }) =>
-    api("/api/views", {
+  create: (body: { name: string; layout?: ScreenLayout }) =>
+    api("/api/screens", {
       method: "POST",
       body: JSON.stringify(body),
-      schema: ViewSchema,
+      schema: ScreenSchema,
     }),
-  update: (id: string, body: { name?: string; layout?: ViewLayout }) =>
-    api(`/api/views/${id}`, {
+  update: (id: string, body: { name?: string; layout?: ScreenLayout }) =>
+    api(`/api/screens/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
-      schema: ViewSchema,
+      schema: ScreenSchema,
     }),
-  remove: (id: string) => api<void>(`/api/views/${id}`, { method: "DELETE" }),
+  remove: (id: string) => api<void>(`/api/screens/${id}`, { method: "DELETE" }),
 };
 
 export const agentAccess = {

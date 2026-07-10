@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -356,32 +356,47 @@ class AgentOut(BaseModel):
     pinned_at: datetime | None = None
     archived_at: datetime | None = None
 
-# ---------- views ----------
+# ---------- screens ----------
 
 
-class ViewTab(BaseModel):
+class LayoutPane(BaseModel):
+    type: Literal["pane"]
+    agent_id: str
+
+
+class LayoutSplit(BaseModel):
+    type: Literal["split"]
+    direction: Literal["row", "column"]
+    ratio: float = Field(default=0.5, ge=0.05, le=0.95)
+    a: LayoutNode
+    b: LayoutNode
+
+
+LayoutNode = Annotated[LayoutPane | LayoutSplit, Field(discriminator="type")]
+
+
+class ScreenTab(BaseModel):
     name: str | None = Field(default=None, max_length=64)
-    agent_ids: list[str] = Field(default_factory=list, max_length=4)
+    root: LayoutNode | None = None
 
 
-class ViewLayout(BaseModel):
-    tabs: list[ViewTab] = Field(default_factory=list, max_length=8)
+class ScreenLayout(BaseModel):
+    tabs: list[ScreenTab] = Field(default_factory=list, max_length=8)
 
 
-class ViewCreate(BaseModel):
+class ScreenCreate(BaseModel):
     name: str = Field(max_length=128)
-    layout: ViewLayout = Field(default_factory=ViewLayout)
+    layout: ScreenLayout = Field(default_factory=ScreenLayout)
 
 
-class ViewPatch(BaseModel):
+class ScreenPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    layout: ViewLayout | None = None
+    layout: ScreenLayout | None = None
 
 
-class ViewOut(BaseModel):
+class ScreenOut(BaseModel):
     id: str
     name: str
-    layout: ViewLayout
+    layout: ScreenLayout
     created_at: datetime
     updated_at: datetime
-

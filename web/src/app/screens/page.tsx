@@ -16,23 +16,24 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { relativeTime } from "@/lib/agents";
-import { ApiError, type View, views } from "@/lib/api";
+import { ApiError, type Screen, screens } from "@/lib/api";
+import { countPanes } from "@/lib/layout";
 
-export default function ViewsPage() {
+export default function ScreensPage() {
   return (
     <AuthGate>
       <AppShell>
-        <ViewsList />
+        <ScreensList />
       </AppShell>
     </AuthGate>
   );
 }
 
-function ViewsList() {
+function ScreensList() {
   const qc = useQueryClient();
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
-  const q = useQuery({ queryKey: ["views"], queryFn: views.list });
+  const q = useQuery({ queryKey: ["screens"], queryFn: screens.list });
 
   const onError = (err: unknown) => setError(err instanceof ApiError ? err.message : String(err));
 
@@ -40,31 +41,34 @@ function ViewsList() {
     mutationFn: () => {
       const existing = new Set((q.data ?? []).map((view) => view.name));
       let n = (q.data?.length ?? 0) + 1;
-      while (existing.has(`View ${n}`)) n += 1;
-      return views.create({ name: `View ${n}`, layout: { tabs: [{ name: null, agent_ids: [] }] } });
+      while (existing.has(`Screen ${n}`)) n += 1;
+      return screens.create({
+        name: `Screen ${n}`,
+        layout: { tabs: [{ name: null, root: null }] },
+      });
     },
     onSuccess: (created) => {
-      qc.invalidateQueries({ queryKey: ["views"] });
-      router.push(`/views/${created.id}`);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+      router.push(`/screens/${created.id}`);
     },
     onError,
   });
   const renameM = useMutation({
-    mutationFn: ({ id, name }: { id: string; name: string }) => views.update(id, { name }),
+    mutationFn: ({ id, name }: { id: string; name: string }) => screens.update(id, { name }),
     onSuccess: () => {
       setError(null);
-      qc.invalidateQueries({ queryKey: ["views"] });
+      qc.invalidateQueries({ queryKey: ["screens"] });
     },
     onError,
   });
   const deleteM = useMutation({
-    mutationFn: (id: string) => views.remove(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["views"] }),
+    mutationFn: (id: string) => screens.remove(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["screens"] }),
     onError,
   });
 
-  const promptRename = (view: View) => {
-    const next = prompt("Rename view", view.name);
+  const promptRename = (view: Screen) => {
+    const next = prompt("Rename screen", view.name);
     if (next === null) return;
     const name = next.trim();
     if (name && name !== view.name) renameM.mutate({ id: view.id, name });
@@ -74,18 +78,20 @@ function ViewsList() {
     <div className="mx-auto w-full max-w-3xl p-4 @md/shell:p-6">
       <header className="mb-5 flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Views</h1>
-          <p className="mt-0.5 text-sm text-muted-foreground">Saved multi-terminal arrangements.</p>
+          <h1 className="text-xl font-semibold tracking-tight">Screens</h1>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Named multi-terminal arrangements — split panes organized in tabs.
+          </p>
         </div>
         <Button size="sm" disabled={createM.isPending} onClick={() => createM.mutate()}>
           <Plus className="size-4" />
-          New view
+          New screen
         </Button>
       </header>
 
       {(error || q.error) && (
         <p className="mb-3 text-sm text-destructive" role="alert">
-          {error ?? `Failed to load views: ${String(q.error)}`}
+          {error ?? `Failed to load screens: ${String(q.error)}`}
         </p>
       )}
 
@@ -106,10 +112,10 @@ function ViewsList() {
       {!q.isLoading && !q.error && (q.data?.length ?? 0) === 0 && (
         <Card>
           <CardHeader>
-            <CardTitle>No views yet</CardTitle>
+            <CardTitle>No screens yet</CardTitle>
             <CardDescription>
-              A view arranges several agent terminals on one screen — split panes, organized in
-              tabs, saved under a name. Create one and add agents to its panes.
+              A screen arranges several agent terminals together — resizable split panes, organized
+              in tabs, saved under a name. Create one and drag agents in.
             </CardDescription>
           </CardHeader>
         </Card>
@@ -119,7 +125,10 @@ function ViewsList() {
         <ul className="overflow-hidden rounded-xl border border-border">
           {(q.data ?? []).map((view) => {
             const tabCount = view.layout.tabs.length;
-            const agentCount = view.layout.tabs.reduce((sum, tab) => sum + tab.agent_ids.length, 0);
+            const agentCount = view.layout.tabs.reduce(
+              (sum, tab) => sum + countPanes(tab.root ?? null),
+              0,
+            );
             return (
               <li
                 key={view.id}
@@ -127,7 +136,7 @@ function ViewsList() {
               >
                 <div className="flex items-center gap-3 px-4 py-3.5">
                   <Link
-                    href={`/views/${view.id}`}
+                    href={`/screens/${view.id}`}
                     className="flex min-w-0 flex-1 items-center gap-3"
                   >
                     <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
@@ -173,7 +182,7 @@ function ViewsList() {
                       destructive
                       disabled={deleteM.isPending}
                       onSelect={() => {
-                        if (confirm(`Delete view ${view.name}?`)) deleteM.mutate(view.id);
+                        if (confirm(`Delete screen ${view.name}?`)) deleteM.mutate(view.id);
                       }}
                     >
                       <Trash2 className="size-4" aria-hidden />

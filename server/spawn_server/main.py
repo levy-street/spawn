@@ -22,7 +22,7 @@ from .routes import device as device_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import presets as presets_routes
-from .routes import views as views_routes
+from .routes import screens as screens_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
 
@@ -73,7 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(hosts_routes.router)
     app.include_router(agents_routes.router)
     app.include_router(presets_routes.router)
-    app.include_router(views_routes.router)
+    app.include_router(screens_routes.router)
     app.include_router(install_routes.router)
 
     app.include_router(daemon_ws.router)
