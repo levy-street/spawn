@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle } from "@/lib/agents";
 import { type Agent, ApiError, agents, type ViewLayout, views } from "@/lib/api";
+import { useAgentDrop } from "@/lib/dnd";
 import { cn } from "@/lib/utils";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -137,6 +138,17 @@ function ViewScreen({ id }: { id: string }) {
       tabs: layout.tabs.map((t, i) => (i === index ? { ...t, agent_ids: agentIds } : t)),
     });
   };
+  const addAgentToTab = (index: number, agentId: string) => {
+    if (!layout) return;
+    const target = layout.tabs[index];
+    if (!target || target.agent_ids.includes(agentId)) return;
+    if (target.agent_ids.length >= MAX_PANES_PER_TAB) {
+      setError("That tab already has 4 panes — drop on another tab or remove one first.");
+      return;
+    }
+    setError(null);
+    updateTab(index, [...target.agent_ids, agentId]);
+  };
   const addTab = () => {
     if (!layout || layout.tabs.length >= 8) return;
     commit({ tabs: [...layout.tabs, { name: null, agent_ids: [] }] });
@@ -211,15 +223,11 @@ function ViewScreen({ id }: { id: string }) {
             const active = i === tabIndex;
             const label = t.name?.trim() || `Tab ${i + 1}`;
             return (
-              <span
+              <TabPill
                 // biome-ignore lint/suspicious/noArrayIndexKey: tabs are positional; reordering is not supported
                 key={`tab-${i}`}
-                className={cn(
-                  "flex shrink-0 items-center overflow-hidden rounded-lg border text-xs transition-colors",
-                  active
-                    ? "border-border bg-accent text-accent-foreground"
-                    : "border-transparent text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-                )}
+                active={active}
+                onDropAgent={(agentId) => addAgentToTab(i, agentId)}
               >
                 <button
                   type="button"
@@ -260,7 +268,7 @@ function ViewScreen({ id }: { id: string }) {
                 ) : (
                   <span className="w-1.5" aria-hidden />
                 )}
-              </span>
+              </TabPill>
             );
           })}
           <button
@@ -337,9 +345,36 @@ function ViewScreen({ id }: { id: string }) {
           agentsById={agentsById}
           allAgents={agentsQ.data ?? []}
           onChange={(agentIds) => updateTab(tabIndex, agentIds)}
+          onDropAgent={(agentId) => addAgentToTab(tabIndex, agentId)}
         />
       )}
     </div>
+  );
+}
+
+function TabPill({
+  active,
+  onDropAgent,
+  children,
+}: {
+  active: boolean;
+  onDropAgent: (agentId: string) => void;
+  children: React.ReactNode;
+}) {
+  const { active: dropActive, dropProps } = useAgentDrop((agentId) => onDropAgent(agentId));
+  return (
+    <span
+      {...dropProps}
+      className={cn(
+        "flex shrink-0 items-center overflow-hidden rounded-lg border text-xs transition-colors",
+        active
+          ? "border-border bg-accent text-accent-foreground"
+          : "border-transparent text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+        dropActive && "border-ring bg-accent text-foreground ring-2 ring-ring/40",
+      )}
+    >
+      {children}
+    </span>
   );
 }
 
@@ -348,12 +383,15 @@ function PaneGrid({
   agentsById,
   allAgents,
   onChange,
+  onDropAgent,
 }: {
   tabAgentIds: string[];
   agentsById: Map<string, Agent>;
   allAgents: Agent[];
   onChange: (agentIds: string[]) => void;
+  onDropAgent: (agentId: string) => void;
 }) {
+  const { active: dropActive, dropProps } = useAgentDrop(onDropAgent);
   const canAdd = tabAgentIds.length < MAX_PANES_PER_TAB;
   const slotCount = tabAgentIds.length + (canAdd ? 1 : 0);
   const candidates = allAgents.filter(
@@ -361,7 +399,14 @@ function PaneGrid({
   );
 
   return (
-    <div className="@container/view min-h-0 flex-1 overflow-hidden">
+    <div {...dropProps} className="@container/view relative min-h-0 flex-1 overflow-hidden">
+      {dropActive && (
+        <div className="pointer-events-none absolute inset-2 z-20 grid place-items-center rounded-xl border-2 border-dashed border-ring bg-background/60">
+          <span className="rounded-lg border border-border bg-popover px-3 py-1.5 text-sm shadow-lg">
+            Drop to add to this tab
+          </span>
+        </div>
+      )}
       <div
         className={cn(
           "flex h-full flex-col gap-px overflow-y-auto bg-border",

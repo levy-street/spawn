@@ -41,6 +41,7 @@ import { RailTooltip } from "@/components/ui/tooltip";
 import { agentActivityDetail, agentTitle } from "@/lib/agents";
 import { type Agent, agents, type Host, hosts } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
+import { setAgentDragData } from "@/lib/dnd";
 import { cn } from "@/lib/utils";
 
 export const SIDEBAR_RAIL_WIDTH = 56;
@@ -478,6 +479,12 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
                       href={`/agents/${agent.id}`}
                       aria-current={active ? "page" : undefined}
                       onClick={(event) => onAgentClick(agent, event)}
+                      draggable
+                      onDragStart={(event) => {
+                        setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
+                        cancelLongPress();
+                        setActionTarget(null);
+                      }}
                       className={cn(rowClass(active), "h-10")}
                     >
                       <IconSlot>

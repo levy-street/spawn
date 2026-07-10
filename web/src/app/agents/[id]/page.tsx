@@ -30,7 +30,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
-import { agentAccess, agents, hosts } from "@/lib/api";
+import { agentAccess, agents, hosts, views } from "@/lib/api";
+import { useAgentDrop } from "@/lib/dnd";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -159,6 +160,27 @@ function AgentTerminal() {
     },
     onError: (err) => setActionError(String(err)),
   });
+  const splitM = useMutation({
+    mutationFn: ({ droppedId, droppedTitle }: { droppedId: string; droppedTitle: string }) => {
+      const current = q.data ? agentTitle(q.data) : "agent";
+      const name = `${current} · ${droppedTitle || "split"}`.slice(0, 128);
+      return views.create({
+        name,
+        layout: { tabs: [{ name: null, agent_ids: [id as string, droppedId] }] },
+      });
+    },
+    onSuccess: (created) => {
+      qc.invalidateQueries({ queryKey: ["views"] });
+      router.push(`/views/${created.id}`);
+    },
+    onError: (err) => setActionError(String(err)),
+  });
+  const { active: splitDropActive, dropProps: splitDropProps } = useAgentDrop(
+    (droppedId, droppedTitle) => {
+      if (!q.data || droppedId === id || splitM.isPending) return;
+      splitM.mutate({ droppedId, droppedTitle });
+    },
+  );
 
   const submitRename = () => {
     const next = draftName.trim();
@@ -371,7 +393,14 @@ function AgentTerminal() {
       {/* imagePasteMode: Claude and Codex both convert a bracketed-pasted
           image path into their native attachment pill ([Image #1]), and
           pasting the path is also the sane behavior for plain shells. */}
-      <div className="relative min-h-0 flex-1 @container/term">
+      <div {...splitDropProps} className="relative min-h-0 flex-1 @container/term">
+        {splitDropActive && (
+          <div className="pointer-events-none absolute inset-2 z-20 grid place-items-center rounded-xl border-2 border-dashed border-ring bg-background/60">
+            <span className="rounded-lg border border-border bg-popover px-3 py-1.5 text-sm shadow-lg">
+              Drop to open a split view
+            </span>
+          </div>
+        )}
         <Terminal
           ref={termRef}
           agentId={id}

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { AGENT_B_ID, AGENT_ID, agent, mockAuthenticatedApi, VIEW_ID, view } from "./app-mocks";
 
 const agentA = agent({ name: "alpha" });
@@ -84,4 +85,104 @@ test("adding a tab and removing a pane persist the layout", async ({ page }) => 
       },
     });
   await expect(page.getByRole("region", { name: "beta" })).toHaveCount(0);
+});
+
+async function dragAgent(page: Page, source: Locator, target: Locator) {
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+  await source.dispatchEvent("dragstart", { dataTransfer });
+  await target.dispatchEvent("dragenter", { dataTransfer });
+  await target.dispatchEvent("dragover", { dataTransfer });
+  await target.dispatchEvent("drop", { dataTransfer });
+}
+
+test("dragging an agent from the sidebar drops a pane into the active tab", async ({ page }) => {
+  const patches: Array<Record<string, unknown>> = [];
+  await mockAuthenticatedApi(page, {
+    agents: [agentA, agentB],
+    views: [view({ layout: { tabs: [{ name: null, agent_ids: [AGENT_ID] }] } })],
+    updateView: async (_id, body, route) => {
+      patches.push(body as Record<string, unknown>);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...view(), ...(body as Record<string, unknown>) },
+      });
+    },
+  });
+
+  await page.goto(`/views/${VIEW_ID}`);
+  await expect(page.getByRole("region", { name: "alpha" })).toBeVisible();
+
+  const source = page.locator("aside").getByRole("link", { name: /beta/ });
+  await dragAgent(page, source, page.getByRole("region", { name: "alpha" }));
+
+  await expect
+    .poll(() => patches.at(-1))
+    .toMatchObject({ layout: { tabs: [{ agent_ids: [AGENT_ID, AGENT_B_ID] }] } });
+  await expect(page.getByRole("region", { name: "beta" })).toBeVisible();
+});
+
+test("dropping an agent on a tab pill targets that tab", async ({ page }) => {
+  const patches: Array<Record<string, unknown>> = [];
+  await mockAuthenticatedApi(page, {
+    agents: [agentA, agentB],
+    views: [
+      view({
+        layout: {
+          tabs: [
+            { name: null, agent_ids: [AGENT_ID] },
+            { name: "spare", agent_ids: [] },
+          ],
+        },
+      }),
+    ],
+    updateView: async (_id, body, route) => {
+      patches.push(body as Record<string, unknown>);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...view(), ...(body as Record<string, unknown>) },
+      });
+    },
+  });
+
+  await page.goto(`/views/${VIEW_ID}`);
+  const source = page.locator("aside").getByRole("link", { name: /beta/ });
+  await dragAgent(page, source, page.getByRole("tab", { name: "spare" }));
+
+  await expect
+    .poll(() => patches.at(-1))
+    .toMatchObject({
+      layout: { tabs: [{ agent_ids: [AGENT_ID] }, { agent_ids: [AGENT_B_ID] }] },
+    });
+});
+
+test("dropping an agent on another agent's terminal creates a split view", async ({ page }) => {
+  let createdBody: Record<string, unknown> | null = null;
+  await mockAuthenticatedApi(page, {
+    agents: [agentA, agentB],
+    views: [view()],
+    createView: async (body, route) => {
+      createdBody = body as Record<string, unknown>;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        json: view({ ...(body as Record<string, unknown>), id: VIEW_ID }),
+      });
+    },
+  });
+
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+
+  const source = page.locator("aside").getByRole("link", { name: /beta/ });
+  await dragAgent(page, source, page.getByLabel("Agent terminal"));
+
+  await expect
+    .poll(() => createdBody)
+    .toMatchObject({
+      name: "palette · beta",
+      layout: { tabs: [{ agent_ids: [AGENT_ID, AGENT_B_ID] }] },
+    });
+  await page.waitForURL(`**/views/${VIEW_ID}`);
 });
