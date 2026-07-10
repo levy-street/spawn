@@ -6,6 +6,7 @@ import {
   Columns3,
   ExternalLink,
   Grid2x2,
+  Home,
   Maximize2,
   Minimize2,
   PanelLeft,
@@ -30,6 +31,7 @@ import {
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
+import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import {
   DropdownMenu,
@@ -93,6 +95,9 @@ function ScreenView({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [zoomedId, setZoomedId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  // Live terminal handles per pane so the shared mobile ModifierBar can
+  // target whichever pane holds focus.
+  const paneHandles = useRef(new Map<string, TerminalHandle | null>());
 
   const q = useQuery({
     queryKey: ["screen", id],
@@ -188,6 +193,17 @@ function ScreenView({ id }: { id: string }) {
     if (zoomedId && !screenAgentIds.includes(zoomedId)) setZoomedId(null);
   }, [screenAgentIds, zoomedId]);
 
+  // Keep a valid focus target so the mobile modifier bar always has a pane.
+  useEffect(() => {
+    if (screenAgentIds.length === 0) {
+      if (focusedId !== null) setFocusedId(null);
+      return;
+    }
+    if (!focusedId || !screenAgentIds.includes(focusedId)) {
+      setFocusedId(screenAgentIds[0]);
+    }
+  }, [screenAgentIds, focusedId]);
+
   const submitRename = () => {
     const next = draftName.trim();
     if (!screen || !next || next === screen.name) {
@@ -265,6 +281,14 @@ function ScreenView({ id }: { id: string }) {
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
+        {/* Mobile escape hatch: the shell chrome is hidden on this page. */}
+        <Link
+          href="/"
+          aria-label="Home"
+          className="grid size-8 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground @md/shell:hidden"
+        >
+          <Home className="size-4" aria-hidden />
+        </Link>
         {/* Screens as tabs */}
         <div
           role="tablist"
@@ -422,6 +446,36 @@ function ScreenView({ id }: { id: string }) {
         onToggleZoom={(agentId) => setZoomedId((z) => (z === agentId ? null : agentId))}
         onRootChange={commit}
         onPlaceAgent={placeAgent}
+        registerPane={(agentId, handle) => {
+          if (handle) paneHandles.current.set(agentId, handle);
+          else paneHandles.current.delete(agentId);
+        }}
+      />
+
+      <ModifierBar
+        className="hidden [@media(pointer:coarse)]:flex"
+        onSend={(bytes) => {
+          const handle = focusedId ? paneHandles.current.get(focusedId) : null;
+          handle?.sendInput(bytes);
+          requestAnimationFrame(() => handle?.focus());
+        }}
+        onPaste={(data) => {
+          const handle = focusedId ? paneHandles.current.get(focusedId) : null;
+          handle?.pasteDataTransfer(data);
+        }}
+        onPasteText={(text) => {
+          const handle = focusedId ? paneHandles.current.get(focusedId) : null;
+          handle?.pasteText(text);
+        }}
+        onPasteClick={() => {
+          const handle = focusedId ? paneHandles.current.get(focusedId) : null;
+          void handle?.pasteFromClipboard();
+        }}
+        onSubmit={() => {
+          const handle = focusedId ? paneHandles.current.get(focusedId) : null;
+          handle?.submit();
+          requestAnimationFrame(() => handle?.focus());
+        }}
       />
     </div>
   );
@@ -497,6 +551,7 @@ type PaneAreaProps = {
     side: Side | "center",
     sourceScreen: string | null,
   ) => void;
+  registerPane: (agentId: string, handle: TerminalHandle | null) => void;
 };
 
 function useIsWide(ref: RefObject<HTMLElement | null>): boolean {
@@ -748,6 +803,11 @@ function ScreenPane({
   } = props;
   const agent = agentsById.get(agentId);
   const termRef = useRef<TerminalHandle>(null);
+  const { registerPane } = props;
+  useEffect(() => {
+    registerPane(agentId, termRef.current);
+    return () => registerPane(agentId, null);
+  });
   const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
   const depth = useRef(0);
@@ -791,6 +851,7 @@ function ScreenPane({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
       onFocusCapture={() => onFocusPane(agentId)}
+      onPointerDownCapture={() => onFocusPane(agentId)}
       className={cn(
         "relative flex min-w-0 flex-1 flex-col overflow-hidden bg-background",
         stacked ? "min-h-[50dvh] flex-none" : "min-h-0",

@@ -294,3 +294,25 @@ test("dropping an agent on another agent's terminal creates a split screen", asy
     });
   await page.waitForURL(`**/screens/${SCREEN_ID}`);
 });
+
+test.describe("mobile", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("stacked panes, home escape hatch, and modifier bar", async ({ page }) => {
+    await mockAuthenticatedApi(page, {
+      agents: [agentA, agentB],
+      screens: [screen()],
+    });
+
+    await page.goto(`/screens/${SCREEN_ID}`);
+    await expect(page.getByRole("region", { name: "alpha" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "beta" })).toBeVisible();
+    // Narrow containers stack panes: no split divider to drag.
+    await expect(page.getByRole("button", { name: "Resize panes" })).toHaveCount(0);
+    // Shared modifier bar serves the focused pane on touch devices.
+    await expect(page.getByRole("button", { name: "Esc" })).toBeVisible();
+    // The shell chrome is hidden here, so the header carries an escape hatch.
+    await page.getByRole("link", { name: "Home" }).click();
+    await page.waitForURL((url) => url.pathname === "/");
+  });
+});
