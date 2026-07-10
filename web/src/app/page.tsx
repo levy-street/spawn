@@ -171,7 +171,7 @@ function TerminalBackdrop() {
           <BackdropLine accent="bg-sky-300" text="nightmare online - gpu queue - nvtop active" />
           <BackdropLine
             accent="bg-amber-300"
-            text="macbook online - local review agent - mcp spawn"
+            text="macbook online - local review agent - skills granted"
           />
           <div className="mt-2 h-40 rounded-md border border-white/10 bg-[#050505] p-4 font-mono text-sm text-zinc-300">
             <p>
@@ -188,7 +188,7 @@ function TerminalBackdrop() {
           <p className="text-emerald-300">spawnd 0.1.0</p>
           <p>host registered</p>
           <p className="text-sky-300">terminal attached</p>
-          <p className="text-amber-300">mcp tools granted</p>
+          <p className="text-amber-300">skills granted</p>
         </div>
       </div>
     </div>

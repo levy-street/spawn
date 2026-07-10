@@ -1,4 +1,4 @@
-"""Managed MCP server and skill API behavior."""
+"""Managed skill API behavior."""
 
 from __future__ import annotations
 
@@ -26,63 +26,11 @@ async def _create_host_for_user(email: str, name: str = "box") -> str:
         return host.id
 
 
-async def test_mcp_server_and_skill_crud_validation_and_scoping(client):
+async def test_skill_crud_validation_and_scoping(client):
     a_token = await _signup(client, "cap-a@example.com")
     b_token = await _signup(client, "cap-b@example.com")
     a_auth = {"Authorization": f"Bearer {a_token}"}
     b_auth = {"Authorization": f"Bearer {b_token}"}
-
-    invalid_http = await client.post(
-        "/api/mcp-servers",
-        json={"name": "bad-http", "transport": "streamable_http"},
-        headers=a_auth,
-    )
-    assert invalid_http.status_code == 400
-    invalid_stdio = await client.post(
-        "/api/mcp-servers",
-        json={"name": "bad-stdio", "transport": "stdio"},
-        headers=a_auth,
-    )
-    assert invalid_stdio.status_code == 400
-
-    server = await client.post(
-        "/api/mcp-servers",
-        json={
-            "name": "  filesystem  ",
-            "transport": "stdio",
-            "command": " npx ",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
-            "env": {"ROOT": "/repo"},
-            "enabled_by_default": True,
-        },
-        headers=a_auth,
-    )
-    assert server.status_code == 201, server.text
-    server_id = server.json()["id"]
-    assert server.json()["name"] == "filesystem"
-    assert server.json()["command"] == "npx"
-
-    duplicate = await client.post(
-        "/api/mcp-servers",
-        json={"name": "filesystem", "transport": "stdio", "command": "node"},
-        headers=a_auth,
-    )
-    assert duplicate.status_code == 409
-
-    patched = await client.patch(
-        f"/api/mcp-servers/{server_id}",
-        json={
-            "transport": "streamable_http",
-            "url": " http://localhost:8000/mcp ",
-            "command": "",
-            "enabled_by_default": False,
-        },
-        headers=a_auth,
-    )
-    assert patched.status_code == 200, patched.text
-    assert patched.json()["url"] == "http://localhost:8000/mcp"
-    assert patched.json()["command"] is None
-    assert patched.json()["enabled_by_default"] is False
 
     skill = await client.post(
         "/api/skills",
@@ -99,41 +47,48 @@ async def test_mcp_server_and_skill_crud_validation_and_scoping(client):
     assert skill.json()["name"] == "reviewer"
     assert skill.json()["description"] == "code review"
 
-    assert (await client.get("/api/mcp-servers", headers=b_auth)).json() == []
+    duplicate = await client.post(
+        "/api/skills",
+        json={"name": "reviewer", "content": "# Other"},
+        headers=a_auth,
+    )
+    assert duplicate.status_code == 409
+
+    blank = await client.post(
+        "/api/skills",
+        json={"name": "   ", "content": "# Blank"},
+        headers=a_auth,
+    )
+    assert blank.status_code == 400
+
+    patched = await client.patch(
+        f"/api/skills/{skill_id}",
+        json={"description": "updated", "enabled_by_default": False},
+        headers=a_auth,
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["description"] == "updated"
+    assert patched.json()["enabled_by_default"] is False
+
     assert (await client.get("/api/skills", headers=b_auth)).json() == []
-    assert (await client.patch(f"/api/mcp-servers/{server_id}", json={}, headers=b_auth)).status_code == 404
+    assert (await client.patch(f"/api/skills/{skill_id}", json={}, headers=b_auth)).status_code == 404
     assert (await client.delete(f"/api/skills/{skill_id}", headers=b_auth)).status_code == 404
 
 
-async def test_spawn_mcp_server_helper_is_idempotent_and_issues_user_scoped_token(client):
-    token = await _signup(client, "spawn-mcp-helper@example.com")
+async def test_mcp_surface_is_gone(client):
+    """MCP was cut entirely (docs/TRUST.md): no /mcp mount, no registry, no OAuth AS."""
+    token = await _signup(client, "cap-no-mcp@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
-    first = await client.post(
-        "/api/mcp-servers/spawn",
-        json={"name": "spawn", "enabled_by_default": True},
-        headers=auth,
-    )
-    assert first.status_code == 201, first.text
-    first_body = first.json()
-    assert first_body["transport"] == "streamable_http"
-    assert first_body["url"] == "http://localhost:8000/mcp"
-    assert first_body["headers"]["Authorization"].startswith("Bearer ")
-    assert first_body["enabled_by_default"] is True
-
-    second = await client.post(
-        "/api/mcp-servers/spawn",
-        json={"name": "spawn", "enabled_by_default": False},
-        headers=auth,
-    )
-    assert second.status_code == 201, second.text
-    second_body = second.json()
-    assert second_body["id"] == first_body["id"]
-    assert second_body["enabled_by_default"] is False
-    assert second_body["headers"]["Authorization"].startswith("Bearer ")
+    assert (await client.get("/api/mcp-servers", headers=auth)).status_code == 404
+    assert (await client.post("/api/mcp-servers/spawn", json={}, headers=auth)).status_code == 404
+    assert (await client.post("/mcp", json={})).status_code == 404
+    assert (await client.get("/.well-known/oauth-protected-resource")).status_code == 404
+    assert (await client.get("/.well-known/oauth-authorization-server")).status_code == 404
+    assert (await client.post("/api/oauth/register", json={})).status_code == 404
 
 
-async def test_default_capabilities_launch_with_agent_and_cross_user_grants_do_not_leak(
+async def test_default_skills_launch_with_agent_and_cross_user_grants_do_not_leak(
     client,
 ):
     a_token = await _signup(client, "cap-launch-a@example.com")
@@ -141,34 +96,22 @@ async def test_default_capabilities_launch_with_agent_and_cross_user_grants_do_n
     a_auth = {"Authorization": f"Bearer {a_token}"}
     b_auth = {"Authorization": f"Bearer {b_token}"}
 
-    a_mcp = await client.post(
-        "/api/mcp-servers",
-        json={
-            "name": "spawn",
-            "transport": "streamable_http",
-            "url": "http://spawn.test/mcp",
-            "headers": {"Authorization": "Bearer a"},
-            "enabled_by_default": True,
-        },
-        headers=a_auth,
-    )
-    assert a_mcp.status_code == 201, a_mcp.text
     a_skill = await client.post(
         "/api/skills",
         json={
             "name": "spawn-skill",
-            "content": "# Spawn\nUse the spawn MCP.",
+            "content": "# Spawn\nHouse style for agents.",
             "enabled_by_default": True,
         },
         headers=a_auth,
     )
     assert a_skill.status_code == 201, a_skill.text
-    b_mcp = await client.post(
-        "/api/mcp-servers",
-        json={"name": "other", "transport": "stdio", "command": "node"},
+    b_skill = await client.post(
+        "/api/skills",
+        json={"name": "other", "content": "# Other"},
         headers=b_auth,
     )
-    assert b_mcp.status_code == 201, b_mcp.text
+    assert b_skill.status_code == 201, b_skill.text
 
     host_id = await _create_host_for_user("cap-launch-a@example.com")
 
@@ -201,7 +144,7 @@ async def test_default_capabilities_launch_with_agent_and_cross_user_grants_do_n
     assert created.status_code == 201, created.text
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "agent.create"
-    assert [server["id"] for server in sent["mcp_servers"]] == [a_mcp.json()["id"]]
+    assert "mcp_servers" not in sent
     assert [skill["id"] for skill in sent["skills"]] == [a_skill.json()["id"]]
 
     denied = await client.post(
@@ -210,12 +153,12 @@ async def test_default_capabilities_launch_with_agent_and_cross_user_grants_do_n
             "host_id": host_id,
             "cwd": "/repo",
             "argv": ["codex"],
-            "mcp_server_ids": [b_mcp.json()["id"]],
+            "skill_ids": [b_skill.json()["id"]],
         },
         headers=a_auth,
     )
     assert denied.status_code == 404
-    assert "mcp server not found" in denied.text
+    assert "skill not found" in denied.text
 
     access = await client.get(f"/api/agents/{created.json()['id']}/access", headers=b_auth)
     assert access.status_code == 404
@@ -235,17 +178,11 @@ async def test_default_capabilities_launch_with_agent_and_cross_user_grants_do_n
     assert count == 1
 
 
-async def test_agent_access_patch_preserves_omitted_categories(client):
+async def test_agent_access_patch_replaces_skills(client):
     token = await _signup(client, "cap-access-patch@example.com")
     auth = {"Authorization": f"Bearer {token}"}
     host_id = await _create_host_for_user("cap-access-patch@example.com")
 
-    mcp = await client.post(
-        "/api/mcp-servers",
-        json={"name": "spawn", "transport": "streamable_http", "url": "http://spawn.test/mcp"},
-        headers=auth,
-    )
-    assert mcp.status_code == 201, mcp.text
     skill_a = await client.post(
         "/api/skills",
         json={"name": "one", "content": "# One"},
@@ -265,7 +202,6 @@ async def test_agent_access_patch_preserves_omitted_categories(client):
             "host_id": host_id,
             "cwd": "/repo",
             "argv": ["codex"],
-            "mcp_server_ids": [mcp.json()["id"]],
             "skill_ids": [skill_a.json()["id"]],
         },
         headers=auth,
@@ -279,5 +215,8 @@ async def test_agent_access_patch_preserves_omitted_categories(client):
         headers=auth,
     )
     assert updated.status_code == 200, updated.text
-    assert [server["id"] for server in updated.json()["mcp_servers"]] == [mcp.json()["id"]]
     assert [skill["id"] for skill in updated.json()["skills"]] == [skill_b.json()["id"]]
+
+    unchanged = await client.patch(f"/api/agents/{agent_id}/access", json={}, headers=auth)
+    assert unchanged.status_code == 200, unchanged.text
+    assert [skill["id"] for skill in unchanged.json()["skills"]] == [skill_b.json()["id"]]

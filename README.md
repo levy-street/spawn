@@ -124,14 +124,12 @@ scripts/test-all.sh
 
 That runs server lint/tests, daemon Rust tests, hosted prebuilt-install smoke,
 local HTTP-surface smoke, real `spawnd login` smoke, local server+daemon
-recovery smoke, real Redis pub/sub smoke, streamable HTTP MCP protocol smoke,
+recovery smoke, real Redis pub/sub smoke,
 live browser+daemon smoke, service-manager crash-restart smoke, web lint,
 Playwright browser tests, web production build, and diff hygiene. The Redis
 smoke starts an isolated Redis instance and proves publish/subscribe plus ring
 buffer behavior across separate Python processes using the production backend.
-The MCP smoke uses a real MCP client to create an agent, send terminal input,
-capture a snapshot, upload a file, and delete the agent through `/mcp`. The
-local daemon smoke also launches multiple shell agents concurrently and verifies
+The local daemon smoke also launches multiple shell agents concurrently and verifies
 each PTY stream stays isolated. The live browser smoke drives the real Next app
 against a disposable FastAPI server and real daemon, creates an agent through
 the UI, attaches xterm over the browser websocket, sends input, verifies output
@@ -154,8 +152,8 @@ To include the public HTTP surface of a staged or production deployment:
 SPAWN_HTTP_SMOKE_URL=https://spawnd.dev scripts/test-all.sh
 ```
 
-That verifies the landing page, download page, `/healthz`, `/install.sh`, MCP
-well-known metadata, and the hosted daemon binary for the current machine.
+That verifies the landing page, download page, `/healthz`, `/install.sh`, and
+the hosted daemon binary for the current machine.
 
 The real reboot persistence check is intentionally gated because it reboots the
 remote machine:

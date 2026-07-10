@@ -31,7 +31,6 @@ import {
   agents,
   type Host,
   hosts,
-  mcpServers,
   presets,
   skills as skillApi,
 } from "@/lib/api";
@@ -593,7 +592,6 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
   const presetsQ = useQuery({ queryKey: ["presets"], queryFn: presets.list });
-  const mcpServersQ = useQuery({ queryKey: ["mcp-servers"], queryFn: mcpServers.list });
   const skillsQ = useQuery({ queryKey: ["skills"], queryFn: skillApi.list });
 
   const [hostId, setHostId] = useState("");
@@ -603,7 +601,6 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const [argv, setArgv] = useState("");
   const [cols, setCols] = useState("120");
   const [rows, setRows] = useState("32");
-  const [mcpServerIds, setMcpServerIds] = useState<string[]>([]);
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastAutoCwd, setLastAutoCwd] = useState("");
@@ -641,7 +638,6 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const selectedHostHomeDir = selectedHost?.home_dir ?? "/";
   const selectedPreset = presetOptions.find((p) => p.id === presetId);
   const formDisabled = m.isPending || hostsQ.isLoading || presetsQ.isLoading;
-  const mcpOptions = mcpServersQ.data ?? [];
   const skillOptions = skillsQ.data ?? [];
 
   useEffect(() => {
@@ -653,10 +649,6 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
     if (presetTouched || presetId || argv.trim() || presetOptions.length === 0) return;
     setPresetId((presetOptions.find((p) => p.name === "codex") ?? presetOptions[0]).id);
   }, [argv, presetId, presetOptions, presetTouched]);
-
-  useEffect(() => {
-    setMcpServerIds((current) => mergeDefaults(current, mcpOptions));
-  }, [mcpOptions]);
 
   useEffect(() => {
     setSkillIds((current) => mergeDefaults(current, skillOptions));
@@ -705,7 +697,6 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
       preset_id: presetId || undefined,
       cwd: normalizeCwdForHost(cwd, selectedHostHomeDir),
       argv: argvArr,
-      mcp_server_ids: mcpServerIds,
       skill_ids: skillIds,
       cols: parsedCols,
       rows: parsedRows,
@@ -839,30 +830,9 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
               disabled={m.isPending}
             />
           </div>
-          {(mcpOptions.length > 0 || skillOptions.length > 0) && (
+          {skillOptions.length > 0 && (
             <div className="space-y-3 rounded-md border border-border p-3 @md/agents:col-span-2">
               <div className="text-sm font-medium">Access</div>
-              {mcpOptions.length > 0 && (
-                <div className="space-y-2">
-                  <div className="text-xs uppercase text-muted-foreground">MCP servers</div>
-                  <div className="flex flex-wrap gap-3">
-                    {mcpOptions.map((server) => (
-                      <label key={server.id} className="flex items-center gap-2 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={mcpServerIds.includes(server.id)}
-                          onChange={(event) =>
-                            setMcpServerIds((current) =>
-                              toggleId(current, server.id, event.currentTarget.checked),
-                            )
-                          }
-                        />
-                        {server.name}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              )}
               {skillOptions.length > 0 && (
                 <div className="space-y-2">
                   <div className="text-xs uppercase text-muted-foreground">Skills</div>

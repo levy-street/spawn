@@ -487,7 +487,7 @@ mod tests {
             "PATH".to_string(),
             "/home/oem/.nvm/versions/node/v20.20.2/bin:/usr/bin".to_string(),
         );
-        env.insert("MCP_TOKEN".to_string(), "secret".to_string());
+        env.insert("API_TOKEN".to_string(), "secret".to_string());
 
         assert_eq!(
             agent_command_args(&argv, &env),

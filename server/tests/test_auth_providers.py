@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import func, select
@@ -228,37 +228,11 @@ async def test_provider_callback_rejects_unverified_email_and_state_replay(
     assert replay.json()["detail"] == "auth state was used"
 
 
-async def test_provider_login_resumes_spawn_oauth_authorization(
+async def test_provider_login_redirects_to_relative_return_to(
     client,
     configured_providers,
     monkeypatch,
 ):
-    registered = await client.post(
-        "/api/oauth/register",
-        json={
-            "client_name": "ChatGPT Spawn",
-            "redirect_uris": ["https://chat.openai.com/aip/callback"],
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "scope": "spawn",
-        },
-    )
-    assert registered.status_code == 201, registered.text
-    verifier = "provider-oauth-flow-verifier"
-    oauth_params = {
-        "response_type": "code",
-        "client_id": registered.json()["client_id"],
-        "redirect_uri": "https://chat.openai.com/aip/callback",
-        "scope": "spawn",
-        "state": "chatgpt-state",
-        "code_challenge": _challenge(verifier),
-        "code_challenge_method": "S256",
-    }
-    authorize = await client.get("/api/oauth/authorize", params=oauth_params)
-    assert authorize.status_code == 200
-    assert "Continue with Google" in authorize.text
-
     async def fake_exchange(**_kwargs):
         return ProviderProfile(
             provider="microsoft",
@@ -268,7 +242,7 @@ async def test_provider_login_resumes_spawn_oauth_authorization(
         )
 
     monkeypatch.setattr(auth_providers, "_exchange_provider_code", fake_exchange)
-    return_to = f"/api/oauth/authorize?{urlencode(oauth_params)}"
+    return_to = "/agents?from=provider-login"
     provider_state = await _provider_state(client, "microsoft", return_to=return_to)
     callback = await client.get(
         "/api/auth/oauth/microsoft/callback",
@@ -277,7 +251,3 @@ async def test_provider_login_resumes_spawn_oauth_authorization(
     )
     assert callback.status_code == 302, callback.text
     assert callback.headers["location"] == return_to
-
-    resumed = await client.get(callback.headers["location"])
-    assert resumed.status_code == 200
-    assert "Signed in as oauth-provider@example.com" in resumed.text

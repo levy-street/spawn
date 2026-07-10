@@ -40,12 +40,6 @@ const nextConfig: NextConfig = {
     return [
       { source: "/api/:path*", destination: `${API_PROXY_TARGET}/api/:path*` },
       { source: "/ws/:path*", destination: `${API_PROXY_TARGET}/ws/:path*` },
-      { source: "/mcp", destination: `${API_PROXY_TARGET}/mcp/` },
-      { source: "/mcp/:path*", destination: `${API_PROXY_TARGET}/mcp/:path*` },
-      {
-        source: "/.well-known/:path*",
-        destination: `${API_PROXY_TARGET}/.well-known/:path*`,
-      },
       { source: "/healthz", destination: `${API_PROXY_TARGET}/healthz` },
       { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
     ];

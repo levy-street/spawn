@@ -59,20 +59,6 @@ def issue_session_token(user_id: str) -> str:
     return _issue_user_token(user_id, timedelta(days=s.jwt_refresh_ttl_days))
 
 
-def issue_oauth_access_token(user_id: str, client_id: str, scope: str) -> str:
-    s = get_settings()
-    now = _now()
-    payload = {
-        "sub": f"user:{user_id}",
-        "kind": KIND_ACCESS,
-        "client_id": client_id,
-        "scope": scope,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=s.oauth_access_ttl_minutes)).timestamp()),
-    }
-    return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm)
-
-
 def _issue_user_token(user_id: str, ttl: timedelta) -> str:
     s = get_settings()
     now = _now()

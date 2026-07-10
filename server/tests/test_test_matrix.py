@@ -36,7 +36,6 @@ def test_test_all_runs_required_local_smoke_matrix():
         "smoke-redis-pubsub.sh",
         "smoke-local-login.sh",
         "smoke-local-daemon.sh",
-        "smoke-local-mcp-protocol.sh",
         "smoke-local-browser-live.sh",
         "smoke-service-manager.sh",
         "bun run test:e2e",

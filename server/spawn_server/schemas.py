@@ -32,12 +32,6 @@ class TokenResponse(BaseModel):
     user: UserOut
 
 
-class McpTokenResponse(BaseModel):
-    access_token: str
-    token_type: Literal["Bearer"] = "Bearer"
-    expires_in: int
-
-
 class MeResponse(BaseModel):
     user: UserOut
 
@@ -49,34 +43,6 @@ class AuthProviderOut(BaseModel):
 
 class AuthProviderList(BaseModel):
     providers: list[AuthProviderOut] = Field(default_factory=list)
-
-
-class OAuthClientRegistration(BaseModel):
-    redirect_uris: list[str] = Field(min_length=1)
-    client_name: str = Field(default="Spawn MCP client", max_length=255)
-    token_endpoint_auth_method: Literal["none"] = "none"
-    grant_types: list[str] = Field(default_factory=lambda: ["authorization_code", "refresh_token"])
-    response_types: list[str] = Field(default_factory=lambda: ["code"])
-    scope: str = "spawn"
-
-
-class OAuthClientRegistrationResponse(BaseModel):
-    client_id: str
-    client_id_issued_at: int
-    client_name: str
-    redirect_uris: list[str]
-    token_endpoint_auth_method: str
-    grant_types: list[str]
-    response_types: list[str]
-    scope: str
-
-
-class OAuthTokenResponse(BaseModel):
-    access_token: str
-    token_type: Literal["Bearer"] = "Bearer"
-    expires_in: int
-    scope: str
-    refresh_token: str | None = None
 
 
 # ---------- device code ----------
@@ -232,49 +198,7 @@ class PresetOut(BaseModel):
     install: str | None = None
 
 
-# ---------- managed MCP servers / skills ----------
-
-
-class McpServerCreate(BaseModel):
-    name: str = Field(max_length=128)
-    transport: Literal["streamable_http", "stdio"] = "streamable_http"
-    url: str | None = Field(default=None, max_length=2048)
-    command: str | None = Field(default=None, max_length=2048)
-    args: list[str] = Field(default_factory=list)
-    env: dict[str, str] = Field(default_factory=dict)
-    headers: dict[str, str] = Field(default_factory=dict)
-    enabled_by_default: bool = False
-
-
-class SpawnMcpServerCreate(BaseModel):
-    name: str = Field(default="spawn", max_length=128)
-    enabled_by_default: bool = False
-
-
-class McpServerPatch(BaseModel):
-    name: str | None = Field(default=None, max_length=128)
-    transport: Literal["streamable_http", "stdio"] | None = None
-    url: str | None = Field(default=None, max_length=2048)
-    command: str | None = Field(default=None, max_length=2048)
-    args: list[str] | None = None
-    env: dict[str, str] | None = None
-    headers: dict[str, str] | None = None
-    enabled_by_default: bool | None = None
-
-
-class McpServerOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: str
-    owner_user_id: str
-    name: str
-    transport: str
-    url: str | None = None
-    command: str | None = None
-    args: list[str]
-    env: dict[str, str]
-    headers: dict[str, str]
-    enabled_by_default: bool
-    created_at: datetime
+# ---------- managed skills ----------
 
 
 class SkillCreate(BaseModel):
@@ -303,25 +227,12 @@ class SkillOut(BaseModel):
 
 
 class AgentAccessPatch(BaseModel):
-    mcp_server_ids: list[str] | None = None
     skill_ids: list[str] | None = None
 
 
 class AgentAccessOut(BaseModel):
     agent_id: str
-    mcp_servers: list[McpServerOut] = Field(default_factory=list)
     skills: list[SkillOut] = Field(default_factory=list)
-
-
-class AgentMcpServerConfig(BaseModel):
-    id: str
-    name: str
-    transport: str
-    url: str | None = None
-    command: str | None = None
-    args: list[str] = Field(default_factory=list)
-    env: dict[str, str] = Field(default_factory=dict)
-    headers: dict[str, str] = Field(default_factory=dict)
 
 
 class AgentSkillConfig(BaseModel):
@@ -341,7 +252,6 @@ class AgentCreate(BaseModel):
     cwd: str
     argv: list[str] | None = None
     env: dict[str, str] | None = None
-    mcp_server_ids: list[str] | None = None
     skill_ids: list[str] | None = None
     cols: int = 120
     rows: int = 32

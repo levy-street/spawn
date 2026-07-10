@@ -4,7 +4,6 @@ export const USER_ID = "00000000-0000-4000-8000-000000000001";
 export const HOST_ID = "00000000-0000-4000-8000-000000000002";
 export const PRESET_ID = "00000000-0000-4000-8000-000000000003";
 export const AGENT_ID = "00000000-0000-4000-8000-000000000004";
-export const MCP_SERVER_ID = "00000000-0000-4000-8000-000000000005";
 export const SKILL_ID = "00000000-0000-4000-8000-000000000006";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
 
@@ -62,23 +61,6 @@ export function agent(overrides: Record<string, unknown> = {}) {
   };
 }
 
-export function mcpServer(overrides: Record<string, unknown> = {}) {
-  return {
-    id: MCP_SERVER_ID,
-    owner_user_id: USER_ID,
-    name: "spawn MCP",
-    transport: "streamable_http",
-    url: "http://localhost:3002/mcp",
-    command: null,
-    args: [],
-    env: {},
-    headers: {},
-    enabled_by_default: false,
-    created_at: CREATED_AT,
-    ...overrides,
-  };
-}
-
 export function skill(overrides: Record<string, unknown> = {}) {
   return {
     id: SKILL_ID,
@@ -96,20 +78,14 @@ export async function mockAuthenticatedApi(
   page: Page,
   options: {
     agents?: unknown[];
-    mcpServers?: unknown[];
     skills?: unknown[];
     createAgent?: (body: unknown, route: Route) => Promise<void> | void;
-    createMcpServer?: (body: unknown, route: Route) => Promise<void> | void;
-    createSpawnMcpServer?: (body: unknown, route: Route) => Promise<void> | void;
-    updateMcpServer?: (id: string, body: unknown, route: Route) => Promise<void> | void;
-    deleteMcpServer?: (id: string, route: Route) => Promise<void> | void;
     createSkill?: (body: unknown, route: Route) => Promise<void> | void;
     updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     deleteSkill?: (id: string, route: Route) => Promise<void> | void;
   } = {},
 ) {
   const agents = options.agents ?? [];
-  const mcpServerList = options.mcpServers ?? [];
   const skillList = options.skills ?? [];
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -149,62 +125,6 @@ export async function mockAuthenticatedApi(
     }
     if (path === "/api/presets") {
       await route.fulfill({ status: 200, contentType: "application/json", json: [preset] });
-      return;
-    }
-    if (path === "/api/mcp-servers" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: mcpServerList });
-      return;
-    }
-    if (path === "/api/mcp-servers" && method === "POST") {
-      const body = await request.postDataJSON();
-      if (options.createMcpServer) {
-        await options.createMcpServer(body, route);
-        return;
-      }
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        json: mcpServer({ ...(body as Record<string, unknown>) }),
-      });
-      return;
-    }
-    if (path === "/api/mcp-servers/spawn" && method === "POST") {
-      const body = await request.postDataJSON();
-      if (options.createSpawnMcpServer) {
-        await options.createSpawnMcpServer(body, route);
-        return;
-      }
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        json: mcpServer({
-          ...(body as Record<string, unknown>),
-          name: (body as { name?: string }).name ?? "spawn",
-        }),
-      });
-      return;
-    }
-    if (path.startsWith("/api/mcp-servers/") && method === "PATCH") {
-      const id = path.split("/").at(-1) ?? "";
-      const body = await request.postDataJSON();
-      if (options.updateMcpServer) {
-        await options.updateMcpServer(id, body, route);
-        return;
-      }
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: mcpServer({ id, ...(body as Record<string, unknown>) }),
-      });
-      return;
-    }
-    if (path.startsWith("/api/mcp-servers/") && method === "DELETE") {
-      const id = path.split("/").at(-1) ?? "";
-      if (options.deleteMcpServer) {
-        await options.deleteMcpServer(id, route);
-        return;
-      }
-      await route.fulfill({ status: 204 });
       return;
     }
     if (path === "/api/skills" && method === "GET") {
@@ -271,7 +191,7 @@ export async function mockAuthenticatedApi(
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        json: { agent_id: AGENT_ID, mcp_servers: [], skills: [] },
+        json: { agent_id: AGENT_ID, skills: [] },
       });
       return;
     }

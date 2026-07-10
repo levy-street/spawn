@@ -76,15 +76,6 @@ async def logout(response: Response) -> None:
     )
 
 
-@router.post("/auth/mcp-token", response_model=schemas.McpTokenResponse)
-async def mcp_token(user: User = Depends(auth.current_user)) -> schemas.McpTokenResponse:
-    settings = get_settings()
-    return schemas.McpTokenResponse(
-        access_token=auth.issue_session_token(user.id),
-        expires_in=60 * 60 * 24 * settings.jwt_refresh_ttl_days,
-    )
-
-
 @router.get("/me", response_model=schemas.MeResponse)
 async def me(user: User = Depends(auth.current_user)) -> schemas.MeResponse:
     return schemas.MeResponse(user=schemas.UserOut.model_validate(user))

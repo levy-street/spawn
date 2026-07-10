@@ -182,7 +182,6 @@ async def _dispatch_agent_launch(
     cols: int,
     rows: int,
     create_cwd: bool,
-    mcp_servers: list[dict] | None = None,
     skills: list[dict] | None = None,
 ) -> None:
     broker = get_broker()
@@ -201,7 +200,6 @@ async def _dispatch_agent_launch(
                 "argv": agent.argv,
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
-                "mcp_servers": mcp_servers or [],
                 "skills": skills or [],
                 "tmux_session": tmux_session_name(agent),
                 "cols": cols,
@@ -292,11 +290,6 @@ async def create_agent(
     )
     session.add(agent)
     await session.flush()
-    mcp_server_ids = (
-        await capabilities.default_mcp_server_ids(session, user)
-        if body.mcp_server_ids is None
-        else body.mcp_server_ids
-    )
     skill_ids = (
         await capabilities.default_skill_ids(session, user)
         if body.skill_ids is None
@@ -306,12 +299,11 @@ async def create_agent(
         session,
         user=user,
         agent=agent,
-        mcp_server_ids=mcp_server_ids,
         skill_ids=skill_ids,
     )
     await session.commit()
     await session.refresh(agent)
-    mcp_servers, skills = await capabilities.get_agent_launch_capabilities(
+    skills = await capabilities.get_agent_launch_capabilities(
         session, user=user, agent_id=agent.id
     )
 
@@ -325,7 +317,6 @@ async def create_agent(
         cols=body.cols,
         rows=body.rows,
         create_cwd=body.create_cwd,
-        mcp_servers=mcp_servers,
         skills=skills,
     )
 
@@ -361,7 +352,7 @@ async def restart_agent(
     agent.last_input_at = None
     await session.commit()
     await session.refresh(agent)
-    mcp_servers, skills = await capabilities.get_agent_launch_capabilities(
+    skills = await capabilities.get_agent_launch_capabilities(
         session, user=user, agent_id=agent.id
     )
 
@@ -373,7 +364,6 @@ async def restart_agent(
         cols=body.cols,
         rows=body.rows,
         create_cwd=body.create_cwd,
-        mcp_servers=mcp_servers,
         skills=skills,
     )
     return _to_out(agent, host.name)

@@ -89,7 +89,6 @@ def report(name: str, ok: bool) -> None:
 
 required = [
     "SPAWN_AGENT_CONFIG_DIR",
-    "SPAWN_MCP_SERVERS_FILE",
     "SPAWN_SKILLS_FILE",
     "SPAWN_SKILLS_DIR",
     "CODEX_HOME",
@@ -98,25 +97,19 @@ missing = [name for name in required if not os.environ.get(name)]
 report("env", not missing)
 
 config_dir = Path(os.environ.get("SPAWN_AGENT_CONFIG_DIR", "/missing"))
-mcp_file = Path(os.environ.get("SPAWN_MCP_SERVERS_FILE", "/missing"))
 skills_file = Path(os.environ.get("SPAWN_SKILLS_FILE", "/missing"))
 skills_dir = Path(os.environ.get("SPAWN_SKILLS_DIR", "/missing"))
 codex_home = Path(os.environ.get("CODEX_HOME", "/missing"))
 
-mcp = json.loads(mcp_file.read_text(encoding="utf-8"))
 skills = json.loads(skills_file.read_text(encoding="utf-8"))
 config = (codex_home / "config.toml").read_text(encoding="utf-8")
 
-mcp_names = [server["name"] for server in mcp["servers"]]
 skill_names = [skill["name"] for skill in skills]
 
-print("fake-codex-mcp:" + ",".join(mcp_names), flush=True)
 print("fake-codex-skills:" + ",".join(skill_names), flush=True)
 report("config-dir", config_dir.is_dir())
-report("mcp-json", mcp_names == ["spawn-smoke"])
 report("skills-json", skill_names == ["spawn-smoke-skill"])
 report("skill-file", (skills_dir / "spawn-smoke-skill" / "SKILL.md").is_file())
-report("codex-config-mcp", '[mcp_servers."spawn-smoke"]' in config)
 report("codex-config-skill", "[[skills.config]]" in config)
 report("codex-config-project", 'trust_level = "trusted"' in config)
 PY
@@ -395,7 +388,7 @@ smoke_host_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["host_i
 start_daemon
 wait_host_online
 
-printf '%s\n' "smoke-local-daemon: verifying MCP and skills reach a real daemon-launched codex agent"
+printf '%s\n' "smoke-local-daemon: verifying skills reach a real daemon-launched codex agent"
 python3 - "$base_url" "$smoke_token" <<'PY'
 import json
 import sys
@@ -421,17 +414,6 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
         raise SystemExit(f"{method} {path} failed: {error.code} {error.read().decode()}") from error
 
 
-request(
-    "POST",
-    "/api/mcp-servers",
-    {
-        "name": "spawn-smoke",
-        "transport": "streamable_http",
-        "url": "http://spawn.test/mcp",
-        "headers": {"Authorization": "Bearer smoke"},
-        "enabled_by_default": True,
-    },
-)
 request(
     "POST",
     "/api/skills",
@@ -499,13 +481,10 @@ def snapshot() -> str:
 required_markers = [
     "fake-codex-ready",
     "fake-codex-env:ok",
-    "fake-codex-mcp:spawn-smoke",
     "fake-codex-skills:spawn-smoke-skill",
     "fake-codex-config-dir:ok",
-    "fake-codex-mcp-json:ok",
     "fake-codex-skills-json:ok",
     "fake-codex-skill-file:ok",
-    "fake-codex-codex-config-mcp:ok",
     "fake-codex-codex-config-skill:ok",
     "fake-codex-codex-config-project:ok",
 ]

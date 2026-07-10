@@ -38,7 +38,9 @@
   relay-and-store role is deleted: the server keeps only auth, registry,
   presence, WebRTC signaling, and TURN credential minting. Terminal
   data, history, uploads, snapshots, and spawn-time secrets (`env`,
-  skill bodies, MCP headers) travel browser↔daemon over DataChannels.
+  skill bodies) travel browser↔daemon over DataChannels. The MCP
+  surface (endpoint, managed-server registry, MCP-client OAuth) was
+  removed entirely on 2026-07-09 per TRUST.md.
 
 ### `spawnd` — Rust
 
@@ -155,8 +157,9 @@ operator-model migration, specified in `TRUST.md`:
    server-minted credentials; delete the WS PTY relay; `spawn.v2`.
 2. **Daemon-owned data** — history/upload/snapshot/fs-listing streams on
    DataChannels; delete server transcripts and the Redis PTY ring
-   buffer; stop persisting `env`, skill bodies, and MCP headers
-   server-side; resolve the `/mcp` visibility question.
+   buffer; stop persisting `env` and skill bodies server-side. (The
+   `/mcp` visibility question is resolved: the MCP surface was cut
+   entirely on 2026-07-09.)
 3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device
    keys bound via the device-code flow; signed SDP; TOFU pinning with
    fingerprint verification UX.

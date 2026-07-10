@@ -36,9 +36,6 @@ scripts/smoke-local-login.sh
 printf '%s\n' "== local server + daemon smoke =="
 scripts/smoke-local-daemon.sh
 
-printf '%s\n' "== MCP protocol smoke =="
-scripts/smoke-local-mcp-protocol.sh
-
 printf '%s\n' "== live browser + daemon smoke =="
 scripts/smoke-local-browser-live.sh
 
@@ -78,7 +75,7 @@ http_smoke_url="${SPAWN_HTTP_SMOKE_URL:-${SPAWN_PROD_URL:-}}"
 if [[ -n "$http_smoke_url" ]]; then
   scripts/smoke-http-surface.sh "$http_smoke_url"
 else
-  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify landing, download, installer, health, MCP metadata, and hosted daemon binary"
+  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify landing, download, installer, health, and hosted daemon binary"
 fi
 
 printf '%s\n' "== web lint + browser tests + build =="

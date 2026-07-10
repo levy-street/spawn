@@ -83,22 +83,6 @@ contains "$tmp_dir/install.sh" "/api/install/spawnd/"
 contains "$tmp_dir/install.sh" "enable-linger"
 contains "$tmp_dir/install.sh" "LaunchAgent"
 
-fetch "/.well-known/oauth-protected-resource/mcp" >"$tmp_dir/mcp-resource.json"
-python3 - "$tmp_dir/mcp-resource.json" "$base_url" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    body = json.load(handle)
-base_url = sys.argv[2].rstrip("/")
-expected_resource = f"{base_url}/mcp"
-if body.get("resource") != expected_resource:
-    raise SystemExit(f"unexpected MCP resource metadata: {body!r}")
-servers = body.get("authorization_servers")
-if not isinstance(servers, list) or base_url not in servers:
-    raise SystemExit(f"unexpected MCP authorization servers: {body!r}")
-PY
-
 if target="$(host_target)"; then
   binary="$tmp_dir/spawnd"
   fetch "/api/install/spawnd/$target" >"$binary"

@@ -106,7 +106,8 @@ is itself sensitive.
 | File uploads | `upload` frames, `bytes_b64` through both WS legs | DataChannel file stream |
 | Terminal snapshots / card previews | `agent.snapshot` frames | rendered from DataChannel output |
 | Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-side |
-| Skill bodies, MCP server headers (bearer tokens) | `agent.create`, `skills`/`mcp_servers` tables | client-encrypted at rest, decrypted only by daemon |
+| Skill bodies | `agent.create`, `skills` table | client-encrypted at rest, decrypted only by daemon |
+| ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Directory listings | `host.fs.list_result` | DataChannel control stream |
 | Tool install output | `host.tools.install_result` | DataChannel or accepted as low-sensitivity (decide in Phase 2) |
 
@@ -166,12 +167,17 @@ What moves where, and the regressions we accept:
   is small.
 - **File upload** → DataChannel file stream (also removes today's
   base64-over-JSON overhead and server memory spike).
-- **The spawn MCP endpoint** (`/mcp`) is the sneaky one: it sends
-  terminal input and captures snapshots *through the server* by design.
-  It must either terminate on the daemon/client side or be clearly
-  scoped as an opt-in that reintroduces server visibility for the agents
-  it touches. It must not silently survive as an exception that
-  falsifies the headline claim.
+- **The spawn MCP surface** — *resolved: cut entirely (2026-07-09).* The
+  `/mcp` endpoint sent terminal input and captured snapshots *through
+  the server* by design, the managed MCP-server registry stored bearer
+  tokens in server Postgres, and the OAuth 2.1 authorization server
+  existed only to authenticate remote MCP clients. All three were
+  removed (endpoint, registry + grants + their tables, OAuth AS +
+  well-known metadata) rather than kept as an exception that falsifies
+  the headline claim. Skills remain: their bodies are the only
+  content-adjacent payload left in `agent.create`, tracked in the table
+  above. If spawn-as-MCP-tool ever returns, it must terminate E2E on
+  the daemon/client side.
 - **Notifications** (future) → opaque "activity on agent X" signals or
   client-decryptable payloads only.
 
@@ -257,12 +263,11 @@ signaling MITM.*
   `max_bytes` read.
 - Delete `server/spawn_server/transcript.py`, the Redis PTY ring
   buffer, and `agent.snapshot`/`upload`/`fs.list` content forwarding.
-- Move `env`, skill bodies, and MCP headers out of server persistence:
-  sent over the host control DataChannel at spawn time. Agent creation
-  becomes: REST creates the agent *row* (id, name, host, status);
-  content-bearing spawn parameters travel E2E.
-- Decide the `/mcp` question (terminate client-side vs. explicit
-  opt-in with a visibility warning).
+- Move `env` and skill bodies out of server persistence: sent over the
+  host control DataChannel at spawn time. Agent creation becomes: REST
+  creates the agent *row* (id, name, host, status); content-bearing
+  spawn parameters travel E2E. (The `/mcp` question is already
+  resolved: the whole MCP surface was cut on 2026-07-09.)
 - Acceptance: `grep` the server for any code path that touches PTY
   bytes, upload bytes, env values, or skill bodies — none exist; a
   compromised server's disk + Redis + memory contain no session content.

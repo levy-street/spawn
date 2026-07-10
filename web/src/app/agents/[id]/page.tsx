@@ -75,17 +75,8 @@ function AgentTerminal() {
     refetchInterval: 10_000,
   });
   const currentTool = toolsQ.data?.tools.find((tool) => tool.preset_id === q.data?.preset_id);
-  const accessSummary = accessQ.data
-    ? [
-        accessQ.data.mcp_servers.length
-          ? `mcp ${accessQ.data.mcp_servers.map((server) => server.name).join(", ")}`
-          : "",
-        accessQ.data.skills.length
-          ? `skills ${accessQ.data.skills.map((skill) => skill.name).join(", ")}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join(" · ")
+  const accessSummary = accessQ.data?.skills.length
+    ? `skills ${accessQ.data.skills.map((skill) => skill.name).join(", ")}`
     : "";
 
   const renameM = useMutation({

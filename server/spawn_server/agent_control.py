@@ -1,4 +1,4 @@
-"""Shared agent-control operations used by REST, browser WS, and MCP tools."""
+"""Shared agent-control operations used by REST and browser WS."""
 
 from __future__ import annotations
 

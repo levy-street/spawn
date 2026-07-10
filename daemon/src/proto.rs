@@ -234,31 +234,12 @@ pub struct AgentCreate {
     #[serde(default)]
     pub install: Option<String>,
     #[serde(default)]
-    pub mcp_servers: Vec<AgentMcpServerConfig>,
-    #[serde(default)]
     pub skills: Vec<AgentSkillConfig>,
     pub tmux_session: String,
     pub cols: u16,
     pub rows: u16,
     #[serde(default)]
     pub create_cwd: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentMcpServerConfig {
-    pub id: String,
-    pub name: String,
-    pub transport: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -178,7 +178,7 @@ async def test_agent_create_defaults_name_from_host_and_cwd(client):
     assert body["tmux_session"] == f"spawn-dream-spawn--{body['id']}"
 
 
-async def test_agent_create_dispatches_managed_mcp_servers_and_skills(client):
+async def test_agent_create_dispatches_managed_skills(client):
     token = await _signup(client, "agent-capabilities@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -188,17 +188,6 @@ async def test_agent_create_dispatches_managed_mcp_servers_and_skills(client):
     from spawn_server.models import Host, User
     from spawn_server.ws.broker import DaemonConn, get_broker
 
-    mcp = await client.post(
-        "/api/mcp-servers",
-        json={
-            "name": "spawn",
-            "transport": "streamable_http",
-            "url": "http://testserver/mcp",
-            "headers": {"Authorization": "Bearer test"},
-        },
-        headers=auth,
-    )
-    assert mcp.status_code == 201, mcp.text
     skill = await client.post(
         "/api/skills",
         json={
@@ -234,7 +223,6 @@ async def test_agent_create_dispatches_managed_mcp_servers_and_skills(client):
             "host_id": host_id,
             "cwd": "/tmp",
             "argv": ["bash", "-lc", "cat"],
-            "mcp_server_ids": [mcp.json()["id"]],
             "skill_ids": [skill.json()["id"]],
         },
         headers=auth,
@@ -243,14 +231,12 @@ async def test_agent_create_dispatches_managed_mcp_servers_and_skills(client):
 
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "agent.create"
-    assert sent["mcp_servers"][0]["name"] == "spawn"
-    assert sent["mcp_servers"][0]["headers"]["Authorization"] == "Bearer test"
+    assert "mcp_servers" not in sent
     assert sent["skills"][0]["name"] == "spawn-test"
     assert sent["skills"][0]["content"] == "# Spawn Test\nUse Spawn."
 
     access = await client.get(f"/api/agents/{r.json()['id']}/access", headers=auth)
     assert access.status_code == 200, access.text
-    assert access.json()["mcp_servers"][0]["id"] == mcp.json()["id"]
     assert access.json()["skills"][0]["id"] == skill.json()["id"]
 
     await broker.unregister_daemon(daemon)

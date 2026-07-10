@@ -60,11 +60,11 @@ Host shape:
 |--------|----------------------|-----------------------------------------------------------------------------------|
 | GET    | `/api/agents`        | list current user's unarchived agents (optional `?host_id=...`, `?include_archived=true`) |
 | GET    | `/api/agents/{id}`   |                                                                                   |
-| POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, mcp_server_ids?, skill_ids?, create_cwd?}` — at least one of preset_id or argv |
+| POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, skill_ids?, create_cwd?}` — at least one of preset_id or argv |
 | PATCH  | `/api/agents/{id}`   | rename/pin/archive: `{name?, pinned?, archived?}`                                 |
 | POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
-| GET    | `/api/agents/{id}/access` | list MCP server and skill grants for an agent                                |
-| PATCH  | `/api/agents/{id}/access` | replace grants with `{mcp_server_ids?, skill_ids?}`                         |
+| GET    | `/api/agents/{id}/access` | list skill grants for an agent                                               |
+| PATCH  | `/api/agents/{id}/access` | replace grants with `{skill_ids?}`                                          |
 | DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
 
 Agent shape:
@@ -111,29 +111,26 @@ Built-in presets (server-seeded, `owner_user_id = null`):
 > `~/.claude/.credentials.json`). The daemon launches the agent under the
 > host user's environment, so the CLI finds whatever it logged in with.
 
-### MCP servers and skills
+### Skills
 
-Spawn stores managed MCP server definitions and skills centrally, then grants
-them to agents explicitly or by default for new agents.
+Spawn stores managed skills centrally, then grants them to agents explicitly
+or by default for new agents. (Managed MCP servers and the `/mcp` endpoint
+were removed entirely — see docs/TRUST.md; spawn-mediated tool control
+through the server conflicts with the operator model.)
 
 | Method | Path | Body |
 |--------|------|------|
-| GET | `/api/mcp-servers` | list managed MCP servers |
-| POST | `/api/mcp-servers` | `{name, transport, url?, command?, args?, env?, headers?, enabled_by_default?}` |
-| POST | `/api/mcp-servers/spawn` | create/refresh a `spawn` MCP entry with a bearer token for this Spawn server |
-| PATCH | `/api/mcp-servers/{id}` | update a managed MCP server |
-| DELETE | `/api/mcp-servers/{id}` | delete a managed MCP server |
 | GET | `/api/skills` | list managed skills |
 | POST | `/api/skills` | `{name, description?, content, enabled_by_default?}` |
 | PATCH | `/api/skills/{id}` | update a managed skill |
 | DELETE | `/api/skills/{id}` | delete a managed skill |
 
-When an agent is launched, granted MCP servers and skills are included in the
-daemon `agent.create` frame. The daemon writes per-agent files and exports
-`SPAWN_AGENT_CONFIG_DIR`, `SPAWN_MCP_SERVERS_FILE`, `SPAWN_SKILLS_FILE`, and
-`SPAWN_SKILLS_DIR`. For Codex-compatible argv, the daemon also writes a
-per-agent `CODEX_HOME` projection containing a `config.toml`, managed skills,
-and links to existing Codex auth state when present.
+When an agent is launched, granted skills are included in the daemon
+`agent.create` frame. The daemon writes per-agent files and exports
+`SPAWN_AGENT_CONFIG_DIR`, `SPAWN_SKILLS_FILE`, and `SPAWN_SKILLS_DIR`. For
+Codex-compatible argv, the daemon also writes a per-agent `CODEX_HOME`
+projection containing a `config.toml`, managed skills, and links to existing
+Codex auth state when present.
 
 ## Daemon WebSocket — `/ws/daemon`
 
@@ -279,11 +276,8 @@ Agent IDs are big-endian 16-byte UUIDs.
  "cwd": "/home/me/projects/foo",
  "argv": ["claude"],
  "env": {"FOO": "bar"},
- "mcp_servers": [{"id": "uuid", "name": "spawn", "transport": "streamable_http",
-                  "url": "https://spawnd.dev/mcp",
-                  "headers": {"Authorization": "Bearer ..."}}],
  "skills": [{"id": "uuid", "name": "spawn-control",
-             "description": "Use Spawn MCP tools", "content": "..."}],
+             "description": "House style for agents", "content": "..."}],
  "install": "npm install -g @anthropic-ai/claude-code",
  "tmux_session": "spawn-<uuid>",
  "cols": 120,
@@ -295,7 +289,6 @@ Agent IDs are big-endian 16-byte UUIDs.
  "cwd": "/home/me/projects/foo",
  "argv": ["claude"],
  "env": {"FOO": "bar"},
- "mcp_servers": [],
  "skills": [],
  "install": "npm install -g @anthropic-ai/claude-code",
  "tmux_session": "spawn-<uuid>",

@@ -594,7 +594,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       renderScrollbackSnapshotRef.current(bytes, true);
     };
     attempt();
-  }, [getScrollbackViewport]);
+  }, []);
 
   const showUploadStatus = useCallback((message: string) => {
     setUploadStatus(message);

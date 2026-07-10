@@ -235,34 +235,6 @@ export interface PresetCreateInput {
 
 export type PresetUpdateInput = Partial<PresetCreateInput>;
 
-export const McpServerSchema = z.object({
-  id: z.string().uuid(),
-  owner_user_id: z.string().uuid(),
-  name: z.string(),
-  transport: z.enum(["streamable_http", "stdio"]).or(z.string()),
-  url: z.string().nullable().optional(),
-  command: z.string().nullable().optional(),
-  args: z.array(z.string()).default([]),
-  env: z.record(z.string(), z.string()).default({}),
-  headers: z.record(z.string(), z.string()).default({}),
-  enabled_by_default: z.boolean().default(false),
-  created_at: z.string(),
-});
-export type McpServer = z.infer<typeof McpServerSchema>;
-
-export interface McpServerCreateInput {
-  name: string;
-  transport?: "streamable_http" | "stdio";
-  url?: string | null;
-  command?: string | null;
-  args?: string[];
-  env?: Record<string, string>;
-  headers?: Record<string, string>;
-  enabled_by_default?: boolean;
-}
-
-export type McpServerUpdateInput = Partial<McpServerCreateInput>;
-
 export const SkillSchema = z.object({
   id: z.string().uuid(),
   owner_user_id: z.string().uuid(),
@@ -285,7 +257,6 @@ export type SkillUpdateInput = Partial<SkillCreateInput>;
 
 export const AgentAccessSchema = z.object({
   agent_id: z.string().uuid(),
-  mcp_servers: z.array(McpServerSchema).default([]),
   skills: z.array(SkillSchema).default([]),
 });
 export type AgentAccess = z.infer<typeof AgentAccessSchema>;
@@ -295,13 +266,6 @@ export const AuthResponseSchema = z.object({
   user: UserSchema,
 });
 export type AuthResponse = z.infer<typeof AuthResponseSchema>;
-
-export const McpTokenResponseSchema = z.object({
-  access_token: z.string(),
-  token_type: z.literal("Bearer"),
-  expires_in: z.number().int(),
-});
-export type McpTokenResponse = z.infer<typeof McpTokenResponseSchema>;
 
 export const DeviceStartResponseSchema = z.object({
   device_code: z.string(),
@@ -342,11 +306,6 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
-  mcpToken: () =>
-    api("/api/auth/mcp-token", {
-      method: "POST",
-      schema: McpTokenResponseSchema,
-    }),
   me: () =>
     api("/api/me", {
       method: "GET",
@@ -433,7 +392,6 @@ export const agents = {
     cwd: string;
     argv?: string[];
     env?: Record<string, string>;
-    mcp_server_ids?: string[];
     skill_ids?: string[];
     cols?: number;
     rows?: number;
@@ -563,33 +521,6 @@ export const presets = {
   remove: (id: string) => api<void>(`/api/presets/${id}`, { method: "DELETE" }),
 };
 
-export const mcpServers = {
-  list: () =>
-    api("/api/mcp-servers", {
-      method: "GET",
-      schema: z.array(McpServerSchema),
-    }),
-  create: (body: McpServerCreateInput) =>
-    api("/api/mcp-servers", {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: McpServerSchema,
-    }),
-  createSpawn: (body?: { name?: string; enabled_by_default?: boolean }) =>
-    api("/api/mcp-servers/spawn", {
-      method: "POST",
-      body: JSON.stringify(body ?? {}),
-      schema: McpServerSchema,
-    }),
-  update: (id: string, body: McpServerUpdateInput) =>
-    api(`/api/mcp-servers/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      schema: McpServerSchema,
-    }),
-  remove: (id: string) => api<void>(`/api/mcp-servers/${id}`, { method: "DELETE" }),
-};
-
 export const skills = {
   list: () =>
     api("/api/skills", {
@@ -617,7 +548,7 @@ export const agentAccess = {
       method: "GET",
       schema: AgentAccessSchema,
     }),
-  update: (agentId: string, body: { mcp_server_ids?: string[]; skill_ids?: string[] }) =>
+  update: (agentId: string, body: { skill_ids?: string[] }) =>
     api(`/api/agents/${agentId}/access`, {
       method: "PATCH",
       body: JSON.stringify(body),

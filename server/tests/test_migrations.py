@@ -66,7 +66,7 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
 
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
-            assert version == "0009"
+            assert version == "0010"
 
             preset_rows = conn.execute(
                 text("select name, default_argv, install from presets")
