@@ -100,7 +100,5 @@ test("sidebar agent rows expose actions via kebab menu", async ({ page }) => {
   await kebab.click();
   await page.getByRole("menuitem", { name: "Pin" }).click();
 
-  await expect
-    .poll(() => patches.at(-1))
-    .toMatchObject({ body: { pinned: true } });
+  await expect.poll(() => patches.at(-1)).toMatchObject({ body: { pinned: true } });
 });

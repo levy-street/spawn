@@ -7,6 +7,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -42,10 +43,26 @@ export function DropdownMenu({
   menuClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [flipped, setFlipped] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
   const close = useCallback(() => setOpen(false), []);
+
+  // Flip to the opposite side when the menu would leave the viewport (e.g.
+  // rows near the bottom of the scrollable sidebar). Layout effect so the
+  // correction lands before paint.
+  useLayoutEffect(() => {
+    if (!open) {
+      setFlipped(false);
+      return;
+    }
+    const rect = menuRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    if (side === "bottom" && rect.bottom > window.innerHeight - 8) setFlipped(true);
+    if (side === "top" && rect.top < 8) setFlipped(true);
+  }, [open, side]);
 
   useEffect(() => {
     if (!open) return;
@@ -85,7 +102,7 @@ export function DropdownMenu({
   };
 
   return (
-    <div ref={rootRef} className={cn("relative inline-block", className)}>
+    <div ref={rootRef} className={cn("relative inline-block", open && "z-50", className)}>
       {renderTrigger({
         onClick: () => setOpen((v) => !v),
         onKeyDown: (event) => {
@@ -98,23 +115,28 @@ export function DropdownMenu({
         "aria-haspopup": "menu",
         "aria-controls": menuId,
       })}
-      {open && (
-        <div
-          id={menuId}
-          role="menu"
-          onKeyDown={onMenuKeyDown}
-          onClick={close}
-          className={cn(
-            "absolute z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
-            "animate-in fade-in-0 zoom-in-95 duration-100",
-            side === "bottom" ? "top-full mt-1" : "bottom-full mb-1",
-            align === "end" ? "right-0" : "left-0",
-            menuClassName,
-          )}
-        >
-          {children}
-        </div>
-      )}
+      {open &&
+        (() => {
+          const effectiveSide = flipped ? (side === "bottom" ? "top" : "bottom") : side;
+          return (
+            <div
+              id={menuId}
+              ref={menuRef}
+              role="menu"
+              onKeyDown={onMenuKeyDown}
+              onClick={close}
+              className={cn(
+                "absolute z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+                "animate-in fade-in-0 zoom-in-95 duration-100",
+                effectiveSide === "bottom" ? "top-full mt-1" : "bottom-full mb-1",
+                align === "end" ? "right-0" : "left-0",
+                menuClassName,
+              )}
+            >
+              {children}
+            </div>
+          );
+        })()}
     </div>
   );
 }
