@@ -30,7 +30,10 @@ your phone.
 Agent provider auth (Anthropic, OpenAI, etc.) is handled by each agent CLI
 itself on the host (e.g. `claude /login`); spawn does not manage those
 credentials. See `docs/DESIGN.md` for the full architecture, auth model, and
-mobile design notes.
+mobile design notes, and `docs/TRUST.md` for the trust architecture and
+threat model: the server is being reduced to an operator that negotiates
+auth and connections but cannot read terminal content — data flows only
+between the host daemon, the browser, and a ciphertext-only TURN relay.
 
 ## Local dev (quickstart)
 

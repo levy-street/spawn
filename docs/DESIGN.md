@@ -9,6 +9,12 @@
 - Per-host agent auth: each agent CLI handles its own provider login
   interactively on the host where it runs. spawn does not manage credentials.
 - First-class mobile UX, including PWA installable.
+- **Operator model**: the server negotiates auth and connections but is
+  structurally unable to read terminal content. Data flows only between
+  the host daemon, the browser, and (when NAT demands) a TURN relay
+  carrying ciphertext. See `TRUST.md` — the governing document for this;
+  where the two disagree, TRUST.md describes the target and this file
+  the current mechanics.
 
 ## Components
 
@@ -24,11 +30,15 @@
   - HTTP/JSON REST under `/api/...`
   - `/ws/daemon` — daemon WebSocket
   - `/ws/browser` — browser WebSocket (per-agent attach)
-- **Bridge logic**: server holds a routing map `agent_id -> daemon_conn` and
-  `agent_id -> {browser_conn, ...}`. PTY output frames from a daemon fan out
-  to subscribed browsers; PTY input from a browser routes to the owning
-  daemon. Server also keeps a Redis ring buffer of the last 256 KB of PTY
-  output per agent for replay on reconnect.
+- **Bridge logic (legacy data path — being removed)**: server holds a
+  routing map `agent_id -> daemon_conn` and `agent_id -> {browser_conn,
+  ...}`. PTY output frames from a daemon fan out to subscribed browsers;
+  PTY input from a browser routes to the owning daemon, with on-disk
+  transcripts for replay. Under the operator model (TRUST.md) this whole
+  relay-and-store role is deleted: the server keeps only auth, registry,
+  presence, WebRTC signaling, and TURN credential minting. Terminal
+  data, history, uploads, snapshots, and spawn-time secrets (`env`,
+  skill bodies, MCP headers) travel browser↔daemon over DataChannels.
 
 ### `spawnd` — Rust
 
@@ -50,6 +60,10 @@
 - **Reconnect**: on WS disconnect, daemon retries with exponential backoff.
   On reconnect, sends a `register` frame with `existing_agents: [...]` so the
   server resyncs its routing map without killing the tmux sessions.
+- **Data ownership (target, TRUST.md Phase 2)**: the daemon is the
+  durable store for transcripts/scrollback — tmux plus the daemon-side
+  scrollback cache are already the source of truth; browsers fetch
+  history over the DataChannel at attach. The server keeps no copy.
 
 ### `spawn-web` — Next.js 15 PWA
 
@@ -116,22 +130,39 @@ device_codes(device_code, user_code, host_name, status, user_id|null,
 ## Wire protocol (summary — see `proto/README.md` for full)
 
 - Daemon `/ws/daemon`:
-  - Out: `register`, `host.heartbeat`, `agent.exit`; binary `0x01 <uuid> <bytes>`
-    for PTY output.
-  - In:  `agent.create`, `agent.kill`, `agent.resize`; binary `0x02 <uuid>
-    <bytes>` for PTY input.
+  - Out: `register`, `host.heartbeat`, `agent.exit`, `rtc.answer`; binary
+    `0x01 <uuid> <bytes>` for PTY output *(legacy relay path)*.
+  - In:  `agent.create`, `agent.kill`, `agent.resize`, `rtc.offer`; binary
+    `0x02 <uuid> <bytes>` for PTY input *(legacy relay path)*.
 - Browser `/ws/browser?agent_id=...`:
-  - Out: text `{type:"resize",cols,rows}`; binary stdin bytes.
-  - In:  text `{type:"history",bytes_b64}`, `{type:"agent.exit",code}`;
-    binary stdout bytes.
+  - Out: text `{type:"resize",cols,rows}`, `rtc.offer`; binary stdin bytes
+    *(legacy)*.
+  - In:  text `{type:"history",bytes_b64}`, `{type:"agent.exit",code}`,
+    `rtc.answer`; binary stdout bytes *(legacy)*.
+- Terminal data plane: WebRTC DataChannel `spawn.pty`, negotiated via the
+  `rtc.*` frames above. Today the WS binary path is the fallback relay
+  and transcript source; under `spawn.v2` (TRUST.md Phase 1) the
+  DataChannel is the only data path and the WS legs carry control +
+  signaling only, with TURN as the reachability fallback.
 
 ## Roadmap
 
-1. **Skeleton** — three workspaces wired up; `docker compose up`,
-   `uvicorn`, `cargo run`, `bun dev` all green; auth + daemon registration
-   end-to-end. *(this scaffold)*
-2. **Spawn one agent** — agent.create → tmux/PTY in daemon → xterm.js in
-   browser. Resize, reconnect, replay.
-3. **Mobile polish** — composer, modifier bar, PWA install, container queries.
-4. **Multi-agent UX** — grid, swipe-between, kill/restart, transcripts.
-5. **Hardening** — audit log, daemon auto-update, rate limiting, observability.
+Phases 1–4 of the original scaffold roadmap (skeleton, first agent,
+mobile polish, multi-agent UX) have shipped. The roadmap is now the
+operator-model migration, specified in `TRUST.md`:
+
+1. **TURN + WebRTC-only terminal path** — coturn with ephemeral
+   server-minted credentials; delete the WS PTY relay; `spawn.v2`.
+2. **Daemon-owned data** — history/upload/snapshot/fs-listing streams on
+   DataChannels; delete server transcripts and the Redis PTY ring
+   buffer; stop persisting `env`, skill bodies, and MCP headers
+   server-side; resolve the `/mcp` visibility question.
+3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device
+   keys bound via the device-code flow; signed SDP; TOFU pinning with
+   fingerprint verification UX.
+4. **Open source** — license, history secret-scan, SECURITY.md,
+   reproducible builds, self-host guide; spawnd.dev becomes the hosted
+   convenience instance.
+
+Ongoing hardening (audit log, daemon auto-update, rate limiting,
+observability) continues alongside.
