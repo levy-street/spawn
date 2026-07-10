@@ -355,3 +355,33 @@ class AgentOut(BaseModel):
     exit_code: int | None = None
     pinned_at: datetime | None = None
     archived_at: datetime | None = None
+
+# ---------- views ----------
+
+
+class ViewTab(BaseModel):
+    name: str | None = Field(default=None, max_length=64)
+    agent_ids: list[str] = Field(default_factory=list, max_length=4)
+
+
+class ViewLayout(BaseModel):
+    tabs: list[ViewTab] = Field(default_factory=list, max_length=8)
+
+
+class ViewCreate(BaseModel):
+    name: str = Field(max_length=128)
+    layout: ViewLayout = Field(default_factory=ViewLayout)
+
+
+class ViewPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    layout: ViewLayout | None = None
+
+
+class ViewOut(BaseModel):
+    id: str
+    name: str
+    layout: ViewLayout
+    created_at: datetime
+    updated_at: datetime
+

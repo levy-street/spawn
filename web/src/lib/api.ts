@@ -261,6 +261,26 @@ export const AgentAccessSchema = z.object({
 });
 export type AgentAccess = z.infer<typeof AgentAccessSchema>;
 
+export const ViewTabSchema = z.object({
+  name: z.string().nullable().optional(),
+  agent_ids: z.array(z.string().uuid()).default([]),
+});
+export type ViewTab = z.infer<typeof ViewTabSchema>;
+
+export const ViewLayoutSchema = z.object({
+  tabs: z.array(ViewTabSchema).default([]),
+});
+export type ViewLayout = z.infer<typeof ViewLayoutSchema>;
+
+export const ViewSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  layout: ViewLayoutSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type View = z.infer<typeof ViewSchema>;
+
 export const AuthResponseSchema = z.object({
   access_token: z.string(),
   user: UserSchema,
@@ -540,6 +560,32 @@ export const skills = {
       schema: SkillSchema,
     }),
   remove: (id: string) => api<void>(`/api/skills/${id}`, { method: "DELETE" }),
+};
+
+export const views = {
+  list: () =>
+    api("/api/views", {
+      method: "GET",
+      schema: z.array(ViewSchema),
+    }),
+  get: (id: string) =>
+    api(`/api/views/${id}`, {
+      method: "GET",
+      schema: ViewSchema,
+    }),
+  create: (body: { name: string; layout?: ViewLayout }) =>
+    api("/api/views", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: ViewSchema,
+    }),
+  update: (id: string, body: { name?: string; layout?: ViewLayout }) =>
+    api(`/api/views/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: ViewSchema,
+    }),
+  remove: (id: string) => api<void>(`/api/views/${id}`, { method: "DELETE" }),
 };
 
 export const agentAccess = {

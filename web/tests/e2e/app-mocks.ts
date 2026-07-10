@@ -5,6 +5,8 @@ export const HOST_ID = "00000000-0000-4000-8000-000000000002";
 export const PRESET_ID = "00000000-0000-4000-8000-000000000003";
 export const AGENT_ID = "00000000-0000-4000-8000-000000000004";
 export const SKILL_ID = "00000000-0000-4000-8000-000000000006";
+export const VIEW_ID = "00000000-0000-4000-8000-000000000007";
+export const AGENT_B_ID = "00000000-0000-4000-8000-000000000008";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
 
 export const user = {
@@ -74,10 +76,24 @@ export function skill(overrides: Record<string, unknown> = {}) {
   };
 }
 
+export function view(overrides: Record<string, unknown> = {}) {
+  return {
+    id: VIEW_ID,
+    name: "daily drive",
+    layout: { tabs: [{ name: null, agent_ids: [AGENT_ID, AGENT_B_ID] }] },
+    created_at: CREATED_AT,
+    updated_at: CREATED_AT,
+    ...overrides,
+  };
+}
+
 export async function mockAuthenticatedApi(
   page: Page,
   options: {
     agents?: unknown[];
+    views?: unknown[];
+    updateView?: (id: string, body: unknown, route: Route) => Promise<void> | void;
+    createView?: (body: unknown, route: Route) => Promise<void> | void;
     skills?: unknown[];
     createAgent?: (body: unknown, route: Route) => Promise<void> | void;
     createSkill?: (body: unknown, route: Route) => Promise<void> | void;
@@ -86,6 +102,7 @@ export async function mockAuthenticatedApi(
   } = {},
 ) {
   const agents = options.agents ?? [];
+  const viewList = options.views ?? [];
   const skillList = options.skills ?? [];
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -164,6 +181,52 @@ export async function mockAuthenticatedApi(
         await options.deleteSkill(id, route);
         return;
       }
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (path === "/api/views" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", json: viewList });
+      return;
+    }
+    if (path === "/api/views" && method === "POST") {
+      const body = await request.postDataJSON();
+      if (options.createView) {
+        await options.createView(body, route);
+        return;
+      }
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        json: view({ ...(body as Record<string, unknown>) }),
+      });
+      return;
+    }
+    if (path.startsWith("/api/views/") && method === "GET") {
+      const id = path.split("/").at(-1) ?? "";
+      const match = (viewList as Array<{ id?: string }>).find((v) => v.id === id);
+      await route.fulfill({
+        status: match ? 200 : 404,
+        contentType: "application/json",
+        json: match ?? { detail: "view not found" },
+      });
+      return;
+    }
+    if (path.startsWith("/api/views/") && method === "PATCH") {
+      const id = path.split("/").at(-1) ?? "";
+      const body = await request.postDataJSON();
+      if (options.updateView) {
+        await options.updateView(id, body, route);
+        return;
+      }
+      const match = (viewList as Array<Record<string, unknown>>).find((v) => v.id === id);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...(match ?? view()), ...(body as Record<string, unknown>) },
+      });
+      return;
+    }
+    if (path.startsWith("/api/views/") && method === "DELETE") {
       await route.fulfill({ status: 204 });
       return;
     }
