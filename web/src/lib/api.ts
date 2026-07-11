@@ -461,6 +461,12 @@ export const hosts = {
       body: JSON.stringify(body),
       schema: HostFileOpSchema,
     }),
+  renameFile: (id: string, body: { path: string; name: string }) =>
+    api(`/api/hosts/${id}/files/rename`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: HostFileOpSchema,
+    }),
   transferFile: (
     id: string,
     body: { path: string; dest_host_id: string; dest_dir: string; overwrite?: boolean },

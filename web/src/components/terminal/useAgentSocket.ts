@@ -38,6 +38,16 @@ export interface UseAgentSocketOptions {
 
 export type SocketState = "idle" | "connecting" | "open" | "closed" | "error";
 
+/** How the live terminal bytes are travelling right now. */
+export interface ConnInfo {
+  /** ICE path classification of the selected candidate pair. */
+  kind: "direct" | "stun" | "relay" | null;
+  rttMs: number | null;
+  protocol: string | null;
+}
+
+const EMPTY_CONN_INFO: ConnInfo = { kind: null, rttMs: null, protocol: null };
+
 type RtcState = {
   pc: RTCPeerConnection | null;
   dc: RTCDataChannel | null;
@@ -86,6 +96,7 @@ export function useAgentSocket({
   // True while the spawn.pty DataChannel is open — on v2 this IS the live
   // terminal path, so callers surface it as connection state.
   const [dcOpen, setDcOpen] = useState(false);
+  const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
   const wsRef = useRef<WebSocket | null>(null);
   const wsV2Ref = useRef(false);
   const pendingInputRef = useRef<Uint8Array[]>([]);
@@ -496,6 +507,77 @@ export function useAgentSocket({
     };
   }, [agentId, enabled]);
 
+  // Poll WebRTC stats while the channel is up: the selected candidate pair
+  // tells us whether bytes flow direct, via STUN-discovered addresses, or
+  // through the TURN relay — plus the live round-trip time.
+  useEffect(() => {
+    if (!dcOpen) {
+      setConnInfo(EMPTY_CONN_INFO);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      const pc = rtcRef.current.pc;
+      if (!pc) return;
+      let stats: RTCStatsReport;
+      try {
+        stats = await pc.getStats();
+      } catch {
+        return;
+      }
+      interface PairStats {
+        id: string;
+        type: string;
+        localCandidateId?: string;
+        remoteCandidateId?: string;
+        currentRoundTripTime?: number;
+        state?: string;
+        nominated?: boolean;
+        selectedCandidatePairId?: string;
+      }
+      const reports: PairStats[] = [];
+      stats.forEach((report) => {
+        reports.push(report as unknown as PairStats);
+      });
+      const selectedPairId = reports.find(
+        (r) => r.type === "transport" && r.selectedCandidatePairId,
+      )?.selectedCandidatePairId;
+      const pair = reports.find(
+        (r) =>
+          r.type === "candidate-pair" &&
+          (selectedPairId ? r.id === selectedPairId : r.state === "succeeded" && r.nominated),
+      );
+      if (!pair || cancelled) return;
+      const local = (pair.localCandidateId ? stats.get(pair.localCandidateId) : null) as {
+        candidateType?: string;
+        protocol?: string;
+      } | null;
+      const remote = (pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null) as {
+        candidateType?: string;
+      } | null;
+      const types = [local?.candidateType, remote?.candidateType];
+      const kind = types.includes("relay")
+        ? "relay"
+        : types.includes("srflx") || types.includes("prflx")
+          ? "stun"
+          : "direct";
+      setConnInfo({
+        kind,
+        rttMs:
+          typeof pair.currentRoundTripTime === "number"
+            ? Math.max(1, Math.round(pair.currentRoundTripTime * 1000))
+            : null,
+        protocol: local?.protocol ?? null,
+      });
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 5_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [dcOpen]);
+
   const sendBinary = (bytes: Uint8Array | string) => {
     const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     const rtc = rtcRef.current;
@@ -535,5 +617,5 @@ export function useAgentSocket({
     return true;
   };
 
-  return { state, v2, dcOpen, sendBinary, sendJson };
+  return { state, v2, dcOpen, connInfo, sendBinary, sendJson };
 }

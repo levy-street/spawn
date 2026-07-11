@@ -1,0 +1,776 @@
+"use client";
+
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  ArrowRightLeft,
+  ChevronRight,
+  ChevronsDownUp,
+  Download,
+  File,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  Loader2,
+  MoreHorizontal,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  Upload,
+} from "lucide-react";
+import {
+  type DragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { ApiError, type HostDirEntry, hosts } from "@/lib/api";
+import { cn } from "@/lib/utils";
+
+/**
+ * VS Code-style lazy file tree for a spawn host. Flat-rendered rows with
+ * indent guides; directories expand in place and load on demand.
+ */
+
+const INDENT_PX = 12;
+
+interface Row {
+  entry: HostDirEntry;
+  depth: number;
+  parentDir: string;
+}
+
+interface MenuState {
+  x: number;
+  y: number;
+  entry: HostDirEntry;
+  parentDir: string;
+}
+
+function baseName(path: string): string {
+  return path.split("/").filter(Boolean).at(-1) ?? path;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof ApiError || err instanceof Error ? err.message : String(err);
+}
+
+export function formatSize(size: number | null | undefined): string {
+  if (size == null) return "";
+  if (size < 1024) return `${size} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = size / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+export function FileExplorer({
+  hostId,
+  rootPath,
+  rootLabel,
+  initialPath,
+  dense = false,
+  className,
+}: {
+  hostId: string;
+  /** Directory the tree is rooted at; defaults to the daemon home dir. */
+  rootPath?: string;
+  rootLabel?: string;
+  /** Deep link: ancestors are expanded and the entry selected once loaded. */
+  initialPath?: string;
+  dense?: boolean;
+  className?: string;
+}) {
+  const qc = useQueryClient();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  const [expanded, setExpanded] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [creatingIn, setCreatingIn] = useState<string | null>(null);
+  const [folderDraft, setFolderDraft] = useState("");
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const [uploadingCount, setUploadingCount] = useState(0);
+  const [dropDir, setDropDir] = useState<string | null>(null);
+  const uploadDirRef = useRef<string | null>(null);
+  const initialAppliedRef = useRef(false);
+
+  const rootQ = useQuery({
+    queryKey: ["host-files", hostId, rootPath ?? ""],
+    queryFn: () => hosts.files(hostId, rootPath),
+  });
+  const resolvedRoot = rootQ.data?.path ?? rootPath ?? null;
+
+  const childQs = useQueries({
+    queries: expanded.map((path) => ({
+      queryKey: ["host-files", hostId, path],
+      queryFn: () => hosts.files(hostId, path),
+    })),
+  });
+  const listings = useMemo(() => {
+    const map = new Map<string, { entries: HostDirEntry[]; loading: boolean }>();
+    expanded.forEach((path, i) => {
+      const q = childQs[i];
+      map.set(path, { entries: q?.data?.entries ?? [], loading: Boolean(q?.isLoading) });
+    });
+    return map;
+  }, [expanded, childQs]);
+
+  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
+  const otherHosts = (hostsQ.data ?? []).filter((h) => h.id !== hostId);
+
+  const rows = useMemo(() => {
+    const out: Row[] = [];
+    const walk = (entries: HostDirEntry[], depth: number, parentDir: string) => {
+      for (const entry of entries) {
+        out.push({ entry, depth, parentDir });
+        if (entry.is_dir && expanded.includes(entry.path)) {
+          walk(listings.get(entry.path)?.entries ?? [], depth + 1, entry.path);
+        }
+      }
+    };
+    if (rootQ.data && resolvedRoot) walk(rootQ.data.entries, 0, resolvedRoot);
+    return out;
+  }, [rootQ.data, resolvedRoot, expanded, listings]);
+
+  // Deep link: expand every ancestor between the root and initialPath.
+  useEffect(() => {
+    if (initialAppliedRef.current || !initialPath || !resolvedRoot) return;
+    if (initialPath === resolvedRoot || !initialPath.startsWith(`${resolvedRoot}/`)) {
+      initialAppliedRef.current = true;
+      return;
+    }
+    const rest = initialPath.slice(resolvedRoot.length).split("/").filter(Boolean);
+    const ancestors: string[] = [];
+    let acc = resolvedRoot;
+    for (const part of rest) {
+      acc = `${acc}/${part}`;
+      ancestors.push(acc);
+    }
+    setExpanded((current) => [...new Set([...current, ...ancestors])]);
+    setSelected(initialPath);
+    initialAppliedRef.current = true;
+  }, [initialPath, resolvedRoot]);
+
+  const refreshDir = useCallback(
+    (dir: string | null) => {
+      if (dir === null || dir === resolvedRoot) {
+        qc.invalidateQueries({ queryKey: ["host-files", hostId, rootPath ?? ""] });
+        if (resolvedRoot) qc.invalidateQueries({ queryKey: ["host-files", hostId, resolvedRoot] });
+      } else {
+        qc.invalidateQueries({ queryKey: ["host-files", hostId, dir] });
+      }
+    },
+    [hostId, qc, resolvedRoot, rootPath],
+  );
+
+  const refreshAll = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ["host-files", hostId] });
+  }, [hostId, qc]);
+
+  const toggleDir = useCallback((path: string) => {
+    setExpanded((current) =>
+      current.includes(path)
+        ? current.filter((p) => p !== path && !p.startsWith(`${path}/`))
+        : [...current, path],
+    );
+  }, []);
+
+  const uploadFiles = useCallback(
+    async (dir: string, files: globalThis.File[]) => {
+      if (files.length === 0) return;
+      setStatus(null);
+      setUploadingCount((n) => n + files.length);
+      for (const file of files) {
+        try {
+          const result = await hosts.uploadFile(hostId, file, { dir });
+          setStatus(`Uploaded ${result.path ?? file.name}`);
+        } catch (err) {
+          setStatus(`${file.name || "File"}: ${errorMessage(err)}`);
+        } finally {
+          setUploadingCount((n) => n - 1);
+        }
+      }
+      refreshDir(dir);
+    },
+    [hostId, refreshDir],
+  );
+
+  const mkdirM = useMutation({
+    mutationFn: ({ dir, name }: { dir: string; name: string }) =>
+      hosts.mkdir(hostId, `${dir}/${name}`),
+    onSuccess: (_, { dir }) => {
+      setCreatingIn(null);
+      setFolderDraft("");
+      refreshDir(dir);
+      if (dir !== resolvedRoot) setExpanded((cur) => (cur.includes(dir) ? cur : [...cur, dir]));
+    },
+    onError: (err) => setStatus(errorMessage(err)),
+  });
+
+  const renameM = useMutation({
+    mutationFn: ({ entry, name }: { entry: HostDirEntry; name: string; parentDir: string }) =>
+      hosts.renameFile(hostId, { path: entry.path, name }),
+    onSuccess: (result, { entry, parentDir }) => {
+      setRenaming(null);
+      if (result.path) {
+        setSelected(result.path);
+        if (entry.is_dir) {
+          const oldPrefix = `${entry.path}/`;
+          setExpanded((cur) =>
+            cur.map((p) =>
+              p === entry.path
+                ? (result.path as string)
+                : p.startsWith(oldPrefix)
+                  ? `${result.path}${p.slice(entry.path.length)}`
+                  : p,
+            ),
+          );
+        }
+      }
+      refreshDir(parentDir);
+      setStatus(null);
+    },
+    onError: (err) => setStatus(errorMessage(err)),
+  });
+
+  const deleteM = useMutation({
+    mutationFn: ({ entry }: { entry: HostDirEntry; parentDir: string }) =>
+      hosts.deleteFile(hostId, { path: entry.path, recursive: entry.is_dir === true }),
+    onSuccess: (_, { entry, parentDir }) => {
+      setStatus(`Deleted ${entry.name}`);
+      setExpanded((cur) => cur.filter((p) => p !== entry.path && !p.startsWith(`${entry.path}/`)));
+      if (selected === entry.path) setSelected(null);
+      refreshDir(parentDir);
+    },
+    onError: (err) => setStatus(errorMessage(err)),
+  });
+
+  const transferM = useMutation({
+    mutationFn: ({
+      entry,
+      destHostId,
+      destDir,
+    }: {
+      entry: HostDirEntry;
+      destHostId: string;
+      destDir: string;
+    }) =>
+      hosts.transferFile(hostId, {
+        path: entry.path,
+        dest_host_id: destHostId,
+        dest_dir: destDir,
+      }),
+    onSuccess: (result) => setStatus(`Sent to ${result.path ?? "destination host"}`),
+    onError: (err) => setStatus(errorMessage(err)),
+  });
+
+  const download = useCallback(
+    async (entry: HostDirEntry) => {
+      setStatus(`Downloading ${entry.name}...`);
+      try {
+        const blob = await hosts.downloadFile(hostId, entry.path);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = entry.name;
+        a.click();
+        URL.revokeObjectURL(url);
+        setStatus(null);
+      } catch (err) {
+        setStatus(`${entry.name}: ${errorMessage(err)}`);
+      }
+    },
+    [hostId],
+  );
+
+  const startRename = useCallback((entry: HostDirEntry) => {
+    setRenaming(entry.path);
+    setRenameDraft(entry.name);
+    setMenu(null);
+  }, []);
+
+  const confirmDelete = useCallback(
+    (entry: HostDirEntry, parentDir: string) => {
+      setMenu(null);
+      const detail = entry.is_dir ? `${entry.name} and everything in it` : entry.name;
+      if (confirm(`Delete ${detail}?`)) deleteM.mutate({ entry, parentDir });
+    },
+    [deleteM],
+  );
+
+  useEffect(() => {
+    if (renaming) renameInputRef.current?.select();
+  }, [renaming]);
+
+  // Close the context menu on outside pointer / escape. Uses a contains
+  // check (like DropdownMenu) — stopPropagation can't reliably beat a
+  // document-level listener to the punch.
+  const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenu(null);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenu(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  const onRowKeyDown = (event: ReactKeyboardEvent) => {
+    if (renaming || creatingIn !== null) return;
+    const index = rows.findIndex((r) => r.entry.path === selected);
+    const row = index >= 0 ? rows[index] : null;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const next = rows[Math.min(rows.length - 1, index + 1)] ?? rows[0];
+      if (next) setSelected(next.entry.path);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const prev = rows[Math.max(0, index - 1)] ?? rows[0];
+      if (prev) setSelected(prev.entry.path);
+    } else if (event.key === "ArrowRight" && row?.entry.is_dir) {
+      event.preventDefault();
+      if (!expanded.includes(row.entry.path)) toggleDir(row.entry.path);
+    } else if (event.key === "ArrowLeft" && row) {
+      event.preventDefault();
+      if (row.entry.is_dir && expanded.includes(row.entry.path)) {
+        toggleDir(row.entry.path);
+      } else if (row.depth > 0) {
+        setSelected(row.parentDir);
+      }
+    } else if (event.key === "Enter" && row) {
+      event.preventDefault();
+      if (row.entry.is_dir) toggleDir(row.entry.path);
+      else void download(row.entry);
+    } else if (event.key === "F2" && row) {
+      event.preventDefault();
+      startRename(row.entry);
+    } else if (event.key === "Delete" && row) {
+      event.preventDefault();
+      confirmDelete(row.entry, row.parentDir);
+    }
+  };
+
+  const dropProps = (dir: string) => ({
+    onDragOver: (event: DragEvent) => {
+      if (event.dataTransfer.types.includes("Files")) {
+        event.preventDefault();
+        event.stopPropagation();
+        setDropDir(dir);
+      }
+    },
+    onDragLeave: (event: DragEvent) => {
+      event.stopPropagation();
+      setDropDir((cur) => (cur === dir ? null : cur));
+    },
+    onDrop: (event: DragEvent) => {
+      if (!event.dataTransfer.types.includes("Files")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setDropDir(null);
+      void uploadFiles(dir, Array.from(event.dataTransfer.files));
+    },
+  });
+
+  const openContextMenu = (event: ReactMouseEvent, entry: HostDirEntry, parentDir: string) => {
+    event.preventDefault();
+    setSelected(entry.path);
+    setMenu({ x: event.clientX, y: event.clientY, entry, parentDir });
+  };
+
+  const rowActions = (entry: HostDirEntry, parentDir: string) => (
+    <>
+      {!entry.is_dir && (
+        <DropdownMenuItem onSelect={() => void download(entry)}>
+          <Download className="size-4" aria-hidden />
+          Download
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuItem onSelect={() => startRename(entry)}>
+        <Pencil className="size-4" aria-hidden />
+        Rename
+      </DropdownMenuItem>
+      {!entry.is_dir && otherHosts.length > 0 && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Send to host</DropdownMenuLabel>
+          {otherHosts.map((other) => (
+            <DropdownMenuItem
+              key={other.id}
+              disabled={other.status !== "online"}
+              onSelect={() =>
+                transferM.mutate({
+                  entry,
+                  destHostId: other.id,
+                  destDir: other.home_dir ?? "~",
+                })
+              }
+            >
+              <ArrowRightLeft className="size-4" aria-hidden />
+              {other.name}
+            </DropdownMenuItem>
+          ))}
+        </>
+      )}
+      <DropdownMenuSeparator />
+      <DropdownMenuItem destructive onSelect={() => confirmDelete(entry, parentDir)}>
+        <Trash2 className="size-4" aria-hidden />
+        Delete
+      </DropdownMenuItem>
+    </>
+  );
+
+  const rootBusy = rootQ.isLoading;
+  const label = rootLabel ?? (resolvedRoot ? baseName(resolvedRoot) : "files");
+
+  return (
+    <div className={cn("flex min-h-0 flex-col", className)}>
+      {/* Header */}
+      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
+        <span
+          className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
+          title={resolvedRoot ?? undefined}
+        >
+          {label}
+        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          aria-label="New folder"
+          onClick={() => {
+            if (resolvedRoot) {
+              setCreatingIn(resolvedRoot);
+              setFolderDraft("");
+            }
+          }}
+        >
+          <FolderPlus className="size-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          aria-label="Upload files"
+          onClick={() => {
+            uploadDirRef.current = resolvedRoot;
+            fileInputRef.current?.click();
+          }}
+        >
+          <Upload className="size-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          aria-label="Refresh files"
+          onClick={refreshAll}
+        >
+          <RefreshCw className={cn("size-3.5", rootQ.isFetching && "animate-spin")} />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          aria-label="Collapse all"
+          onClick={() => setExpanded([])}
+        >
+          <ChevronsDownUp className="size-3.5" />
+        </Button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          aria-label="Upload file input"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = "";
+            const dir = uploadDirRef.current ?? resolvedRoot;
+            if (dir) void uploadFiles(dir, files);
+          }}
+        />
+      </div>
+
+      {/* Tree */}
+      <div
+        ref={containerRef}
+        role="tree"
+        aria-label="Files"
+        tabIndex={0}
+        onKeyDown={onRowKeyDown}
+        className={cn(
+          "min-h-0 flex-1 overflow-y-auto py-1 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          dropDir && resolvedRoot === dropDir && "bg-primary/5",
+        )}
+        {...(resolvedRoot ? dropProps(resolvedRoot) : {})}
+      >
+        {rootBusy && (
+          <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" aria-hidden /> Loading...
+          </div>
+        )}
+        {rootQ.error && (
+          <p className="px-3 py-2 text-xs text-destructive" role="alert">
+            {errorMessage(rootQ.error)}
+          </p>
+        )}
+        {rootQ.data?.error && (
+          <p className="px-3 py-2 text-xs text-destructive" role="alert">
+            {rootQ.data.error}
+          </p>
+        )}
+        {!rootBusy && rows.length === 0 && creatingIn === null && !rootQ.error && (
+          <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+            Empty directory. Drop files here to upload.
+          </p>
+        )}
+
+        {creatingIn === resolvedRoot && resolvedRoot && (
+          <NewFolderRow
+            depth={0}
+            draft={folderDraft}
+            setDraft={setFolderDraft}
+            pending={mkdirM.isPending}
+            onSubmit={(name) => mkdirM.mutate({ dir: resolvedRoot, name })}
+            onCancel={() => setCreatingIn(null)}
+          />
+        )}
+
+        {rows.map(({ entry, depth, parentDir }) => {
+          const isDir = entry.is_dir === true;
+          const isExpanded = isDir && expanded.includes(entry.path);
+          const isSelected = selected === entry.path;
+          const isRenaming = renaming === entry.path;
+          const childLoading = isExpanded && listings.get(entry.path)?.loading;
+          return (
+            <div key={entry.path}>
+              <div
+                role="treeitem"
+                tabIndex={-1}
+                aria-selected={isSelected}
+                aria-expanded={isDir ? isExpanded : undefined}
+                data-path={entry.path}
+                className={cn(
+                  "group/filerow relative flex cursor-default select-none items-center gap-1 pr-8",
+                  dense ? "h-6" : "h-7",
+                  isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/40",
+                  dropDir === entry.path && "bg-primary/10 outline outline-1 outline-primary",
+                )}
+                style={{ paddingLeft: 6 + depth * INDENT_PX }}
+                onClick={() => {
+                  setSelected(entry.path);
+                  if (isDir && !isRenaming) toggleDir(entry.path);
+                }}
+                onContextMenu={(e) => openContextMenu(e, entry, parentDir)}
+                {...(isDir ? dropProps(entry.path) : {})}
+              >
+                {depth > 0 && (
+                  <span
+                    aria-hidden
+                    className="pointer-events-none absolute inset-y-0 left-0 flex"
+                    style={{ paddingLeft: 11 }}
+                  >
+                    {Array.from({ length: depth }).map((_, i) => (
+                      <span
+                        // biome-ignore lint/suspicious/noArrayIndexKey: purely decorative guides
+                        key={i}
+                        className="h-full border-l border-border/50"
+                        style={{ width: INDENT_PX }}
+                      />
+                    ))}
+                  </span>
+                )}
+                {isDir ? (
+                  <ChevronRight
+                    className={cn(
+                      "z-10 size-3.5 shrink-0 text-muted-foreground transition-transform",
+                      isExpanded && "rotate-90",
+                    )}
+                    aria-hidden
+                  />
+                ) : (
+                  <span className="z-10 size-3.5 shrink-0" aria-hidden />
+                )}
+                {isDir ? (
+                  isExpanded ? (
+                    <FolderOpen className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                  ) : (
+                    <Folder className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                  )
+                ) : (
+                  <File className="z-10 size-4 shrink-0 text-muted-foreground" aria-hidden />
+                )}
+                {isRenaming ? (
+                  <input
+                    ref={renameInputRef}
+                    aria-label="Rename entry"
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === "Enter") {
+                        const name = renameDraft.trim();
+                        if (name && name !== entry.name) {
+                          renameM.mutate({ entry, name, parentDir });
+                        } else {
+                          setRenaming(null);
+                        }
+                      }
+                      if (e.key === "Escape") setRenaming(null);
+                    }}
+                    onBlur={() => setRenaming(null)}
+                    className="z-10 h-5 min-w-0 flex-1 rounded border border-ring bg-background px-1 text-[13px] outline-none"
+                    disabled={renameM.isPending}
+                  />
+                ) : (
+                  <span className="z-10 min-w-0 flex-1 truncate text-[13px]">{entry.name}</span>
+                )}
+                {childLoading && (
+                  <Loader2
+                    className="z-10 size-3 shrink-0 animate-spin text-muted-foreground"
+                    aria-hidden
+                  />
+                )}
+                {!dense && !isDir && (
+                  <span className="z-10 hidden shrink-0 pr-1 text-[11px] tabular-nums text-muted-foreground sm:block">
+                    {formatSize(entry.size)}
+                  </span>
+                )}
+                <DropdownMenu
+                  className="absolute right-1 top-1/2 -translate-y-1/2"
+                  renderTrigger={(props) => (
+                    <button
+                      {...props}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        props.onClick();
+                      }}
+                      aria-label={`${entry.name} actions`}
+                      className="z-10 grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover/filerow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
+                    >
+                      <MoreHorizontal className="size-3.5" aria-hidden />
+                    </button>
+                  )}
+                >
+                  {rowActions(entry, parentDir)}
+                </DropdownMenu>
+              </div>
+              {creatingIn === entry.path && (
+                <NewFolderRow
+                  depth={depth + 1}
+                  draft={folderDraft}
+                  setDraft={setFolderDraft}
+                  pending={mkdirM.isPending}
+                  onSubmit={(name) => mkdirM.mutate({ dir: entry.path, name })}
+                  onCancel={() => setCreatingIn(null)}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Right-click context menu */}
+      {menu && (
+        <div
+          ref={menuRef}
+          role="menu"
+          className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40"
+          style={{
+            left: Math.min(
+              menu.x,
+              typeof window !== "undefined" ? window.innerWidth - 200 : menu.x,
+            ),
+            top: Math.min(
+              menu.y,
+              typeof window !== "undefined" ? window.innerHeight - 240 : menu.y,
+            ),
+          }}
+          onClick={() => setMenu(null)}
+        >
+          {rowActions(menu.entry, menu.parentDir)}
+        </div>
+      )}
+
+      {/* Status footer */}
+      {(status || uploadingCount > 0) && (
+        <div
+          className="flex shrink-0 items-center gap-2 border-t border-border px-2 py-1 text-[11px] text-muted-foreground"
+          role="status"
+        >
+          {uploadingCount > 0 && <Loader2 className="size-3 animate-spin" aria-hidden />}
+          <span className="truncate">
+            {uploadingCount > 0 ? `Uploading ${uploadingCount} file(s)...` : status}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NewFolderRow({
+  depth,
+  draft,
+  setDraft,
+  pending,
+  onSubmit,
+  onCancel,
+}: {
+  depth: number;
+  draft: string;
+  setDraft: (value: string) => void;
+  pending: boolean;
+  onSubmit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="flex h-7 items-center gap-1 pr-2"
+      style={{ paddingLeft: 6 + depth * INDENT_PX + 14 }}
+    >
+      <Folder className="size-4 shrink-0 text-sky-400" aria-hidden />
+      <input
+        ref={(el) => el?.focus()}
+        aria-label="Folder name"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && draft.trim()) onSubmit(draft.trim());
+          if (e.key === "Escape") onCancel();
+        }}
+        onBlur={onCancel}
+        placeholder="folder name"
+        className="h-5 min-w-0 flex-1 rounded border border-ring bg-background px-1 text-[13px] outline-none"
+        disabled={pending}
+      />
+    </div>
+  );
+}

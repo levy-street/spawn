@@ -309,6 +309,11 @@ Agent IDs are big-endian 16-byte UUIDs.
  "request_id": "uuid",
  "path": "/home/me/projects/new-dir"}
 
+{"type": "host.fs.rename",
+ "request_id": "uuid",
+ "path": "/home/me/projects/a.txt",
+ "name": "b.txt"}
+
 {"type": "host.fs.remove",
  "request_id": "uuid",
  "path": "/home/me/projects/old",

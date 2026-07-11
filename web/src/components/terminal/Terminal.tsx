@@ -19,6 +19,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
 import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
@@ -119,6 +120,8 @@ export interface TerminalProps {
   imagePasteMode?: ImagePasteMode;
   /** Server-side shared terminal display ownership changed. */
   onDisplayControl?: (state: DisplayControlState) => void;
+  /** Live transport snapshot (path kind, RTT) for connection indicators. */
+  onConnectionInfo?: (info: AgentConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
 }
 
@@ -135,6 +138,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     mobileReturnBytes = ALT_ENTER,
     imagePasteMode = "deferred",
     onDisplayControl,
+    onConnectionInfo,
     onExit,
   },
   ref,
@@ -862,6 +866,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // reach it without re-running every render.
   const socketRef = useRef(socket);
   socketRef.current = socket;
+
+  // Surface the live transport for connection indicators without forcing the
+  // callback identity into effect deps (screen panes pass inline closures).
+  const onConnectionInfoRef = useRef(onConnectionInfo);
+  onConnectionInfoRef.current = onConnectionInfo;
+  useEffect(() => {
+    onConnectionInfoRef.current?.({
+      socketState: socket.state,
+      v2: socket.v2,
+      dcOpen: socket.dcOpen,
+      ...socket.connInfo,
+    });
+  }, [socket.state, socket.v2, socket.dcOpen, socket.connInfo]);
 
   // On spawn.v2 the DataChannel is the only live path. When it (re)opens,
   // force a tmux repaint so output produced between the history snapshot and

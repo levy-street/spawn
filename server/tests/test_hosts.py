@@ -377,6 +377,25 @@ async def test_host_files_listing_download_and_ops(client):
     assert r.status_code == 200, r.text
     assert r.json() == {"path": "/repo/notes.txt"}
 
+    # Rename round-trips through the daemon.
+    start = len(fake_ws.sent_text)
+    task = asyncio.create_task(
+        client.post(
+            f"/api/hosts/{host_id}/files/rename",
+            headers=auth,
+            json={"path": "/repo/notes.txt", "name": "notes-v2.txt"},
+        )
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.fs.rename", start=start)
+    assert sent["path"] == "/repo/notes.txt"
+    assert sent["name"] == "notes-v2.txt"
+    await broker.resolve_fs_result(
+        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/notes-v2.txt"}
+    )
+    r = await task
+    assert r.status_code == 200, r.text
+    assert r.json() == {"path": "/repo/notes-v2.txt"}
+
     # mkdir + delete round-trip; daemon errors surface as 400s.
     start = len(fake_ws.sent_text)
     task = asyncio.create_task(

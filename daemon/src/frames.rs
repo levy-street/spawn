@@ -287,6 +287,15 @@ mod tests {
                 .unwrap();
         assert!(matches!(mkdir, Inbound::HostFsMkdir { .. }));
 
+        let rename: Inbound = serde_json::from_str(
+            r#"{"type":"host.fs.rename","request_id":"r6","path":"~/old.txt","name":"new.txt"}"#,
+        )
+        .unwrap();
+        match rename {
+            Inbound::HostFsRename { name, .. } => assert_eq!(name, "new.txt"),
+            _ => panic!("expected HostFsRename"),
+        }
+
         let remove: Inbound = serde_json::from_str(
             r#"{"type":"host.fs.remove","request_id":"r5","path":"~/old","recursive":true}"#,
         )

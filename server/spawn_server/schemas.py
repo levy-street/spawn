@@ -133,6 +133,11 @@ class HostFileDeleteRequest(BaseModel):
     recursive: bool = False
 
 
+class HostFileRenameRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    name: str = Field(min_length=1, max_length=255)
+
+
 class HostFileTransferRequest(BaseModel):
     path: str = Field(min_length=1, max_length=1024)
     dest_host_id: str = Field(min_length=1, max_length=64)

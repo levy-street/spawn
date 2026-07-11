@@ -224,7 +224,14 @@ function HostDetail() {
             <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
             <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
             <Fact label="Home" value={host.home_dir ?? "—"} mono />
-            <Fact label="Last seen" value={relativeTime(host.last_seen_at) ?? "never"} />
+            <Fact
+              label="Connection"
+              value={
+                host.status === "online"
+                  ? `wss control link · heartbeat ${relativeTime(host.last_seen_at) ?? "now"}`
+                  : `offline · last seen ${relativeTime(host.last_seen_at) ?? "never"}`
+              }
+            />
           </dl>
 
           <HostToolsPanel host={host} />

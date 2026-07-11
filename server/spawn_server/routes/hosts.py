@@ -517,6 +517,20 @@ async def mkdir_host_file(
     return _fs_op_out(result, timeout_detail="host mkdir timed out")
 
 
+@router.post("/{host_id}/files/rename", response_model=schemas.HostFileOpOut)
+async def rename_host_file(
+    host_id: str,
+    body: schemas.HostFileRenameRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostFileOpOut:
+    daemon = await _online_daemon(session, host_id, user)
+    await session.commit()
+
+    result = await get_broker().request_fs_rename(daemon, path=body.path, name=body.name)
+    return _fs_op_out(result, timeout_detail="host rename timed out")
+
+
 @router.post("/{host_id}/files/delete", response_model=schemas.HostFileOpOut)
 async def delete_host_file(
     host_id: str,

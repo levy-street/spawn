@@ -139,6 +139,7 @@ export async function mockAuthenticatedApi(
     fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileTransfer?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+    fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   } = {},
 ) {
   const agents = options.agents ?? [];
@@ -188,14 +189,19 @@ export async function mockAuthenticatedApi(
         });
         return;
       }
-      if ((op === "mkdir" || op === "delete" || op === "transfer") && method === "POST") {
+      if (
+        (op === "mkdir" || op === "delete" || op === "transfer" || op === "rename") &&
+        method === "POST"
+      ) {
         const body = await request.postDataJSON();
         const handler =
           op === "mkdir"
             ? options.fileMkdir
             : op === "delete"
               ? options.fileDelete
-              : options.fileTransfer;
+              : op === "rename"
+                ? options.fileRename
+                : options.fileTransfer;
         if (handler) {
           await handler(hostId, body, route);
           return;

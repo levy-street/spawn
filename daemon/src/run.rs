@@ -301,6 +301,13 @@ async fn dispatch_loop(
                 } => {
                     handle_host_fs_remove(request_id, path, recursive, out_tx).await;
                 }
+                Inbound::HostFsRename {
+                    request_id,
+                    path,
+                    name,
+                } => {
+                    handle_host_fs_rename(request_id, path, name, out_tx).await;
+                }
                 Inbound::HostToolsCheck {
                     request_id,
                     targets,
@@ -673,6 +680,59 @@ async fn handle_host_fs_remove(
         Err(e) => {
             send_fs_op_result(request_id, Some(path_string), Some(e.to_string()), out_tx).await
         }
+    }
+}
+
+async fn handle_host_fs_rename(
+    request_id: String,
+    path: String,
+    name: String,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    let source = expand_host_path(&path);
+
+    let rename = async {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 255 || name == "." || name == ".." {
+            anyhow::bail!("invalid name");
+        }
+        if name.contains(['/', '\\']) || name.chars().any(char::is_control) {
+            anyhow::bail!("name cannot contain path separators");
+        }
+        if source == Path::new("/") || Some(&source) == daemon_home_dir().as_ref() {
+            anyhow::bail!("refusing to rename {}", source.display());
+        }
+        let parent = source
+            .parent()
+            .ok_or_else(|| anyhow!("cannot rename {}", source.display()))?;
+        let target = parent.join(name);
+        if target == source {
+            return Ok(target);
+        }
+        if tokio::fs::try_exists(&target)
+            .await
+            .with_context(|| format!("checking {}", target.display()))?
+        {
+            anyhow::bail!("{name} already exists");
+        }
+        tokio::fs::rename(&source, &target)
+            .await
+            .with_context(|| format!("renaming {}", source.display()))?;
+        Ok::<_, anyhow::Error>(target)
+    }
+    .await;
+
+    match rename {
+        Ok(target) => {
+            send_fs_op_result(
+                request_id,
+                Some(target.to_string_lossy().into_owned()),
+                None,
+                out_tx,
+            )
+            .await;
+        }
+        Err(e) => send_fs_op_result(request_id, None, Some(e.to_string()), out_tx).await,
     }
 }
 

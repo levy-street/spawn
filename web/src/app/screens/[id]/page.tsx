@@ -5,6 +5,7 @@ import {
   ChevronDown,
   Columns3,
   ExternalLink,
+  FolderOpen,
   Grid2x2,
   Home,
   Maximize2,
@@ -30,7 +31,9 @@ import {
 } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { FileExplorer } from "@/components/files/FileExplorer";
 import { AppShell } from "@/components/nav/AppShell";
+import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import {
@@ -95,6 +98,7 @@ function ScreenView({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [zoomedId, setZoomedId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [filesOpen, setFilesOpen] = useState(false);
   // Live terminal handles per pane so the shared mobile ModifierBar can
   // target whichever pane holds focus.
   const paneHandles = useRef(new Map<string, TerminalHandle | null>());
@@ -278,6 +282,11 @@ function ScreenView({ id }: { id: string }) {
   );
   const allScreens = screensQ.data ?? [];
 
+  const panelAgent =
+    (focusedId ? agentsById.get(focusedId) : null) ??
+    (screenAgentIds.length > 0 ? agentsById.get(screenAgentIds[0]) : null) ??
+    null;
+
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
@@ -426,6 +435,23 @@ function ScreenView({ id }: { id: string }) {
         >
           Saving…
         </span>
+        <button
+          type="button"
+          aria-label="Toggle files panel"
+          aria-pressed={filesOpen}
+          title="Files"
+          disabled={!panelAgent}
+          onClick={() => setFilesOpen((v) => !v)}
+          className={cn(
+            "hidden size-8 shrink-0 place-items-center rounded-lg transition-colors md:grid",
+            filesOpen
+              ? "bg-accent text-foreground"
+              : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+            !panelAgent && "opacity-40",
+          )}
+        >
+          <FolderOpen className="size-4" aria-hidden />
+        </button>
       </header>
 
       {(error || q.error) && (
@@ -434,23 +460,39 @@ function ScreenView({ id }: { id: string }) {
         </p>
       )}
 
-      <PaneArea
-        root={currentRoot}
-        agentsById={agentsById}
-        candidates={candidates}
-        screenId={id}
-        zoomedId={zoomedId}
-        focusedId={focusedId}
-        paneCount={screenAgentIds.length}
-        onFocusPane={setFocusedId}
-        onToggleZoom={(agentId) => setZoomedId((z) => (z === agentId ? null : agentId))}
-        onRootChange={commit}
-        onPlaceAgent={placeAgent}
-        registerPane={(agentId, handle) => {
-          if (handle) paneHandles.current.set(agentId, handle);
-          else paneHandles.current.delete(agentId);
-        }}
-      />
+      <div className="flex min-h-0 flex-1">
+        <PaneArea
+          root={currentRoot}
+          agentsById={agentsById}
+          candidates={candidates}
+          screenId={id}
+          zoomedId={zoomedId}
+          focusedId={focusedId}
+          paneCount={screenAgentIds.length}
+          onFocusPane={setFocusedId}
+          onToggleZoom={(agentId) => setZoomedId((z) => (z === agentId ? null : agentId))}
+          onRootChange={commit}
+          onPlaceAgent={placeAgent}
+          registerPane={(agentId, handle) => {
+            if (handle) paneHandles.current.set(agentId, handle);
+            else paneHandles.current.delete(agentId);
+          }}
+        />
+        {filesOpen && panelAgent && (
+          <aside
+            aria-label="Files panel"
+            className="hidden w-72 shrink-0 flex-col border-l border-border md:flex"
+          >
+            <FileExplorer
+              key={`${panelAgent.host_id}:${panelAgent.cwd}`}
+              hostId={panelAgent.host_id}
+              rootPath={panelAgent.cwd}
+              dense
+              className="min-h-0 flex-1"
+            />
+          </aside>
+        )}
+      </div>
 
       <ModifierBar
         className="hidden [@media(pointer:coarse)]:flex"
@@ -585,7 +627,7 @@ function PaneArea(props: PaneAreaProps) {
         ref={areaRef}
         {...emptyDropProps}
         className={cn(
-          "relative grid min-h-0 flex-1 place-items-center bg-background",
+          "relative grid min-h-0 min-w-0 flex-1 place-items-center bg-background",
           emptyDropActive && "bg-accent/20",
         )}
       >
@@ -634,7 +676,10 @@ function PaneArea(props: PaneAreaProps) {
     // desktop-width affair.
     const ids = collectAgentIds(root);
     return (
-      <div ref={areaRef} className="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto bg-border">
+      <div
+        ref={areaRef}
+        className="flex min-h-0 min-w-0 flex-1 flex-col gap-px overflow-y-auto bg-border"
+      >
         {ids.map((agentId) => (
           <ScreenPane key={agentId} agentId={agentId} stacked {...props} />
         ))}
@@ -643,7 +688,10 @@ function PaneArea(props: PaneAreaProps) {
   }
 
   return (
-    <div ref={areaRef} className="relative flex min-h-0 flex-1 overflow-hidden bg-background">
+    <div
+      ref={areaRef}
+      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
+    >
       <NodeView node={root} path={[]} {...props} />
     </div>
   );
@@ -809,6 +857,7 @@ function ScreenPane({
     return () => registerPane(agentId, null);
   });
   const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
+  const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
   const depth = useRef(0);
   const zoomed = zoomedId === agentId;
@@ -891,6 +940,7 @@ function ScreenPane({
             <span className="hidden min-w-0 truncate text-[10px] text-muted-foreground lg:inline">
               {agentActivityDetail(agent)}
             </span>
+            <ConnectionChip info={connInfo} compact className="shrink-0" />
             <span className="flex-1" />
             {displayState && !displayState.owner && (
               <button
@@ -954,6 +1004,7 @@ function ScreenPane({
             mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
             imagePasteMode="bracketed-path"
             onDisplayControl={setDisplayState}
+            onConnectionInfo={setConnInfo}
           />
         </div>
       ) : (

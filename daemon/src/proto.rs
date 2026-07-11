@@ -164,6 +164,13 @@ pub enum Inbound {
         request_id: String,
         path: String,
     },
+    #[serde(rename = "host.fs.rename")]
+    HostFsRename {
+        request_id: String,
+        path: String,
+        /// New name within the same directory (not a path).
+        name: String,
+    },
     #[serde(rename = "host.fs.remove")]
     HostFsRemove {
         request_id: String,

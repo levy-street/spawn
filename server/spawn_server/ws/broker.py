@@ -412,6 +412,13 @@ class Broker:
             daemon, {"type": "host.fs.mkdir", "path": path}, timeout=timeout
         )
 
+    async def request_fs_rename(
+        self, daemon: DaemonConn, *, path: str, name: str, timeout: float = 10.0
+    ) -> dict | None:
+        return await self._request_fs(
+            daemon, {"type": "host.fs.rename", "path": path, "name": name}, timeout=timeout
+        )
+
     async def request_fs_remove(
         self, daemon: DaemonConn, *, path: str, recursive: bool = False, timeout: float = 30.0
     ) -> dict | None:

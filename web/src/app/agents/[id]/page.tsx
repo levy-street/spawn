@@ -14,11 +14,14 @@ import {
   RotateCcw,
   Trash2,
 } from "lucide-react";
+import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { FileExplorer } from "@/components/files/FileExplorer";
 import { AppShell } from "@/components/nav/AppShell";
+import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
@@ -58,6 +61,8 @@ function AgentTerminal() {
   const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
 
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
@@ -261,6 +266,7 @@ function AgentTerminal() {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          <ConnectionChip info={connInfo} className="hidden sm:flex" />
           {currentTool?.update_available && (
             <Button
               variant="secondary"
@@ -286,6 +292,30 @@ function AgentTerminal() {
             state={displayState}
             onTakeControl={() => termRef.current?.takeControl()}
           />
+          <Button
+            variant={filesOpen ? "secondary" : "ghost"}
+            size="icon"
+            className="hidden size-8 md:inline-flex"
+            aria-label="Toggle files panel"
+            title="Files"
+            aria-pressed={filesOpen}
+            onClick={() => setFilesOpen((v) => !v)}
+          >
+            <FolderOpen className="size-4" />
+          </Button>
+          {agent && (
+            <Button
+              asChild
+              variant="ghost"
+              size="icon"
+              className="size-8 md:hidden"
+              aria-label="Browse files"
+            >
+              <Link href={`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`}>
+                <FolderOpen className="size-4" />
+              </Link>
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -410,23 +440,39 @@ function AgentTerminal() {
       {/* imagePasteMode: Claude and Codex both convert a bracketed-pasted
           image path into their native attachment pill ([Image #1]), and
           pasting the path is also the sane behavior for plain shells. */}
-      <div {...splitDropProps} className="relative min-h-0 flex-1 @container/term">
-        {splitDropActive && (
-          <div className="pointer-events-none absolute inset-2 z-20 grid place-items-center rounded-xl border-2 border-dashed border-ring bg-background/60">
-            <span className="rounded-lg border border-border bg-popover px-3 py-1.5 text-sm shadow-lg">
-              Drop to open a split view
-            </span>
-          </div>
+      <div className="flex min-h-0 flex-1">
+        <div {...splitDropProps} className="relative min-h-0 min-w-0 flex-1 @container/term">
+          {splitDropActive && (
+            <div className="pointer-events-none absolute inset-2 z-20 grid place-items-center rounded-xl border-2 border-dashed border-ring bg-background/60">
+              <span className="rounded-lg border border-border bg-popover px-3 py-1.5 text-sm shadow-lg">
+                Drop to open a split view
+              </span>
+            </div>
+          )}
+          <Terminal
+            ref={termRef}
+            agentId={id}
+            rawInput
+            mobileReturnMode="newline"
+            mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
+            imagePasteMode="bracketed-path"
+            onDisplayControl={setDisplayState}
+            onConnectionInfo={setConnInfo}
+          />
+        </div>
+        {filesOpen && agent && (
+          <aside
+            aria-label="Files panel"
+            className="hidden w-72 shrink-0 flex-col border-l border-border md:flex"
+          >
+            <FileExplorer
+              hostId={agent.host_id}
+              rootPath={agent.cwd}
+              dense
+              className="min-h-0 flex-1"
+            />
+          </aside>
         )}
-        <Terminal
-          ref={termRef}
-          agentId={id}
-          rawInput
-          mobileReturnMode="newline"
-          mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
-          imagePasteMode="bracketed-path"
-          onDisplayControl={setDisplayState}
-        />
       </div>
 
       <ModifierBar
