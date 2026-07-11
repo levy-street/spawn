@@ -457,8 +457,7 @@ test.describe("terminal usability audit", () => {
       history: "viewer-ready\n$ ",
     });
 
-    await expect(page.getByText("Viewer · 118x32")).toBeVisible();
-    await page.getByRole("button", { name: "Take control" }).click();
+    // Opening as viewer claims the shared display automatically.
     await expect
       .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
       .toMatchObject({
@@ -466,7 +465,7 @@ test.describe("terminal usability audit", () => {
         cols: expect.any(Number),
         rows: expect.any(Number),
       });
-    observations.push(await observeTerminal(page, "viewer took control"));
+    observations.push(await observeTerminal(page, "viewer auto-took control"));
 
     await page.getByLabel("Agent terminal").click();
     await page.keyboard.type("controlled input");

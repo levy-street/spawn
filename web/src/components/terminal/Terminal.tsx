@@ -120,6 +120,9 @@ export interface TerminalProps {
   imagePasteMode?: ImagePasteMode;
   /** Server-side shared terminal display ownership changed. */
   onDisplayControl?: (state: DisplayControlState) => void;
+  /** Claim the shared display on attach (default). Viewers get a dimmed
+   *  terminal with a centered take-control button either way. */
+  autoTakeControl?: boolean;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: AgentConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
@@ -139,6 +142,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     imagePasteMode = "deferred",
     onDisplayControl,
     onConnectionInfo,
+    autoTakeControl = true,
     onExit,
   },
   ref,
@@ -152,6 +156,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
   const displayOwnerRef = useRef<boolean | null>(null);
   const displayGeometryRef = useRef<TerminalGeometry | null>(null);
+  const [controlState, setControlState] = useState<DisplayControlState | null>(null);
+  const firstControlSeenRef = useRef(false);
+  const autoTakeControlRef = useRef(autoTakeControl);
+  autoTakeControlRef.current = autoTakeControl;
+  const takeControlNowRef = useRef<() => void>(() => {});
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -664,6 +673,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeReadyAttachmentPrefix],
   );
 
+  const takeControlNow = useCallback(() => {
+    hideScrollbackOverlay();
+    const term = termRef.current;
+    if (!term) return;
+    displayOwnerRef.current = true;
+    displayGeometryRef.current = null;
+    setControlState((prev) => (prev ? { ...prev, owner: true } : prev)); // optimistic
+    layoutTerminalSurfaceRef.current(false);
+    try {
+      fitRef.current?.fit();
+    } catch {
+      // Keep the current size if fit is unavailable.
+    }
+    const { cols, rows } = term;
+    const last = lastSizeRef.current;
+    lastSizeRef.current = { cols, rows };
+    if (cols !== last.cols || rows !== last.rows) {
+      invalidateScrollbackForResizeRef.current();
+    }
+    socketRef.current.sendJson({ type: "take_control", cols, rows });
+    term.focus();
+  }, [hideScrollbackOverlay]);
+  takeControlNowRef.current = takeControlNow;
+
   const applyDisplayControl = useCallback(
     (state: DisplayControlState) => {
       const geometry =
@@ -673,6 +706,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       displayOwnerRef.current = state.owner;
       displayGeometryRef.current = geometry;
       onDisplayControl?.(state);
+
+      // Opening a terminal claims the shared display by default — but only
+      // off the FIRST state after mount. Reacting to later ownership changes
+      // would make two open tabs steal control from each other forever; a
+      // dimmed viewer re-takes via the centered button instead.
+      const isFirstControl = !firstControlSeenRef.current;
+      firstControlSeenRef.current = true;
+      if (isFirstControl && !state.owner && autoTakeControlRef.current) {
+        setControlState({ ...state, owner: true }); // optimistic; server confirms
+        requestAnimationFrame(() => takeControlNowRef.current());
+        return;
+      }
+      setControlState(state);
 
       requestAnimationFrame(() => {
         const term = termRef.current;
@@ -2202,27 +2248,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteFromClipboard,
       pasteDataTransfer,
       pasteText,
-      takeControl: () => {
-        hideScrollbackOverlay();
-        const term = termRef.current;
-        if (!term) return;
-        displayOwnerRef.current = true;
-        displayGeometryRef.current = null;
-        layoutTerminalSurfaceRef.current(false);
-        try {
-          fitRef.current?.fit();
-        } catch {
-          // Keep the current size if fit is unavailable.
-        }
-        const { cols, rows } = term;
-        const last = lastSizeRef.current;
-        lastSizeRef.current = { cols, rows };
-        if (cols !== last.cols || rows !== last.rows) {
-          invalidateScrollbackForResizeRef.current();
-        }
-        socket.sendJson({ type: "take_control", cols, rows });
-        term.focus();
-      },
+      takeControl: () => takeControlNowRef.current(),
     }),
     [
       appendAttachmentsForSubmit,
@@ -2385,6 +2411,27 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       >
         <Upload className="size-4" aria-hidden="true" />
       </button>
+      {/* Viewer mode: another session owns the shared display. Dim the
+          terminal (output stays visible underneath) and put take-control
+          front and center; input is blocked until control is claimed. */}
+      {controlState && !controlState.owner && (
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2.5 bg-background/60 backdrop-blur-[1px]">
+          <span className="rounded bg-black/50 px-2 py-0.5 text-xs text-muted-foreground">
+            Another session has control
+            {typeof controlState.cols === "number" && typeof controlState.rows === "number"
+              ? ` · ${controlState.cols}x${controlState.rows}`
+              : ""}
+            {controlState.viewers > 1 ? ` · ${controlState.viewers} viewers` : ""}
+          </span>
+          <button
+            type="button"
+            onClick={() => takeControlNow()}
+            className="rounded-lg border border-border bg-popover px-4 py-2 text-sm font-medium shadow-lg shadow-black/40 transition-colors hover:bg-accent"
+          >
+            Take control
+          </button>
+        </div>
+      )}
       {/* Live region stays mounted so screen readers hear transitions; the
           visible chip only appears when there is something worth saying —
           a healthy "open" connection is the norm, not news. */}

@@ -69,7 +69,6 @@ import {
   setRatioAt,
 } from "@/lib/layout";
 import { cn } from "@/lib/utils";
-import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 const MAX_PANES_PER_SCREEN = 8;
@@ -856,7 +855,6 @@ function ScreenPane({
     registerPane(agentId, termRef.current);
     return () => registerPane(agentId, null);
   });
-  const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
   const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
   const depth = useRef(0);
@@ -942,15 +940,6 @@ function ScreenPane({
             </span>
             <ConnectionChip info={connInfo} compact className="shrink-0" />
             <span className="flex-1" />
-            {displayState && !displayState.owner && (
-              <button
-                type="button"
-                className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                onClick={() => termRef.current?.takeControl()}
-              >
-                Take control
-              </button>
-            )}
             {!stacked && (
               <button
                 type="button"
@@ -1003,7 +992,6 @@ function ScreenPane({
             mobileReturnMode="newline"
             mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
             imagePasteMode="bracketed-path"
-            onDisplayControl={setDisplayState}
             onConnectionInfo={setConnInfo}
           />
         </div>

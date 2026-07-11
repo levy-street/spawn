@@ -177,14 +177,11 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
     });
 });
 
-test("viewer can take display control and sends shared geometry", async ({ page }) => {
+test("opening a terminal as viewer claims control automatically", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, {
     control: { owner: false, cols: 156, rows: 38, viewers: 2 },
     history: "viewer\n",
   });
-
-  await expect(page.getByText("Viewer · 156x38")).toBeVisible();
-  await page.getByRole("button", { name: "Take control" }).click();
 
   await expect
     .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
@@ -193,6 +190,29 @@ test("viewer can take display control and sends shared geometry", async ({ page 
       cols: expect.any(Number),
       rows: expect.any(Number),
     });
+  // Ownership is claimed optimistically, so no dimmed viewer overlay shows.
+  await expect(page.getByRole("button", { name: "Take control" })).toHaveCount(0);
+});
+
+test("losing control dims the terminal and re-takes from the centered button", async ({ page }) => {
+  // Opens as owner (default mock state) — the auto-claim never fires.
+  const { messages, sockets } = await openTerminalWithMockSocket(page, { history: "owner\n" });
+  await expect(liveTerminalRows(page)).toContainText("owner");
+  expect(jsonMessages(messages).some((m) => m?.type === "take_control")).toBe(false);
+
+  // Another session steals control: the pane dims with a centered button.
+  sockets[0]?.send(
+    JSON.stringify({ type: "display.control", owner: false, cols: 156, rows: 38, viewers: 2 }),
+  );
+  const button = page.getByRole("button", { name: "Take control" });
+  await expect(button).toBeVisible();
+  await expect(page.getByText("Another session has control · 156x38 · 2 viewers")).toBeVisible();
+
+  await button.click();
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
+    .toMatchObject({ type: "take_control", cols: expect.any(Number), rows: expect.any(Number) });
+  await expect(button).toHaveCount(0);
 });
 
 test("owner sees additional viewer count", async ({ page }) => {

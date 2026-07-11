@@ -288,10 +288,7 @@ function AgentTerminal() {
                   : "Update"}
             </Button>
           )}
-          <TerminalDisplayControl
-            state={displayState}
-            onTakeControl={() => termRef.current?.takeControl()}
-          />
+          <TerminalDisplayControl state={displayState} />
           <Button
             variant={filesOpen ? "secondary" : "ghost"}
             size="icon"
@@ -499,31 +496,10 @@ function AgentTerminal() {
   );
 }
 
-function TerminalDisplayControl({
-  state,
-  onTakeControl,
-}: {
-  state: DisplayControlState | null;
-  onTakeControl: () => void;
-}) {
-  if (!state) return null;
-  if (!state.owner) {
-    const size =
-      typeof state.cols === "number" && typeof state.rows === "number"
-        ? `${state.cols}x${state.rows}`
-        : "shared";
-    return (
-      <div className="flex items-center gap-1">
-        <span className="hidden whitespace-nowrap text-xs text-muted-foreground sm:inline">
-          Viewer · {size}
-        </span>
-        <Button variant="secondary" size="sm" onClick={onTakeControl}>
-          Take control
-        </Button>
-      </div>
-    );
-  }
-
+function TerminalDisplayControl({ state }: { state: DisplayControlState | null }) {
+  // Viewer mode is handled by the terminal itself (dimmed overlay with a
+  // centered take-control button); the header only reports extra viewers.
+  if (!state?.owner) return null;
   const otherViewers = Math.max(0, state.viewers - 1);
   if (otherViewers === 0) return null;
   return (
