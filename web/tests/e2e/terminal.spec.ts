@@ -564,3 +564,13 @@ test.describe("mobile terminal touch", () => {
     await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
   });
 });
+
+test("connection chip opens a details popover", async ({ page }) => {
+  await openTerminalWithMockSocket(page);
+
+  await page.getByRole("button", { name: /Connection details/ }).click();
+
+  await expect(page.getByText("Path", { exact: true })).toBeVisible();
+  await expect(page.getByText("Round trip", { exact: true })).toBeVisible();
+  await expect(page.getByText(/spawn\.v/).first()).toBeVisible();
+});

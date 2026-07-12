@@ -1,6 +1,7 @@
 "use client";
 
 import type { ConnInfo, SocketState } from "@/components/terminal/useAgentSocket";
+import { DropdownMenu, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
 /** Snapshot of an agent terminal's transport, surfaced by <Terminal>. */
@@ -79,35 +80,79 @@ export function ConnectionChip({
     .filter(Boolean)
     .join(" · ");
 
-  if (compact) {
-    return (
-      <span
-        className={cn("flex items-center gap-1 text-[10px] text-muted-foreground", className)}
-        title={title}
-      >
-        <span
-          className={cn("size-1.5 shrink-0 rounded-full", view.dot, view.pulse && "animate-pulse")}
-          aria-hidden
-        />
-        <span className="sr-only">Connection: {view.label}</span>
-        {info.dcOpen && info.rttMs != null && <span className="tabular-nums">{info.rttMs}ms</span>}
-      </span>
-    );
-  }
+  const details: Array<[string, string]> = [
+    ["Path", view.detail],
+    ["Round trip", info.rttMs != null ? `${info.rttMs} ms` : "—"],
+    ["Transport", info.protocol ?? "—"],
+    [
+      "Channel",
+      info.dcOpen
+        ? "DataChannel open"
+        : info.socketState !== "open"
+          ? "disconnected"
+          : info.v2
+            ? "negotiating"
+            : "WS relay",
+    ],
+    [
+      "Protocol",
+      info.v2 ? "spawn.v2 — server never sees terminal data" : "spawn.v1 (legacy relay)",
+    ],
+  ];
 
   return (
-    <span
-      className={cn(
-        "flex h-6 items-center gap-1.5 rounded-full border border-border px-2 text-[11px] text-muted-foreground",
-        className,
-      )}
-      title={title}
+    <DropdownMenu
+      className={className}
+      menuClassName="w-72"
+      renderTrigger={(props) =>
+        compact ? (
+          <button
+            {...props}
+            type="button"
+            title={title}
+            aria-label={`Connection details: ${view.label}`}
+            className="flex items-center gap-1 rounded p-1 text-[10px] text-muted-foreground hover:bg-accent/60"
+          >
+            <span
+              className={cn(
+                "size-1.5 shrink-0 rounded-full",
+                view.dot,
+                view.pulse && "animate-pulse",
+              )}
+              aria-hidden
+            />
+            {info.dcOpen && info.rttMs != null && (
+              <span className="tabular-nums">{info.rttMs}ms</span>
+            )}
+          </button>
+        ) : (
+          <button
+            {...props}
+            type="button"
+            title={title}
+            aria-label={`Connection details: ${view.label}`}
+            className="flex h-6 items-center gap-1.5 rounded-full border border-border px-2 text-[11px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+          >
+            <span
+              className={cn(
+                "size-2 shrink-0 rounded-full",
+                view.dot,
+                view.pulse && "animate-pulse",
+              )}
+              aria-hidden
+            />
+            <span className="whitespace-nowrap tabular-nums">{view.label}</span>
+          </button>
+        )
+      }
     >
-      <span
-        className={cn("size-2 shrink-0 rounded-full", view.dot, view.pulse && "animate-pulse")}
-        aria-hidden
-      />
-      <span className="whitespace-nowrap tabular-nums">{view.label}</span>
-    </span>
+      <DropdownMenuLabel>Connection</DropdownMenuLabel>
+      {details.map(([key, value]) => (
+        <div key={key} className="flex items-baseline justify-between gap-3 px-2 py-1 text-xs">
+          <span className="shrink-0 text-muted-foreground">{key}</span>
+          <span className="min-w-0 text-right">{value}</span>
+        </div>
+      ))}
+    </DropdownMenu>
   );
 }

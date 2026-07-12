@@ -160,7 +160,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const firstControlSeenRef = useRef(false);
   const autoTakeControlRef = useRef(autoTakeControl);
   autoTakeControlRef.current = autoTakeControl;
-  const takeControlNowRef = useRef<() => void>(() => {});
+  const takeControlNowRef = useRef<() => boolean>(() => false);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -673,10 +673,26 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeReadyAttachmentPrefix],
   );
 
-  const takeControlNow = useCallback(() => {
+  const redrawTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleRedraw = useCallback(() => {
+    if (redrawTimerRef.current) clearTimeout(redrawTimerRef.current);
+    redrawTimerRef.current = setTimeout(() => {
+      redrawTimerRef.current = null;
+      agentsApi.redraw(agentId).catch(() => {});
+    }, 600);
+  }, [agentId]);
+  const scheduleRedrawRef = useRef(scheduleRedraw);
+  scheduleRedrawRef.current = scheduleRedraw;
+  useEffect(() => {
+    return () => {
+      if (redrawTimerRef.current) clearTimeout(redrawTimerRef.current);
+    };
+  }, []);
+
+  const takeControlNow = useCallback((): boolean => {
     hideScrollbackOverlay();
     const term = termRef.current;
-    if (!term) return;
+    if (!term) return false;
     displayOwnerRef.current = true;
     displayGeometryRef.current = null;
     setControlState((prev) => (prev ? { ...prev, owner: true } : prev)); // optimistic
@@ -693,7 +709,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       invalidateScrollbackForResizeRef.current();
     }
     socketRef.current.sendJson({ type: "take_control", cols, rows });
+    // Ownership + geometry both just changed hands; force a clean repaint
+    // once the daemon has resized the PTY to our size.
+    scheduleRedrawRef.current();
     term.focus();
+    return true;
   }, [hideScrollbackOverlay]);
   takeControlNowRef.current = takeControlNow;
 
@@ -715,7 +735,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       firstControlSeenRef.current = true;
       if (isFirstControl && !state.owner && autoTakeControlRef.current) {
         setControlState({ ...state, owner: true }); // optimistic; server confirms
-        requestAnimationFrame(() => takeControlNowRef.current());
+        // The control frame can beat xterm mount; retry briefly rather than
+        // silently staying an optimistic "owner" whose PTY is still sized
+        // for another session (which renders as clipped/garbled output).
+        const attemptTake = (tries: number) => {
+          if (takeControlNowRef.current()) return;
+          if (tries < 30) {
+            requestAnimationFrame(() => attemptTake(tries + 1));
+          } else {
+            setControlState(state); // give up: reflect the real viewer state
+          }
+        };
+        requestAnimationFrame(() => attemptTake(0));
         return;
       }
       setControlState(state);
@@ -1879,6 +1910,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       invalidateScrollbackForResizeRef.current();
       if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
+        // tmux repaints on SIGWINCH, but rapid geometry churn (mobile
+        // keyboard show/hide, split drags) sometimes leaves stale cells at
+        // the old wrap width. A trailing refresh-client self-heals.
+        scheduleRedrawRef.current();
       }
       // History already written into the live buffer keeps its old wrap
       // after a width change (tmux reflows its own copy, not ours). Once a

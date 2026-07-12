@@ -266,7 +266,8 @@ function AgentTerminal() {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <ConnectionChip info={connInfo} className="hidden sm:flex" />
+          <ConnectionChip info={connInfo} compact className="sm:hidden" />
+          <ConnectionChip info={connInfo} className="hidden sm:block" />
           {currentTool?.update_available && (
             <Button
               variant="secondary"
