@@ -183,8 +183,6 @@ pub enum WorkerCmd {
         cols: u16,
         rows: u16,
     },
-    /// SIGWINCH repaint nudge (tmux-free equivalent of `refresh-client`).
-    Redraw,
     /// Fetch decrypted scrollback for a snapshot/reattach seed. Responds with
     /// `(watermark, bytes)` — watermark = total PTY output bytes logged at
     /// capture time.
@@ -327,15 +325,6 @@ impl AgentHandle {
         Ok(true)
     }
 
-    /// Worker backend: ask the worker for a SIGWINCH repaint nudge. Returns
-    /// false for the tmux backend (callers use `tmux::force_repaint`).
-    pub fn worker_redraw(&self) -> bool {
-        match &self.backend {
-            HandleBackend::Worker { cmd_tx } => cmd_tx.send(WorkerCmd::Redraw).is_ok(),
-            HandleBackend::Tmux { .. } => false,
-        }
-    }
-
     /// Worker backend: signal the agent process. Returns false for tmux.
     pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
         match &self.backend {
@@ -359,30 +348,6 @@ impl AgentHandle {
                 Some(rx)
             }
             HandleBackend::Tmux { .. } => None,
-        }
-    }
-
-    /// Re-apply the current PTY size so the kernel emits a fresh SIGWINCH to
-    /// `tmux attach`. NOTE: the kernel only signals when the size CHANGES, so
-    /// this is a no-op at unchanged geometry — prefer tmux::refresh_client
-    /// for forcing repaints.
-    #[allow(dead_code)]
-    pub fn nudge_redraw(&self) -> Result<()> {
-        match &self.backend {
-            HandleBackend::Tmux { master, .. } => {
-                let master = master
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
-                let size = master.get_size().context("reading PTY size")?;
-                master.resize(size).context("re-applying PTY size")?;
-                Ok(())
-            }
-            HandleBackend::Worker { cmd_tx } => {
-                cmd_tx
-                    .send(WorkerCmd::Redraw)
-                    .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
-                Ok(())
-            }
         }
     }
 

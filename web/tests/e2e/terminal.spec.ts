@@ -293,6 +293,32 @@ test("terminal reconnect restores a fresh terminal history snapshot", async ({ p
   await expect(liveTerminalRows(page)).toContainText("after reconnect");
 });
 
+test("worker replay streams render exactly with geometry markers", async ({ page }) => {
+  // Worker-backed agents ship history/snapshots as exact terminal byte
+  // streams self-described by geometry markers (CSI 8 ; rows ; cols t). The
+  // client must render them without the tmux-capture CR/LF reformatting —
+  // the lone-\r overwrite below would split into two lines under it — and
+  // apply each chunk's geometry so old-size bytes never render garbled.
+  const history =
+    "\x1b[8;30;80t" +
+    `${Array.from({ length: 40 }, (_, i) => `deep-${String(i).padStart(3, "0")}`).join("\r\n")}\r\n` +
+    "progress:AAAA\rprogress:BBBB\r\n" +
+    "\x1b[8;30;100t" +
+    "tail-at-current-size\r\n$ ";
+  await openTerminalWithMockSocket(page, { history });
+
+  await expect(liveTerminalRows(page)).toContainText("tail-at-current-size");
+  await expect(liveTerminalRows(page)).toContainText("progress:BBBB");
+  await expect(liveTerminalRows(page)).not.toContainText("AAAA");
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -600);
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator(".xterm-rows")).toContainText("deep-0");
+  await expect(overlay.locator(".xterm-rows")).not.toContainText("AAAA");
+});
+
 test("terminal scrollback opens from cached snapshots without waiting for a round trip", async ({
   page,
 }) => {

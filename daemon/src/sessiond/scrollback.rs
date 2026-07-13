@@ -1,13 +1,20 @@
-//! Encrypted-at-rest, append-only scrollback log with checkpoint markers.
+//! Encrypted-at-rest, append-only scrollback log with stateful checkpoints.
 //!
 //! PTY output is encrypted the moment it leaves the read buffer
 //! ("encrypt-on-read at the PTY boundary") and only ever hits disk as
 //! ChaCha20-Poly1305 ciphertext. The log is segmented: a new segment begins
-//! with a CHECKPOINT record, and the worker nudges the PTY (SIGWINCH jiggle)
-//! right after rotating so the bytes that follow a checkpoint contain a fresh
-//! full-screen repaint. Replay therefore starts at a segment boundary and
-//! yields a coherent screen for full-screen apps, while line-oriented output
-//! replays trivially.
+//! with a CHECKPOINT record carrying the geometry and an emulator-serialized
+//! screen state (see `sessiond::emulator`), so a replay starting at any
+//! segment boundary opens with an exact synthesized repaint — the agent
+//! process is never signaled or disturbed to produce one. PTY resizes are
+//! recorded as RESIZE records so every byte of a replay is renderable at a
+//! known geometry.
+//!
+//! Replay output is a self-describing ANSI stream: it opens with a geometry
+//! marker (`CSI 8 ; rows ; cols t`) followed by the checkpoint repaint, and
+//! every in-stream resize becomes another geometry marker. A consumer that
+//! honors the marker (xterm.js `windowOptions.setWinSizeChars`) renders the
+//! whole stream faithfully.
 //!
 //! Growth is bounded: when the total plaintext budget is exceeded, whole
 //! oldest segments are deleted (never partial records, never the newest
@@ -38,6 +45,22 @@ pub const DEFAULT_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 pub const KIND_OUTPUT: u8 = 1;
 pub const KIND_CHECKPOINT: u8 = 2;
+pub const KIND_RESIZE: u8 = 3;
+
+/// Terminal geometry plus the emulator-serialized screen state that
+/// reconstructs it; written at the head of every segment.
+pub struct Checkpoint<'a> {
+    pub cols: u16,
+    pub rows: u16,
+    pub state: &'a [u8],
+}
+
+/// The self-describing geometry marker replays open with and emit at every
+/// recorded resize: `CSI 8 ; rows ; cols t` (xterm window ops; honored by
+/// xterm.js via `windowOptions.setWinSizeChars`).
+pub fn geometry_marker(cols: u16, rows: u16) -> Vec<u8> {
+    format!("\x1b[8;{rows};{cols}t").into_bytes()
+}
 
 /// Per-record header: `u32 LE ciphertext_len | u8 kind | u64 LE seq`.
 const RECORD_HEADER_LEN: usize = 4 + 1 + 8;
@@ -63,11 +86,13 @@ pub struct ScrollbackLog {
     max_bytes: u64,
     /// Cumulative OUTPUT plaintext bytes ever appended (the replay watermark).
     total_logged: u64,
+    /// Current geometry, tracked to drop no-op resize records.
+    geometry: (u16, u16),
 }
 
 impl ScrollbackLog {
-    pub fn new(dir: &Path, key: &secret::SecretBytes) -> Result<Self> {
-        Self::with_limits(dir, key, DEFAULT_SEGMENT_BYTES, DEFAULT_MAX_LOG_BYTES)
+    pub fn new(dir: &Path, key: &secret::SecretBytes, initial: Checkpoint<'_>) -> Result<Self> {
+        Self::with_limits(dir, key, DEFAULT_SEGMENT_BYTES, DEFAULT_MAX_LOG_BYTES, initial)
     }
 
     pub fn with_limits(
@@ -75,6 +100,7 @@ impl ScrollbackLog {
         key: &secret::SecretBytes,
         segment_bytes: u64,
         max_bytes: u64,
+        initial: Checkpoint<'_>,
     ) -> Result<Self> {
         if key.as_slice().len() != 32 {
             bail!("scrollback key must be 32 bytes");
@@ -111,15 +137,16 @@ impl ScrollbackLog {
             segment_bytes,
             max_bytes,
             total_logged: 0,
+            geometry: (initial.cols, initial.rows),
         };
         let _ = fs::remove_file(dir.join(segment_name(0)));
-        log.begin_segment(1)?;
+        log.begin_segment(1, &initial)?;
         Ok(log)
     }
 
     /// Append PTY output. Returns true when a checkpoint rotation is due —
-    /// the caller should call [`rotate`](Self::rotate) and then trigger a
-    /// repaint so the new segment opens with a full redraw.
+    /// the caller should serialize its emulator state and call
+    /// [`rotate`](Self::rotate). The agent process is not involved.
     pub fn append_output(&mut self, plaintext: &[u8]) -> Result<bool> {
         if plaintext.is_empty() {
             return Ok(false);
@@ -131,11 +158,31 @@ impl ScrollbackLog {
         Ok(seg.plaintext_bytes >= self.segment_bytes)
     }
 
-    /// Close the active segment and open the next one (which begins with a
-    /// CHECKPOINT record), then drop oldest segments beyond the budget.
-    pub fn rotate(&mut self) -> Result<()> {
+    /// Record a PTY geometry change so replays can reproduce it in-stream.
+    /// No-op when the geometry is unchanged.
+    pub fn append_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        if self.geometry == (cols, rows) {
+            return Ok(());
+        }
+        self.geometry = (cols, rows);
+        let mut payload = [0u8; 4];
+        payload[..2].copy_from_slice(&cols.to_le_bytes());
+        payload[2..].copy_from_slice(&rows.to_le_bytes());
+        self.append_record(KIND_RESIZE, &payload)?;
+        // Count toward segment fullness (but never the OUTPUT watermark) so
+        // resize-heavy idle sessions still rotate instead of growing a
+        // segment without bound.
+        let seg = self.segments.last_mut().expect("active segment");
+        seg.plaintext_bytes += payload.len() as u64;
+        Ok(())
+    }
+
+    /// Close the active segment and open the next one headed by `checkpoint`,
+    /// then drop oldest segments beyond the budget.
+    pub fn rotate(&mut self, checkpoint: &Checkpoint<'_>) -> Result<()> {
         let next = self.segments.last().map(|s| s.index + 1).unwrap_or(1);
-        self.begin_segment(next)?;
+        self.geometry = (checkpoint.cols, checkpoint.rows);
+        self.begin_segment(next, checkpoint)?;
         self.trim();
         Ok(())
     }
@@ -145,9 +192,12 @@ impl ScrollbackLog {
         self.total_logged
     }
 
-    /// Decrypt and concatenate output from the newest run of whole segments
-    /// whose plaintext fits `max_bytes` (always at least the newest segment).
-    /// The result begins at a checkpoint boundary.
+    /// Decrypt and stitch a self-describing replay stream from the newest run
+    /// of whole segments whose plaintext fits `max_bytes` (always at least
+    /// the newest segment). The stream opens with a geometry marker plus the
+    /// starting segment's checkpoint repaint; later segments' checkpoints are
+    /// skipped (their state is reproduced by the output that flows through),
+    /// and RESIZE records become in-stream geometry markers.
     pub fn replay(&mut self, max_bytes: u64) -> Result<Vec<u8>> {
         self.active.flush().ok();
         let mut start = self.segments.len().saturating_sub(1);
@@ -165,6 +215,7 @@ impl ScrollbackLog {
 
         let mut out = Vec::new();
         let mut expect_seq: Option<u64> = None;
+        let mut opened = false;
         for seg in &self.segments[start..] {
             let data =
                 fs::read(&seg.path).with_context(|| format!("reading {}", seg.path.display()))?;
@@ -199,8 +250,31 @@ impl ScrollbackLog {
                         );
                     }
                 };
-                if kind == KIND_OUTPUT {
-                    out.extend_from_slice(&plaintext);
+                match kind {
+                    KIND_OUTPUT => out.extend_from_slice(&plaintext),
+                    KIND_CHECKPOINT if !opened => {
+                        opened = true;
+                        let (cols, rows, state) = match decode_checkpoint(&plaintext) {
+                            Ok(parts) => parts,
+                            Err(e) => {
+                                plaintext.zeroize();
+                                secret::wipe(&mut out);
+                                return Err(e.context(format!(
+                                    "decoding checkpoint in {}",
+                                    seg.path.display()
+                                )));
+                            }
+                        };
+                        out.extend_from_slice(&geometry_marker(cols, rows));
+                        out.extend_from_slice(state);
+                    }
+                    KIND_CHECKPOINT => {} // covered by the output flowing through
+                    KIND_RESIZE if plaintext.len() == 4 => {
+                        let cols = u16::from_le_bytes([plaintext[0], plaintext[1]]);
+                        let rows = u16::from_le_bytes([plaintext[2], plaintext[3]]);
+                        out.extend_from_slice(&geometry_marker(cols, rows));
+                    }
+                    _ => {}
                 }
                 plaintext.zeroize();
             }
@@ -229,7 +303,7 @@ impl ScrollbackLog {
         let _ = fs::remove_dir(&self.dir);
     }
 
-    fn begin_segment(&mut self, index: u64) -> Result<()> {
+    fn begin_segment(&mut self, index: u64, checkpoint: &Checkpoint<'_>) -> Result<()> {
         let path = self.dir.join(segment_name(index));
         let file = OpenOptions::new()
             .create_new(true)
@@ -248,8 +322,13 @@ impl ScrollbackLog {
             path,
             plaintext_bytes: 0,
         });
-        self.append_record(KIND_CHECKPOINT, b"")?;
-        Ok(())
+        let mut payload = Vec::with_capacity(4 + checkpoint.state.len());
+        payload.extend_from_slice(&checkpoint.cols.to_le_bytes());
+        payload.extend_from_slice(&checkpoint.rows.to_le_bytes());
+        payload.extend_from_slice(checkpoint.state);
+        let result = self.append_record(KIND_CHECKPOINT, &payload);
+        payload.zeroize();
+        result
     }
 
     fn trim(&mut self) {
@@ -308,6 +387,15 @@ fn aad_for(kind: u8, seq: u64) -> [u8; 9] {
     aad
 }
 
+fn decode_checkpoint(payload: &[u8]) -> Result<(u16, u16, &[u8])> {
+    if payload.len() < 4 {
+        bail!("checkpoint payload shorter than geometry header");
+    }
+    let cols = u16::from_le_bytes([payload[0], payload[1]]);
+    let rows = u16::from_le_bytes([payload[2], payload[3]]);
+    Ok((cols, rows, &payload[4..]))
+}
+
 fn parse_record<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u8, u64, &'a [u8])> {
     if data.len() - *offset < RECORD_HEADER_LEN {
         bail!("truncated record header");
@@ -333,9 +421,21 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
 
+    fn ckpt(state: &[u8]) -> Checkpoint<'_> {
+        Checkpoint {
+            cols: 80,
+            rows: 24,
+            state,
+        }
+    }
+
     fn new_log(dir: &Path, segment: u64, max: u64) -> ScrollbackLog {
         let key = secret::SecretBytes::random(32).unwrap();
-        ScrollbackLog::with_limits(dir, &key, segment, max).unwrap()
+        ScrollbackLog::with_limits(dir, &key, segment, max, ckpt(b"")).unwrap()
+    }
+
+    fn marker() -> Vec<u8> {
+        geometry_marker(80, 24)
     }
 
     #[test]
@@ -346,32 +446,83 @@ mod tests {
         log.append_output(b"world\r\n").unwrap();
         assert_eq!(log.total_logged(), 13);
         let replay = log.replay(1024 * 1024).unwrap();
-        assert_eq!(replay, b"hello world\r\n");
+        assert_eq!(replay, [marker().as_slice(), b"hello world\r\n"].concat());
+    }
+
+    #[test]
+    fn replay_opens_with_checkpoint_state() {
+        let dir = tempdir().unwrap();
+        let key = secret::SecretBytes::random(32).unwrap();
+        let mut log = ScrollbackLog::with_limits(
+            dir.path(),
+            &key,
+            1024,
+            8 * 1024,
+            Checkpoint {
+                cols: 120,
+                rows: 40,
+                state: b"REPAINT",
+            },
+        )
+        .unwrap();
+        log.append_output(b"tail").unwrap();
+        let replay = log.replay(1024).unwrap();
+        assert_eq!(
+            replay,
+            [geometry_marker(120, 40).as_slice(), b"REPAINT", b"tail"].concat()
+        );
+    }
+
+    #[test]
+    fn resize_records_become_geometry_markers() {
+        let dir = tempdir().unwrap();
+        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        log.append_output(b"before").unwrap();
+        log.append_resize(120, 40).unwrap();
+        log.append_resize(120, 40).unwrap(); // dedup: no second marker
+        log.append_output(b"after").unwrap();
+        let replay = log.replay(1024).unwrap();
+        assert_eq!(
+            replay,
+            [
+                marker().as_slice(),
+                b"before",
+                geometry_marker(120, 40).as_slice(),
+                b"after"
+            ]
+            .concat()
+        );
+        // Watermark counts output only.
+        assert_eq!(log.total_logged(), 11);
     }
 
     #[test]
     fn plaintext_never_hits_disk() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        let marker = b"SUPER-SECRET-MARKER-0451";
-        log.append_output(marker).unwrap();
+        let output_marker = b"SUPER-SECRET-MARKER-0451".as_slice();
+        let state_marker = b"CHECKPOINT-STATE-SECRET-9932".as_slice();
+        log.append_output(output_marker).unwrap();
+        log.rotate(&ckpt(state_marker)).unwrap();
         for entry in fs::read_dir(dir.path()).unwrap().flatten() {
             let mut contents = Vec::new();
             File::open(entry.path())
                 .unwrap()
                 .read_to_end(&mut contents)
                 .unwrap();
-            assert!(
-                !contents
-                    .windows(marker.len())
-                    .any(|window| window == marker),
-                "plaintext marker found in {}",
-                entry.path().display()
-            );
+            for secret_bytes in [output_marker, state_marker] {
+                assert!(
+                    !contents
+                        .windows(secret_bytes.len())
+                        .any(|window| window == secret_bytes),
+                    "plaintext found in {}",
+                    entry.path().display()
+                );
+            }
         }
         // ...but it decrypts fine.
         let replay = log.replay(1024).unwrap();
-        assert_eq!(replay, marker);
+        assert_eq!(replay, [marker().as_slice(), output_marker].concat());
     }
 
     #[test]
@@ -383,7 +534,7 @@ mod tests {
         let mut appended = 0u64;
         for _ in 0..32 {
             if log.append_output(&chunk).unwrap() {
-                log.rotate().unwrap();
+                log.rotate(&ckpt(b"")).unwrap();
             }
             appended += chunk.len() as u64;
         }
@@ -399,8 +550,9 @@ mod tests {
         assert_eq!(on_disk, log.segment_count());
         // Replay decrypts cleanly from a checkpoint boundary.
         let replay = log.replay(u64::MAX).unwrap();
-        assert_eq!(replay.len() as u64, total_plaintext);
-        assert!(replay.iter().all(|&b| b == b'x'));
+        let head = marker();
+        assert_eq!(replay.len() as u64, head.len() as u64 + total_plaintext);
+        assert!(replay[head.len()..].iter().all(|&b| b == b'x'));
     }
 
     #[test]
@@ -408,14 +560,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 8, 1024 * 1024);
         log.append_output(b"old-old-old!").unwrap();
-        log.rotate().unwrap();
+        log.rotate(&ckpt(b"NEW-CKPT-STATE")).unwrap();
         log.append_output(b"new-new-new!").unwrap();
-        // Budget covers only one segment: expect just the newest.
+        // Budget covers only one segment: the newest, opened by its own
+        // checkpoint state.
         let replay = log.replay(12).unwrap();
-        assert_eq!(replay, b"new-new-new!");
-        // Large budget: everything.
+        assert_eq!(
+            replay,
+            [marker().as_slice(), b"NEW-CKPT-STATE", b"new-new-new!"].concat()
+        );
+        // Large budget: everything from the older checkpoint; the newer
+        // segment's checkpoint is skipped (output flows through it).
         let replay = log.replay(1024).unwrap();
-        assert_eq!(replay, b"old-old-old!new-new-new!");
+        assert_eq!(
+            replay,
+            [marker().as_slice(), b"old-old-old!new-new-new!"].concat()
+        );
     }
 
     #[test]

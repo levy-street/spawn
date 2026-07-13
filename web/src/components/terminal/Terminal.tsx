@@ -378,12 +378,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // terminal modes (bracketed paste, mouse reporting, application cursor
       // keys) that the agent still believes are active, garbling input until
       // the next full repaint.
-      term.write(`\x1b[0m\x1b[H\x1b[2J\x1b[3J${formatSnapshotForXterm(decodeUtf8(bytes))}`);
-      for (const slice of replaySlices.slice(0, -1)) {
-        term.write(slice);
-      }
-      term.write(
-        replaySlices.length > 0 ? (replaySlices[replaySlices.length - 1] as Uint8Array) : "",
+      writeSequenced(
+        term,
+        [
+          { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
+          ...snapshotWriteOps(decodeUtf8(bytes), { cols, rows }),
+          ...replaySlices.map((slice) => ({ data: slice })),
+        ],
         () => {
           term.scrollToBottom();
         },
@@ -494,20 +495,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       const { cols, rows } = lastSizeRef.current;
       historyTerm.reset();
-      historyTerm.resize(cols, rows);
       // Queue the snapshot and any newer live chunks back-to-back so nothing
       // that arrives mid-render can interleave; the callback rides the last
       // queued write. A coverage gap (null) renders the snapshot alone —
       // best effort for the overlay; the scheduled refresh converges it.
+      // Worker replays are geometry-tagged: each chunk renders at the size
+      // its bytes were produced for, and xterm reflows on each transition.
       const replaySlices = takeDcReplaySlices(bytes) ?? [];
-      const writeQueue: (string | Uint8Array)[] = [
-        formatSnapshotForXterm(decodeUtf8(bytes)),
-        ...replaySlices,
+      const ops: SequencedWrite[] = [
+        ...snapshotWriteOps(decodeUtf8(bytes), { cols, rows }),
+        ...replaySlices.map((slice) => ({ data: slice })),
       ];
-      for (const piece of writeQueue.slice(0, -1)) {
-        historyTerm.write(piece);
-      }
-      historyTerm.write(writeQueue[writeQueue.length - 1] as string | Uint8Array, () => {
+      writeSequenced(historyTerm, ops, () => {
         // Two frames let xterm's renderer settle the viewport height, but
         // ALL scroll mutations happen atomically in the final frame: a
         // half-applied scrollToBottom from a render superseded mid-sequence
@@ -906,7 +905,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
       term.reset();
-      term.write(formatSnapshotForXterm(decodeUtf8(bytes)), () => {
+      writeSequenced(term, snapshotWriteOps(decodeUtf8(bytes), lastSizeRef.current), () => {
         term.scrollToBottom();
       });
       liveRewriteAtRef.current = Date.now();
@@ -2555,6 +2554,89 @@ function scrollElementPixels(element: HTMLElement, deltaY: number): boolean {
 
 function wrapSnapshotForXterm(input: string): string {
   return `\x1b[?7l${input}\x1b[?7h`;
+}
+
+/** One geometry-tagged span of a worker replay stream. */
+type ReplayChunk = { cols: number; rows: number; data: string };
+
+/**
+ * Worker-backed agents ship snapshots as exact terminal byte streams,
+ * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
+ * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
+ * or null when the payload is not such a stream (tmux captures never open
+ * with a geometry marker). xterm.js does not implement CSI 8 t itself, so the
+ * consumer applies each chunk's geometry via term.resize() between writes.
+ */
+function parseExactReplay(text: string): ReplayChunk[] | null {
+  if (!text.startsWith("\x1b[8;")) return null;
+  const marker = /\x1b\[8;(\d{1,5});(\d{1,5})t/g;
+  const first = marker.exec(text);
+  if (!first || first.index !== 0) return null;
+  const chunks: ReplayChunk[] = [];
+  let current: RegExpExecArray | null = first;
+  while (current) {
+    const start = marker.lastIndex;
+    const next = marker.exec(text);
+    chunks.push({
+      rows: Number(current[1]),
+      cols: Number(current[2]),
+      data: text.slice(start, next ? next.index : undefined),
+    });
+    current = next;
+  }
+  return chunks;
+}
+
+/** A queued terminal write, optionally preceded by a geometry change. */
+type SequencedWrite = { resize?: { cols: number; rows: number }; data: string | Uint8Array };
+
+/**
+ * Write in order, applying each op's resize only after every earlier write
+ * has been consumed — xterm applies resize() immediately while write() is
+ * queued, so interleaving them without sequencing renders bytes at the wrong
+ * geometry. `done` rides the final write's completion.
+ */
+function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
+  let index = 0;
+  const step = () => {
+    if (index >= ops.length) {
+      done();
+      return;
+    }
+    const op = ops[index];
+    index += 1;
+    if (op.resize) {
+      try {
+        term.resize(op.resize.cols, op.resize.rows);
+      } catch {
+        // Mid-dispose during route changes; the write below is a no-op too.
+      }
+    }
+    term.write(op.data, step);
+  };
+  step();
+}
+
+/** Build the sequenced ops for a snapshot payload: exact worker replays get
+ *  per-chunk geometry, tmux captures get the legacy reformat, and both end at
+ *  `finalSize`. */
+function snapshotWriteOps(
+  text: string,
+  finalSize: { cols: number; rows: number },
+): SequencedWrite[] {
+  const exact = parseExactReplay(text);
+  if (!exact) {
+    return [{ resize: finalSize, data: formatSnapshotForXterm(text) }];
+  }
+  const ops: SequencedWrite[] = exact.map((chunk) => ({
+    resize: { cols: chunk.cols, rows: chunk.rows },
+    data: chunk.data,
+  }));
+  const last = exact[exact.length - 1];
+  if (last.cols !== finalSize.cols || last.rows !== finalSize.rows) {
+    ops.push({ resize: finalSize, data: "" });
+  }
+  return ops;
 }
 
 function formatSnapshotForXterm(input: string): string {

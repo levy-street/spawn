@@ -41,12 +41,22 @@ everything else.
    touches the control plane: the worker protocol runs on a unix socket in a
    `0700` directory on the user's own host; live PTY bytes leave the host
    only over WebRTC DataChannels (DTLS peer-to-peer; TURN relays ciphertext).
-2. **Terminal emulation lives in the browser, and only in the browser.**
-   Workers are byte pipes: they never parse escape sequences, never hold a
-   grid, never re-render. xterm.js in `web/` is the single emulator in the
-   system, which is also what makes the conformance harness (§12) meaningful.
-3. **Raw PTY bytes end-to-end.** Scrollback is the raw output stream, not a
-   serialized grid; replay is "feed the same bytes to the same emulator."
+2. **Terminal emulation for rendering lives in the browser.** xterm.js in
+   `web/` is the only emulator whose grid a human ever sees. The worker holds
+   a *headless checkpoint emulator* (`sessiond/emulator.rs`, alacritty's
+   `Term` core plus an owned ANSI serializer) fed from the PTY read path —
+   used exclusively to synthesize segment checkpoints and never in the live
+   byte path. This is a deliberate revision of the original "workers are byte
+   pipes" rule: the byte-pipe design needed a SIGWINCH jiggle to provoke
+   checkpoint repaints from the app, which disturbed the agent, stacked
+   duplicate frames into scrollback on every rotation, and made checkpoint
+   quality depend on each app's WINCH behavior. The emulator's fidelity is a
+   tested contract (`feed → serialize → re-feed ⇒ identical state`), not an
+   assumption.
+3. **Raw PTY bytes in the live path, end-to-end.** Live output is forwarded
+   byte-for-byte, unparsed. Scrollback is the raw output stream plus typed
+   CHECKPOINT/RESIZE records; replay is "feed the same bytes to the same
+   emulator, opening from a serialized screen at a known geometry."
 4. **One process per agent.** Crash isolation, per-agent keys, per-agent
    lifecycle, no shared mux server.
 5. **Honest crypto claims.** Encrypted-at-rest scrollback minimizes plaintext
@@ -62,6 +72,7 @@ spawnd (host supervisor, one per host)
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
  │    ├── owns the PTY master (portable-pty)
  │    ├── agent process (session leader on the PTY slave)
+ │    ├── headless checkpoint emulator (grid state only, no scrollback)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
  │    └── unix listener: $WORKER_DIR/<agent-id>.sock
  └── spawn-worker --agent-id B …
@@ -125,10 +136,10 @@ guessed at.
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | raw bytes | live PTY output |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
-| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH) |
-| `T_REDRAW` 0x07 | d→w | empty | SIGWINCH repaint nudge (§8.2) |
+| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); also recorded in the log as a `RESIZE` record |
+| `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
-| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | replay starting at a checkpoint; watermark = total output bytes logged at capture |
+| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = total output bytes logged at capture |
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?}` | signal the agent's process group (TERM/KILL/INT/HUP/QUIT) |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
@@ -267,30 +278,46 @@ When TRUST.md's optional encrypted transcript backup lands, it should be a
 
 ### 8.1 Checkpoint segments
 
-Every segment opens with a `CHECKPOINT` record. When `append_output` crosses
-the segment budget, the worker rotates the log and immediately fires a
-**SIGWINCH jiggle** (§8.2). Full-screen programs respond by repainting, so
-the bytes at the head of each new segment contain a fresh full-screen redraw.
-Replay returns the newest run of whole segments fitting the caller's budget —
-it therefore **starts at a checkpoint boundary**, which for full-screen apps
-means "starts with a coherent repaint" and for line-oriented output is
-trivially correct. This leverages the exact repaint mechanism the terminal
-self-healing work (commit 9627b09) already validated against real agents.
+Every segment opens with a `CHECKPOINT` record carrying `{cols, rows,
+emulator-serialized screen state}`. When `append_output` crosses the segment
+budget, the worker serializes its checkpoint emulator and rotates — **the
+agent process is never signaled, resized, or otherwise disturbed by storage
+rotation** (`scrollback_rotation_must_not_disturb_the_agent` in
+`worker_e2e.rs` asserts this). PTY resizes are written as `RESIZE` records,
+so every byte in the log is attributable to a known geometry.
 
-Checkpoints are markers, not grid snapshots — storing a grid would require a
-server-side emulator, violating principle 2. The cost is that replay of a
-budget-truncated log may include a partial leading screen for apps that
-ignore SIGWINCH; the SIGWINCH-repaint behavior of every agent TUI we ship has
-been validated by the repaint self-healing feature in production.
+Replay returns the newest run of whole segments fitting the caller's budget
+as a **self-describing stream**: it opens with a geometry marker
+(`CSI 8 ; rows ; cols t`) plus the starting checkpoint's synthesized repaint,
+emits another marker at every recorded resize, and skips later segments'
+checkpoints (their state is reproduced by the output flowing through). The
+browser client (`parseExactReplay`/`writeSequenced` in `Terminal.tsx`)
+applies each chunk's geometry via `term.resize()` — xterm.js parses but does
+not implement CSI 8 t itself — so old-geometry bytes never render garbled.
 
-### 8.2 SIGWINCH jiggle
+The original design used checkpoint *markers* plus a SIGWINCH jiggle to
+provoke repaints from the app. That was retired: it duplicated full frames in
+scrollback on every 256KB rotation (Ink-style TUIs fully re-render on WINCH),
+left replay quality dependent on app behavior, and could not describe
+geometry at all. The emulator-serialized checkpoint is the iTerm2 session
+restoration model adapted to encrypted-at-rest storage.
 
-The kernel only delivers SIGWINCH on an actual size *change*, so the worker
-nudges: resize to `(cols, rows∓1)`, wait 20 ms, restore the desired geometry
-(tracked so a concurrent real resize always wins). This is the tmux-free
-equivalent of `refresh-client`, exposed as `T_REDRAW` and used (a) after
-checkpoint rotation, (b) on browser (re)connect (`install_session_sinks`),
-(c) on worker adoption after a spawnd restart.
+### 8.2 The checkpoint emulator
+
+`sessiond/emulator.rs` wraps alacritty_terminal's `Term` (no scrolling
+history — the grid only; deep history stays in the byte log) plus a shadow
+handler on a second vte parser for the states `Term` keeps private (margins,
+charsets). `serialize()` emits an ANSI stream reconstructing cells,
+attributes, hyperlinks, wide/combining chars, cursor (including pending
+wrap), margins, modes, charsets, cursor style, and palette overrides — for
+both screens when the alternate screen is active. The fidelity contract
+(`feed → serialize → re-feed ⇒ identical state`) is enforced cell-by-cell by
+the module's unit tests, and end-to-end by
+`replay_reconstructs_the_live_screen_across_rotations`, which renders the
+live byte stream and the replay through two emulators and requires identical
+screens. `T_REDRAW` is obsolete and ignored by workers: snapshots synthesized
+from the emulator already carry cursor and modes, so there is nothing left to
+provoke.
 
 ### 8.3 Replay and viewer seeding
 
@@ -313,8 +340,8 @@ is involved in any of these tests.
 ## 9. Resize, flow control, multi-viewer
 
 **Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
-sends `T_RESIZE`; the worker applies it to the PTY master and remembers it as
-the restore target for jiggles. Resize *authority* is a client/server-side
+sends `T_RESIZE`; the worker applies it to the PTY master and the checkpoint
+emulator, and records it in the log. Resize *authority* is a client/server-side
 concern: the display-control feature (commit c43340c) designates one
 controlling viewer whose geometry drives the session while other viewers dim
 — `display.control` frames carry owner + geometry + viewer metadata only (no
@@ -337,8 +364,8 @@ slow viewer buffers in daemon memory, bounded in practice by session volume.
 The scrollback budget bounds *replay*, not live buffering. Planned follow-up
 (applies to both backends, so it is deliberately not gated on this
 migration): bound the per-viewer sink, drop-oldest on overflow, and re-seed
-the lagging viewer with replay-from-watermark + `T_REDRAW` — the worker
-protocol already carries everything that recovery needs.
+the lagging viewer with replay-from-watermark — the worker protocol already
+carries everything that recovery needs.
 
 ## 10. Crash isolation, restart, upgrades
 
@@ -346,7 +373,7 @@ protocol already carries everything that recovery needs.
 |---|---|
 | **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, unlinks its socket, exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit; spawnd additionally reaps via `socket_live` probes. |
 | **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`; the stale socket is cleaned up on next probe. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, and adopts from the `Hello` (state, pid, geometry) — no persistent supervisor state, no fd handoff. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; a `T_REDRAW` repaints the screen for viewers. |
+| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, and adopts from the `Hello` (state, pid, geometry) — no persistent supervisor state, no fd handoff. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; a mismatched worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak. Old workers drain away as their agents exit. |
 | **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
 | **Host reboot** | everything dies, as with tmux. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
@@ -388,8 +415,8 @@ survives as the display label it already is for workers.)
 |---|---|---|---|---|
 | Language | Rust | Rust | Rust | Rust |
 | Model | one daemon, N named sessions | one mux server, own client protocol | one server per session group, plugin runtime | **one process per agent** |
-| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **none — raw bytes; emulator is xterm.js only** |
-| Reattach story | replays restore buffer | grid sync | grid sync | encrypted raw-byte replay from checkpoint + SIGWINCH repaint |
+| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core); live path is raw bytes, rendering is xterm.js only** |
+| Reattach story | replays restore buffer | grid sync | grid sync | encrypted geometry-tagged byte replay opening with an emulator-serialized checkpoint (the iTerm2 restoration model, encrypted at rest) |
 | Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key, zeroized buffers** |
 | Crash blast radius | all sessions in daemon | all clients of the mux | session group | one agent |
 | Remote transport | ssh | ssh/TLS, own protocol | ssh | WebRTC DataChannel (already existed; unchanged) |
@@ -438,9 +465,12 @@ is raw bytes, *replay fidelity* is testable by feeding (a) the live stream
 and (b) a post-rotation replay of the same session into two headless xterm
 instances and diffing their grid-state JSON — "replay from a checkpoint
 converges to the live screen" becomes a machine-checkable property using the
-harness's differ unmodified. That integration test is future work in
-`tools/term-conformance` territory and should reuse its runner rather than
-grow a second serializer in `daemon/`.
+harness's differ unmodified. A Rust-side version of that property already
+runs in `worker_e2e.rs` (`replay_reconstructs_the_live_screen_across_
+rotations`, diffing through the sessiond emulator); the xterm.js-side
+integration is future work in `tools/term-conformance` territory and should
+reuse its runner. The checkpoint emulator itself is a natural additional SUT
+for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 ## 14. TRUST.md phase mapping
 

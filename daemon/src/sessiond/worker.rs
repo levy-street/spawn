@@ -6,10 +6,12 @@
 //! 2. Every accepted connection is greeted with a `Hello` frame carrying the
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
-//! 3. `Start` spawns the agent argv on a PTY the worker owns. Raw output is
-//!    encrypted into the scrollback log the moment it leaves the PTY read
-//!    buffer, then forwarded to the current connection; the plaintext buffer
-//!    is zeroized after each hop.
+//! 3. `Start` spawns the agent argv on a PTY the worker owns. Raw output
+//!    feeds a headless screen emulator (`sessiond::emulator`), is encrypted
+//!    into the scrollback log the moment it leaves the PTY read buffer, then
+//!    forwarded to the current connection; the plaintext buffer is zeroized
+//!    after each hop. Log rotations checkpoint the emulator's serialized
+//!    screen — the agent process is never signaled to provoke a repaint.
 //! 4. On PTY EOF the worker reports `Exit`, deletes its scrollback (the key
 //!    dies with the process anyway), unlinks its socket, and exits.
 //!
@@ -32,7 +34,8 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use super::scrollback::ScrollbackLog;
+use super::emulator::Emulator;
+use super::scrollback::{Checkpoint, ScrollbackLog};
 use super::secret::{self, SecretBytes};
 use super::wire;
 
@@ -41,8 +44,6 @@ const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
 /// After the agent exits, how long the worker lingers to deliver `Exit` to a
 /// (re)connecting spawnd before cleaning up regardless.
 const EXIT_LINGER: Duration = Duration::from_secs(60);
-/// Delay between the two halves of a SIGWINCH repaint nudge.
-const JIGGLE_DELAY: Duration = Duration::from_millis(20);
 
 pub struct WorkerArgs {
     pub socket: PathBuf,
@@ -123,14 +124,29 @@ struct ConnFrame {
     frame: Option<(u8, Vec<u8>)>,
 }
 
+/// Everything needed to open the scrollback log at `Start` time (the log's
+/// initial checkpoint needs the agent's geometry, which arrives with the
+/// `StartSpec`).
+struct LogSetup {
+    dir: PathBuf,
+    segment_bytes: u64,
+    max_log_bytes: u64,
+    key: SecretBytes,
+}
+
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let key = SecretBytes::random(32).context("generating scrollback key")?;
     if !key.is_locked() {
         tracing::warn!("mlock failed for scrollback key; key may be swappable (RLIMIT_MEMLOCK?)");
     }
-    let mut log =
-        ScrollbackLog::with_limits(&args.log_dir, &key, args.segment_bytes, args.max_log_bytes)
-            .context("opening scrollback log")?;
+    let setup = LogSetup {
+        dir: args.log_dir.clone(),
+        segment_bytes: args.segment_bytes,
+        max_log_bytes: args.max_log_bytes,
+        key,
+    };
+    let mut log: Option<ScrollbackLog> = None;
+    let mut emulator: Option<Emulator> = None;
 
     if let Some(parent) = args.socket.parent() {
         std::fs::create_dir_all(parent)
@@ -224,6 +240,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &mut pty,
                     &mut conn_write,
                     &mut log,
+                    &mut emulator,
+                    &setup,
                     &mut pty_tx,
                     &mut exit_tx,
                 ).await {
@@ -246,19 +264,32 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             chunk = pty_rx.recv(), if pty_open => {
                 match chunk {
                     Some(mut chunk) => {
-                        // Encrypt-on-read: log first, then forward live.
-                        match log.append_output(&chunk) {
-                            Ok(true) => {
-                                if let Err(e) = log.rotate() {
-                                    tracing::warn!(error = %e, "scrollback rotate failed");
-                                } else if let Some(p) = &pty {
-                                    // Fresh segment: nudge a full repaint so the
-                                    // checkpoint is a coherent replay start.
-                                    spawn_jiggle(p.master.clone(), p.size.clone());
+                        // Feed the screen emulator, then encrypt-on-read into
+                        // the log, then forward live. A due rotation opens the
+                        // next segment with an emulator-serialized checkpoint;
+                        // the agent process is never signaled or disturbed.
+                        if let Some(emu) = emulator.as_mut() {
+                            emu.feed(&chunk);
+                        }
+                        if let Some(active_log) = log.as_mut() {
+                            match active_log.append_output(&chunk) {
+                                Ok(true) => {
+                                    if let Some(emu) = emulator.as_mut() {
+                                        let (cols, rows) = emu.geometry();
+                                        let state = emu.serialize();
+                                        if let Err(e) = active_log.rotate(&Checkpoint {
+                                            cols,
+                                            rows,
+                                            state: &state,
+                                        }) {
+                                            tracing::warn!(error = %e, "scrollback rotate failed");
+                                        }
+                                        secret::wipe_vec(state);
+                                    }
                                 }
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(error = %e, "scrollback append failed"),
                             }
-                            Ok(false) => {}
-                            Err(e) => tracing::warn!(error = %e, "scrollback append failed"),
                         }
                         if let Some(w) = conn_write.as_mut() {
                             if wire::write_frame(w, wire::T_OUTPUT, &chunk).await.is_err() {
@@ -310,7 +341,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if let Some(mut w) = conn_write.take() {
         let _ = w.shutdown().await;
     }
-    log.destroy();
+    if let Some(log) = log {
+        log.destroy();
+    }
     let _ = std::fs::remove_file(&args.socket);
     Ok(())
 }
@@ -328,7 +361,9 @@ async fn handle_frame(
     state: &mut State,
     pty: &mut Option<Pty>,
     conn_write: &mut Option<OwnedWriteHalf>,
-    log: &mut ScrollbackLog,
+    log: &mut Option<ScrollbackLog>,
+    emulator: &mut Option<Emulator>,
+    setup: &LogSetup,
     pty_tx: &mut Option<mpsc::UnboundedSender<Vec<u8>>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
 ) -> Result<LoopAction> {
@@ -338,6 +373,24 @@ async fn handle_frame(
                 bail!("Start received but agent is already {}", state_name(state));
             }
             let spec: wire::StartSpec = wire::decode_json(&payload)?;
+            let (cols, rows) = (spec.cols.max(1), spec.rows.max(1));
+            let mut emu = Emulator::new(cols, rows);
+            let initial = emu.serialize();
+            let opened = ScrollbackLog::with_limits(
+                &setup.dir,
+                &setup.key,
+                setup.segment_bytes,
+                setup.max_log_bytes,
+                Checkpoint {
+                    cols,
+                    rows,
+                    state: &initial,
+                },
+            )
+            .context("opening scrollback log");
+            secret::wipe_vec(initial);
+            *log = Some(opened?);
+            *emulator = Some(emu);
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
             let started = spawn_pty(&spec, out_tx, ex_tx).context("spawning agent PTY")?;
@@ -362,18 +415,31 @@ async fn handle_frame(
                 *p.size.lock().unwrap() = (cols, rows);
                 resize_master(&p.master, cols, rows);
             }
+            if let Some(emu) = emulator.as_mut() {
+                emu.resize(cols, rows);
+            }
+            if let Some(active_log) = log.as_mut() {
+                if let Err(e) = active_log.append_resize(cols, rows) {
+                    tracing::warn!(error = %e, "recording resize failed");
+                }
+            }
             Ok(LoopAction::Continue)
         }
         wire::T_REDRAW => {
-            if let Some(p) = pty {
-                spawn_jiggle(p.master.clone(), p.size.clone());
-            }
+            // Obsolete: repaints are synthesized from the emulator via replay
+            // (`T_REPLAY_REQ`); the agent process is never disturbed.
+            tracing::debug!("ignoring redraw request (emulator-backed worker)");
             Ok(LoopAction::Continue)
         }
         wire::T_REPLAY_REQ => {
             let max_bytes = wire::decode_replay_req(&payload)?;
-            let replay = log.replay(max_bytes as u64)?;
-            let watermark = log.total_logged();
+            let (replay, watermark) = match log.as_mut() {
+                Some(active_log) => {
+                    let replay = active_log.replay(max_bytes as u64)?;
+                    (replay, active_log.total_logged())
+                }
+                None => (Vec::new(), 0),
+            };
             if let Some(w) = conn_write.as_mut() {
                 let framed = wire::encode_replay(watermark, &replay);
                 let _ = wire::write_frame(w, wire::T_REPLAY, &framed).await;
@@ -543,21 +609,6 @@ fn resize_master(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, cols: u16, rows
             pixel_height: 0,
         });
     }
-}
-
-/// SIGWINCH repaint nudge: briefly change the PTY size, then restore the
-/// desired geometry. The kernel only signals on actual change, so a jiggle is
-/// the tmux-free equivalent of `refresh-client` — full-screen apps repaint on
-/// the restore.
-fn spawn_jiggle(master: Arc<Mutex<Box<dyn MasterPty + Send>>>, size: Arc<Mutex<(u16, u16)>>) {
-    tokio::spawn(async move {
-        let (cols, rows) = *size.lock().unwrap();
-        let alt_rows = if rows > 2 { rows - 1 } else { rows + 1 };
-        resize_master(&master, cols, alt_rows);
-        tokio::time::sleep(JIGGLE_DELAY).await;
-        let (cols, rows) = *size.lock().unwrap();
-        resize_master(&master, cols, rows);
-    });
 }
 
 fn signal_child(pid: u32, signal: Option<&str>) {

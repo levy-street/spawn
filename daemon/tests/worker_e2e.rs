@@ -269,6 +269,178 @@ async fn worker_reports_exit_code() {
     assert!(status.success());
 }
 
+/// Guards against the "duplicated screenfuls in scrollback" bug: rotations
+/// used to jiggle the PTY rows-1 -> rows to provoke a checkpoint repaint, and
+/// full-screen apps (claude, codex) re-rendered a duplicate frame on every
+/// WINCH. Checkpoints are now synthesized from the worker's emulator, so log
+/// rotation is a storage concern that must be invisible to the agent process.
+#[tokio::test]
+async fn scrollback_rotation_must_not_disturb_the_agent() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    // Flood ~14KB (>3 rotations at 4KB segments) with a WINCH trap armed,
+    // then idle long enough for any pending jiggle signals to be delivered.
+    let script = r#"
+trap 'printf "WINCH-SEEN\n"' WINCH
+i=0; while [ $i -lt 200 ]; do printf 'chunk-%04d-%060d\n' "$i" 0; i=$((i+1)); done
+printf 'FLOOD-DONE\n'
+n=0; while [ $n -lt 20 ]; do sleep 0.1; n=$((n+1)); done
+printf 'IDLE-DONE\n'
+"#;
+    let spec = start_spec(&["/bin/bash", "-c", script]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+
+    let output = collect_output_until(&mut conn, b"IDLE-DONE").await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("FLOOD-DONE"),
+        "flood never completed: {text:?}"
+    );
+    let winches = text.matches("WINCH-SEEN").count();
+    assert_eq!(
+        winches, 0,
+        "agent received {winches} WINCH(es) purely from log rotation; \
+         full-screen apps re-render their frame on each one, duplicating \
+         screenfuls in scrollback"
+    );
+}
+
+/// Guards against the "garbled lines when scrolling" bug: replays used to be
+/// raw bytes with no geometry information, so a replay spanning a resize
+/// rendered old-geometry bytes at the current size. Replays are now
+/// self-describing: they open with a geometry marker (`CSI 8 ; rows ; cols t`)
+/// plus a checkpoint repaint and emit a marker at every recorded resize, so
+/// every byte renders at a known geometry.
+#[tokio::test]
+async fn replay_describes_geometry_across_resizes() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    let spec = start_spec(&["/bin/sh", "-c", "printf 'before-resize\\n'; cat"]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    collect_output_until(&mut conn, b"before-resize").await;
+
+    wire::write_frame(&mut conn, wire::T_RESIZE, &wire::encode_resize(120, 40))
+        .await
+        .unwrap();
+    wire::write_frame(&mut conn, wire::T_INPUT, b"after-resize\n")
+        .await
+        .unwrap();
+    collect_output_until(&mut conn, b"after-resize").await;
+
+    wire::write_frame(
+        &mut conn,
+        wire::T_REPLAY_REQ,
+        &wire::encode_replay_req(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let replay = loop {
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_REPLAY {
+            break payload;
+        }
+        assert!(
+            frame_type == wire::T_OUTPUT,
+            "unexpected frame {frame_type}"
+        );
+    };
+    let (_, bytes) = wire::decode_replay(&replay).unwrap();
+    let text = String::from_utf8_lossy(bytes);
+
+    // Opens with the starting geometry (80x24 from the StartSpec).
+    assert!(
+        text.starts_with("\x1b[8;24;80t"),
+        "replay must open with a geometry marker: {:?}",
+        &text[..text.len().min(40)]
+    );
+    let before = text.find("before-resize").expect("pre-resize output");
+    let resize_marker = text
+        .find("\x1b[8;40;120t")
+        .expect("resize must appear as a geometry marker");
+    let after = text.find("after-resize").expect("post-resize output");
+    assert!(
+        before < resize_marker && resize_marker < after,
+        "geometry marker must sit between output produced at 80x24 and at \
+         120x40 (before={before}, marker={resize_marker}, after={after})"
+    );
+}
+
+/// The capstone fidelity check: a replay reconstructs the exact screen a
+/// viewer of the live byte stream would see, across TUI cursor addressing
+/// and multiple checkpoint rotations. Both streams are rendered through the
+/// sessiond emulator and compared cell-for-cell as text.
+#[tokio::test]
+async fn replay_reconstructs_the_live_screen_across_rotations() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    // ~7KB of flood (several 4KB-segment rotations), then a cursor-addressed
+    // TUI frame painted over the scrolled screen.
+    let script = r#"
+printf '\033[2J\033[H'
+i=0; while [ $i -lt 600 ]; do printf 'flood-%04d\n' "$i"; i=$((i+1)); done
+printf '\033[5;10H\033[7mTUI-BOX-FINAL\033[0m\033[K'
+printf '\033[24;1HDONE-MARKER'
+cat
+"#;
+    let spec = start_spec(&["/bin/sh", "-c", script]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    let live_bytes = collect_output_until(&mut conn, b"DONE-MARKER").await;
+
+    wire::write_frame(
+        &mut conn,
+        wire::T_REPLAY_REQ,
+        &wire::encode_replay_req(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let replay = loop {
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_REPLAY {
+            break payload;
+        }
+        assert!(
+            frame_type == wire::T_OUTPUT,
+            "unexpected frame {frame_type}"
+        );
+    };
+    let (_, replay_bytes) = wire::decode_replay(&replay).unwrap();
+
+    let mut live = spawnd::sessiond::emulator::Emulator::new(80, 24);
+    live.feed(&live_bytes);
+    let mut replayed = spawnd::sessiond::emulator::Emulator::new(80, 24);
+    replayed.feed(replay_bytes);
+
+    let (live_screen, replay_screen) = (live.screen_text(), replayed.screen_text());
+    assert_eq!(
+        live_screen, replay_screen,
+        "replay-reconstructed screen diverged from the live screen"
+    );
+    let joined = replay_screen.join("\n");
+    assert_eq!(
+        joined.matches("TUI-BOX-FINAL").count(),
+        1,
+        "TUI frame must appear exactly once: {joined}"
+    );
+}
+
 #[tokio::test]
 async fn worker_rejects_bad_start_and_reports_error() {
     let fixture = WorkerFixture::launch().await;

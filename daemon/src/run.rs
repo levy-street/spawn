@@ -232,14 +232,13 @@ async fn install_session_sinks(registry: &AgentRegistry, out_tx: &mpsc::Sender<W
     for (_, control) in registry.snapshot_controls() {
         control.set_sink(out_tx.clone()).await;
     }
-    // Force a repaint for every agent so freshly-connected clients see the
-    // current screen. refresh-client works even when the geometry is
-    // unchanged, unlike a same-size SIGWINCH nudge. Worker-backed agents get
-    // the worker's jiggle-based redraw instead.
+    // Force a repaint for every tmux agent so freshly-connected clients see
+    // the current screen. refresh-client works even when the geometry is
+    // unchanged, unlike a same-size SIGWINCH nudge. Worker-backed agents
+    // need no push: snapshots are synthesized from the worker's emulator
+    // state on demand, and the browser re-syncs from its snapshot cache.
     for id in registry.ids() {
-        let mut worker_redraw = false;
-        registry.with_handle(id, |h| worker_redraw = h.worker_redraw());
-        if worker_redraw {
+        if registry.is_worker(id) == Some(true) {
             continue;
         }
         if let Some(session) = registry.session_for(id) {
@@ -2255,11 +2254,10 @@ async fn handle_agent_snapshot(
 }
 
 async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
-    // Worker backend: the worker jiggles the PTY size (two SIGWINCHes) to
-    // provoke a full repaint from the app itself.
-    let mut worker_redraw = false;
-    registry.with_handle(agent_id, |h| worker_redraw = h.worker_redraw());
-    if worker_redraw {
+    // Worker backend: nothing to do — snapshots are emulator-synthesized and
+    // already carry cursor position and terminal modes, so there is no
+    // repaint to provoke (and the agent process is never disturbed).
+    if registry.is_worker(agent_id) == Some(true) {
         return;
     }
     let Some(session) = registry.session_for(agent_id) else {
@@ -2433,11 +2431,6 @@ async fn adopt_worker_agent(
         return Ok(false);
     };
     register_attached(agent_id, launched, registry, out_tx, notify_started).await;
-    // Nudge a repaint so freshly-connected clients see the current screen
-    // (mirrors the tmux force_repaint on reattach).
-    registry.with_handle(agent_id, |h| {
-        h.worker_redraw();
-    });
     Ok(true)
 }
 

@@ -343,7 +343,6 @@ async fn run_writer(
                 )
                 .await
             }
-            WorkerCmd::Redraw => wire::write_frame(&mut write_half, wire::T_REDRAW, b"").await,
             WorkerCmd::Replay { max_bytes, resp } => {
                 pending.lock().expect("pending lock").push_back(resp);
                 wire::write_frame(
