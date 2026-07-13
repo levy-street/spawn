@@ -54,7 +54,11 @@
   - `spawnd status` — prints connection / agent state.
 - **Process model**: each agent runs inside its own detached `tmux` session
   (`spawn-<uuid>`), so an agent survives `spawnd` crashes/restarts. The
-  daemon attaches a PTY to the tmux pane to stream I/O.
+  daemon attaches a PTY to the tmux pane to stream I/O. The tmux layer is
+  being replaced by per-agent session workers (`spawn-worker`) with
+  encrypted-at-rest scrollback — implemented behind
+  `SPAWND_SESSION_BACKEND=worker`, tmux still the default; see
+  `SESSIOND.md`.
 - **Agent environment**: the daemon launches the agent under the host user's
   process env (HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally),
   overlaid with the `env` from `agent.create`. spawn does not manage agent
