@@ -26,6 +26,7 @@ use crate::pty::{self, WsOutbound};
 use crate::rtc::RtcSessions;
 use crate::tmux;
 use crate::upload;
+use crate::worker_backend::{self, BackendKind};
 use crate::ws::{self, WsInbound};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -233,8 +234,14 @@ async fn install_session_sinks(registry: &AgentRegistry, out_tx: &mpsc::Sender<W
     }
     // Force a repaint for every agent so freshly-connected clients see the
     // current screen. refresh-client works even when the geometry is
-    // unchanged, unlike a same-size SIGWINCH nudge.
+    // unchanged, unlike a same-size SIGWINCH nudge. Worker-backed agents get
+    // the worker's jiggle-based redraw instead.
     for id in registry.ids() {
+        let mut worker_redraw = false;
+        registry.with_handle(id, |h| worker_redraw = h.worker_redraw());
+        if worker_redraw {
+            continue;
+        }
         if let Some(session) = registry.session_for(id) {
             tmux::force_repaint(&session).await;
         }
@@ -324,7 +331,7 @@ async fn dispatch_loop(
                     handle_agent_restart(create, registry, out_tx).await;
                 }
                 Inbound::AgentKill { agent_id, signal } => {
-                    handle_agent_kill(agent_id, signal, registry).await;
+                    handle_agent_kill(agent_id, signal, registry, out_tx).await;
                 }
                 Inbound::AgentRename {
                     agent_id,
@@ -439,10 +446,13 @@ async fn dispatch_loop(
                         continue;
                     };
                     // Cached check: never pay a tmux subprocess per keystroke.
-                    if let Some(control) = registry.control_for(agent_id) {
-                        if control.copy_mode_cached(&session) {
-                            tmux::cancel_copy_mode(&session).await;
-                            control.clear_copy_mode();
+                    // Worker-backed agents have no tmux copy-mode at all.
+                    if registry.is_worker(agent_id) != Some(true) {
+                        if let Some(control) = registry.control_for(agent_id) {
+                            if control.copy_mode_cached(&session) {
+                                tmux::cancel_copy_mode(&session).await;
+                                control.clear_copy_mode();
+                            }
                         }
                     }
                     let found = registry.with_handle(agent_id, |h| {
@@ -1402,7 +1412,7 @@ async fn handle_agent_create(
     } else {
         session.to_string()
     };
-    let launched_res = pty::launch(pty::LaunchSpec {
+    let spec = pty::LaunchSpec {
         agent_id,
         session: &tmux_session,
         cwd: &launch_cwd_str,
@@ -1410,8 +1420,11 @@ async fn handle_agent_create(
         rows: create.rows,
         argv: &create.argv,
         env: &env,
-    })
-    .await;
+    };
+    let launched_res = match worker_backend::backend_for_create(&create) {
+        BackendKind::Worker => worker_backend::launch(spec).await,
+        BackendKind::Tmux => pty::launch(spec).await,
+    };
 
     let launched = match launched_res {
         Ok(l) => l,
@@ -1958,11 +1971,26 @@ async fn handle_agent_restart(
 
     // Remove the current handle before killing tmux. Its exit task will see
     // that its generation is no longer current and will not emit agent.exit.
+    let mut was_worker = false;
     let session = if let Some(handle) = registry.remove(agent_id) {
         let session = handle
             .session()
             .unwrap_or_else(|_| tmux::legacy_session_name(agent_id));
         handle.control.clear_sink().await;
+        if handle.is_worker() {
+            was_worker = true;
+            // Escalating shutdown; the worker unlinks its socket on exit.
+            handle.worker_shutdown(Some("TERM".into()));
+            for attempt in 0..30u32 {
+                if !worker_backend::socket_live(agent_id).await {
+                    break;
+                }
+                if attempt == 15 {
+                    handle.worker_shutdown(Some("KILL".into()));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         session
     } else {
         let requested = create.tmux_session.trim();
@@ -1972,6 +2000,22 @@ async fn handle_agent_restart(
             requested.to_string()
         }
     };
+
+    if was_worker {
+        if worker_backend::socket_live(agent_id).await {
+            send_pty_text(
+                agent_id,
+                out_tx,
+                "\r\n\x1b[31m[spawn] restart failed: old session worker did not exit\x1b[0m\r\n",
+            )
+            .await;
+            send_spawn_failed_exit(agent_id, out_tx, "restart timeout").await;
+            return;
+        }
+        handle_agent_create(create, registry, out_tx).await;
+        return;
+    }
+
     if let Err(e) = tmux::kill_session(&session).await {
         tracing::debug!(%agent_id, error = %e, "tmux kill-session before restart");
     }
@@ -2011,6 +2055,11 @@ async fn handle_agent_rename(
     if current == next {
         return;
     }
+    // Worker backend: the session name is a display label; just update it.
+    if registry.is_worker(agent_id) == Some(true) {
+        registry.update_session(agent_id, next.to_string());
+        return;
+    }
     match tmux::rename_session(&current, next).await {
         Ok(()) => {
             registry.update_session(agent_id, next.to_string());
@@ -2023,7 +2072,23 @@ async fn handle_agent_rename(
     }
 }
 
-async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &AgentRegistry) {
+async fn handle_agent_kill(
+    agent_id: Uuid,
+    signal: Option<String>,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
+    // Worker backend: signal through the worker (adopting first if this
+    // daemon process hasn't attached yet). The Exit frame drives agent.exit.
+    if !registry.contains(agent_id) {
+        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+    }
+    if registry.is_worker(agent_id) == Some(true) {
+        registry.with_handle(agent_id, |h| {
+            h.worker_shutdown(signal);
+        });
+        return;
+    }
     let session = registry
         .session_for(agent_id)
         .unwrap_or_else(|| tmux::legacy_session_name(agent_id));
@@ -2033,7 +2098,6 @@ async fn handle_agent_kill(agent_id: Uuid, _signal: Option<String>, registry: &A
     // The PTY reader will see EOF and emit `agent.exit` itself. We do NOT
     // remove from the registry here — let the exit handler do it once it has
     // the exit code.
-    let _ = registry.ids(); // satisfy borrow checker / placeholder
 }
 
 async fn handle_agent_resize(agent_id: Uuid, cols: u16, rows: u16, registry: &AgentRegistry) {
@@ -2051,7 +2115,7 @@ async fn handle_agent_resize(agent_id: Uuid, cols: u16, rows: u16, registry: &Ag
         tracing::debug!(%agent_id, "ignoring resize for unknown agent");
         return;
     }
-    if changed {
+    if changed && registry.is_worker(agent_id) != Some(true) {
         if let Some(session) = registry.session_for(agent_id) {
             tokio::spawn(async move {
                 tmux::refresh_client(&session, cols, rows).await;
@@ -2062,6 +2126,12 @@ async fn handle_agent_resize(agent_id: Uuid, cols: u16, rows: u16, registry: &Ag
 
 async fn handle_agent_scroll(agent_id: Uuid, lines: i16, registry: &AgentRegistry) {
     if lines == 0 {
+        return;
+    }
+    // Worker backend: scrollback is browser-local (xterm) seeded by replay;
+    // there is no daemon-side viewport to scroll.
+    if registry.is_worker(agent_id) == Some(true) {
+        tracing::debug!(%agent_id, "ignoring scroll for worker-backed agent");
         return;
     }
     let Some(session) = registry.session_for(agent_id) else {
@@ -2082,6 +2152,54 @@ async fn handle_agent_snapshot(
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let attach_outcome = ensure_agent_attached(agent_id, registry, out_tx).await;
+
+    // Worker backend: the snapshot is a decrypted replay of the worker's
+    // scrollback log — raw PTY bytes starting at a checkpoint (which opens
+    // with a full repaint), directly consumable by the browser's xterm.
+    if registry.is_worker(agent_id) == Some(true) {
+        // Sample the requester's DataChannel position BEFORE the replay
+        // request: the worker logs bytes before shipping them to us, so
+        // everything counted here is guaranteed to be covered by the replay.
+        let dc_offset = match &rtc_session_id {
+            Some(id) => match registry.control_for(agent_id) {
+                Some(control) => control.direct_sink_offset(id).await,
+                None => None,
+            },
+            None => None,
+        };
+        let max_bytes = (lines as u32)
+            .saturating_mul(256)
+            .clamp(64 * 1024, 8 * 1024 * 1024);
+        let mut replay_rx = None;
+        registry.with_handle(agent_id, |h| replay_rx = h.worker_replay(max_bytes));
+        let replay = match replay_rx {
+            Some(rx) => match rx.await {
+                Ok(Ok((_watermark, bytes))) => Ok(bytes),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(anyhow!("worker replay dropped")),
+            },
+            None => Err(anyhow!("worker connection gone")),
+        };
+        match replay {
+            Ok(bytes) => {
+                let snapshot = Outbound::AgentSnapshot {
+                    agent_id,
+                    bytes_b64: STANDARD.encode(bytes),
+                    dc_offset,
+                    rtc_session_id,
+                };
+                if let Ok(s) = serde_json::to_string(&snapshot) {
+                    let _ = out_tx.send(WsOutbound::Json(s)).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%agent_id, error = %e, "worker snapshot failed");
+                send_error(out_tx, Some(agent_id), "snapshot_failed", &e).await;
+            }
+        }
+        return;
+    }
+
     let Some(session) = registry.session_for(agent_id) else {
         if attach_outcome == AttachOutcome::NoSession {
             tracing::debug!(%agent_id, "snapshot for agent with no tmux session");
@@ -2137,6 +2255,13 @@ async fn handle_agent_snapshot(
 }
 
 async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
+    // Worker backend: the worker jiggles the PTY size (two SIGWINCHes) to
+    // provoke a full repaint from the app itself.
+    let mut worker_redraw = false;
+    registry.with_handle(agent_id, |h| worker_redraw = h.worker_redraw());
+    if worker_redraw {
+        return;
+    }
     let Some(session) = registry.session_for(agent_id) else {
         tracing::debug!(%agent_id, "ignoring redraw for unknown agent");
         return;
@@ -2288,6 +2413,43 @@ async fn attach_existing_agent(
         return Ok(());
     }
     let launched = pty::reattach(agent_id, session).await?;
+    register_attached(agent_id, launched, registry, out_tx, notify_started).await;
+    Ok(())
+}
+
+/// Adopt a running session worker for this agent (spawnd restart / lazy
+/// attach). Returns false when no live worker exists.
+async fn adopt_worker_agent(
+    agent_id: Uuid,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    notify_started: bool,
+) -> Result<bool> {
+    if registry.contains(agent_id) {
+        return Ok(true);
+    }
+    let label = tmux::session_name(agent_id, None);
+    let Some(launched) = worker_backend::adopt(agent_id, &label).await? else {
+        return Ok(false);
+    };
+    register_attached(agent_id, launched, registry, out_tx, notify_started).await;
+    // Nudge a repaint so freshly-connected clients see the current screen
+    // (mirrors the tmux force_repaint on reattach).
+    registry.with_handle(agent_id, |h| {
+        h.worker_redraw();
+    });
+    Ok(true)
+}
+
+/// Shared tail of launch/reattach/adopt: wire the sink, insert into the
+/// registry, optionally announce agent.started, and spawn the exit forwarder.
+async fn register_attached(
+    agent_id: Uuid,
+    launched: pty::Launched,
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    notify_started: bool,
+) {
     let pid = launched.pid;
     let exit_rx = launched.exit_rx;
 
@@ -2308,7 +2470,6 @@ async fn attach_existing_agent(
         registry.clone(),
         out_tx.clone(),
     ));
-    Ok(())
 }
 
 /// Outcome of a lazy attach attempt, distinguishing "the session is truly
@@ -2336,6 +2497,19 @@ async fn ensure_agent_attached(
     let _guard = registry.lock_attach().await;
     if registry.contains(agent_id) {
         return AttachOutcome::Attached;
+    }
+    // Worker backend first: a live worker socket is authoritative for this
+    // agent regardless of any tmux state.
+    match adopt_worker_agent(agent_id, registry, out_tx, true).await {
+        Ok(true) => {
+            tracing::info!(%agent_id, "lazily adopted session worker");
+            return AttachOutcome::Attached;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(%agent_id, error = %e, "worker adoption failed");
+            return AttachOutcome::Unknown;
+        }
     }
     let sessions = match tmux::list_sessions().await {
         Ok(sessions) => sessions,
@@ -2378,10 +2552,23 @@ async fn ensure_agent_attached(
     }
 }
 
-/// On daemon startup, discover tmux sessions containing a Spawn agent UUID
-/// left behind by a previous instance and reattach to each. Inserts handles
-/// into the registry and spawns the await-exit task per agent.
+/// On daemon startup, discover sessions left behind by a previous instance
+/// and reattach to each: session workers via their unix sockets, tmux
+/// sessions via `list-sessions`. Inserts handles into the registry and spawns
+/// the await-exit task per agent.
 async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
+    for agent_id in worker_backend::discover_ids() {
+        if registry.contains(agent_id) {
+            continue;
+        }
+        match adopt_worker_agent(agent_id, registry, out_tx, false).await {
+            Ok(true) => tracing::info!(%agent_id, "rediscovered worker-backed agent"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(%agent_id, error = %e, "failed to adopt session worker");
+            }
+        }
+    }
     let sessions = match tmux::list_sessions().await {
         Ok(sessions) => sessions,
         Err(e) => {

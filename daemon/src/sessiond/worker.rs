@@ -383,9 +383,8 @@ async fn handle_frame(
             Ok(LoopAction::Continue)
         }
         wire::T_SHUTDOWN => {
-            let shutdown: wire::Shutdown = wire::decode_json(&payload).unwrap_or(wire::Shutdown {
-                signal: None,
-            });
+            let shutdown: wire::Shutdown =
+                wire::decode_json(&payload).unwrap_or(wire::Shutdown { signal: None });
             match pty {
                 Some(p) => {
                     signal_child(p.pid, shutdown.signal.as_deref());

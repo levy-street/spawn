@@ -150,7 +150,9 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     header[4] = frame_type;
     w.write_all(&header).await.context("writing frame header")?;
-    w.write_all(payload).await.context("writing frame payload")?;
+    w.write_all(payload)
+        .await
+        .context("writing frame payload")?;
     w.flush().await.context("flushing frame")?;
     Ok(())
 }

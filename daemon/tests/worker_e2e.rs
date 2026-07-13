@@ -181,7 +181,10 @@ async fn worker_runs_command_streams_output_and_replays_on_reattach() {
             break payload;
         }
         // Live output frames may interleave; skip them.
-        assert!(frame_type == wire::T_OUTPUT, "unexpected frame {frame_type}");
+        assert!(
+            frame_type == wire::T_OUTPUT,
+            "unexpected frame {frame_type}"
+        );
     };
     let (watermark, bytes) = wire::decode_replay(&replay).unwrap();
     assert!(watermark > 0);

@@ -77,7 +77,7 @@ pub struct ForwarderControl {
 const COPY_MODE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl ForwarderControl {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -174,18 +174,53 @@ impl ForwarderControl {
     }
 }
 
+/// Commands routed from spawnd to a session worker's connection tasks
+/// (worker backend only; see `worker_backend`).
+#[derive(Debug)]
+pub enum WorkerCmd {
+    Input(Vec<u8>),
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// SIGWINCH repaint nudge (tmux-free equivalent of `refresh-client`).
+    Redraw,
+    /// Fetch decrypted scrollback for a snapshot/reattach seed. Responds with
+    /// `(watermark, bytes)` — watermark = total PTY output bytes logged at
+    /// capture time.
+    Replay {
+        max_bytes: u32,
+        resp: oneshot::Sender<Result<(u64, Vec<u8>)>>,
+    },
+    Shutdown {
+        signal: Option<String>,
+    },
+}
+
+/// What actually carries stdin/resize/etc. for this agent.
+enum HandleBackend {
+    /// `tmux attach` running inside a daemon-owned PTY.
+    Tmux {
+        /// Stdin into the PTY (writer half).
+        stdin: Arc<Mutex<Box<dyn Write + Send>>>,
+        /// Master PTY (kept alive so resize works).
+        master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    },
+    /// A spawn-worker process owning the PTY, reached over a unix socket.
+    Worker {
+        cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
+    },
+}
+
 /// Per-agent runtime handle.
 pub struct AgentHandle {
     pub agent_id: Uuid,
-    /// tmux session name (e.g. "spawn-palette--<uuid>").
+    /// tmux session name (e.g. "spawn-palette--<uuid>"). For the worker
+    /// backend this is a display label only; nothing shells out with it.
     session: Arc<Mutex<String>>,
-    /// Stdin into the PTY (writer half).
-    stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Optional token used to cancel the read thread; consumed on shutdown.
     #[allow(dead_code)]
     cancel_tx: Option<oneshot::Sender<()>>,
-    /// Master PTY (kept alive so resize works).
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     /// Last size applied through this handle. Used to avoid expensive tmux
     /// refreshes when browsers repeat the same geometry.
     size: Arc<Mutex<(u16, u16)>>,
@@ -195,9 +230,39 @@ pub struct AgentHandle {
     outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
+    backend: HandleBackend,
+}
+
+/// Everything `worker_backend` needs to assemble a worker-backed handle.
+pub struct WorkerHandleParts {
+    pub agent_id: Uuid,
+    pub session: String,
+    pub cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
+    pub cols: u16,
+    pub rows: u16,
+    pub outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub control: ForwarderControl,
 }
 
 impl AgentHandle {
+    pub fn new_worker(parts: WorkerHandleParts) -> Self {
+        Self {
+            agent_id: parts.agent_id,
+            session: Arc::new(Mutex::new(parts.session)),
+            cancel_tx: None,
+            size: Arc::new(Mutex::new((parts.cols, parts.rows))),
+            outbox_tx: parts.outbox_tx,
+            control: parts.control,
+            backend: HandleBackend::Worker {
+                cmd_tx: parts.cmd_tx,
+            },
+        }
+    }
+
+    pub fn is_worker(&self) -> bool {
+        matches!(self.backend, HandleBackend::Worker { .. })
+    }
+
     pub fn session(&self) -> Result<String> {
         self.session
             .lock()
@@ -215,13 +280,19 @@ impl AgentHandle {
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| anyhow::anyhow!("pty stdin lock poisoned"))?;
-        stdin.write_all(bytes).context("writing PTY stdin")?;
-        stdin.flush().ok();
-        Ok(())
+        match &self.backend {
+            HandleBackend::Tmux { stdin, .. } => {
+                let mut stdin = stdin
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pty stdin lock poisoned"))?;
+                stdin.write_all(bytes).context("writing PTY stdin")?;
+                stdin.flush().ok();
+                Ok(())
+            }
+            HandleBackend::Worker { cmd_tx } => cmd_tx
+                .send(WorkerCmd::Input(bytes.to_vec()))
+                .map_err(|_| anyhow::anyhow!("worker connection gone")),
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
@@ -232,20 +303,63 @@ impl AgentHandle {
         if *size == (cols, rows) {
             return Ok(false);
         }
-        let master = self
-            .master
-            .lock()
-            .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("resizing PTY")?;
+        match &self.backend {
+            HandleBackend::Tmux { master, .. } => {
+                let master = master
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
+                master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .context("resizing PTY")?;
+            }
+            HandleBackend::Worker { cmd_tx } => {
+                cmd_tx
+                    .send(WorkerCmd::Resize { cols, rows })
+                    .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
+            }
+        }
         *size = (cols, rows);
         Ok(true)
+    }
+
+    /// Worker backend: ask the worker for a SIGWINCH repaint nudge. Returns
+    /// false for the tmux backend (callers use `tmux::force_repaint`).
+    pub fn worker_redraw(&self) -> bool {
+        match &self.backend {
+            HandleBackend::Worker { cmd_tx } => cmd_tx.send(WorkerCmd::Redraw).is_ok(),
+            HandleBackend::Tmux { .. } => false,
+        }
+    }
+
+    /// Worker backend: signal the agent process. Returns false for tmux.
+    pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
+        match &self.backend {
+            HandleBackend::Worker { cmd_tx } => {
+                cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok()
+            }
+            HandleBackend::Tmux { .. } => false,
+        }
+    }
+
+    /// Worker backend: request decrypted scrollback replay. Returns None for
+    /// tmux (callers use `tmux::capture_history`).
+    pub fn worker_replay(
+        &self,
+        max_bytes: u32,
+    ) -> Option<oneshot::Receiver<Result<(u64, Vec<u8>)>>> {
+        match &self.backend {
+            HandleBackend::Worker { cmd_tx } => {
+                let (resp, rx) = oneshot::channel();
+                cmd_tx.send(WorkerCmd::Replay { max_bytes, resp }).ok()?;
+                Some(rx)
+            }
+            HandleBackend::Tmux { .. } => None,
+        }
     }
 
     /// Re-apply the current PTY size so the kernel emits a fresh SIGWINCH to
@@ -254,13 +368,22 @@ impl AgentHandle {
     /// for forcing repaints.
     #[allow(dead_code)]
     pub fn nudge_redraw(&self) -> Result<()> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
-        let size = master.get_size().context("reading PTY size")?;
-        master.resize(size).context("re-applying PTY size")?;
-        Ok(())
+        match &self.backend {
+            HandleBackend::Tmux { master, .. } => {
+                let master = master
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
+                let size = master.get_size().context("reading PTY size")?;
+                master.resize(size).context("re-applying PTY size")?;
+                Ok(())
+            }
+            HandleBackend::Worker { cmd_tx } => {
+                cmd_tx
+                    .send(WorkerCmd::Redraw)
+                    .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
+                Ok(())
+            }
+        }
     }
 
     /// Drop the cancel channel so the reader exits next iteration.
@@ -426,12 +549,11 @@ fn attach_to_session(
     let handle = AgentHandle {
         agent_id,
         session: Arc::new(Mutex::new(session.to_string())),
-        stdin,
         cancel_tx: Some(cancel_tx),
-        master,
         size: Arc::new(Mutex::new((cols, rows))),
         outbox_tx,
         control,
+        backend: HandleBackend::Tmux { stdin, master },
     };
     Ok(Launched {
         handle,
@@ -504,7 +626,7 @@ fn run_reader_thread(
 /// installs one. Exits when `outbox_rx` returns None (i.e. all
 /// `outbox_tx` clones — including the AgentHandle and reader thread — are
 /// dropped).
-async fn run_forwarder(
+pub(crate) async fn run_forwarder(
     agent_id: Uuid,
     mut outbox_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     control: ForwarderControl,
