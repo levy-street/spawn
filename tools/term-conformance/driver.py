@@ -200,7 +200,11 @@ def _producer_label(state: dict, directory: pathlib.Path) -> str:
     producer = state.get("producer") or {}
     name = producer.get("name", "unknown")
     version = producer.get("version") or "?"
-    return f"{name} {version} ({directory})"
+    try:
+        shown = directory.resolve().relative_to(ROOT)
+    except ValueError:
+        shown = directory
+    return f"{name} {version} ({shown})"
 
 
 def cmd_compare(args: argparse.Namespace) -> int:

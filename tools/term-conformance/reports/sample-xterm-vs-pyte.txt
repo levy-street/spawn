@@ -1,6 +1,6 @@
 term-conformance report
-  expected (oracle): pyte 0.8.2 (/home/oem/projects/spawn/.claude/worktrees/agent-a7b66670f0e5262ef/tools/term-conformance/fixtures-pyte)
-  actual   (SUT)  : xterm-headless 5.5.0 (/home/oem/projects/spawn/.claude/worktrees/agent-a7b66670f0e5262ef/tools/term-conformance/out/sut)
+  expected (oracle): pyte 0.8.2 (fixtures-pyte)
+  actual   (SUT)  : xterm-headless 5.5.0 (out/sut)
 
 DIVERGES altscreen-active: DIVERGES (known: pyte has no alternate screen buffer: DECSET 1049 is recorded in Screen.mode but drawing continues on the primary buffer, so main-screen text stays visible) — 11 cell(s)
         cell r1c1: text expected='h' actual=' '
