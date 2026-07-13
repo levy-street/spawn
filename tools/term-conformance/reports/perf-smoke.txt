@@ -1,0 +1,5 @@
+term-conformance perf smoke (xterm-headless, web client config)
+  payload: 100000 lines, 9.8 MB (SGR 16/256-color + bold per line)
+  wall time (node process): 0.47 s
+  emulation write time: 0.36 s (27.4 MB/s)
+  final grid: marker=ok last-line=ok

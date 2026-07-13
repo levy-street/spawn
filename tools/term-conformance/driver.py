@@ -270,6 +270,85 @@ def cmd_full_run(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_perf(args: argparse.Namespace) -> int:
+    """Throughput smoke: feed a large synthetic stream (not committed to the
+    corpus) through the SUT and report parse/emulation throughput plus a
+    final-grid sanity check. Report-only: exits 0 unless the SUT crashes or
+    the final grid is wrong (2), so timing noise never breaks CI."""
+    import tempfile
+    import time
+
+    _ensure_sut_deps()
+    node = shutil.which("node")
+    if node is None:
+        sys.exit("error: node not found on PATH")
+
+    lines = args.lines
+    parts: list[str] = []
+    for i in range(lines):
+        color = 31 + (i % 7)
+        parts.append(
+            f"\x1b[{color}m{i:08d}\x1b[0m "
+            + "col=\x1b[1m" + "x" * 48 + "\x1b[22m "
+            + f"\x1b[38;5;{16 + (i % 216)}mZ\x1b[0m\r\n"
+        )
+    parts.append("\x1b[2K\x1b[35mPERF-END-MARKER\x1b[0m")
+    payload = "".join(parts).encode()
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = pathlib.Path(tmp.name)
+    try:
+        wall_start = time.monotonic()
+        proc = subprocess.run(
+            [node, str(SUT_DIR / "run.mjs"), str(tmp_path),
+             "--cols", "80", "--rows", "24", "--name", "perf-smoke"],
+            capture_output=True,
+            text=True,
+        )
+        wall_s = time.monotonic() - wall_start
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if proc.returncode != 0:
+        print(proc.stderr, file=sys.stderr)
+        print("perf-smoke: SUT crashed", file=sys.stderr)
+        return 2
+
+    write_ms = None
+    for token in proc.stderr.split():
+        if token.startswith("sut-write-ms="):
+            write_ms = float(token.split("=", 1)[1])
+
+    state = json.loads(proc.stdout)
+    gridstate.validate_state(state, source="perf-smoke")
+    final_rows = ["".join(c.get("text", " ") for c in row) for row in state["rows"]]
+    marker_ok = any("PERF-END-MARKER" in row for row in final_rows)
+    last_line_ok = any(f"{lines - 1:08d}" in row for row in final_rows)
+
+    mb = len(payload) / 1e6
+    report_lines = [
+        "term-conformance perf smoke (xterm-headless, web client config)",
+        f"  payload: {lines} lines, {mb:.1f} MB (SGR 16/256-color + bold per line)",
+        f"  wall time (node process): {wall_s:.2f} s",
+    ]
+    if write_ms is not None:
+        report_lines.append(
+            f"  emulation write time: {write_ms / 1000:.2f} s ({mb / (write_ms / 1000):.1f} MB/s)"
+        )
+    report_lines.append(
+        f"  final grid: marker={'ok' if marker_ok else 'MISSING'} "
+        f"last-line={'ok' if last_line_ok else 'MISSING'}"
+    )
+    report = "\n".join(report_lines) + "\n"
+    print(report, end="")
+    if args.report:
+        path = pathlib.Path(args.report)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(report)
+    return 0 if (marker_ok and last_line_ok) else 2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="term-conformance",
@@ -301,6 +380,11 @@ def main() -> None:
     p.add_argument("--report", default=None)
     p.add_argument("--case", default=None)
     p.set_defaults(func=cmd_full_run)
+
+    p = sub.add_parser("perf", help="throughput smoke: large synthetic stream through the SUT")
+    p.add_argument("--lines", type=int, default=100_000, help="synthetic output lines")
+    p.add_argument("--report", default=None, help="also write the timing report to this file")
+    p.set_defaults(func=cmd_perf)
 
     args = parser.parse_args()
     sys.exit(args.func(args))

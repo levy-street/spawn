@@ -1,10 +1,12 @@
 # Terminal Web UI Testing
 
-The frontend terminal has three useful automated layers:
+The frontend terminal has several automated layers:
 
-- `web/tests/e2e/terminal.spec.ts` covers deterministic protocol and rendering regressions: ANSI color, raw input, control keys, resize, upload frames, reconnect, scrollback, alternate screen behavior, and mobile touch scrolling.
+- `web/tests/e2e/terminal.spec.ts` covers deterministic protocol and rendering regressions: ANSI color, raw input, control keys, resize, REST uploads, reconnect, scrollback, alternate screen behavior, mobile touch scrolling, and renderer-level emulation fidelity (emoji two-cell width via Unicode 11, OSC 8 hyperlink underlining without URL leakage, DECSCUSR cursor shapes, OSC 52 clipboard writes).
+- `web/tests/e2e/terminal-scrollback-wheel.spec.ts` is a slow-frame regression spec for the wheel-scrollback overlay; it keeps Playwright video/trace recording ON because the recording load is what triggers the underlying xterm.js Viewport NaN race it guards against.
+- `tools/term-conformance/` tests grid-level emulation (xterm.js vs oracle terminals) using the exact terminal configuration the web client ships, via the shared module `web/src/components/terminal/xterm-config.mjs`. Change terminal options there, then run `uv run driver.py full-run` in `tools/term-conformance/`.
 - `scripts/smoke-local-browser-live.sh` starts the API server, web app, daemon, and a real browser. It verifies a live agent terminal, WebRTC terminal bytes, upload, and second-tab display control.
-- `web/tests/e2e/terminal-usability.audit.spec.ts` is an optional recorded Playwright audit for common end-user flows. It uses mocked API and WebSocket data so it is fast and deterministic, but records trace/video/screenshot artifacts and attaches a JSON session report.
+- `web/tests/e2e/terminal-usability.audit.spec.ts` is an optional recorded Playwright audit for common end-user flows. It uses mocked API and WebSocket data so it is fast and deterministic, but records trace/video/screenshot artifacts and attaches a JSON session report. The mock pins the client to the `spawn.v1` relay (spawn.v2 correctly refuses to send keystrokes until a WebRTC DataChannel opens, which never happens against a mocked socket).
 
 ## Recorded Usability Audit
 

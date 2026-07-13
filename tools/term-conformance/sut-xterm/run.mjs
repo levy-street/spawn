@@ -101,7 +101,12 @@ async function main() {
     title = t;
   });
 
+  const writeStart = process.hrtime.bigint();
   await new Promise((resolve) => term.write(new Uint8Array(data), resolve));
+  const writeMs = Number(process.hrtime.bigint() - writeStart) / 1e6;
+  // Timing goes to stderr: the schema forbids extra top-level fields, and
+  // stdout must stay pure grid-state JSON. Consumed by `driver.py perf`.
+  process.stderr.write(`sut-write-ms=${writeMs.toFixed(1)} bytes=${data.length}\n`);
 
   const buf = term.buffer.active;
   const rows = [];

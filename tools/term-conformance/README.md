@@ -64,7 +64,15 @@ Other subcommands:
 uv run driver.py run-sut [--case NAME] [--out DIR]         # SUT only -> out/sut/
 uv run driver.py record-fixtures --oracle pyte             # -> fixtures-pyte/
 uv run driver.py compare --expected fixtures-pyte --actual out/sut [--report F]
+uv run driver.py perf [--lines N] [--report F]             # throughput smoke
 ```
+
+The perf smoke feeds ~10 MB of SGR-heavy synthetic output (100k lines by
+default, generated on the fly, never committed) through the SUT with the web
+client's exact config and reports emulation throughput plus a final-grid
+sanity check (report-only; see `reports/perf-smoke.txt` for a sample —
+~27 MB/s on this box). Timing rides stderr (`sut-write-ms=`) so stdout stays
+pure grid-state JSON.
 
 **Exit codes** (compare/full-run): `0` = every case passes or fails only in
 ways listed in `known-divergences.json`; `1` = unexpected divergence **or** a
@@ -102,6 +110,20 @@ DECSCUSR observations) may be added without a bump; additive fields with
 concrete defaults bump the version. Fixtures carry the version they were
 recorded with, so old recordings stay honest. Full rules in
 `schema/schema.md`.
+
+## Future work
+
+- **iTerm2 fixtures**: record `fixtures/` on a Mac (above) and add a CI
+  compare lane against them with an empty allowlist.
+- **OSC 1337 inline images (iTerm2 extension)**: the corpus already asserts
+  containment (`osc1337-ignored` — payloads must not corrupt the grid or
+  leak text). Actual rendering in web/ would come from an xterm.js
+  image addon (`@xterm/addon-image` supports SIXEL + iTerm2 IIP); grid-state
+  schema would need an additive nullable `image` cell field (wildcard for
+  oracles that cannot observe it, so no version bump).
+- **Replay-fidelity lane**: designer's sessiond checkpoint replay could be
+  diffed live-vs-replay using this differ and the repaint-convergence
+  equivalence machinery (see docs/SESSIOND.md).
 
 ## Layout
 
