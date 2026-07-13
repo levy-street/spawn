@@ -1,0 +1,81 @@
+term-conformance report
+  expected (oracle): pyte 0.8.2 (/home/oem/projects/spawn/.claude/worktrees/agent-a7b66670f0e5262ef/tools/term-conformance/fixtures-pyte)
+  actual   (SUT)  : xterm-headless 5.5.0 (/home/oem/projects/spawn/.claude/worktrees/agent-a7b66670f0e5262ef/tools/term-conformance/out/sut)
+
+DIVERGES altscreen-active: DIVERGES (known: pyte has no alternate screen buffer: DECSET 1049 is recorded in Screen.mode but drawing continues on the primary buffer, so main-screen text stays visible) — 11 cell(s)
+        cell r1c1: text expected='h' actual=' '
+        cell r1c2: text expected='i' actual=' '
+        cell r1c3: text expected='d' actual=' '
+        cell r1c4: text expected='d' actual=' '
+        cell r1c5: text expected='e' actual=' '
+        cell r1c6: text expected='n' actual=' '
+        cell r1c7: text expected='-' actual=' '
+        cell r1c8: text expected='m' actual=' '
+        cell r1c9: text expected='a' actual=' '
+        cell r1c10: text expected='i' actual=' '
+        cell r1c11: text expected='n' actual=' '
+DIVERGES altscreen-roundtrip: DIVERGES (known: pyte has no alternate screen buffer: content drawn 'in the alt screen' bleeds onto the primary buffer and survives DECRST 1049) — 10 cell(s); cursor.col, cursor.row
+        cursor: row expected=4 actual=1
+        cursor: col expected=13 actual=14
+        cell r1c13: text expected=' ' actual='!'
+        cell r4c4: text expected='a' actual=' '
+        cell r4c4: fg expected=2 actual='default'
+        cell r4c5: text expected='l' actual=' '
+        cell r4c5: fg expected=2 actual='default'
+        cell r4c6: text expected='t' actual=' '
+        cell r4c6: fg expected=2 actual='default'
+        cell r4c7: text expected='-' actual=' '
+        cell r4c7: fg expected=2 actual='default'
+        cell r4c8: text expected='o' actual=' '
+        cell r4c8: fg expected=2 actual='default'
+        cell r4c9: text expected='n' actual=' '
+        cell r4c9: fg expected=2 actual='default'
+        cell r4c10: text expected='l' actual=' '
+        cell r4c10: fg expected=2 actual='default'
+        cell r4c11: text expected='y' actual=' '
+        cell r4c11: fg expected=2 actual='default'
+        cell r4c12: text expected='!' actual=' '
+PASS  combining-chars
+PASS  cursor-cup
+PASS  cursor-relative
+DIVERGES cursor-save-restore-ansi: DIVERGES (known: pyte does not implement ANSI save/restore cursor (SCOSC/SCORC, CSI s / CSI u); xterm.js restores the saved position) — 2 cell(s); cursor.col, cursor.row
+        cursor: row expected=19 actual=5
+        cursor: col expected=65 actual=20
+        cell r5c19: text expected=' ' actual='X'
+        cell r19c64: text expected='X' actual=' '
+PASS  cursor-save-restore-decsc
+PASS  ed-clear-all
+PASS  ed-clear-below-above
+PASS  el-clears
+PASS  ich-dch
+PASS  il-dl
+PASS  origin-mode-decom
+PASS  osc-title
+PASS  reverse-index-top
+DIVERGES scroll-region-lf: DIVERGES (known: pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070) — cursor.col, cursor.row
+        cursor: row expected=9 actual=0
+        cursor: col expected=6 actual=0
+DIVERGES scroll-region-ri: DIVERGES (known: pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070) — cursor.col, cursor.row
+        cursor: row expected=4 actual=0
+        cursor: col expected=13 actual=0
+PASS  sgr-16color
+PASS  sgr-256color
+DIVERGES sgr-attributes: DIVERGES (known: pyte does not implement SGR 2 (dim/faint); the pyte runner hard-reports dim=false) — 3 cell(s)
+        cell r1c0: dim expected=False actual=True
+        cell r1c1: dim expected=False actual=True
+        cell r1c2: dim expected=False actual=True
+PASS  sgr-combos
+PASS  sgr-truecolor
+PASS  tabs-hts-tbc
+PASS  wide-cjk
+PASS  wrap-autowrap-off
+PASS  wrap-autowrap-on
+DIVERGES wrap-wide-at-edge: DIVERGES (known: pyte draws a wide char whose second column would overflow into the last column anyway; xterm.js (like iTerm2) wraps the whole glyph to the next row) — 3 cell(s)
+        cell r0c79: text expected='漢' actual=' '
+        cell r1c0: text expected=' ' actual='漢'
+        cell r1c0: width expected=1 actual=2
+        cell r1c1: text expected=' ' actual=''
+        cell r1c1: width expected=1 actual=0
+
+summary: 27 cases — 20 pass, 7 known-divergent, 0 unexpected fail, 0 stale-known, 0 error
+exit code: 0

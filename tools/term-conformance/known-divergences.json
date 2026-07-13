@@ -1,0 +1,33 @@
+{
+  "comment": "Cases where the pyte pseudo-oracle genuinely diverges from xterm.js. These are pyte limitations/behaviors, verified by hand against the corpus bytes; xterm.js matches DEC/xterm documented behavior in each. The compare step exits 0 when the only failures are listed here, and exits 1 if a listed case starts passing (stale entry). This file applies to xterm-vs-PYTE runs; a real iTerm2 fixture run should start with an empty list.",
+  "divergences": [
+    {
+      "case": "altscreen-active",
+      "reason": "pyte has no alternate screen buffer: DECSET 1049 is recorded in Screen.mode but drawing continues on the primary buffer, so main-screen text stays visible"
+    },
+    {
+      "case": "altscreen-roundtrip",
+      "reason": "pyte has no alternate screen buffer: content drawn 'in the alt screen' bleeds onto the primary buffer and survives DECRST 1049"
+    },
+    {
+      "case": "cursor-save-restore-ansi",
+      "reason": "pyte does not implement ANSI save/restore cursor (SCOSC/SCORC, CSI s / CSI u); xterm.js restores the saved position"
+    },
+    {
+      "case": "scroll-region-lf",
+      "reason": "pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070"
+    },
+    {
+      "case": "scroll-region-ri",
+      "reason": "pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070"
+    },
+    {
+      "case": "sgr-attributes",
+      "reason": "pyte does not implement SGR 2 (dim/faint); the pyte runner hard-reports dim=false"
+    },
+    {
+      "case": "wrap-wide-at-edge",
+      "reason": "pyte draws a wide char whose second column would overflow into the last column anyway; xterm.js (like iTerm2) wraps the whole glyph to the next row"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"version": 1, "producer": {"name": "pyte", "version": "0.8.2"}, "size": {"cols": 80, "rows": 24}, "cursor": {"row": 8, "col": 9, "visible": true}, "altScreen": false, "title": "", "rows": [[], [], [], [], [], [], [], [], [{}, {}, {}, {}, {}, {}, {}, {}, {"text": "M"}], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []], "case": "ed-clear-all"}
