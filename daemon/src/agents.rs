@@ -117,6 +117,13 @@ impl AgentRegistry {
         }
     }
 
+    /// Whether the agent runs on the worker backend (vs tmux). None when the
+    /// agent isn't in the registry.
+    pub fn is_worker(&self, id: Uuid) -> Option<bool> {
+        let guard = self.inner.lock().expect("agents lock");
+        guard.get(&id).map(|entry| entry.handle.is_worker())
+    }
+
     pub fn control_for(&self, id: Uuid) -> Option<ForwarderControl> {
         let guard = self.inner.lock().expect("agents lock");
         guard.get(&id).map(|entry| entry.handle.control.clone())

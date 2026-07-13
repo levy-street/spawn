@@ -23,6 +23,7 @@ mod rtc;
 mod run;
 mod tmux;
 mod upload;
+mod worker_backend;
 mod ws;
 
 use clap::Parser;

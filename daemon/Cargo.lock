@@ -2468,9 +2468,11 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
+ "chacha20poly1305",
  "clap",
  "dirs",
  "futures-util",
+ "getrandom 0.2.17",
  "hostname",
  "keyring",
  "nix 0.29.0",
@@ -2490,6 +2492,7 @@ dependencies = [
  "url",
  "uuid",
  "webrtc",
+ "zeroize",
 ]
 
 [[package]]

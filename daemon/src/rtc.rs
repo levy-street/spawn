@@ -358,11 +358,14 @@ fn install_data_channel_handler(
                         return;
                     }
                     // Cached check: never pay a tmux subprocess per keystroke.
-                    if let Some(session) = registry.session_for(agent_id) {
-                        if let Some(control) = registry.control_for(agent_id) {
-                            if control.copy_mode_cached(&session) {
-                                tmux::cancel_copy_mode(&session).await;
-                                control.clear_copy_mode();
+                    // Worker-backed agents have no tmux copy-mode at all.
+                    if registry.is_worker(agent_id) != Some(true) {
+                        if let Some(session) = registry.session_for(agent_id) {
+                            if let Some(control) = registry.control_for(agent_id) {
+                                if control.copy_mode_cached(&session) {
+                                    tmux::cancel_copy_mode(&session).await;
+                                    control.clear_copy_mode();
+                                }
                             }
                         }
                     }
