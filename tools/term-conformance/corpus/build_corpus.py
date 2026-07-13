@@ -313,6 +313,273 @@ case(
     + ESC + "]0;final title" + ESC + "\\",
 )
 
+# ---------------------------------------------------------------- pending wrap
+# DECAWM defers the wrap after writing the last column: the cursor sits on the
+# last column in a "pending" state and only wraps when the next printable
+# arrives. Cursor col is reported clamped to cols-1 per schema.
+
+FILL80 = "".join(chr(ord("A") + (i % 26)) for i in range(80))
+
+case(
+    "pending-wrap-defer",
+    "Fill exactly one row: wrap is deferred, cursor reports last column, next row untouched.",
+    cup(1, 1) + FILL80,
+)
+
+case(
+    "pending-wrap-write",
+    "Printable after a pending wrap triggers the deferred wrap to row 2 col 1.",
+    cup(1, 1) + FILL80 + "X",
+)
+
+case(
+    "pending-wrap-cr",
+    "CR cancels a pending wrap: next char overwrites row 1 col 1, no wrap occurs.",
+    cup(1, 1) + FILL80 + "\rY",
+)
+
+case(
+    "pending-wrap-cub",
+    "CUB from the pending-wrap state moves off the last column and cancels the wrap.",
+    cup(1, 1) + FILL80 + f"{CSI}D" + "Z",
+)
+
+case(
+    "pending-wrap-el",
+    "EL 0 in the pending-wrap state erases from the last column; wrap stays cancelled for the next char.",
+    cup(1, 1) + FILL80 + f"{CSI}0K" + "Q",
+)
+
+case(
+    "pending-wrap-cup",
+    "Explicit CUP cancels a pending wrap; the next char lands at the addressed cell.",
+    cup(1, 1) + FILL80 + cup(1, 40) + "M",
+)
+
+# ---------------------------------------------------------------- DECALN
+
+case(
+    "decaln-fill",
+    "DECALN (ESC # 8) fills the whole screen with E; drawing afterwards overwrites normally.",
+    f"{CSI}5;10r" + ESC + "#8" + cup(2, 2) + "X",
+)
+
+case(
+    "decaln-resets-margins",
+    "DECALN resets DECSTBM margins and homes the cursor: an LF at the true bottom scrolls the full screen.",
+    f"{CSI}5;10r" + ESC + "#8" + cup(24, 1) + "\n" + "end",
+    cols=20,
+)
+
+# ---------------------------------------------------------------- ECH / BCE
+
+case(
+    "ech-erase",
+    "ECH (CSI X) erases n cells at the cursor without moving it; count clamps at end of line.",
+    cup(1, 1) + "ABCDEFGHIJ" + cup(1, 3) + f"{CSI}4X"
+    + cup(2, 1) + "KLMNO" + cup(2, 4) + f"{CSI}99X"
+    + cup(3, 1),
+)
+
+case(
+    "bce-el-bg",
+    "Background color erase: EL fills erased cells with the active SGR background.",
+    cup(1, 1) + sgr(41) + f"{CSI}2K"
+    + cup(2, 1) + sgr(44) + "text" + f"{CSI}0K" + sgr(0)
+    + cup(4, 1),
+    cols=20,
+    rows=6,
+)
+
+case(
+    "bce-ed-bg",
+    "Background color erase: ED fills the cleared region with the active SGR background.",
+    cup(1, 1) + "junk junk" + cup(2, 1) + sgr(42) + f"{CSI}0J" + sgr(0) + cup(1, 1),
+    cols=10,
+    rows=4,
+)
+
+# ---------------------------------------------------------------- scrolling ops
+
+case(
+    "su-sd-scroll",
+    "SU (CSI S) and SD (CSI T) shift lines within the screen, then SU inside a DECSTBM region.",
+    "\r\n".join(f"line-{i}" for i in range(1, 11))
+    + f"{CSI}3S" + f"{CSI}1T"
+    + f"{CSI}4;7r" + f"{CSI}1S" + f"{CSI}r"
+    + cup(1, 1),
+    rows=10,
+)
+
+case(
+    "rep-repeat",
+    "REP (CSI b) repeats the preceding graphic character, inheriting current SGR attributes.",
+    cup(1, 1) + "ab" + f"{CSI}3b" + "c"
+    + cup(2, 1) + sgr(31) + "x" + f"{CSI}2b" + sgr(0),
+)
+
+case(
+    "il-dl-region-bounds",
+    "IL outside a DECSTBM region is a no-op; IL at the region bottom and DL at the region top shift only region rows.",
+    f"{CSI}5;10r"
+    + "".join(cup(r, 1) + f"r{r:02d}" for r in range(1, 13))
+    + cup(3, 1) + f"{CSI}5L"
+    + cup(10, 1) + f"{CSI}2L"
+    + cup(5, 1) + f"{CSI}1M"
+    + f"{CSI}r" + cup(12, 1),
+    rows=12,
+)
+
+case(
+    "nel-region-bottom",
+    "NEL (ESC E) at the DECSTBM bottom scrolls the region and always performs a carriage return.",
+    f"{CSI}3;6r" + cup(6, 4) + "bot" + ESC + "E" + "nel"
+    + f"{CSI}r" + cup(8, 1),
+    rows=8,
+)
+
+case(
+    "decom-outside-region",
+    "DECOM: CUP addressing a row beyond the region clamps to the region bottom (DEC STD-070).",
+    f"{CSI}5;10r{CSI}?6h"
+    + cup(99, 5) + "bottom-clamped"
+    + cup(2, 70) + "row2-in-region"
+    + f"{CSI}?6l{CSI}r" + cup(12, 1),
+    rows=12,
+)
+
+# ---------------------------------------------------------------- cursor column/line ops
+
+case(
+    "cursor-line-col-ops",
+    "CNL (CSI E) and CPL (CSI F) move to column 1 of other lines; VPA (CSI d) and CHA (CSI G) address directly.",
+    cup(5, 10) + "S" + f"{CSI}2E" + "cnl" + f"{CSI}1F" + "cpl"
+    + f"{CSI}8d" + "vpa" + f"{CSI}30G" + "cha",
+)
+
+case(
+    "hpa-column",
+    "HPA (CSI `) addresses an absolute column on the current row.",
+    cup(1, 5) + "G" + f"{CSI}20`" + "H" + cup(3, 1),
+)
+
+case(
+    "cht-cbt-tabs",
+    "CHT (CSI I) jumps forward n tab stops; CBT (CSI Z) jumps backward.",
+    cup(1, 1) + "x" + f"{CSI}2I" + "f" + f"{CSI}1Z" + f"{CSI}Z" + "b",
+)
+
+# ---------------------------------------------------------------- cursor style
+
+case(
+    "decscusr-styles",
+    "DECSCUSR sequences change only cursor style/blink (v1.1 fields); the grid must be unaffected.",
+    cup(1, 1) + "steady" + f"{CSI}3 q" + " blink-ul" + f"{CSI}5 q" + " blink-bar",
+)
+
+# ---------------------------------------------------------------- unicode edge cases
+
+case(
+    "wide-overwrite-half",
+    "Overwriting either half of a wide char blanks the orphaned half instead of leaving torn cells.",
+    cup(1, 1) + "漢字" + cup(1, 2) + "X"
+    + cup(2, 1) + "漢" + cup(2, 1) + "Y"
+    + cup(3, 1),
+)
+
+case(
+    "ich-wide-edge",
+    "ICH that would push half a wide char past the right edge drops the whole glyph.",
+    cup(1, 76) + "ab漢" + cup(1, 76) + f"{CSI}1@" + cup(3, 1),
+)
+
+case(
+    "combining-eol",
+    "Combining marks attach to the last-column cell even in the pending-wrap state.",
+    cup(1, 79) + "aé" + cup(2, 80) + "ó̂" + cup(3, 1),
+)
+
+case(
+    "emoji-width",
+    "Emoji are width 2 under the Unicode 11 tables the web client ships (xterm's built-in default is width-1 Unicode 6).",
+    cup(1, 1) + "\U0001F600X" + cup(2, 1) + "A\U0001F680B" + cup(3, 1),
+)
+
+# ---------------------------------------------------------------- OSC side effects
+
+case(
+    "osc8-hyperlink",
+    "OSC 8 hyperlinks: anchor text renders in-grid, no URL bytes leak; xterm.js additionally reports linked cells as underlined.",
+    cup(1, 1) + ESC + "]8;;https://example.com" + ESC + "\\" + "link-text"
+    + ESC + "]8;;" + ESC + "\\" + " after",
+)
+
+case(
+    "osc52-clipboard",
+    "OSC 52 (clipboard write) has no grid-observable effect; payload must not leak into the screen.",
+    cup(1, 1) + "before " + ESC + "]52;c;aGVsbG8=" + "\x07" + "after",
+)
+
+case(
+    "osc1337-ignored",
+    "iTerm2 proprietary OSC 1337 must be consumed cleanly by non-iTerm2 emulators; no payload leaks.",
+    cup(1, 1) + "pre " + ESC + "]1337;SetUserVar=foo=YmFy" + "\x07" + "post",
+)
+
+# ---------------------------------------------------------------- full reset
+
+case(
+    "ris-full-reset",
+    "RIS (ESC c) clears the screen, homes the cursor, and resets margins, DECOM, and SGR; default tab stops return.",
+    f"{CSI}5;10r{CSI}?6h" + sgr(31, 44) + cup(2, 2) + "junk-junk"
+    + ESC + "c" + "clean" + "\t" + "tabbed",
+)
+
+# ---------------------------------------------------------------- scrollback
+
+case(
+    "scrollback-overflow",
+    "More lines than rows: the viewport shows the tail; earlier lines move to scrollback.",
+    "\r\n".join(f"line-{i:02d}" for i in range(1, 31)) + "\r\n",
+)
+
+# ---------------------------------------------------------------- repaint / reattach
+# spawn's reattach path replays raw bytes from a checkpoint whose first bytes
+# are a full-screen repaint (the daemon nudges the PTY with a SIGWINCH jiggle
+# after rotating segments). A correct repaint must converge to the same grid
+# regardless of what was on screen before it — these two cases share the same
+# repaint tail after very different prefixes, and the driver asserts their
+# grids are identical (manifest "equivalences").
+
+REPAINT_TAIL = (
+    f"{CSI}r{CSI}?6l{CSI}?7h" + sgr(0) + f"{CSI}H{CSI}2J"
+    + cup(1, 1) + sgr(1, 32) + "spawn " + sgr(0) + "session"
+    + cup(2, 1) + "$ tail -f app.log"
+    + cup(3, 1) + sgr(33) + "warn:" + sgr(0) + " retry"
+    + f"{CSI}2 q"
+    + cup(4, 3)
+)
+
+case(
+    "repaint-converge-a",
+    "Full-redraw checkpoint replay converges: repaint tail after margin/SGR-heavy prefix.",
+    cup(1, 1) + "OLD JUNK " * 20 + f"{CSI}3;7r" + cup(5, 5) + sgr(35) + "stale" + REPAINT_TAIL,
+)
+
+case(
+    "repaint-converge-b",
+    "Full-redraw checkpoint replay converges: same repaint tail after scrolled/DECOM prefix.",
+    "\r\n" * 30 + "different history" + f"{CSI}?6h" + REPAINT_TAIL,
+)
+
+EQUIVALENCES = [
+    {
+        "name": "repaint-converge",
+        "cases": ["repaint-converge-a", "repaint-converge-b"],
+        "reason": "a full-redraw checkpoint replay must produce identical grids regardless of prior screen state (reattach correctness)",
+    }
+]
+
 
 def main() -> None:
     root = pathlib.Path(__file__).resolve().parent
@@ -326,7 +593,10 @@ def main() -> None:
         manifest.append(c)
 
     (root / "manifest.json").write_text(
-        json.dumps({"version": 1, "cases": manifest}, indent=2) + "\n"
+        json.dumps(
+            {"version": 1, "cases": manifest, "equivalences": EQUIVALENCES}, indent=2
+        )
+        + "\n"
     )
     print(f"wrote {len(manifest)} cases to {cases_dir}")
 

@@ -35,41 +35,178 @@ DIVERGES altscreen-roundtrip: DIVERGES (known: pyte has no alternate screen buff
         cell r4c11: text expected='y' actual=' '
         cell r4c11: fg expected=2 actual='default'
         cell r4c12: text expected='!' actual=' '
-PASS  combining-chars
-PASS  cursor-cup
-PASS  cursor-relative
+DIVERGES bce-ed-bg: DIVERGES (known: pyte fills ED-cleared cells with the default background (it honors BCE for EL but not ED); xterm.js, like iTerm2, erases with the active SGR background) — 20 cell(s)
+        cell r2c0: bg expected='default' actual=2
+        cell r2c1: bg expected='default' actual=2
+        cell r2c2: bg expected='default' actual=2
+        cell r2c3: bg expected='default' actual=2
+        cell r2c4: bg expected='default' actual=2
+        cell r2c5: bg expected='default' actual=2
+        cell r2c6: bg expected='default' actual=2
+        cell r2c7: bg expected='default' actual=2
+        cell r2c8: bg expected='default' actual=2
+        cell r2c9: bg expected='default' actual=2
+        cell r3c0: bg expected='default' actual=2
+        cell r3c1: bg expected='default' actual=2
+        cell r3c2: bg expected='default' actual=2
+        cell r3c3: bg expected='default' actual=2
+        cell r3c4: bg expected='default' actual=2
+        cell r3c5: bg expected='default' actual=2
+        cell r3c6: bg expected='default' actual=2
+        cell r3c7: bg expected='default' actual=2
+        cell r3c8: bg expected='default' actual=2
+        cell r3c9: bg expected='default' actual=2
+PASS  bce-el-bg [2 wildcard fields]
+DIVERGES cht-cbt-tabs: DIVERGES (known: pyte does not implement CHT (CSI I) / CBT (CSI Z); xterm.js moves the cursor by tab stops) — 4 cell(s); cursor.col
+        cursor: col expected=3 actual=9
+        cell r0c1: text expected='f' actual=' '
+        cell r0c2: text expected='b' actual=' '
+        cell r0c8: text expected=' ' actual='b'
+        cell r0c16: text expected=' ' actual='f'
+PASS  combining-chars [2 wildcard fields]
+PASS  combining-eol [2 wildcard fields]
+PASS  cursor-cup [2 wildcard fields]
+PASS  cursor-line-col-ops [2 wildcard fields]
+PASS  cursor-relative [2 wildcard fields]
 DIVERGES cursor-save-restore-ansi: DIVERGES (known: pyte does not implement ANSI save/restore cursor (SCOSC/SCORC, CSI s / CSI u); xterm.js restores the saved position) — 2 cell(s); cursor.col, cursor.row
         cursor: row expected=19 actual=5
         cursor: col expected=65 actual=20
         cell r5c19: text expected=' ' actual='X'
         cell r19c64: text expected='X' actual=' '
-PASS  cursor-save-restore-decsc
-PASS  ed-clear-all
-PASS  ed-clear-below-above
-PASS  el-clears
-PASS  ich-dch
-PASS  il-dl
-PASS  origin-mode-decom
-PASS  osc-title
-PASS  reverse-index-top
+PASS  cursor-save-restore-decsc [2 wildcard fields]
+PASS  decaln-fill [2 wildcard fields]
+DIVERGES decaln-resets-margins: DIVERGES (known: pyte's DECALN fills the screen with E but neither resets DECSTBM margins nor homes the cursor; xterm.js resets margins and homes per DEC STD-070) — 6 cell(s); cursor.row
+        cursor: row expected=9 actual=23
+        cell r9c0: text expected='e' actual='E'
+        cell r9c1: text expected='n' actual='E'
+        cell r9c2: text expected='d' actual='E'
+        cell r23c0: text expected='E' actual='e'
+        cell r23c1: text expected='E' actual='n'
+        cell r23c2: text expected='E' actual='d'
+DIVERGES decom-outside-region: DIVERGES (known: pyte treats a DECOM CUP addressing a row outside the scroll region as a no-op (cursor unmoved); xterm.js clamps to the region bottom per DEC STD-070) — 28 cell(s)
+        cell r4c0: text expected='b' actual=' '
+        cell r4c1: text expected='o' actual=' '
+        cell r4c2: text expected='t' actual=' '
+        cell r4c3: text expected='t' actual=' '
+        cell r4c4: text expected='o' actual=' '
+        cell r4c5: text expected='m' actual=' '
+        cell r4c6: text expected='-' actual=' '
+        cell r4c7: text expected='c' actual=' '
+        cell r4c8: text expected='l' actual=' '
+        cell r4c9: text expected='a' actual=' '
+        cell r4c10: text expected='m' actual=' '
+        cell r4c11: text expected='p' actual=' '
+        cell r4c12: text expected='e' actual=' '
+        cell r4c13: text expected='d' actual=' '
+        cell r9c4: text expected=' ' actual='b'
+        cell r9c5: text expected=' ' actual='o'
+        cell r9c6: text expected=' ' actual='t'
+        cell r9c7: text expected=' ' actual='t'
+        cell r9c8: text expected=' ' actual='o'
+        cell r9c9: text expected=' ' actual='m'
+        ... 8 more mismatched cell(s) not shown
+PASS  decscusr-styles [2 wildcard fields]
+PASS  ech-erase [2 wildcard fields]
+PASS  ed-clear-all [2 wildcard fields]
+PASS  ed-clear-below-above [2 wildcard fields]
+PASS  el-clears [2 wildcard fields]
+PASS  emoji-width [2 wildcard fields]
+PASS  equiv:repaint-converge:oracle [2 wildcard fields]
+PASS  equiv:repaint-converge:sut
+DIVERGES hpa-column: DIVERGES (known: pyte does not implement HPA (CSI `); xterm.js moves to the addressed absolute column) — 2 cell(s)
+        cell r0c5: text expected='H' actual=' '
+        cell r0c19: text expected=' ' actual='H'
+PASS  ich-dch [2 wildcard fields]
+PASS  ich-wide-edge [2 wildcard fields]
+PASS  il-dl [2 wildcard fields]
+PASS  il-dl-region-bounds [2 wildcard fields]
+DIVERGES nel-region-bottom: DIVERGES (known: pyte's NEL performs a carriage return only when LNM is set; per DEC, NEL is an unconditional CR+index, which xterm.js implements) — 6 cell(s)
+        cell r5c0: text expected=' ' actual='n'
+        cell r5c1: text expected=' ' actual='e'
+        cell r5c2: text expected=' ' actual='l'
+        cell r5c6: text expected='n' actual=' '
+        cell r5c7: text expected='e' actual=' '
+        cell r5c8: text expected='l' actual=' '
+PASS  origin-mode-decom [2 wildcard fields]
+PASS  osc-title [2 wildcard fields]
+PASS  osc1337-ignored [2 wildcard fields]
+PASS  osc52-clipboard [2 wildcard fields]
+DIVERGES osc8-hyperlink: DIVERGES (known: pyte does not implement OSC 8 hyperlinks; xterm.js consumes them and reports linked cells as underlined through its buffer API (links render underlined; iTerm2 underlines on hover only)) — 9 cell(s)
+        cell r0c0: underline expected=False actual=True
+        cell r0c1: underline expected=False actual=True
+        cell r0c2: underline expected=False actual=True
+        cell r0c3: underline expected=False actual=True
+        cell r0c4: underline expected=False actual=True
+        cell r0c5: underline expected=False actual=True
+        cell r0c6: underline expected=False actual=True
+        cell r0c7: underline expected=False actual=True
+        cell r0c8: underline expected=False actual=True
+PASS  pending-wrap-cr [2 wildcard fields]
+PASS  pending-wrap-cub [2 wildcard fields]
+PASS  pending-wrap-cup [2 wildcard fields]
+PASS  pending-wrap-defer [2 wildcard fields]
+PASS  pending-wrap-el [2 wildcard fields]
+PASS  pending-wrap-write [2 wildcard fields]
+DIVERGES rep-repeat: DIVERGES (known: pyte does not implement REP (CSI b); xterm.js repeats the preceding graphic character with the current SGR attributes) — 6 cell(s); cursor.col
+        cursor: col expected=1 actual=3
+        cell r0c2: text expected='c' actual='b'
+        cell r0c3: text expected=' ' actual='b'
+        cell r0c4: text expected=' ' actual='b'
+        cell r0c5: text expected=' ' actual='c'
+        cell r1c1: text expected=' ' actual='x'
+        cell r1c1: fg expected='default' actual=1
+        cell r1c2: text expected=' ' actual='x'
+        cell r1c2: fg expected='default' actual=1
+PASS  repaint-converge-a [2 wildcard fields]
+PASS  repaint-converge-b [2 wildcard fields]
+PASS  reverse-index-top [2 wildcard fields]
+PASS  ris-full-reset [2 wildcard fields]
 DIVERGES scroll-region-lf: DIVERGES (known: pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070) — cursor.col, cursor.row
         cursor: row expected=9 actual=0
         cursor: col expected=6 actual=0
 DIVERGES scroll-region-ri: DIVERGES (known: pyte does not home the cursor when DECSTBM (CSI r) is set/reset; xterm.js moves to (1,1) per DEC STD-070) — cursor.col, cursor.row
         cursor: row expected=4 actual=0
         cursor: col expected=13 actual=0
-PASS  sgr-16color
-PASS  sgr-256color
+PASS  scrollback-overflow [2 wildcard fields]
+PASS  sgr-16color [2 wildcard fields]
+PASS  sgr-256color [2 wildcard fields]
 DIVERGES sgr-attributes: DIVERGES (known: pyte does not implement SGR 2 (dim/faint); the pyte runner hard-reports dim=false) — 3 cell(s)
         cell r1c0: dim expected=False actual=True
         cell r1c1: dim expected=False actual=True
         cell r1c2: dim expected=False actual=True
-PASS  sgr-combos
-PASS  sgr-truecolor
-PASS  tabs-hts-tbc
-PASS  wide-cjk
-PASS  wrap-autowrap-off
-PASS  wrap-autowrap-on
+PASS  sgr-combos [2 wildcard fields]
+PASS  sgr-truecolor [2 wildcard fields]
+DIVERGES su-sd-scroll: DIVERGES (known: pyte does not implement SU/SD (CSI S / CSI T); xterm.js scrolls the screen/region per ECMA-48 and xterm) — 32 cell(s)
+        cell r0c0: text expected='l' actual=' '
+        cell r0c1: text expected='i' actual=' '
+        cell r0c2: text expected='n' actual=' '
+        cell r0c3: text expected='e' actual=' '
+        cell r0c4: text expected='-' actual=' '
+        cell r0c5: text expected='1' actual=' '
+        cell r1c5: text expected='2' actual='4'
+        cell r2c5: text expected='3' actual='5'
+        cell r3c5: text expected='4' actual='7'
+        cell r4c5: text expected='5' actual='8'
+        cell r5c5: text expected='6' actual='9'
+        cell r6c0: text expected='l' actual=' '
+        cell r6c1: text expected='i' actual=' '
+        cell r6c2: text expected='n' actual=' '
+        cell r6c3: text expected='e' actual=' '
+        cell r6c4: text expected='-' actual=' '
+        cell r6c5: text expected='7' actual=' '
+        cell r7c5: text expected='8' actual='1'
+        cell r7c6: text expected=' ' actual='0'
+        cell r8c0: text expected='l' actual=' '
+        ... 12 more mismatched cell(s) not shown
+PASS  tabs-hts-tbc [2 wildcard fields]
+PASS  wide-cjk [2 wildcard fields]
+DIVERGES wide-overwrite-half: DIVERGES (known: pyte leaves torn wide-char cells when one half is overwritten (the lead glyph or continuation stub survives); xterm.js blanks the orphaned half like iTerm2) — 3 cell(s)
+        cell r0c0: text expected='漢' actual=' '
+        cell r1c0: width expected=2 actual=1
+        cell r1c1: text expected='' actual=' '
+        cell r1c1: width expected=0 actual=1
+PASS  wrap-autowrap-off [2 wildcard fields]
+PASS  wrap-autowrap-on [2 wildcard fields]
 DIVERGES wrap-wide-at-edge: DIVERGES (known: pyte draws a wide char whose second column would overflow into the last column anyway; xterm.js (like iTerm2) wraps the whole glyph to the next row) — 3 cell(s)
         cell r0c79: text expected='漢' actual=' '
         cell r1c0: text expected=' ' actual='漢'
@@ -77,5 +214,5 @@ DIVERGES wrap-wide-at-edge: DIVERGES (known: pyte draws a wide char whose second
         cell r1c1: text expected=' ' actual=''
         cell r1c1: width expected=1 actual=0
 
-summary: 27 cases — 20 pass, 7 known-divergent, 0 unexpected fail, 0 stale-known, 0 error
+summary: 60 cases — 43 pass, 17 known-divergent, 0 unexpected fail, 0 stale-known, 0 error
 exit code: 0

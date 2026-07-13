@@ -38,7 +38,17 @@
       "properties": {
         "row": { "type": "integer", "minimum": 0 },
         "col": { "type": "integer", "minimum": 0 },
-        "visible": { "type": ["boolean", "null"], "default": true }
+        "visible": { "type": ["boolean", "null"], "default": true },
+        "style": {
+          "enum": ["block", "underline", "bar", null],
+          "default": null,
+          "description": "Cursor shape as last set by DECSCUSR (v1.1 additive field). Producers that cannot observe it report null; absent means null."
+        },
+        "blink": {
+          "type": ["boolean", "null"],
+          "default": null,
+          "description": "Cursor blink state as last set by DECSCUSR (v1.1 additive field). Producers that cannot observe it report null; absent means null."
+        }
       }
     },
     "altScreen": {

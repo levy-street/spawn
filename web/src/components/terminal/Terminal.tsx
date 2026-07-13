@@ -2,6 +2,7 @@
 
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -21,14 +22,23 @@ import {
 } from "react";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
+// Terminal configuration shared with the conformance harness
+// (tools/term-conformance/); see xterm-config.mjs before changing options.
+import {
+  activateUnicodeVersion,
+  TERMINAL_FONT_FAMILY,
+  TERMINAL_FONT_SIZE,
+  TERMINAL_LINE_HEIGHT,
+  TERMINAL_SCROLLBACK_LINES,
+  TERMINAL_SCROLLBACK_THEME,
+  TERMINAL_SNAPSHOT_LINES,
+  TERMINAL_THEME,
+  XTERM_EMULATION_OPTIONS,
+} from "@/components/terminal/xterm-config.mjs";
 import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
-const TERMINAL_FONT_SIZE = 13;
-const TERMINAL_LINE_HEIGHT = 1.2;
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
-const TERMINAL_SCROLLBACK_LINES = 100_000;
-const TERMINAL_SNAPSHOT_LINES = 10_000;
 // Defer the deep (10k-line) scrollback warm so connecting to an agent paints
 // the small connect-time history first instead of competing with a multi-MB
 // capture transfer and offscreen render.
@@ -1117,22 +1127,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!host || scrollbackTermRef.current) return;
 
     const historyTerm = new XTerm({
-      convertEol: false,
+      ...XTERM_EMULATION_OPTIONS,
       cursorBlink: false,
       disableStdin: true,
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
       scrollback: TERMINAL_SNAPSHOT_LINES,
       smoothScrollDuration: 0,
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e5e5e5",
-        cursor: "#0a0a0a",
-      },
+      theme: { ...TERMINAL_SCROLLBACK_THEME },
     });
     historyTerm.loadAddon(new WebLinksAddon());
+    activateUnicodeVersion(historyTerm, Unicode11Addon);
     historyTerm.open(host);
     scrollbackTermRef.current = historyTerm;
     // Route wheel through the shared scrollback logic (close-at-bottom,
@@ -1196,10 +1202,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return;
     }
     const term = new XTerm({
-      convertEol: false,
+      ...XTERM_EMULATION_OPTIONS,
       cursorBlink: true,
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
       // Keep a large local buffer for transcript replay and non-wheel access.
@@ -1208,11 +1213,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e5e5e5",
-        cursor: "#e5e5e5",
-      },
+      theme: { ...TERMINAL_THEME },
     });
     const fit = new FitAddon();
     const links = new WebLinksAddon();
@@ -1220,6 +1221,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.loadAddon(fit);
     term.loadAddon(links);
     term.loadAddon(clipboard);
+    activateUnicodeVersion(term, Unicode11Addon);
 
     term.open(containerRef.current);
     termRef.current = term;

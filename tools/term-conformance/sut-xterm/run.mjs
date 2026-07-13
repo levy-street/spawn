@@ -6,11 +6,21 @@
  * Usage: node run.mjs <bytes-file> --cols 80 --rows 24 --name <case-name>
  *
  * This is the real system under test: web/ renders terminals with @xterm/xterm
- * (same emulation core as @xterm/headless, pinned to the same version here).
+ * (same emulation core as @xterm/headless, pinned to the same version here),
+ * and this runner instantiates the Terminal with the exact emulation options
+ * and Unicode width tables the web client ships, imported from the shared
+ * config module in web/ (single source of truth).
  */
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import pkg from "@xterm/headless";
+import {
+  activateUnicodeVersion,
+  TERMINAL_SCROLLBACK_LINES,
+  TERMINAL_UNICODE_VERSION,
+  XTERM_EMULATION_OPTIONS,
+} from "../../../web/src/components/terminal/xterm-config.mjs";
 
 const { Terminal } = pkg;
 const require = createRequire(import.meta.url);
@@ -77,12 +87,14 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const data = readFileSync(args.file);
 
+  // The web client's exact emulation config (see web/.../xterm-config.mjs).
   const term = new Terminal({
+    ...XTERM_EMULATION_OPTIONS,
     cols: args.cols,
     rows: args.rows,
-    allowProposedApi: true,
-    scrollback: 1000,
+    scrollback: TERMINAL_SCROLLBACK_LINES,
   });
+  activateUnicodeVersion(term, Unicode11Addon);
 
   let title = "";
   term.onTitleChange((t) => {
@@ -119,6 +131,13 @@ async function main() {
     cursorVisible = null;
   }
 
+  // DECSCUSR updates the public cursorStyle/cursorBlink options (v1.1
+  // additive schema fields). "underline" and "bar" map straight through;
+  // xterm.js has no other styles.
+  const cursorStyle = ["block", "underline", "bar"].includes(term.options.cursorStyle)
+    ? term.options.cursorStyle
+    : null;
+
   const state = {
     version: 1,
     producer: { name: "xterm-headless", version: XTERM_VERSION },
@@ -128,6 +147,8 @@ async function main() {
       row: buf.cursorY,
       col: Math.min(buf.cursorX, args.cols - 1),
       visible: cursorVisible,
+      style: cursorStyle,
+      blink: typeof term.options.cursorBlink === "boolean" ? term.options.cursorBlink : null,
     },
     altScreen: term.buffer.active.type === "alternate",
     title,
