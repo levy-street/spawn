@@ -1,0 +1,194 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "cursor-cup",
+      "description": "CUP absolute positioning to corners and center; cursor left mid-screen.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cursor-cup.bin"
+    },
+    {
+      "name": "cursor-relative",
+      "description": "CUU/CUD/CUF/CUB relative movement, including clamping at the top edge.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cursor-relative.bin"
+    },
+    {
+      "name": "cursor-save-restore-decsc",
+      "description": "DECSC/DECRC (ESC 7 / ESC 8) save-restore including SGR state.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cursor-save-restore-decsc.bin"
+    },
+    {
+      "name": "cursor-save-restore-ansi",
+      "description": "ANSI save/restore cursor (CSI s / CSI u), position only.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cursor-save-restore-ansi.bin"
+    },
+    {
+      "name": "sgr-16color",
+      "description": "Standard fg 30-37, bright fg 90-97, bg 40-47, bright bg 100-107.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/sgr-16color.bin"
+    },
+    {
+      "name": "sgr-256color",
+      "description": "Indexed 256-color fg (38;5;n) and bg (48;5;n) samples from cube and grayscale ramp.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/sgr-256color.bin"
+    },
+    {
+      "name": "sgr-truecolor",
+      "description": "24-bit truecolor fg (38;2) and bg (48;2), including combined fg+bg.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/sgr-truecolor.bin"
+    },
+    {
+      "name": "sgr-attributes",
+      "description": "Each attribute alone (bold, dim, italic, underline, blink, inverse, strikethrough) then explicit removal codes.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/sgr-attributes.bin"
+    },
+    {
+      "name": "sgr-combos",
+      "description": "Attribute+color combos with selective resets (24, 39, 49) rather than SGR 0.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/sgr-combos.bin"
+    },
+    {
+      "name": "wrap-autowrap-on",
+      "description": "DECAWM on (default): 60 chars wrap across 40-col lines.",
+      "cols": 40,
+      "rows": 10,
+      "file": "cases/wrap-autowrap-on.bin"
+    },
+    {
+      "name": "wrap-autowrap-off",
+      "description": "DECAWM off (CSI ?7l): overflow overwrites the last column instead of wrapping.",
+      "cols": 40,
+      "rows": 10,
+      "file": "cases/wrap-autowrap-off.bin"
+    },
+    {
+      "name": "wrap-wide-at-edge",
+      "description": "Wide CJK char that does not fit in the last column wraps whole to the next line.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/wrap-wide-at-edge.bin"
+    },
+    {
+      "name": "scroll-region-lf",
+      "description": "DECSTBM 3;10 with LF-driven scrolling inside the region; outside rows untouched.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/scroll-region-lf.bin"
+    },
+    {
+      "name": "scroll-region-ri",
+      "description": "RI (ESC M) at the top of a DECSTBM region scrolls the region down.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/scroll-region-ri.bin"
+    },
+    {
+      "name": "ed-clear-below-above",
+      "description": "Fill screen, then ED 1 (above+left) at 6;40 and ED 0 (below+right) at 18;40.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ed-clear-below-above.bin"
+    },
+    {
+      "name": "ed-clear-all",
+      "description": "Fill screen then ED 2; cursor position must survive; marker drawn after.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ed-clear-all.bin"
+    },
+    {
+      "name": "el-clears",
+      "description": "EL 0 (right), EL 1 (left, incl. cursor cell), EL 2 (whole line) on three filled rows.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/el-clears.bin"
+    },
+    {
+      "name": "altscreen-roundtrip",
+      "description": "Enter 1049 alt screen, draw, exit; main screen content and cursor restored.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/altscreen-roundtrip.bin"
+    },
+    {
+      "name": "altscreen-active",
+      "description": "Enter 1049 alt screen and stay there; altScreen flag true, alt content visible.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/altscreen-active.bin"
+    },
+    {
+      "name": "il-dl",
+      "description": "IL (CSI L) inserts blank lines pushing content down; DL (CSI M) deletes lines pulling up.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/il-dl.bin"
+    },
+    {
+      "name": "ich-dch",
+      "description": "ICH (CSI @) inserts blanks shifting right; DCH (CSI P) deletes shifting left.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ich-dch.bin"
+    },
+    {
+      "name": "tabs-hts-tbc",
+      "description": "Default 8-col tab stops; HTS sets custom stops; TBC 3 clears all (tab then jumps to last column).",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/tabs-hts-tbc.bin"
+    },
+    {
+      "name": "origin-mode-decom",
+      "description": "DECOM: CUP becomes relative to the DECSTBM region top; reset afterwards.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/origin-mode-decom.bin"
+    },
+    {
+      "name": "reverse-index-top",
+      "description": "RI at the true top of the screen scrolls the whole screen down one line.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/reverse-index-top.bin"
+    },
+    {
+      "name": "wide-cjk",
+      "description": "Wide CJK glyphs interleaved with ASCII; continuation cells must be width-0.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/wide-cjk.bin"
+    },
+    {
+      "name": "combining-chars",
+      "description": "Combining marks attach to the preceding cell; precomposed form on next row for comparison.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/combining-chars.bin"
+    },
+    {
+      "name": "osc-title",
+      "description": "OSC 2 (BEL-terminated) then OSC 0 (ST-terminated); final title wins.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/osc-title.bin"
+    }
+  ]
+}

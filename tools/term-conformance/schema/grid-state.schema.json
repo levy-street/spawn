@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spawn.local/schemas/term-conformance/grid-state/v1.json",
+  "title": "Terminal grid state (v1)",
+  "description": "Snapshot of a terminal emulator's visible screen after feeding a corpus case. Serializers SHOULD omit cell fields equal to their documented defaults and MAY trim trailing all-default cells from each row; consumers MUST re-normalize. A null value in any nullable field means 'producer cannot observe this' and is treated as a wildcard by the differ.",
+  "type": "object",
+  "required": ["version", "size", "cursor", "altScreen", "rows"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "producer": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": ["string", "null"] }
+      }
+    },
+    "case": {
+      "type": "string",
+      "description": "Corpus case name this snapshot was produced from."
+    },
+    "size": {
+      "type": "object",
+      "required": ["cols", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "cols": { "type": "integer", "minimum": 1 },
+        "rows": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "required": ["row", "col"],
+      "additionalProperties": false,
+      "description": "0-based screen coordinates. col MUST be clamped to [0, cols-1]; a pending-wrap cursor reports the last column.",
+      "properties": {
+        "row": { "type": "integer", "minimum": 0 },
+        "col": { "type": "integer", "minimum": 0 },
+        "visible": { "type": ["boolean", "null"], "default": true }
+      }
+    },
+    "altScreen": {
+      "type": ["boolean", "null"],
+      "description": "True if the alternate screen buffer (DECSET 47/1047/1049) is active at snapshot time."
+    },
+    "title": {
+      "type": ["string", "null"],
+      "default": "",
+      "description": "Terminal window title as last set by OSC 0/2. Empty string if never set; null if unobservable."
+    },
+    "rows": {
+      "type": "array",
+      "description": "Exactly size.rows entries (top to bottom). Each row holds at most size.cols cells (left to right); trailing all-default cells may be trimmed.",
+      "items": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/cell" }
+      }
+    }
+  },
+  "$defs": {
+    "color": {
+      "description": "\"default\" = terminal default fg/bg; integer = 256-color palette index; \"#rrggbb\" = truecolor; null = unobservable.",
+      "oneOf": [
+        { "const": "default" },
+        { "type": "integer", "minimum": 0, "maximum": 255 },
+        { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+        { "type": "null" }
+      ]
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string",
+          "default": " ",
+          "description": "Cell contents: base character plus any combining marks (uncombined; differ compares NFC-normalized). Unwritten/erased cells MUST serialize as a single space. Wide-char continuation cells MUST serialize as \"\" with width 0."
+        },
+        "width": {
+          "enum": [0, 1, 2],
+          "default": 1,
+          "description": "2 = lead cell of a wide (e.g. CJK) character; 0 = continuation cell of a wide character; 1 otherwise."
+        },
+        "fg": { "$ref": "#/$defs/color", "default": "default" },
+        "bg": { "$ref": "#/$defs/color", "default": "default" },
+        "bold": { "type": ["boolean", "null"], "default": false },
+        "dim": { "type": ["boolean", "null"], "default": false },
+        "italic": { "type": ["boolean", "null"], "default": false },
+        "underline": { "type": ["boolean", "null"], "default": false },
+        "inverse": { "type": ["boolean", "null"], "default": false },
+        "strikethrough": { "type": ["boolean", "null"], "default": false },
+        "blink": { "type": ["boolean", "null"], "default": false }
+      }
+    }
+  }
+}

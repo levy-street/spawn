@@ -1,0 +1,17 @@
+[project]
+name = "term-conformance"
+version = "0.1.0"
+description = "Grid-state conformance harness: xterm.js (SUT) vs iTerm2 / pyte oracles"
+requires-python = ">=3.12"
+dependencies = [
+    "pyte>=0.8.2",
+    "jsonschema>=4.23",
+]
+
+# The iterm2 package only works on macOS (it talks to a running iTerm2 app).
+# Install on a Mac with: uv sync --group iterm2
+[dependency-groups]
+iterm2 = ["iterm2>=2.7"]
+
+[tool.uv]
+package = false
