@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Conformance SUT runner: feeds corpus bytes to @xterm/headless and emits grid-state JSON (schema v1). Pinned to the same xterm.js major/minor as web/ (@xterm/xterm ^5.5.0).",
   "dependencies": {
+    "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "5.5.0"
   }
 }
