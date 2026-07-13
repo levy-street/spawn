@@ -115,7 +115,10 @@ async function watchPageHealth(page: Page) {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    if (message.type() === "error") {
+      const location = message.location();
+      consoleErrors.push(`${message.text()} [${location.url}]`);
+    }
   });
   page.on("pageerror", (error) => {
     pageErrors.push(error.stack ?? error.message);
@@ -225,10 +228,36 @@ async function openAuditedTerminal(
     reconnectHistory?: string;
   } = {},
 ) {
+  // Trust Phase 1 (spawn.v2) holds keystrokes until a WebRTC DataChannel
+  // opens, which never happens against the mocked WebSocket. Pin the client
+  // to the spawn.v1 relay like terminal.spec.ts does (Playwright's WS mock
+  // always selects the first offered subprotocol).
+  await page.addInitScript(() => {
+    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
+  });
   await mockAuthenticatedApi(page, { agents: [agent()] });
   const messages: WireMessage[] = [];
   const sockets: WebSocketRoute[] = [];
   const socketEvents: SocketEvent[] = [];
+  const restUploads: Array<Record<string, unknown>> = [];
+
+  // Uploads travel over REST (not WebSocket frames); mirror the API and echo
+  // the daemon's usual terminal acknowledgement into the live socket.
+  await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    restUploads.push(body);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: {
+        agent_id: AGENT_ID,
+        path: `/Users/tester/projects/spawn/${String(body.name ?? "upload.bin")}`,
+        client_id: String(body.client_id ?? ""),
+        pasted: false,
+      },
+    });
+    sockets.at(-1)?.send(Buffer.from(`\r\nuploaded:${String(body.name ?? "")}\r\n$ `));
+  });
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     sockets.push(ws);
@@ -340,7 +369,7 @@ async function openAuditedTerminal(
 
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(page.getByLabel("Agent terminal")).toBeVisible();
-  return { messages, sockets, socketEvents };
+  return { messages, restUploads, sockets, socketEvents };
 }
 
 test.use({
@@ -358,7 +387,7 @@ test.describe("terminal usability audit", () => {
   }, testInfo) => {
     const health = await watchPageHealth(page);
     const observations: Observation[] = [];
-    const { messages, sockets, socketEvents } = await openAuditedTerminal(page, {
+    const { messages, restUploads, sockets, socketEvents } = await openAuditedTerminal(page, {
       history: `${longHistory(180)}audit-ready\n$ `,
     });
 
@@ -400,9 +429,8 @@ test.describe("terminal usability audit", () => {
       buffer: Buffer.from("uploaded from terminal usability audit\n"),
     });
     await expect
-      .poll(() => jsonMessages(messages).find((message) => message?.type === "upload"))
+      .poll(() => restUploads.at(-1))
       .toMatchObject({
-        type: "upload",
         name: "audit-note.txt",
         mime_type: "text/plain",
         bytes_b64: Buffer.from("uploaded from terminal usability audit\n").toString("base64"),

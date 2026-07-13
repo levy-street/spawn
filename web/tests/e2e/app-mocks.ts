@@ -378,6 +378,12 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    // Repaint self-healing: the terminal requests a tmux refresh-client after
+    // owner resizes and control changes.
+    if (path.match(/^\/api\/agents\/[^/]+\/redraw$/) && method === "POST") {
+      await route.fulfill({ status: 204 });
+      return;
+    }
 
     await route.fulfill({
       status: 404,

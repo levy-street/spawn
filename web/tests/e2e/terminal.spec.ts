@@ -574,3 +574,79 @@ test("connection chip opens a details popover", async ({ page }) => {
   await expect(page.getByText("Round trip", { exact: true })).toBeVisible();
   await expect(page.getByText(/spawn\.v/).first()).toBeVisible();
 });
+
+// Terminal emulation fidelity in the real renderer. Grid-level behavior is
+// covered by tools/term-conformance/; these assert the browser-visible side
+// of the same guarantees (shared config in xterm-config.mjs).
+
+test("emoji occupy two cells (Unicode 11 width tables)", async ({ page }) => {
+  await openTerminalWithMockSocket(page, { history: "\u{1F600}X\r\n" });
+  const rows = liveTerminalRows(page);
+  await expect(rows).toContainText("X");
+
+  const widths = await rows.evaluate((rowsEl) => {
+    const spans = Array.from(rowsEl.querySelectorAll("span"));
+    const width = (text: string) =>
+      spans.find((s) => s.textContent === text)?.getBoundingClientRect().width ?? 0;
+    return { emoji: width("\u{1F600}"), x: width("X") };
+  });
+  expect(widths.x).toBeGreaterThan(0);
+  // Under xterm's built-in Unicode 6 tables the emoji is one cell wide and
+  // glyphs render overlapped; Unicode 11 gives it a two-cell lead.
+  expect(widths.emoji / widths.x).toBeCloseTo(2, 1);
+});
+
+test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page }) => {
+  await openTerminalWithMockSocket(page, {
+    history: "\x1b]8;;https://example.com\x1b\\LINKTEXT\x1b]8;;\x1b\\ plain\r\n",
+  });
+  const rows = liveTerminalRows(page);
+  await expect(rows).toContainText("LINKTEXT");
+  await expect(rows).not.toContainText("example.com");
+
+  const decoration = await rows
+    .locator("span", { hasText: "LINKTEXT" })
+    .first()
+    .evaluate((node) => getComputedStyle(node).textDecorationLine);
+  expect(decoration).toContain("underline");
+  const plainDecoration = await rows
+    .locator("span", { hasText: "plain" })
+    .first()
+    .evaluate((node) => getComputedStyle(node).textDecorationLine);
+  expect(plainDecoration).not.toContain("underline");
+});
+
+test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {
+  const { sockets } = await openTerminalWithMockSocket(page, { history: "ready\r\n" });
+  await page.getByLabel("Agent terminal").click();
+
+  sockets[0]?.send(Buffer.from("\x1b[6 q"));
+  await expect(page.getByTestId("terminal-live-host").locator(".xterm-cursor-bar")).toHaveCount(1);
+
+  sockets[0]?.send(Buffer.from("\x1b[4 q"));
+  await expect(
+    page.getByTestId("terminal-live-host").locator(".xterm-cursor-underline"),
+  ).toHaveCount(1);
+
+  sockets[0]?.send(Buffer.from("\x1b[2 q"));
+  await expect(page.getByTestId("terminal-live-host").locator(".xterm-cursor-bar")).toHaveCount(0);
+  await expect(
+    page.getByTestId("terminal-live-host").locator(".xterm-cursor-underline"),
+  ).toHaveCount(0);
+});
+
+test.describe("OSC 52 clipboard", () => {
+  test.use({ permissions: ["clipboard-read", "clipboard-write"] });
+
+  test("agent writes to the system clipboard through OSC 52", async ({ page }) => {
+    const { sockets } = await openTerminalWithMockSocket(page, { history: "ready\r\n" });
+    await page.getByLabel("Agent terminal").click();
+
+    const payload = Buffer.from("hello clipboard", "utf8").toString("base64");
+    sockets[0]?.send(Buffer.from(`\x1b]52;c;${payload}\x07`));
+
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText().catch(() => "")))
+      .toBe("hello clipboard");
+  });
+});

@@ -394,6 +394,27 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeDcReplaySlices],
   );
 
+  // xterm's Viewport translates DOM scrollTop into buffer lines by dividing
+  // by its measured row height. While the overlay host is hidden or
+  // mid-relayout that height can be 0, and 0/0 poisons the buffer's scroll
+  // offset (ydisp) with NaN — which never heals because every public scroll
+  // API is delta-based (NaN + n = NaN), leaving the overlay wedged shut
+  // under the reader (upstream xterm.js Viewport bug, observed on 5.5.0
+  // under slow-frame conditions). Reset the internal offset directly;
+  // pinned-version internals, degrades to a no-op if they move.
+  const healScrollbackScrollState = useCallback(() => {
+    const historyTerm = scrollbackTermRef.current;
+    if (!historyTerm || Number.isFinite(historyTerm.buffer.active.viewportY)) return;
+    const buffer = (
+      historyTerm as unknown as {
+        _core?: { _bufferService?: { buffer?: { ydisp?: unknown } } };
+      }
+    )._core?._bufferService?.buffer;
+    if (buffer && typeof buffer.ydisp === "number" && !Number.isFinite(buffer.ydisp)) {
+      buffer.ydisp = 0;
+    }
+  }, []);
+
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
     if (scrollbackRerenderTimerRef.current) {
@@ -435,11 +456,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // out under the reader. The render's own completion callback re-runs
       // this with the rebuilt buffer.
       if (scrollbackRenderInFlightRef.current) return;
+      healScrollbackScrollState();
       const buffer = scrollbackTermRef.current?.buffer.active;
       const reveal = buffer ? buffer.baseY > 0 && buffer.viewportY < buffer.baseY : false;
       setScrollbackReadyState(reveal);
     },
-    [setScrollbackReadyState],
+    [healScrollbackScrollState, setScrollbackReadyState],
   );
 
   const renderScrollbackSnapshot = useCallback(
@@ -509,6 +531,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               return;
             }
             scrollbackOverlayHasSnapshotRef.current = true;
+            healScrollbackScrollState();
             const restoreLine = scrollbackRestoreLineRef.current;
             scrollbackRestoreLineRef.current = null;
             if (restoreLine !== null) {
@@ -532,7 +555,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         });
       });
     },
-    [getScrollbackViewport, takeDcReplaySlices, updateScrollbackReveal],
+    [getScrollbackViewport, healScrollbackScrollState, takeDcReplaySlices, updateScrollbackReveal],
   );
   renderScrollbackSnapshotRef.current = renderScrollbackSnapshot;
 
@@ -544,6 +567,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (scrollbackRenderInFlightRef.current) return false;
     if (!overlay || !bytes || scrollbackRenderedSnapshotBytesRef.current !== bytes) return false;
     scrollbackOverlayHasSnapshotRef.current = true;
+    healScrollbackScrollState();
     const historyTerm = scrollbackTermRef.current;
     const pendingDelta = scrollbackPendingDeltaPxRef.current;
     const pendingLines = Math.trunc(pendingDelta / Math.max(1, terminalRowHeightRef.current));
@@ -553,7 +577,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackStableLineRef.current = historyTerm?.buffer.active.viewportY ?? null;
     updateScrollbackReveal(overlay);
     return true;
-  }, [getScrollbackViewport, updateScrollbackReveal]);
+  }, [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal]);
   revealRenderedScrollbackRef.current = revealRenderedScrollback;
 
   const prepareScrollbackSnapshot = useCallback(() => {
@@ -1386,6 +1410,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       // Scroll through xterm's internal line state: raw DOM scrollTop writes
       // race with the viewport syncing xterm performs on concurrent writes.
+      healScrollbackScrollState();
       overlayWheelRemainderPx += deltaY;
       const rowHeight = Math.max(1, terminalRowHeightRef.current);
       const lines = Math.trunc(overlayWheelRemainderPx / rowHeight);
@@ -2025,6 +2050,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     // through `socketRef`, so it doesn't need to be in deps.
   }, [
     getScrollbackViewport,
+    healScrollbackScrollState,
     hideScrollbackOverlay,
     recordScrollbackUserPosition,
     updateScrollbackReveal,
