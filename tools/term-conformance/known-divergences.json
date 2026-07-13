@@ -28,6 +28,46 @@
     {
       "case": "wrap-wide-at-edge",
       "reason": "pyte draws a wide char whose second column would overflow into the last column anyway; xterm.js (like iTerm2) wraps the whole glyph to the next row"
+    },
+    {
+      "case": "su-sd-scroll",
+      "reason": "pyte does not implement SU/SD (CSI S / CSI T); xterm.js scrolls the screen/region per ECMA-48 and xterm"
+    },
+    {
+      "case": "rep-repeat",
+      "reason": "pyte does not implement REP (CSI b); xterm.js repeats the preceding graphic character with the current SGR attributes"
+    },
+    {
+      "case": "bce-ed-bg",
+      "reason": "pyte fills ED-cleared cells with the default background (it honors BCE for EL but not ED); xterm.js, like iTerm2, erases with the active SGR background"
+    },
+    {
+      "case": "wide-overwrite-half",
+      "reason": "pyte leaves torn wide-char cells when one half is overwritten (the lead glyph or continuation stub survives); xterm.js blanks the orphaned half like iTerm2"
+    },
+    {
+      "case": "osc8-hyperlink",
+      "reason": "pyte does not implement OSC 8 hyperlinks; xterm.js consumes them and reports linked cells as underlined through its buffer API (links render underlined; iTerm2 underlines on hover only)"
+    },
+    {
+      "case": "nel-region-bottom",
+      "reason": "pyte's NEL performs a carriage return only when LNM is set; per DEC, NEL is an unconditional CR+index, which xterm.js implements"
+    },
+    {
+      "case": "decom-outside-region",
+      "reason": "pyte treats a DECOM CUP addressing a row outside the scroll region as a no-op (cursor unmoved); xterm.js clamps to the region bottom per DEC STD-070"
+    },
+    {
+      "case": "hpa-column",
+      "reason": "pyte does not implement HPA (CSI `); xterm.js moves to the addressed absolute column"
+    },
+    {
+      "case": "cht-cbt-tabs",
+      "reason": "pyte does not implement CHT (CSI I) / CBT (CSI Z); xterm.js moves the cursor by tab stops"
+    },
+    {
+      "case": "decaln-resets-margins",
+      "reason": "pyte's DECALN fills the screen with E but neither resets DECSTBM margins nor homes the cursor; xterm.js resets margins and homes per DEC STD-070"
     }
   ]
 }

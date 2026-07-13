@@ -64,8 +64,14 @@ def make_state(
     alt_screen: bool | None,
     title: str | None,
     grid: list[list[dict]],
+    cursor_style: str | None = None,
+    cursor_blink: bool | None = None,
 ) -> dict:
-    """Assemble a schema-v1 document from full (non-compacted) cells."""
+    """Assemble a schema-v1 document from full (non-compacted) cells.
+
+    cursor_style / cursor_blink are v1.1 additive DECSCUSR observations;
+    None (the default) means "producer cannot observe" and diffs as wildcard.
+    """
     state = {
         "version": SCHEMA_VERSION,
         "producer": {"name": producer_name, "version": producer_version},
@@ -74,6 +80,8 @@ def make_state(
             "row": max(0, min(cursor_row, rows - 1)),
             "col": max(0, min(cursor_col, cols - 1)),
             "visible": cursor_visible,
+            "style": cursor_style,
+            "blink": cursor_blink,
         },
         "altScreen": alt_screen,
         "title": title,

@@ -53,6 +53,12 @@ def load_manifest(only_case: str | None = None) -> list[dict]:
     return cases
 
 
+def load_equivalences() -> list[dict]:
+    """Groups of cases whose final grids must be identical (e.g. the
+    repaint-convergence pair modeling checkpoint-replay reattach)."""
+    return json.loads(MANIFEST.read_text()).get("equivalences", [])
+
+
 def load_known_divergences() -> dict[str, str]:
     if not KNOWN_DIVERGENCES.exists():
         return {}
@@ -181,6 +187,35 @@ def _compare_dirs(
         exp_label = exp_label or _producer_label(exp, expected_dir)
         act_label = act_label or _producer_label(act, actual_dir)
         results.append(differ.compare_states(exp, act, name))
+
+    # Equivalence groups: every member of a group must produce an identical
+    # grid within EACH side (oracle and SUT separately). Failures are ordinary
+    # unexpected failures (exit 1) — the allowlist does not apply to them.
+    if only_case is None:
+        for group in load_equivalences():
+            for side, states in (("oracle", expected), ("sut", actual)):
+                members = [(n, states.get(n)) for n in group["cases"]]
+                bad = [n for n, s in members if not isinstance(s, dict)]
+                label = f"equiv:{group['name']}:{side}"
+                if bad:
+                    results.append(
+                        differ.CaseResult(label, [], 0, 0, error=f"missing member(s): {bad}")
+                    )
+                    continue
+                first_name, first_state = members[0]
+                for other_name, other_state in members[1:]:
+                    r = differ.compare_states(first_state, other_state, label)
+                    if not r.passed:
+                        r.mismatches.insert(
+                            0,
+                            differ.Mismatch(
+                                "equivalence",
+                                "grids",
+                                f"{first_name} == {other_name}",
+                                "grids differ",
+                            ),
+                        )
+                    results.append(r)
 
     report, exit_code = differ.render_report(
         results,

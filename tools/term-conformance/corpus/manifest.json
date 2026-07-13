@@ -189,6 +189,233 @@
       "cols": 80,
       "rows": 24,
       "file": "cases/osc-title.bin"
+    },
+    {
+      "name": "pending-wrap-defer",
+      "description": "Fill exactly one row: wrap is deferred, cursor reports last column, next row untouched.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-defer.bin"
+    },
+    {
+      "name": "pending-wrap-write",
+      "description": "Printable after a pending wrap triggers the deferred wrap to row 2 col 1.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-write.bin"
+    },
+    {
+      "name": "pending-wrap-cr",
+      "description": "CR cancels a pending wrap: next char overwrites row 1 col 1, no wrap occurs.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-cr.bin"
+    },
+    {
+      "name": "pending-wrap-cub",
+      "description": "CUB from the pending-wrap state moves off the last column and cancels the wrap.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-cub.bin"
+    },
+    {
+      "name": "pending-wrap-el",
+      "description": "EL 0 in the pending-wrap state erases from the last column; wrap stays cancelled for the next char.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-el.bin"
+    },
+    {
+      "name": "pending-wrap-cup",
+      "description": "Explicit CUP cancels a pending wrap; the next char lands at the addressed cell.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/pending-wrap-cup.bin"
+    },
+    {
+      "name": "decaln-fill",
+      "description": "DECALN (ESC # 8) fills the whole screen with E; drawing afterwards overwrites normally.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/decaln-fill.bin"
+    },
+    {
+      "name": "decaln-resets-margins",
+      "description": "DECALN resets DECSTBM margins and homes the cursor: an LF at the true bottom scrolls the full screen.",
+      "cols": 20,
+      "rows": 24,
+      "file": "cases/decaln-resets-margins.bin"
+    },
+    {
+      "name": "ech-erase",
+      "description": "ECH (CSI X) erases n cells at the cursor without moving it; count clamps at end of line.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ech-erase.bin"
+    },
+    {
+      "name": "bce-el-bg",
+      "description": "Background color erase: EL fills erased cells with the active SGR background.",
+      "cols": 20,
+      "rows": 6,
+      "file": "cases/bce-el-bg.bin"
+    },
+    {
+      "name": "bce-ed-bg",
+      "description": "Background color erase: ED fills the cleared region with the active SGR background.",
+      "cols": 10,
+      "rows": 4,
+      "file": "cases/bce-ed-bg.bin"
+    },
+    {
+      "name": "su-sd-scroll",
+      "description": "SU (CSI S) and SD (CSI T) shift lines within the screen, then SU inside a DECSTBM region.",
+      "cols": 80,
+      "rows": 10,
+      "file": "cases/su-sd-scroll.bin"
+    },
+    {
+      "name": "rep-repeat",
+      "description": "REP (CSI b) repeats the preceding graphic character, inheriting current SGR attributes.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/rep-repeat.bin"
+    },
+    {
+      "name": "il-dl-region-bounds",
+      "description": "IL outside a DECSTBM region is a no-op; IL at the region bottom and DL at the region top shift only region rows.",
+      "cols": 80,
+      "rows": 12,
+      "file": "cases/il-dl-region-bounds.bin"
+    },
+    {
+      "name": "nel-region-bottom",
+      "description": "NEL (ESC E) at the DECSTBM bottom scrolls the region and always performs a carriage return.",
+      "cols": 80,
+      "rows": 8,
+      "file": "cases/nel-region-bottom.bin"
+    },
+    {
+      "name": "decom-outside-region",
+      "description": "DECOM: CUP addressing a row beyond the region clamps to the region bottom (DEC STD-070).",
+      "cols": 80,
+      "rows": 12,
+      "file": "cases/decom-outside-region.bin"
+    },
+    {
+      "name": "cursor-line-col-ops",
+      "description": "CNL (CSI E) and CPL (CSI F) move to column 1 of other lines; VPA (CSI d) and CHA (CSI G) address directly.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cursor-line-col-ops.bin"
+    },
+    {
+      "name": "hpa-column",
+      "description": "HPA (CSI `) addresses an absolute column on the current row.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/hpa-column.bin"
+    },
+    {
+      "name": "cht-cbt-tabs",
+      "description": "CHT (CSI I) jumps forward n tab stops; CBT (CSI Z) jumps backward.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/cht-cbt-tabs.bin"
+    },
+    {
+      "name": "decscusr-styles",
+      "description": "DECSCUSR sequences change only cursor style/blink (v1.1 fields); the grid must be unaffected.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/decscusr-styles.bin"
+    },
+    {
+      "name": "wide-overwrite-half",
+      "description": "Overwriting either half of a wide char blanks the orphaned half instead of leaving torn cells.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/wide-overwrite-half.bin"
+    },
+    {
+      "name": "ich-wide-edge",
+      "description": "ICH that would push half a wide char past the right edge drops the whole glyph.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ich-wide-edge.bin"
+    },
+    {
+      "name": "combining-eol",
+      "description": "Combining marks attach to the last-column cell even in the pending-wrap state.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/combining-eol.bin"
+    },
+    {
+      "name": "emoji-width",
+      "description": "Emoji are width 2 under the Unicode 11 tables the web client ships (xterm's built-in default is width-1 Unicode 6).",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/emoji-width.bin"
+    },
+    {
+      "name": "osc8-hyperlink",
+      "description": "OSC 8 hyperlinks: anchor text renders in-grid, no URL bytes leak; xterm.js additionally reports linked cells as underlined.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/osc8-hyperlink.bin"
+    },
+    {
+      "name": "osc52-clipboard",
+      "description": "OSC 52 (clipboard write) has no grid-observable effect; payload must not leak into the screen.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/osc52-clipboard.bin"
+    },
+    {
+      "name": "osc1337-ignored",
+      "description": "iTerm2 proprietary OSC 1337 must be consumed cleanly by non-iTerm2 emulators; no payload leaks.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/osc1337-ignored.bin"
+    },
+    {
+      "name": "ris-full-reset",
+      "description": "RIS (ESC c) clears the screen, homes the cursor, and resets margins, DECOM, and SGR; default tab stops return.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/ris-full-reset.bin"
+    },
+    {
+      "name": "scrollback-overflow",
+      "description": "More lines than rows: the viewport shows the tail; earlier lines move to scrollback.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/scrollback-overflow.bin"
+    },
+    {
+      "name": "repaint-converge-a",
+      "description": "Full-redraw checkpoint replay converges: repaint tail after margin/SGR-heavy prefix.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/repaint-converge-a.bin"
+    },
+    {
+      "name": "repaint-converge-b",
+      "description": "Full-redraw checkpoint replay converges: same repaint tail after scrolled/DECOM prefix.",
+      "cols": 80,
+      "rows": 24,
+      "file": "cases/repaint-converge-b.bin"
+    }
+  ],
+  "equivalences": [
+    {
+      "name": "repaint-converge",
+      "cases": [
+        "repaint-converge-a",
+        "repaint-converge-b"
+      ],
+      "reason": "a full-redraw checkpoint replay must produce identical grids regardless of prior screen state (reattach correctness)"
     }
   ]
 }

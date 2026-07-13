@@ -131,6 +131,13 @@ async function main() {
     cursorVisible = null;
   }
 
+  // DECSCUSR updates the public cursorStyle/cursorBlink options (v1.1
+  // additive schema fields). "underline" and "bar" map straight through;
+  // xterm.js has no other styles.
+  const cursorStyle = ["block", "underline", "bar"].includes(term.options.cursorStyle)
+    ? term.options.cursorStyle
+    : null;
+
   const state = {
     version: 1,
     producer: { name: "xterm-headless", version: XTERM_VERSION },
@@ -140,6 +147,8 @@ async function main() {
       row: buf.cursorY,
       col: Math.min(buf.cursorX, args.cols - 1),
       visible: cursorVisible,
+      style: cursorStyle,
+      blink: typeof term.options.cursorBlink === "boolean" ? term.options.cursorBlink : null,
     },
     altScreen: term.buffer.active.type === "alternate",
     title,

@@ -12,7 +12,7 @@ case's raw bytes. Scrollback is out of scope. The formal definition lives in
   "producer": { "name": "xterm-headless", "version": "5.5.0" },
   "case": "sgr-truecolor",
   "size": { "cols": 80, "rows": 24 },
-  "cursor": { "row": 3, "col": 10, "visible": true },
+  "cursor": { "row": 3, "col": 10, "visible": true, "style": "block", "blink": false },
   "altScreen": false,
   "title": "",
   "rows": [
@@ -42,15 +42,24 @@ case's raw bytes. Scrollback is out of scope. The formal definition lives in
   differ compares text NFC-normalized so `"é"` and `"é"` match.
 - **Unwritten vs erased cells** both serialize as `" "` (width 1). Erased cells keep
   their background color if the emulator does background-color-erase.
-- **Unknowns.** Any nullable field (`title`, `altScreen`, `cursor.visible`, any cell
-  style field or color) may be `null`, meaning the producer cannot observe it. The
-  differ treats null as a wildcard match and reports wildcard counts, so a limited
-  oracle degrades transparently instead of producing false failures.
+- **Unknowns.** Any nullable field (`title`, `altScreen`, `cursor.visible`,
+  `cursor.style`, `cursor.blink`, any cell style field or color) may be `null`, meaning
+  the producer cannot observe it. The differ treats null as a wildcard match and
+  reports wildcard counts, so a limited oracle degrades transparently instead of
+  producing false failures.
+- **Cursor style (v1.1 additive).** `cursor.style` (`"block" | "underline" | "bar"`)
+  and `cursor.blink` report the DECSCUSR state at snapshot time. Both default to
+  `null` (absent = null = unobservable); pyte cannot observe them, xterm reports them
+  from its public options. They matter for reattach fidelity: a replayed checkpoint
+  must restore the cursor shape the app selected.
 
 ## Versioning
 
 `version` is a monotonically increasing integer. Consumers MUST reject documents whose
-version they don't know. Additive, default-carrying fields (e.g. a future
-`underlineStyle`) bump the version; fixtures record the version they were produced with,
-and the differ refuses to compare mismatched versions. v1 is intentionally minimal:
-no scrollback, no hyperlinks, no underline color/style, no protected attributes.
+version they don't know. Fields whose absence is defined as `null`/wildcard (like
+`cursor.style`) may be added WITHOUT a version bump: old documents simply wildcard
+them. Additive fields with non-wildcard defaults (e.g. a future `underlineStyle`
+defaulting to a concrete style) bump the version; fixtures record the version they
+were produced with, and the differ refuses to compare mismatched versions. v1 is
+intentionally minimal: no scrollback, no hyperlink URLs, no underline color/style,
+no protected attributes.

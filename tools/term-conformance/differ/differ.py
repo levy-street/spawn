@@ -95,6 +95,9 @@ def compare_states(expected: dict, actual: dict, case: str) -> CaseResult:
         expected["cursor"].get("visible", True),
         actual["cursor"].get("visible", True),
     )
+    # v1.1 additive DECSCUSR observations; absent means null (wildcard).
+    check("cursor", "style", expected["cursor"].get("style"), actual["cursor"].get("style"))
+    check("cursor", "blink", expected["cursor"].get("blink"), actual["cursor"].get("blink"))
     check("screen", "altScreen", expected["altScreen"], actual["altScreen"])
     check("screen", "title", expected.get("title", ""), actual.get("title", ""))
 
