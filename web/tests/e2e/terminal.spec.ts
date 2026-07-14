@@ -432,6 +432,43 @@ test("terminal reconciles stale live content when returning from a fresh scrollb
     .toBe(true);
 });
 
+test("exact worker streams skip the live rewrite when closing scrollback", async ({ page }) => {
+  // The live terminal consumes every byte even while the overlay is open, so
+  // for worker replays there is nothing to reconcile on close — a rewrite
+  // would replay recently-scrolled lines into a buffer that already has them
+  // (the "repeated lines while output generates" bug).
+  const history = `\x1b[8;30;100t${longHistory(60)}live-bottom\n$ `;
+  const { messages, sockets } = await openTerminalWithMockSocket(page, { history });
+  await expect(liveTerminalRows(page)).toContainText("live-bottom");
+
+  sockets[0]?.send(Buffer.from("streamed-while-open-001\r\n"));
+  await expect(liveTerminalRows(page)).toContainText("streamed-while-open-001");
+
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -300);
+  await expect
+    .poll(() => jsonMessages(messages).filter((m) => m?.type === "snapshot").length)
+    .toBeGreaterThanOrEqual(1);
+  sockets[0]?.send(
+    JSON.stringify({
+      type: "snapshot",
+      bytes_b64: b64(`${history}streamed-while-open-001\r\n`),
+      plain: false,
+      dc_offset: 0,
+    }),
+  );
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+
+  await page.mouse.wheel(0, 5000);
+  await expect(overlay).not.toBeVisible();
+  // No duplicate of the streamed line, and no tmux-era redraw request.
+  await page.waitForTimeout(400);
+  const rows = await liveTerminalRows(page).innerText();
+  expect(rows.match(/streamed-while-open-001/g)?.length ?? 0).toBe(1);
+  expect(jsonMessages(messages).some((m) => m?.type === "redraw")).toBe(false);
+});
+
 test("returning from scrollback over an alternate-screen app leaves the live terminal untouched", async ({
   page,
 }) => {

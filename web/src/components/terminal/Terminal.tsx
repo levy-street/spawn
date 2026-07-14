@@ -278,6 +278,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
   const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
+  // True once a snapshot/history proved this agent ships exact worker
+  // replays; used to widen the overlay fetch budget (the daemon maps lines
+  // to a byte budget, and TUI redraw churn dwarfs the tmux-era line sizing).
+  const exactStreamRef = useRef(false);
   const invalidateScrollbackForResizeRef = useRef<() => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
@@ -344,7 +348,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
 
   const syncLiveTerminalFromSnapshot = useCallback(
-    (bytes: Uint8Array | null): boolean => {
+    (bytes: Uint8Array | null, opts?: { force?: boolean }): boolean => {
       const term = termRef.current;
       if (
         !term ||
@@ -358,6 +362,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // viewport and repaints incrementally; rewriting it from a flattened
       // snapshot would desync the buffer and cursor from the app's state.
       if (term.buffer.active.type === "alternate") return false;
+
+      const text = decodeUtf8(bytes);
+      const exact = parseExactReplay(text) !== null;
+      // Exact worker streams keep the live terminal byte-exact by
+      // construction (it consumes every live byte even while the overlay is
+      // open), so there is nothing to reconcile on overlay close — and a
+      // rewrite would replay recently-scrolled lines into a buffer that
+      // already contains them, duplicating history. Only a forced reseed
+      // (width change reflow) rewrites, and it clears first for the same
+      // reason.
+      if (exact && !opts?.force) return false;
 
       // Compute the replay BEFORE writing anything: if the ring buffer can't
       // cover the gap between the snapshot's capture offset and now (e.g.
@@ -374,17 +389,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // The live terminal can be mid-dispose during route changes; the next
         // socket history frame will seed the replacement instance.
       }
-      // Exact worker states are self-contained idempotent repaints, so no
-      // destructive clear is needed and existing scrollback (real history)
-      // survives. Legacy tmux captures clear via escape sequences instead of
-      // term.reset(): reset() also wipes terminal modes (bracketed paste,
-      // mouse reporting, application cursor keys) that the agent still
-      // believes are active, garbling input until the next full repaint.
-      const text = decodeUtf8(bytes);
-      const seedOps = liveSeedWriteOps(text);
-      const ops: SequencedWrite[] = parseExactReplay(text)
-        ? seedOps
-        : [{ data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" }, ...seedOps];
+      // Clear via escape sequences instead of term.reset(): reset() also
+      // wipes terminal modes (bracketed paste, mouse reporting, application
+      // cursor keys) that the agent still believes are active, garbling
+      // input until the next full repaint. The 3J matters: without wiping
+      // local scrollback, the seed's replayed output would duplicate lines
+      // the buffer already scrolled in.
+      const ops: SequencedWrite[] = [
+        { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
+        ...liveSeedWriteOps(text),
+      ];
       writeSequenced(
         term,
         [...ops, ...replaySlices.map((slice) => ({ data: slice }))],
@@ -908,8 +922,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes) => {
       const term = termRef.current;
       if (!term) return;
-      const altActive =
-        exactReplayEndsInAlternate(decodeUtf8(bytes)) ?? containsAlternateBufferSwitch(bytes);
+      const endsInAlt = exactReplayEndsInAlternate(decodeUtf8(bytes));
+      if (endsInAlt !== null) exactStreamRef.current = true;
+      const altActive = endsInAlt ?? containsAlternateBufferSwitch(bytes);
       if (altActive) {
         scrollbackCachedSnapshotBytesRef.current = null;
         scrollbackCacheDirtyRef.current = true;
@@ -931,6 +946,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset) => {
+      if (parseExactReplay(decodeUtf8(bytes)) !== null) exactStreamRef.current = true;
       if (scrollbackSnapshotTimeoutRef.current) {
         clearTimeout(scrollbackSnapshotTimeoutRef.current);
         scrollbackSnapshotTimeoutRef.current = null;
@@ -965,7 +981,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // rewrite the live buffer from this anchored capture so it reflows.
         // Stays pending until a rewrite actually succeeds (alternate-screen
         // apps and replay-coverage gaps defer it to a later snapshot).
-        if (syncLiveTerminalFromSnapshot(bytes)) {
+        if (syncLiveTerminalFromSnapshot(bytes, { force: true })) {
           historyReseedPendingRef.current = false;
           socketRef.current.sendJson({ type: "redraw" });
         }
@@ -1048,7 +1064,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       lines:
         purpose === "cache" && !dcActiveRef.current
           ? SCROLLBACK_RELAY_CACHE_LINES
-          : TERMINAL_SNAPSHOT_LINES,
+          : purpose === "overlay" && exactStreamRef.current
+            ? // Worker replays: reach the full retained log. A TUI's redraw
+              // churn is hundreds of bytes per "line", so the tmux-era
+              // lines→bytes sizing leaves older transcript out of reach and
+              // scrollback dead-ends ("can't scroll") on busy sessions.
+              TERMINAL_SNAPSHOT_LINES * 4
+            : TERMINAL_SNAPSHOT_LINES,
       plain: false,
     });
     if (!sent) {
@@ -2041,8 +2063,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
     ro.observe(terminalViewport);
 
+    // ResizeObserver only fires on size changes; two mount-time races leave
+    // the terminal misfitted at a stable size until something (like toggling
+    // the sidebar) nudges the container: the monospace font finishing its
+    // load after the initial fit measured fallback-font cell metrics, and a
+    // background tab's throttled layout settling only on refocus.
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") scheduleFit();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    document.fonts?.ready
+      .then(() => {
+        scheduleFit();
+      })
+      .catch(() => {});
+
     return () => {
       ro.disconnect();
+      document.removeEventListener("visibilitychange", onVisibility);
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });
       term.textarea?.removeEventListener("input", onInput, { capture: true });
