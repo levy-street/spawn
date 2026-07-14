@@ -68,7 +68,13 @@ try {
   await page.waitForTimeout(6000); // claude startup render
   await shot("01-claude-started");
 
+  // Accept the folder-trust dialog if present (free text on a selection
+  // dialog can trigger letter shortcuts like "No, exit"); Enter on the main
+  // input box is a harmless empty submit.
   await term.click();
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(4000);
+  await shot("01b-main-ui");
   await page.keyboard.type("first line of a draft prompt that is not submitted", { delay: 15 });
   await shot("02-typed-in-box");
 

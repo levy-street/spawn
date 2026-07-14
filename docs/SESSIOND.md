@@ -316,9 +316,13 @@ handler on a second vte parser for the states `Term` keeps private (margins,
 charsets). `serialize()` emits an ANSI stream reconstructing cells,
 attributes, hyperlinks, wide/combining chars, cursor (including pending
 wrap), margins, modes, charsets, cursor style, and palette overrides — for
-both screens when the alternate screen is active. The fidelity contract
-(`feed → serialize → re-feed ⇒ identical state`) is enforced cell-by-cell by
-the module's unit tests, and end-to-end by
+both screens when the alternate screen is active — including the DECSC
+saved-cursor register, which Ink renderers (claude, codex) rely on around
+every frame. Checkpoints only land on escape-sequence/UTF-8 boundaries
+(`sessiond/boundary.rs` tracks VT framing; the worker defers a due
+checkpoint until the stream is safe to cut, capped at 32 KB). The fidelity
+contract (`feed → serialize → re-feed ⇒ identical state`) is enforced
+cell-by-cell by the module's unit tests, and end-to-end by
 `replay_reconstructs_the_live_screen_across_rotations`, which renders the
 live byte stream and the replay through two emulators and requires identical
 screens. `T_REDRAW` is obsolete and ignored by workers: snapshots synthesized
