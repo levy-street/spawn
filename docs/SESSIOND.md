@@ -136,7 +136,7 @@ guessed at.
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | raw bytes | live PTY output |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
-| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); also recorded in the log as a `RESIZE` record |
+| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); forces a log checkpoint at the new geometry |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
 | `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = total output bytes logged at capture |
@@ -283,17 +283,23 @@ emulator-serialized screen state}`. When `append_output` crosses the segment
 budget, the worker serializes its checkpoint emulator and rotates — **the
 agent process is never signaled, resized, or otherwise disturbed by storage
 rotation** (`scrollback_rotation_must_not_disturb_the_agent` in
-`worker_e2e.rs` asserts this). PTY resizes are written as `RESIZE` records,
-so every byte in the log is attributable to a known geometry.
+`worker_e2e.rs` asserts this). A PTY resize **forces a checkpoint at the new
+geometry** (replacing the active segment in place when it holds no output
+yet, so resize storms rewrite one small file instead of growing the log);
+every segment is therefore single-geometry and self-contained.
 
 Replay returns the newest run of whole segments fitting the caller's budget
-as a **self-describing stream**: it opens with a geometry marker
-(`CSI 8 ; rows ; cols t`) plus the starting checkpoint's synthesized repaint,
-emits another marker at every recorded resize, and skips later segments'
-checkpoints (their state is reproduced by the output flowing through). The
-browser client (`parseExactReplay`/`writeSequenced` in `Terminal.tsx`)
-applies each chunk's geometry via `term.resize()` — xterm.js parses but does
-not implement CSI 8 t itself — so old-geometry bytes never render garbled.
+as a **self-describing stream of geometry-tagged chunks**: each included
+segment contributes `CSI 8 ; rows ; cols t` + its checkpoint repaint + its
+output. Checkpoint repaints are idempotent (leading `?1049l`, full-row
+painting, no ED), so mid-stream chunks converge rather than duplicate, and
+the final chunk alone reconstructs the current screen at the current
+geometry. The browser exploits both properties (`parseExactReplay` in
+`Terminal.tsx`): the **live terminal is seeded from the final chunk with
+zero resize calls** — it is fit-sized and must never be geometry-walked —
+while the display-only scrollback overlay renders every chunk at its own
+geometry via sequenced `term.resize()` (xterm.js parses but does not
+implement CSI 8 t itself).
 
 The original design used checkpoint *markers* plus a SIGWINCH jiggle to
 provoke repaints from the app. That was retired: it duplicated full frames in
@@ -341,7 +347,7 @@ is involved in any of these tests.
 
 **Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
 sends `T_RESIZE`; the worker applies it to the PTY master and the checkpoint
-emulator, and records it in the log. Resize *authority* is a client/server-side
+emulator, and checkpoints the log at the new geometry. Resize *authority* is a client/server-side
 concern: the display-control feature (commit c43340c) designates one
 controlling viewer whose geometry drives the session while other viewers dim
 — `display.control` frames carry owner + geometry + viewer metadata only (no
