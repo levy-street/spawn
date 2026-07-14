@@ -160,6 +160,9 @@ function AgentTerminal() {
         name: `terminal-diag-${new Date().toISOString().replaceAll(":", "-")}.json`,
         mime_type: "application/json",
         bytes_b64: btoa(binary),
+        // Diagnostics are for offline review — never paste the saved path
+        // into the agent's prompt like image uploads do.
+        paste: false,
       });
       setActionError(null);
       setDiagSaved(true);
