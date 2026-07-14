@@ -6,15 +6,16 @@
 //! with a CHECKPOINT record carrying the geometry and an emulator-serialized
 //! screen state (see `sessiond::emulator`), so a replay starting at any
 //! segment boundary opens with an exact synthesized repaint — the agent
-//! process is never signaled or disturbed to produce one. PTY resizes are
-//! recorded as RESIZE records so every byte of a replay is renderable at a
-//! known geometry.
+//! process is never signaled or disturbed to produce one. A PTY resize
+//! forces a checkpoint (replacing the active segment when it holds no output
+//! yet, so resize storms cannot grow the log), which makes **every segment
+//! single-geometry and self-contained**.
 //!
-//! Replay output is a self-describing ANSI stream: it opens with a geometry
-//! marker (`CSI 8 ; rows ; cols t`) followed by the checkpoint repaint, and
-//! every in-stream resize becomes another geometry marker. A consumer that
-//! honors the marker (xterm.js `windowOptions.setWinSizeChars`) renders the
-//! whole stream faithfully.
+//! Replay output is a self-describing ANSI stream of geometry-tagged chunks:
+//! each included segment contributes `CSI 8 ; rows ; cols t` + its checkpoint
+//! repaint + its output. Checkpoint repaints are idempotent (full-row
+//! painting, no ED), so mid-stream chunks converge rather than duplicate, and
+//! a consumer may seed a live terminal from the final chunk alone.
 //!
 //! Growth is bounded: when the total plaintext budget is exceeded, whole
 //! oldest segments are deleted (never partial records, never the newest
@@ -45,7 +46,6 @@ pub const DEFAULT_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 pub const KIND_OUTPUT: u8 = 1;
 pub const KIND_CHECKPOINT: u8 = 2;
-pub const KIND_RESIZE: u8 = 3;
 
 /// Terminal geometry plus the emulator-serialized screen state that
 /// reconstructs it; written at the head of every segment.
@@ -55,9 +55,9 @@ pub struct Checkpoint<'a> {
     pub state: &'a [u8],
 }
 
-/// The self-describing geometry marker replays open with and emit at every
-/// recorded resize: `CSI 8 ; rows ; cols t` (xterm window ops; honored by
-/// xterm.js via `windowOptions.setWinSizeChars`).
+/// The geometry marker heading every replay chunk: `CSI 8 ; rows ; cols t`
+/// (xterm window ops syntax; xterm.js parses but does not apply it, so the
+/// web client splits on it and applies geometry via `term.resize()`).
 pub fn geometry_marker(cols: u16, rows: u16) -> Vec<u8> {
     format!("\x1b[8;{rows};{cols}t").into_bytes()
 }
@@ -158,23 +158,25 @@ impl ScrollbackLog {
         Ok(seg.plaintext_bytes >= self.segment_bytes)
     }
 
-    /// Record a PTY geometry change so replays can reproduce it in-stream.
-    /// No-op when the geometry is unchanged.
-    pub fn append_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        if self.geometry == (cols, rows) {
+    /// Record a PTY geometry change by checkpointing at the new geometry:
+    /// rotate when the active segment holds output, otherwise replace the
+    /// active segment's checkpoint in place — a resize storm therefore
+    /// rewrites one small file instead of growing the log. No-op when the
+    /// geometry is unchanged.
+    pub fn resize_checkpoint(&mut self, checkpoint: &Checkpoint<'_>) -> Result<()> {
+        if self.geometry == (checkpoint.cols, checkpoint.rows) {
             return Ok(());
         }
-        self.geometry = (cols, rows);
-        let mut payload = [0u8; 4];
-        payload[..2].copy_from_slice(&cols.to_le_bytes());
-        payload[2..].copy_from_slice(&rows.to_le_bytes());
-        self.append_record(KIND_RESIZE, &payload)?;
-        // Count toward segment fullness (but never the OUTPUT watermark) so
-        // resize-heavy idle sessions still rotate instead of growing a
-        // segment without bound.
-        let seg = self.segments.last_mut().expect("active segment");
-        seg.plaintext_bytes += payload.len() as u64;
-        Ok(())
+        let active = self.segments.last().expect("active segment");
+        if active.plaintext_bytes == 0 {
+            let index = active.index;
+            let path = active.path.clone();
+            self.segments.pop();
+            let _ = fs::remove_file(&path);
+            self.geometry = (checkpoint.cols, checkpoint.rows);
+            return self.begin_segment(index, checkpoint);
+        }
+        self.rotate(checkpoint)
     }
 
     /// Close the active segment and open the next one headed by `checkpoint`,
@@ -194,10 +196,10 @@ impl ScrollbackLog {
 
     /// Decrypt and stitch a self-describing replay stream from the newest run
     /// of whole segments whose plaintext fits `max_bytes` (always at least
-    /// the newest segment). The stream opens with a geometry marker plus the
-    /// starting segment's checkpoint repaint; later segments' checkpoints are
-    /// skipped (their state is reproduced by the output that flows through),
-    /// and RESIZE records become in-stream geometry markers.
+    /// the newest segment). Every included segment contributes a geometry
+    /// marker + its checkpoint repaint + its output, so each chunk between
+    /// markers is self-contained and the final chunk alone reconstructs the
+    /// current screen at the current geometry.
     pub fn replay(&mut self, max_bytes: u64) -> Result<Vec<u8>> {
         self.active.flush().ok();
         let mut start = self.segments.len().saturating_sub(1);
@@ -214,25 +216,32 @@ impl ScrollbackLog {
         }
 
         let mut out = Vec::new();
-        let mut expect_seq: Option<u64> = None;
-        let mut opened = false;
+        // Seqs must be contiguous within a segment and strictly increasing
+        // across segment boundaries (in-place checkpoint replacement retires
+        // seq ranges, so cross-segment gaps are legitimate).
+        let mut min_seq: u64 = 0;
         for seg in &self.segments[start..] {
             let data =
                 fs::read(&seg.path).with_context(|| format!("reading {}", seg.path.display()))?;
             let mut offset = 0usize;
+            let mut expect_seq: Option<u64> = None;
             while offset < data.len() {
                 let (kind, seq, ct) = parse_record(&data, &mut offset)
                     .with_context(|| format!("parsing {}", seg.path.display()))?;
-                if let Some(expected) = expect_seq {
-                    if seq != expected {
-                        secret::wipe(&mut out);
-                        bail!(
-                            "scrollback sequence gap in {} (expected {expected}, got {seq})",
-                            seg.path.display()
-                        );
-                    }
+                let valid = match expect_seq {
+                    Some(expected) => seq == expected,
+                    None => seq >= min_seq,
+                };
+                if !valid {
+                    secret::wipe(&mut out);
+                    bail!(
+                        "scrollback sequence gap in {} (expected {:?}/min {min_seq}, got {seq})",
+                        seg.path.display(),
+                        expect_seq
+                    );
                 }
                 expect_seq = Some(seq + 1);
+                min_seq = seq + 1;
                 let nonce_bytes = nonce_for(seq);
                 let mut plaintext = match self.cipher.decrypt(
                     Nonce::from_slice(&nonce_bytes),
@@ -252,8 +261,7 @@ impl ScrollbackLog {
                 };
                 match kind {
                     KIND_OUTPUT => out.extend_from_slice(&plaintext),
-                    KIND_CHECKPOINT if !opened => {
-                        opened = true;
+                    KIND_CHECKPOINT => {
                         let (cols, rows, state) = match decode_checkpoint(&plaintext) {
                             Ok(parts) => parts,
                             Err(e) => {
@@ -267,12 +275,6 @@ impl ScrollbackLog {
                         };
                         out.extend_from_slice(&geometry_marker(cols, rows));
                         out.extend_from_slice(state);
-                    }
-                    KIND_CHECKPOINT => {} // covered by the output flowing through
-                    KIND_RESIZE if plaintext.len() == 4 => {
-                        let cols = u16::from_le_bytes([plaintext[0], plaintext[1]]);
-                        let rows = u16::from_le_bytes([plaintext[2], plaintext[3]]);
-                        out.extend_from_slice(&geometry_marker(cols, rows));
                     }
                     _ => {}
                 }
@@ -474,13 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn resize_records_become_geometry_markers() {
+    fn resize_rotates_when_the_segment_has_output() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
         log.append_output(b"before").unwrap();
-        log.append_resize(120, 40).unwrap();
-        log.append_resize(120, 40).unwrap(); // dedup: no second marker
+        let resized = Checkpoint {
+            cols: 120,
+            rows: 40,
+            state: b"STATE-AT-120",
+        };
+        log.resize_checkpoint(&resized).unwrap();
+        log.resize_checkpoint(&resized).unwrap(); // dedupe: unchanged geometry
         log.append_output(b"after").unwrap();
+        assert_eq!(log.segment_count(), 2);
         let replay = log.replay(1024).unwrap();
         assert_eq!(
             replay,
@@ -488,12 +496,42 @@ mod tests {
                 marker().as_slice(),
                 b"before",
                 geometry_marker(120, 40).as_slice(),
+                b"STATE-AT-120",
                 b"after"
             ]
             .concat()
         );
         // Watermark counts output only.
         assert_eq!(log.total_logged(), 11);
+    }
+
+    #[test]
+    fn resize_storm_replaces_the_empty_segment_in_place() {
+        let dir = tempdir().unwrap();
+        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        log.append_output(b"content").unwrap();
+        for i in 0..50u16 {
+            log.resize_checkpoint(&Checkpoint {
+                cols: 100 + i,
+                rows: 40,
+                state: b"S",
+            })
+            .unwrap();
+        }
+        // One rotation for the first change, in-place replacement after.
+        assert_eq!(log.segment_count(), 2);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        let replay = log.replay(1024).unwrap();
+        assert_eq!(
+            replay,
+            [
+                marker().as_slice(),
+                b"content",
+                geometry_marker(149, 40).as_slice(),
+                b"S"
+            ]
+            .concat()
+        );
     }
 
     #[test]
@@ -520,9 +558,18 @@ mod tests {
                 );
             }
         }
-        // ...but it decrypts fine.
+        // ...but it decrypts fine (including the rotated-in checkpoint state).
         let replay = log.replay(1024).unwrap();
-        assert_eq!(replay, [marker().as_slice(), output_marker].concat());
+        assert_eq!(
+            replay,
+            [
+                marker().as_slice(),
+                output_marker,
+                marker().as_slice(),
+                state_marker
+            ]
+            .concat()
+        );
     }
 
     #[test]
@@ -548,11 +595,16 @@ mod tests {
         // Only segment files that are tracked exist on disk.
         let on_disk = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(on_disk, log.segment_count());
-        // Replay decrypts cleanly from a checkpoint boundary.
+        // Replay decrypts cleanly; each segment contributes one geometry
+        // marker (checkpoint states are empty in this test).
         let replay = log.replay(u64::MAX).unwrap();
         let head = marker();
-        assert_eq!(replay.len() as u64, head.len() as u64 + total_plaintext);
-        assert!(replay[head.len()..].iter().all(|&b| b == b'x'));
+        let expected_len = head.len() as u64 * log.segment_count() as u64 + total_plaintext;
+        assert_eq!(replay.len() as u64, expected_len);
+        assert_eq!(
+            replay.iter().filter(|&&b| b == b'x').count() as u64,
+            total_plaintext
+        );
     }
 
     #[test]
@@ -569,12 +621,18 @@ mod tests {
             replay,
             [marker().as_slice(), b"NEW-CKPT-STATE", b"new-new-new!"].concat()
         );
-        // Large budget: everything from the older checkpoint; the newer
-        // segment's checkpoint is skipped (output flows through it).
+        // Large budget: both segments, each opened by its own checkpoint.
         let replay = log.replay(1024).unwrap();
         assert_eq!(
             replay,
-            [marker().as_slice(), b"old-old-old!new-new-new!"].concat()
+            [
+                marker().as_slice(),
+                b"old-old-old!",
+                marker().as_slice(),
+                b"NEW-CKPT-STATE",
+                b"new-new-new!"
+            ]
+            .concat()
         );
     }
 

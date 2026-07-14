@@ -295,21 +295,26 @@ test("terminal reconnect restores a fresh terminal history snapshot", async ({ p
 
 test("worker replay streams render exactly with geometry markers", async ({ page }) => {
   // Worker-backed agents ship history/snapshots as exact terminal byte
-  // streams self-described by geometry markers (CSI 8 ; rows ; cols t). The
-  // client must render them without the tmux-capture CR/LF reformatting —
-  // the lone-\r overwrite below would split into two lines under it — and
-  // apply each chunk's geometry so old-size bytes never render garbled.
+  // streams of geometry-tagged, self-contained chunks (CSI 8 ; rows ; cols t
+  // + checkpoint repaint + output). The client must render them without the
+  // tmux-capture CR/LF reformatting — the lone-\r overwrite below would
+  // split into two lines under it. The LIVE terminal seeds from the final
+  // chunk alone and is never resized through historical geometries; the
+  // overlay renders every chunk at its own geometry.
   const history =
     "\x1b[8;30;80t" +
     `${Array.from({ length: 40 }, (_, i) => `deep-${String(i).padStart(3, "0")}`).join("\r\n")}\r\n` +
     "progress:AAAA\rprogress:BBBB\r\n" +
     "\x1b[8;30;100t" +
-    "tail-at-current-size\r\n$ ";
+    "repainted-screen-line\r\nprogress:BBBB\r\ntail-at-current-size\r\n$ ";
   await openTerminalWithMockSocket(page, { history });
 
   await expect(liveTerminalRows(page)).toContainText("tail-at-current-size");
   await expect(liveTerminalRows(page)).toContainText("progress:BBBB");
   await expect(liveTerminalRows(page)).not.toContainText("AAAA");
+  // Last-chunk-only seeding: old-geometry content stays out of the live
+  // terminal buffer entirely.
+  await expect(liveTerminalRows(page)).not.toContainText("deep-039");
 
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -600);

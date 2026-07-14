@@ -180,16 +180,23 @@ impl Emulator {
         paint_screen(&self.term, &mut active_paint);
 
         // Painting baseline: default pen, no margins, absolute addressing,
-        // autowrap on (paint_screen relies on natural wrapping), clear screen.
+        // autowrap on (paint_screen relies on natural wrapping). There is
+        // deliberately no ED (2J): paint_screen covers every row (content or
+        // EL), which makes the state stream idempotent when written over an
+        // already-populated terminal — it can never scroll stale content into
+        // scrollback, so checkpoints may appear mid-stream. The leading
+        // `?1049l` normalizes a consumer stuck on the alternate screen; it is
+        // a no-op otherwise. It must never be fed back into self (the alt
+        // repair below relies on self staying on its own alternate screen).
         const BASELINE: &[u8] = b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
         let mut out: Vec<u8> = Vec::with_capacity(8192);
+        out.extend_from_slice(b"\x1b[?1049l");
         out.extend_from_slice(BASELINE);
-        out.extend_from_slice(b"\x1b[2J\x1b[H");
 
         let alt_active = mode.contains(TermMode::ALT_SCREEN);
         if alt_active {
-            // Mirror the baseline in self (sans the clear: the primary grid
-            // is the source of the paint, not its target).
+            // Mirror the baseline in self: the primary grid is the source of
+            // the paint, not its target.
             self.feed(BASELINE);
             // Paint the primary screen first so leaving the alt screen after
             // reattach reveals the right content.
@@ -203,7 +210,6 @@ impl Emulator {
         // Reconstruction tail: active screen and every remaining state. Built
         // separately so the alt path can replay it into self.
         let mut tail: Vec<u8> = Vec::with_capacity(4096);
-        tail.extend_from_slice(b"\x1b[2J\x1b[H");
         tail.extend_from_slice(&active_paint);
 
         // Margins (CSI r homes the cursor; emitted before final placement).

@@ -374,17 +374,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // The live terminal can be mid-dispose during route changes; the next
         // socket history frame will seed the replacement instance.
       }
-      // Clear via escape sequences instead of term.reset(): reset() also wipes
-      // terminal modes (bracketed paste, mouse reporting, application cursor
-      // keys) that the agent still believes are active, garbling input until
-      // the next full repaint.
+      // Exact worker states are self-contained idempotent repaints, so no
+      // destructive clear is needed and existing scrollback (real history)
+      // survives. Legacy tmux captures clear via escape sequences instead of
+      // term.reset(): reset() also wipes terminal modes (bracketed paste,
+      // mouse reporting, application cursor keys) that the agent still
+      // believes are active, garbling input until the next full repaint.
+      const text = decodeUtf8(bytes);
+      const seedOps = liveSeedWriteOps(text);
+      const ops: SequencedWrite[] = parseExactReplay(text)
+        ? seedOps
+        : [{ data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" }, ...seedOps];
       writeSequenced(
         term,
-        [
-          { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
-          ...snapshotWriteOps(decodeUtf8(bytes), { cols, rows }),
-          ...replaySlices.map((slice) => ({ data: slice })),
-        ],
+        [...ops, ...replaySlices.map((slice) => ({ data: slice }))],
         () => {
           term.scrollToBottom();
         },
@@ -503,7 +506,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // its bytes were produced for, and xterm reflows on each transition.
       const replaySlices = takeDcReplaySlices(bytes) ?? [];
       const ops: SequencedWrite[] = [
-        ...snapshotWriteOps(decodeUtf8(bytes), { cols, rows }),
+        ...overlayWriteOps(decodeUtf8(bytes), { cols, rows }),
         ...replaySlices.map((slice) => ({ data: slice })),
       ];
       writeSequenced(historyTerm, ops, () => {
@@ -905,7 +908,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
       term.reset();
-      writeSequenced(term, snapshotWriteOps(decodeUtf8(bytes), lastSizeRef.current), () => {
+      writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
       });
       liveRewriteAtRef.current = Date.now();
@@ -2617,10 +2620,10 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
   step();
 }
 
-/** Build the sequenced ops for a snapshot payload: exact worker replays get
- *  per-chunk geometry, tmux captures get the legacy reformat, and both end at
- *  `finalSize`. */
-function snapshotWriteOps(
+/** Sequenced ops for the scrollback overlay (a display-only terminal that is
+ *  safe to resize): exact worker replays get per-chunk geometry, tmux
+ *  captures get the legacy reformat, and both end at `finalSize`. */
+function overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
 ): SequencedWrite[] {
@@ -2637,6 +2640,19 @@ function snapshotWriteOps(
     ops.push({ resize: finalSize, data: "" });
   }
   return ops;
+}
+
+/** Sequenced ops for seeding the LIVE terminal, which is fit-sized and must
+ *  never be geometry-walked (resizing it reflows the buffer and desyncs it
+ *  from its container). Exact worker replays end with a self-contained chunk
+ *  — a full idempotent repaint at the current PTY geometry — so the final
+ *  chunk alone seeds the screen. tmux captures keep the legacy reformat. */
+function liveSeedWriteOps(text: string): SequencedWrite[] {
+  const exact = parseExactReplay(text);
+  if (!exact) {
+    return [{ data: formatSnapshotForXterm(text) }];
+  }
+  return [{ data: exact[exact.length - 1].data }];
 }
 
 function formatSnapshotForXterm(input: string): string {

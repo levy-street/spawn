@@ -415,12 +415,21 @@ async fn handle_frame(
                 *p.size.lock().unwrap() = (cols, rows);
                 resize_master(&p.master, cols, rows);
             }
+            // A resize forces a checkpoint at the new geometry so every log
+            // segment stays single-geometry and the final replay chunk is
+            // always self-contained at the current size.
             if let Some(emu) = emulator.as_mut() {
                 emu.resize(cols, rows);
-            }
-            if let Some(active_log) = log.as_mut() {
-                if let Err(e) = active_log.append_resize(cols, rows) {
-                    tracing::warn!(error = %e, "recording resize failed");
+                if let Some(active_log) = log.as_mut() {
+                    let state = emu.serialize();
+                    if let Err(e) = active_log.resize_checkpoint(&Checkpoint {
+                        cols,
+                        rows,
+                        state: &state,
+                    }) {
+                        tracing::warn!(error = %e, "resize checkpoint failed");
+                    }
+                    secret::wipe_vec(state);
                 }
             }
             Ok(LoopAction::Continue)
