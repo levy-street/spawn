@@ -61,7 +61,12 @@ def decode_upload(
     clean_mime = str(mime_type or "").strip().lower()[:MAX_UPLOAD_MIME_LENGTH]
     if not clean_mime:
         clean_mime = "application/octet-stream"
-    if destination != UPLOAD_DESTINATION_CWD and not clean_mime.startswith("image/"):
+    # Terminal pastes/drops are image-only (they become @path references for
+    # TUIs); application/json is additionally allowed for the diagnostics
+    # bundles the terminal refresh button saves to the agent host.
+    if destination != UPLOAD_DESTINATION_CWD and not (
+        clean_mime.startswith("image/") or clean_mime == "application/json"
+    ):
         raise UploadValidationError("Only image files can be pasted or dropped here.")
 
     if not isinstance(bytes_b64, str) or not bytes_b64:
