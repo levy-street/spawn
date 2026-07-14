@@ -54,7 +54,10 @@ pub async fn save_upload(
     bytes_b64: &str,
     save_to_cwd: bool,
 ) -> Result<PathBuf> {
-    if !save_to_cwd && !mime_type.starts_with("image/") {
+    // Attachments accept images (terminal paste/drop) plus application/json
+    // (the terminal refresh button's diagnostics bundles); mirrors the server
+    // gate in agent_control.decode_upload.
+    if !save_to_cwd && !(mime_type.starts_with("image/") || mime_type == "application/json") {
         anyhow::bail!("upload is not an image");
     }
     if cwd.trim().is_empty() {
