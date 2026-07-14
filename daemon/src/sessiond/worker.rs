@@ -34,10 +34,69 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use super::boundary::SeqScanner;
 use super::emulator::Emulator;
 use super::scrollback::{Checkpoint, ScrollbackLog};
 use super::secret::{self, SecretBytes};
 use super::wire;
+
+/// A checkpoint waiting for an escape-sequence boundary in the output stream
+/// (splitting a sequence across segments would garble replays).
+#[derive(Clone, Copy, PartialEq)]
+enum PendingCheckpoint {
+    Rotate,
+    Resize,
+}
+
+/// If no boundary shows up within this many deferred bytes (pathological
+/// endless string), checkpoint anyway — a bounded rare glitch beats an
+/// unbounded segment.
+const CHECKPOINT_DEFER_CAP: usize = 32 * 1024;
+
+#[derive(Default)]
+struct CheckpointGate {
+    scanner: SeqScanner,
+    pending: Option<PendingCheckpoint>,
+    deferred_bytes: usize,
+}
+
+/// Serialize the emulator and cut the log: a rotation for size-triggered
+/// checkpoints, a geometry checkpoint for resize-triggered ones.
+fn checkpoint_now(log: &mut ScrollbackLog, emulator: &mut Emulator, kind: PendingCheckpoint) {
+    let (cols, rows) = emulator.geometry();
+    let state = emulator.serialize();
+    let checkpoint = Checkpoint {
+        cols,
+        rows,
+        state: &state,
+    };
+    let result = match kind {
+        PendingCheckpoint::Rotate => log.rotate(&checkpoint),
+        PendingCheckpoint::Resize => log.resize_checkpoint(&checkpoint),
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "checkpoint failed");
+    }
+    secret::wipe_vec(state);
+}
+
+/// Feed bytes to the emulator and the log; a due rotation is queued on the
+/// gate (checkpoints land only on sequence boundaries).
+fn ingest(emu: &mut Emulator, log: &mut ScrollbackLog, bytes: &[u8], gate: &mut CheckpointGate) {
+    if bytes.is_empty() {
+        return;
+    }
+    emu.feed(bytes);
+    match log.append_output(bytes) {
+        Ok(true) => {
+            if gate.pending.is_none() {
+                gate.pending = Some(PendingCheckpoint::Rotate);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "scrollback append failed"),
+    }
+}
 
 /// How long a worker with no agent yet waits for `Start` before giving up.
 const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -147,6 +206,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     };
     let mut log: Option<ScrollbackLog> = None;
     let mut emulator: Option<Emulator> = None;
+    let mut gate = CheckpointGate::default();
 
     if let Some(parent) = args.socket.parent() {
         std::fs::create_dir_all(parent)
@@ -241,6 +301,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &mut conn_write,
                     &mut log,
                     &mut emulator,
+                    &mut gate,
                     &setup,
                     &mut pty_tx,
                     &mut exit_tx,
@@ -265,30 +326,45 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 match chunk {
                     Some(mut chunk) => {
                         // Feed the screen emulator, then encrypt-on-read into
-                        // the log, then forward live. A due rotation opens the
-                        // next segment with an emulator-serialized checkpoint;
-                        // the agent process is never signaled or disturbed.
-                        if let Some(emu) = emulator.as_mut() {
-                            emu.feed(&chunk);
-                        }
-                        if let Some(active_log) = log.as_mut() {
-                            match active_log.append_output(&chunk) {
-                                Ok(true) => {
-                                    if let Some(emu) = emulator.as_mut() {
-                                        let (cols, rows) = emu.geometry();
-                                        let state = emu.serialize();
-                                        if let Err(e) = active_log.rotate(&Checkpoint {
-                                            cols,
-                                            rows,
-                                            state: &state,
-                                        }) {
-                                            tracing::warn!(error = %e, "scrollback rotate failed");
-                                        }
-                                        secret::wipe_vec(state);
+                        // the log, then forward live. Checkpoints only land
+                        // on escape-sequence boundaries; the agent process is
+                        // never signaled or disturbed by any of it.
+                        if let (Some(emu), Some(active_log)) = (emulator.as_mut(), log.as_mut()) {
+                            let split = match gate.pending {
+                                Some(_) => gate.scanner.first_boundary(&chunk),
+                                None => {
+                                    gate.scanner.scan(&chunk);
+                                    None
+                                }
+                            };
+                            match (gate.pending, split) {
+                                (Some(kind), Some(i)) => {
+                                    ingest(emu, active_log, &chunk[..i], &mut gate);
+                                    checkpoint_now(active_log, emu, kind);
+                                    gate.pending = None;
+                                    gate.deferred_bytes = 0;
+                                    ingest(emu, active_log, &chunk[i..], &mut gate);
+                                }
+                                (Some(kind), None) => {
+                                    ingest(emu, active_log, &chunk, &mut gate);
+                                    gate.deferred_bytes += chunk.len();
+                                    if gate.deferred_bytes > CHECKPOINT_DEFER_CAP {
+                                        checkpoint_now(active_log, emu, kind);
+                                        gate.pending = None;
+                                        gate.deferred_bytes = 0;
                                     }
                                 }
-                                Ok(false) => {}
-                                Err(e) => tracing::warn!(error = %e, "scrollback append failed"),
+                                (None, _) => ingest(emu, active_log, &chunk, &mut gate),
+                            }
+                            // A checkpoint that became due in this chunk can
+                            // land right away when the stream sits at a
+                            // sequence boundary.
+                            if let Some(kind) = gate.pending {
+                                if gate.scanner.at_boundary() {
+                                    checkpoint_now(active_log, emu, kind);
+                                    gate.pending = None;
+                                    gate.deferred_bytes = 0;
+                                }
                             }
                         }
                         if let Some(w) = conn_write.as_mut() {
@@ -363,6 +439,7 @@ async fn handle_frame(
     conn_write: &mut Option<OwnedWriteHalf>,
     log: &mut Option<ScrollbackLog>,
     emulator: &mut Option<Emulator>,
+    gate: &mut CheckpointGate,
     setup: &LogSetup,
     pty_tx: &mut Option<mpsc::UnboundedSender<Vec<u8>>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
@@ -417,19 +494,17 @@ async fn handle_frame(
             }
             // A resize forces a checkpoint at the new geometry so every log
             // segment stays single-geometry and the final replay chunk is
-            // always self-contained at the current size.
+            // always self-contained at the current size. Deferred to the
+            // next escape-sequence boundary when the stream is mid-sequence;
+            // a resize supersedes a pending size rotation (it rotates too).
             if let Some(emu) = emulator.as_mut() {
                 emu.resize(cols, rows);
                 if let Some(active_log) = log.as_mut() {
-                    let state = emu.serialize();
-                    if let Err(e) = active_log.resize_checkpoint(&Checkpoint {
-                        cols,
-                        rows,
-                        state: &state,
-                    }) {
-                        tracing::warn!(error = %e, "resize checkpoint failed");
+                    if gate.pending.is_none() && gate.scanner.at_boundary() {
+                        checkpoint_now(active_log, emu, PendingCheckpoint::Resize);
+                    } else {
+                        gate.pending = Some(PendingCheckpoint::Resize);
                     }
-                    secret::wipe_vec(state);
                 }
             }
             Ok(LoopAction::Continue)

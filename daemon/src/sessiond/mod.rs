@@ -7,6 +7,7 @@
 //! binary's private modules) so that the worker binary and the integration
 //! tests can share them.
 
+pub mod boundary;
 pub mod emulator;
 pub mod scrollback;
 pub mod secret;

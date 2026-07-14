@@ -894,7 +894,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes) => {
       const term = termRef.current;
       if (!term) return;
-      if (containsAlternateBufferSwitch(bytes)) {
+      const altActive =
+        exactReplayEndsInAlternate(decodeUtf8(bytes)) ?? containsAlternateBufferSwitch(bytes);
+      if (altActive) {
         scrollbackCachedSnapshotBytesRef.current = null;
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
@@ -2640,6 +2642,19 @@ function overlayWriteOps(
     ops.push({ resize: finalSize, data: "" });
   }
   return ops;
+}
+
+/**
+ * Whether an exact worker replay leaves the terminal on the alternate
+ * screen. Scoped to the final chunk: historical alt-app sessions in older
+ * chunks must not count, only the state the stream ends in. Returns null for
+ * non-exact (tmux capture) payloads.
+ */
+function exactReplayEndsInAlternate(text: string): boolean | null {
+  const exact = parseExactReplay(text);
+  if (!exact) return null;
+  const data = exact[exact.length - 1].data;
+  return data.lastIndexOf("\x1b[?1049h") > data.lastIndexOf("\x1b[?1049l");
 }
 
 /** Sequenced ops for seeding the LIVE terminal, which is fit-sized and must

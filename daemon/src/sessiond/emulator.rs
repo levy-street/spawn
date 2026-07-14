@@ -176,6 +176,10 @@ impl Emulator {
         let needs_wrap = self.term.grid().cursor.input_needs_wrap;
         let wrap_cell = self.term.grid()[cursor.line][cursor.column].clone();
         let template = self.term.grid().cursor.template.clone();
+        // The DECSC register: Ink-style renderers (claude, codex) wrap every
+        // frame in save/restore, so a checkpoint landing mid-frame MUST
+        // reproduce it or the replayed DECRC teleports the next frame.
+        let saved = self.term.grid().saved_cursor.clone();
         let mut active_paint = Vec::with_capacity(4096);
         paint_screen(&self.term, &mut active_paint);
 
@@ -184,13 +188,12 @@ impl Emulator {
         // deliberately no ED (2J): paint_screen covers every row (content or
         // EL), which makes the state stream idempotent when written over an
         // already-populated terminal — it can never scroll stale content into
-        // scrollback, so checkpoints may appear mid-stream. The leading
-        // `?1049l` normalizes a consumer stuck on the alternate screen; it is
-        // a no-op otherwise. It must never be fed back into self (the alt
-        // repair below relies on self staying on its own alternate screen).
+        // scrollback, so checkpoints may appear mid-stream. There is also
+        // deliberately no `?1049l`/alt normalization prefix: the client
+        // detects "is an alt app active" from these bytes, and a spurious
+        // 1049 toggle in every checkpoint poisons that detection.
         const BASELINE: &[u8] = b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
         let mut out: Vec<u8> = Vec::with_capacity(8192);
-        out.extend_from_slice(b"\x1b[?1049l");
         out.extend_from_slice(BASELINE);
 
         let alt_active = mode.contains(TermMode::ALT_SCREEN);
@@ -202,6 +205,9 @@ impl Emulator {
             // reattach reveals the right content.
             self.term.swap_alt();
             paint_screen(&self.term, &mut out);
+            // Primary's DECSC register (its saved cursor is clobbered in
+            // self by the swap below; the stream keeps the true value).
+            emit_saved_cursor(&mut out, &self.term.grid().saved_cursor);
             emit_cup(&mut out, cursor_point(&self.term));
             self.term.swap_alt(); // wipes the alt grid; the tail repairs it
             out.extend_from_slice(b"\x1b[?1049h");
@@ -216,6 +222,9 @@ impl Emulator {
         if let Some((top, bottom)) = margins {
             tail.extend_from_slice(format!("\x1b[{top};{bottom}r").as_bytes());
         }
+        // Re-arm the DECSC register before origin mode and final placement
+        // (absolute CUP + ESC 7, then the real cursor state below).
+        emit_saved_cursor(&mut tail, &saved);
         if mode.contains(TermMode::ORIGIN) {
             tail.extend_from_slice(b"\x1b[?6h");
         }
@@ -364,6 +373,18 @@ impl Emulator {
 
 fn cursor_point<T>(term: &Term<T>) -> Point {
     term.grid().cursor.point
+}
+
+/// Reconstruct a DECSC register: position with the saved pen, save, and leave
+/// the pen for the caller to overwrite (every later emission resets it).
+fn emit_saved_cursor(
+    out: &mut Vec<u8>,
+    saved: &alacritty_terminal::grid::Cursor<Cell>,
+) {
+    let mut pen = Pen::default();
+    pen.apply_cell(out, &saved.template);
+    emit_cup(out, saved.point);
+    out.extend_from_slice(b"\x1b7");
 }
 
 fn emit_cup(out: &mut Vec<u8>, point: Point) {
@@ -617,6 +638,21 @@ mod tests {
             (tb.fg, tb.bg, tb.flags & PEN_FLAGS),
             "{context}: pen"
         );
+        let (sa, sb) = (&ga.saved_cursor, &gb.saved_cursor);
+        assert_eq!(sa.point, sb.point, "{context}: saved cursor point");
+        assert_eq!(
+            (
+                sa.template.fg,
+                sa.template.bg,
+                sa.template.flags & PEN_FLAGS
+            ),
+            (
+                sb.template.fg,
+                sb.template.bg,
+                sb.template.flags & PEN_FLAGS
+            ),
+            "{context}: saved cursor pen"
+        );
     }
 
     fn screen_text(e: &Emulator) -> Vec<String> {
@@ -752,6 +788,28 @@ mod tests {
         let text = screen_text(&b).join("\n");
         assert!(!text.contains("frame-0"), "stale frame leaked: {text}");
         assert!(text.contains("status-frame-2"));
+    }
+
+    #[test]
+    fn saved_cursor_survives_a_mid_frame_checkpoint() {
+        // Ink-style frame: save cursor, paint a bottom box, restore. A
+        // checkpoint between ESC 7 and ESC 8 must reproduce the register so
+        // the replayed restore lands where the app expects.
+        let (mut a, mut b) = round_trip(
+            30,
+            8,
+            b"line-one\r\nline-two\x1b[33m\x1b7\x1b[8;1H\x1b[Kbox-frame",
+        );
+        assert_same_state(&a, &b, "decsc");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8after-restore");
+        }
+        assert_eq!(screen_text(&a), screen_text(&b), "post-restore drift");
+        assert!(
+            screen_text(&b)[1].contains("after-restore"),
+            "restore must return to the saved row: {:?}",
+            screen_text(&b)
+        );
     }
 
     #[test]
