@@ -154,6 +154,19 @@ test("terminal renders ANSI color and sends keystrokes without refresh", async (
   await expect.poll(() => binaryText(messages)).toContain("hello");
 });
 
+test("shift+enter sends ESC CR exactly once (no trailing plain CR)", async ({ page }) => {
+  // Claude-style TUIs bind ESC+CR to "insert newline"; a stray plain \r from
+  // the same key press (keypress path) would submit the prompt instead.
+  const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
+  await page.getByLabel("Agent terminal").click();
+  await page.keyboard.press("Shift+Enter");
+  await expect.poll(() => binaryText(messages)).toContain("\x1b\r");
+  await page.keyboard.type("x");
+  await expect.poll(() => binaryText(messages)).toContain("x");
+  const bytes = binaryText(messages);
+  expect(bytes.replace("\x1b\r", "")).not.toContain("\r");
+});
+
 test("terminal sends control keys without waiting for a refresh", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
 

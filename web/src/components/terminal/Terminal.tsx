@@ -1867,16 +1867,26 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     term.attachCustomKeyEventHandler((event) => {
-      if (event.type !== "keydown") return true;
       if (event.key !== "Enter" && event.key !== "Return") return true;
       // Plain terminals can't distinguish Shift+Enter from Enter; send the
       // ESC+CR sequence TUIs like Claude Code bind to "insert newline" (the
       // same mapping their /terminal-setup installs in iTerm/VS Code).
+      // Suppress EVERY event of the press, not just keydown: returning false
+      // does not preventDefault, so the browser still fires keypress for the
+      // same Enter and xterm's keypress path would emit a plain \r right
+      // after our sequence — newline followed by an accidental submit.
       if (event.shiftKey && rawInputRef.current) {
-        hideScrollbackOverlay();
-        socketRef.current.sendBinary(ALT_ENTER);
+        if (event.type === "keydown") {
+          event.preventDefault();
+          hideScrollbackOverlay();
+          // Also mute the textarea input fallback (virtual keyboards) for
+          // this press so it cannot double-send.
+          lastMobileReturnAtRef.current = performance.now();
+          socketRef.current.sendBinary(ALT_ENTER);
+        }
         return false;
       }
+      if (event.type !== "keydown") return true;
       return !interceptMobileReturn(event);
     });
     term.textarea?.addEventListener("beforeinput", onBeforeInput, { capture: true });
