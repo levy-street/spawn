@@ -40,7 +40,10 @@ DAEMON_SNAPSHOT_LINES = 10_000
 # overlay. Capturing 10k styled lines here made switching to long-running
 # agents take multiple seconds.
 INITIAL_SNAPSHOT_LINES = 400
-INITIAL_SNAPSHOT_TIMEOUT = 1.0
+# Worker replays answer in milliseconds and tmux captures in hundreds of ms;
+# this only bites when the path is degraded — and the transcript fallback it
+# triggers is strictly worse than waiting (legacy formatting, no geometry).
+INITIAL_SNAPSHOT_TIMEOUT = 3.0
 # Fallback when no daemon snapshot is available: ship only the transcript
 # tail. Long-running agents accumulate up to 64 MB of transcript.
 TRANSCRIPT_FALLBACK_MAX_BYTES = 512 * 1024

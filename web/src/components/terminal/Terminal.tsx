@@ -260,6 +260,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
+  // Whether the live buffer's current seed came from an exact worker stream
+  // (vs the legacy transcript fallback on a degraded connect).
+  const liveSeedWasExactRef = useRef(false);
   // Timestamp of the last local live-buffer rewrite; keystrokes shortly
   // after request an extra repaint to cover stale-cursor echo artifacts.
   const liveRewriteAtRef = useRef(0);
@@ -927,6 +930,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!term) return;
       const exactChunks = parseExactReplay(decodeUtf8(bytes));
       if (exactChunks) exactStreamRef.current = true;
+      // Remember what kind of seed the live buffer got: a degraded connect
+      // can fall back to the server transcript (legacy formatting) even for
+      // worker agents, and a later exact snapshot should heal that.
+      liveSeedWasExactRef.current = exactChunks !== null;
       const lastChunk = exactChunks?.[exactChunks.length - 1];
       if (lastChunk) {
         const { cols, rows } = lastSizeRef.current;
@@ -964,7 +971,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset) => {
-      if (parseExactReplay(decodeUtf8(bytes)) !== null) exactStreamRef.current = true;
+      const snapshotIsExact = parseExactReplay(decodeUtf8(bytes)) !== null;
+      if (snapshotIsExact) {
+        exactStreamRef.current = true;
+        if (!liveSeedWasExactRef.current) {
+          // The connect-time seed fell back to the legacy transcript (slow
+          // or degraded path) but the stream is provably exact: heal the
+          // live buffer from a proper checkpoint capture.
+          historyReseedPendingRef.current = true;
+        }
+      }
       if (scrollbackSnapshotTimeoutRef.current) {
         clearTimeout(scrollbackSnapshotTimeoutRef.current);
         scrollbackSnapshotTimeoutRef.current = null;
@@ -990,11 +1006,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheDirtyRef.current = dirty;
         if (dirty) scheduleScrollbackCacheRefreshRef.current();
       }
-      if (
-        historyReseedPendingRef.current &&
-        typeof dcOffset === "number" &&
-        !scrollbackVisibleRef.current
-      ) {
+      // Reseeds prefer an anchored capture, but a relay-only session (no
+      // DataChannel) can never produce one — accept an unanchored capture
+      // there; syncLive's cache-clean gate guarantees the stream was quiet
+      // around it, so nothing can roll back.
+      const anchorOk = typeof dcOffset === "number" || !dcActiveRef.current;
+      if (historyReseedPendingRef.current && anchorOk && !scrollbackVisibleRef.current) {
         // A width change left seeded history wrapped at the old width;
         // rewrite the live buffer from this anchored capture so it reflows.
         // Stays pending until a rewrite actually succeeds (alternate-screen
@@ -1008,6 +1025,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             finalChunk.rows === lastSizeRef.current.rows);
         if (geometryReady && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
           historyReseedPendingRef.current = false;
+          liveSeedWasExactRef.current = snapshotIsExact;
           socketRef.current.sendJson({ type: "redraw" });
         }
       }
