@@ -5,6 +5,7 @@ import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
+  Check,
   FolderOpen,
   MoreHorizontal,
   Pencil,
@@ -140,12 +141,14 @@ function AgentTerminal() {
     onError: (err) => setActionError(String(err)),
   });
   const [diagBusy, setDiagBusy] = useState(false);
+  const [diagSaved, setDiagSaved] = useState(false);
   // Manual terminal refresh that records before/after diagnostics and saves
   // them to the agent host (cwd/.spawn/attachments) for offline review.
   const runDiagnosticRefresh = async () => {
     const handle = termRef.current;
     if (!handle || diagBusy) return;
     setDiagBusy(true);
+    setDiagSaved(false);
     try {
       const bundle = await handle.refreshDiagnostics();
       const json = new TextEncoder().encode(JSON.stringify(bundle, null, 2));
@@ -159,6 +162,8 @@ function AgentTerminal() {
         bytes_b64: btoa(binary),
       });
       setActionError(null);
+      setDiagSaved(true);
+      setTimeout(() => setDiagSaved(false), 2500);
     } catch (err) {
       setActionError(`diagnostic refresh: ${String(err)}`);
     } finally {
@@ -308,11 +313,19 @@ function AgentTerminal() {
             size="icon"
             className="size-8"
             aria-label="Refresh terminal"
-            title="Refresh terminal (saves before/after diagnostics)"
+            title={
+              diagSaved
+                ? "Diagnostics saved to the agent host"
+                : "Refresh terminal (saves before/after diagnostics)"
+            }
             disabled={diagBusy}
             onClick={runDiagnosticRefresh}
           >
-            <RefreshCw className={`size-4 ${diagBusy ? "animate-spin" : ""}`} />
+            {diagSaved ? (
+              <Check className="size-4 text-emerald-500" />
+            ) : (
+              <RefreshCw className={`size-4 ${diagBusy ? "animate-spin" : ""}`} />
+            )}
           </Button>
           <Button
             variant="ghost"
