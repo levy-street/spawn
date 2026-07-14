@@ -600,6 +600,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const historyTerm = scrollbackTermRef.current;
       if (!historyTerm || scrollbackRenderedSnapshotBytesRef.current === null) return;
       if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) return;
+      // Warm-cache appends are an optimization and must never write at the
+      // wrong geometry. Mid-render, xterm's shared write queue would slot
+      // these bytes between the sequenced chunk walk's writes — at whatever
+      // historical geometry the walk is passing through. And after an
+      // external PTY resize (another window taking control), bytes at the
+      // new width can arrive before this client learns the geometry. In both
+      // cases: drop; the snapshot covering these bytes re-renders shortly.
+      if (scrollbackRenderInFlightRef.current) return;
+      const { cols, rows } = lastSizeRef.current;
+      if (historyTerm.cols !== cols || historyTerm.rows !== rows) {
+        scrollbackCacheDirtyRef.current = true;
+        scheduleScrollbackCacheRefreshRef.current();
+        return;
+      }
 
       // xterm's own viewport semantics do the right thing here: writes
       // follow the bottom when the viewport is at the live edge and hold the
