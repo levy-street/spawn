@@ -84,7 +84,7 @@ try {
   // Grow the input box: 30 draft lines via shift+enter pushes the welcome
   // box and earlier frame rows into scrollback, all claude-rendered.
   for (let i = 0; i < 30; i += 1) {
-    await page.keyboard.type(`draft line ${String(i).padStart(2, "0")} of the tall unsubmitted prompt`, { delay: 4 });
+    await page.keyboard.type(`draft line ${String(i).padStart(2, "0")} of the tall unsubmitted prompt`, { delay: 45 });
     await page.keyboard.press("Shift+Enter");
   }
   await page.keyboard.type("last draft line", { delay: 4 });
