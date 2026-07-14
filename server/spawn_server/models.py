@@ -260,6 +260,10 @@ class Screen(Base):
     # "ratio": ..., "a": <node>, "b": <node>}. Kept as loose JSON so layout
     # evolution doesn't need migrations.
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Ad-hoc screens (drag one agent onto another) start ephemeral: they are
+    # auto-deleted when emptied and promoted to permanent on rename or a
+    # third pane. Deliberate "New screen" screens are never ephemeral.
+    ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

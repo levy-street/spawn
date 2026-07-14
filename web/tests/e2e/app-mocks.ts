@@ -128,6 +128,7 @@ export async function mockAuthenticatedApi(
     screens?: unknown[];
     updateScreen?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     createScreen?: (body: unknown, route: Route) => Promise<void> | void;
+    restartAgent?: (id: string, route: Route) => Promise<void> | void;
     skills?: unknown[];
     createAgent?: (body: unknown, route: Route) => Promise<void> | void;
     updateAgent?: (id: string, body: unknown, route: Route) => Promise<void> | void;
@@ -382,6 +383,19 @@ export async function mockAuthenticatedApi(
     // owner resizes and control changes.
     if (path.match(/^\/api\/agents\/[^/]+\/redraw$/) && method === "POST") {
       await route.fulfill({ status: 204 });
+      return;
+    }
+    const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/);
+    if (restartMatch && method === "POST") {
+      if (options.restartAgent) {
+        await options.restartAgent(restartMatch[1], route);
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: agent({ id: restartMatch[1] }),
+      });
       return;
     }
 

@@ -410,16 +410,19 @@ class ScreenLayout(BaseModel):
 class ScreenCreate(BaseModel):
     name: str = Field(max_length=128)
     layout: ScreenLayout = Field(default_factory=ScreenLayout)
+    ephemeral: bool = False
 
 
 class ScreenPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     layout: ScreenLayout | None = None
+    ephemeral: bool | None = None
 
 
 class ScreenOut(BaseModel):
     id: str
     name: str
     layout: ScreenLayout
+    ephemeral: bool = False
     created_at: datetime
     updated_at: datetime

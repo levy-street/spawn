@@ -291,6 +291,7 @@ export const ScreenSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   layout: ScreenLayoutSchema,
+  ephemeral: z.boolean().default(false),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -678,13 +679,13 @@ export const screens = {
       method: "GET",
       schema: ScreenSchema,
     }),
-  create: (body: { name: string; layout?: ScreenLayout }) =>
+  create: (body: { name: string; layout?: ScreenLayout; ephemeral?: boolean }) =>
     api("/api/screens", {
       method: "POST",
       body: JSON.stringify(body),
       schema: ScreenSchema,
     }),
-  update: (id: string, body: { name?: string; layout?: ScreenLayout }) =>
+  update: (id: string, body: { name?: string; layout?: ScreenLayout; ephemeral?: boolean }) =>
     api(`/api/screens/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),

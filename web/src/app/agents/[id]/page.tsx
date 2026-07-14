@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   Check,
   FolderOpen,
+  LayoutGrid,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -20,7 +21,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { FileExplorer } from "@/components/files/FileExplorer";
+import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
 import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -36,7 +37,9 @@ import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
 import { agentAccess, agents, screens } from "@/lib/api";
+import { runDiagnosticRefresh } from "@/lib/diagnostics";
 import { useAgentDrop } from "@/lib/dnd";
+import { collectAgentIds } from "@/lib/layout";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -88,6 +91,10 @@ function AgentTerminal() {
     enabled: !!id,
     refetchInterval: 10_000,
   });
+  const screensQ = useQuery({ queryKey: ["screens"], queryFn: screens.list, staleTime: 30_000 });
+  const memberScreens = (screensQ.data ?? []).filter((item) =>
+    collectAgentIds(item.layout.root ?? null).includes(id as string),
+  );
   const skillsSummary = accessQ.data?.skills.length
     ? accessQ.data.skills.map((skill) => skill.name).join(", ")
     : null;
@@ -144,26 +151,13 @@ function AgentTerminal() {
   const [diagSaved, setDiagSaved] = useState(false);
   // Manual terminal refresh that records before/after diagnostics and saves
   // them to the agent host (cwd/.spawn/attachments) for offline review.
-  const runDiagnosticRefresh = async () => {
+  const handleDiagnosticRefresh = async () => {
     const handle = termRef.current;
     if (!handle || diagBusy) return;
     setDiagBusy(true);
     setDiagSaved(false);
     try {
-      const bundle = await handle.refreshDiagnostics();
-      const json = new TextEncoder().encode(JSON.stringify(bundle, null, 2));
-      let binary = "";
-      for (let i = 0; i < json.length; i += 0x8000) {
-        binary += String.fromCharCode(...json.subarray(i, i + 0x8000));
-      }
-      await agents.upload(id as string, {
-        name: `terminal-diag-${new Date().toISOString().replaceAll(":", "-")}.json`,
-        mime_type: "application/json",
-        bytes_b64: btoa(binary),
-        // Diagnostics are for offline review — never paste the saved path
-        // into the agent's prompt like image uploads do.
-        paste: false,
-      });
+      await runDiagnosticRefresh(handle, id as string);
       setActionError(null);
       setDiagSaved(true);
       setTimeout(() => setDiagSaved(false), 2500);
@@ -190,6 +184,8 @@ function AgentTerminal() {
       const name = `${current} · ${droppedTitle || "split"}`.slice(0, 128);
       return screens.create({
         name,
+        // Ad-hoc: dissolves if emptied, promotes on rename or a third pane.
+        ephemeral: true,
         layout: {
           root: {
             type: "split",
@@ -276,10 +272,23 @@ function AgentTerminal() {
               {agent ? agentTitle(agent) : "…"}
             </button>
           )}
-          <div className="truncate px-0.5 text-[11px] leading-4 text-muted-foreground">
-            {agent
-              ? `${agentActivityDetail(agent)}${archived ? " · archived" : ""} · ${agent.host_name ?? "?"} · ${agent.cwd}`
-              : "loading…"}
+          <div className="flex items-center gap-1 truncate px-0.5 text-[11px] leading-4 text-muted-foreground">
+            <span className="truncate">
+              {agent
+                ? `${agentActivityDetail(agent)}${archived ? " · archived" : ""} · ${agent.host_name ?? "?"} · ${agent.cwd}`
+                : "loading…"}
+            </span>
+            {memberScreens.slice(0, 2).map((item) => (
+              <Link
+                key={item.id}
+                href={`/screens/${item.id}?focus=${id}`}
+                title={`Focus this pane on ${item.name}`}
+                className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border px-1 leading-4 transition-colors hover:bg-accent/60 hover:text-foreground"
+              >
+                <LayoutGrid className="size-2.5" aria-hidden />
+                {item.name}
+              </Link>
+            ))}
           </div>
         </div>
 
@@ -322,7 +331,7 @@ function AgentTerminal() {
                 : "Refresh terminal (saves before/after diagnostics)"
             }
             disabled={diagBusy}
-            onClick={runDiagnosticRefresh}
+            onClick={handleDiagnosticRefresh}
           >
             {diagSaved ? (
               <Check className="size-4 text-emerald-500" />
@@ -464,19 +473,7 @@ function AgentTerminal() {
             onConnectionInfo={setConnInfo}
           />
         </div>
-        {filesOpen && agent && (
-          <aside
-            aria-label="Files panel"
-            className="hidden w-72 shrink-0 flex-col border-l border-border md:flex"
-          >
-            <FileExplorer
-              hostId={agent.host_id}
-              rootPath={agent.cwd}
-              dense
-              className="min-h-0 flex-1"
-            />
-          </aside>
-        )}
+        {filesOpen && agent && <AgentFilesAside agent={agent} />}
       </div>
 
       <ModifierBar

@@ -83,3 +83,10 @@ export function relativeTime(value: string | null | undefined): string | null {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+/** Attention states a multi-pane screen should surface at a glance. */
+export function agentNeedsAttention(agent: Agent): "waiting" | "dead" | null {
+  if (agent.status === "exited" || agent.status === "killed") return "dead";
+  if (agent.activity_state === "waiting") return "waiting";
+  return null;
+}

@@ -11,8 +11,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import type { AgentKind } from "@/lib/agents";
-import { ApiError, agents, hosts, presets, skills as skillApi } from "@/lib/api";
+import { ApiError, agents, hosts, presets, screens, skills as skillApi } from "@/lib/api";
 import { normalizeCommandText, parseArgv } from "@/lib/argv";
+import { insertAtEdge } from "@/lib/layout";
 import { normalizeCwdForHost, withTrailingSlash } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +29,13 @@ function kindForPreset(agentKind: string): AgentKind {
   return "custom";
 }
 
-export function NewAgentForm({ initialHostId }: { initialHostId?: string }) {
+export function NewAgentForm({
+  initialHostId,
+  intoScreenId,
+}: {
+  initialHostId?: string;
+  intoScreenId?: string;
+}) {
   const qc = useQueryClient();
   const router = useRouter();
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
@@ -50,9 +57,24 @@ export function NewAgentForm({ initialHostId }: { initialHostId?: string }) {
 
   const m = useMutation({
     mutationFn: agents.create,
-    onSuccess: (created) => {
+    onSuccess: async (created) => {
       qc.invalidateQueries({ queryKey: ["agents"] });
       qc.invalidateQueries({ queryKey: ["hosts"] });
+      // Born into a screen: append the new agent as a pane and land there
+      // with it focused, instead of the standalone agent page.
+      if (intoScreenId) {
+        try {
+          const target = await screens.get(intoScreenId);
+          const nextRoot = insertAtEdge(target.layout.root ?? null, null, "right", created.id);
+          await screens.update(intoScreenId, { layout: { root: nextRoot } });
+          qc.invalidateQueries({ queryKey: ["screens"] });
+          qc.invalidateQueries({ queryKey: ["screen", intoScreenId] });
+          router.push(`/screens/${intoScreenId}?focus=${created.id}`);
+          return;
+        } catch {
+          // Fall through to the agent page if the screen vanished.
+        }
+      }
       router.push(`/agents/${created.id}`);
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),

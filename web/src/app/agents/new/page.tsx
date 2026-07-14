@@ -44,5 +44,10 @@ export default function NewAgentPage() {
 
 function NewAgentFormWithParams() {
   const searchParams = useSearchParams();
-  return <NewAgentForm initialHostId={searchParams?.get("host") ?? undefined} />;
+  return (
+    <NewAgentForm
+      initialHostId={searchParams?.get("host") ?? undefined}
+      intoScreenId={searchParams?.get("screen") ?? undefined}
+    />
+  );
 }

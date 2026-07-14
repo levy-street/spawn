@@ -21,9 +21,16 @@ def _to_out(screen: Screen) -> schemas.ScreenOut:
         id=screen.id,
         name=screen.name,
         layout=schemas.ScreenLayout.model_validate(screen.layout or {}),
+        ephemeral=bool(screen.ephemeral),
         created_at=screen.created_at,
         updated_at=screen.updated_at,
     )
+
+
+def _pane_count(layout: schemas.ScreenLayout) -> int:
+    ids: list[str] = []
+    _collect_agent_ids(layout.root, ids)
+    return len(ids)
 
 
 async def _get_owned_screen(session: AsyncSession, screen_id: str, user: User) -> Screen:
@@ -128,6 +135,7 @@ async def create_screen(
         owner_user_id=user.id,
         name=name,
         layout=await _sanitize_layout(session, user, body.layout),
+        ephemeral=body.ephemeral,
     )
     session.add(screen)
     await session.commit()
@@ -152,13 +160,29 @@ async def update_screen(
     user: User = Depends(auth.current_user),
 ) -> schemas.ScreenOut:
     screen = await _get_owned_screen(session, screen_id, user)
+    if body.ephemeral is not None:
+        screen.ephemeral = body.ephemeral
     if body.name is not None:
         name = body.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
+        # Naming an ad-hoc screen is a commitment to keep it.
+        if name != screen.name:
+            screen.ephemeral = False
         screen.name = name
     if body.layout is not None:
-        screen.layout = await _sanitize_layout(session, user, body.layout)
+        sanitized = await _sanitize_layout(session, user, body.layout)
+        panes = _pane_count(schemas.ScreenLayout.model_validate(sanitized))
+        # An ad-hoc screen emptied of panes has served its purpose — drop it
+        # so the tab strip doesn't accumulate husks. Growing it past the
+        # original pair is a deliberate arrangement worth persisting.
+        if screen.ephemeral and panes == 0:
+            await session.delete(screen)
+            await session.commit()
+            raise HTTPException(status_code=410, detail="ephemeral screen emptied")
+        if screen.ephemeral and panes >= 3:
+            screen.ephemeral = False
+        screen.layout = sanitized
     await session.commit()
     await session.refresh(screen)
     return _to_out(screen)

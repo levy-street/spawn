@@ -225,6 +225,36 @@ test("zoom fills the screen with one pane and restores", async ({ page }) => {
   await expect(beta).toBeVisible();
 });
 
+test("pane kebab exposes agent actions and restarts the agent", async ({ page }) => {
+  let restarted = false;
+  await mockAuthenticatedApi(page, {
+    agents: [agentA, agentB],
+    screens: [screen()],
+    restartAgent: async (id, route) => {
+      if (id === AGENT_ID) restarted = true;
+      await route.fulfill({ status: 200, contentType: "application/json", json: agentA });
+    },
+  });
+
+  await page.goto(`/screens/${SCREEN_ID}`);
+  const alpha = page.getByRole("region", { name: "alpha" });
+  await alpha.getByRole("button", { name: "alpha pane actions" }).click();
+  await expect(page.getByRole("menuitem", { name: "Open full page" })).toBeVisible();
+  await page.getByRole("menuitem", { name: "Restart agent" }).click();
+  await expect.poll(() => restarted).toBe(true);
+});
+
+test("waiting agents surface an attention badge on the screen tab", async ({ page }) => {
+  await mockAuthenticatedApi(page, {
+    agents: [agent({ name: "alpha", activity_state: "waiting", activity_label: "Awaiting input" }), agentB],
+    screens: [screen()],
+  });
+  await page.goto(`/screens/${SCREEN_ID}`);
+  // The active tab shows a "1" attention count for the one waiting pane.
+  const tab = page.getByRole("tab", { name: /daily drive/ });
+  await expect(tab).toContainText("1");
+});
+
 test("arrange presets rebuild the split tree", async ({ page }) => {
   const patches: Array<Record<string, unknown>> = [];
   await mockAuthenticatedApi(page, {

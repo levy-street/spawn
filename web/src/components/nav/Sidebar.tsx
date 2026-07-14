@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
+  LayoutGrid,
   LogOut,
   MoreHorizontal,
   PanelLeftClose,
@@ -29,10 +30,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentStatusDot, hostStatusTone, StatusDot } from "@/components/ui/status";
 import { RailTooltip } from "@/components/ui/tooltip";
-import { agentActivityDetail, agentTitle } from "@/lib/agents";
-import { type Agent, agents, type Host, hosts } from "@/lib/api";
+import { agentActivityDetail, agentNeedsAttention, agentTitle } from "@/lib/agents";
+import { type Agent, agents, type Host, hosts, type Screen, screens } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { setAgentDragData } from "@/lib/dnd";
+import { collectAgentIds } from "@/lib/layout";
 import { cn } from "@/lib/utils";
 
 export const SIDEBAR_RAIL_WIDTH = 56;
@@ -265,6 +267,27 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     () => groupAgentsByHost(agentsQ.data ?? [], hostsQ.data ?? []),
     [agentsQ.data, hostsQ.data],
   );
+  const screensQ = useQuery({
+    queryKey: ["screens"],
+    queryFn: screens.list,
+    refetchInterval: 30_000,
+  });
+  const allScreens = screensQ.data ?? [];
+  const currentScreenId = /^\/screens\/([^/?]+)/.exec(pathname)?.[1] ?? null;
+  const currentScreen = allScreens.find((item) => item.id === currentScreenId) ?? null;
+  const currentScreenAgentIds = useMemo(
+    () => (currentScreen ? collectAgentIds(currentScreen.layout.root ?? null) : []),
+    [currentScreen],
+  );
+  const agentsById = useMemo(
+    () => new Map((agentsQ.data ?? []).map((agent) => [agent.id, agent])),
+    [agentsQ.data],
+  );
+  const screenAttention = (item: Screen) =>
+    collectAgentIds(item.layout.root ?? null).filter((agentId) => {
+      const agent = agentsById.get(agentId);
+      return agent && agentNeedsAttention(agent) !== null;
+    }).length;
 
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -341,6 +364,58 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
       {actionError && !collapsed && (
         <p className="mb-1 px-1.5 text-[11px] text-destructive">{actionError}</p>
       )}
+      {allScreens.length > 0 && (
+        <ul className="mb-1">
+          <li aria-hidden={collapsed}>
+            <span
+              className={cn(
+                "flex items-center gap-1.5 overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
+                collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
+              )}
+            >
+              Screens
+            </span>
+          </li>
+          {allScreens.map((item) => {
+            const active = currentScreenId === item.id;
+            const attention = screenAttention(item);
+            const paneTotal = collectAgentIds(item.layout.root ?? null).length;
+            return (
+              <li key={item.id} className="my-0.5">
+                <RailTooltip label={item.name} disabled={!collapsed}>
+                  <Link
+                    href={`/screens/${item.id}`}
+                    aria-current={active ? "page" : undefined}
+                    className={rowClass(active)}
+                  >
+                    <IconSlot>
+                      <span className="relative">
+                        <LayoutGrid className="size-4" aria-hidden />
+                        {attention > 0 && (
+                          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-amber-400" />
+                        )}
+                      </span>
+                    </IconSlot>
+                    <RowLabel collapsed={collapsed}>
+                      <span className="flex items-center gap-1 text-xs font-medium leading-4">
+                        <span className="truncate">{item.name}</span>
+                        <span className="shrink-0 text-[10px] font-normal text-muted-foreground">
+                          {paneTotal}
+                        </span>
+                        {attention > 0 && (
+                          <span className="shrink-0 rounded-full bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-500">
+                            {attention}
+                          </span>
+                        )}
+                      </span>
+                    </RowLabel>
+                  </Link>
+                </RailTooltip>
+              </li>
+            );
+          })}
+        </ul>
+      )}
       <ul>
         {groups.map((group) => (
           <Fragment key={group.hostId}>
@@ -372,6 +447,11 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
               />
             </li>
             {group.agents.map((agent) => {
+              const onCurrentScreen =
+                currentScreenId !== null && currentScreenAgentIds.includes(agent.id);
+              const agentHref = onCurrentScreen
+                ? `/screens/${currentScreenId}?focus=${agent.id}`
+                : `/agents/${agent.id}`;
               const active = pathname === `/agents/${agent.id}`;
               return (
                 <li key={agent.id} className="group/agentrow relative my-0.5">
@@ -380,7 +460,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
                     disabled={!collapsed}
                   >
                     <Link
-                      href={`/agents/${agent.id}`}
+                      href={agentHref}
                       aria-current={active ? "page" : undefined}
                       draggable
                       onDragStart={(event) => {

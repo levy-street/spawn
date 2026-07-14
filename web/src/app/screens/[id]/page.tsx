@@ -10,28 +10,33 @@ import {
   Home,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   PanelLeft,
   Pencil,
+  Pin,
   Plus,
+  RotateCcw,
   Rows3,
   Trash2,
   X,
 } from "lucide-react";
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   type DragEvent as ReactDragEvent,
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
+  Suspense,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
+import { AgentPaneMenuItems } from "@/components/agents/AgentPaneMenu";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { FileExplorer } from "@/components/files/FileExplorer";
+import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
 import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -44,7 +49,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
-import { agentActivityDetail, agentTitle } from "@/lib/agents";
+import { agentActivityDetail, agentNeedsAttention, agentTitle } from "@/lib/agents";
 import { type Agent, ApiError, agents, type Screen, screens } from "@/lib/api";
 import {
   AGENT_DRAG_MIME,
@@ -81,7 +86,7 @@ export default function ScreenDetailPage() {
     <AuthGate>
       <AppShell hideMobileNav mainClassName="overflow-hidden">
         {/* Keying on the screen id resets all editor state on navigation. */}
-        {id ? <ScreenView key={id} id={id} /> : null}
+        <Suspense fallback={null}>{id ? <ScreenView key={id} id={id} /> : null}</Suspense>
       </AppShell>
     </AuthGate>
   );
@@ -138,7 +143,17 @@ function ScreenView({ id }: { id: string }) {
       qc.setQueryData(["screen", id], saved);
       qc.invalidateQueries({ queryKey: ["screens"] });
     },
-    onError,
+    onError: (err) => {
+      // An emptied ephemeral screen self-destructs server-side (410); follow
+      // it to whatever screen remains instead of showing an error.
+      if (err instanceof ApiError && err.status === 410) {
+        qc.invalidateQueries({ queryKey: ["screens"] });
+        const remaining = (screensQ.data ?? []).filter((item) => item.id !== id);
+        router.push(remaining.length > 0 ? `/screens/${remaining[0].id}` : "/screens");
+        return;
+      }
+      onError(err);
+    },
   });
   const otherScreenM = useMutation({
     mutationFn: ({ screenId, nextRoot }: { screenId: string; nextRoot: LayoutNode | null }) =>
@@ -154,6 +169,15 @@ function ScreenView({ id }: { id: string }) {
     onSuccess: (saved) => {
       setError(null);
       setEditingName(false);
+      qc.setQueryData(["screen", id], saved);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+    },
+    onError,
+  });
+  const keepM = useMutation({
+    mutationFn: () => screens.update(id, { ephemeral: false }),
+    onSuccess: (saved) => {
+      setError(null);
       qc.setQueryData(["screen", id], saved);
       qc.invalidateQueries({ queryKey: ["screens"] });
     },
@@ -206,6 +230,60 @@ function ScreenView({ id }: { id: string }) {
       setFocusedId(screenAgentIds[0]);
     }
   }, [screenAgentIds, focusedId]);
+
+  // Deep links (?focus=<agentId>) land with that pane focused — the sidebar
+  // and agent-page chips use this to jump straight to a pane.
+  const focusParam = useSearchParams()?.get("focus") ?? null;
+  const focusParamApplied = useRef(false);
+  useEffect(() => {
+    if (focusParamApplied.current || !focusParam) return;
+    if (!screenAgentIds.includes(focusParam)) return;
+    focusParamApplied.current = true;
+    setFocusedId(focusParam);
+    requestAnimationFrame(() => paneHandles.current.get(focusParam)?.focus());
+  }, [focusParam, screenAgentIds]);
+
+  // Keyboard: Alt+arrows cycle pane focus, Alt+Z zooms, Alt+1..9 switches
+  // screens. Capture phase so the focused terminal doesn't swallow them.
+  const keyboardStateRef = useRef({ screenAgentIds, focusedId, zoomedId });
+  keyboardStateRef.current = { screenAgentIds, focusedId, zoomedId };
+  const allScreensRef = useRef<Screen[]>([]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const { screenAgentIds: ids, focusedId: focused } = keyboardStateRef.current;
+      const digit = /^Digit([1-9])$/.exec(event.code)?.[1];
+      if (digit) {
+        const target = allScreensRef.current[Number(digit) - 1];
+        if (target && target.id !== id) {
+          event.preventDefault();
+          event.stopPropagation();
+          router.push(`/screens/${target.id}`);
+        }
+        return;
+      }
+      if (ids.length === 0) return;
+      if (event.code === "KeyZ") {
+        if (focused) {
+          event.preventDefault();
+          event.stopPropagation();
+          setZoomedId((z) => (z === focused ? null : focused));
+        }
+        return;
+      }
+      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+      const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
+      if (!forward && !backward) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const index = focused ? ids.indexOf(focused) : 0;
+      const next = ids[(index + (forward ? 1 : ids.length - 1)) % ids.length];
+      setFocusedId(next);
+      requestAnimationFrame(() => paneHandles.current.get(next)?.focus());
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [id, router]);
 
   const submitRename = () => {
     const next = draftName.trim();
@@ -280,6 +358,24 @@ function ScreenView({ id }: { id: string }) {
     (agent) => !screenAgentIds.includes(agent.id) && agent.archived_at === null,
   );
   const allScreens = screensQ.data ?? [];
+  allScreensRef.current = allScreens;
+  const attentionCount = (item: Screen) =>
+    collectAgentIds(item.layout.root ?? null).filter((agentId) => {
+      const agent = agentsById.get(agentId);
+      return agent && agentNeedsAttention(agent) !== null;
+    }).length;
+
+  const TAB_LIMIT = 5;
+  const { visibleTabs, overflowTabs } = useMemo(() => {
+    if (allScreens.length <= TAB_LIMIT) {
+      return { visibleTabs: allScreens, overflowTabs: [] as Screen[] };
+    }
+    const active = allScreens.find((item) => item.id === id);
+    const rest = allScreens.filter((item) => item.id !== id);
+    const visible = (active ? [active, ...rest] : rest).slice(0, TAB_LIMIT);
+    const ids = new Set(visible.map((item) => item.id));
+    return { visibleTabs: visible, overflowTabs: allScreens.filter((item) => !ids.has(item.id)) };
+  }, [allScreens, id]);
 
   const panelAgent =
     (focusedId ? agentsById.get(focusedId) : null) ??
@@ -297,13 +393,15 @@ function ScreenView({ id }: { id: string }) {
         >
           <Home className="size-4" aria-hidden />
         </Link>
-        {/* Screens as tabs */}
+        {/* Screens as tabs. Past a handful, keep the active one plus the
+            most recent visible and fold the rest into an overflow menu so the
+            strip never crowds out the pane area. */}
         <div
           role="tablist"
           aria-label="Screens"
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto px-1"
         >
-          {allScreens.map((item) => {
+          {visibleTabs.map((item) => {
             const active = item.id === id;
             return (
               <ScreenTabPill
@@ -340,7 +438,22 @@ function ScreenView({ id }: { id: string }) {
                       setEditingName(true);
                     }}
                   >
-                    {item.name}
+                    <span className="inline-flex items-center gap-1">
+                      <span className={cn(item.ephemeral && "italic opacity-80")}>{item.name}</span>
+                      {item.ephemeral && (
+                        <span
+                          title="Temporary — dissolves when emptied. Rename or add a pane to keep it."
+                          className="rounded bg-muted px-1 text-[8px] uppercase tracking-wide text-muted-foreground"
+                        >
+                          temp
+                        </span>
+                      )}
+                      {attentionCount(item) > 0 && (
+                        <span className="rounded-full bg-amber-400/20 px-1.5 text-[9px] font-semibold leading-4 text-amber-500">
+                          {attentionCount(item)}
+                        </span>
+                      )}
+                    </span>
                   </button>
                 )}
                 {active && !editingName && (
@@ -367,10 +480,17 @@ function ScreenView({ id }: { id: string }) {
                       <Pencil className="size-4" aria-hidden />
                       Rename screen
                     </DropdownMenuItem>
+                    {screen?.ephemeral && (
+                      <DropdownMenuItem onSelect={() => keepM.mutate()}>
+                        <Pin className="size-4" aria-hidden />
+                        Keep screen
+                      </DropdownMenuItem>
+                    )}
                     {candidates.length > 0 && screenAgentIds.length < MAX_PANES_PER_SCREEN && (
                       <AddAgentItems
                         candidates={candidates}
                         onAdd={(agentId) => placeAgent(agentId, null, "right", null)}
+                        screenId={id}
                       />
                     )}
                     {screenAgentIds.length > 1 && (
@@ -423,6 +543,36 @@ function ScreenView({ id }: { id: string }) {
           >
             <Plus className="size-4" aria-hidden />
           </button>
+          {overflowTabs.length > 0 && (
+            <DropdownMenu
+              align="end"
+              menuClassName="max-h-80 w-56 overflow-y-auto"
+              renderTrigger={(props) => (
+                <button
+                  {...props}
+                  type="button"
+                  aria-label={`${overflowTabs.length} more screens`}
+                  className="flex h-7 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+                >
+                  {overflowTabs.length} more
+                  <ChevronDown className="size-3" aria-hidden />
+                </button>
+              )}
+            >
+              {overflowTabs.map((item) => (
+                <DropdownMenuItem key={item.id} onSelect={() => router.push(`/screens/${item.id}`)}>
+                  <span className={cn("min-w-0 flex-1 truncate", item.ephemeral && "italic")}>
+                    {item.name}
+                  </span>
+                  {attentionCount(item) > 0 && (
+                    <span className="shrink-0 rounded-full bg-amber-400/20 px-1.5 text-[9px] font-semibold text-amber-500">
+                      {attentionCount(item)}
+                    </span>
+                  )}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenu>
+          )}
         </div>
 
         <span
@@ -476,21 +626,9 @@ function ScreenView({ id }: { id: string }) {
             if (handle) paneHandles.current.set(agentId, handle);
             else paneHandles.current.delete(agentId);
           }}
+          onPaneError={setError}
         />
-        {filesOpen && panelAgent && (
-          <aside
-            aria-label="Files panel"
-            className="hidden w-72 shrink-0 flex-col border-l border-border md:flex"
-          >
-            <FileExplorer
-              key={`${panelAgent.host_id}:${panelAgent.cwd}`}
-              hostId={panelAgent.host_id}
-              rootPath={panelAgent.cwd}
-              dense
-              className="min-h-0 flex-1"
-            />
-          </aside>
-        )}
+        {filesOpen && panelAgent && <AgentFilesAside agent={panelAgent} />}
       </div>
 
       <ModifierBar
@@ -525,14 +663,21 @@ function ScreenView({ id }: { id: string }) {
 function AddAgentItems({
   candidates,
   onAdd,
+  screenId,
 }: {
   candidates: Agent[];
   onAdd: (agentId: string) => void;
+  screenId: string;
 }) {
+  const router = useRouter();
   return (
     <>
       <DropdownMenuSeparator />
       <DropdownMenuLabel>Add agent</DropdownMenuLabel>
+      <DropdownMenuItem onSelect={() => router.push(`/agents/new?screen=${screenId}`)}>
+        <Plus className="size-4" aria-hidden />
+        New agent…
+      </DropdownMenuItem>
       {candidates.slice(0, 8).map((agent) => (
         <DropdownMenuItem key={agent.id} onSelect={() => onAdd(agent.id)}>
           <AgentKindIcon agent={agent} className="size-5 rounded-md" iconClassName="size-3" />
@@ -593,6 +738,7 @@ type PaneAreaProps = {
     sourceScreen: string | null,
   ) => void;
   registerPane: (agentId: string, handle: TerminalHandle | null) => void;
+  onPaneError: (message: string) => void;
 };
 
 function useIsWide(ref: RefObject<HTMLElement | null>): boolean {
@@ -611,7 +757,8 @@ function useIsWide(ref: RefObject<HTMLElement | null>): boolean {
 }
 
 function PaneArea(props: PaneAreaProps) {
-  const { root, candidates, onPlaceAgent, onRootChange } = props;
+  const { root, candidates, onPlaceAgent, onRootChange, screenId } = props;
+  const router = useRouter();
   const areaRef = useRef<HTMLDivElement>(null);
   const wide = useIsWide(areaRef);
 
@@ -652,7 +799,11 @@ function PaneArea(props: PaneAreaProps) {
             </button>
           )}
         >
-          {candidates.length === 0 && <DropdownMenuLabel>No agents available</DropdownMenuLabel>}
+          <DropdownMenuItem onSelect={() => router.push(`/agents/new?screen=${screenId}`)}>
+            <Plus className="size-4" aria-hidden />
+            New agent…
+          </DropdownMenuItem>
+          {candidates.length > 0 && <DropdownMenuLabel>Existing agents</DropdownMenuLabel>}
           {candidates.map((agent) => (
             <DropdownMenuItem
               key={agent.id}
@@ -846,6 +997,7 @@ function ScreenPane({
     onToggleZoom,
     onPlaceAgent,
     onRootChange,
+    onPaneError,
     root,
   } = props;
   const agent = agentsById.get(agentId);
@@ -856,9 +1008,18 @@ function ScreenPane({
     return () => registerPane(agentId, null);
   });
   const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
+  const [displayOwner, setDisplayOwner] = useState<boolean | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
   const depth = useRef(0);
   const zoomed = zoomedId === agentId;
+  const attention = agent ? agentNeedsAttention(agent) : null;
+  const restartM = useMutation({
+    mutationFn: () => {
+      const size = termRef.current?.getSize();
+      return agents.restart(agentId, size ? { ...size, create_cwd: true } : undefined);
+    },
+    onError: (err) => onPaneError(String(err)),
+  });
 
   const onDragEnter = (event: ReactDragEvent<HTMLElement>) => {
     if (!dragHasAgent(event.dataTransfer)) return;
@@ -902,7 +1063,7 @@ function ScreenPane({
       className={cn(
         "relative flex min-w-0 flex-1 flex-col overflow-hidden bg-background",
         stacked ? "min-h-[50dvh] flex-none" : "min-h-0",
-        focusedId === agentId && paneCount > 1 && "ring-1 ring-inset ring-ring/40",
+        focusedId === agentId && paneCount > 1 && "ring-2 ring-inset ring-ring/60",
       )}
     >
       {/* Drop-zone highlight */}
@@ -935,11 +1096,48 @@ function ScreenPane({
               <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5 size-1.5" />
             </span>
             <span className="min-w-0 truncate text-xs font-medium">{agentTitle(agent)}</span>
+            {attention && (
+              <span
+                title={attention === "dead" ? "Agent exited" : "Awaiting input"}
+                className={cn(
+                  "size-1.5 shrink-0 rounded-full",
+                  attention === "dead" ? "bg-red-500" : "animate-pulse bg-amber-400",
+                )}
+              />
+            )}
             <span className="hidden min-w-0 truncate text-[10px] text-muted-foreground lg:inline">
               {agentActivityDetail(agent)}
             </span>
+            {displayOwner === false && (
+              <span
+                title="Another window controls this terminal's size"
+                className="shrink-0 rounded border border-border px-1 text-[9px] uppercase tracking-wide text-muted-foreground"
+              >
+                viewer
+              </span>
+            )}
             <ConnectionChip info={connInfo} compact className="shrink-0" />
             <span className="flex-1" />
+            <DropdownMenu
+              align="end"
+              menuClassName="w-56"
+              renderTrigger={(triggerProps) => (
+                <button
+                  {...triggerProps}
+                  type="button"
+                  aria-label={`${agentTitle(agent)} pane actions`}
+                  className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                >
+                  <MoreHorizontal className="size-3" aria-hidden />
+                </button>
+              )}
+            >
+              <AgentPaneMenuItems
+                agent={agent}
+                getHandle={() => termRef.current}
+                onError={onPaneError}
+              />
+            </DropdownMenu>
             {!stacked && (
               <button
                 type="button"
@@ -993,7 +1191,21 @@ function ScreenPane({
             mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
             imagePasteMode="bracketed-path"
             onConnectionInfo={setConnInfo}
+            onDisplayControl={(state) => setDisplayOwner(state.owner)}
           />
+          {attention === "dead" && (
+            <div className="absolute inset-x-0 bottom-4 z-20 flex justify-center">
+              <button
+                type="button"
+                disabled={restartM.isPending}
+                onClick={() => restartM.mutate()}
+                className="flex items-center gap-1.5 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg transition-colors hover:bg-accent"
+              >
+                <RotateCcw className="size-3.5" aria-hidden />
+                {restartM.isPending ? "Restarting…" : `Restart ${agentTitle(agent)}`}
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="grid flex-1 place-items-center text-xs text-muted-foreground">

@@ -146,3 +146,89 @@ async def test_screen_layout_limits(client):
         headers=auth,
     )
     assert bad_ratio.status_code == 422
+
+
+async def test_ephemeral_screen_lifecycle(client):
+    token = await _signup(client, "screens-eph@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-eph@example.com")
+    a2 = await _create_agent_row("screens-eph@example.com")
+    a3 = await _create_agent_row("screens-eph@example.com")
+
+    # Ad-hoc two-pane screen is created ephemeral.
+    created = await client.post(
+        "/api/screens",
+        json={
+            "name": "a · b",
+            "ephemeral": True,
+            "layout": {"root": _split("row", _pane(a1), _pane(a2))},
+        },
+        headers=auth,
+    )
+    assert created.status_code == 201
+    sid = created.json()["id"]
+    assert created.json()["ephemeral"] is True
+
+    # Removing a pane down to one keeps it (still ephemeral).
+    r = await client.patch(
+        f"/api/screens/{sid}", json={"layout": {"root": _pane(a1)}}, headers=auth
+    )
+    assert r.status_code == 200
+    assert r.json()["ephemeral"] is True
+
+    # Growing to three panes promotes it to permanent.
+    r = await client.patch(
+        f"/api/screens/{sid}",
+        json={"layout": {"root": _split("row", _pane(a1), _split("column", _pane(a2), _pane(a3)))}},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    assert r.json()["ephemeral"] is False
+
+
+async def test_ephemeral_screen_dissolves_when_emptied(client):
+    token = await _signup(client, "screens-eph2@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-eph2@example.com")
+
+    created = await client.post(
+        "/api/screens",
+        json={"name": "temp", "ephemeral": True, "layout": {"root": _pane(a1)}},
+        headers=auth,
+    )
+    sid = created.json()["id"]
+
+    # Emptying an ephemeral screen self-destructs (410) and it's gone.
+    r = await client.patch(f"/api/screens/{sid}", json={"layout": {"root": None}}, headers=auth)
+    assert r.status_code == 410
+    assert (await client.get(f"/api/screens/{sid}", headers=auth)).status_code == 404
+
+
+async def test_rename_promotes_ephemeral(client):
+    token = await _signup(client, "screens-eph3@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-eph3@example.com")
+    created = await client.post(
+        "/api/screens",
+        json={"name": "temp", "ephemeral": True, "layout": {"root": _pane(a1)}},
+        headers=auth,
+    )
+    sid = created.json()["id"]
+    r = await client.patch(f"/api/screens/{sid}", json={"name": "my board"}, headers=auth)
+    assert r.status_code == 200
+    assert r.json()["ephemeral"] is False
+
+
+async def test_keep_promotes_via_ephemeral_flag(client):
+    token = await _signup(client, "screens-eph4@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-eph4@example.com")
+    created = await client.post(
+        "/api/screens",
+        json={"name": "temp", "ephemeral": True, "layout": {"root": _pane(a1)}},
+        headers=auth,
+    )
+    sid = created.json()["id"]
+    r = await client.patch(f"/api/screens/{sid}", json={"ephemeral": False}, headers=auth)
+    assert r.status_code == 200
+    assert r.json()["ephemeral"] is False
