@@ -844,6 +844,52 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
     }
 }
 
+/// Self-update subcommand for tools whose own updater targets the
+/// installation PATH actually resolves — install scripts often manage a
+/// different copy (e.g. `npm install -g` under nvm while PATH serves the
+/// native installer's binary), which "succeeds" without changing anything.
+fn self_update_args(agent_kind: &str) -> Option<&'static [&'static str]> {
+    match agent_kind {
+        "claude-code" => Some(&["update"]),
+        _ => None,
+    }
+}
+
+/// Decide the honest outcome of an update attempt: a script can exit 0 while
+/// the version PATH serves never changes (shadowed install). Demote that to
+/// an explicit failure so the auto-update loop surfaces it instead of
+/// silently retrying forever.
+fn update_outcome(
+    version_before: Option<&str>,
+    status: Option<&HostToolStatus>,
+    script_success: bool,
+    script_error: Option<String>,
+) -> (bool, Option<String>) {
+    if !script_success {
+        return (false, script_error);
+    }
+    let Some(status) = status else {
+        return (true, script_error);
+    };
+    let unchanged = match (version_before, status.version.as_deref()) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    };
+    if unchanged && status.update_available == Some(true) {
+        let path = status.path.as_deref().unwrap_or("?");
+        let version = status.version.as_deref().unwrap_or("?");
+        let latest = status.latest_version.as_deref().unwrap_or("?");
+        return (
+            false,
+            Some(format!(
+                "update ran but PATH still serves {path} at {version} (latest {latest}); \
+                 another installation is shadowing the updated copy"
+            )),
+        );
+    }
+    (true, script_error)
+}
+
 async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
     let install = target.install.as_deref().unwrap_or("").trim().to_string();
     if install.is_empty() {
@@ -862,24 +908,54 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
     }
 
     let env = resolved_command_env().await;
-    let capture = run_shell_capture(
-        &install,
-        TOOL_INSTALL_TIMEOUT,
-        TOOL_OUTPUT_LIMIT,
-        Some(&env),
-    )
-    .await;
+    let version_before = read_tool_version(&target.command, &env)
+        .await
+        .ok()
+        .flatten();
+
+    // Already-installed tools with a self-updater get it first: it updates
+    // the installation PATH resolves, which the install script may not.
+    let mut capture = None;
+    if version_before.is_some() {
+        if let Some(args) = self_update_args(&target.agent_kind) {
+            let self_capture = run_program_capture(
+                &target.command,
+                args,
+                TOOL_INSTALL_TIMEOUT,
+                TOOL_OUTPUT_LIMIT,
+                Some(&env),
+            )
+            .await;
+            let after = read_tool_version(&target.command, &env).await.ok().flatten();
+            if self_capture.success && after != version_before {
+                capture = Some(self_capture);
+            }
+        }
+    }
+    let capture = match capture {
+        Some(capture) => capture,
+        None => {
+            run_shell_capture(&install, TOOL_INSTALL_TIMEOUT, TOOL_OUTPUT_LIMIT, Some(&env)).await
+        }
+    };
+
     let status = Some(check_host_tool(target.clone()).await);
+    let (success, error) = update_outcome(
+        version_before.as_deref(),
+        status.as_ref(),
+        capture.success,
+        capture.error,
+    );
     HostToolInstallResult {
         preset_id: target.preset_id,
         preset_name: target.preset_name,
         agent_kind: target.agent_kind,
         command: target.command,
         install: target.install,
-        success: capture.success,
+        success,
         exit_code: capture.exit_code,
         output: capture.output,
-        error: capture.error,
+        error,
         status,
     }
 }
@@ -934,7 +1010,10 @@ async fn latest_tool_version(
         return None;
     }
 
-    if let Some(package) = npm_package_from_install_command(install) {
+    if let Some(package) = registry_package_for_known_installer(install)
+        .map(str::to_string)
+        .or_else(|| npm_package_from_install_command(install))
+    {
         let capture = run_program_capture(
             "npm",
             &["view", &package, "version"],
@@ -962,6 +1041,19 @@ async fn latest_tool_version(
         }
     }
 
+    None
+}
+
+/// curl|sh installers reveal no registry, but several known tools publish to
+/// npm in lockstep with their script releases — good enough for a
+/// latest-version check (updates still run the configured installer).
+fn registry_package_for_known_installer(install: &str) -> Option<&'static str> {
+    if install.contains("chatgpt.com/codex/install") {
+        return Some("@openai/codex");
+    }
+    if install.contains("claude.ai/install") {
+        return Some("@anthropic-ai/claude-code");
+    }
     None
 }
 
@@ -1829,6 +1921,82 @@ fn toml_string(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::proto::AgentSkillConfig;
+
+    fn tool_status(
+        version: Option<&str>,
+        latest: Option<&str>,
+        update_available: Option<bool>,
+    ) -> HostToolStatus {
+        HostToolStatus {
+            preset_id: "p".into(),
+            preset_name: "claude".into(),
+            agent_kind: "claude-code".into(),
+            command: "claude".into(),
+            install: None,
+            installed: true,
+            path: Some("/home/u/.local/bin/claude".into()),
+            version: version.map(str::to_string),
+            latest_version: latest.map(str::to_string),
+            update_available,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn update_outcome_demotes_shadowed_install_success() {
+        // Script exited 0 but PATH still serves the old version with an
+        // update still available: silent no-op must become a visible error.
+        let status = tool_status(Some("2.1.129"), Some("2.1.209"), Some(true));
+        let (success, error) = update_outcome(Some("2.1.129"), Some(&status), true, None);
+        assert!(!success);
+        let msg = error.expect("explanatory error");
+        assert!(msg.contains("shadowing"), "unexpected error: {msg}");
+        assert!(msg.contains("2.1.129") && msg.contains("2.1.209"));
+    }
+
+    #[test]
+    fn update_outcome_accepts_version_change() {
+        let status = tool_status(Some("2.1.209"), Some("2.1.209"), Some(false));
+        let (success, error) = update_outcome(Some("2.1.129"), Some(&status), true, None);
+        assert!(success);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn update_outcome_accepts_fresh_install_and_keeps_script_failures() {
+        let status = tool_status(Some("1.0.0"), None, None);
+        let (success, _) = update_outcome(None, Some(&status), true, None);
+        assert!(success, "fresh install with no prior version");
+        let (success, error) =
+            update_outcome(Some("1.0.0"), Some(&status), false, Some("boom".into()));
+        assert!(!success);
+        assert_eq!(error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn known_curl_installers_map_to_registry_packages() {
+        assert_eq!(
+            registry_package_for_known_installer(
+                "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+            ),
+            Some("@openai/codex")
+        );
+        assert_eq!(
+            registry_package_for_known_installer("curl -fsSL https://claude.ai/install.sh | bash"),
+            Some("@anthropic-ai/claude-code")
+        );
+        assert_eq!(
+            registry_package_for_known_installer("npm install -g opencode-ai"),
+            None
+        );
+    }
+
+    #[test]
+    fn self_update_args_only_for_known_kinds() {
+        assert_eq!(self_update_args("claude-code"), Some(&["update"][..]));
+        assert_eq!(self_update_args("codex"), None);
+        assert_eq!(self_update_args("shell"), None);
+    }
 
     #[test]
     fn codex_projection_includes_selected_skills_and_trusted_project() {

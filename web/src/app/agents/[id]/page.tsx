@@ -5,7 +5,6 @@ import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
-  Download,
   FolderOpen,
   MoreHorizontal,
   Pencil,
@@ -35,7 +34,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
-import { agentAccess, agents, hosts, screens } from "@/lib/api";
+import { agentAccess, agents, screens } from "@/lib/api";
 import { useAgentDrop } from "@/lib/dnd";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -82,20 +81,12 @@ function AgentTerminal() {
     enabled: !!id,
     refetchInterval: 5_000,
   });
-  const toolsQ = useQuery({
-    queryKey: ["host-tools", q.data?.host_id],
-    queryFn: () => hosts.tools(q.data!.host_id),
-    enabled: Boolean(q.data?.host_id && q.data?.preset_id),
-    refetchInterval: 60_000,
-    staleTime: 30_000,
-  });
   const accessQ = useQuery({
     queryKey: ["agent-access", id],
     queryFn: () => agentAccess.get(id as string),
     enabled: !!id,
     refetchInterval: 10_000,
   });
-  const currentTool = toolsQ.data?.tools.find((tool) => tool.preset_id === q.data?.preset_id);
   const skillsSummary = accessQ.data?.skills.length
     ? accessQ.data.skills.map((skill) => skill.name).join(", ")
     : null;
@@ -182,14 +173,6 @@ function AgentTerminal() {
     onSuccess: () => {
       setActionError(null);
       invalidate();
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const updateToolM = useMutation({
-    mutationFn: () => hosts.installTool(q.data!.host_id, q.data!.preset_id!),
-    onSuccess: () => {
-      setActionError(null);
-      if (q.data) qc.invalidateQueries({ queryKey: ["host-tools", q.data.host_id] });
     },
     onError: (err) => setActionError(String(err)),
   });
@@ -295,27 +278,6 @@ function AgentTerminal() {
         <div className="flex shrink-0 items-center gap-1">
           <ConnectionChip info={connInfo} compact className="sm:hidden" />
           <ConnectionChip info={connInfo} className="hidden sm:block" />
-          {currentTool?.update_available && (
-            <Button
-              variant="secondary"
-              size="sm"
-              className="hidden sm:inline-flex"
-              disabled={updateToolM.isPending}
-              title={
-                currentTool.latest_version
-                  ? `Latest version: ${currentTool.latest_version}`
-                  : "Update available"
-              }
-              onClick={() => updateToolM.mutate()}
-            >
-              <Download className="size-4" />
-              {updateToolM.isPending
-                ? "Updating..."
-                : currentTool.auto_update
-                  ? "Auto updating"
-                  : "Update"}
-            </Button>
-          )}
           <TerminalDisplayControl state={displayState} />
           <Button
             variant={filesOpen ? "secondary" : "ghost"}
@@ -420,16 +382,6 @@ function AgentTerminal() {
               )}
               {archived ? "Unarchive" : "Archive"}
             </DropdownMenuItem>
-            {currentTool?.update_available && (
-              <DropdownMenuItem
-                className="sm:hidden"
-                disabled={updateToolM.isPending}
-                onSelect={() => updateToolM.mutate()}
-              >
-                <Download className="size-4" aria-hidden />
-                Update {currentTool.preset_name}
-              </DropdownMenuItem>
-            )}
             {agent && (
               <>
                 <DropdownMenuSeparator />
