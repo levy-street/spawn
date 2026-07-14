@@ -11,6 +11,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  RefreshCw,
   RotateCcw,
   Trash2,
 } from "lucide-react";
@@ -147,6 +148,32 @@ function AgentTerminal() {
     },
     onError: (err) => setActionError(String(err)),
   });
+  const [diagBusy, setDiagBusy] = useState(false);
+  // Manual terminal refresh that records before/after diagnostics and saves
+  // them to the agent host (cwd/.spawn/attachments) for offline review.
+  const runDiagnosticRefresh = async () => {
+    const handle = termRef.current;
+    if (!handle || diagBusy) return;
+    setDiagBusy(true);
+    try {
+      const bundle = await handle.refreshDiagnostics();
+      const json = new TextEncoder().encode(JSON.stringify(bundle, null, 2));
+      let binary = "";
+      for (let i = 0; i < json.length; i += 0x8000) {
+        binary += String.fromCharCode(...json.subarray(i, i + 0x8000));
+      }
+      await agents.upload(id as string, {
+        name: `terminal-diag-${new Date().toISOString().replaceAll(":", "-")}.json`,
+        mime_type: "application/json",
+        bytes_b64: btoa(binary),
+      });
+      setActionError(null);
+    } catch (err) {
+      setActionError(`diagnostic refresh: ${String(err)}`);
+    } finally {
+      setDiagBusy(false);
+    }
+  };
   const restartM = useMutation({
     mutationFn: () => {
       const size = termRef.current?.getSize();
@@ -314,6 +341,17 @@ function AgentTerminal() {
               </Link>
             </Button>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            aria-label="Refresh terminal"
+            title="Refresh terminal (saves before/after diagnostics)"
+            disabled={diagBusy}
+            onClick={runDiagnosticRefresh}
+          >
+            <RefreshCw className={`size-4 ${diagBusy ? "animate-spin" : ""}`} />
+          </Button>
           <Button
             variant="ghost"
             size="icon"

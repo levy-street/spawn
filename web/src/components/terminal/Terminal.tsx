@@ -104,6 +104,9 @@ export interface TerminalHandle {
   fit: () => void;
   /** Last known terminal geometry. */
   getSize: () => TerminalGeometry;
+  /** Capture diagnostics, force a full refit + reseed, capture again.
+   *  Returns the before/after bundle for saving. */
+  refreshDiagnostics: () => Promise<Record<string, unknown>>;
   /** Focus the terminal so keystrokes flow there (raw mode). */
   focus: () => void;
   /** Submit the current terminal draft, appending pending image refs first. */
@@ -922,9 +925,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes) => {
       const term = termRef.current;
       if (!term) return;
-      const endsInAlt = exactReplayEndsInAlternate(decodeUtf8(bytes));
-      if (endsInAlt !== null) exactStreamRef.current = true;
-      const altActive = endsInAlt ?? containsAlternateBufferSwitch(bytes);
+      const exactChunks = parseExactReplay(decodeUtf8(bytes));
+      if (exactChunks) exactStreamRef.current = true;
+      const lastChunk = exactChunks?.[exactChunks.length - 1];
+      if (lastChunk) {
+        const { cols, rows } = lastSizeRef.current;
+        if (lastChunk.cols !== cols || lastChunk.rows !== rows) {
+          // The seed renders at the agent's previous PTY geometry (set by
+          // another window/session). The owner assertion converges the PTY,
+          // but no LOCAL size change follows, so nothing else would trigger
+          // the rewrap — request a reseed from a fresh checkpoint.
+          historyReseedPendingRef.current = true;
+        }
+      }
+      // Alt-screen detection scoped to the state the stream ends in;
+      // historical alt apps in older chunks must not count.
+      const altActive = lastChunk
+        ? lastChunk.data.lastIndexOf("\x1b[?1049h") > lastChunk.data.lastIndexOf("\x1b[?1049l")
+        : containsAlternateBufferSwitch(bytes);
       if (altActive) {
         scrollbackCachedSnapshotBytesRef.current = null;
         scrollbackCacheDirtyRef.current = true;
@@ -980,8 +998,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // A width change left seeded history wrapped at the old width;
         // rewrite the live buffer from this anchored capture so it reflows.
         // Stays pending until a rewrite actually succeeds (alternate-screen
-        // apps and replay-coverage gaps defer it to a later snapshot).
-        if (syncLiveTerminalFromSnapshot(bytes, { force: true })) {
+        // apps, replay-coverage gaps, and captures whose PTY geometry hasn't
+        // converged to ours yet all defer it to a later snapshot).
+        const chunks = parseExactReplay(decodeUtf8(bytes));
+        const finalChunk = chunks?.[chunks.length - 1];
+        const geometryReady =
+          !finalChunk ||
+          (finalChunk.cols === lastSizeRef.current.cols &&
+            finalChunk.rows === lastSizeRef.current.rows);
+        if (geometryReady && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
           historyReseedPendingRef.current = false;
           socketRef.current.sendJson({ type: "redraw" });
         }
@@ -2368,6 +2393,74 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         fitTerminalRef.current(true);
       },
       getSize: () => lastSizeRef.current,
+      refreshDiagnostics: async () => {
+        const capture = () => {
+          const term = termRef.current;
+          const host = terminalViewportRef.current;
+          const hostRect = host?.getBoundingClientRect();
+          const screenRect = host?.querySelector(".xterm-screen")?.getBoundingClientRect();
+          const buf = term?.buffer.active;
+          const tail: string[] = [];
+          if (term && buf) {
+            const start = Math.max(0, buf.baseY - 5);
+            for (let i = start; i < buf.baseY + term.rows; i += 1) {
+              tail.push(buf.getLine(i)?.translateToString(true) ?? "");
+            }
+          }
+          return {
+            at: new Date().toISOString(),
+            term: term ? { cols: term.cols, rows: term.rows } : null,
+            lastSize: { ...lastSizeRef.current },
+            hostRect: hostRect
+              ? { w: Math.round(hostRect.width), h: Math.round(hostRect.height) }
+              : null,
+            screenRect: screenRect
+              ? { w: Math.round(screenRect.width), h: Math.round(screenRect.height) }
+              : null,
+            buffer: buf
+              ? {
+                  type: buf.type,
+                  baseY: buf.baseY,
+                  viewportY: buf.viewportY,
+                  length: buf.length,
+                }
+              : null,
+            displayOwner: displayOwnerRef.current,
+            socketState: socketRef.current.state,
+            dcActive: dcActiveRef.current,
+            exactStream: exactStreamRef.current,
+            overlay: {
+              visible: scrollbackVisibleRef.current,
+              cacheDirty: scrollbackCacheDirtyRef.current,
+              reseedPending: historyReseedPendingRef.current,
+              renderInFlight: scrollbackRenderInFlightRef.current,
+            },
+            fonts: document.fonts?.status ?? "unknown",
+            dpr: window.devicePixelRatio,
+            viewport: { w: window.innerWidth, h: window.innerHeight },
+            visibility: document.visibilityState,
+            tail,
+          };
+        };
+        const before = capture();
+        hideScrollbackOverlay();
+        fitTerminalRef.current(true);
+        historyReseedPendingRef.current = true;
+        invalidateScrollbackForResizeRef.current();
+        if (displayOwnerRef.current === true) {
+          const { cols, rows } = lastSizeRef.current;
+          socketRef.current.sendJson({ type: "resize", cols, rows });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2200));
+        const after = capture();
+        return {
+          kind: "terminal-refresh-diagnostics",
+          agentId,
+          userAgent: navigator.userAgent,
+          before,
+          after,
+        };
+      },
       focus: () => termRef.current?.focus(),
       submit: () => {
         hideScrollbackOverlay();
@@ -2704,19 +2797,6 @@ function overlayWriteOps(
     ops.push({ resize: finalSize, data: "" });
   }
   return ops;
-}
-
-/**
- * Whether an exact worker replay leaves the terminal on the alternate
- * screen. Scoped to the final chunk: historical alt-app sessions in older
- * chunks must not count, only the state the stream ends in. Returns null for
- * non-exact (tmux capture) payloads.
- */
-function exactReplayEndsInAlternate(text: string): boolean | null {
-  const exact = parseExactReplay(text);
-  if (!exact) return null;
-  const data = exact[exact.length - 1].data;
-  return data.lastIndexOf("\x1b[?1049h") > data.lastIndexOf("\x1b[?1049l");
 }
 
 /** Sequenced ops for seeding the LIVE terminal, which is fit-sized and must
