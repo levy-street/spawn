@@ -3,11 +3,21 @@
 import { Settings } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type ReactNode, type PointerEvent as ReactPointerEvent, useEffect, useState } from "react";
+import {
+  type ReactNode,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+
+// Runs before paint on the client, falls back to a no-op-ish effect on the
+// server (avoids the useLayoutEffect SSR warning).
+const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 const SIDEBAR_DEFAULT_WIDTH = 264;
 const SIDEBAR_MIN_WIDTH = 216;
@@ -35,13 +45,26 @@ export function AppShell({
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [resizing, setResizing] = useState(false);
+  // Width transitions only after the first paint. AppShell remounts on
+  // cross-route navigation, and applying the saved width would otherwise glide
+  // from the default every time — jerking the terminal that resizes with it.
+  const [transitionReady, setTransitionReady] = useState(false);
 
-  useEffect(() => {
+  // Apply the persisted width BEFORE paint so a remount snaps straight to the
+  // saved size (no visible default frame, no glide).
+  useIsoLayoutEffect(() => {
     const savedWidth = Number(window.localStorage.getItem("spawn.sidebar.width"));
     if (Number.isFinite(savedWidth) && savedWidth > 0) {
       setSidebarWidth(clampSidebarWidth(savedWidth));
     }
     setSidebarCollapsed(window.localStorage.getItem("spawn.sidebar.collapsed") === "true");
+  }, []);
+
+  // Enable the width transition one frame later, so collapse/drag still glide
+  // but the initial saved-width application does not.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setTransitionReady(true));
+    return () => cancelAnimationFrame(id);
   }, []);
 
   useEffect(() => {
@@ -86,7 +109,7 @@ export function AppShell({
           className={cn(
             "relative hidden h-vv shrink-0 flex-col border-r border-border bg-card @md/shell:flex pad-safe-top pad-safe-bottom",
             "sticky top-0",
-            !resizing && "transition-[width] duration-200 ease-swift",
+            transitionReady && !resizing && "transition-[width] duration-200 ease-swift",
           )}
           aria-label="Primary"
         >
