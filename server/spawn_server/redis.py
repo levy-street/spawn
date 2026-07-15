@@ -25,6 +25,7 @@ class _InProcPubSub:
     def __init__(self) -> None:
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._values: dict[str, tuple[bytes, float]] = {}
+        self._generations: dict[str, int] = {}
 
     async def publish(self, channel: str, data: bytes) -> None:
         for q in list(self._subs.get(channel, ())):
@@ -45,6 +46,20 @@ class _InProcPubSub:
         previous = self.get_ephemeral(key)
         self.set_ephemeral(key, value, ttl_seconds)
         return previous
+
+    def claim_ephemeral(
+        self,
+        key: str,
+        generation_key: str,
+        value: bytes,
+        minimum_generation: int,
+        ttl_seconds: int,
+    ) -> tuple[bytes | None, int]:
+        generation = max(self._generations.get(generation_key, 0), minimum_generation) + 1
+        self._generations[generation_key] = generation
+        previous = self.get_ephemeral(key)
+        self.set_ephemeral(key, value, ttl_seconds)
+        return previous, generation
 
     def get_ephemeral(self, key: str) -> bytes | None:
         item = self._values.get(key)
@@ -204,6 +219,59 @@ class RedisBackend:
             ttl_seconds,
         )
         return previous if isinstance(previous, bytes) else None
+
+    async def claim_ephemeral(
+        self,
+        key: str,
+        generation_key: str,
+        value: bytes,
+        *,
+        minimum_generation: int,
+        ttl_seconds: int,
+    ) -> tuple[bytes | None, int]:
+        """Atomically claim a lease with a monotonically increasing fence token.
+
+        ``minimum_generation`` lets a durable database generation seed the
+        counter after Redis data loss. The counter intentionally outlives the
+        expiring lease so a delayed claimant can never become newer again.
+        """
+        if minimum_generation < 0:
+            raise ValueError("minimum_generation must be non-negative")
+        if self._inproc is not None:
+            return self._inproc.claim_ephemeral(
+                key,
+                generation_key,
+                value,
+                minimum_generation,
+                ttl_seconds,
+            )
+        assert self._client is not None
+        claimed = await self._client.eval(
+            "local current = tonumber(redis.call('get', KEYS[2]) or '0'); "
+            "local minimum = tonumber(ARGV[3]); "
+            "local generation = math.max(current, minimum) + 1; "
+            "redis.call('set', KEYS[2], generation); "
+            "local old = redis.call('get', KEYS[1]); "
+            "redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2]); "
+            "return {old or false, generation}",
+            2,
+            key,
+            generation_key,
+            value,
+            ttl_seconds,
+            minimum_generation,
+        )
+        if not isinstance(claimed, (list, tuple)) or len(claimed) != 2:
+            raise RuntimeError("Redis returned an invalid lease claim")
+        previous_raw, generation_raw = claimed
+        previous = previous_raw if isinstance(previous_raw, bytes) else None
+        if isinstance(generation_raw, bytes):
+            generation = int(generation_raw)
+        elif isinstance(generation_raw, int):
+            generation = generation_raw
+        else:
+            raise RuntimeError("Redis returned an invalid lease generation")
+        return previous, generation
 
     async def get_ephemeral(self, key: str) -> bytes | None:
         if self._inproc is not None:

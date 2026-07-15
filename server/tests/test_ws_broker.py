@@ -471,6 +471,27 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
     assert await backend.get_ephemeral(key) == new
     assert await backend.refresh_ephemeral_if(key, new, ttl_seconds=60)
 
+    generation_key = f"{key}:generation"
+    first_previous, first_generation = await backend.claim_ephemeral(
+        key,
+        generation_key,
+        old,
+        minimum_generation=0,
+        ttl_seconds=60,
+    )
+    assert first_previous == new
+    assert first_generation == 1
+    second_previous, second_generation = await backend.claim_ephemeral(
+        key,
+        generation_key,
+        new,
+        minimum_generation=100,
+        ttl_seconds=60,
+    )
+    assert second_previous == old
+    assert second_generation == 101
+    assert await backend.get_ephemeral(key) == new
+
 
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     from spawn_server.ws.host_signal import (

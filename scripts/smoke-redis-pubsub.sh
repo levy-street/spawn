@@ -200,8 +200,14 @@ printf '%s\n' "smoke-redis-pubsub: publishing from a second process"
 import asyncio
 import os
 
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from spawn_server.config import get_settings
+from spawn_server.db import Base
+from spawn_server.models import Host, User
 from spawn_server.redis import get_backend
+from spawn_server.ws.daemon import _mark_host_online
+from spawn_server.ws.host_signal import host_presence_generation_key, host_presence_key
 
 agent_id = os.environ["SPAWN_REDIS_SMOKE_AGENT_ID"]
 
@@ -211,6 +217,74 @@ async def main() -> None:
     backend = get_backend()
     await backend.startup()
     try:
+        # Reproduce the inverse durable-ownership race with real Redis: A
+        # claims and stalls, B claims later and commits first, then A resumes.
+        # The older fence token must make A's database CAS a no-op.
+        inverse_host_id = "00000000-0000-4000-8000-000000000099"
+        inverse_user_id = "00000000-0000-4000-8000-000000000098"
+        old_owner = b"a" * 32
+        new_owner = b"b" * 32
+        inverse_owner_key = host_presence_key(inverse_host_id)
+        inverse_generation_key = host_presence_generation_key(inverse_host_id)
+        _, old_generation = await backend.claim_ephemeral(
+            inverse_owner_key,
+            inverse_generation_key,
+            old_owner,
+            minimum_generation=0,
+            ttl_seconds=60,
+        )
+        previous, new_generation = await backend.claim_ephemeral(
+            inverse_owner_key,
+            inverse_generation_key,
+            new_owner,
+            minimum_generation=0,
+            ttl_seconds=60,
+        )
+        assert previous == old_owner
+        assert new_generation > old_generation
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(User(id=inverse_user_id, email="inverse@example.com", password_hash="x"))
+            session.add(
+                Host(
+                    id=inverse_host_id,
+                    owner_user_id=inverse_user_id,
+                    name="inverse-race",
+                )
+            )
+            await session.commit()
+        async with sessions() as session:
+            assert await _mark_host_online(
+                session,
+                inverse_host_id,
+                new_owner.decode("ascii"),
+                new_generation,
+                {"version": "new"},
+            )
+        async with sessions() as session:
+            assert not await _mark_host_online(
+                session,
+                inverse_host_id,
+                old_owner.decode("ascii"),
+                old_generation,
+                {"version": "old"},
+            )
+            durable = await session.get(Host, inverse_host_id)
+            assert durable is not None
+            assert durable.status == "online"
+            assert durable.version == "new"
+            assert durable.daemon_connection_id == new_owner.decode("ascii")
+            assert durable.daemon_generation == new_generation
+        assert await backend.get_ephemeral(inverse_owner_key) == new_owner
+        assert await backend.refresh_ephemeral_if(
+            inverse_owner_key, new_owner, ttl_seconds=60
+        )
+        await engine.dispose()
+
         owner_key = f"spawn:rtc:host:{agent_id}:owner"
         await backend.set_ephemeral(owner_key, b"old", ttl_seconds=60)
         assert await backend.swap_ephemeral(owner_key, b"new", ttl_seconds=60) == b"old"
@@ -408,6 +482,7 @@ from spawn_server.ws.host_signal import (
     HostSignalEnvelope,
     browser_signal_channel,
     host_presence_key,
+    host_presence_generation_key,
     publish_host_owner_revocation,
     publish_host_signal,
 )
@@ -449,10 +524,15 @@ async def main() -> None:
             await asyncio.sleep(0.01)
         assert established_file.exists(), "old worker did not establish the session"
 
-        previous = await backend.swap_ephemeral(
-            host_presence_key(host_id), new_owner.encode("ascii"), ttl_seconds=60
+        previous, generation = await backend.claim_ephemeral(
+            host_presence_key(host_id),
+            host_presence_generation_key(host_id),
+            new_owner.encode("ascii"),
+            minimum_generation=0,
+            ttl_seconds=60,
         )
         assert previous == old_owner.encode("ascii")
+        assert generation > 0
         # Deliberately publish the stale offer before the revocation event. The
         # old worker must fence on the current lease generation, not event order.
         await publish_host_signal(

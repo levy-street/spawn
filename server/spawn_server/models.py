@@ -98,6 +98,7 @@ class Host(Base):
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="offline", nullable=False)
     daemon_connection_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    daemon_generation: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

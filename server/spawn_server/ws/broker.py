@@ -28,6 +28,7 @@ class DaemonConn:
     user_id: str
     websocket: WebSocket
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    host_generation: int | None = None
     home_dir: str | None = None
     agent_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

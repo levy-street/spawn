@@ -28,6 +28,7 @@ from .host_signal import (
     RedisBrowserConn,
     decode_host_owner_revocation,
     decode_host_signal,
+    host_presence_generation_key,
     host_presence_key,
     host_signal_channel,
     publish_host_owner_revocation,
@@ -86,10 +87,12 @@ async def _mark_host_online(
     session: AsyncSession,
     host_id: str,
     connection_id: str,
+    generation: int,
     registration: dict[str, object],
 ) -> bool:
     values: dict[str, object] = {
         "daemon_connection_id": connection_id,
+        "daemon_generation": generation,
         "status": "online",
         "last_seen_at": _utcnow(),
     }
@@ -97,15 +100,25 @@ async def _mark_host_online(
         value = registration.get(field)
         if isinstance(value, str) and value:
             values[field] = value
-    result = await session.execute(update(Host).where(Host.id == host_id).values(**values))
+    result = await session.execute(
+        update(Host)
+        .where(Host.id == host_id, Host.daemon_generation < generation)
+        .values(**values)
+    )
     await session.commit()
     return result.rowcount == 1
 
 
-async def _touch_host(session: AsyncSession, host_id: str, connection_id: str) -> bool:
+async def _touch_host(
+    session: AsyncSession, host_id: str, connection_id: str, generation: int
+) -> bool:
     result = await session.execute(
         update(Host)
-        .where(Host.id == host_id, Host.daemon_connection_id == connection_id)
+        .where(
+            Host.id == host_id,
+            Host.daemon_connection_id == connection_id,
+            Host.daemon_generation == generation,
+        )
         .values(last_seen_at=_utcnow())
     )
     if result.rowcount != 1:
@@ -116,11 +129,15 @@ async def _touch_host(session: AsyncSession, host_id: str, connection_id: str) -
 
 
 async def _mark_host_offline_if_owner(
-    session: AsyncSession, host_id: str, connection_id: str
+    session: AsyncSession, host_id: str, connection_id: str, generation: int
 ) -> bool:
     result = await session.execute(
         update(Host)
-        .where(Host.id == host_id, Host.daemon_connection_id == connection_id)
+        .where(
+            Host.id == host_id,
+            Host.daemon_connection_id == connection_id,
+            Host.daemon_generation == generation,
+        )
         .values(status="offline", last_seen_at=_utcnow(), daemon_connection_id=None)
     )
     await session.commit()
@@ -190,22 +207,25 @@ def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
     )
 
 
-async def _claim_host_signal_presence(conn: DaemonConn) -> None:
+async def _claim_host_signal_presence(conn: DaemonConn, minimum_generation: int) -> int:
     key = host_presence_key(conn.host_id)
     value = conn.id.encode("ascii")
-    previous = await get_backend().swap_ephemeral(
+    previous, generation = await get_backend().claim_ephemeral(
         key,
+        host_presence_generation_key(conn.host_id),
         value,
+        minimum_generation=minimum_generation,
         ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
     )
+    conn.host_generation = generation
     if previous is None or previous == value:
-        return
+        return generation
     try:
         previous_id = previous.decode("ascii")
     except UnicodeDecodeError:
-        return
+        return generation
     if not valid_daemon_connection_id(previous_id):
-        return
+        return generation
     await publish_host_owner_revocation(
         conn.host_id,
         HostOwnerRevocation(
@@ -213,6 +233,7 @@ async def _claim_host_signal_presence(conn: DaemonConn) -> None:
             replacement_connection_id=conn.id,
         ),
     )
+    return generation
 
 
 async def _refresh_host_signal_presence(conn: DaemonConn) -> bool:
@@ -419,6 +440,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     signal_task = asyncio.create_task(_pump_host_rtc_signals(conn, signal_ready, expiry_tasks))
 
     sm = get_sessionmaker()
+    registered = False
 
     try:
         await wait_for_signal_pump(signal_task, signal_ready)
@@ -479,23 +501,45 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 ftype = obj.get("type")
 
                 if ftype == "register":
-                    # Claim distributed routing before publishing online state.
-                    # That ordering ensures a superseded worker cannot race its
-                    # disconnect cleanup after this registration commits.
-                    await _claim_host_signal_presence(conn)
+                    if registered:
+                        log.warning("daemon repeated register host=%s", host.id)
+                        continue
+                    # Redis serializes claims and assigns a monotonic fence
+                    # token. The database only accepts a strictly newer token,
+                    # so a claimant stalled here cannot overwrite a replacement
+                    # that has already committed its later generation.
+                    async with sm() as session:
+                        durable_host = await session.get(Host, host.id)
+                        if durable_host is None:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        minimum_generation = durable_host.daemon_generation
+                    generation = await _claim_host_signal_presence(
+                        conn, minimum_generation
+                    )
                     # Resync existing agents the daemon thinks it has.
                     existing = obj.get("existing_agents") or []
                     home_dir = obj.get("home_dir")
                     if isinstance(home_dir, str) and home_dir:
                         conn.home_dir = home_dir
                     async with sm() as session:
+                        marked_online = await _mark_host_online(
+                            session, host.id, conn.id, generation, obj
+                        )
+                        if not marked_online:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await _owns_host_signal_presence(conn):
+                            await _mark_host_offline_if_owner(
+                                session, host.id, conn.id, generation
+                            )
+                            await _fence_superseded_daemon(conn)
+                            break
                         for aid in existing:
                             agent = await session.get(Agent, aid)
                             if agent is not None and agent.host_id == host.id:
                                 await broker.attach_agent_to_daemon(aid, conn)
-                        if not await _mark_host_online(session, host.id, conn.id, obj):
-                            await _fence_superseded_daemon(conn)
-                            break
+                    registered = True
                     await conn.send_text({"type": "registered", "host_id": host.id})
 
                 elif ftype == "host.fs.list_result":
@@ -522,8 +566,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if not await _refresh_host_signal_presence(conn):
                         await _fence_superseded_daemon(conn)
                         break
+                    generation = conn.host_generation
+                    if generation is None:
+                        await _fence_superseded_daemon(conn)
+                        break
                     async with sm() as session:
-                        if not await _touch_host(session, host.id, conn.id):
+                        if not await _touch_host(
+                            session, host.id, conn.id, generation
+                        ):
                             await _fence_superseded_daemon(conn)
                             break
                     await conn.send_text({"type": "host.heartbeat"})
@@ -556,7 +606,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             agent = await session.get(Agent, aid)
                             if agent is not None and agent.host_id == host.id:
                                 agent.last_output_at = now
-                                if not await _touch_host(session, host.id, conn.id):
+                                generation = conn.host_generation
+                                if generation is None or not await _touch_host(
+                                    session, host.id, conn.id, generation
+                                ):
                                     await _fence_superseded_daemon(conn)
                                     break
 
@@ -571,7 +624,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             agent = await session.get(Agent, aid)
                             if agent is not None and agent.host_id == host.id:
                                 agent.last_input_at = now
-                                if not await _touch_host(session, host.id, conn.id):
+                                generation = conn.host_generation
+                                if generation is None or not await _touch_host(
+                                    session, host.id, conn.id, generation
+                                ):
                                     await _fence_superseded_daemon(conn)
                                     break
 
@@ -820,6 +876,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
         except Exception:
             log.warning("failed to release distributed host signaling ownership")
         await broker.unregister_daemon(conn)
-        async with sm() as session:
-            await _mark_host_offline_if_owner(session, host.id, conn.id)
+        if conn.host_generation is not None:
+            async with sm() as session:
+                await _mark_host_offline_if_owner(
+                    session, host.id, conn.id, conn.host_generation
+                )
         log.info("daemon disconnected host=%s", host.id)

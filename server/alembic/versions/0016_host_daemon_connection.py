@@ -4,9 +4,8 @@ Revision ID: 0016
 Revises: 0015
 """
 
-from __future__ import annotations
-
 import sqlalchemy as sa
+
 from alembic import op
 
 # revision identifiers
@@ -21,7 +20,12 @@ def upgrade() -> None:
         "hosts",
         sa.Column("daemon_connection_id", sa.String(length=32), nullable=True),
     )
+    op.add_column(
+        "hosts",
+        sa.Column("daemon_generation", sa.Integer(), server_default="0", nullable=False),
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("hosts", "daemon_generation")
     op.drop_column("hosts", "daemon_connection_id")

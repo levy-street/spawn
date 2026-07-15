@@ -157,9 +157,13 @@ not make the Phase 2 claim and does not remove any legacy host content route.
 Host signaling is routed between websocket workers through ephemeral Redis
 pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
 does not depend on process-local broker affinity. A replacement claim actively
-revokes the previous worker and every host signal revalidates the current lease
-generation, so a stale worker cannot retain or create host sessions during the
-notification race. Browser, host, and daemon session
+revokes the previous worker. Each claim receives a monotonically increasing
+Redis fence token, seeded from the durable host generation after Redis loss;
+the host row accepts only a strictly newer token, while heartbeat and offline
+transitions require the exact connection and generation. Every host signal
+also revalidates the current lease, so a stale worker cannot retain or create
+host sessions or overwrite its replacement's durable status during either
+claim or notification races. Browser, host, and daemon session
 counts are capped, pending offers expire, daemon peer connections have a hard
 ceiling, and only the first correctly labelled host DataChannel is accepted.
 The browser's negotiation deadline starts before offer creation and ends only

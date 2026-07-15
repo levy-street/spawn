@@ -16,6 +16,7 @@ from spawn_server.redis import get_backend
 from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
+from spawn_server.ws.host_signal import host_presence_key
 
 
 class FakeDaemonWebSocket:
@@ -249,6 +250,103 @@ async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_h
         assert host is not None
         assert host.status == "offline"
         assert host.daemon_connection_id is None
+
+
+async def test_newer_claim_generation_wins_when_older_claimant_resumes_late(client, monkeypatch):
+    user_id, _ = await _signup(client, "ws-daemon-inverse-claim-race@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    await _wait_until(lambda: get_broker().get_daemon_for_host(host_id) is not None)
+    old_conn = get_broker().get_daemon_for_host(host_id)
+    assert old_conn is not None
+
+    backend = get_backend()
+    original_claim = backend.claim_ephemeral
+    old_claimed_redis = asyncio.Event()
+    release_old_claimant = asyncio.Event()
+    old_claim_generation: int | None = None
+
+    async def claim_with_inverse_barrier(
+        key: str,
+        generation_key: str,
+        value: bytes,
+        *,
+        minimum_generation: int,
+        ttl_seconds: int,
+    ) -> tuple[bytes | None, int]:
+        nonlocal old_claim_generation
+        claim = await original_claim(
+            key,
+            generation_key,
+            value,
+            minimum_generation=minimum_generation,
+            ttl_seconds=ttl_seconds,
+        )
+        if value == old_conn.id.encode("ascii"):
+            old_claim_generation = claim[1]
+            old_claimed_redis.set()
+            await release_old_claimant.wait()
+        return claim
+
+    monkeypatch.setattr(backend, "claim_ephemeral", claim_with_inverse_barrier)
+    old.queue_text(
+        {"type": "register", "version": "old", "existing_agents": [agent_id]}
+    )
+    await asyncio.wait_for(old_claimed_redis.wait(), timeout=1)
+
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text(
+        {"type": "register", "version": "new", "existing_agents": [agent_id]}
+    )
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
+    new_conn = get_broker().get_daemon_for_host(host_id)
+    assert new_conn is not None
+    assert new_conn.id != old_conn.id
+    assert old_claim_generation == 1
+    assert new_conn.host_generation == 2
+    assert get_broker().get_daemon_for_agent(agent_id) is new_conn
+    assert await backend.get_ephemeral(host_presence_key(host_id)) == new_conn.id.encode("ascii")
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "online"
+        assert host.version == "new"
+        assert host.daemon_connection_id == new_conn.id
+        assert host.daemon_generation == new_conn.host_generation
+
+    new.queue_text({"type": "host.heartbeat"})
+    await _wait_until(
+        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(new))
+    )
+
+    release_old_claimant.set()
+    await asyncio.wait_for(old_task, timeout=1)
+    assert old.closed == (4000, "superseded")
+    assert await backend.get_ephemeral(host_presence_key(host_id)) == new_conn.id.encode("ascii")
+    assert get_broker().get_daemon_for_agent(agent_id) is new_conn
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "online"
+        assert host.version == "new"
+        assert host.daemon_connection_id == new_conn.id
+        assert host.daemon_generation == new_conn.host_generation
+
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "offline"
+        assert host.daemon_connection_id is None
+        assert host.daemon_generation == new_conn.host_generation
 
 
 async def test_old_cleanup_cannot_overwrite_replacement_database_ownership(client, monkeypatch):
