@@ -130,7 +130,7 @@ async fn serve_one_connection(
     // a PTY reader to each, and surface them in `existing_agents`. This is
     // what makes daemon restart non-destructive.
     if registry.claim_discovery() {
-        rediscover_existing_agents(registry, &out_tx).await;
+        rediscover_existing_agents(registry, rtc_sessions, &out_tx).await;
     }
 
     // Install this session's sink for every agent's forwarder so PTY bytes
@@ -327,13 +327,13 @@ async fn dispatch_loop(
                     handle_host_tools_install(request_id, target, out_tx).await;
                 }
                 Inbound::AgentCreate(create) => {
-                    handle_agent_create(create, registry, out_tx).await;
+                    handle_agent_create(create, registry, rtc_sessions, out_tx).await;
                 }
                 Inbound::AgentRestart(create) => {
-                    handle_agent_restart(create, registry, out_tx).await;
+                    handle_agent_restart(create, registry, rtc_sessions, out_tx).await;
                 }
                 Inbound::AgentKill { agent_id, signal } => {
-                    handle_agent_kill(agent_id, signal, registry, out_tx).await;
+                    handle_agent_kill(agent_id, signal, registry, rtc_sessions, out_tx).await;
                 }
                 Inbound::AgentRename {
                     agent_id,
@@ -361,6 +361,7 @@ async fn dispatch_loop(
                     // the dispatch loop so queued stdin frames aren't delayed
                     // behind them.
                     let registry = registry.clone();
+                    let rtc_sessions = rtc_sessions.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
                         handle_agent_snapshot(
@@ -369,6 +370,7 @@ async fn dispatch_loop(
                             plain.unwrap_or(false),
                             rtc_session_id,
                             &registry,
+                            &rtc_sessions,
                             &out_tx,
                         )
                         .await;
@@ -399,6 +401,7 @@ async fn dispatch_loop(
                         destination,
                         client_id,
                         registry,
+                        rtc_sessions,
                         out_tx,
                     )
                     .await;
@@ -445,7 +448,8 @@ async fn dispatch_loop(
             } => {
                 if kind == frames::KIND_PTY_INPUT {
                     if !registry.contains(agent_id) {
-                        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+                        let _ =
+                            ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
                     }
                     let Some(session) = registry.session_for(agent_id) else {
                         tracing::debug!(%agent_id, "ignoring stdin for unknown agent");
@@ -1424,6 +1428,7 @@ fn lexical_normalize(path: PathBuf) -> PathBuf {
 async fn handle_agent_create(
     create: AgentCreate,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let agent_id = create.agent_id;
@@ -1571,6 +1576,11 @@ async fn handle_agent_create(
     // the registry — that way the first PTY bytes (tmux's initial pane draw)
     // route through cleanly instead of piling up in the outbox.
     launched.handle.control.set_sink(out_tx.clone()).await;
+    if let Some(previous) = registry.binding_for(agent_id) {
+        rtc_sessions
+            .close_for_agent(agent_id, previous.generation())
+            .await;
+    }
     let generation = registry.insert(launched.handle);
 
     // Tell server it's up.
@@ -1581,12 +1591,14 @@ async fn handle_agent_create(
 
     // Await PTY exit and forward `agent.exit`.
     let registry = registry.clone();
+    let rtc_sessions = rtc_sessions.clone();
     let out_tx = out_tx.clone();
     tokio::spawn(async move {
         let reason = exit_rx.await.unwrap_or(pty::ExitReason {
             exit_code: None,
             signal: None,
         });
+        rtc_sessions.close_for_agent(agent_id, generation).await;
         if registry
             .remove_if_generation(agent_id, generation)
             .is_none()
@@ -2148,6 +2160,7 @@ mod tests {
 async fn handle_agent_restart(
     create: AgentCreate,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let agent_id = create.agent_id;
@@ -2156,7 +2169,15 @@ async fn handle_agent_restart(
     // Remove the current handle before killing tmux. Its exit task will see
     // that its generation is no longer current and will not emit agent.exit.
     let mut was_worker = false;
-    let session = if let Some(handle) = registry.remove(agent_id) {
+    let current = registry.binding_for(agent_id);
+    if let Some(binding) = current {
+        rtc_sessions
+            .close_for_agent(agent_id, binding.generation())
+            .await;
+    }
+    let removed =
+        current.and_then(|binding| registry.remove_if_generation(agent_id, binding.generation()));
+    let session = if let Some(handle) = removed {
         let session = handle
             .session()
             .unwrap_or_else(|_| tmux::legacy_session_name(agent_id));
@@ -2196,7 +2217,7 @@ async fn handle_agent_restart(
             send_spawn_failed_exit(agent_id, out_tx, "restart timeout").await;
             return;
         }
-        handle_agent_create(create, registry, out_tx).await;
+        handle_agent_create(create, registry, rtc_sessions, out_tx).await;
         return;
     }
 
@@ -2206,7 +2227,7 @@ async fn handle_agent_restart(
 
     for _ in 0..30 {
         if !tmux::has_session(&session).await {
-            handle_agent_create(create, registry, out_tx).await;
+            handle_agent_create(create, registry, rtc_sessions, out_tx).await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2260,12 +2281,13 @@ async fn handle_agent_kill(
     agent_id: Uuid,
     signal: Option<String>,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     // Worker backend: signal through the worker (adopting first if this
     // daemon process hasn't attached yet). The Exit frame drives agent.exit.
     if !registry.contains(agent_id) {
-        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+        let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
     }
     if registry.is_worker(agent_id) == Some(true) {
         registry.with_handle(agent_id, |h| {
@@ -2339,9 +2361,10 @@ async fn handle_agent_snapshot(
     plain: bool,
     rtc_session_id: Option<String>,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let attach_outcome = ensure_agent_attached(agent_id, registry, out_tx).await;
+    let attach_outcome = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
 
     // Worker backend: the snapshot is a decrypted replay of the worker's
     // scrollback log — raw PTY bytes starting at a checkpoint (which opens
@@ -2477,10 +2500,11 @@ async fn handle_agent_upload(
     destination: Option<String>,
     client_id: Option<String>,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     if !registry.contains(agent_id) {
-        let _ = ensure_agent_attached(agent_id, registry, out_tx).await;
+        let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
         if !registry.contains(agent_id) {
             tracing::debug!(%agent_id, "ignoring upload for unknown agent");
             return;
@@ -2575,12 +2599,14 @@ async fn spawn_exit_forwarder(
     generation: u64,
     exit_rx: tokio::sync::oneshot::Receiver<pty::ExitReason>,
     registry: AgentRegistry,
+    rtc_sessions: RtcSessions,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     let reason = exit_rx.await.unwrap_or(pty::ExitReason {
         exit_code: None,
         signal: None,
     });
+    rtc_sessions.close_for_agent(agent_id, generation).await;
     if registry
         .remove_if_generation(agent_id, generation)
         .is_none()
@@ -2602,6 +2628,7 @@ async fn attach_existing_agent(
     agent_id: Uuid,
     session: &str,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
 ) -> Result<()> {
@@ -2609,7 +2636,15 @@ async fn attach_existing_agent(
         return Ok(());
     }
     let launched = pty::reattach(agent_id, session).await?;
-    register_attached(agent_id, launched, registry, out_tx, notify_started).await;
+    register_attached(
+        agent_id,
+        launched,
+        registry,
+        rtc_sessions,
+        out_tx,
+        notify_started,
+    )
+    .await;
     Ok(())
 }
 
@@ -2618,6 +2653,7 @@ async fn attach_existing_agent(
 async fn adopt_worker_agent(
     agent_id: Uuid,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
 ) -> Result<bool> {
@@ -2628,7 +2664,15 @@ async fn adopt_worker_agent(
     let Some(launched) = worker_backend::adopt(agent_id, &label).await? else {
         return Ok(false);
     };
-    register_attached(agent_id, launched, registry, out_tx, notify_started).await;
+    register_attached(
+        agent_id,
+        launched,
+        registry,
+        rtc_sessions,
+        out_tx,
+        notify_started,
+    )
+    .await;
     Ok(true)
 }
 
@@ -2638,6 +2682,7 @@ async fn register_attached(
     agent_id: Uuid,
     launched: pty::Launched,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
 ) {
@@ -2659,6 +2704,7 @@ async fn register_attached(
         generation,
         exit_rx,
         registry.clone(),
+        rtc_sessions.clone(),
         out_tx.clone(),
     ));
 }
@@ -2677,6 +2723,7 @@ enum AttachOutcome {
 async fn ensure_agent_attached(
     agent_id: Uuid,
     registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) -> AttachOutcome {
     if registry.contains(agent_id) {
@@ -2691,7 +2738,7 @@ async fn ensure_agent_attached(
     }
     // Worker backend first: a live worker socket is authoritative for this
     // agent regardless of any tmux state.
-    match adopt_worker_agent(agent_id, registry, out_tx, true).await {
+    match adopt_worker_agent(agent_id, registry, rtc_sessions, out_tx, true).await {
         Ok(true) => {
             tracing::info!(%agent_id, "lazily adopted session worker");
             return AttachOutcome::Attached;
@@ -2730,7 +2777,7 @@ async fn ensure_agent_attached(
         tracing::debug!(%agent_id, "no tmux session found for unknown agent");
         return AttachOutcome::NoSession;
     };
-    match attach_existing_agent(agent_id, &session, registry, out_tx, true).await {
+    match attach_existing_agent(agent_id, &session, registry, rtc_sessions, out_tx, true).await {
         Ok(()) => {
             tracing::info!(%agent_id, %session, "lazily reattached existing agent");
             AttachOutcome::Attached
@@ -2747,12 +2794,16 @@ async fn ensure_agent_attached(
 /// and reattach to each: session workers via their unix sockets, tmux
 /// sessions via `list-sessions`. Inserts handles into the registry and spawns
 /// the await-exit task per agent.
-async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
+async fn rediscover_existing_agents(
+    registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
     for agent_id in worker_backend::discover_ids() {
         if registry.contains(agent_id) {
             continue;
         }
-        match adopt_worker_agent(agent_id, registry, out_tx, false).await {
+        match adopt_worker_agent(agent_id, registry, rtc_sessions, out_tx, false).await {
             Ok(true) => tracing::info!(%agent_id, "rediscovered worker-backed agent"),
             Ok(false) => {}
             Err(e) => {
@@ -2775,7 +2826,7 @@ async fn rediscover_existing_agents(registry: &AgentRegistry, out_tx: &mpsc::Sen
         if registry.contains(agent_id) {
             continue; // shouldn't happen on a fresh process, but be safe
         }
-        match attach_existing_agent(agent_id, &name, registry, out_tx, false).await {
+        match attach_existing_agent(agent_id, &name, registry, rtc_sessions, out_tx, false).await {
             Ok(()) => {
                 tracing::info!(%agent_id, "rediscovered existing agent");
             }

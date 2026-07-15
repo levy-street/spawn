@@ -7,12 +7,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -31,9 +31,9 @@ use crate::agent_ctl::{
     self, AgentControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
     ProtocolError,
 };
-use crate::agents::AgentRegistry;
+use crate::agents::{AgentBinding, AgentRegistry};
 use crate::proto::{Outbound, RtcIceServerConfig};
-use crate::pty::WsOutbound;
+use crate::pty::{ForwarderControl, WsOutbound};
 use crate::tmux;
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
@@ -51,19 +51,26 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
+
 #[derive(Default, Clone)]
 pub struct RtcSessions {
     peers: Arc<Mutex<HashMap<String, RtcPeer>>>,
+    agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
 }
 
 #[derive(Clone)]
 struct RtcPeer {
     pc: Arc<RTCPeerConnection>,
-    agent_id: Uuid,
+    agent: AgentBinding,
     generation: String,
     active: Arc<AtomicBool>,
-    lifecycle: Arc<RwLock<()>>,
+    control: ForwarderControl,
+    /// Replacement sets `active` false, closes the PC, then takes this write
+    /// lock. Every callback holds a read lock while touching its backend, so
+    /// `close_for_agent` does not return until old-generation work has drained.
+    fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Immutable identity assigned by the signaling broker to one RTC attempt.
@@ -88,6 +95,13 @@ impl RtcSessionBinding {
     }
 }
 
+#[derive(Clone)]
+struct BoundRtcSession {
+    signaling: RtcSessionBinding,
+    agent: AgentBinding,
+    control: ForwarderControl,
+}
+
 fn viewer_id(session_id: &str, generation: &str) -> String {
     format!("{session_id}:{generation}")
 }
@@ -105,7 +119,7 @@ impl RtcSessions {
         registry: AgentRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
     ) {
-        if !registry.contains(binding.agent_id) {
+        let Some(agent) = registry.binding_for(binding.agent_id) else {
             send_status(
                 &out_tx,
                 binding.session_id,
@@ -116,23 +130,40 @@ impl RtcSessions {
             )
             .await;
             return;
-        }
-
-        if let Err(e) = self
-            .create_answer(binding.clone(), sdp, ice_servers, registry, out_tx.clone())
-            .await
-        {
-            tracing::warn!(
-                agent_id = %binding.agent_id,
-                session_id = %binding.session_id,
-                error = %e,
-                "rtc offer failed"
-            );
+        };
+        let Some(control) = registry.control_for_binding(agent) else {
             send_status(
                 &out_tx,
                 binding.session_id,
                 binding.generation,
                 binding.agent_id,
+                "failed",
+                Some("agent backend was replaced while binding RTC"),
+            )
+            .await;
+            return;
+        };
+        let bound = BoundRtcSession {
+            signaling: binding,
+            agent,
+            control,
+        };
+
+        if let Err(e) = self
+            .create_answer(bound.clone(), sdp, ice_servers, registry, out_tx.clone())
+            .await
+        {
+            tracing::warn!(
+                agent_id = %bound.signaling.agent_id,
+                session_id = %bound.signaling.session_id,
+                error = %e,
+                "rtc offer failed"
+            );
+            send_status(
+                &out_tx,
+                bound.signaling.session_id,
+                bound.signaling.generation,
+                bound.signaling.agent_id,
                 "failed",
                 Some(&format!("{e:#}")),
             )
@@ -142,7 +173,7 @@ impl RtcSessions {
 
     async fn create_answer(
         &self,
-        binding: RtcSessionBinding,
+        binding: BoundRtcSession,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
         registry: AgentRegistry,
@@ -182,23 +213,24 @@ impl RtcSessions {
             .context("creating peer connection")?,
         );
         let active = Arc::new(AtomicBool::new(true));
-        let lifecycle = Arc::new(RwLock::new(()));
+        let fence = Arc::new(tokio::sync::RwLock::new(()));
 
         // Track the peer connection BEFORE negotiation so every exit path —
         // including negotiation errors below — can reach it and close it.
         let collision = {
             let mut peers = self.peers.lock().await;
-            if peers.contains_key(&binding.session_id) {
+            if peers.contains_key(&binding.signaling.session_id) {
                 true
             } else {
                 peers.insert(
-                    binding.session_id.clone(),
+                    binding.signaling.session_id.clone(),
                     RtcPeer {
                         pc: Arc::clone(&pc),
-                        agent_id: binding.agent_id,
-                        generation: binding.generation.clone(),
+                        agent: binding.agent,
+                        generation: binding.signaling.generation.clone(),
                         active: Arc::clone(&active),
-                        lifecycle: Arc::clone(&lifecycle),
+                        control: binding.control.clone(),
+                        fence: Arc::clone(&fence),
                     },
                 );
                 false
@@ -209,23 +241,40 @@ impl RtcSessions {
             anyhow::bail!("rtc session id is already active");
         }
 
-        install_ice_handler(&pc, binding.clone(), out_tx.clone());
+        // The backend may have been replaced while the peer connection was
+        // being constructed. Once the peer is visible, either this check or
+        // the replacement path's `close_for_agent` owns closing it.
+        if !registry.is_current(binding.agent) {
+            self.close_if_same(
+                &binding.signaling.session_id,
+                &binding.signaling.generation,
+                &pc,
+            )
+            .await;
+            anyhow::bail!("agent backend was replaced during RTC negotiation");
+        }
+
+        install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
         install_data_channel_handler(
             &pc,
             binding.clone(),
             registry,
             self.controls.clone(),
             Arc::clone(&active),
-            Arc::clone(&lifecycle),
+            fence,
             out_tx.clone(),
         );
-        self.install_reaper(&pc, binding.clone());
+        self.install_reaper(&pc, binding.signaling.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
             Ok(local_sdp) => local_sdp,
             Err(e) => {
-                self.close_if_same(&binding.session_id, &binding.generation, &pc)
-                    .await;
+                self.close_if_same(
+                    &binding.signaling.session_id,
+                    &binding.signaling.generation,
+                    &pc,
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -233,9 +282,9 @@ impl RtcSessions {
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
-                session_id: binding.session_id,
-                generation: binding.generation,
-                agent_id: binding.agent_id,
+                session_id: binding.signaling.session_id,
+                generation: binding.signaling.generation,
+                agent_id: binding.signaling.agent_id,
                 sdp: local_sdp,
             },
         )
@@ -317,6 +366,19 @@ impl RtcSessions {
     /// Close `pc`, removing its map entry only if the entry still refers to
     /// this same instance (a newer offer may have replaced it).
     async fn close_if_same(&self, session_id: &str, generation: &str, pc: &Arc<RTCPeerConnection>) {
+        let agent = {
+            let peers = self.peers.lock().await;
+            peers
+                .get(session_id)
+                .filter(|current| current.generation == generation && Arc::ptr_eq(&current.pc, pc))
+                .map(|peer| peer.agent)
+        };
+        let Some(agent) = agent else {
+            let _ = pc.close().await;
+            return;
+        };
+        let closer = self.agent_closer(agent).await;
+        let _closing = closer.lock().await;
         let removed = {
             let mut peers = self.peers.lock().await;
             if peers.get(session_id).is_some_and(|current| {
@@ -328,11 +390,8 @@ impl RtcSessions {
             }
         };
         if let Some(peer) = removed {
-            peer.active.store(false, Ordering::Release);
-            let _lifecycle = peer.lifecycle.write().await;
-            self.controls
-                .unregister_session(&viewer_id(session_id, generation))
-                .await;
+            self.deactivate_peer(session_id, peer).await;
+            return;
         }
         let _ = pc.close().await;
     }
@@ -348,7 +407,7 @@ impl RtcSessions {
             tracing::debug!(%session_id, "ignoring rtc candidate for unknown session");
             return;
         };
-        if peer.agent_id != agent_id || peer.generation != generation {
+        if peer.agent.agent_id() != agent_id || peer.generation != generation {
             tracing::warn!(%session_id, %agent_id, "ignoring rtc candidate with stale binding");
             return;
         }
@@ -366,36 +425,95 @@ impl RtcSessions {
     }
 
     pub async fn close(&self, session_id: &str, generation: &str, agent_id: Uuid) {
+        let agent = {
+            let peers = self.peers.lock().await;
+            peers
+                .get(session_id)
+                .filter(|peer| peer.agent.agent_id() == agent_id && peer.generation == generation)
+                .map(|peer| peer.agent)
+        };
+        let Some(agent) = agent else { return };
+        let closer = self.agent_closer(agent).await;
+        let _closing = closer.lock().await;
         let peer = {
             let mut peers = self.peers.lock().await;
-            if peers
-                .get(session_id)
-                .is_some_and(|peer| peer.agent_id == agent_id && peer.generation == generation)
-            {
+            if peers.get(session_id).is_some_and(|peer| {
+                peer.agent.agent_id() == agent_id && peer.generation == generation
+            }) {
                 peers.remove(session_id)
             } else {
                 None
             }
         };
         if let Some(peer) = peer {
-            peer.active.store(false, Ordering::Release);
-            let _lifecycle = peer.lifecycle.write().await;
-            self.controls
-                .unregister_session(&viewer_id(session_id, generation))
-                .await;
-            let _ = peer.pc.close().await;
+            self.deactivate_peer(session_id, peer).await;
+        }
+    }
+
+    /// Close peers attached to one concrete backend generation. A replacement
+    /// using the same UUID is deliberately not matched.
+    pub async fn close_for_agent(&self, agent_id: Uuid, agent_generation: u64) {
+        let agent = AgentBinding::new(agent_id, agent_generation);
+        let closer = self.agent_closer(agent).await;
+        let _closing = closer.lock().await;
+        let removed = {
+            let mut peers = self.peers.lock().await;
+            let session_ids = peers
+                .iter()
+                .filter(|(_, peer)| {
+                    peer.agent.agent_id() == agent_id && peer.agent.generation() == agent_generation
+                })
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            session_ids
+                .into_iter()
+                .filter_map(|session_id| peers.remove(&session_id).map(|peer| (session_id, peer)))
+                .collect::<Vec<_>>()
+        };
+        for (session_id, peer) in removed {
+            self.deactivate_peer(&session_id, peer).await;
+        }
+        // An old exit task can race a replacement using the same UUID. Keep
+        // the peer map locked while deciding and clearing backend-wide hub
+        // state so a new generation either prevents cleanup or registers only
+        // after cleanup has completed.
+        let peers = self.peers.lock().await;
+        if !peers.values().any(|peer| peer.agent.agent_id() == agent_id) {
+            self.controls.remove_agent(agent_id).await;
+        }
+    }
+
+    async fn deactivate_peer(&self, session_id: &str, peer: RtcPeer) {
+        peer.active.store(false, Ordering::Release);
+        peer.control
+            .remove_direct_sink(&viewer_id(session_id, &peer.generation))
+            .await;
+        // Closing first wakes blocked WebRTC sends. The bounded callback send
+        // timeout remains the backstop before the write lock drains them.
+        let _ = peer.pc.close().await;
+        let _drained = peer.fence.write().await;
+        self.controls
+            .unregister_session(&viewer_id(session_id, &peer.generation))
+            .await;
+    }
+
+    async fn agent_closer(&self, agent: AgentBinding) -> Arc<Mutex<()>> {
+        let key = (agent.agent_id(), agent.generation());
+        let mut closers = self.agent_closers.lock().await;
+        closers.retain(|_, closer| closer.strong_count() > 0);
+        if let Some(closer) = closers.get(&key).and_then(Weak::upgrade) {
+            closer
+        } else {
+            let closer = Arc::new(Mutex::new(()));
+            closers.insert(key, Arc::downgrade(&closer));
+            closer
         }
     }
 
     pub async fn close_all(&self) {
         let peers = std::mem::take(&mut *self.peers.lock().await);
         for (session_id, peer) in peers {
-            peer.active.store(false, Ordering::Release);
-            let _lifecycle = peer.lifecycle.write().await;
-            self.controls
-                .unregister_session(&viewer_id(&session_id, &peer.generation))
-                .await;
-            let _ = peer.pc.close().await;
+            self.deactivate_peer(&session_id, peer).await;
         }
     }
 }
@@ -458,11 +576,11 @@ fn install_ice_handler(
 
 fn install_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
-    binding: RtcSessionBinding,
+    binding: BoundRtcSession,
     registry: AgentRegistry,
     controls: AgentControlHub,
     active: Arc<AtomicBool>,
-    lifecycle: Arc<RwLock<()>>,
+    fence: Arc<tokio::sync::RwLock<()>>,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -470,81 +588,78 @@ fn install_data_channel_handler(
         let registry = registry.clone();
         let controls = controls.clone();
         let active = Arc::clone(&active);
-        let lifecycle = Arc::clone(&lifecycle);
+        let fence = Arc::clone(&fence);
         let out_tx = out_tx.clone();
         Box::pin(async move {
-            let _lifecycle = lifecycle.read().await;
-            if !active.load(Ordering::Acquire) {
-                let _ = dc.close().await;
-                return;
-            }
-            let viewer_id = viewer_id(&binding.session_id, &binding.generation);
+            let viewer_id = viewer_id(
+                &binding.signaling.session_id,
+                &binding.signaling.generation,
+            );
             if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
                 install_control_data_channel(
                     dc,
                     viewer_id,
-                    binding.agent_id,
+                    binding.agent,
                     registry,
                     controls,
                     active,
-                    lifecycle.clone(),
+                    fence,
                 );
                 return;
             }
             if dc.label() != PTY_DATA_CHANNEL_LABEL {
-                tracing::debug!(agent_id = %binding.agent_id, label = %dc.label(), "ignoring unknown rtc data channel");
+                tracing::debug!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "ignoring unknown rtc data channel");
                 return;
             }
 
-            let agent_id = binding.agent_id;
+            let agent = binding.agent;
+            let agent_id = agent.agent_id();
 
             let input_registry = registry.clone();
             let input_out_tx = out_tx.clone();
             let input_active = Arc::clone(&active);
-            let input_lifecycle = Arc::clone(&lifecycle);
+            let input_fence = Arc::clone(&fence);
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
                 let out_tx = input_out_tx.clone();
                 let active = Arc::clone(&input_active);
-                let lifecycle = Arc::clone(&input_lifecycle);
+                let fence = Arc::clone(&input_fence);
                 Box::pin(async move {
-                    if !active.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let _lifecycle = lifecycle.read().await;
-                    if !active.load(Ordering::Acquire) {
+                    let _callback = fence.read().await;
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                         return;
                     }
                     // Cached check: never pay a tmux subprocess per keystroke.
                     // Worker-backed agents have no tmux copy-mode at all.
                     if !msg.is_string
                         && !msg.data.is_empty()
-                        && registry.is_worker(agent_id) != Some(true)
+                        && registry.is_worker_binding(agent) != Some(true)
                     {
-                        if let Some(session) = registry.session_for(agent_id) {
-                            if let Some(control) = registry.control_for(agent_id) {
+                        if let Some(session) = registry.session_for_binding(agent) {
+                            if let Some(control) = registry.control_for_binding(agent) {
                                 if control.copy_mode_cached(&session) {
                                     control.suppress_activity(
                                         crate::activity::REDRAW_SUPPRESS_WINDOW,
                                     );
                                     tmux::cancel_copy_mode(&session).await;
                                     control.clear_copy_mode();
+                                    if !active.load(Ordering::Acquire)
+                                        || !registry.is_current(agent)
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
-                    let mut result = None;
-                    let found = registry.with_handle(agent_id, |h| {
-                        result = Some(forward_data_channel_input(
-                            agent_id,
-                            msg.is_string,
-                            &msg.data,
-                            &h.control,
-                            &out_tx,
-                            |bytes| h.write_stdin(bytes),
-                        ));
-                    });
-                    if !found {
+                    let result = forward_bound_data_channel_input(
+                        agent,
+                        msg.is_string,
+                        &msg.data,
+                        &registry,
+                        &out_tx,
+                    );
+                    if result.is_none() {
                         tracing::debug!(%agent_id, "ignoring rtc stdin for unknown agent");
                     } else if let Some(Err(e)) = result {
                         tracing::warn!(%agent_id, error = %e, "rtc PTY stdin write failed");
@@ -553,13 +668,14 @@ fn install_data_channel_handler(
             }));
 
             let open_registry = registry.clone();
-            let open_session_id = binding.session_id.clone();
-            let open_generation = binding.generation.clone();
+            let open_session_id = binding.signaling.session_id.clone();
+            let open_generation = binding.signaling.generation.clone();
             let open_viewer_id = viewer_id.clone();
             let open_out_tx = out_tx.clone();
             let open_dc = Arc::clone(&dc);
             let open_active = Arc::clone(&active);
-            let open_lifecycle = Arc::clone(&lifecycle);
+            let open_fence = Arc::clone(&fence);
+            let open_control = binding.control.clone();
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
                 let session_id = open_session_id.clone();
@@ -568,33 +684,17 @@ fn install_data_channel_handler(
                 let out_tx = open_out_tx.clone();
                 let dc = Arc::clone(&open_dc);
                 let active = Arc::clone(&open_active);
-                let lifecycle = Arc::clone(&open_lifecycle);
+                let fence = Arc::clone(&open_fence);
+                let control = open_control.clone();
                 Box::pin(async move {
-                    if !active.load(Ordering::Acquire) {
+                    let _callback = fence.read().await;
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                         let _ = dc.close().await;
                         return;
                     }
-                    let _lifecycle = lifecycle.read().await;
-                    if !active.load(Ordering::Acquire) {
-                        let _ = dc.close().await;
-                        return;
-                    }
-                    let Some(control) = registry.control_for(agent_id) else {
-                        send_status(
-                            &out_tx,
-                            session_id,
-                            generation,
-                            agent_id,
-                            "failed",
-                            Some("agent is not running on this daemon"),
-                        )
-                        .await;
-                        return;
-                    };
-
-                    if registry.is_worker(agent_id) == Some(true) {
+                    if registry.is_worker_binding(agent) == Some(true) {
                         let mut replay_rx = None;
-                        registry.with_handle(agent_id, |handle| {
+                        registry.with_bound_handle(agent, |handle| {
                             replay_rx = handle.worker_replay(64 * 1024);
                         });
                         let Some(replay_rx) = replay_rx else {
@@ -623,6 +723,10 @@ fn install_data_channel_handler(
                             .await;
                             return;
                         };
+                        if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                            let _ = dc.close().await;
+                            return;
+                        }
                         if tokio::time::timeout(
                             Duration::from_secs(3),
                             control.wait_source_offset(watermark),
@@ -641,9 +745,18 @@ fn install_data_channel_handler(
                             .await;
                             return;
                         }
+                        if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                            let _ = dc.close().await;
+                            return;
+                        }
                     }
 
                     let mut direct = control.add_direct_sink(viewer_id.clone()).await;
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                        control.remove_direct_sink(&viewer_id).await;
+                        let _ = dc.close().await;
+                        return;
+                    }
                     send_status(
                         &out_tx,
                         session_id.clone(),
@@ -653,6 +766,14 @@ fn install_data_channel_handler(
                         None,
                     )
                     .await;
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                        control.remove_direct_sink(&viewer_id).await;
+                        let _ = dc.close().await;
+                        return;
+                    }
+                    let output_registry = registry.clone();
+                    let output_active = Arc::clone(&active);
+                    let output_fence = Arc::clone(&fence);
                     tokio::spawn(async move {
                         loop {
                             let chunk = tokio::select! {
@@ -663,6 +784,12 @@ fn install_data_channel_handler(
                                 chunk = direct.receiver.recv() => chunk,
                             };
                             let Some(chunk) = chunk else { break };
+                            let _callback = output_fence.read().await;
+                            if !output_active.load(Ordering::Acquire)
+                                || !rtc_output_allowed(&output_registry, agent)
+                            {
+                                break;
+                            }
                             match tokio::time::timeout(
                                 DATA_CHANNEL_SEND_TIMEOUT,
                                 dc.send(&Bytes::from(chunk)),
@@ -686,15 +813,13 @@ fn install_data_channel_handler(
                 })
             }));
 
-            let close_registry = registry.clone();
+            let close_control = binding.control;
             let close_viewer_id = viewer_id;
             dc.on_close(Box::new(move || {
-                let registry = close_registry.clone();
+                let control = close_control.clone();
                 let viewer_id = close_viewer_id.clone();
                 Box::pin(async move {
-                    if let Some(control) = registry.control_for(agent_id) {
-                        control.remove_direct_sink(&viewer_id).await;
-                    }
+                    control.remove_direct_sink(&viewer_id).await;
                 })
             }));
         })
@@ -704,12 +829,13 @@ fn install_data_channel_handler(
 fn install_control_data_channel(
     dc: Arc<RTCDataChannel>,
     session_id: String,
-    agent_id: Uuid,
+    agent: AgentBinding,
     registry: AgentRegistry,
     controls: AgentControlHub,
     active: Arc<AtomicBool>,
-    lifecycle: Arc<RwLock<()>>,
+    fence: Arc<tokio::sync::RwLock<()>>,
 ) {
+    let agent_id = agent.agent_id();
     let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
     let (display_sender, mut display_receiver) = tokio::sync::watch::channel(None::<String>);
     let (close_tx, mut close_rx) = oneshot::channel();
@@ -717,6 +843,9 @@ fn install_control_data_channel(
     let send_dc = Arc::clone(&dc);
     let send_controls = controls.clone();
     let send_session_id = session_id.clone();
+    let send_registry = registry.clone();
+    let send_active = Arc::clone(&active);
+    let send_fence = Arc::clone(&fence);
     tokio::spawn(async move {
         loop {
             let message = tokio::select! {
@@ -736,6 +865,10 @@ fn install_control_data_channel(
             let Some(message) = message else {
                 break;
             };
+            let _callback = send_fence.read().await;
+            if !send_active.load(Ordering::Acquire) || !send_registry.is_current(agent) {
+                break;
+            }
             let send = async {
                 match message {
                     ControlOutbound::Text(text) => send_dc.send_text(text).await,
@@ -762,13 +895,13 @@ fn install_control_data_channel(
     // each viewer's requests so state-changing operations and their replies
     // retain the ordered DataChannel's request order.
     let request_lock = Arc::new(Mutex::new(()));
-    let message_registry = registry;
+    let message_registry = registry.clone();
     let message_controls = controls.clone();
     let message_sender = sender.clone();
     let message_display_sender = display_sender.clone();
     let message_session_id = session_id.clone();
     let message_active = Arc::clone(&active);
-    let message_lifecycle = Arc::clone(&lifecycle);
+    let message_fence = Arc::clone(&fence);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let registry = message_registry.clone();
         let controls = message_controls.clone();
@@ -777,17 +910,15 @@ fn install_control_data_channel(
         let session_id = message_session_id.clone();
         let request_lock = request_lock.clone();
         let active = Arc::clone(&message_active);
-        let lifecycle = Arc::clone(&message_lifecycle);
+        let fence = Arc::clone(&message_fence);
         Box::pin(async move {
-            if !active.load(Ordering::Acquire) {
-                return;
-            }
-            let _lifecycle = lifecycle.read().await;
-            if !active.load(Ordering::Acquire) {
+            let _callback = fence.read().await;
+            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                controls.unregister(agent_id, &session_id).await;
                 return;
             }
             let _guard = request_lock.lock().await;
-            if !active.load(Ordering::Acquire) {
+            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 return;
             }
             if !msg.is_string {
@@ -815,13 +946,21 @@ fn install_control_data_channel(
             };
             match ControlRequest::decode(text) {
                 Ok(request) => {
-                    if !controls.contains_viewer(agent_id, &session_id).await {
+                    let registered = controls.contains_viewer(agent_id, &session_id).await;
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                        return;
+                    }
+                    if !registered {
                         controls
-                            .register(agent_id, session_id.clone(), display_sender)
+                            .register(agent_id, session_id.clone(), display_sender.clone())
                             .await;
+                        if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                            controls.unregister(agent_id, &session_id).await;
+                            return;
+                        }
                     }
                     handle_control_request(
-                        agent_id,
+                        agent,
                         &session_id,
                         request,
                         &registry,
@@ -840,25 +979,27 @@ fn install_control_data_channel(
     let open_sender = sender;
     let open_display_sender = display_sender;
     let open_active = Arc::clone(&active);
-    let open_lifecycle = Arc::clone(&lifecycle);
+    let open_registry = registry;
+    let open_fence = fence;
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
         let session_id = open_session_id.clone();
         let _sender = open_sender.clone();
         let display_sender = open_display_sender.clone();
         let active = Arc::clone(&open_active);
-        let lifecycle = Arc::clone(&open_lifecycle);
+        let registry = open_registry.clone();
+        let fence = Arc::clone(&open_fence);
         Box::pin(async move {
-            if !active.load(Ordering::Acquire) {
-                return;
-            }
-            let _lifecycle = lifecycle.read().await;
-            if !active.load(Ordering::Acquire) {
+            let _callback = fence.read().await;
+            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 return;
             }
             controls
-                .register(agent_id, session_id, display_sender)
+                .register(agent_id, session_id.clone(), display_sender)
                 .await;
+            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                controls.unregister(agent_id, &session_id).await;
+            }
         })
     }));
 
@@ -876,18 +1017,19 @@ fn install_control_data_channel(
 }
 
 async fn handle_control_request(
-    agent_id: Uuid,
+    agent: AgentBinding,
     session_id: &str,
     request: ControlRequest,
     registry: &AgentRegistry,
     controls: &AgentControlHub,
     sender: &ControlSender,
 ) {
+    let agent_id = agent.agent_id();
     let request_id = request.request_id;
     let transaction = controls.transaction(agent_id).await;
     let _guard = transaction.lock().await;
     if let Err(mut error) =
-        execute_control_request(agent_id, session_id, request, registry, controls, sender).await
+        execute_control_request(agent, session_id, request, registry, controls, sender).await
     {
         if error.request_id.is_none() {
             error.request_id = Some(request_id);
@@ -897,13 +1039,21 @@ async fn handle_control_request(
 }
 
 async fn execute_control_request(
-    agent_id: Uuid,
+    agent: AgentBinding,
     session_id: &str,
     request: ControlRequest,
     registry: &AgentRegistry,
     controls: &AgentControlHub,
     sender: &ControlSender,
 ) -> Result<(), ProtocolError> {
+    let agent_id = agent.agent_id();
+    if !registry.is_current(agent) {
+        return Err(ProtocolError::new(
+            Some(request.request_id),
+            "stale_agent_generation",
+            "the RTC session belongs to a replaced agent backend",
+        ));
+    }
     let request_id = request.request_id;
     let operation_name = request.operation_name();
     match request.operation {
@@ -915,16 +1065,16 @@ async fn execute_control_request(
         } => {
             if let Some((cols, rows)) = cols.zip(rows) {
                 if controls.is_owner(agent_id, session_id).await {
-                    resize_agent(agent_id, cols, rows, registry).await?;
+                    resize_agent(agent, cols, rows, registry).await?;
                     let _ = controls.update_size(agent_id, session_id, cols, rows).await;
                     // tmux reflows asynchronously after refresh-client.
-                    if registry.is_worker(agent_id) != Some(true) {
+                    if registry.is_worker_binding(agent) != Some(true) {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                     }
                 }
             }
             send_agent_replay(
-                agent_id,
+                agent,
                 ReplaySpec {
                     session_id,
                     request_id,
@@ -939,7 +1089,7 @@ async fn execute_control_request(
         }
         ControlOperation::Snapshot { lines, plain } => {
             send_agent_replay(
-                agent_id,
+                agent,
                 ReplaySpec {
                     session_id,
                     request_id,
@@ -960,7 +1110,7 @@ async fn execute_control_request(
                     "only the controlling viewer may resize the shared PTY",
                 ));
             }
-            resize_agent(agent_id, cols, rows, registry).await?;
+            resize_agent(agent, cols, rows, registry).await?;
             let _ = controls.update_size(agent_id, session_id, cols, rows).await;
             agent_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
@@ -973,21 +1123,21 @@ async fn execute_control_request(
                     "viewer is not registered on this control channel",
                 ));
             }
-            resize_agent(agent_id, cols, rows, registry).await?;
+            resize_agent(agent, cols, rows, registry).await?;
             let _ = controls
                 .take_control(agent_id, session_id, cols, rows)
                 .await;
-            redraw_agent(agent_id, registry).await;
+            redraw_agent(agent, registry).await;
             agent_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::Scroll { lines } => {
-            scroll_agent(agent_id, lines, registry).await?;
+            scroll_agent(agent, lines, registry).await?;
             agent_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::Redraw => {
-            redraw_agent(agent_id, registry).await;
+            redraw_agent(agent, registry).await;
             agent_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
@@ -1003,12 +1153,12 @@ struct ReplaySpec<'a> {
 }
 
 async fn send_agent_replay(
-    agent_id: Uuid,
+    agent: AgentBinding,
     spec: ReplaySpec<'_>,
     registry: &AgentRegistry,
     sender: &ControlSender,
 ) -> Result<(), ProtocolError> {
-    let Some(control) = registry.control_for(agent_id) else {
+    let Some(control) = registry.control_for_binding(agent) else {
         return Err(ProtocolError::new(
             Some(spec.request_id),
             "agent_unavailable",
@@ -1025,7 +1175,7 @@ async fn send_agent_replay(
             "spawn.pty did not become ready for this control session",
         ));
     }
-    let capture = capture_agent_replay(agent_id, spec.lines, spec.plain, registry, &control);
+    let capture = capture_agent_replay(agent, spec.lines, spec.plain, registry, &control);
     tokio::pin!(capture);
     let (source_boundary, bytes) = tokio::select! {
         result = &mut capture => result?,
@@ -1066,13 +1216,13 @@ async fn send_agent_replay(
 }
 
 async fn capture_agent_replay(
-    agent_id: Uuid,
+    agent: AgentBinding,
     lines: u16,
     plain: bool,
     registry: &AgentRegistry,
     control: &crate::pty::ForwarderControl,
 ) -> Result<(u64, Vec<u8>), ProtocolError> {
-    if registry.is_worker(agent_id) == Some(true) {
+    if registry.is_worker_binding(agent) == Some(true) {
         let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
             8 * 1024 * 1024
         } else {
@@ -1081,7 +1231,7 @@ async fn capture_agent_replay(
                 .clamp(64 * 1024, 8 * 1024 * 1024)
         };
         let mut replay_rx = None;
-        registry.with_handle(agent_id, |handle| {
+        registry.with_bound_handle(agent, |handle| {
             replay_rx = handle.worker_replay(max_bytes);
         });
         return match replay_rx {
@@ -1123,13 +1273,13 @@ async fn capture_agent_replay(
 }
 
 async fn resize_agent(
-    agent_id: Uuid,
+    agent: AgentBinding,
     cols: u16,
     rows: u16,
     registry: &AgentRegistry,
 ) -> Result<(), ProtocolError> {
     let mut result = None;
-    let found = registry.with_handle(agent_id, |handle| {
+    let found = registry.with_bound_handle(agent, |handle| {
         result = Some(handle.resize(cols, rows));
     });
     if !found {
@@ -1142,8 +1292,8 @@ async fn resize_agent(
     let changed = result
         .expect("found handle sets result")
         .map_err(|error| ProtocolError::new(None, "resize_failed", &format!("{error:#}")))?;
-    if changed && registry.is_worker(agent_id) != Some(true) {
-        if let Some(session) = registry.session_for(agent_id) {
+    if changed && registry.is_worker_binding(agent) != Some(true) {
+        if let Some(session) = registry.session_for_binding(agent) {
             tmux::refresh_client(&session, cols, rows).await;
         }
     }
@@ -1151,21 +1301,21 @@ async fn resize_agent(
 }
 
 async fn scroll_agent(
-    agent_id: Uuid,
+    agent: AgentBinding,
     lines: i16,
     registry: &AgentRegistry,
 ) -> Result<(), ProtocolError> {
-    if registry.is_worker(agent_id) == Some(true) {
+    if registry.is_worker_binding(agent) == Some(true) {
         return Ok(());
     }
-    let Some(session) = registry.session_for(agent_id) else {
+    let Some(session) = registry.session_for_binding(agent) else {
         return Err(ProtocolError::new(
             None,
             "agent_unavailable",
             "agent is not running on this daemon",
         ));
     };
-    if let Some(control) = registry.control_for(agent_id) {
+    if let Some(control) = registry.control_for_binding(agent) {
         control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
     }
     tmux::scroll_history(&session, lines)
@@ -1175,14 +1325,14 @@ async fn scroll_agent(
         })
 }
 
-async fn redraw_agent(agent_id: Uuid, registry: &AgentRegistry) {
-    if registry.is_worker(agent_id) == Some(true) {
+async fn redraw_agent(agent: AgentBinding, registry: &AgentRegistry) {
+    if registry.is_worker_binding(agent) == Some(true) {
         return;
     }
-    let Some(session) = registry.session_for(agent_id) else {
+    let Some(session) = registry.session_for_binding(agent) else {
         return;
     };
-    if let Some(control) = registry.control_for(agent_id) {
+    if let Some(control) = registry.control_for_binding(agent) {
         control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
     }
     tmux::force_repaint(&session).await;
@@ -1191,6 +1341,31 @@ async fn redraw_agent(agent_id: Uuid, registry: &AgentRegistry) {
 /// Testable core of the `spawn.pty` input callback. Activity is recorded only
 /// after a successful, non-empty binary write, and the helper API exposes no
 /// input bytes to the content-free activity serializer.
+fn forward_bound_data_channel_input(
+    agent: AgentBinding,
+    is_string: bool,
+    data: &[u8],
+    registry: &AgentRegistry,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) -> Option<Result<bool>> {
+    let mut result = None;
+    registry.with_bound_handle(agent, |handle| {
+        result = Some(forward_data_channel_input(
+            agent.agent_id(),
+            is_string,
+            data,
+            &handle.control,
+            out_tx,
+            |bytes| handle.write_stdin(bytes),
+        ));
+    });
+    result
+}
+
+fn rtc_output_allowed(registry: &AgentRegistry, agent: AgentBinding) -> bool {
+    registry.is_current(agent)
+}
+
 fn forward_data_channel_input<W>(
     agent_id: Uuid,
     is_string: bool,
@@ -1250,6 +1425,30 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_test_worker(
+        registry: &AgentRegistry,
+        agent_id: Uuid,
+        session: &str,
+    ) -> (AgentBinding, mpsc::UnboundedReceiver<crate::pty::WorkerCmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, _outbox_rx) = mpsc::unbounded_channel();
+        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
+            agent_id,
+            session: session.to_string(),
+            cmd_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: crate::pty::ForwarderControl::new(),
+        });
+        registry.insert(handle);
+        (
+            registry.binding_for(agent_id).expect("worker binding"),
+            cmd_rx,
+        )
+    }
 
     async fn connect_peer_pair(
         offer_pc: &Arc<RTCPeerConnection>,
@@ -1320,15 +1519,18 @@ mod tests {
         let hub = AgentControlHub::default();
         let server_hub = hub.clone();
         let server_viewer = viewer.clone();
+        let registry = AgentRegistry::new();
+        let (agent, _cmd_rx) = insert_test_worker(&registry, agent_id, "rtc-real");
+        let server_registry = registry.clone();
         answer_pc.on_data_channel(Box::new(move |dc| {
             install_control_data_channel(
                 dc,
                 server_viewer.clone(),
-                agent_id,
-                AgentRegistry::new(),
+                agent,
+                server_registry.clone(),
                 server_hub.clone(),
                 Arc::new(AtomicBool::new(true)),
-                Arc::new(RwLock::new(())),
+                Arc::new(tokio::sync::RwLock::new(())),
             );
             Box::pin(async {})
         }));
@@ -1369,6 +1571,153 @@ mod tests {
         })
         .await
         .expect("spawn.ctl viewer cleanup timed out");
+    }
+
+    #[tokio::test]
+    async fn replacement_fences_stale_peer_input_control_and_output() {
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let (current, mut current_commands) = insert_test_worker(&registry, agent_id, "current");
+        assert_ne!(old, current);
+
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        assert!(
+            forward_bound_data_channel_input(old, false, b"stale input", &registry, &out_tx)
+                .is_none()
+        );
+        assert!(current_commands.try_recv().is_err());
+
+        assert!(forward_bound_data_channel_input(
+            current,
+            false,
+            b"current input",
+            &registry,
+            &out_tx,
+        )
+        .expect("current binding")
+        .expect("current input write"));
+        assert!(matches!(
+            current_commands.try_recv(),
+            Ok(crate::pty::WorkerCmd::Input(bytes)) if bytes == b"current input"
+        ));
+
+        let request_id = Uuid::new_v4();
+        let request = ControlRequest::decode(&format!(
+            r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"resize","cols":100,"rows":30}}"#
+        ))
+        .expect("valid resize request");
+        let controls = AgentControlHub::default();
+        let (sender, _receiver) = mpsc::channel(4);
+        let error =
+            execute_control_request(old, "stale-viewer", request, &registry, &controls, &sender)
+                .await
+                .expect_err("stale control must fail");
+        assert_eq!(error.code, "stale_agent_generation");
+        assert!(current_commands.try_recv().is_err());
+
+        assert!(!rtc_output_allowed(&registry, old));
+        assert!(rtc_output_allowed(&registry, current));
+    }
+
+    #[tokio::test]
+    async fn close_for_agent_drains_only_the_matching_backend_generation() {
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let old_control = registry.control_for_binding(old).unwrap();
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        let current_control = registry.control_for_binding(current).unwrap();
+        let api = APIBuilder::new().build();
+        let old_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let current_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let old_active = Arc::new(AtomicBool::new(true));
+        let current_active = Arc::new(AtomicBool::new(true));
+        let old_fence = Arc::new(tokio::sync::RwLock::new(()));
+        let current_fence = Arc::new(tokio::sync::RwLock::new(()));
+        let sessions = RtcSessions::new();
+        let old_viewer = viewer_id("old-session", "old-signal");
+        let current_viewer = viewer_id("current-session", "current-signal");
+        let old_direct = old_control.add_direct_sink(old_viewer.clone()).await;
+        let current_direct = current_control
+            .add_direct_sink(current_viewer.clone())
+            .await;
+        sessions.peers.lock().await.extend([
+            (
+                "old-session".to_string(),
+                RtcPeer {
+                    pc: old_pc,
+                    agent: old,
+                    generation: "old-signal".to_string(),
+                    active: Arc::clone(&old_active),
+                    control: old_control,
+                    fence: Arc::clone(&old_fence),
+                },
+            ),
+            (
+                "current-session".to_string(),
+                RtcPeer {
+                    pc: current_pc,
+                    agent: current,
+                    generation: "current-signal".to_string(),
+                    active: Arc::clone(&current_active),
+                    control: current_control,
+                    fence: current_fence,
+                },
+            ),
+        ]);
+        let (old_display, _old_display_rx) = tokio::sync::watch::channel(None);
+        let (current_display, _current_display_rx) = tokio::sync::watch::channel(None);
+        sessions
+            .controls
+            .register(agent_id, old_viewer.clone(), old_display)
+            .await;
+        sessions
+            .controls
+            .register(agent_id, current_viewer.clone(), current_display)
+            .await;
+
+        let in_flight = old_fence.read().await;
+        let closing_sessions = sessions.clone();
+        let close = tokio::spawn(async move {
+            closing_sessions
+                .close_for_agent(agent_id, old.generation())
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished(), "close returned before callback drain");
+        drop(in_flight);
+        close.await.unwrap();
+
+        let peers = sessions.peers.lock().await;
+        assert!(!peers.contains_key("old-session"));
+        assert!(peers.contains_key("current-session"));
+        drop(peers);
+        assert!(!old_active.load(Ordering::Acquire));
+        assert!(current_active.load(Ordering::Acquire));
+        assert!(*old_direct.disconnected.borrow());
+        assert!(!*current_direct.disconnected.borrow());
+        assert!(
+            !sessions
+                .controls
+                .contains_viewer(agent_id, &old_viewer)
+                .await
+        );
+        assert!(
+            sessions
+                .controls
+                .contains_viewer(agent_id, &current_viewer)
+                .await
+        );
+        sessions.close_all().await;
     }
 
     #[test]
