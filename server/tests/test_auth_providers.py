@@ -21,6 +21,17 @@ def _challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
+@pytest.fixture(autouse=True)
+def isolated_provider_settings(monkeypatch):
+    monkeypatch.setenv("SPAWN_PUBLIC_URL", "http://localhost:8000")
+    for provider in ("GOOGLE", "MICROSOFT", "GITHUB"):
+        monkeypatch.setenv(f"SPAWN_{provider}_CLIENT_ID", "")
+        monkeypatch.setenv(f"SPAWN_{provider}_CLIENT_SECRET", "")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    yield
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
 @pytest.fixture
 def configured_providers(monkeypatch):
     for provider in ("GOOGLE", "MICROSOFT", "GITHUB"):

@@ -13,11 +13,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from spawn_server.db import Base
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _current_migration_head() -> str:
+    config = Config()
+    config.set_main_option("script_location", str(SERVER_ROOT / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
 
 
 def _migration_env(db_url: str) -> dict[str, str]:
@@ -66,7 +74,7 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
 
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
-            assert version == "0013"
+            assert version == _current_migration_head()
 
             preset_rows = conn.execute(
                 text("select name, default_argv, install from presets")

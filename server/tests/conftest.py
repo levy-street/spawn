@@ -15,6 +15,9 @@ import pytest_asyncio
 os.environ.setdefault("SPAWN_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("SPAWN_USE_INPROCESS_PUBSUB", "1")
 os.environ.setdefault("SPAWN_JWT_SECRET", "test-secret")
+# Tests use an HTTP client and assert development cookie/redirect behavior.
+# Override developer shell and .env values before importing the application.
+os.environ["SPAWN_PUBLIC_URL"] = "http://localhost:8000"
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
