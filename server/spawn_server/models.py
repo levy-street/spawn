@@ -264,6 +264,9 @@ class Screen(Base):
     # auto-deleted when emptied and promoted to permanent on rename or a
     # third pane. Deliberate "New screen" screens are never ephemeral.
     ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pinned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

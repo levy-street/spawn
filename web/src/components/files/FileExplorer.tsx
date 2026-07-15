@@ -5,6 +5,8 @@ import {
   ArrowRightLeft,
   ChevronRight,
   ChevronsDownUp,
+  Copy,
+  CornerUpLeft,
   Download,
   File,
   Folder,
@@ -302,6 +304,26 @@ export function FileExplorer({
     [hostId],
   );
 
+  const relativePath = useCallback(
+    (path: string) => {
+      if (!resolvedRoot) return path;
+      if (path === resolvedRoot) return ".";
+      if (path.startsWith(`${resolvedRoot}/`)) return path.slice(resolvedRoot.length + 1);
+      return path;
+    },
+    [resolvedRoot],
+  );
+
+  const copyText = useCallback(async (text: string, label: string) => {
+    setMenu(null);
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus(`Copied ${label}`);
+    } catch {
+      setStatus("Clipboard unavailable");
+    }
+  }, []);
+
   const startRename = useCallback((entry: HostDirEntry) => {
     setRenaming(entry.path);
     setRenameDraft(entry.name);
@@ -405,6 +427,15 @@ export function FileExplorer({
 
   const rowActions = (entry: HostDirEntry, parentDir: string) => (
     <>
+      <DropdownMenuItem onSelect={() => void copyText(entry.path, "path")}>
+        <Copy className="size-4" aria-hidden />
+        Copy path
+      </DropdownMenuItem>
+      <DropdownMenuItem onSelect={() => void copyText(relativePath(entry.path), "relative path")}>
+        <CornerUpLeft className="size-4" aria-hidden />
+        Copy relative path
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
       {!entry.is_dir && (
         <DropdownMenuItem onSelect={() => void download(entry)}>
           <Download className="size-4" aria-hidden />

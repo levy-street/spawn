@@ -232,3 +232,40 @@ async def test_keep_promotes_via_ephemeral_flag(client):
     r = await client.patch(f"/api/screens/{sid}", json={"ephemeral": False}, headers=auth)
     assert r.status_code == 200
     assert r.json()["ephemeral"] is False
+
+
+async def test_pin_and_unpin_screen(client):
+    token = await _signup(client, "screens-pin@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-pin@example.com")
+    created = await client.post(
+        "/api/screens",
+        json={"name": "board", "layout": {"root": _pane(a1)}},
+        headers=auth,
+    )
+    sid = created.json()["id"]
+    assert created.json()["pinned_at"] is None
+
+    pinned = await client.patch(f"/api/screens/{sid}", json={"pinned": True}, headers=auth)
+    assert pinned.status_code == 200
+    assert pinned.json()["pinned_at"] is not None
+
+    unpinned = await client.patch(f"/api/screens/{sid}", json={"pinned": False}, headers=auth)
+    assert unpinned.status_code == 200
+    assert unpinned.json()["pinned_at"] is None
+
+
+async def test_pinning_promotes_ephemeral(client):
+    token = await _signup(client, "screens-pin2@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    a1 = await _create_agent_row("screens-pin2@example.com")
+    created = await client.post(
+        "/api/screens",
+        json={"name": "temp", "ephemeral": True, "layout": {"root": _pane(a1)}},
+        headers=auth,
+    )
+    sid = created.json()["id"]
+    r = await client.patch(f"/api/screens/{sid}", json={"pinned": True}, headers=auth)
+    assert r.status_code == 200
+    assert r.json()["pinned_at"] is not None
+    assert r.json()["ephemeral"] is False

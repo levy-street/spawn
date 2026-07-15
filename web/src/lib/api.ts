@@ -292,6 +292,7 @@ export const ScreenSchema = z.object({
   name: z.string(),
   layout: ScreenLayoutSchema,
   ephemeral: z.boolean().default(false),
+  pinned_at: z.string().nullable().optional(),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -685,7 +686,10 @@ export const screens = {
       body: JSON.stringify(body),
       schema: ScreenSchema,
     }),
-  update: (id: string, body: { name?: string; layout?: ScreenLayout; ephemeral?: boolean }) =>
+  update: (
+    id: string,
+    body: { name?: string; layout?: ScreenLayout; ephemeral?: boolean; pinned?: boolean },
+  ) =>
     api(`/api/screens/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),

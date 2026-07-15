@@ -19,12 +19,13 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
 import { ScreenIcon } from "@/components/screens/ScreenIcon";
 import {
   DropdownMenu,
+  type DropdownMenuHandle,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -271,24 +272,25 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   // rest sort by recency. Recency keys off last *input* (and screen edits),
   // not output, so a chattering agent doesn't reshuffle the list every tick.
   const { pinnedItems, recentItems } = useMemo(() => {
-    const agentItems: AgentItem[] = (agentsQ.data ?? []).map((agent) => ({
+    const agentItems: RecentItem[] = (agentsQ.data ?? []).map((agent) => ({
       kind: "agent",
       id: agent.id,
       recency: agentRecency(agent),
       pinned: Boolean(agent.pinned_at),
       agent,
     }));
-    const screenItems: ScreenItem[] = allScreens.map((item) => ({
+    const screenItems: RecentItem[] = allScreens.map((item) => ({
       kind: "screen",
       id: item.id,
       recency: screenRecency(item, agentsById),
-      pinned: false,
+      pinned: Boolean(item.pinned_at),
       screen: item,
     }));
+    const all = [...agentItems, ...screenItems];
     const byRecency = (a: RecentItem, b: RecentItem) => b.recency - a.recency;
     return {
-      pinnedItems: agentItems.filter((item) => item.pinned).sort(byRecency),
-      recentItems: [...agentItems.filter((item) => !item.pinned), ...screenItems].sort(byRecency),
+      pinnedItems: all.filter((item) => item.pinned).sort(byRecency),
+      recentItems: all.filter((item) => !item.pinned).sort(byRecency),
     };
   }, [agentsQ.data, allScreens, agentsById]);
 
@@ -343,6 +345,14 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     },
     onError: (err) => setActionError(String(err)),
   });
+  const pinScreenM = useMutation({
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => screens.update(id, { pinned }),
+    onSuccess: () => {
+      setActionError(null);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+    },
+    onError: (err) => setActionError(String(err)),
+  });
   const pinM = useMutation({
     mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
       pinned ? agents.pin(id) : agents.unpin(id),
@@ -359,7 +369,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     deleteM.isPending ||
     restartM.isPending ||
     pinM.isPending;
-  const screenBusy = deleteScreenM.isPending;
+  const screenBusy = deleteScreenM.isPending || pinScreenM.isPending;
 
   const promptRename = (agent: Agent) => {
     const next = prompt("Rename agent", agent.name ?? agentTitle(agent));
@@ -369,28 +379,42 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     renameM.mutate({ id: agent.id, name });
   };
 
-  const renderAgent = (agent: Agent) => (
-    <AgentRow
-      key={`agent-${agent.id}`}
-      agent={agent}
-      collapsed={collapsed}
-      active={pathname === `/agents/${agent.id}`}
-      // Always open the full agent view — even when the agent is a pane on
-      // the screen you're viewing. To jump back into the screen, use the
-      // membership chip in the agent header or the pane itself.
-      href={`/agents/${agent.id}`}
-      busy={busy}
-      onRename={() => promptRename(agent)}
-      onPin={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
-      onRestart={() => {
-        if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
-      }}
-      onArchive={() => archiveM.mutate(agent.id)}
-      onDelete={() => {
-        if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
-      }}
-    />
-  );
+  const renderItem = (item: RecentItem) =>
+    item.kind === "screen" ? (
+      <ScreenRow
+        key={`screen-${item.id}`}
+        screen={item.screen}
+        agentsById={agentsById}
+        collapsed={collapsed}
+        active={currentScreenId === item.id}
+        busy={screenBusy}
+        onPin={() => pinScreenM.mutate({ id: item.id, pinned: !item.screen.pinned_at })}
+        onDelete={() => {
+          if (confirm(`Delete screen ${item.screen.name}?`)) deleteScreenM.mutate(item.id);
+        }}
+      />
+    ) : (
+      <AgentRow
+        key={`agent-${item.id}`}
+        agent={item.agent}
+        collapsed={collapsed}
+        active={pathname === `/agents/${item.id}`}
+        // Always open the full agent view — even when the agent is a pane on
+        // the screen you're viewing. To jump back into the screen, use the
+        // membership chip in the agent header or the pane itself.
+        href={`/agents/${item.id}`}
+        busy={busy}
+        onRename={() => promptRename(item.agent)}
+        onPin={() => pinM.mutate({ id: item.id, pinned: !item.agent.pinned_at })}
+        onRestart={() => {
+          if (confirm(`Restart ${agentTitle(item.agent)}?`)) restartM.mutate(item.id);
+        }}
+        onArchive={() => archiveM.mutate(item.id)}
+        onDelete={() => {
+          if (confirm(`Delete ${agentTitle(item.agent)}?`)) deleteM.mutate(item.id);
+        }}
+      />
+    );
 
   return (
     <section
@@ -403,28 +427,12 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
       {pinnedItems.length > 0 && (
         <ul className="mb-1">
           <SidebarSectionLabel collapsed={collapsed}>Pinned</SidebarSectionLabel>
-          {pinnedItems.map((item) => renderAgent(item.agent))}
+          {pinnedItems.map(renderItem)}
         </ul>
       )}
       <ul>
         <SidebarSectionLabel collapsed={collapsed}>Recents</SidebarSectionLabel>
-        {recentItems.map((item) =>
-          item.kind === "screen" ? (
-            <ScreenRow
-              key={`screen-${item.id}`}
-              screen={item.screen}
-              agentsById={agentsById}
-              collapsed={collapsed}
-              active={currentScreenId === item.id}
-              busy={screenBusy}
-              onDelete={() => {
-                if (confirm(`Delete screen ${item.screen.name}?`)) deleteScreenM.mutate(item.id);
-              }}
-            />
-          ) : (
-            renderAgent(item.agent)
-          ),
-        )}
+        {recentItems.map(renderItem)}
         {!agentsQ.isLoading &&
           recentItems.length === 0 &&
           pinnedItems.length === 0 &&
@@ -435,7 +443,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
 }
 
 type AgentItem = { kind: "agent"; id: string; recency: number; pinned: boolean; agent: Agent };
-type ScreenItem = { kind: "screen"; id: string; recency: number; pinned: false; screen: Screen };
+type ScreenItem = { kind: "screen"; id: string; recency: number; pinned: boolean; screen: Screen };
 type RecentItem = AgentItem | ScreenItem;
 
 function SidebarSectionLabel({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
@@ -484,8 +492,19 @@ function AgentRow({
   onArchive: () => void;
   onDelete: () => void;
 }) {
+  const menuHandle = useRef<DropdownMenuHandle>(null);
   return (
-    <li className="group/agentrow relative my-0.5">
+    <li
+      className="group/agentrow relative my-0.5"
+      onContextMenu={
+        collapsed
+          ? undefined
+          : (event) => {
+              event.preventDefault();
+              menuHandle.current?.openAt(event.clientX, event.clientY);
+            }
+      }
+    >
       <RailTooltip
         label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}`}
         disabled={!collapsed}
@@ -520,6 +539,7 @@ function AgentRow({
       </RailTooltip>
       {!collapsed && (
         <DropdownMenu
+          ref={menuHandle}
           className="absolute right-1 top-1/2 -translate-y-1/2"
           menuClassName="w-44"
           renderTrigger={(props) => (
@@ -573,6 +593,7 @@ function ScreenRow({
   collapsed,
   active,
   busy,
+  onPin,
   onDelete,
 }: {
   screen: Screen;
@@ -580,12 +601,24 @@ function ScreenRow({
   collapsed: boolean;
   active: boolean;
   busy: boolean;
+  onPin: () => void;
   onDelete: () => void;
 }) {
   const paneCount = screenPaneCount(screen);
   const attention = screenAttentionCount(screen, agentsById);
+  const menuHandle = useRef<DropdownMenuHandle>(null);
   return (
-    <li className="group/agentrow relative my-0.5">
+    <li
+      className="group/agentrow relative my-0.5"
+      onContextMenu={
+        collapsed
+          ? undefined
+          : (event) => {
+              event.preventDefault();
+              menuHandle.current?.openAt(event.clientX, event.clientY);
+            }
+      }
+    >
       <RailTooltip label={`${screen.name} · ${paneCount} panes`} disabled={!collapsed}>
         <Link
           href={`/screens/${screen.id}`}
@@ -605,6 +638,9 @@ function ScreenRow({
               <span className={cn("truncate", screen.ephemeral && "italic opacity-80")}>
                 {screen.name}
               </span>
+              {screen.pinned_at && (
+                <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
+              )}
               {attention > 0 && (
                 <span className="shrink-0 rounded-full bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-500">
                   {attention}
@@ -620,6 +656,7 @@ function ScreenRow({
       </RailTooltip>
       {!collapsed && (
         <DropdownMenu
+          ref={menuHandle}
           className="absolute right-1 top-1/2 -translate-y-1/2"
           menuClassName="w-44"
           renderTrigger={(props) => (
@@ -639,6 +676,14 @@ function ScreenRow({
           <DropdownMenuItem href={`/screens/${screen.id}`}>
             <LayoutGrid className="size-4" aria-hidden />
             Open screen
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={busy} onSelect={onPin}>
+            {screen.pinned_at ? (
+              <PinOff className="size-4" aria-hidden />
+            ) : (
+              <Pin className="size-4" aria-hidden />
+            )}
+            {screen.pinned_at ? "Unpin" : "Pin"}
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>

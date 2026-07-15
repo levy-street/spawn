@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,7 @@ def _to_out(screen: Screen) -> schemas.ScreenOut:
         name=screen.name,
         layout=schemas.ScreenLayout.model_validate(screen.layout or {}),
         ephemeral=bool(screen.ephemeral),
+        pinned_at=screen.pinned_at,
         created_at=screen.created_at,
         updated_at=screen.updated_at,
     )
@@ -162,6 +165,11 @@ async def update_screen(
     screen = await _get_owned_screen(session, screen_id, user)
     if body.ephemeral is not None:
         screen.ephemeral = body.ephemeral
+    if body.pinned is not None:
+        # Pinning is a commitment to keep the screen.
+        screen.pinned_at = datetime.now(UTC) if body.pinned else None
+        if body.pinned:
+            screen.ephemeral = False
     if body.name is not None:
         name = body.name.strip()
         if not name:

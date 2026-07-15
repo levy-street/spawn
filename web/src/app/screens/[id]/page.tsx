@@ -12,6 +12,7 @@ import {
   PanelLeft,
   Pencil,
   Pin,
+  PinOff,
   Plus,
   RotateCcw,
   Rows3,
@@ -187,6 +188,15 @@ function ScreenView({ id }: { id: string }) {
   });
   const keepM = useMutation({
     mutationFn: () => screens.update(id, { ephemeral: false }),
+    onSuccess: (saved) => {
+      setError(null);
+      qc.setQueryData(["screen", id], saved);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+    },
+    onError,
+  });
+  const pinM = useMutation({
+    mutationFn: (pinned: boolean) => screens.update(id, { pinned }),
     onSuccess: (saved) => {
       setError(null);
       qc.setQueryData(["screen", id], saved);
@@ -490,7 +500,15 @@ function ScreenView({ id }: { id: string }) {
                       <Pencil className="size-4" aria-hidden />
                       Rename screen
                     </DropdownMenuItem>
-                    {screen?.ephemeral && (
+                    <DropdownMenuItem onSelect={() => pinM.mutate(!screen?.pinned_at)}>
+                      {screen?.pinned_at ? (
+                        <PinOff className="size-4" aria-hidden />
+                      ) : (
+                        <Pin className="size-4" aria-hidden />
+                      )}
+                      {screen?.pinned_at ? "Unpin screen" : "Pin screen"}
+                    </DropdownMenuItem>
+                    {screen?.ephemeral && !screen?.pinned_at && (
                       <DropdownMenuItem onSelect={() => keepM.mutate()}>
                         <Pin className="size-4" aria-hidden />
                         Keep screen

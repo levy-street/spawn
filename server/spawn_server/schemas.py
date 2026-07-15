@@ -417,6 +417,7 @@ class ScreenPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     layout: ScreenLayout | None = None
     ephemeral: bool | None = None
+    pinned: bool | None = None
 
 
 class ScreenOut(BaseModel):
@@ -424,5 +425,6 @@ class ScreenOut(BaseModel):
     name: str
     layout: ScreenLayout
     ephemeral: bool = False
+    pinned_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

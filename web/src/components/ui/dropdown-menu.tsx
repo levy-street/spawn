@@ -3,17 +3,23 @@
 import Link from "next/link";
 import {
   type CSSProperties,
+  forwardRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   useCallback,
   useEffect,
   useId,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
+
+/** Imperative handle: open the menu at a viewport point (e.g. a right-click),
+ *  bypassing the trigger anchor. */
+export type DropdownMenuHandle = { openAt: (x: number, y: number) => void };
 
 type Align = "start" | "end";
 type Side = "top" | "bottom";
@@ -23,34 +29,50 @@ type Side = "top" | "bottom";
  * `renderTrigger` receives the props to spread onto the trigger button so
  * nested-interactive markup never occurs.
  */
-export function DropdownMenu({
-  renderTrigger,
-  children,
-  align = "end",
-  side = "bottom",
-  className,
-  menuClassName,
-}: {
-  renderTrigger: (props: {
-    onClick: () => void;
-    onKeyDown: (event: ReactKeyboardEvent) => void;
-    "aria-expanded": boolean;
-    "aria-haspopup": "menu";
-    "aria-controls": string;
-  }) => ReactNode;
-  children: ReactNode;
-  align?: Align;
-  side?: Side;
-  className?: string;
-  menuClassName?: string;
-}) {
+export const DropdownMenu = forwardRef<
+  DropdownMenuHandle,
+  {
+    renderTrigger: (props: {
+      onClick: () => void;
+      onKeyDown: (event: ReactKeyboardEvent) => void;
+      "aria-expanded": boolean;
+      "aria-haspopup": "menu";
+      "aria-controls": string;
+    }) => ReactNode;
+    children: ReactNode;
+    align?: Align;
+    side?: Side;
+    className?: string;
+    menuClassName?: string;
+  }
+>(function DropdownMenu(
+  { renderTrigger, children, align = "end", side = "bottom", className, menuClassName },
+  ref,
+) {
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<CSSProperties | null>(null);
+  // When opened via openAt (right-click), position at this viewport point
+  // instead of anchoring to the trigger.
+  const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
-  const close = useCallback(() => setOpen(false), []);
+  const close = useCallback(() => {
+    setOpen(false);
+    setPoint(null);
+  }, []);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      openAt: (x: number, y: number) => {
+        setPoint({ x, y });
+        setOpen(true);
+      },
+    }),
+    [],
+  );
 
   // The menu renders in a portal (position: fixed) so it can never be clipped
   // by an ancestor's overflow — e.g. the horizontally-scrolling screen tab
@@ -63,12 +85,24 @@ export function DropdownMenu({
       return;
     }
     const place = () => {
-      const anchor = rootRef.current?.getBoundingClientRect();
-      if (!anchor) return;
       const menu = menuRef.current?.getBoundingClientRect();
       const menuH = menu?.height ?? 0;
       const menuW = menu?.width ?? 176;
       const style: CSSProperties = { position: "fixed" };
+      if (point) {
+        // Cursor-anchored (right-click): drop below-right, flipping near the
+        // viewport edges so it stays fully visible.
+        if (point.y + menuH + 4 > window.innerHeight - 8 && point.y - menuH - 4 > 8) {
+          style.bottom = window.innerHeight - point.y + 4;
+        } else {
+          style.top = point.y + 4;
+        }
+        style.left = Math.min(point.x, window.innerWidth - menuW - 8);
+        setCoords(style);
+        return;
+      }
+      const anchor = rootRef.current?.getBoundingClientRect();
+      if (!anchor) return;
       const opensUp =
         side === "top"
           ? anchor.top - menuH - 4 > 8
@@ -86,7 +120,7 @@ export function DropdownMenu({
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
-  }, [open, side, align]);
+  }, [open, side, align, point]);
 
   useEffect(() => {
     if (!open) return;
@@ -162,7 +196,7 @@ export function DropdownMenu({
         )}
     </div>
   );
-}
+});
 
 const ITEM_CLASS =
   "flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent focus-visible:bg-accent disabled:pointer-events-none disabled:opacity-50";
