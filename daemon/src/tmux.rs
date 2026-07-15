@@ -7,36 +7,12 @@ use std::collections::BTreeMap;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
-use nix::sys::signal::{killpg, Signal};
-use nix::unistd::{getpgid, getpgrp, Pid};
 use tokio::process::Command;
 use uuid::Uuid;
 
 const SESSION_PREFIX: &str = "spawn-";
 const DEFAULT_LABEL: &str = "agent";
 const MAX_LABEL_LEN: usize = 48;
-
-/// Stops the tmux pane's process group for an atomic capture boundary. Drop
-/// always resumes it, including timeout/cancellation paths.
-pub struct PausedPane {
-    pgid: Pid,
-    resumed: bool,
-}
-
-impl PausedPane {
-    pub fn resume(mut self) {
-        let _ = killpg(self.pgid, Signal::SIGCONT);
-        self.resumed = true;
-    }
-}
-
-impl Drop for PausedPane {
-    fn drop(&mut self) {
-        if !self.resumed {
-            let _ = killpg(self.pgid, Signal::SIGCONT);
-        }
-    }
-}
 
 /// Base `tmux` invocation. Strips any inherited `$TMUX` so a daemon launched
 /// from inside a tmux pane (dev shells, smoke tests) resolves sockets via its
@@ -421,40 +397,6 @@ pub async fn capture_history(session: &str, lines: u16, styled: bool) -> Result<
     }
     normalized.extend_from_slice(b"\x1b[0m");
     Ok(normalized)
-}
-
-/// Stop the foreground pane process group while a replay snapshot and its
-/// live-stream watermark are captured. Tmux itself remains responsive so
-/// `capture-pane` can run.
-pub async fn pause_pane(session: &str) -> Result<PausedPane> {
-    let out = tmux_command()
-        .args(["display-message", "-p", "-t", session, "-F", "#{pane_pid}"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("querying tmux pane pid")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "tmux pane pid query failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let pid = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<i32>()
-        .context("parsing tmux pane pid")?;
-    let pgid = getpgid(Some(Pid::from_raw(pid))).context("querying tmux pane process group")?;
-    if pgid == getpgrp() {
-        return Err(anyhow!("refusing to stop spawnd's own process group"));
-    }
-    killpg(pgid, Signal::SIGSTOP).context("stopping tmux pane process group")?;
-    Ok(PausedPane {
-        pgid,
-        resumed: false,
-    })
 }
 
 /// Best-effort exit from copy-mode before injecting ordinary PTY input.

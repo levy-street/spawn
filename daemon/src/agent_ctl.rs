@@ -396,8 +396,11 @@ impl AgentControlHub {
 
     pub async fn unregister(&self, agent_id: Uuid, session_id: &str) {
         let transaction = self.transaction(agent_id).await;
-        let _guard = transaction.lock().await;
-        self.unregister_in_transaction(agent_id, session_id).await;
+        {
+            let _guard = transaction.lock().await;
+            self.unregister_in_transaction(agent_id, session_id).await;
+        }
+        self.evict_transaction_if_idle(agent_id, &transaction).await;
     }
 
     async fn unregister_in_transaction(&self, agent_id: Uuid, session_id: &str) {
@@ -421,6 +424,36 @@ impl AgentControlHub {
         if should_broadcast {
             self.broadcast(agent_id).await;
         }
+    }
+
+    /// Remove all display/lifecycle state when an agent backend is removed.
+    pub async fn remove_agent(&self, agent_id: Uuid) {
+        let transaction = self.transaction(agent_id).await;
+        {
+            let _guard = transaction.lock().await;
+            self.inner.lock().await.remove(&agent_id);
+        }
+        self.evict_transaction_if_idle(agent_id, &transaction).await;
+    }
+
+    async fn evict_transaction_if_idle(&self, agent_id: Uuid, transaction: &Arc<Mutex<()>>) {
+        if self.inner.lock().await.contains_key(&agent_id) {
+            return;
+        }
+        let mut transactions = self.transactions.lock().await;
+        if transactions.get(&agent_id).is_some_and(|current| {
+            Arc::ptr_eq(current, transaction) && Arc::strong_count(current) == 2
+        }) {
+            transactions.remove(&agent_id);
+        }
+    }
+
+    #[cfg(test)]
+    async fn retained_counts(&self) -> (usize, usize) {
+        (
+            self.inner.lock().await.len(),
+            self.transactions.lock().await.len(),
+        )
     }
 
     pub async fn unregister_session(&self, session_id: &str) {
@@ -735,5 +768,22 @@ mod tests {
             .borrow()
             .as_ref()
             .is_some_and(|text| text.contains("\"owner\":true")));
+    }
+
+    #[tokio::test]
+    async fn idle_agent_state_and_transaction_mutex_are_evicted() {
+        let hub = AgentControlHub::default();
+        let agent_id = Uuid::new_v4();
+        let (display, _events) = watch::channel(None);
+        hub.register(agent_id, "viewer".into(), display).await;
+        assert_eq!(hub.retained_counts().await, (1, 1));
+
+        hub.unregister(agent_id, "viewer").await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
+
+        let (display, _events) = watch::channel(None);
+        hub.register(agent_id, "replacement".into(), display).await;
+        hub.remove_agent(agent_id).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
     }
 }

@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::vte::ansi::{Handler as VteHandler, Processor as VteProcessor};
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
@@ -60,6 +61,84 @@ pub struct DirectSinkReceiver {
 
 pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
 pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
+pub const EXACT_REPLAY_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+#[derive(Default)]
+struct PlainReplayBytes {
+    bytes: Vec<u8>,
+}
+
+impl VteHandler for PlainReplayBytes {
+    fn input(&mut self, c: char) {
+        let mut encoded = [0_u8; 4];
+        self.bytes
+            .extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
+    }
+
+    fn carriage_return(&mut self) {
+        self.bytes.push(b'\r');
+    }
+
+    fn linefeed(&mut self) {
+        self.bytes.push(b'\n');
+    }
+}
+
+struct ExactReplayBuffer {
+    styled: Vec<u8>,
+    plain: PlainReplayBytes,
+    plain_parser: VteProcessor,
+    source_end: u64,
+    overflowed: bool,
+}
+
+impl ExactReplayBuffer {
+    fn seeded(styled: Vec<u8>, plain: Vec<u8>) -> Self {
+        let overflowed =
+            styled.len() > EXACT_REPLAY_MAX_BYTES || plain.len() > EXACT_REPLAY_MAX_BYTES;
+        Self {
+            styled: if overflowed { Vec::new() } else { styled },
+            plain: PlainReplayBytes {
+                bytes: if overflowed { Vec::new() } else { plain },
+            },
+            plain_parser: VteProcessor::new(),
+            source_end: 0,
+            overflowed,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8], source_end: u64) {
+        self.source_end = source_end;
+        if self.overflowed || self.styled.len().saturating_add(bytes.len()) > EXACT_REPLAY_MAX_BYTES
+        {
+            self.overflowed = true;
+            self.styled.clear();
+            self.plain.bytes.clear();
+            return;
+        }
+        self.styled.extend_from_slice(bytes);
+        self.plain_parser.advance(&mut self.plain, bytes);
+        if self.plain.bytes.len() > EXACT_REPLAY_MAX_BYTES {
+            self.overflowed = true;
+            self.styled.clear();
+            self.plain.bytes.clear();
+        }
+    }
+
+    fn snapshot(&self, plain: bool) -> Result<(u64, Vec<u8>)> {
+        if self.overflowed {
+            anyhow::bail!("exact tmux replay exceeded its bounded 12 MiB buffer");
+        }
+        Ok((
+            self.source_end,
+            if plain {
+                self.plain.bytes.clone()
+            } else {
+                self.styled.clone()
+            },
+        ))
+    }
+}
 
 /// Immutable result of handling one output event at its producer. Immediate
 /// activity and the eligibility/generation of an ambiguous idle candidate are
@@ -188,6 +267,7 @@ struct DirectSinkEntry {
 pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
     direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
+    exact_replay: Arc<AsyncMutex<Option<ExactReplayBuffer>>>,
     direct_sink_notify: Arc<Notify>,
     source_offset: Arc<AtomicU64>,
     source_notify: Arc<Notify>,
@@ -222,6 +302,7 @@ impl ForwarderControl {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
+            exact_replay: Arc::new(AsyncMutex::new(None)),
             direct_sink_notify: Arc::new(Notify::new()),
             source_offset: Arc::new(AtomicU64::new(0)),
             source_notify: Arc::new(Notify::new()),
@@ -230,6 +311,24 @@ impl ForwarderControl {
             copy_mode_checked_at: Arc::new(Mutex::new(None)),
             activity: Arc::new(Mutex::new(ActivityState::default())),
         }
+    }
+
+    fn with_exact_replay_seed(styled: Vec<u8>, plain: Vec<u8>) -> Self {
+        let control = Self::new();
+        *control
+            .exact_replay
+            .try_lock()
+            .expect("new exact replay mutex is uncontended") =
+            Some(ExactReplayBuffer::seeded(styled, plain));
+        control
+    }
+
+    pub async fn exact_replay_snapshot(&self, plain: bool) -> Result<(u64, Vec<u8>)> {
+        let replay = self.exact_replay.lock().await;
+        replay
+            .as_ref()
+            .context("exact replay is unavailable for this backend")?
+            .snapshot(plain)
     }
 
     /// Suppress output-activity classification for `window` — an injected
@@ -466,27 +565,9 @@ impl ForwarderControl {
         }
     }
 
-    /// Wait until the producer/forwarder byte coordinate has stayed stable
-    /// for `quiet`. Used after a tmux pane is stopped so capture and the live
-    /// stream share an exact boundary.
-    pub async fn wait_source_quiet(&self, quiet: Duration, timeout: Duration) -> Option<u64> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut observed = self.source_offset();
-        loop {
-            tokio::time::sleep_until((tokio::time::Instant::now() + quiet).min(deadline)).await;
-            let current = self.source_offset();
-            if current == observed {
-                return Some(observed);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            observed = current;
-        }
-    }
-
     async fn route_direct(&self, chunk: &[u8], explicit_source_end: Option<u64>) {
         let mut sinks = self.direct_sinks.lock().await;
+        let mut replay = self.exact_replay.lock().await;
         let previous_source_end = self.source_offset.load(Ordering::Acquire);
         let source_end = explicit_source_end
             .unwrap_or_else(|| previous_source_end.saturating_add(chunk.len() as u64));
@@ -501,6 +582,9 @@ impl ForwarderControl {
             sinks.clear();
         }
         if source_end > previous_source_end {
+            if let Some(replay) = replay.as_mut() {
+                replay.append(chunk, source_end);
+            }
             self.source_offset.store(source_end, Ordering::Release);
             self.source_notify.notify_waiters();
         }
@@ -777,7 +861,7 @@ pub async fn launch(spec: LaunchSpec<'_>) -> Result<Launched> {
         );
     }
 
-    attach_to_session(spec.agent_id, session, spec.cwd, spec.cols, spec.rows)
+    attach_to_session_with_exact_seed(spec.agent_id, session, spec.cwd, spec.cols, spec.rows).await
 }
 
 /// Re-attach to an existing tmux session that was started by a previous
@@ -797,7 +881,23 @@ pub async fn reattach(agent_id: uuid::Uuid, session: &str) -> Result<Launched> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "/".to_string());
     tracing::info!(%agent_id, %session, cols, rows, "reattaching to existing tmux session");
-    attach_to_session(agent_id, session, &cwd, cols, rows)
+    attach_to_session_with_exact_seed(agent_id, session, &cwd, cols, rows).await
+}
+
+async fn attach_to_session_with_exact_seed(
+    agent_id: Uuid,
+    session: &str,
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<Launched> {
+    // Capture a point-in-time history seed before starting a fresh tmux
+    // client. The attach client's initial full render and every later byte are
+    // then logged in the exact producer coordinate used by spawn.pty. No pane
+    // process is signalled, so existing job-control state is untouched.
+    let styled = tmux::capture_history(session, 10_000, true).await?;
+    let plain = tmux::capture_history(session, 10_000, false).await?;
+    attach_to_session(agent_id, session, cwd, cols, rows, styled, plain)
 }
 
 /// Shared core: open a portable-pty, run `tmux attach` in it, start the
@@ -810,6 +910,8 @@ fn attach_to_session(
     cwd: &str,
     cols: u16,
     rows: u16,
+    replay_seed: Vec<u8>,
+    plain_replay_seed: Vec<u8>,
 ) -> Result<Launched> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -855,7 +957,7 @@ fn attach_to_session(
 
     // Per-agent outbox + forwarder.
     let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<OutputChunk>();
-    let control = ForwarderControl::new();
+    let control = ForwarderControl::with_exact_replay_seed(replay_seed, plain_replay_seed);
 
     // Forwarder: outbox -> current sink (with reconnect-aware looping).
     {
@@ -1507,6 +1609,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_replay_log_is_atomic_across_straddled_and_post_snapshot_output() {
+        let agent_id = Uuid::new_v4();
+        let seed = b"seed\r\n".to_vec();
+        let control = ForwarderControl::with_exact_replay_seed(seed.clone(), seed.clone());
+        let (mirror_tx, mut mirror_rx) = mpsc::channel(64);
+        control.set_sink(mirror_tx).await;
+        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let mut first = control.add_direct_sink("first".into()).await;
+
+        // Split both UTF-8 and a CSI sequence across producer chunks.
+        for part in [
+            b"before:\xf0\x9f".as_slice(),
+            b"\x98\x80\x1b[3".as_slice(),
+            b"1mduring\x1b[0m".as_slice(),
+        ] {
+            outbox_tx.send(source_output(&control, part)).unwrap();
+            assert_eq!(first.receiver.recv().await.unwrap(), part);
+        }
+        let mut second = control.add_direct_sink("second".into()).await;
+        let (boundary, replay) = control.exact_replay_snapshot(false).await.unwrap();
+        assert_eq!(
+            replay,
+            [
+                seed.as_slice(),
+                b"before:\xf0\x9f\x98\x80\x1b[31mduring\x1b[0m"
+            ]
+            .concat()
+        );
+
+        // This output lands after the immutable replay snapshot but before
+        // anchors are translated for either viewer. It must remain live and
+        // must not be discarded as if the replay contained it.
+        let after = b"after-snapshot\r\n";
+        outbox_tx.send(source_output(&control, after)).unwrap();
+        assert_eq!(first.receiver.recv().await.unwrap(), after);
+        assert_eq!(second.receiver.recv().await.unwrap(), after);
+        assert_eq!(
+            control.direct_sink_anchor("first", boundary).await,
+            Some(boundary)
+        );
+        assert_eq!(
+            control.direct_sink_anchor("second", boundary).await,
+            Some(0)
+        );
+        assert_eq!(
+            control.source_offset(),
+            boundary + u64::try_from(after.len()).unwrap()
+        );
+
+        let (_, plain) = control.exact_replay_snapshot(true).await.unwrap();
+        assert!(String::from_utf8_lossy(&plain).contains("before:😀during"));
+        assert!(String::from_utf8_lossy(&plain).contains("after-snapshot"));
+
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stalled_direct_sink_is_bounded_and_disconnected_for_replay_catchup() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
@@ -1572,28 +1734,16 @@ mod tests {
 
         launched.handle.write_stdin(b"before-capture\n").unwrap();
         collect_direct_until(&mut direct.receiver, b"before-capture").await;
-        let paused = tmux::pause_pane(&session).await.expect("pause pane");
-        launched
-            .handle
-            .control
-            .wait_source_quiet(Duration::from_millis(25), Duration::from_secs(1))
-            .await
-            .expect("drain pre-capture output");
         launched.handle.write_stdin(b"during-capture\n").unwrap();
-        let replay = tmux::capture_history(&session, 400, true)
-            .await
-            .expect("capture pane");
-        assert!(String::from_utf8_lossy(&replay).contains("before-capture"));
-        // TTY echo can still be rendered while the process group is stopped;
-        // sampling after capture anchors those exact bytes instead of
-        // duplicating them when the browser applies replay.
-        assert!(String::from_utf8_lossy(&replay).contains("during-capture"));
-        let boundary = launched
+        collect_direct_until(&mut direct.receiver, b"during-capture").await;
+        let (boundary, replay) = launched
             .handle
             .control
-            .wait_source_quiet(Duration::from_millis(25), Duration::from_secs(1))
+            .exact_replay_snapshot(false)
             .await
-            .expect("capture boundary");
+            .expect("exact replay snapshot");
+        assert!(String::from_utf8_lossy(&replay).contains("before-capture"));
+        assert!(String::from_utf8_lossy(&replay).contains("during-capture"));
         assert_eq!(
             launched
                 .handle
@@ -1602,9 +1752,6 @@ mod tests {
                 .await,
             launched.handle.control.direct_sink_offset("viewer").await
         );
-        paused.resume();
-        tmux::force_repaint(&session).await;
-        collect_direct_until(&mut direct.receiver, b"during-capture").await;
         launched.handle.write_stdin(b"after-capture\n").unwrap();
         collect_direct_until(&mut direct.receiver, b"after-capture").await;
 

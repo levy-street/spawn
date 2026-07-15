@@ -391,9 +391,15 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     generation = _valid_rtc_generation(obj.get("generation"))
                     status_value = obj.get("status")
                     if aid and session_id and generation and isinstance(status_value, str):
-                        browser = await broker.browser_for_rtc_signal(
-                            session_id, aid, conn, generation
-                        )
+                        if status_value in {"failed", "disabled", "unavailable", "collision"}:
+                            binding = await broker.unregister_rtc_signal(
+                                session_id, aid, conn, generation
+                            )
+                            browser = binding.browser if binding is not None else None
+                        else:
+                            browser = await broker.browser_for_rtc_signal(
+                                session_id, aid, conn, generation
+                            )
                         if browser is not None:
                             payload = {
                                 "type": "rtc.status",

@@ -335,6 +335,57 @@ async def test_rtc_signal_binding_rejects_wrong_daemon_agent_and_generation():
     await broker.unregister_rtc_session("bound", browser, "agent-a")
 
 
+async def test_failed_rtc_status_consumes_only_its_exact_retry_binding(client):
+    user_id, _ = await _signup(client, "ws-daemon-rtc-failure@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    browser_ws = FakeDaemonWebSocket()
+    browser = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    await _wait_until(lambda: broker.get_daemon_for_host(host_id) is not None)
+    daemon = broker.get_daemon_for_host(host_id)
+    assert daemon is not None
+    first = await broker.register_rtc_session("retry-id", browser, agent_id, daemon)
+    assert first is not None
+    assert await broker.rtc_session_count() == 1
+
+    ws.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": first.session_id,
+            "generation": first.generation,
+            "agent_id": agent_id,
+            "status": "failed",
+            "message": "negotiation failed",
+        }
+    )
+    await _wait_until(lambda: len(_sent_json(browser_ws)) == 1)
+    assert await broker.rtc_session_count() == 0
+
+    replacement = await broker.register_rtc_session("retry-id", browser, agent_id, daemon)
+    assert replacement is not None and replacement.generation != first.generation
+    # A delayed terminal status from the first attempt cannot consume retry 2.
+    ws.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": first.session_id,
+            "generation": first.generation,
+            "agent_id": agent_id,
+            "status": "failed",
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert await broker.rtc_session_count() == 1
+
+    await broker.unregister_rtc_session("retry-id", browser, agent_id)
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 async def test_daemon_ws_activity_is_content_free_and_host_scoped(
     client, monkeypatch, tmp_path
 ):

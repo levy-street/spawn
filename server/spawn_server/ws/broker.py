@@ -287,6 +287,30 @@ class Broker:
                 return binding.browser
             return None
 
+    async def unregister_rtc_signal(
+        self,
+        session_id: str,
+        agent_id: str,
+        daemon: DaemonConn,
+        generation: str,
+    ) -> RtcSessionBinding | None:
+        """Consume a terminal daemon status without touching a replacement binding."""
+        async with self._lock:
+            binding = self._rtc_sessions.get(session_id)
+            if (
+                binding is not None
+                and binding.agent_id == agent_id
+                and binding.daemon is daemon
+                and binding.generation == generation
+            ):
+                self._rtc_sessions.pop(session_id, None)
+                return binding
+            return None
+
+    async def rtc_session_count(self) -> int:
+        async with self._lock:
+            return len(self._rtc_sessions)
+
     async def update_display_size(
         self,
         conn: BrowserConn,

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -63,6 +63,7 @@ struct RtcPeer {
     agent_id: Uuid,
     generation: String,
     active: Arc<AtomicBool>,
+    lifecycle: Arc<RwLock<()>>,
 }
 
 /// Immutable identity assigned by the signaling broker to one RTC attempt.
@@ -181,6 +182,7 @@ impl RtcSessions {
             .context("creating peer connection")?,
         );
         let active = Arc::new(AtomicBool::new(true));
+        let lifecycle = Arc::new(RwLock::new(()));
 
         // Track the peer connection BEFORE negotiation so every exit path —
         // including negotiation errors below — can reach it and close it.
@@ -196,6 +198,7 @@ impl RtcSessions {
                         agent_id: binding.agent_id,
                         generation: binding.generation.clone(),
                         active: Arc::clone(&active),
+                        lifecycle: Arc::clone(&lifecycle),
                     },
                 );
                 false
@@ -213,6 +216,7 @@ impl RtcSessions {
             registry,
             self.controls.clone(),
             Arc::clone(&active),
+            Arc::clone(&lifecycle),
             out_tx.clone(),
         );
         self.install_reaper(&pc, binding.clone());
@@ -325,6 +329,7 @@ impl RtcSessions {
         };
         if let Some(peer) = removed {
             peer.active.store(false, Ordering::Release);
+            let _lifecycle = peer.lifecycle.write().await;
             self.controls
                 .unregister_session(&viewer_id(session_id, generation))
                 .await;
@@ -374,6 +379,7 @@ impl RtcSessions {
         };
         if let Some(peer) = peer {
             peer.active.store(false, Ordering::Release);
+            let _lifecycle = peer.lifecycle.write().await;
             self.controls
                 .unregister_session(&viewer_id(session_id, generation))
                 .await;
@@ -385,6 +391,7 @@ impl RtcSessions {
         let peers = std::mem::take(&mut *self.peers.lock().await);
         for (session_id, peer) in peers {
             peer.active.store(false, Ordering::Release);
+            let _lifecycle = peer.lifecycle.write().await;
             self.controls
                 .unregister_session(&viewer_id(&session_id, &peer.generation))
                 .await;
@@ -455,6 +462,7 @@ fn install_data_channel_handler(
     registry: AgentRegistry,
     controls: AgentControlHub,
     active: Arc<AtomicBool>,
+    lifecycle: Arc<RwLock<()>>,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -462,8 +470,14 @@ fn install_data_channel_handler(
         let registry = registry.clone();
         let controls = controls.clone();
         let active = Arc::clone(&active);
+        let lifecycle = Arc::clone(&lifecycle);
         let out_tx = out_tx.clone();
         Box::pin(async move {
+            let _lifecycle = lifecycle.read().await;
+            if !active.load(Ordering::Acquire) {
+                let _ = dc.close().await;
+                return;
+            }
             let viewer_id = viewer_id(&binding.session_id, &binding.generation);
             if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
                 install_control_data_channel(
@@ -473,6 +487,7 @@ fn install_data_channel_handler(
                     registry,
                     controls,
                     active,
+                    lifecycle.clone(),
                 );
                 return;
             }
@@ -486,11 +501,17 @@ fn install_data_channel_handler(
             let input_registry = registry.clone();
             let input_out_tx = out_tx.clone();
             let input_active = Arc::clone(&active);
+            let input_lifecycle = Arc::clone(&lifecycle);
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
                 let out_tx = input_out_tx.clone();
                 let active = Arc::clone(&input_active);
+                let lifecycle = Arc::clone(&input_lifecycle);
                 Box::pin(async move {
+                    if !active.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let _lifecycle = lifecycle.read().await;
                     if !active.load(Ordering::Acquire) {
                         return;
                     }
@@ -538,6 +559,7 @@ fn install_data_channel_handler(
             let open_out_tx = out_tx.clone();
             let open_dc = Arc::clone(&dc);
             let open_active = Arc::clone(&active);
+            let open_lifecycle = Arc::clone(&lifecycle);
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
                 let session_id = open_session_id.clone();
@@ -546,7 +568,13 @@ fn install_data_channel_handler(
                 let out_tx = open_out_tx.clone();
                 let dc = Arc::clone(&open_dc);
                 let active = Arc::clone(&open_active);
+                let lifecycle = Arc::clone(&open_lifecycle);
                 Box::pin(async move {
+                    if !active.load(Ordering::Acquire) {
+                        let _ = dc.close().await;
+                        return;
+                    }
+                    let _lifecycle = lifecycle.read().await;
                     if !active.load(Ordering::Acquire) {
                         let _ = dc.close().await;
                         return;
@@ -680,6 +708,7 @@ fn install_control_data_channel(
     registry: AgentRegistry,
     controls: AgentControlHub,
     active: Arc<AtomicBool>,
+    lifecycle: Arc<RwLock<()>>,
 ) {
     let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
     let (display_sender, mut display_receiver) = tokio::sync::watch::channel(None::<String>);
@@ -739,6 +768,7 @@ fn install_control_data_channel(
     let message_display_sender = display_sender.clone();
     let message_session_id = session_id.clone();
     let message_active = Arc::clone(&active);
+    let message_lifecycle = Arc::clone(&lifecycle);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let registry = message_registry.clone();
         let controls = message_controls.clone();
@@ -747,11 +777,19 @@ fn install_control_data_channel(
         let session_id = message_session_id.clone();
         let request_lock = request_lock.clone();
         let active = Arc::clone(&message_active);
+        let lifecycle = Arc::clone(&message_lifecycle);
         Box::pin(async move {
             if !active.load(Ordering::Acquire) {
                 return;
             }
+            let _lifecycle = lifecycle.read().await;
+            if !active.load(Ordering::Acquire) {
+                return;
+            }
             let _guard = request_lock.lock().await;
+            if !active.load(Ordering::Acquire) {
+                return;
+            }
             if !msg.is_string {
                 agent_ctl::send_error(
                     &sender,
@@ -802,13 +840,19 @@ fn install_control_data_channel(
     let open_sender = sender;
     let open_display_sender = display_sender;
     let open_active = Arc::clone(&active);
+    let open_lifecycle = Arc::clone(&lifecycle);
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
         let session_id = open_session_id.clone();
         let _sender = open_sender.clone();
         let display_sender = open_display_sender.clone();
         let active = Arc::clone(&open_active);
+        let lifecycle = Arc::clone(&open_lifecycle);
         Box::pin(async move {
+            if !active.load(Ordering::Acquire) {
+                return;
+            }
+            let _lifecycle = lifecycle.read().await;
             if !active.load(Ordering::Acquire) {
                 return;
             }
@@ -1065,51 +1109,16 @@ async fn capture_agent_replay(
         };
     }
 
-    let Some(session) = registry.session_for(agent_id) else {
-        return Err(ProtocolError::new(
-            None,
-            "agent_unavailable",
-            "agent is not attached to this daemon",
-        ));
-    };
-    let paused = tmux::pause_pane(&session).await.map_err(|error| {
-        ProtocolError::new(
-            None,
-            "replay_barrier_failed",
-            &format!("tmux replay barrier failed: {error:#}"),
-        )
-    })?;
-    control
-        .wait_source_quiet(Duration::from_millis(25), Duration::from_secs(1))
-        .await
-        .ok_or_else(|| {
-            ProtocolError::new(
-                None,
-                "replay_barrier_failed",
-                "tmux output did not quiesce while the pane was stopped",
-            )
-        })?;
-    let bytes = tmux::capture_history(&session, lines, !plain)
+    let (source_boundary, bytes) = control
+        .exact_replay_snapshot(plain)
         .await
         .map_err(|error| {
             ProtocolError::new(
                 None,
-                "replay_failed",
-                &format!("tmux replay failed: {error:#}"),
+                "replay_unavailable",
+                &format!("exact tmux replay is unavailable: {error:#}"),
             )
         })?;
-    let source_boundary = control
-        .wait_source_quiet(Duration::from_millis(25), Duration::from_secs(1))
-        .await
-        .ok_or_else(|| {
-            ProtocolError::new(
-                None,
-                "replay_barrier_failed",
-                "tmux output changed while replay was captured",
-            )
-        })?;
-    paused.resume();
-    tmux::force_repaint(&session).await;
     Ok((source_boundary, bytes))
 }
 
@@ -1319,6 +1328,7 @@ mod tests {
                 AgentRegistry::new(),
                 server_hub.clone(),
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(RwLock::new(())),
             );
             Box::pin(async {})
         }));
