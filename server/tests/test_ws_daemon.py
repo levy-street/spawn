@@ -14,6 +14,7 @@ from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host, User
 from spawn_server.ws.broker import BrowserConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
+from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 
 
 class FakeDaemonWebSocket:
@@ -44,6 +45,9 @@ class FakeDaemonWebSocket:
 
     def queue_text(self, payload: dict[str, Any]) -> None:
         self._incoming.put_nowait({"type": "websocket.receive", "text": json.dumps(payload)})
+
+    def queue_bytes(self, payload: bytes) -> None:
+        self._incoming.put_nowait({"type": "websocket.receive", "bytes": payload})
 
     def queue_disconnect(self) -> None:
         self._incoming.put_nowait({"type": "websocket.disconnect"})
@@ -274,12 +278,20 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
 
 
-async def test_daemon_ws_agent_activity_stamps_last_output_at_without_bytes(client):
-    """Trust Phase 2: the daemon emits a content-free `agent.activity` frame;
-    the server stamps `last_output_at` from it, never inspecting PTY bytes."""
+async def test_daemon_ws_activity_is_content_free_and_host_scoped(
+    client, monkeypatch, tmp_path
+):
+    """Only metadata frames stamp activity, and only for this daemon's host."""
+    from spawn_server.config import get_settings
+
+    monkeypatch.setenv("SPAWN_TRANSCRIPT_DIR", str(tmp_path))
+    get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, _ = await _signup(client, "ws-daemon-activity@example.com")
     host_id = await _create_host(user_id)
+    other_host_id = await _create_host(user_id, name="other-daemon-box")
     agent_id = await _create_agent(user_id, host_id, name="worker")
+    binary_only_agent_id = await _create_agent(user_id, host_id, name="binary-only")
+    other_agent_id = await _create_agent(user_id, other_host_id, name="other-host-agent")
     token = auth.issue_daemon_token(host_id, user_id)
 
     ws = FakeDaemonWebSocket()
@@ -292,7 +304,11 @@ async def test_daemon_ws_agent_activity_stamps_last_output_at_without_bytes(clie
             "version": "0.1.0",
         }
     )
+    ws.queue_bytes(encode_binary_frame(KIND_OUTPUT, binary_only_agent_id, b"secret terminal bytes"))
     ws.queue_text({"type": "agent.activity", "agent_id": agent_id})
+    ws.queue_text({"type": "agent.input_activity", "agent_id": agent_id})
+    ws.queue_text({"type": "agent.activity", "agent_id": other_agent_id})
+    ws.queue_text({"type": "agent.input_activity", "agent_id": other_agent_id})
     ws.queue_disconnect()
 
     await daemon_ws(ws, token=token)  # type: ignore[arg-type]
@@ -302,6 +318,20 @@ async def test_daemon_ws_agent_activity_stamps_last_output_at_without_bytes(clie
         agent = await session.get(Agent, agent_id)
         assert agent is not None
         assert agent.last_output_at is not None
+        assert agent.last_input_at is not None
+
+        binary_only_agent = await session.get(Agent, binary_only_agent_id)
+        assert binary_only_agent is not None
+        assert binary_only_agent.last_output_at is None
+        assert binary_only_agent.last_input_at is None
+
+        other_agent = await session.get(Agent, other_agent_id)
+        assert other_agent is not None
+        assert other_agent.last_output_at is None
+        assert other_agent.last_input_at is None
+
         host = await session.get(Host, host_id)
         assert host is not None
         assert host.last_seen_at is not None
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]

@@ -23,8 +23,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -49,6 +50,26 @@ pub enum WsOutbound {
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ActivityKind {
+    Output,
+    Input,
+}
+
+/// Best-effort activity emission shared by the PTY output forwarder and the
+/// WebRTC input path. These frames deliberately contain only an event type and
+/// agent id; its API cannot accept terminal bytes or other outbound payloads.
+pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
+    let event = match kind {
+        ActivityKind::Output => Outbound::AgentActivity { agent_id },
+        ActivityKind::Input => Outbound::AgentInputActivity { agent_id },
+    };
+    let Ok(json) = serde_json::to_string(&event) else {
+        return false;
+    };
+    out_tx.try_send(WsOutbound::Json(json)).is_ok()
+}
+
 /// A direct terminal sink plus a cumulative count of PTY bytes queued to it.
 /// The counter lets snapshot responses carry the stream position at capture
 /// time, so browsers can order snapshot content against live DataChannel
@@ -70,18 +91,17 @@ pub struct ForwarderControl {
     /// tmux subprocess per keystroke; refreshed lazily in the background.
     copy_mode: Arc<AtomicBool>,
     copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Output-activity ping state (trust Phase 2). `last_activity_ms` throttles
-    /// the ping; `suppress_until_ms` is bumped by injected input/resize/redraw
-    /// so their echoes don't count as agent work. Both are unix-millis, 0=unset.
-    last_activity_ms: Arc<AtomicI64>,
-    suppress_until_ms: Arc<AtomicI64>,
+    /// Monotonic activity state. Input/output pings have independent throttle
+    /// clocks; injected input/resize/redraw extend the output suppression
+    /// deadline so their echoes and repaints do not count as agent work.
+    activity: Arc<Mutex<ActivityState>>,
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+#[derive(Debug, Default)]
+struct ActivityState {
+    last_output_at: Option<Instant>,
+    last_input_at: Option<Instant>,
+    suppress_output_until: Option<Instant>,
 }
 
 /// How stale the cached copy-mode flag may get before a background refresh
@@ -98,26 +118,26 @@ impl ForwarderControl {
             notify: Arc::new(Notify::new()),
             copy_mode: Arc::new(AtomicBool::new(false)),
             copy_mode_checked_at: Arc::new(Mutex::new(None)),
-            last_activity_ms: Arc::new(AtomicI64::new(0)),
-            suppress_until_ms: Arc::new(AtomicI64::new(0)),
+            activity: Arc::new(Mutex::new(ActivityState::default())),
         }
     }
 
     /// Suppress output-activity classification for `window` — an injected
     /// resize/redraw or local input echo must not register as agent work.
-    pub fn suppress_activity(&self, window: std::time::Duration) {
-        let until = now_ms() + window.as_millis() as i64;
-        let mut cur = self.suppress_until_ms.load(Ordering::Relaxed);
-        while until > cur {
-            match self.suppress_until_ms.compare_exchange_weak(
-                cur,
-                until,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
+    pub fn suppress_activity(&self, window: Duration) {
+        self.suppress_activity_at(Instant::now(), window);
+    }
+
+    fn suppress_activity_at(&self, now: Instant, window: Duration) {
+        let until = now.checked_add(window).unwrap_or(now);
+        let Ok(mut state) = self.activity.lock() else {
+            return;
+        };
+        if state
+            .suppress_output_until
+            .is_none_or(|previous| previous < until)
+        {
+            state.suppress_output_until = Some(until);
         }
     }
 
@@ -126,22 +146,47 @@ impl ForwarderControl {
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
     fn note_output(&self, chunk: &[u8]) -> bool {
-        let now = now_ms();
-        // Cheap throttle check first, so the classifier only runs when a ping
+        self.note_output_at(Instant::now(), chunk)
+    }
+
+    fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
+        let Ok(mut state) = self.activity.lock() else {
+            return false;
+        };
+        // Cheap state checks first, so the classifier only runs when a ping
         // could actually be emitted.
-        let last = self.last_activity_ms.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < activity::OUTPUT_TOUCH_INTERVAL.as_millis() as i64
-        {
+        if state.last_output_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < activity::OUTPUT_TOUCH_INTERVAL
+        }) {
             return false;
         }
-        let sup = self.suppress_until_ms.load(Ordering::Relaxed);
-        if sup != 0 && now < sup {
+        if state.suppress_output_until.is_some_and(|until| now < until) {
             return false;
         }
+        state.suppress_output_until = None;
         if !activity::output_is_meaningful(chunk) {
             return false;
         }
-        self.last_activity_ms.store(now, Ordering::Relaxed);
+        state.last_output_at = Some(now);
+        true
+    }
+
+    /// Record local DataChannel input without revealing its contents. The
+    /// caller emits `agent.input_activity` only when this returns true.
+    pub fn note_input(&self) -> bool {
+        self.note_input_at(Instant::now())
+    }
+
+    fn note_input_at(&self, now: Instant) -> bool {
+        let Ok(mut state) = self.activity.lock() else {
+            return false;
+        };
+        if state.last_input_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < activity::INPUT_TOUCH_INTERVAL
+        }) {
+            return false;
+        }
+        state.last_input_at = Some(now);
         true
     }
 
@@ -694,12 +739,123 @@ pub(crate) async fn run_forwarder(
         // if the control channel is momentarily full — the throttle means a
         // later chunk re-emits soon.
         if control.note_output(&chunk) {
-            if let Ok(json) = serde_json::to_string(&Outbound::AgentActivity { agent_id }) {
-                if let Some(sink) = control.slot.lock().await.clone() {
-                    let _ = sink.try_send(WsOutbound::Json(json));
-                }
+            if let Some(sink) = control.slot.lock().await.clone() {
+                try_emit_activity(&sink, agent_id, ActivityKind::Output);
             }
         }
     }
     tracing::debug!(%agent_id, "forwarder exiting (outbox closed)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_activity_is_throttled_with_monotonic_time() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(control.note_output_at(start, b"meaningful output"));
+        assert!(!control.note_output_at(
+            start + activity::OUTPUT_TOUCH_INTERVAL - Duration::from_millis(1),
+            b"more meaningful output"
+        ));
+        assert!(control.note_output_at(
+            start + activity::OUTPUT_TOUCH_INTERVAL,
+            b"more meaningful output"
+        ));
+    }
+
+    #[test]
+    fn suppression_extends_and_expires_deterministically() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+        control.suppress_activity_at(start, Duration::from_secs(1));
+        control.suppress_activity_at(start + Duration::from_millis(100), Duration::from_secs(2));
+
+        assert!(!control.note_output_at(start + Duration::from_secs(1), b"meaningful output"));
+        assert!(!control.note_output_at(start + Duration::from_millis(2099), b"meaningful output"));
+        assert!(control.note_output_at(start + Duration::from_millis(2100), b"meaningful output"));
+    }
+
+    #[test]
+    fn suppressed_or_noise_output_does_not_consume_throttle() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+        control.suppress_activity_at(start, Duration::from_millis(10));
+
+        assert!(!control.note_output_at(start, b"meaningful output"));
+        assert!(!control.note_output_at(start + Duration::from_millis(10), b"ok"));
+        assert!(control.note_output_at(start + Duration::from_millis(10), b"meaningful output"));
+    }
+
+    #[test]
+    fn input_activity_has_an_independent_throttle() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(control.note_input_at(start));
+        assert!(!control
+            .note_input_at(start + activity::INPUT_TOUCH_INTERVAL - Duration::from_millis(1)));
+        assert!(control.note_input_at(start + activity::INPUT_TOUCH_INTERVAL));
+        assert!(control.note_output_at(start, b"independent output"));
+    }
+
+    #[tokio::test]
+    async fn activity_frames_serialize_without_terminal_content() {
+        let agent_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Output));
+        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Input));
+
+        let WsOutbound::Json(output_json) = rx.recv().await.unwrap() else {
+            panic!("expected JSON output activity")
+        };
+        let WsOutbound::Json(input_json) = rx.recv().await.unwrap() else {
+            panic!("expected JSON input activity")
+        };
+        assert_eq!(
+            output_json,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert_eq!(
+            input_json,
+            format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_emits_binary_output_then_content_free_activity() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+
+        outbox_tx
+            .send(b"sensitive terminal output".to_vec())
+            .unwrap();
+        drop(outbox_tx);
+
+        let WsOutbound::Binary(binary) = sink_rx.recv().await.unwrap() else {
+            panic!("expected binary PTY output")
+        };
+        let (kind, decoded_id, payload) = frames::decode_binary(&binary).unwrap();
+        assert_eq!(kind, frames::KIND_PTY_OUTPUT);
+        assert_eq!(decoded_id, agent_id);
+        assert_eq!(payload, b"sensitive terminal output");
+
+        let WsOutbound::Json(activity_json) = sink_rx.recv().await.unwrap() else {
+            panic!("expected JSON output activity")
+        };
+        assert_eq!(
+            activity_json,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(!activity_json.contains("sensitive terminal output"));
+        forwarder.await.unwrap();
+    }
 }

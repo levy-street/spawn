@@ -351,10 +351,12 @@ fn install_data_channel_handler(
             }
 
             let input_registry = registry.clone();
+            let input_out_tx = out_tx.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
+                let out_tx = input_out_tx.clone();
                 Box::pin(async move {
-                    if msg.is_string {
+                    if msg.is_string || msg.data.is_empty() {
                         return;
                     }
                     // Cached check: never pay a tmux subprocess per keystroke.
@@ -363,19 +365,34 @@ fn install_data_channel_handler(
                         if let Some(session) = registry.session_for(agent_id) {
                             if let Some(control) = registry.control_for(agent_id) {
                                 if control.copy_mode_cached(&session) {
+                                    control.suppress_activity(
+                                        crate::activity::REDRAW_SUPPRESS_WINDOW,
+                                    );
                                     tmux::cancel_copy_mode(&session).await;
                                     control.clear_copy_mode();
                                 }
                             }
                         }
                     }
-                    let found = registry.with_handle(agent_id, |h| {
-                        if let Err(e) = h.write_stdin(&msg.data) {
+                    let mut wrote_input = false;
+                    let found = registry.with_handle(agent_id, |h| match h.write_stdin(&msg.data) {
+                        Ok(()) => wrote_input = true,
+                        Err(e) => {
                             tracing::warn!(%agent_id, error = %e, "rtc PTY stdin write failed");
                         }
                     });
                     if !found {
                         tracing::debug!(%agent_id, "ignoring rtc stdin for unknown agent");
+                    } else if wrote_input {
+                        if let Some(control) = registry.control_for(agent_id) {
+                            if control.note_input() {
+                                crate::pty::try_emit_activity(
+                                    &out_tx,
+                                    agent_id,
+                                    crate::pty::ActivityKind::Input,
+                                );
+                            }
+                        }
                     }
                 })
             }));

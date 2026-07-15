@@ -11,12 +11,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Agent, User
-from .ws.activity import (
-    REDRAW_SUPPRESS_WINDOW,
-    should_record_agent_input,
-    suppress_agent_output_activity,
-    utcnow,
-)
+from .ws.activity import should_record_agent_input, utcnow
 from .ws.broker import get_broker
 from .ws.frames import KIND_INPUT, encode_binary_frame
 
@@ -141,7 +136,6 @@ async def resize_agent(
     daemon = daemon_for_agent(agent)
     cols = max(20, min(400, int(cols)))
     rows = max(5, min(200, int(rows)))
-    suppress_agent_output_activity(agent.id, duration=REDRAW_SUPPRESS_WINDOW)
     await daemon.send_text({"type": "agent.resize", "agent_id": agent.id, "cols": cols, "rows": rows})
     return {"agent_id": agent.id, "cols": cols, "rows": rows}
 
@@ -157,7 +151,6 @@ async def scroll_agent(
     daemon = daemon_for_agent(agent)
     lines = max(-200, min(200, int(lines)))
     if lines:
-        suppress_agent_output_activity(agent.id, duration=REDRAW_SUPPRESS_WINDOW)
         await daemon.send_text({"type": "agent.scroll", "agent_id": agent.id, "lines": lines})
     return {"agent_id": agent.id, "lines": lines}
 
@@ -165,7 +158,6 @@ async def scroll_agent(
 async def redraw_agent(*, session: AsyncSession, user: User, agent_id: str) -> dict[str, Any]:
     agent = await get_owned_agent(session, agent_id, user)
     daemon = daemon_for_agent(agent)
-    suppress_agent_output_activity(agent.id, duration=REDRAW_SUPPRESS_WINDOW)
     await daemon.send_text({"type": "agent.redraw", "agent_id": agent.id})
     return {"agent_id": agent.id, "redraw": True}
 

@@ -15,6 +15,8 @@ use regex::Regex;
 
 /// Throttle: at most one activity ping per agent per this interval.
 pub const OUTPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(2);
+/// Throttle: at most one input-activity ping per agent per this interval.
+pub const INPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(1);
 /// After local input, suppress the echo from counting as agent work.
 pub const INPUT_ECHO_SUPPRESS_WINDOW: Duration = Duration::from_millis(750);
 /// After an injected resize/redraw, suppress the resulting repaint.
@@ -36,14 +38,43 @@ static CONTROL_RE: LazyLock<Regex> =
 /// True if this output chunk represents meaningful agent work rather than
 /// cursor moves, redraw noise, or the tmux status-bar clock ticking.
 pub fn output_is_meaningful(payload: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(payload);
-    let text = OSC_RE.replace_all(text.as_ref(), "");
+    let text = decode_utf8_ignoring_errors(payload);
+    let text = OSC_RE.replace_all(&text, "");
     let text = CSI_RE.replace_all(text.as_ref(), "");
     let text = CHARSET_RE.replace_all(text.as_ref(), "");
     let text = TMUX_CLOCK_RE.replace_all(text.as_ref(), "");
     let text = TMUX_FRAG_RE.replace_all(text.as_ref(), "");
     let text = CONTROL_RE.replace_all(text.as_ref(), "");
     text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_MEANINGFUL_OUTPUT_CHARS
+}
+
+/// Match Python's former `payload.decode("utf-8", errors="ignore")` exactly:
+/// retain valid UTF-8 (including a genuine U+FFFD) and skip only malformed
+/// byte sequences. `String::from_utf8_lossy` is not equivalent because its
+/// synthetic replacement characters would themselves count as activity.
+fn decode_utf8_ignoring_errors(mut payload: &[u8]) -> String {
+    let mut decoded = String::with_capacity(payload.len());
+    while !payload.is_empty() {
+        match std::str::from_utf8(payload) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                // SAFETY is unnecessary: `valid_up_to` is guaranteed to end
+                // at a valid UTF-8 boundary by `Utf8Error`.
+                decoded.push_str(std::str::from_utf8(&payload[..valid_up_to]).unwrap());
+                match error.error_len() {
+                    Some(invalid_len) => {
+                        payload = &payload[valid_up_to + invalid_len..];
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    decoded
 }
 
 #[cfg(test)]
@@ -68,11 +99,30 @@ mod tests {
 
     #[test]
     fn tmux_status_clock_is_not_meaningful() {
-        assert!(!output_is_meaningful(b"[spawn-oem] \"bash\" 12:34 15-Jul-26"));
+        assert!(!output_is_meaningful(
+            b"[spawn-oem] \"bash\" 12:34 15-Jul-26"
+        ));
     }
 
     #[test]
     fn osc_title_only_is_not_meaningful() {
         assert!(!output_is_meaningful(b"\x1b]0;my terminal title\x07"));
+    }
+
+    #[test]
+    fn invalid_utf8_is_ignored_instead_of_counting_as_replacements() {
+        assert!(!output_is_meaningful(b"\xff\xfe\xfd"));
+        assert!(!output_is_meaningful(b"a\xffb"));
+        assert!(output_is_meaningful(b"a\xffbc"));
+
+        // Genuine replacement characters are valid input and remain visible,
+        // just as they did in the former Python classifier.
+        assert!(output_is_meaningful("���".as_bytes()));
+    }
+
+    #[test]
+    fn incomplete_utf8_tail_is_ignored() {
+        assert!(!output_is_meaningful(b"ab\xe2\x82"));
+        assert!(output_is_meaningful(b"abc\xe2\x82"));
     }
 }

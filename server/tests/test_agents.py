@@ -393,6 +393,10 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     assert frame.kind == KIND_INPUT
     assert frame.agent_id == agent_id
     assert frame.payload == b"hello\n"
+    async with sm() as session:
+        persisted_agent = await session.get(Agent, agent_id)
+        assert persisted_agent is not None
+        assert persisted_agent.last_input_at is not None
 
     r = await client.post(
         f"/api/agents/{agent_id}/resize",
