@@ -207,6 +207,53 @@ mod tests {
     }
 
     #[test]
+    fn rtc_signaling_parses_legacy_agent_and_bound_host_shapes() {
+        use crate::proto::Inbound;
+
+        let legacy: Inbound = serde_json::from_str(
+            r#"{"type":"rtc.offer","session_id":"legacy","agent_id":"00000000-0000-4000-8000-000000000001","sdp":"v=0"}"#,
+        )
+        .unwrap();
+        match legacy {
+            Inbound::RtcOffer {
+                agent_id,
+                scope_type,
+                protocol,
+                ..
+            } => {
+                assert!(agent_id.is_some());
+                assert!(scope_type.is_none());
+                assert!(protocol.is_none());
+            }
+            _ => panic!("expected legacy RTC offer"),
+        }
+
+        let host: Inbound = serde_json::from_str(
+            r#"{"type":"rtc.offer","session_id":"host","scope_type":"host","scope_id":"00000000-0000-4000-8000-000000000002","protocol":"spawn.host.ctl","protocol_version":1,"sdp":"v=0","ice_transport_policy":"relay"}"#,
+        )
+        .unwrap();
+        match host {
+            Inbound::RtcOffer {
+                agent_id,
+                scope_type,
+                scope_id,
+                protocol,
+                protocol_version,
+                ice_transport_policy,
+                ..
+            } => {
+                assert!(agent_id.is_none());
+                assert_eq!(scope_type.as_deref(), Some("host"));
+                assert!(scope_id.is_some());
+                assert_eq!(protocol.as_deref(), Some("spawn.host.ctl"));
+                assert_eq!(protocol_version, Some(1));
+                assert_eq!(ice_transport_policy.as_deref(), Some("relay"));
+            }
+            _ => panic!("expected host RTC offer"),
+        }
+    }
+
+    #[test]
     fn host_fs_frames_parse_and_serialize() {
         use crate::proto::{HostDirEntry, Inbound, Outbound};
 

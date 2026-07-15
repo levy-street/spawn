@@ -111,19 +111,46 @@ pub enum Outbound {
     #[serde(rename = "rtc.answer")]
     RtcAnswer {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         sdp: String,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         status: String,
         #[serde(default)]
         message: Option<String>,
@@ -258,21 +285,50 @@ pub enum Inbound {
     #[serde(rename = "rtc.offer")]
     RtcOffer {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
         sdp: String,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
+        #[serde(default)]
+        ice_transport_policy: Option<String>,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.close")]
     RtcClose {
         session_id: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
     },
 }
 

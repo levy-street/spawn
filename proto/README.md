@@ -230,6 +230,23 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "status": "connected|failed",
  "message": "optional detail"}
 
+Host-scoped signaling uses the same `rtc.*` types but replaces `agent_id` with
+an explicit, mandatory binding tuple on every frame:
+
+```json
+{"type": "rtc.answer",
+ "session_id": "browser-generated-id",
+ "scope_type": "host",
+ "scope_id": "host-uuid",
+ "protocol": "spawn.host.ctl",
+ "protocol_version": 1,
+ "sdp": "v=0..."}
+```
+
+Host `rtc.candidate` and `rtc.status` frames carry the identical tuple. Host
+status values are content-free codes; endpoint error detail is not placed on
+the signaling websocket.
+
 {"type": "host.fs.list_result",
  "request_id": "uuid",
  "path": "/home/me/projects",
@@ -407,6 +424,14 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "agent_id": "uuid"}
 ```
 
+For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
+`agent_id` and carry `scope_type:"host"`, `scope_id`,
+`protocol:"spawn.host.ctl"`, and `protocol_version:1`. A host offer also
+carries `ice_transport_policy:"all|relay"`; when the server supplies only TURN
+URLs both endpoints use `relay` and do not gather direct/STUN candidates.
+Legacy agent signaling without the generalized tuple remains accepted during
+the `spawn.v1` rollout.
+
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
 provider credentials — each agent CLI authenticates itself on the host.
@@ -496,6 +521,37 @@ on top of the websocket control plane.
   `rtc.config` (browser) and `rtc.offer.ice_servers` (daemon). The relay
   only ever carries DTLS ciphertext between the peers.
 
+## Host control WebSocket and DataChannel
+
+`/ws/host?host_id=<uuid>` is a signaling-only browser websocket independent of
+any agent. It authenticates the browser session, verifies that the user owns
+the host, and selects subprotocol `spawn.host.v1`. The server sends a bound
+`rtc.config`; browser offers/candidates/closes and daemon
+answers/candidates/statuses must repeat the exact host binding tuple above.
+The signaling router binds each `session_id` to the initiating browser
+connection, selected daemon connection, host, protocol, and version. Session
+ID collisions and cross-browser, cross-daemon, cross-host, or cross-protocol
+frames are rejected.
+
+The browser creates an ordered `spawn.host.ctl` DataChannel. The daemon accepts
+that label only on a host-scoped peer connection for its server-registered host
+identity. The server never receives these messages. Version 1 starts with:
+
+```json
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping"]}
+{"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
+{"version":1,"type":"cancel","request_id":"unguessable-id"}
+```
+
+Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
+limited to 128 bytes, and malformed, binary, wrong-version, or oversized
+messages close the channel. The browser limits concurrent requests, applies a
+timeout, sends cancellation on timeout/abort, and binds responses to the
+outstanding request ID. Filesystem/tool/launch operations and their bounded
+chunk streams are added by later trust Phase 2 tasks; the transport root
+currently advertises only `ping`.
+
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
@@ -503,4 +559,7 @@ on top of the websocket control plane.
   legacy relay fallback; the daemon WS remains `spawn.v1` until the
   daemon-owned-data migration (docs/TRUST.md Phase 2). Server SHOULD
   support both during a rollout window.
+- Host signaling uses `spawn.host.v1`; its DataChannel protocol is separately
+  versioned by the mandatory `protocol_version` signaling field and `version`
+  envelope field.
 - REST endpoints under `/api/` are versioned by additive evolution.

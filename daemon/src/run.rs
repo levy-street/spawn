@@ -23,7 +23,7 @@ use crate::proto::{
     Outbound,
 };
 use crate::pty::{self, WsOutbound};
-use crate::rtc::RtcSessions;
+use crate::rtc::{RtcCandidateSignal, RtcCloseSignal, RtcOfferSignal, RtcSessions};
 use crate::tmux;
 use crate::upload;
 use crate::worker_backend::{self, BackendKind};
@@ -54,6 +54,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
 
     let registry = AgentRegistry::new();
     let rtc_sessions = RtcSessions::new();
+    if let Some(host_id) = stored.host_id {
+        let _ = rtc_sessions.bind_registered_host_id(host_id).await;
+    }
 
     // Ctrl-C handler closes the WS but does NOT kill agent tmux sessions —
     // that's the whole point of using tmux.
@@ -269,6 +272,9 @@ async fn dispatch_loop(
             WsInbound::Closed => return Ok(()),
             WsInbound::Json(frame) => match frame {
                 Inbound::Registered { host_id } => {
+                    if !rtc_sessions.bind_registered_host_id(host_id).await {
+                        return Err(anyhow!("server registered daemon as an unexpected host"));
+                    }
                     tracing::info!(%host_id, "registered with server");
                 }
                 Inbound::HostHeartbeat => {
@@ -406,15 +412,27 @@ async fn dispatch_loop(
                 Inbound::RtcOffer {
                     session_id,
                     agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                     sdp,
                     ice_servers,
+                    ice_transport_policy,
                 } => {
                     rtc_sessions
                         .handle_offer(
-                            session_id,
-                            agent_id,
-                            sdp,
-                            ice_servers,
+                            RtcOfferSignal {
+                                session_id,
+                                agent_id,
+                                scope_type,
+                                scope_id,
+                                protocol,
+                                protocol_version,
+                                sdp,
+                                ice_servers,
+                                ice_transport_policy,
+                            },
                             registry.clone(),
                             out_tx.clone(),
                         )
@@ -422,16 +440,43 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcCandidate {
                     session_id,
-                    agent_id: _,
+                    agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                     candidate,
                 } => {
-                    rtc_sessions.handle_candidate(session_id, candidate).await;
+                    rtc_sessions
+                        .handle_candidate(RtcCandidateSignal {
+                            session_id,
+                            agent_id,
+                            scope_type,
+                            scope_id,
+                            protocol,
+                            protocol_version,
+                            candidate,
+                        })
+                        .await;
                 }
                 Inbound::RtcClose {
                     session_id,
-                    agent_id: _,
+                    agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                 } => {
-                    rtc_sessions.close(&session_id).await;
+                    rtc_sessions
+                        .close_bound(RtcCloseSignal {
+                            session_id,
+                            agent_id,
+                            scope_type,
+                            scope_id,
+                            protocol,
+                            protocol_version,
+                        })
+                        .await;
                 }
             },
             WsInbound::Binary {

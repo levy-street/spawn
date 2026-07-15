@@ -146,6 +146,15 @@ authorizes operations to its own host identity; the browser binds every
 response to the requested host/session. Phase 3 adds signed signaling to both
 agent- and host-scoped peer connections.
 
+Implementation note: the transport root is intentionally separable from the
+content migrations in Increment 5. Its first reviewed cut uses a dedicated
+`/ws/host` signaling websocket, binds each RTC session to browser connection,
+daemon connection, host scope, protocol, and version, and exposes only a
+bounded `hello`/`ping` request-response primitive. This permits ownership,
+zero-agent, TURN-only, reconnect, cancellation, size, and cross-scope behavior
+to be tested before any protected filesystem/tool payload is moved. It does
+not make the Phase 2 claim and does not remove any legacy host content route.
+
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the

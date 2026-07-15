@@ -25,6 +25,7 @@ from .routes import presets as presets_routes
 from .routes import screens as screens_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
+from .ws import host as host_ws
 
 log = logging.getLogger("spawn.main")
 
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
 
     app.include_router(daemon_ws.router)
     app.include_router(browser_ws.router)
+    app.include_router(host_ws.router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

@@ -56,6 +56,12 @@ export function buildAgentWsUrl(
   return u.toString();
 }
 
+export function buildHostWsUrl(hostId: string): string {
+  const url = new URL(`${originForWs()}/ws/host`);
+  url.searchParams.set("host_id", hostId);
+  return url.toString();
+}
+
 // ---------- Inbound JSON frame types ----------
 
 export interface DisplayControlState {

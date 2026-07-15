@@ -42,6 +42,8 @@ INITIAL_SNAPSHOT_TIMEOUT = 3.0
 # Fallback when no daemon snapshot is available: ship only the transcript
 # tail. Long-running agents accumulate up to 64 MB of transcript.
 TRANSCRIPT_FALLBACK_MAX_BYTES = 512 * 1024
+AGENT_RTC_PROTOCOL = "spawn.pty"
+AGENT_RTC_PROTOCOL_VERSION = 1
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -551,7 +553,25 @@ async def browser_ws(
                             }
                         )
                         continue
-                    await broker.register_rtc_session(session_id, conn)
+                    registered = await broker.register_rtc_session(
+                        session_id,
+                        conn,
+                        daemon=daemon,
+                        scope_type="agent",
+                        scope_id=agent_id,
+                        protocol=AGENT_RTC_PROTOCOL,
+                        protocol_version=AGENT_RTC_PROTOCOL_VERSION,
+                    )
+                    if not registered:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "status": "failed",
+                                "message": "RTC session id is already in use.",
+                            }
+                        )
+                        continue
                     try:
                         await daemon.send_text(
                             {
@@ -580,13 +600,17 @@ async def browser_ws(
                     candidate = _valid_rtc_candidate(obj.get("candidate"))
                     if session_id is None or candidate is None:
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is None:
+                    binding = await broker.rtc_session_for(session_id, browser=conn)
+                    if (
+                        binding is None
+                        or binding.scope_type != "agent"
+                        or binding.scope_id != agent_id
+                        or binding.protocol != AGENT_RTC_PROTOCOL
+                        or binding.protocol_version != AGENT_RTC_PROTOCOL_VERSION
+                    ):
                         continue
                     try:
-                        await daemon.send_text(
+                        await binding.daemon.send_text(
                             {
                                 "type": "rtc.candidate",
                                 "session_id": session_id,
@@ -600,21 +624,20 @@ async def browser_ws(
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     if session_id is None:
                         continue
+                    binding = await broker.rtc_session_for(session_id, browser=conn)
+                    if binding is None:
+                        continue
                     await broker.unregister_rtc_session(session_id, conn)
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            await daemon.send_text(
-                                {
-                                    "type": "rtc.close",
-                                    "session_id": session_id,
-                                    "agent_id": agent_id,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("rtc close forward failed: %s", e)
+                    try:
+                        await binding.daemon.send_text(
+                            {
+                                "type": "rtc.close",
+                                "session_id": session_id,
+                                "agent_id": agent_id,
+                            }
+                        )
+                    except Exception as e:
+                        log.warning("rtc close forward failed: %s", e)
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
@@ -626,20 +649,18 @@ async def browser_ws(
                 await pump_task
             except (asyncio.CancelledError, Exception):
                 pass
-        session_ids = await broker.unregister_rtc_sessions_for(conn)
-        daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
-        if daemon is not None:
-            for session_id in session_ids:
-                try:
-                    await daemon.send_text(
-                        {
-                            "type": "rtc.close",
-                            "session_id": session_id,
-                            "agent_id": agent_id,
-                        }
-                    )
-                except Exception:
-                    pass
+        bindings = await broker.unregister_rtc_sessions_for(conn)
+        for binding in bindings:
+            try:
+                await binding.daemon.send_text(
+                    {
+                        "type": "rtc.close",
+                        "session_id": binding.session_id,
+                        "agent_id": agent_id,
+                    }
+                )
+            except Exception:
+                pass
         await broker.detach_browser(conn)
         await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)

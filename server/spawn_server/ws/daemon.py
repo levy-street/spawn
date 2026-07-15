@@ -13,7 +13,7 @@ from .. import auth as auth_mod
 from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, Host
-from .broker import DaemonConn, get_broker
+from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .frames import KIND_OUTPUT, decode_binary_frame
 
 router = APIRouter()
@@ -87,6 +87,41 @@ def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     if not isinstance(candidate, str) or len(candidate) > 64 * 1024:
         return None
     return dict(value)
+
+
+def _valid_rtc_sdp(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 1024 * 1024:
+        return None
+    return value
+
+
+def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
+    """Bind daemon signaling to its registered session, endpoint and scope.
+
+    Legacy agent daemons omit the generalized fields, so those fields remain
+    optional only for agent sessions. Host sessions always require the full
+    tuple; the signaling server never guesses host scope from an unbound frame.
+    """
+    scope_type = binding.scope_type
+    if obj.get("session_id") != binding.session_id:
+        return False
+    expected = {
+        "scope_type": scope_type,
+        "scope_id": binding.scope_id,
+        "protocol": binding.protocol,
+        "protocol_version": binding.protocol_version,
+    }
+    for key, value in expected.items():
+        actual = obj.get(key)
+        if scope_type == "host" and actual != value:
+            return False
+        if scope_type == "agent" and actual is not None and actual != value:
+            return False
+    if scope_type == "agent" and obj.get("agent_id") != binding.scope_id:
+        return False
+    if scope_type == "host" and obj.get("agent_id") is not None:
+        return False
+    return True
 
 
 @router.websocket("/ws/daemon")
@@ -322,73 +357,94 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         )
 
                 elif ftype == "rtc.answer":
-                    aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    sdp = obj.get("sdp")
-                    if aid and session_id and isinstance(sdp, str):
-                        async with sm() as session:
-                            agent = await session.get(Agent, aid)
-                            if agent is None or agent.host_id != host.id:
-                                log.warning("rtc answer for unknown agent=%s", aid)
-                                continue
-                        browser = await broker.browser_for_rtc_session(session_id)
-                        if browser is not None:
-                            try:
-                                await browser.send_text(
-                                    {
-                                        "type": "rtc.answer",
-                                        "session_id": session_id,
-                                        "agent_id": aid,
-                                        "sdp": sdp,
-                                    }
-                                )
-                            except Exception as e:
-                                log.warning("rtc answer route failed: %s", e)
+                    sdp = _valid_rtc_sdp(obj.get("sdp"))
+                    if session_id and sdp:
+                        binding = await broker.rtc_session_for(session_id, daemon=conn)
+                        if binding is None or not _rtc_frame_matches_binding(obj, binding):
+                            log.warning("rtc answer did not match its registered session")
+                            continue
+                        payload: dict[str, object] = {
+                            "type": "rtc.answer",
+                            "session_id": session_id,
+                            "sdp": sdp,
+                        }
+                        if binding.scope_type == "agent":
+                            payload["agent_id"] = binding.scope_id
+                        else:
+                            payload.update(
+                                {
+                                    "scope_type": binding.scope_type,
+                                    "scope_id": binding.scope_id,
+                                    "protocol": binding.protocol,
+                                    "protocol_version": binding.protocol_version,
+                                }
+                            )
+                        try:
+                            await binding.browser.send_text(payload)
+                        except Exception as e:
+                            log.warning("rtc answer route failed: %s", e)
 
                 elif ftype == "rtc.candidate":
-                    aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     candidate = _valid_rtc_candidate(obj.get("candidate"))
-                    if aid and session_id and candidate is not None:
-                        async with sm() as session:
-                            agent = await session.get(Agent, aid)
-                            if agent is None or agent.host_id != host.id:
-                                log.warning("rtc candidate for unknown agent=%s", aid)
-                                continue
-                        browser = await broker.browser_for_rtc_session(session_id)
-                        if browser is not None:
-                            try:
-                                await browser.send_text(
-                                    {
-                                        "type": "rtc.candidate",
-                                        "session_id": session_id,
-                                        "agent_id": aid,
-                                        "candidate": candidate,
-                                    }
-                                )
-                            except Exception as e:
-                                log.warning("rtc candidate route failed: %s", e)
+                    if session_id and candidate is not None:
+                        binding = await broker.rtc_session_for(session_id, daemon=conn)
+                        if binding is None or not _rtc_frame_matches_binding(obj, binding):
+                            log.warning("rtc candidate did not match its registered session")
+                            continue
+                        payload = {
+                            "type": "rtc.candidate",
+                            "session_id": session_id,
+                            "candidate": candidate,
+                        }
+                        if binding.scope_type == "agent":
+                            payload["agent_id"] = binding.scope_id
+                        else:
+                            payload.update(
+                                {
+                                    "scope_type": binding.scope_type,
+                                    "scope_id": binding.scope_id,
+                                    "protocol": binding.protocol,
+                                    "protocol_version": binding.protocol_version,
+                                }
+                            )
+                        try:
+                            await binding.browser.send_text(payload)
+                        except Exception as e:
+                            log.warning("rtc candidate route failed: %s", e)
 
                 elif ftype == "rtc.status":
-                    aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     status_value = obj.get("status")
-                    if aid and session_id and isinstance(status_value, str):
-                        browser = await broker.browser_for_rtc_session(session_id)
-                        if browser is not None:
-                            payload = {
-                                "type": "rtc.status",
-                                "session_id": session_id,
-                                "agent_id": aid,
-                                "status": status_value,
-                            }
+                    if session_id and isinstance(status_value, str) and len(status_value) <= 64:
+                        binding = await broker.rtc_session_for(session_id, daemon=conn)
+                        if binding is None or not _rtc_frame_matches_binding(obj, binding):
+                            log.warning("rtc status did not match its registered session")
+                            continue
+                        payload = {
+                            "type": "rtc.status",
+                            "session_id": session_id,
+                            "status": status_value,
+                        }
+                        if binding.scope_type == "agent":
+                            payload["agent_id"] = binding.scope_id
                             message = obj.get("message")
                             if isinstance(message, str):
                                 payload["message"] = message
-                            try:
-                                await browser.send_text(payload)
-                            except Exception as e:
-                                log.warning("rtc status route failed: %s", e)
+                        else:
+                            payload.update(
+                                {
+                                    "scope_type": binding.scope_type,
+                                    "scope_id": binding.scope_id,
+                                    "protocol": binding.protocol,
+                                    "protocol_version": binding.protocol_version,
+                                }
+                            )
+                        try:
+                            await binding.browser.send_text(payload)
+                        except Exception as e:
+                            log.warning("rtc status route failed: %s", e)
 
                 elif ftype == "error":
                     aid = obj.get("agent_id")

@@ -12,7 +12,7 @@ from sqlalchemy import select
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host, User
-from spawn_server.ws.broker import BrowserConn, get_broker
+from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 
@@ -216,11 +216,35 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
 
     browser_ws = FakeDaemonWebSocket()
     browser_conn = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
+    signal_daemon = DaemonConn(
+        host_id=host_id, user_id=user_id, websocket=FakeDaemonWebSocket()
+    )  # type: ignore[arg-type]
     broker = get_broker()
-    await broker.register_rtc_session("rtc-daemon-1", browser_conn)
+    assert await broker.register_rtc_session(
+        "rtc-daemon-1",
+        browser_conn,
+        daemon=signal_daemon,
+        scope_type="agent",
+        scope_id=agent_id,
+        protocol="spawn.pty",
+        protocol_version=1,
+    )
 
     ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    await _wait_until(lambda: get_broker().get_daemon_for_host(host_id) is not None)
+    live_daemon = get_broker().get_daemon_for_host(host_id)
+    assert live_daemon is not None
+    await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
+    assert await broker.register_rtc_session(
+        "rtc-daemon-1",
+        browser_conn,
+        daemon=live_daemon,
+        scope_type="agent",
+        scope_id=agent_id,
+        protocol="spawn.pty",
+        protocol_version=1,
+    )
 
     ws.queue_text(
         {

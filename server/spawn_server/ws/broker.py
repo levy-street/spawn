@@ -54,6 +54,30 @@ class BrowserConn:
             await self.websocket.send_bytes(payload)
 
 
+@dataclass(eq=False)
+class HostBrowserConn:
+    user_id: str
+    host_id: str
+    websocket: WebSocket
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def send_text(self, payload: dict) -> None:
+        async with self.send_lock:
+            await self.websocket.send_text(json.dumps(payload))
+
+
+@dataclass(frozen=True)
+class RtcSessionBinding:
+    session_id: str
+    browser: BrowserConn | HostBrowserConn
+    daemon: DaemonConn
+    scope_type: str
+    scope_id: str
+    protocol: str
+    protocol_version: int
+
+
 @dataclass
 class _DisplayState:
     owner_conn_id: str | None = None
@@ -82,7 +106,7 @@ class Broker:
         self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
         self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
         self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
-        self._rtc_browsers: dict[str, BrowserConn] = {}
+        self._rtc_sessions: dict[str, RtcSessionBinding] = {}
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -99,6 +123,7 @@ class Broker:
                 for aid in list(existing.agent_ids):
                     self._daemon_by_agent.pop(aid, None)
                 existing.agent_ids.clear()
+                self._drop_rtc_sessions_for_daemon_locked(existing)
             self._daemons_by_host[conn.host_id] = conn
 
     async def unregister_daemon(self, conn: DaemonConn) -> None:
@@ -109,6 +134,16 @@ class Broker:
                 if self._daemon_by_agent.get(aid) is conn:
                     self._daemon_by_agent.pop(aid, None)
             conn.agent_ids.clear()
+            self._drop_rtc_sessions_for_daemon_locked(conn)
+
+    def _drop_rtc_sessions_for_daemon_locked(self, conn: DaemonConn) -> None:
+        stale = [
+            session_id
+            for session_id, binding in self._rtc_sessions.items()
+            if binding.daemon is conn
+        ]
+        for session_id in stale:
+            self._rtc_sessions.pop(session_id, None)
 
     async def attach_agent_to_daemon(self, agent_id: str, conn: DaemonConn) -> None:
         async with self._lock:
@@ -170,30 +205,72 @@ class Broker:
     def browsers_for(self, agent_id: str) -> list[BrowserConn]:
         return list(self._browsers_by_agent.get(agent_id, ()))
 
-    async def register_rtc_session(self, session_id: str, conn: BrowserConn) -> None:
+    async def register_rtc_session(
+        self,
+        session_id: str,
+        conn: BrowserConn | HostBrowserConn,
+        *,
+        daemon: DaemonConn,
+        scope_type: str,
+        scope_id: str,
+        protocol: str,
+        protocol_version: int,
+    ) -> bool:
         async with self._lock:
-            self._rtc_browsers[session_id] = conn
+            if session_id in self._rtc_sessions:
+                return False
+            self._rtc_sessions[session_id] = RtcSessionBinding(
+                session_id=session_id,
+                browser=conn,
+                daemon=daemon,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                protocol=protocol,
+                protocol_version=protocol_version,
+            )
+            return True
 
-    async def unregister_rtc_session(self, session_id: str, conn: BrowserConn | None = None) -> None:
+    async def unregister_rtc_session(
+        self, session_id: str, conn: BrowserConn | HostBrowserConn | None = None
+    ) -> None:
         async with self._lock:
-            current = self._rtc_browsers.get(session_id)
-            if current is not None and (conn is None or current is conn):
-                self._rtc_browsers.pop(session_id, None)
+            current = self._rtc_sessions.get(session_id)
+            if current is not None and (conn is None or current.browser is conn):
+                self._rtc_sessions.pop(session_id, None)
 
-    async def unregister_rtc_sessions_for(self, conn: BrowserConn) -> list[str]:
+    async def unregister_rtc_sessions_for(
+        self, conn: BrowserConn | HostBrowserConn
+    ) -> list[RtcSessionBinding]:
         async with self._lock:
-            session_ids = [
-                session_id
-                for session_id, current in self._rtc_browsers.items()
-                if current is conn
+            sessions = [
+                (session_id, binding)
+                for session_id, binding in self._rtc_sessions.items()
+                if binding.browser is conn
             ]
-            for session_id in session_ids:
-                self._rtc_browsers.pop(session_id, None)
-            return session_ids
+            for session_id, _ in sessions:
+                self._rtc_sessions.pop(session_id, None)
+            return [binding for _, binding in sessions]
 
-    async def browser_for_rtc_session(self, session_id: str) -> BrowserConn | None:
+    async def rtc_session_for(
+        self,
+        session_id: str,
+        *,
+        browser: BrowserConn | HostBrowserConn | None = None,
+        daemon: DaemonConn | None = None,
+    ) -> RtcSessionBinding | None:
         async with self._lock:
-            return self._rtc_browsers.get(session_id)
+            binding = self._rtc_sessions.get(session_id)
+            if binding is None:
+                return None
+            if browser is not None and binding.browser is not browser:
+                return None
+            if daemon is not None and binding.daemon is not daemon:
+                return None
+            return binding
+
+    async def browser_for_rtc_session(self, session_id: str) -> BrowserConn | HostBrowserConn | None:
+        binding = await self.rtc_session_for(session_id)
+        return binding.browser if binding is not None else None
 
     async def update_display_size(
         self,
