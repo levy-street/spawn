@@ -408,6 +408,76 @@ describe("HostControlClient", () => {
     third.client.close();
   });
 
+  test("queued callbacks from a replaced websocket cannot affect the current attempt", async () => {
+    const client = new HostControlClient(hostId, {
+      connectTimeoutMs: 1000,
+      reconnectBaseDelayMs: 1,
+    });
+    client.connect();
+    const oldWs = FakeWebSocket.instances[0];
+    const staleOpen = oldWs.onopen;
+    const staleMessage = oldWs.onmessage;
+    const staleError = oldWs.onerror;
+    const staleClose = oldWs.onclose;
+
+    oldWs.onopen?.();
+    staleClose?.();
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(oldWs.onopen).toBeNull();
+    expect(oldWs.onmessage).toBeNull();
+    expect(oldWs.onerror).toBeNull();
+    expect(oldWs.onclose).toBeNull();
+
+    const newWs = FakeWebSocket.instances[1];
+    newWs.onopen?.();
+    newWs.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const newPc = FakePeerConnection.instances.at(-1);
+    newPc.channel.onopen?.();
+    newPc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "hello",
+        protocol: HOST_CONTROL_PROTOCOL,
+        capabilities: ["ping"],
+      }),
+    );
+    expect(client.getState()).toBe("ready");
+    const newSocketSignals = newWs.sent.length;
+
+    staleOpen?.();
+    staleMessage?.({
+      data: JSON.stringify({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [{ urls: ["turn:stale.example"] }],
+        ice_transport_policy: "relay",
+        ...metadata,
+      }),
+    });
+    staleMessage?.({ data: "null" });
+    staleError?.();
+    staleClose?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Bun.sleep(2);
+
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(newPc.channel.closed).toBe(false);
+    expect(newWs.sent).toHaveLength(newSocketSignals);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(client.getState()).toBe("ready");
+    client.close();
+  });
+
   test("bounds pending requests and ignores a response with the wrong request id", async () => {
     const { client, pc } = await readyClient({ maxPendingRequests: 2, requestTimeoutMs: 1000 });
     const first = client.ping();

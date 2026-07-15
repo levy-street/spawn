@@ -12,6 +12,7 @@ from sqlalchemy import select
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host, User
+from spawn_server.redis import get_backend
 from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
@@ -239,6 +240,7 @@ async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_h
         assert host is not None
         assert host.status == "online"
         assert host.version == "new"
+        assert host.daemon_connection_id == get_broker().get_daemon_for_host(host_id).id
 
     new.queue_disconnect()
     await asyncio.wait_for(new_task, timeout=1)
@@ -246,6 +248,70 @@ async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_h
         host = await session.get(Host, host_id)
         assert host is not None
         assert host.status == "offline"
+        assert host.daemon_connection_id is None
+
+
+async def test_old_cleanup_cannot_overwrite_replacement_database_ownership(client, monkeypatch):
+    user_id, _ = await _signup(client, "ws-daemon-cleanup-race@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "version": "old"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+    old_conn = get_broker().get_daemon_for_host(host_id)
+    assert old_conn is not None
+
+    backend = get_backend()
+    original_delete = backend.delete_ephemeral_if
+    old_deleted_lease = asyncio.Event()
+    release_old_cleanup = asyncio.Event()
+
+    async def delete_with_old_cleanup_barrier(key: str, value: bytes) -> bool:
+        deleted = await original_delete(key, value)
+        if value == old_conn.id.encode("ascii"):
+            old_deleted_lease.set()
+            await release_old_cleanup.wait()
+        return deleted
+
+    monkeypatch.setattr(backend, "delete_ephemeral_if", delete_with_old_cleanup_barrier)
+
+    old.queue_disconnect()
+    await asyncio.wait_for(old_deleted_lease.wait(), timeout=1)
+
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text({"type": "register", "version": "new"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
+    new_conn = get_broker().get_daemon_for_host(host_id)
+    assert new_conn is not None
+    assert new_conn.id != old_conn.id
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "online"
+        assert host.daemon_connection_id == new_conn.id
+
+    release_old_cleanup.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "online"
+        assert host.version == "new"
+        assert host.daemon_connection_id == new_conn.id
+
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "offline"
+        assert host.daemon_connection_id is None
 
 
 async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):

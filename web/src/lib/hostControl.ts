@@ -61,6 +61,7 @@ export class HostControlClient {
   private sessionId: string | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  private connectionAttempt = 0;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private stopped = true;
@@ -90,12 +91,17 @@ export class HostControlClient {
 
   close(): void {
     this.stopped = true;
+    this.connectionAttempt += 1;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.clearConnectDeadline();
     this.cleanupRtc(true);
-    this.ws?.close(1000, "host control closed");
+    const ws = this.ws;
     this.ws = null;
+    if (ws) {
+      this.detachWebSocket(ws);
+      ws.close(1000, "host control closed");
+    }
     this.rejectPending(new Error("Host control connection closed"));
     this.setState("closed");
   }
@@ -168,10 +174,18 @@ export class HostControlClient {
 
   private openWebSocket(): void {
     if (this.stopped) return;
+    const attempt = ++this.connectionAttempt;
+    const previous = this.ws;
+    this.ws = null;
+    if (previous) {
+      this.detachWebSocket(previous);
+      previous.close();
+    }
     this.setState("connecting");
     this.clearConnectDeadline();
     this.connectTimer = setTimeout(
       () => {
+        if (attempt !== this.connectionAttempt || this.stopped) return;
         this.connectTimer = null;
         this.failRtc();
       },
@@ -187,9 +201,11 @@ export class HostControlClient {
     }
     this.ws = ws;
     ws.onopen = () => {
+      if (!this.isCurrentWebSocket(ws, attempt)) return;
       this.setState("open");
     };
     ws.onmessage = (event) => {
+      if (!this.isCurrentWebSocket(ws, attempt)) return;
       if (typeof event.data !== "string") return;
       let parsed: unknown;
       try {
@@ -208,6 +224,8 @@ export class HostControlClient {
         void this.startRtc(
           message.ice_servers ?? [],
           message.ice_transport_policy === "relay" ? "relay" : "all",
+          ws,
+          attempt,
         );
       } else if (message.type === "rtc.answer" && message.session_id === this.sessionId) {
         const pc = this.pc;
@@ -215,11 +233,14 @@ export class HostControlClient {
         void pc
           .setRemoteDescription({ type: "answer", sdp: message.sdp })
           .then(() => {
+            if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
             for (const candidate of this.pendingRemoteCandidates.splice(0)) {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
           })
-          .catch(() => this.failRtc(message.session_id));
+          .catch(() => {
+            if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(message.session_id);
+          });
       } else if (message.type === "rtc.candidate" && message.session_id === this.sessionId) {
         if (this.pc?.remoteDescription) {
           void this.pc.addIceCandidate(message.candidate).catch(() => {});
@@ -234,9 +255,13 @@ export class HostControlClient {
         this.failRtc(message.session_id);
       }
     };
-    ws.onerror = () => this.setState("error");
+    ws.onerror = () => {
+      if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.setState("error");
+    };
     ws.onclose = () => {
-      if (this.ws !== ws) return;
+      if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.detachWebSocket(ws);
       this.ws = null;
       this.clearConnectDeadline();
       this.cleanupRtc(false);
@@ -247,9 +272,12 @@ export class HostControlClient {
   private async startRtc(
     iceServers: RTCIceServer[],
     iceTransportPolicy: RTCIceTransportPolicy,
+    ws: WebSocket,
+    attempt: number,
   ): Promise<void> {
+    if (!this.isCurrentWebSocket(ws, attempt)) return;
     this.cleanupRtc(true);
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isCurrentWebSocket(ws, attempt) || ws.readyState !== WebSocket.OPEN) return;
     const sessionId = crypto.randomUUID();
     const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy });
     const channel = pc.createDataChannel(HOST_CONTROL_PROTOCOL, { ordered: true });
@@ -258,23 +286,35 @@ export class HostControlClient {
     this.sessionId = sessionId;
     this.pendingRemoteCandidates = [];
     pc.onicecandidate = (event) => {
-      if (!event.candidate || this.sessionId !== sessionId) return;
-      this.sendSignal({
-        type: "rtc.candidate",
-        session_id: sessionId,
-        candidate: event.candidate.toJSON(),
-      });
+      if (!event.candidate || this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt))
+        return;
+      this.sendSignal(
+        {
+          type: "rtc.candidate",
+          session_id: sessionId,
+          candidate: event.candidate.toJSON(),
+        },
+        ws,
+        attempt,
+      );
     };
     pc.onconnectionstatechange = () => {
-      if (["failed", "closed"].includes(pc.connectionState)) {
+      if (
+        this.isCurrentWebSocket(ws, attempt) &&
+        ["failed", "closed"].includes(pc.connectionState)
+      ) {
         this.failRtc(sessionId);
       }
     };
-    channel.onmessage = (event) => this.handleControlMessage(event.data, sessionId);
+    channel.onmessage = (event) => {
+      if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.handleControlMessage(event.data, sessionId);
+    };
     channel.onclose = () => {
-      this.failRtc(sessionId);
+      if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
     };
     channel.onerror = () => {
+      if (!this.isCurrentWebSocket(ws, attempt) || this.sessionId !== sessionId) return;
       this.setState("error");
       this.failRtc(sessionId);
     };
@@ -282,10 +322,14 @@ export class HostControlClient {
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      if (this.sessionId !== sessionId) return;
-      this.sendSignal({ type: "rtc.offer", session_id: sessionId, sdp: offer.sdp ?? "" });
+      if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
+      this.sendSignal(
+        { type: "rtc.offer", session_id: sessionId, sdp: offer.sdp ?? "" },
+        ws,
+        attempt,
+      );
     } catch {
-      this.failRtc(sessionId);
+      if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
     }
   }
 
@@ -336,9 +380,16 @@ export class HostControlClient {
     else pending.reject(new Error(message.error?.code ?? "Host control request failed"));
   }
 
-  private sendSignal(values: Record<string, unknown>): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(
+  private sendSignal(
+    values: Record<string, unknown>,
+    expectedWs?: WebSocket,
+    expectedAttempt?: number,
+  ): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (expectedWs !== undefined && ws !== expectedWs) return;
+    if (expectedAttempt !== undefined && this.connectionAttempt !== expectedAttempt) return;
+    ws.send(
       JSON.stringify({
         ...values,
         scope_type: "host",
@@ -414,22 +465,26 @@ export class HostControlClient {
     if (this.stopped || this.reconnectTimer) return;
     this.clearConnectDeadline();
     this.reconnectAttempt += 1;
+    const attempt = this.connectionAttempt;
     const delay = Math.min(
       10_000,
       Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS) *
         this.reconnectAttempt,
     );
-    this.reconnectTimer = setTimeout(() => {
+    const timer = setTimeout(() => {
+      if (this.reconnectTimer !== timer) return;
       this.reconnectTimer = null;
+      if (this.stopped || this.connectionAttempt !== attempt) return;
       const ws = this.ws;
       this.ws = null;
       if (ws) {
-        ws.onclose = null;
+        this.detachWebSocket(ws);
         ws.close();
       }
       this.cleanupRtc(false);
       this.openWebSocket();
     }, delay);
+    this.reconnectTimer = timer;
   }
 
   private failRtc(expectedSessionId?: string): void {
@@ -442,6 +497,17 @@ export class HostControlClient {
   private clearConnectDeadline(): void {
     if (this.connectTimer) clearTimeout(this.connectTimer);
     this.connectTimer = null;
+  }
+
+  private isCurrentWebSocket(ws: WebSocket, attempt: number): boolean {
+    return !this.stopped && this.ws === ws && this.connectionAttempt === attempt;
+  }
+
+  private detachWebSocket(ws: WebSocket): void {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
   }
 
   private maxPendingRequests(): number {
