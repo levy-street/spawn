@@ -11,16 +11,16 @@ your phone.
                    ┌────────────────────────┐
    ┌─────────┐     │                        │     ┌─────────────────┐
    │ Browser │◀───▶│  spawn-server (FastAPI)│◀───▶│ spawnd (Rust)   │
-   │  PWA    │ WSS │   Postgres + Redis     │ WSS │ tmux + PTY      │
+   │  PWA    │ WSS │   Postgres + Redis     │ WSS │ workers + PTY   │
    └─────────┘     │                        │     │  ↳ claude/codex │
                    └────────────────────────┘     └─────────────────┘
 ```
 
 - **server/** — FastAPI control plane. Auth, host/agent registry, WS broker
   between daemons and browsers.
-- **daemon/** — `spawnd`, a single Rust binary that runs on each remote host.
+- **daemon/** — `spawnd` plus `spawn-worker` binaries that run on each remote host.
   Dials *out* to the server (no inbound ports needed). Manages local agent
-  processes inside `tmux` and streams PTY I/O back over WSS.
+  Each purpose-built worker owns one agent PTY and encrypted bounded replay.
 - **web/** — Next.js 15 PWA. xterm.js terminal, mobile-first composer +
   modifier bar, hosts/agents UI.
 - **proto/** — single source of truth for the WS + REST contract shared by all
@@ -38,8 +38,8 @@ between the host daemon, the browser, and a ciphertext-only TURN relay.
 ## Local dev (quickstart)
 
 System prerequisites: `docker`, Python 3.13 (`uv` installs interpreters on
-demand), Rust stable (via `rustup`), Bun 1.x, and **`tmux`** on every host
-that will run `spawnd`.
+demand), Rust stable (via `rustup`), and Bun 1.x. Agent hosts install both
+`spawnd` and its paired `spawn-worker` binary.
 
 ## Daemon install
 
@@ -133,7 +133,7 @@ The local daemon smoke also launches multiple shell agents concurrently and veri
 each PTY stream stays isolated. The live browser smoke drives the real Next app
 against a disposable FastAPI server and real daemon, creates an agent through
 the UI, attaches xterm over the browser websocket, sends input, verifies output
-from the tmux session, uploads a file into the agent cwd, and proves a second
+from the session worker, uploads a file into the agent cwd, and proves a second
 browser tab can take terminal control and send input.
 
 To include non-disruptive Linux host coverage over SSH, set a host alias from

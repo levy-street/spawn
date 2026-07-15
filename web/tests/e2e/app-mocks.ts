@@ -41,7 +41,6 @@ export function agent(overrides: Record<string, unknown> = {}) {
   return {
     id: AGENT_ID,
     name: "palette",
-    tmux_session: `spawn-palette--${AGENT_ID}`,
     host_id: HOST_ID,
     host_name: "Mac",
     preset_id: PRESET_ID,
@@ -377,12 +376,6 @@ export async function mockAuthenticatedApi(
         contentType: "application/json",
         json: { agent_id: AGENT_ID, skills: [] },
       });
-      return;
-    }
-    // Repaint self-healing: the terminal requests a tmux refresh-client after
-    // owner resizes and control changes.
-    if (path.match(/^\/api\/agents\/[^/]+\/redraw$/) && method === "POST") {
-      await route.fulfill({ status: 204 });
       return;
     }
     const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/);

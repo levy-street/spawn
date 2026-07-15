@@ -50,17 +50,8 @@ const PREVIEW_LINES = 3;
 const PREVIEW_POLL_MS = 10_000;
 const PREVIEW_FETCH_CHUNK = 6;
 
-/**
- * The daemon reports a dead/lost tmux session as snapshot *content* — this
- * exact sentence and nothing else. Match the whole payload, not a substring:
- * a live agent's scrollback can legitimately contain this text (e.g. while
- * debugging spawn itself).
- */
-const LOST_SESSION_MARKER =
-  "[spawn] agent is not attached to this daemon and no matching tmux session was found";
-
-// tmux appends stray SGR resets even in plain mode; strip CSI/OSC sequences
-// and control bytes before deciding which lines are blank.
+// Strip CSI/OSC sequences and control bytes before deciding which lines are
+// blank in a legacy plain snapshot.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
 const ANSI_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
@@ -73,14 +64,13 @@ function decodeSnapshotTail(bytesB64: string): string | null {
     .decode(bytes)
     .replace(ANSI_RE, "")
     .replace(CONTROL_RE, "");
-  if (text.trim() === LOST_SESSION_MARKER) return null;
   const lines = text.split(/\r?\n/).map((line) => line.trimEnd());
   while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   return lines.slice(-PREVIEW_LINES).join("\n");
 }
 
 /**
- * Polls plain-text tmux tails for the running agents via the REST snapshot
+ * Polls plain-text worker replay tails for running agents via the REST snapshot
  * endpoint. Fetches in small chunks to stay gentle on the daemons; pauses
  * automatically while the tab is hidden (react-query default).
  */

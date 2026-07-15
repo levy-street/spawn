@@ -18,13 +18,12 @@ entirely — see docs/TRUST.md.)
 | Manage skills | settings, new-agent access picker | `/api/skills` | `skills.*` | included in `agent.create` |
 | Grant agent skill access | new-agent access picker, agent detail summary | `/api/agents/{id}/access` | `agentAccess.*`; `agents.create` grant fields | materializes files/env and Codex projection |
 | List/get/create agents | agents page, sidebar, new-agent form | `/api/agents` | `agents.list/get/create` | `agent.create` |
-| Rename/pin/archive/delete agent | agents page, detail header, sidebar | `PATCH/DELETE /api/agents/{id}` | `agents.update/rename/pin/archive/remove` | `agent.rename`, `agent.kill` |
+| Rename/pin/archive/delete agent | agents page, detail header, sidebar | `PATCH/DELETE /api/agents/{id}` | `agents.update/rename/pin/archive/remove` | metadata update; `agent.kill` for delete |
 | Restart agent | agents page, detail header, sidebar | `POST /api/agents/{id}/restart` | `agents.restart` | `agent.restart` |
 | Terminal input | terminal page | `POST /api/agents/{id}/input` | `agents.input` | binary input frame |
 | Resize/scroll/redraw terminal | terminal page display owner | `/resize`, `/scroll`, `/redraw` | `agents.resize/scroll/redraw` | `agent.resize`, `agent.scroll`, `agent.redraw` |
 | Capture terminal snapshot | terminal reconnect/history | `POST /api/agents/{id}/snapshot` | `agents.snapshot` | `agent.snapshot` request/result |
 | Upload file/image to agent cwd | terminal upload/drop/paste | `/upload`, `/upload-file` | `agents.upload/uploadFile` | `agent.upload` request/result |
-| tmux session visibility | agent detail header | `tmux_session` field | `Agent.tmux_session` | daemon creates/renames session |
 
 Intentional differences:
 

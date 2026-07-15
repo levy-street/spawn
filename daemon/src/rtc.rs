@@ -34,7 +34,6 @@ use crate::agent_ctl::{
 use crate::agents::{AgentBinding, AgentRegistry};
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
-use crate::tmux;
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
@@ -659,29 +658,6 @@ fn install_data_channel_handler(
                     if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                         return;
                     }
-                    // Cached check: never pay a tmux subprocess per keystroke.
-                    // Worker-backed agents have no tmux copy-mode at all.
-                    if !msg.is_string
-                        && !msg.data.is_empty()
-                        && registry.is_worker_binding(agent) != Some(true)
-                    {
-                        if let Some(session) = registry.session_for_binding(agent) {
-                            if let Some(control) = registry.control_for_binding(agent) {
-                                if control.copy_mode_cached(&session) {
-                                    control.suppress_activity(
-                                        crate::activity::REDRAW_SUPPRESS_WINDOW,
-                                    );
-                                    tmux::cancel_copy_mode(&session).await;
-                                    control.clear_copy_mode();
-                                    if !active.load(Ordering::Acquire)
-                                        || !registry.is_current(agent)
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let result = forward_bound_data_channel_input(
                         agent,
                         msg.is_string,
@@ -722,63 +698,61 @@ fn install_data_channel_handler(
                         let _ = dc.close().await;
                         return;
                     }
-                    if registry.is_worker_binding(agent) == Some(true) {
-                        let mut replay_rx = None;
-                        registry.with_bound_handle(agent, |handle| {
-                            replay_rx = handle.worker_replay(64 * 1024);
-                        });
-                        let Some(replay_rx) = replay_rx else {
-                            send_status(
-                                &out_tx,
-                                session_id,
-                                generation,
-                                agent_id,
-                                "failed",
-                                Some("worker replay is unavailable"),
-                            )
-                            .await;
-                            return;
-                        };
-                        let Ok(Ok(Ok((watermark, _)))) =
-                            tokio::time::timeout(Duration::from_secs(3), replay_rx).await
-                        else {
-                            send_status(
-                                &out_tx,
-                                session_id,
-                                generation,
-                                agent_id,
-                                "failed",
-                                Some("worker replay barrier failed"),
-                            )
-                            .await;
-                            return;
-                        };
-                        if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
-                            let _ = dc.close().await;
-                            return;
-                        }
-                        if tokio::time::timeout(
-                            Duration::from_secs(3),
-                            control.wait_source_offset(watermark),
+                    let mut replay_rx = None;
+                    registry.with_bound_handle(agent, |handle| {
+                        replay_rx = handle.replay(64 * 1024);
+                    });
+                    let Some(replay_rx) = replay_rx else {
+                        send_status(
+                            &out_tx,
+                            session_id,
+                            generation,
+                            agent_id,
+                            "failed",
+                            Some("worker replay is unavailable"),
                         )
-                        .await
-                        .is_err()
-                        {
-                            send_status(
-                                &out_tx,
-                                session_id,
-                                generation,
-                                agent_id,
-                                "failed",
-                                Some("worker live-stream barrier timed out"),
-                            )
-                            .await;
-                            return;
-                        }
-                        if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
-                            let _ = dc.close().await;
-                            return;
-                        }
+                        .await;
+                        return;
+                    };
+                    let Ok(Ok(Ok((watermark, _)))) =
+                        tokio::time::timeout(Duration::from_secs(3), replay_rx).await
+                    else {
+                        send_status(
+                            &out_tx,
+                            session_id,
+                            generation,
+                            agent_id,
+                            "failed",
+                            Some("worker replay barrier failed"),
+                        )
+                        .await;
+                        return;
+                    };
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                        let _ = dc.close().await;
+                        return;
+                    }
+                    if tokio::time::timeout(
+                        Duration::from_secs(3),
+                        control.wait_source_offset(watermark),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        send_status(
+                            &out_tx,
+                            session_id,
+                            generation,
+                            agent_id,
+                            "failed",
+                            Some("worker live-stream barrier timed out"),
+                        )
+                        .await;
+                        return;
+                    }
+                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                        let _ = dc.close().await;
+                        return;
                     }
 
                     let mut direct = control.add_direct_sink(viewer_id.clone()).await;
@@ -1103,10 +1077,6 @@ async fn execute_control_request(
                 if controls.is_owner(agent_id, session_id).await {
                     resize_agent(agent, cols, rows, registry).await?;
                     let _ = controls.update_size(agent_id, session_id, cols, rows).await;
-                    // tmux reflows asynchronously after refresh-client.
-                    if registry.is_worker_binding(agent) != Some(true) {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
                 }
             }
             send_agent_replay(
@@ -1254,58 +1224,44 @@ async fn send_agent_replay(
 async fn capture_agent_replay(
     agent: AgentBinding,
     lines: u16,
-    plain: bool,
+    _plain: bool,
     registry: &AgentRegistry,
     control: &crate::pty::ForwarderControl,
 ) -> Result<(u64, Vec<u8>), ProtocolError> {
-    if registry.is_worker_binding(agent) == Some(true) {
-        let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
-            8 * 1024 * 1024
-        } else {
-            (lines as u32)
-                .saturating_mul(256)
-                .clamp(64 * 1024, 8 * 1024 * 1024)
-        };
-        let mut replay_rx = None;
-        registry.with_bound_handle(agent, |handle| {
-            replay_rx = handle.worker_replay(max_bytes);
-        });
-        return match replay_rx {
-            Some(receiver) => match receiver.await {
-                Ok(Ok((watermark, bytes))) => {
-                    control.wait_source_offset(watermark).await;
-                    Ok((watermark, bytes))
-                }
-                Ok(Err(error)) => Err(ProtocolError::new(
-                    None,
-                    "replay_failed",
-                    &format!("worker replay failed: {error:#}"),
-                )),
-                Err(_) => Err(ProtocolError::new(
-                    None,
-                    "replay_unavailable",
-                    "worker replay channel closed",
-                )),
-            },
-            None => Err(ProtocolError::new(
+    let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
+        8 * 1024 * 1024
+    } else {
+        (lines as u32)
+            .saturating_mul(256)
+            .clamp(64 * 1024, 8 * 1024 * 1024)
+    };
+    let mut replay_rx = None;
+    registry.with_bound_handle(agent, |handle| {
+        replay_rx = handle.replay(max_bytes);
+    });
+    match replay_rx {
+        Some(receiver) => match receiver.await {
+            Ok(Ok((watermark, bytes))) => {
+                control.wait_source_offset(watermark).await;
+                Ok((watermark, bytes))
+            }
+            Ok(Err(error)) => Err(ProtocolError::new(
                 None,
-                "replay_unavailable",
-                "worker replay is unavailable",
+                "replay_failed",
+                &format!("worker replay failed: {error:#}"),
             )),
-        };
-    }
-
-    let (source_boundary, bytes) = control
-        .exact_replay_snapshot(plain)
-        .await
-        .map_err(|error| {
-            ProtocolError::new(
+            Err(_) => Err(ProtocolError::new(
                 None,
                 "replay_unavailable",
-                &format!("exact tmux replay is unavailable: {error:#}"),
-            )
-        })?;
-    Ok((source_boundary, bytes))
+                "worker replay channel closed",
+            )),
+        },
+        None => Err(ProtocolError::new(
+            None,
+            "replay_unavailable",
+            "worker replay is unavailable",
+        )),
+    }
 }
 
 async fn resize_agent(
@@ -1325,14 +1281,9 @@ async fn resize_agent(
             "agent is not running on this daemon",
         ));
     }
-    let changed = result
+    result
         .expect("found handle sets result")
         .map_err(|error| ProtocolError::new(None, "resize_failed", &format!("{error:#}")))?;
-    if changed && registry.is_worker_binding(agent) != Some(true) {
-        if let Some(session) = registry.session_for_binding(agent) {
-            tmux::refresh_client(&session, cols, rows).await;
-        }
-    }
     Ok(())
 }
 
@@ -1341,37 +1292,19 @@ async fn scroll_agent(
     lines: i16,
     registry: &AgentRegistry,
 ) -> Result<(), ProtocolError> {
-    if registry.is_worker_binding(agent) == Some(true) {
-        return Ok(());
-    }
-    let Some(session) = registry.session_for_binding(agent) else {
+    if !registry.is_current(agent) {
         return Err(ProtocolError::new(
             None,
             "agent_unavailable",
             "agent is not running on this daemon",
         ));
-    };
-    if let Some(control) = registry.control_for_binding(agent) {
-        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
     }
-    tmux::scroll_history(&session, lines)
-        .await
-        .map_err(|error| {
-            ProtocolError::new(None, "scroll_failed", &format!("scroll failed: {error:#}"))
-        })
+    tracing::debug!(agent_id = %agent.agent_id(), lines, "ignoring deprecated scroll operation");
+    Ok(())
 }
 
 async fn redraw_agent(agent: AgentBinding, registry: &AgentRegistry) {
-    if registry.is_worker_binding(agent) == Some(true) {
-        return;
-    }
-    let Some(session) = registry.session_for_binding(agent) else {
-        return;
-    };
-    if let Some(control) = registry.control_for_binding(agent) {
-        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
-    }
-    tmux::force_repaint(&session).await;
+    tracing::debug!(agent_id = %agent.agent_id(), current = registry.is_current(agent), "ignoring deprecated redraw operation");
 }
 
 /// Testable core of the `spawn.pty` input callback. Activity is recorded only
@@ -1465,13 +1398,11 @@ mod tests {
     fn insert_test_worker(
         registry: &AgentRegistry,
         agent_id: Uuid,
-        session: &str,
     ) -> (AgentBinding, mpsc::UnboundedReceiver<crate::pty::WorkerCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (outbox_tx, _outbox_rx) = mpsc::unbounded_channel();
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
-            session: session.to_string(),
             cmd_tx,
             alive: Arc::new(AtomicBool::new(true)),
             cols: 80,
@@ -1638,7 +1569,7 @@ mod tests {
         let agent_id = Uuid::new_v4();
         let viewer = "rtc-real:generation".to_string();
         let registry = AgentRegistry::new();
-        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id, "rtc-real");
+        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
         let control = registry.control_for_binding(agent).unwrap();
         let worker_control = control.clone();
         let replay_bytes = b"worker-history\r\n".to_vec();
@@ -1826,8 +1757,8 @@ mod tests {
     async fn replacement_fences_stale_peer_input_control_and_output() {
         let registry = AgentRegistry::new();
         let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
-        let (current, mut current_commands) = insert_test_worker(&registry, agent_id, "current");
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+        let (current, mut current_commands) = insert_test_worker(&registry, agent_id);
         assert_ne!(old, current);
 
         let (out_tx, _out_rx) = mpsc::channel(4);
@@ -2006,9 +1937,9 @@ mod tests {
     async fn close_for_agent_drains_only_the_matching_backend_generation() {
         let registry = AgentRegistry::new();
         let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
         let old_control = registry.control_for_binding(old).unwrap();
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
         let current_control = registry.control_for_binding(current).unwrap();
         let api = APIBuilder::new().build();
         let old_pc = Arc::new(

@@ -1,44 +1,26 @@
-//! Per-agent PTY + tmux session management.
+//! Per-agent terminal routing shared by `spawnd` and the mandatory session
+//! worker backend.
 //!
-//! For each `agent.create`:
-//!   1. `tmux new-session -d -s spawn-<name>--<id>` launches the real argv detached,
-//!      with the final env injected into the pane process. Spawn does not
-//!      manage agent credentials — the daemon's process env (HOME,
-//!      XDG_CONFIG_HOME, PATH, etc.) flows through, and the agent CLI finds
-//!      whatever it logged in with on the host.
-//!   2. We open a portable_pty PTY and spawn `tmux attach -t <session>`
-//!      inside it. A blocking reader thread pushes raw PTY bytes into a
-//!      per-agent **outbox** (an unbounded mpsc). A long-lived per-agent
-//!      **forwarder** task encodes those bytes as binary frames and ships
-//!      them to the WS session's outbound sink. Stdin from the WS goes into
-//!      the PTY's writer.
-//!
-//! The reader thread + forwarder task survive across WS reconnects: the
-//! WS session installs/clears the forwarder's sink on connect/disconnect,
-//! and the outbox buffers any bytes received in between. This is what makes
-//! "bounce uvicorn while an agent is running" not break the agent.
-//!
-//! Because tmux owns the underlying agent process, the agent also survives
-//! `spawnd` restarts (see `reattach`).
+//! A `spawn-worker` owns each agent's PTY. Its output enters an unbounded
+//! per-agent outbox and a long-lived forwarder routes it to the current server
+//! connection plus bounded direct DataChannel sinks. Workers and their PTYs
+//! survive `spawnd` reconnects/restarts; `spawnd` never owns a second terminal
+//! emulator or shells out to a multiplexer.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future;
-use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::vte::ansi::{Handler as VteHandler, Processor as VteProcessor};
-use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
 use crate::activity;
 use crate::frames;
 use crate::proto::Outbound;
-use crate::tmux;
 
 #[derive(Clone, Debug)]
 pub enum WsOutbound {
@@ -61,84 +43,6 @@ pub struct DirectSinkReceiver {
 
 pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
 pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
-pub const EXACT_REPLAY_MAX_BYTES: usize = 12 * 1024 * 1024;
-
-#[derive(Default)]
-struct PlainReplayBytes {
-    bytes: Vec<u8>,
-}
-
-impl VteHandler for PlainReplayBytes {
-    fn input(&mut self, c: char) {
-        let mut encoded = [0_u8; 4];
-        self.bytes
-            .extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
-    }
-
-    fn carriage_return(&mut self) {
-        self.bytes.push(b'\r');
-    }
-
-    fn linefeed(&mut self) {
-        self.bytes.push(b'\n');
-    }
-}
-
-struct ExactReplayBuffer {
-    styled: Vec<u8>,
-    plain: PlainReplayBytes,
-    plain_parser: VteProcessor,
-    source_end: u64,
-    overflowed: bool,
-}
-
-impl ExactReplayBuffer {
-    fn seeded(styled: Vec<u8>, plain: Vec<u8>) -> Self {
-        let overflowed =
-            styled.len() > EXACT_REPLAY_MAX_BYTES || plain.len() > EXACT_REPLAY_MAX_BYTES;
-        Self {
-            styled: if overflowed { Vec::new() } else { styled },
-            plain: PlainReplayBytes {
-                bytes: if overflowed { Vec::new() } else { plain },
-            },
-            plain_parser: VteProcessor::new(),
-            source_end: 0,
-            overflowed,
-        }
-    }
-
-    fn append(&mut self, bytes: &[u8], source_end: u64) {
-        self.source_end = source_end;
-        if self.overflowed || self.styled.len().saturating_add(bytes.len()) > EXACT_REPLAY_MAX_BYTES
-        {
-            self.overflowed = true;
-            self.styled.clear();
-            self.plain.bytes.clear();
-            return;
-        }
-        self.styled.extend_from_slice(bytes);
-        self.plain_parser.advance(&mut self.plain, bytes);
-        if self.plain.bytes.len() > EXACT_REPLAY_MAX_BYTES {
-            self.overflowed = true;
-            self.styled.clear();
-            self.plain.bytes.clear();
-        }
-    }
-
-    fn snapshot(&self, plain: bool) -> Result<(u64, Vec<u8>)> {
-        if self.overflowed {
-            anyhow::bail!("exact tmux replay exceeded its bounded 12 MiB buffer");
-        }
-        Ok((
-            self.source_end,
-            if plain {
-                self.plain.bytes.clone()
-            } else {
-                self.styled.clone()
-            },
-        ))
-    }
-}
 
 /// Immutable result of handling one output event at its producer. Immediate
 /// activity and the eligibility/generation of an ambiguous idle candidate are
@@ -148,7 +52,7 @@ impl ExactReplayBuffer {
 pub(crate) struct OutputChunk {
     bytes: Vec<u8>,
     /// End watermark in the producer's byte coordinate. Worker output carries
-    /// its durable log watermark; tmux output assigns one in the forwarder.
+    /// its durable log watermark.
     source_end: Option<u64>,
     source_barrier: bool,
     activity: bool,
@@ -267,15 +171,10 @@ struct DirectSinkEntry {
 pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
     direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
-    exact_replay: Arc<AsyncMutex<Option<ExactReplayBuffer>>>,
     direct_sink_notify: Arc<Notify>,
     source_offset: Arc<AtomicU64>,
     source_notify: Arc<Notify>,
     notify: Arc<Notify>,
-    /// Cached `#{pane_in_mode}` so the stdin hot path never has to spawn a
-    /// tmux subprocess per keystroke; refreshed lazily in the background.
-    copy_mode: Arc<AtomicBool>,
-    copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// Monotonic activity state. Input/output pings have independent throttle
     /// clocks; injected input/resize/redraw extend the output suppression
     /// deadline so their echoes and repaints do not count as agent work.
@@ -291,44 +190,17 @@ struct ActivityState {
     output_generation: u64,
 }
 
-/// How stale the cached copy-mode flag may get before a background refresh
-/// is kicked off. A keystroke landing within this window of the user
-/// entering copy-mode may slip through uncancelled — the same best-effort
-/// semantics the old always-cancel had for its own races.
-const COPY_MODE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
-
 impl ForwarderControl {
     pub(crate) fn new() -> Self {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
-            exact_replay: Arc::new(AsyncMutex::new(None)),
             direct_sink_notify: Arc::new(Notify::new()),
             source_offset: Arc::new(AtomicU64::new(0)),
             source_notify: Arc::new(Notify::new()),
             notify: Arc::new(Notify::new()),
-            copy_mode: Arc::new(AtomicBool::new(false)),
-            copy_mode_checked_at: Arc::new(Mutex::new(None)),
             activity: Arc::new(Mutex::new(ActivityState::default())),
         }
-    }
-
-    fn with_exact_replay_seed(styled: Vec<u8>, plain: Vec<u8>) -> Self {
-        let control = Self::new();
-        *control
-            .exact_replay
-            .try_lock()
-            .expect("new exact replay mutex is uncontended") =
-            Some(ExactReplayBuffer::seeded(styled, plain));
-        control
-    }
-
-    pub async fn exact_replay_snapshot(&self, plain: bool) -> Result<(u64, Vec<u8>)> {
-        let replay = self.exact_replay.lock().await;
-        replay
-            .as_ref()
-            .context("exact replay is unavailable for this backend")?
-            .snapshot(plain)
     }
 
     /// Suppress output-activity classification for `window` — an injected
@@ -441,37 +313,6 @@ impl ForwarderControl {
         true
     }
 
-    /// Cached answer to "is the pane in copy-mode?", kicking off a background
-    /// refresh when the cache is stale. Never blocks on tmux.
-    pub fn copy_mode_cached(&self, session: &str) -> bool {
-        let needs_refresh = match self.copy_mode_checked_at.lock() {
-            Ok(mut guard) => match *guard {
-                Some(at) if at.elapsed() < COPY_MODE_CACHE_TTL => false,
-                _ => {
-                    *guard = Some(std::time::Instant::now());
-                    true
-                }
-            },
-            Err(_) => false,
-        };
-        if needs_refresh {
-            let flag = Arc::clone(&self.copy_mode);
-            let session = session.to_string();
-            tokio::spawn(async move {
-                if let Some(in_mode) = tmux::pane_in_mode(&session).await {
-                    flag.store(in_mode, Ordering::Relaxed);
-                }
-            });
-        }
-        self.copy_mode.load(Ordering::Relaxed)
-    }
-
-    /// Record that copy-mode was just cancelled without waiting for the next
-    /// background refresh.
-    pub fn clear_copy_mode(&self) {
-        self.copy_mode.store(false, Ordering::Relaxed);
-    }
-
     /// Install the current WS session's outbound sink. Wakes the forwarder
     /// task so any backlog drains immediately.
     pub async fn set_sink(&self, sink: SessionSink) {
@@ -567,7 +408,6 @@ impl ForwarderControl {
 
     async fn route_direct(&self, chunk: &[u8], explicit_source_end: Option<u64>) {
         let mut sinks = self.direct_sinks.lock().await;
-        let mut replay = self.exact_replay.lock().await;
         let previous_source_end = self.source_offset.load(Ordering::Acquire);
         let source_end = explicit_source_end
             .unwrap_or_else(|| previous_source_end.saturating_add(chunk.len() as u64));
@@ -582,9 +422,6 @@ impl ForwarderControl {
             sinks.clear();
         }
         if source_end > previous_source_end {
-            if let Some(replay) = replay.as_mut() {
-                replay.append(chunk, source_end);
-            }
             self.source_offset.store(source_end, Ordering::Release);
             self.source_notify.notify_waiters();
         }
@@ -608,8 +445,7 @@ impl ForwarderControl {
     }
 }
 
-/// Commands routed from spawnd to a session worker's connection tasks
-/// (worker backend only; see `worker_backend`).
+/// Commands routed from spawnd to a session worker's connection tasks.
 pub type WorkerReplayResult = Result<(u64, Vec<u8>)>;
 pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
 
@@ -632,47 +468,24 @@ pub enum WorkerCmd {
     },
 }
 
-/// What actually carries stdin/resize/etc. for this agent.
-enum HandleBackend {
-    /// `tmux attach` running inside a daemon-owned PTY.
-    Tmux {
-        /// Stdin into the PTY (writer half).
-        stdin: Arc<Mutex<Box<dyn Write + Send>>>,
-        /// Master PTY (kept alive so resize works).
-        master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    },
-    /// A spawn-worker process owning the PTY, reached over a unix socket.
-    Worker {
-        cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
-        alive: Arc<AtomicBool>,
-    },
-}
-
 /// Per-agent runtime handle.
 pub struct AgentHandle {
     pub agent_id: Uuid,
-    /// tmux session name (e.g. "spawn-palette--<uuid>"). For the worker
-    /// backend this is a display label only; nothing shells out with it.
-    session: Arc<Mutex<String>>,
-    /// Optional token used to cancel the read thread; consumed on shutdown.
-    #[allow(dead_code)]
-    cancel_tx: Option<oneshot::Sender<()>>,
-    /// Last size applied through this handle. Used to avoid expensive tmux
-    /// refreshes when browsers repeat the same geometry.
+    /// Last size applied through this handle.
     size: Arc<Mutex<(u16, u16)>>,
-    /// Reader thread pushes raw PTY bytes here. Held alive while the agent
-    /// is alive; when dropped, the per-agent forwarder task exits.
+    /// Held alive while the agent is alive; when dropped, the per-agent
+    /// forwarder task exits after the worker connection closes.
     #[allow(dead_code)]
     outbox_tx: mpsc::UnboundedSender<OutputChunk>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
-    backend: HandleBackend,
+    cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
+    alive: Arc<AtomicBool>,
 }
 
 /// Everything `worker_backend` needs to assemble a worker-backed handle.
 pub struct WorkerHandleParts {
     pub agent_id: Uuid,
-    pub session: String,
     pub cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
     pub alive: Arc<AtomicBool>,
     pub cols: u16,
@@ -685,60 +498,24 @@ impl AgentHandle {
     pub fn new_worker(parts: WorkerHandleParts) -> Self {
         Self {
             agent_id: parts.agent_id,
-            session: Arc::new(Mutex::new(parts.session)),
-            cancel_tx: None,
             size: Arc::new(Mutex::new((parts.cols, parts.rows))),
             outbox_tx: parts.outbox_tx,
             control: parts.control,
-            backend: HandleBackend::Worker {
-                cmd_tx: parts.cmd_tx,
-                alive: parts.alive,
-            },
+            cmd_tx: parts.cmd_tx,
+            alive: parts.alive,
         }
-    }
-
-    pub fn is_worker(&self) -> bool {
-        matches!(self.backend, HandleBackend::Worker { .. })
-    }
-
-    pub fn session(&self) -> Result<String> {
-        self.session
-            .lock()
-            .map(|s| s.clone())
-            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))
-    }
-
-    pub fn set_session(&self, next: String) -> Result<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))?;
-        *session = next;
-        Ok(())
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
         // The echo of this input shouldn't count as agent output-activity.
         self.control
             .suppress_activity(activity::INPUT_ECHO_SUPPRESS_WINDOW);
-        match &self.backend {
-            HandleBackend::Tmux { stdin, .. } => {
-                let mut stdin = stdin
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pty stdin lock poisoned"))?;
-                stdin.write_all(bytes).context("writing PTY stdin")?;
-                stdin.flush().ok();
-                Ok(())
-            }
-            HandleBackend::Worker { cmd_tx, alive } => {
-                if !alive.load(Ordering::Acquire) {
-                    anyhow::bail!("worker connection gone");
-                }
-                cmd_tx
-                    .send(WorkerCmd::Input(bytes.to_vec()))
-                    .map_err(|_| anyhow::anyhow!("worker connection gone"))
-            }
+        if !self.alive.load(Ordering::Acquire) {
+            anyhow::bail!("worker connection gone");
         }
+        self.cmd_tx
+            .send(WorkerCmd::Input(bytes.to_vec()))
+            .map_err(|_| anyhow::anyhow!("worker connection gone"))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
@@ -752,85 +529,48 @@ impl AgentHandle {
         // The repaint this resize triggers shouldn't count as agent activity.
         self.control
             .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
-        match &self.backend {
-            HandleBackend::Tmux { master, .. } => {
-                let master = master
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
-                master
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("resizing PTY")?;
-            }
-            HandleBackend::Worker { cmd_tx, alive } => {
-                if !alive.load(Ordering::Acquire) {
-                    anyhow::bail!("worker connection gone");
-                }
-                cmd_tx
-                    .send(WorkerCmd::Resize { cols, rows })
-                    .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
-            }
+        if !self.alive.load(Ordering::Acquire) {
+            anyhow::bail!("worker connection gone");
         }
+        self.cmd_tx
+            .send(WorkerCmd::Resize { cols, rows })
+            .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
         *size = (cols, rows);
         Ok(true)
     }
 
-    /// Worker backend: signal the agent process. Returns false for tmux.
-    pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
-        match &self.backend {
-            HandleBackend::Worker { cmd_tx, alive } => {
-                alive.load(Ordering::Acquire) && cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok()
-            }
-            HandleBackend::Tmux { .. } => false,
-        }
+    pub fn shutdown(&self, signal: Option<String>) -> bool {
+        self.alive.load(Ordering::Acquire)
+            && self.cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok()
     }
 
-    /// Worker backend: request decrypted scrollback replay. Returns None for
-    /// tmux (callers use `tmux::capture_history`).
-    pub fn worker_replay(&self, max_bytes: u32) -> Option<WorkerReplayReceiver> {
-        match &self.backend {
-            HandleBackend::Worker { cmd_tx, alive } => {
-                if !alive.load(Ordering::Acquire) {
-                    return None;
-                }
-                let (resp, rx) = oneshot::channel();
-                cmd_tx.send(WorkerCmd::Replay { max_bytes, resp }).ok()?;
-                Some(rx)
-            }
-            HandleBackend::Tmux { .. } => None,
+    /// Request decrypted scrollback replay from the owning worker.
+    pub fn replay(&self, max_bytes: u32) -> Option<WorkerReplayReceiver> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
         }
-    }
-
-    /// Drop the cancel channel so the reader exits next iteration.
-    #[allow(dead_code)]
-    pub fn cancel(&mut self) {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(());
-        }
+        let (resp, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(WorkerCmd::Replay { max_bytes, resp })
+            .ok()?;
+        Some(rx)
     }
 }
 
 pub struct LaunchSpec<'a> {
     pub agent_id: Uuid,
-    pub session: &'a str,
     pub cwd: &'a str,
     pub cols: u16,
     pub rows: u16,
     pub argv: &'a [String],
-    /// Final env to pass to the launched agent (and to tmux via `-e`).
+    /// Final env to pass to the launched agent.
     pub env: &'a BTreeMap<String, String>,
 }
 
 /// Result of a successful launch.
 pub struct Launched {
     pub handle: AgentHandle,
-    /// PID of the `tmux attach` we spawned in the PTY (reported via
-    /// `agent.started`). Note this is NOT the agent's pid; the real agent
-    /// runs under tmux.
+    /// PID of the real agent process, reported by its session worker.
     pub pid: u32,
     /// Future-style: receives the exit reason once the PTY EOFs.
     pub exit_rx: oneshot::Receiver<ExitReason>,
@@ -840,225 +580,6 @@ pub struct Launched {
 pub struct ExitReason {
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
-}
-
-/// 1) tmux new-session -d
-/// 2) attach in a portable-pty
-/// 3) spawn a reader thread (raw bytes -> outbox)
-/// 4) spawn a forwarder task (outbox -> current WS sink)
-pub async fn launch(spec: LaunchSpec<'_>) -> Result<Launched> {
-    let session = spec.session;
-
-    tmux::new_session_detached(session, spec.cwd, spec.cols, spec.rows, spec.argv, spec.env)
-        .await
-        .context("starting tmux session")?;
-
-    // If the agent's argv exits within a few hundred ms (bad binary, missing
-    // flag, smart-quote garbage), the tmux session is already gone by the
-    // time we try to attach — and the user just sees a confusing
-    // "can't find session" from `tmux attach`. Detect that case here and
-    // surface a clearer error.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if !tmux::has_session(session).await {
-        anyhow::bail!(
-            "agent process exited before we could attach — check argv: {:?}",
-            spec.argv
-        );
-    }
-
-    attach_to_session_with_exact_seed(spec.agent_id, session, spec.cwd, spec.cols, spec.rows).await
-}
-
-/// Re-attach to an existing tmux session that was started by a previous
-/// `spawnd` instance. Used during daemon discovery on startup so agents
-/// survive daemon restarts without losing state.
-pub async fn reattach(agent_id: uuid::Uuid, session: &str) -> Result<Launched> {
-    if !tmux::has_session(session).await {
-        anyhow::bail!("tmux session {session:?} not found");
-    }
-    let (cols, rows) = tmux::window_size(session).await.unwrap_or((120, 32));
-    // We don't know the original cwd; default to the current daemon's working
-    // directory (which is typically the user's home). The PTY child only
-    // needs cwd to be a valid dir; the agent's actual cwd is preserved by
-    // tmux.
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "/".to_string());
-    tracing::info!(%agent_id, %session, cols, rows, "reattaching to existing tmux session");
-    attach_to_session_with_exact_seed(agent_id, session, &cwd, cols, rows).await
-}
-
-async fn attach_to_session_with_exact_seed(
-    agent_id: Uuid,
-    session: &str,
-    cwd: &str,
-    cols: u16,
-    rows: u16,
-) -> Result<Launched> {
-    // Capture a point-in-time history seed before starting a fresh tmux
-    // client. The attach client's initial full render and every later byte are
-    // then logged in the exact producer coordinate used by spawn.pty. No pane
-    // process is signalled, so existing job-control state is untouched.
-    let styled = tmux::capture_history(session, 10_000, true).await?;
-    let plain = tmux::capture_history(session, 10_000, false).await?;
-    attach_to_session(agent_id, session, cwd, cols, rows, styled, plain)
-}
-
-/// Shared core: open a portable-pty, run `tmux attach` in it, start the
-/// reader thread + per-agent forwarder task. Returns once the structures
-/// are wired up; bytes will start flowing as soon as the WS session installs
-/// a sink via `handle.control.set_sink(...)`.
-fn attach_to_session(
-    agent_id: uuid::Uuid,
-    session: &str,
-    cwd: &str,
-    cols: u16,
-    rows: u16,
-    replay_seed: Vec<u8>,
-    plain_replay_seed: Vec<u8>,
-) -> Result<Launched> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("openpty")?;
-
-    let mut cmd = CommandBuilder::new("tmux");
-    cmd.args(["attach", "-t", session]);
-    cmd.env("TERM", "xterm-256color");
-    if let Ok(p) = std::env::var("PATH") {
-        cmd.env("PATH", p);
-    }
-    // Match the socket resolution of every other tmux invocation: honor the
-    // daemon's TMUX_TMPDIR, never an inherited $TMUX, so an attach from a
-    // daemon started inside a tmux pane can't target the outer server.
-    cmd.env_remove("TMUX");
-    if let Ok(t) = std::env::var("TMUX_TMPDIR") {
-        cmd.env("TMUX_TMPDIR", t);
-    }
-    cmd.cwd(cwd);
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("spawning tmux attach inside PTY")?;
-    let pid = child.process_id().unwrap_or(0);
-
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .context("cloning PTY reader")?;
-    let writer = pair.master.take_writer().context("taking PTY writer")?;
-    let master = Arc::new(Mutex::new(pair.master));
-    let stdin = Arc::new(Mutex::new(writer));
-
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
-
-    // Per-agent outbox + forwarder.
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<OutputChunk>();
-    let control = ForwarderControl::with_exact_replay_seed(replay_seed, plain_replay_seed);
-
-    // Forwarder: outbox -> current sink (with reconnect-aware looping).
-    {
-        let control = control.clone();
-        tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
-    }
-
-    // Reader thread: raw PTY -> outbox.
-    let outbox_for_reader = outbox_tx.clone();
-    let control_for_reader = control.clone();
-    std::thread::spawn(move || {
-        run_reader_thread(
-            agent_id,
-            reader,
-            child,
-            outbox_for_reader,
-            control_for_reader,
-            cancel_rx,
-            exit_tx,
-        );
-    });
-
-    let handle = AgentHandle {
-        agent_id,
-        session: Arc::new(Mutex::new(session.to_string())),
-        cancel_tx: Some(cancel_tx),
-        size: Arc::new(Mutex::new((cols, rows))),
-        outbox_tx,
-        control,
-        backend: HandleBackend::Tmux { stdin, master },
-    };
-    Ok(Launched {
-        handle,
-        pid,
-        exit_rx,
-    })
-}
-
-fn run_reader_thread(
-    agent_id: Uuid,
-    mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    outbox: mpsc::UnboundedSender<OutputChunk>,
-    control: ForwarderControl,
-    mut cancel_rx: oneshot::Receiver<()>,
-    exit_tx: oneshot::Sender<ExitReason>,
-) {
-    let mut buf = [0u8; 8192];
-    loop {
-        // Cooperative cancel check (non-blocking).
-        if cancel_rx.try_recv().is_ok() {
-            tracing::debug!(%agent_id, "PTY reader cancelled");
-            break;
-        }
-
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                tracing::debug!(%agent_id, "PTY EOF");
-                break;
-            }
-            Ok(n) => {
-                let chunk = OutputChunk::classify(buf[..n].to_vec(), &control);
-                if outbox.send(chunk).is_err() {
-                    // Forwarder gone (registry dropped this agent). We can stop.
-                    tracing::debug!(%agent_id, "outbox closed; stopping reader");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(%agent_id, error = %e, "PTY read error");
-                break;
-            }
-        }
-    }
-
-    // Drain exit status.
-    let reason = match child.wait() {
-        Ok(status) => {
-            if status.success() {
-                ExitReason {
-                    exit_code: Some(0),
-                    signal: None,
-                }
-            } else {
-                ExitReason {
-                    exit_code: Some(status.exit_code() as i32),
-                    signal: None,
-                }
-            }
-        }
-        Err(_) => ExitReason {
-            exit_code: None,
-            signal: None,
-        },
-    };
-    let _ = exit_tx.send(reason);
 }
 
 /// Long-lived per-agent task: encode raw PTY bytes into binary frames and
@@ -1297,21 +818,6 @@ mod tests {
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
-    }
-
-    async fn collect_direct_until(rx: &mut mpsc::Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut bytes = Vec::new();
-            loop {
-                let chunk = rx.recv().await.expect("direct sink closed");
-                bytes.extend_from_slice(&chunk);
-                if bytes.windows(needle.len()).any(|window| window == needle) {
-                    return bytes;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for direct output")
     }
 
     #[test]
@@ -1614,78 +1120,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_replay_log_is_atomic_across_straddled_and_post_snapshot_output() {
-        let agent_id = Uuid::new_v4();
-        let seed = b"seed\r\n".to_vec();
-        let control = ForwarderControl::with_exact_replay_seed(seed.clone(), seed.clone());
-        let (mirror_tx, mut mirror_rx) = mpsc::channel(64);
-        control.set_sink(mirror_tx).await;
-        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-        let mut first = control.add_direct_sink("first".into()).await;
-
-        // Split both UTF-8 and a CSI sequence across producer chunks.
-        for part in [
-            b"before:\xf0\x9f".as_slice(),
-            b"\x98\x80\x1b[3".as_slice(),
-            b"1mduring\x1b[0m".as_slice(),
-        ] {
-            outbox_tx.send(source_output(&control, part)).unwrap();
-            assert_eq!(first.receiver.recv().await.unwrap(), part);
-        }
-        let mut second = control.add_direct_sink("second".into()).await;
-        let (boundary, replay) = control.exact_replay_snapshot(false).await.unwrap();
-        assert_eq!(
-            replay,
-            [
-                seed.as_slice(),
-                b"before:\xf0\x9f\x98\x80\x1b[31mduring\x1b[0m"
-            ]
-            .concat()
-        );
-
-        // This output lands after the immutable replay snapshot but before
-        // anchors are translated for either viewer. It must remain live and
-        // must not be discarded as if the replay contained it.
-        let after = b"after-snapshot\r\n";
-        outbox_tx.send(source_output(&control, after)).unwrap();
-        assert_eq!(first.receiver.recv().await.unwrap(), after);
-        assert_eq!(second.receiver.recv().await.unwrap(), after);
-        assert_eq!(
-            control.direct_sink_anchor("first", boundary).await,
-            Some(boundary)
-        );
-        assert_eq!(
-            control.direct_sink_anchor("second", boundary).await,
-            Some(0)
-        );
-        assert_eq!(
-            control.source_offset(),
-            boundary + u64::try_from(after.len()).unwrap()
-        );
-
-        let (_, plain) = control.exact_replay_snapshot(true).await.unwrap();
-        assert!(String::from_utf8_lossy(&plain).contains("before:😀during"));
-        assert!(String::from_utf8_lossy(&plain).contains("after-snapshot"));
-
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-    }
-
-    #[test]
-    fn exact_replay_overflow_fails_closed_without_retaining_partial_content() {
-        let mut replay = ExactReplayBuffer::seeded(vec![b'x'; EXACT_REPLAY_MAX_BYTES], Vec::new());
-        replay.append(b"overflow", 8);
-
-        assert!(replay.snapshot(false).is_err());
-        assert!(replay.snapshot(true).is_err());
-        assert!(replay.styled.is_empty());
-        assert!(replay.plain.bytes.is_empty());
-        assert_eq!(replay.source_end, 8);
-    }
-
-    #[tokio::test]
     async fn stalled_direct_sink_is_bounded_and_disconnected_for_replay_catchup() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
@@ -1709,209 +1143,6 @@ mod tests {
 
         drop(outbox_tx);
         forwarder.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tmux_capture_boundary_and_reattach_keep_live_stream_exact() {
-        let agent_id = Uuid::new_v4();
-        let session = format!("spawn-test-boundary-{agent_id}");
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "printf 'tmux-ready\\n'; exec cat".to_string(),
-        ];
-        let env = [
-            (
-                "PATH".to_string(),
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-            ),
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-        let mut launched = launch(LaunchSpec {
-            agent_id,
-            session: &session,
-            cwd: "/",
-            cols: 80,
-            rows: 24,
-            argv: &argv,
-            env: &env,
-        })
-        .await
-        .expect("launch tmux agent");
-        let (mirror_tx, mut mirror_rx) = mpsc::channel(128);
-        launched.handle.control.set_sink(mirror_tx).await;
-        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
-        let mut direct = launched
-            .handle
-            .control
-            .add_direct_sink("viewer".into())
-            .await;
-
-        launched.handle.write_stdin(b"before-capture\n").unwrap();
-        collect_direct_until(&mut direct.receiver, b"before-capture").await;
-        launched.handle.write_stdin(b"during-capture\n").unwrap();
-        collect_direct_until(&mut direct.receiver, b"during-capture").await;
-        let (boundary, replay) = launched
-            .handle
-            .control
-            .exact_replay_snapshot(false)
-            .await
-            .expect("exact replay snapshot");
-        assert!(String::from_utf8_lossy(&replay).contains("before-capture"));
-        assert!(String::from_utf8_lossy(&replay).contains("during-capture"));
-        assert_eq!(
-            launched
-                .handle
-                .control
-                .direct_sink_anchor("viewer", boundary)
-                .await,
-            launched.handle.control.direct_sink_offset("viewer").await
-        );
-        launched.handle.write_stdin(b"after-capture\n").unwrap();
-        collect_direct_until(&mut direct.receiver, b"after-capture").await;
-
-        tmux::detach_clients(&session)
-            .await
-            .expect("detach old daemon client");
-        launched.handle.cancel();
-        drop(launched);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let reattached = reattach(agent_id, &session)
-            .await
-            .expect("reattach tmux agent");
-        let (mirror_tx, mut mirror_rx) = mpsc::channel(128);
-        reattached.handle.control.set_sink(mirror_tx).await;
-        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
-        let mut reattached_direct = reattached
-            .handle
-            .control
-            .add_direct_sink("reattached".into())
-            .await;
-        let (_, adopted_replay) = reattached
-            .handle
-            .control
-            .exact_replay_snapshot(false)
-            .await
-            .expect("reattached exact replay snapshot");
-        assert!(String::from_utf8_lossy(&adopted_replay).contains("after-capture"));
-        reattached.handle.write_stdin(b"after-reattach\n").unwrap();
-        collect_direct_until(&mut reattached_direct.receiver, b"after-reattach").await;
-        let (_, post_reattach_replay) = reattached
-            .handle
-            .control
-            .exact_replay_snapshot(false)
-            .await
-            .expect("post-reattach exact replay snapshot");
-        assert!(String::from_utf8_lossy(&post_reattach_replay).contains("after-reattach"));
-
-        tmux::kill_session(&session)
-            .await
-            .expect("cleanup tmux session");
-    }
-
-    #[tokio::test]
-    async fn tmux_exact_replay_preserves_prestopped_and_background_jobs() {
-        let agent_id = Uuid::new_v4();
-        let session = format!("spawn-test-job-control-{agent_id}");
-        let pid_file = std::env::temp_dir().join(format!("spawn-stopped-{agent_id}.pid"));
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            concat!(
-                "sleep 600 & stopped=$!; ",
-                "printf '%s' \"$stopped\" > \"$1\"; ",
-                "kill -STOP \"$stopped\"; ",
-                "(sleep 0.6; printf 'background-writer\\n') & ",
-                "printf 'jobs-ready\\n'; exec cat"
-            )
-            .to_string(),
-            "spawn-test".to_string(),
-            pid_file.to_string_lossy().into_owned(),
-        ];
-        let env = [
-            (
-                "PATH".to_string(),
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-            ),
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-        let launched = launch(LaunchSpec {
-            agent_id,
-            session: &session,
-            cwd: "/",
-            cols: 80,
-            rows: 24,
-            argv: &argv,
-            env: &env,
-        })
-        .await
-        .expect("launch tmux job-control agent");
-        let (mirror_tx, mut mirror_rx) = mpsc::channel(128);
-        launched.handle.control.set_sink(mirror_tx).await;
-        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
-        let mut direct = launched
-            .handle
-            .control
-            .add_direct_sink("viewer".into())
-            .await;
-
-        let stopped_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid.parse::<u32>() {
-                        break pid;
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("stopped child pid was not recorded");
-        let stopped_pid = stopped_pid.to_string();
-        let state_before = tokio::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &stopped_pid])
-            .output()
-            .await
-            .expect("inspect stopped child before replay");
-        assert!(String::from_utf8_lossy(&state_before.stdout)
-            .trim()
-            .starts_with('T'));
-
-        launched
-            .handle
-            .control
-            .exact_replay_snapshot(false)
-            .await
-            .expect("exact replay while child is stopped");
-        collect_direct_until(&mut direct.receiver, b"background-writer").await;
-        launched
-            .handle
-            .control
-            .exact_replay_snapshot(true)
-            .await
-            .expect("plain exact replay after background output");
-
-        let state_after = tokio::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &stopped_pid])
-            .output()
-            .await
-            .expect("inspect stopped child after replay");
-        assert!(String::from_utf8_lossy(&state_after.stdout)
-            .trim()
-            .starts_with('T'));
-
-        let _ = tokio::process::Command::new("kill")
-            .args(["-KILL", &stopped_pid])
-            .status()
-            .await;
-        tmux::kill_session(&session)
-            .await
-            .expect("cleanup tmux session");
-        let _ = std::fs::remove_file(pid_file);
     }
 
     #[tokio::test]
@@ -1963,162 +1194,6 @@ mod tests {
             WsOutbound::Binary(_)
         ));
         forwarder.await.unwrap();
-        assert!(sink_rx.try_recv().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn short_ambiguous_output_emits_after_bounded_idle_without_blocking_bytes() {
-        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
-            let agent_id = Uuid::new_v4();
-            let control = ForwarderControl::new();
-            let (sink_tx, mut sink_rx) = mpsc::channel(4);
-            control.set_sink(sink_tx).await;
-            let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-            let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-            let chunk = source_output(&control, payload);
-            assert!(!chunk.activity);
-            assert!(chunk.idle_resolution.is_some());
-            outbox_tx.send(chunk).unwrap();
-
-            // Terminal bytes are never held behind the classification debounce.
-            assert!(matches!(
-                sink_rx.recv().await.unwrap(),
-                WsOutbound::Binary(_)
-            ));
-            assert!(sink_rx.try_recv().is_err());
-
-            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
-            tokio::task::yield_now().await;
-            assert!(sink_rx.try_recv().is_err());
-
-            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY).await;
-            tokio::task::yield_now().await;
-            let WsOutbound::Json(json) = sink_rx.try_recv().expect("idle activity") else {
-                panic!("expected idle activity JSON")
-            };
-            assert_eq!(
-                json,
-                format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
-            );
-
-            drop(outbox_tx);
-            forwarder.await.unwrap();
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delayed_decision_preserves_receipt_time_suppression_ordering() {
-        // Suppression after receipt cannot erase eligible candidate text.
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        control.suppress_activity(Duration::from_secs(60));
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
-        assert!(matches!(sink_rx.try_recv().unwrap(), WsOutbound::Json(_)));
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-
-        // Suppression at receipt remains immutable even if it is cleared before
-        // the candidate resolves.
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        control.suppress_activity(Duration::from_secs(60));
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-        outbox_tx
-            .send(source_output(&control, b" \"quoted real output\""))
-            .unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        control.activity.lock().unwrap().suppress_output_until = None;
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
-        assert!(sink_rx.try_recv().is_err());
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn complete_tmux_status_stays_suppressed_at_every_split_with_idle_debounce() {
-        for payload in [
-            b"[spawn-oem] \"bash\" 12:34 15-Jul-26".as_slice(),
-            b"           \"project\" 04:49 08-May-26".as_slice(),
-            b"12:34 15-Jul-26".as_slice(),
-        ] {
-            for split in 0..=payload.len() {
-                let agent_id = Uuid::new_v4();
-                let control = ForwarderControl::new();
-                let (sink_tx, mut sink_rx) = mpsc::channel(4);
-                control.set_sink(sink_tx).await;
-                let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-                let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-                // Let the first half reach the forwarder and arm its timer,
-                // then complete the status before the debounce expires.
-                outbox_tx
-                    .send(source_output(&control, &payload[..split]))
-                    .unwrap();
-                assert!(matches!(
-                    sink_rx.recv().await.unwrap(),
-                    WsOutbound::Binary(_)
-                ));
-                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
-                tokio::task::yield_now().await;
-                assert!(sink_rx.try_recv().is_err());
-
-                outbox_tx
-                    .send(source_output(&control, &payload[split..]))
-                    .unwrap();
-                assert!(matches!(
-                    sink_rx.recv().await.unwrap(),
-                    WsOutbound::Binary(_)
-                ));
-                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-                tokio::task::yield_now().await;
-                assert!(
-                    sink_rx.try_recv().is_err(),
-                    "status emitted activity at split {split} for {payload:?}"
-                );
-
-                drop(outbox_tx);
-                forwarder.await.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_idle_timer_is_cancelled_when_agent_outbox_closes() {
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
         assert!(sink_rx.try_recv().is_err());
     }
 }

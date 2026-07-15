@@ -11,8 +11,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 binary="daemon/target/prebuilt/linux-x86_64/spawnd"
+worker_binary="daemon/target/prebuilt/linux-x86_64/spawn-worker"
 if [[ ! -x "$binary" ]]; then
   printf 'smoke-remote-linux-install: missing %s\n' "$binary" >&2
+  exit 1
+fi
+if [[ ! -x "$worker_binary" ]]; then
+  printf 'smoke-remote-linux-install: missing %s\n' "$worker_binary" >&2
   exit 1
 fi
 
@@ -45,9 +50,10 @@ PY
 )
 
 remote_tmp="$(ssh "$host" 'mktemp -d')"
-ssh "$host" "mkdir -p '$remote_tmp/api/install/spawnd'"
+ssh "$host" "mkdir -p '$remote_tmp/api/install/spawnd' '$remote_tmp/api/install/spawn-worker'"
 scp -q "$install_script" "$host:$remote_tmp/install.sh"
 scp -q "$binary" "$host:$remote_tmp/api/install/spawnd/linux-x86_64"
+scp -q "$worker_binary" "$host:$remote_tmp/api/install/spawn-worker/linux-x86_64"
 
 ssh "$host" "SPAWN_REMOTE_INSTALL_SMOKE_DIR='$remote_tmp' bash -se" <<'REMOTE'
 set -euo pipefail
@@ -63,6 +69,7 @@ cleanup() {
 trap cleanup EXIT
 
 chmod 755 "$work/api/install/spawnd/linux-x86_64"
+chmod 755 "$work/api/install/spawn-worker/linux-x86_64"
 port="$(
   python3 - <<'PY'
 import socket
@@ -93,5 +100,6 @@ HOME="$work/home" SPAWN_INSTALL_ROOT="$work/install" sh "$work/install.sh" \
   --prebuilt-only
 
 "$work/install/bin/spawnd" --version >/dev/null
+test -x "$work/install/bin/spawn-worker"
 printf '%s\n' "smoke-remote-linux-install: passed"
 REMOTE

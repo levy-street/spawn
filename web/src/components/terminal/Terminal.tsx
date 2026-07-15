@@ -63,9 +63,6 @@ const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // DataChannel, so a fresh capture can lag chunks already rendered locally;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
-// How long after a local live-buffer rewrite a keystroke still triggers a
-// covering repaint (the rewrite->repaint cursor desync window plus slack).
-const LIVE_REWRITE_ECHO_GUARD_MS = 5_000;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -315,9 +312,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Whether the live buffer's current seed came from an exact worker stream
   // (vs the legacy transcript fallback on a degraded connect).
   const liveSeedWasExactRef = useRef(false);
-  // Timestamp of the last local live-buffer rewrite; keystrokes shortly
-  // after request an extra repaint to cover stale-cursor echo artifacts.
-  const liveRewriteAtRef = useRef(0);
   // Last trustworthy reader position (buffer line of the viewport top),
   // recorded only while no rewrite is collapsing the buffer. Rebuilt content
   // only grows at the bottom, so a line anchor keeps the reader's lines
@@ -339,7 +333,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
   // True once a snapshot/history proved this agent ships exact worker
   // replays; used to widen the overlay fetch budget (the daemon maps lines
-  // to a byte budget, and TUI redraw churn dwarfs the tmux-era line sizing).
+  // to a byte budget, and TUI redraw churn dwarfs line-based sizing).
   const exactStreamRef = useRef(false);
   const invalidateScrollbackForResizeRef = useRef<() => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
@@ -488,7 +482,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
         term.scrollToBottom();
       });
-      liveRewriteAtRef.current = Date.now();
       return true;
     },
     [takeDcReplaySlices],
@@ -521,10 +514,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       clearTimeout(scrollbackRerenderTimerRef.current);
       scrollbackRerenderTimerRef.current = null;
     }
-    const synced = syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
-    // tmux stays the authority on screen content and cursor position; after a
-    // local rewrite, ask it to repaint so any drift self-corrects.
-    if (synced) socketRef.current.sendJson({ type: "redraw" });
+    syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     scrollbackVisibleRef.current = false;
     scrollbackRenderInFlightRef.current = false;
     scrollbackStableLineRef.current = null;
@@ -820,22 +810,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeReadyAttachmentPrefix],
   );
 
-  const redrawTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scheduleRedraw = useCallback(() => {
-    if (redrawTimerRef.current) clearTimeout(redrawTimerRef.current);
-    redrawTimerRef.current = setTimeout(() => {
-      redrawTimerRef.current = null;
-      socketRef.current.sendJson({ type: "redraw" });
-    }, 600);
-  }, []);
-  const scheduleRedrawRef = useRef(scheduleRedraw);
-  scheduleRedrawRef.current = scheduleRedraw;
-  useEffect(() => {
-    return () => {
-      if (redrawTimerRef.current) clearTimeout(redrawTimerRef.current);
-    };
-  }, []);
-
   const takeControlNow = useCallback((): boolean => {
     hideScrollbackOverlay();
     const term = termRef.current;
@@ -857,9 +831,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }
     markResizeSentRef.current(cols, rows);
     socketRef.current.sendJson({ type: "take_control", cols, rows });
-    // Ownership + geometry both just changed hands; force a clean repaint
-    // once the daemon has resized the PTY to our size.
-    scheduleRedrawRef.current();
     term.focus();
     return true;
   }, [hideScrollbackOverlay]);
@@ -1069,7 +1040,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
       });
-      liveRewriteAtRef.current = Date.now();
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset) => {
@@ -1128,7 +1098,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         if (geometryReady && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
           historyReseedPendingRef.current = false;
           liveSeedWasExactRef.current = snapshotIsExact;
-          socketRef.current.sendJson({ type: "redraw" });
         }
       }
       if (scrollbackVisibleRef.current) {
@@ -1170,18 +1139,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
   }, [socket.state, socket.v2, socket.dcOpen, socket.connInfo]);
 
-  // On spawn.v2 the DataChannel is the only live path. When it (re)opens,
-  // force a tmux repaint so output produced between the history snapshot and
-  // channel-open lands on screen; the daemon only mirrors bytes from the
-  // open handshake onward.
-  const dcWasOpenRef = useRef(false);
-  useEffect(() => {
-    if (socket.v2 && socket.dcOpen && !dcWasOpenRef.current) {
-      socket.sendJson({ type: "redraw" });
-    }
-    dcWasOpenRef.current = socket.dcOpen;
-  }, [socket.v2, socket.dcOpen, socket.sendJson]);
-
   // Only surface "waiting for the direct channel" after a grace period —
   // the DC normally opens within a second or two of attach.
   const [channelPending, setChannelPending] = useState(false);
@@ -1211,7 +1168,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ? SCROLLBACK_RELAY_CACHE_LINES
           : purpose === "overlay" && exactStreamRef.current
             ? // Worker replays: reach the full retained log. A TUI's redraw
-              // churn is hundreds of bytes per "line", so the tmux-era
+              // churn is hundreds of bytes per "line", so the legacy
               // lines→bytes sizing leaves older transcript out of reach and
               // scrollback dead-ends ("can't scroll") on busy sessions.
               TERMINAL_SNAPSHOT_LINES * 4
@@ -1318,8 +1275,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   );
   requestScrollbackSnapshotRef.current = requestScrollbackSnapshot;
 
-  // A resize re-wraps the tmux pane, so any cached capture is laid out at the
-  // old width. Drop the rendered copy and fetch a fresh capture at the new
+  // A resize changes checkpoint geometry, so any cached replay is laid out at
+  // the old width. Drop the rendered copy and fetch a fresh checkpoint at the new
   // geometry instead of presenting stale-width history.
   const invalidateScrollbackForResize = useCallback(() => {
     scrollbackCacheDirtyRef.current = true;
@@ -1419,7 +1376,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       lineHeight: TERMINAL_LINE_HEIGHT,
       // Keep a large local buffer for transcript replay and non-wheel access.
       // Wheel/touch scrollback is rendered from fresh daemon snapshots so it
-      // reflects the current tmux pane rather than browser replay artifacts.
+      // reflects the current worker checkpoint rather than browser replay artifacts.
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
@@ -2134,15 +2091,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       markResizeSentRef.current(cols, rows);
       if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
-        // tmux repaints on SIGWINCH, but rapid geometry churn (mobile
-        // keyboard show/hide, split drags) sometimes leaves stale cells at
-        // the old wrap width. A trailing refresh-client self-heals.
-        scheduleRedrawRef.current();
       }
-      // History already written into the live buffer keeps its old wrap
-      // after a width change (tmux reflows its own copy, not ours). Once a
-      // fresh offset-anchored capture arrives, rewrite the live buffer from
-      // it so history reflows at the new width too.
+      // History already written into the live buffer keeps its old wrap after
+      // a width change. Once a fresh offset-anchored checkpoint arrives,
+      // rewrite the live buffer so history reflows at the new width too.
       historyReseedPendingRef.current = true;
     };
 
@@ -2471,17 +2423,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
-      // A local buffer rewrite parks the real cursor away from where the app
-      // believes it is until the requested repaint lands; a keystroke inside
-      // that window can echo a glyph at the stale position. One extra repaint
-      // right after the keystroke paints over it within a frame or two.
-      if (
-        liveRewriteAtRef.current !== 0 &&
-        Date.now() - liveRewriteAtRef.current < LIVE_REWRITE_ECHO_GUARD_MS
-      ) {
-        liveRewriteAtRef.current = 0;
-        socket.sendJson({ type: "redraw" });
-      }
     });
     return () => {
       onDataDisposableRef.current?.dispose();
@@ -2936,8 +2877,8 @@ type ReplayChunk = { cols: number; rows: number; data: string };
  * Worker-backed agents ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
- * or null when the payload is not such a stream (tmux captures never open
- * with a geometry marker). xterm.js does not implement CSI 8 t itself, so the
+ * or null when the payload is a legacy transcript rather than worker replay.
+ * xterm.js does not implement CSI 8 t itself, so the
  * consumer applies each chunk's geometry via term.resize() between writes.
  */
 function parseExactReplay(text: string): ReplayChunk[] | null {
@@ -2992,8 +2933,8 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
 }
 
 /** Sequenced ops for the scrollback overlay (a display-only terminal that is
- *  safe to resize): exact worker replays get per-chunk geometry, tmux
- *  captures get the legacy reformat, and both end at `finalSize`. */
+ *  safe to resize): exact worker replays get per-chunk geometry, legacy
+ *  transcripts get the fallback reformat, and both end at `finalSize`. */
 function overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
@@ -3017,7 +2958,7 @@ function overlayWriteOps(
  *  never be geometry-walked (resizing it reflows the buffer and desyncs it
  *  from its container). Exact worker replays end with a self-contained chunk
  *  — a full idempotent repaint at the current PTY geometry — so the final
- *  chunk alone seeds the screen. tmux captures keep the legacy reformat. */
+ *  chunk alone seeds the screen. Legacy transcript fallback is reformatted. */
 function liveSeedWriteOps(text: string): SequencedWrite[] {
   const exact = parseExactReplay(text);
   if (!exact) {
@@ -3028,7 +2969,7 @@ function liveSeedWriteOps(text: string): SequencedWrite[] {
 
 function formatSnapshotForXterm(input: string): string {
   const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
-  // tmux captures terminate the final row with a newline; writing it would
+  // Legacy snapshots can terminate the final row with a newline; writing it would
   // scroll the terminal one row past the content and desync subsequent
   // app-relative drawing by one row (e.g. input echo landing on the status
   // bar row). Leave the cursor on the last content row instead.
@@ -3049,7 +2990,7 @@ function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // to tmux after transcript replay can echo fragments like "0;276;0c".
+  // back to the agent after transcript replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

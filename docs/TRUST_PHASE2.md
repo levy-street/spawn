@@ -8,8 +8,7 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
 
 ## Current reality (why this is the sequence)
 
-- Both session backends (tmux `pty.rs`, worker `worker_backend.rs`) converge on
-  one `run_forwarder` (`daemon/src/pty.rs:658-702`) that sends every output
+- The mandatory session worker feeds one `run_forwarder` that sends every output
   chunk to **two sinks unconditionally**: the WebRTC DataChannel direct-sinks
   **and** the server-bound `0x01` WS leg. No v2 gate on the daemon side.
 - The only DataChannel is a raw per-agent `spawn.pty` byte pipe
@@ -100,29 +99,20 @@ Add a second DC label `spawn.ctl` (daemon already gates on label at
 `rtc.rs:348`; browser creates only `spawn.pty` at `useAgentSocket.ts:244`).
 Carry snapshot/replay **requests + responses** over it, framed. On DC-open the
 browser requests the connect-time backfill + scrollback from the daemon over
-`spawn.ctl` (worker: `worker_replay`; tmux: an attach-time pane seed plus the
-actual attached-client byte stream) instead of the server `history`/`snapshot`
-frames. This removes those two v2
+`spawn.ctl` from the worker's encrypted bounded replay instead of the server
+`history`/`snapshot` frames. This removes those two v2
 content paths only. It does **not** complete the server cut: the daemon still
 mirrors every output chunk on `0x01` until Increment 3. The
 server-bound `rtc_session_id` correlation collapses once both live and
 backfill use the peer connection. An endpoint-only PTY byte anchor remains
 necessary: separate ordered DataChannels do not share a total order.
 
-This increment reuses the backend's actual bounded history; it does not add a
-durable daemon transcript archive. On tmux attach/adoption, the daemon seeds an
-in-memory replay with at most 10,000 lines from the configured tmux history,
-then retains the exact bytes emitted by its attached tmux client up to a 12 MiB
-cap. A tmux `lines` request is range-checked but does not truncate that raw
-checkpoint-plus-stream: slicing a terminal stream can discard the escape or
-UTF-8 prefix needed to interpret its suffix. If the cap is exceeded, replay
-fails closed until the daemon reattaches and obtains a fresh bounded seed; live
-PTY delivery continues. Long-running sessions needing durable rotation should
-use the worker backend. A worker keeps an encrypted-at-rest rolling log with an
-8 MiB plaintext default, deletes whole oldest segments beyond the budget, and
-retains its key only in the live worker process. Acceptance covers both
-backends at their retention boundary, replay after `spawnd` restart/adoption,
-and history becoming unavailable after the underlying session/worker exits.
+This increment reuses the worker's actual bounded history; it does not add a
+durable daemon transcript archive. The worker keeps an encrypted-at-rest
+rolling log with an 8 MiB plaintext default, deletes whole oldest segments
+beyond the budget, and retains its key only in the live worker process.
+Acceptance covers its retention boundary, replay after `spawnd` restart/adoption,
+and history becoming unavailable after the underlying worker exits.
 Browser-side history beyond those bounds is not a server backup and is outside
 the reconnect guarantee.
 
@@ -133,12 +123,8 @@ state so geometry, deltas, and event timing remain E2E.
 **Implementation checkpoint (independent review pending):** `spawn.ctl` v1 is
 implemented as bounded request-bound JSON plus chunked binary replay frames.
 Worker replay propagates its durable output watermark into the same producer
-coordinate as live frames. For tmux, each attached-client byte is appended to
-the bounded replay log under the same producer lock that advances the source
-coordinate and routes `spawn.pty`; a snapshot clones the bytes and boundary
-under that lock. No pane process or process group is signalled, so replay cannot
-resume a pre-stopped job or suspend unrelated background output. Each producer
-boundary is translated through the viewer's attach origin into an exact
+coordinate as live frames. Each producer boundary is translated through the
+viewer's attach origin into an exact
 `spawn.pty` offset. RTC callbacks also carry an immutable backend-generation
 binding and a teardown fence, preventing a late callback from resolving the
 same agent UUID to a replacement backend. The browser uses the explicit offset
@@ -273,13 +259,13 @@ skill recovery tests.
    and provider backups. Record owners, encryption/key scope, retention,
    deletion capability, and the oldest restorable point.
 2. **Migrate and verify endpoint copies.** Retire server transcripts in favor of
-   the existing bounded tmux/worker replay described in Increment 2, and move
+   the existing bounded worker replay described in Increment 2, and move
    launch/preset/skill data to the approved endpoint store. Server-only
    offline/archived transcripts are an accepted retirement, not a silent
    migration: announce a bounded export/reconnect window before the cut, let
    users re-establish available history from an online endpoint or export it,
    and record the deletion deadline. Check record counts, byte counts or keyed
-   digests at endpoints, then exercise both replay backends across retention,
+   digests at endpoints, then exercise worker replay across retention,
    daemon restart/adoption, agent exit, history attach, preset edit/use, and
    skill edit/use. The audit record contains identifiers/counts only.
 3. **Close, drain, and restart every ingress before purge.** Require upgraded browser/daemon
@@ -328,12 +314,13 @@ skill recovery tests.
 ## Operational staging (do not break live sessions)
 
 Most remaining increments modify the **daemon**. Restarting it tears down RTC
-and server-control connections and makes browsers reconnect, but tmux sessions
-and worker processes normally survive and are rediscovered/adopted. Treat that
-as a tested behavior, not a guarantee: for each daemon increment build (`cargo
-build`), run the daemon suite + `scripts/smoke-local-*`, verify tmux and worker
-adoption on a throwaway host, and only then roll the live daemon during a quiet
-window. Server-only pieces deploy independently with a server restart.
+and server-control connections and makes browsers reconnect, while compatible
+worker processes normally survive and are rediscovered/adopted. The one-time
+worker-only cutover requires the fail-closed drain in `TMUX_REMOVAL.md`; old
+sessions are not adopted. For later increments build (`cargo build`), run the
+daemon suite + `scripts/smoke-local-*`, verify worker adoption on a throwaway
+host, and only then roll the live daemon during a quiet window. Server-only
+pieces deploy independently with a server restart.
 
 The purge has its own change window and rollback boundary. Take no fresh
 plaintext backup for convenience: backup policy must already be compatible

@@ -52,24 +52,21 @@
   - `spawnd run` — foreground; connects WSS, registers, services frames.
   - `spawnd logout` — wipes stored token.
   - `spawnd status` — prints connection / agent state.
-- **Process model**: each agent runs inside its own detached `tmux` session
-  (`spawn-<uuid>`), so an agent survives `spawnd` crashes/restarts. The
-  daemon attaches a PTY to the tmux pane to stream I/O. The tmux layer is
-  being replaced by per-agent session workers (`spawn-worker`) with
-  encrypted-at-rest scrollback — implemented behind
-  `SPAWND_SESSION_BACKEND=worker`, tmux still the default; see
-  `SESSIOND.md`.
+- **Process model**: each agent runs inside a mandatory per-agent
+  `spawn-worker`, which owns its PTY and encrypted-at-rest bounded scrollback.
+  Workers survive `spawnd` crashes/restarts and are adopted over Unix sockets;
+  see `SESSIOND.md` and the cutover ADR in `TMUX_REMOVAL.md`.
 - **Agent environment**: the daemon launches the agent under the host user's
   process env (HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally),
   overlaid with the `env` from `agent.create`. spawn does not manage agent
   credentials; each agent CLI handles its own login on the host.
 - **Reconnect**: on WS disconnect, daemon retries with exponential backoff.
   On reconnect, sends a `register` frame with `existing_agents: [...]` so the
-  server resyncs its routing map without killing the tmux sessions.
-- **Data ownership (target, TRUST.md Phase 2)**: the daemon is the
-  durable store for transcripts/scrollback — tmux plus the daemon-side
-  scrollback cache are already the source of truth; browsers fetch
-  history over the DataChannel at attach. The server keeps no copy.
+  server resyncs its routing map without killing session workers.
+- **Data ownership (target, TRUST.md Phase 2)**: the live worker is the source
+  of bounded replay, using encrypted-at-rest rolling segments and an ephemeral
+  key; this is not a durable transcript archive. Browsers fetch history over
+  the DataChannel at attach. The server keeps no copy.
 
 ### `spawn-web` — Next.js 15 PWA
 

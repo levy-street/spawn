@@ -91,7 +91,7 @@ def test_ci_workflow_runs_the_repeatable_matrix_with_required_host_packages():
         "branches:",
         "- master",
         "timeout-minutes:",
-        "sudo apt-get install -y redis-server tmux",
+        "sudo apt-get install -y redis-server",
         "uv sync --frozen",
         "bun install --frozen-lockfile",
         "bunx playwright install --with-deps chromium",

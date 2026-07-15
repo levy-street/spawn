@@ -1,18 +1,12 @@
-//! spawnd-side supervision of session workers (docs/SESSIOND.md).
-//!
-//! The worker backend replaces tmux for agents opted in via
-//! `SPAWND_SESSION_BACKEND=worker` (globally) or a per-agent
-//! `SPAWND_SESSION_BACKEND=worker` entry in `agent.create` env. tmux remains
-//! the default backend; nothing here runs unless the flag is set.
+//! spawnd-side supervision of mandatory session workers (docs/SESSIOND.md).
 //!
 //! For each worker agent, spawnd:
 //! - spawns `spawn-worker` in its own process group (so it survives spawnd
 //!   restarts and upgrades),
 //! - connects to its unix socket and drives the framed `sessiond::wire`
 //!   protocol,
-//! - bridges worker output into the same per-agent outbox → forwarder →
-//!   {WS sink, DataChannel direct sinks} pipeline the tmux backend uses, so
-//!   the WebRTC PTY path needs no changes,
+//! - bridges worker output into the per-agent outbox → forwarder →
+//!   {WS sink, DataChannel direct sinks} pipeline,
 //! - adopts already-running workers after a restart by scanning the socket
 //!   directory (the worker greets every connection with `Hello`).
 
@@ -29,46 +23,16 @@ use uuid::Uuid;
 use spawnd::sessiond::wire;
 
 use crate::config;
-use crate::proto::AgentCreate;
 use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, WorkerHandleParts};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADOPT_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    Tmux,
-    Worker,
-}
-
-fn parse_backend(value: &str) -> Option<BackendKind> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "worker" | "sessiond" => Some(BackendKind::Worker),
-        "tmux" => Some(BackendKind::Tmux),
-        _ => None,
-    }
-}
-
-/// Global backend selection: `SPAWND_SESSION_BACKEND` env, default tmux.
-pub fn global_backend() -> BackendKind {
-    std::env::var("SPAWND_SESSION_BACKEND")
-        .ok()
-        .and_then(|v| parse_backend(&v))
-        .unwrap_or(BackendKind::Tmux)
-}
-
-/// Per-agent backend selection: an `SPAWND_SESSION_BACKEND` entry in the
-/// create frame's env overrides the global default. This is the migration
-/// lever — individual agents can move to the worker backend while the rest
-/// of the host stays on tmux.
-pub fn backend_for_create(create: &AgentCreate) -> BackendKind {
-    create
-        .env
-        .get("SPAWND_SESSION_BACKEND")
-        .and_then(|v| parse_backend(v))
-        .unwrap_or_else(global_backend)
-}
+/// Process environment is global; worker integration tests that override the
+/// binary/socket paths must serialize with RTC acceptance tests doing the same.
+#[cfg(test)]
+pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Directory holding worker sockets and scrollback dirs:
 /// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir.
@@ -187,7 +151,6 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
 
     Ok(assemble(
         spec.agent_id,
-        spec.session.to_string(),
         started.pid,
         spec.cols,
         spec.rows,
@@ -197,7 +160,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
 
 /// Adopt an already-running worker (spawnd restart / lazy attach). Returns
 /// `Ok(None)` when no live worker socket exists for this agent.
-pub async fn adopt(agent_id: Uuid, session_label: &str) -> Result<Option<pty::Launched>> {
+pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
     let dir = worker_dir()?;
     let socket = socket_path(&dir, agent_id);
     if !socket.exists() {
@@ -225,7 +188,6 @@ pub async fn adopt(agent_id: Uuid, session_label: &str) -> Result<Option<pty::La
     tracing::info!(%agent_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
     Ok(Some(assemble(
         agent_id,
-        session_label.to_string(),
         hello.pid.unwrap_or(0),
         hello.cols.max(1),
         hello.rows.max(1),
@@ -233,26 +195,14 @@ pub async fn adopt(agent_id: Uuid, session_label: &str) -> Result<Option<pty::La
     )))
 }
 
-/// Restart-only liveness probe: is a worker still holding this agent's
-/// socket? Connecting displaces the worker's active connection, so callers
-/// must only probe after the agent's handle has been removed (the old
-/// connection is being torn down anyway). A stale socket from a crashed
-/// worker is cleaned up as a side effect.
-pub async fn socket_live(agent_id: Uuid) -> bool {
+/// Whether the worker socket still exists. This deliberately does not connect:
+/// accepting a probe would displace the active supervisor connection and
+/// could fence a queued TERM/KILL command during restart.
+pub fn socket_exists(agent_id: Uuid) -> bool {
     let Ok(dir) = worker_dir() else {
         return false;
     };
-    let socket = socket_path(&dir, agent_id);
-    if !socket.exists() {
-        return false;
-    }
-    match UnixStream::connect(&socket).await {
-        Ok(_) => true,
-        Err(_) => {
-            let _ = std::fs::remove_file(&socket);
-            false
-        }
-    }
+    socket_path(&dir, agent_id).exists()
 }
 
 /// Agent ids with a worker socket present (candidates for adoption).
@@ -275,16 +225,9 @@ pub fn discover_ids() -> Vec<Uuid> {
 }
 
 /// Wire a connected worker stream into the standard per-agent plumbing:
-/// outbox → forwarder (shared with the tmux backend), a command channel for
-/// stdin/resize/replay/shutdown, and an exit oneshot.
-fn assemble(
-    agent_id: Uuid,
-    session: String,
-    pid: u32,
-    cols: u16,
-    rows: u16,
-    stream: UnixStream,
-) -> pty::Launched {
+/// outbox → forwarder, a command channel for stdin/resize/replay/shutdown,
+/// and an exit oneshot.
+fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) -> pty::Launched {
     let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<pty::OutputChunk>();
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
@@ -315,7 +258,6 @@ fn assemble(
 
     let handle = AgentHandle::new_worker(WorkerHandleParts {
         agent_id,
-        session,
         cmd_tx,
         alive,
         cols,
@@ -507,8 +449,8 @@ async fn read_hello(stream: &mut UnixStream) -> Result<wire::Hello> {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn worker_output_uses_bounded_idle_activity_resolution() {
+    #[tokio::test]
+    async fn worker_output_emits_content_free_activity_without_status_filtering() {
         let agent_id = Uuid::new_v4();
         let (daemon_stream, mut worker_stream) = UnixStream::pair().expect("unix pair");
         let (read_half, _write_half) = daemon_stream.into_split();
@@ -540,26 +482,14 @@ mod tests {
             sink_rx.recv().await.unwrap(),
             pty::WsOutbound::Binary(_)
         ));
-        assert!(sink_rx.try_recv().is_err());
-
-        tokio::time::advance(crate::activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
         assert!(matches!(
-            sink_rx.try_recv().unwrap(),
+            sink_rx.recv().await.unwrap(),
             pty::WsOutbound::Json(_)
         ));
 
         drop(worker_stream);
         reader.await.unwrap();
         forwarder.await.unwrap();
-    }
-
-    #[test]
-    fn backend_parses_and_defaults_to_tmux() {
-        assert_eq!(parse_backend("worker"), Some(BackendKind::Worker));
-        assert_eq!(parse_backend("SESSIOND"), Some(BackendKind::Worker));
-        assert_eq!(parse_backend("tmux"), Some(BackendKind::Tmux));
-        assert_eq!(parse_backend("bogus"), None);
     }
 
     /// The spawn-worker binary as built alongside this test binary
@@ -599,12 +529,15 @@ mod tests {
     /// handle, replay, drop-handle-then-adopt, shutdown → exit_rx.
     #[tokio::test]
     async fn worker_launch_adopt_and_shutdown_roundtrip() {
+        let _env_lock = WORKER_TEST_ENV_LOCK.lock().await;
+        let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
+        let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("SPAWND_WORKER_DIR", dir.path());
         std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
 
         let agent_id = Uuid::new_v4();
-        let argv: Vec<String> = ["/bin/sh", "-c", "printf 'wb-hello\\n'; cat"]
+        let argv: Vec<String> = ["/bin/sh", "-c", "trap '' TERM; printf 'wb-hello\\n'; cat"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -617,7 +550,6 @@ mod tests {
 
         let launched = launch(pty::LaunchSpec {
             agent_id,
-            session: "spawn-test-worker",
             cwd: "/",
             cols: 80,
             rows: 24,
@@ -627,7 +559,6 @@ mod tests {
         .await
         .expect("worker launch");
         assert!(launched.pid > 0);
-        assert!(launched.handle.is_worker());
 
         // Keep the forwarder unblocked the way a live WS session would.
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
@@ -636,7 +567,7 @@ mod tests {
 
         // Establish the same replay barrier used before a real DataChannel is
         // registered. Historical worker watermarks may predate this spawnd.
-        let initial_replay_rx = launched.handle.worker_replay(1 << 20).expect("replay req");
+        let initial_replay_rx = launched.handle.replay(1 << 20).expect("replay req");
         let (initial_watermark, initial_bytes) = initial_replay_rx
             .await
             .expect("replay resp")
@@ -662,7 +593,7 @@ mod tests {
         collect_direct_until(&mut direct.receiver, b"ping-1").await;
 
         // Replay covers everything so far.
-        let replay_rx = launched.handle.worker_replay(1 << 20).expect("replay req");
+        let replay_rx = launched.handle.replay(1 << 20).expect("replay req");
         let (watermark, bytes) = replay_rx.await.expect("replay resp").expect("replay ok");
         assert!(watermark > 0);
         let text = String::from_utf8_lossy(&bytes);
@@ -675,7 +606,7 @@ mod tests {
         // Simulate a spawnd restart: drop the handle, adopt the live worker.
         drop(launched);
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let adopted = adopt(agent_id, "spawn-test-worker")
+        let adopted = adopt(agent_id)
             .await
             .expect("adopt ok")
             .expect("worker should still be alive");
@@ -684,10 +615,7 @@ mod tests {
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
         adopted.handle.control.set_sink(ws_tx).await;
         tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
-        let adopted_replay_rx = adopted
-            .handle
-            .worker_replay(1 << 20)
-            .expect("adopt replay req");
+        let adopted_replay_rx = adopted.handle.replay(1 << 20).expect("adopt replay req");
         let (adopted_watermark, adopted_bytes) = adopted_replay_rx
             .await
             .expect("adopt replay resp")
@@ -707,9 +635,21 @@ mod tests {
         adopted.handle.write_stdin(b"ping-2\n").expect("stdin");
         collect_direct_until(&mut direct.receiver, b"ping-2").await;
 
-        // Shutdown: exit_rx resolves and the worker cleans up its socket.
-        assert!(adopted.handle.worker_shutdown(Some("TERM".into())));
-        let reason = tokio::time::timeout(Duration::from_secs(15), adopted.exit_rx)
+        // Restart shutdown must not probe by connecting: a probe would become
+        // the worker's current supervisor generation and fence this TERM.
+        // The agent ignores TERM so the same connection must remain usable
+        // for the KILL escalation.
+        assert!(adopted.handle.shutdown(Some("TERM".into())));
+        let mut exit_rx = adopted.exit_rx;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut exit_rx)
+                .await
+                .is_err(),
+            "TERM unexpectedly stopped the signal-ignoring test agent"
+        );
+        assert!(socket_exists(agent_id));
+        assert!(adopted.handle.shutdown(Some("KILL".into())));
+        let reason = tokio::time::timeout(Duration::from_secs(15), exit_rx)
             .await
             .expect("exit timed out")
             .expect("exit_rx dropped");
@@ -718,37 +658,26 @@ mod tests {
             "exit reason should carry a code or signal: {reason:?}"
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while socket_live(agent_id).await {
+        while socket_exists(agent_id) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "worker socket never went away"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if let Some(replay_after_exit) = adopted.handle.worker_replay(1 << 20) {
+        if let Some(replay_after_exit) = adopted.handle.replay(1 << 20) {
             assert!(
                 !matches!(replay_after_exit.await, Ok(Ok(_))),
                 "replay unexpectedly remained available after worker exit"
             );
         }
-    }
-
-    #[test]
-    fn per_agent_env_overrides_backend() {
-        let create = AgentCreate {
-            agent_id: Uuid::new_v4(),
-            cwd: "/".into(),
-            argv: vec!["bash".into()],
-            env: [("SPAWND_SESSION_BACKEND".to_string(), "worker".to_string())]
-                .into_iter()
-                .collect(),
-            install: None,
-            skills: vec![],
-            tmux_session: "spawn-test".into(),
-            cols: 80,
-            rows: 24,
-            create_cwd: false,
-        };
-        assert_eq!(backend_for_create(&create), BackendKind::Worker);
+        match old_dir {
+            Some(value) => std::env::set_var("SPAWND_WORKER_DIR", value),
+            None => std::env::remove_var("SPAWND_WORKER_DIR"),
+        }
+        match old_bin {
+            Some(value) => std::env::set_var("SPAWND_WORKER_BIN", value),
+            None => std::env::remove_var("SPAWND_WORKER_BIN"),
+        }
     }
 }

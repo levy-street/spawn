@@ -1,6 +1,6 @@
 //! End-to-end test of the spawn-worker binary: spawn a real shell on a PTY it
 //! owns, drive it over the framed unix-socket protocol, and verify live
-//! output, stdin, resize, reattach replay, and exit reporting. No tmux
+//! output, stdin, resize, reattach replay, and exit reporting. No external
 //! anywhere near this test.
 
 use std::collections::BTreeMap;

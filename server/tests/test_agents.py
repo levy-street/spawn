@@ -28,7 +28,7 @@ class _FakeWS:
         pass
 
 
-async def test_agent_rename_archive_and_delete(client):
+async def test_agent_patch_name_archive_and_delete(client):
     token = await _signup(client, "agent-owner@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -60,7 +60,6 @@ async def test_agent_rename_archive_and_delete(client):
     r = await client.patch(f"/api/agents/{agent_id}", json={"name": "  ui work  "}, headers=auth)
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "ui work"
-    assert r.json()["tmux_session"] == f"spawn-ui-work--{agent_id}"
     assert r.json()["archived_at"] is None
     assert r.json()["pinned_at"] is None
 
@@ -91,62 +90,6 @@ async def test_agent_rename_archive_and_delete(client):
     assert r.status_code == 404
 
 
-async def test_agent_rename_dispatches_tmux_session_update(client):
-    token = await _signup(client, "agent-rename-dispatch@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(
-                select(User).where(User.email == "agent-rename-dispatch@example.com")
-            )
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="online")
-        session.add(host)
-        await session.flush()
-        agent = Agent(
-            owner_user_id=user.id,
-            host_id=host.id,
-            cwd="/repo",
-            argv=["codex"],
-            env={},
-            name="old name",
-            status="running",
-        )
-        session.add(agent)
-        await session.commit()
-        host_id = host.id
-        agent_id = agent.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
-
-    r = await client.patch(
-        f"/api/agents/{agent_id}",
-        json={"name": "Palette / Codex"},
-        headers=auth,
-    )
-    assert r.status_code == 200, r.text
-    sent = json.loads(fake_ws.sent_text[-1])
-    assert sent == {
-        "type": "agent.rename",
-        "agent_id": agent_id,
-        "tmux_session": f"spawn-palette-codex--{agent_id}",
-    }
-
-    await broker.unregister_daemon(daemon)
-
-
 async def test_agent_create_defaults_name_from_host_and_cwd(client):
     token = await _signup(client, "default-name@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -175,7 +118,6 @@ async def test_agent_create_defaults_name_from_host_and_cwd(client):
     body = r.json()
     assert body["name"] == "dream - spawn"
     assert body["host_name"] == "dream"
-    assert body["tmux_session"] == f"spawn-dream-spawn--{body['id']}"
 
 
 async def test_agent_create_dispatches_managed_skills(client):
@@ -336,7 +278,6 @@ async def test_agent_restart_dispatches_existing_agent(client):
     assert sent["rows"] == 40
     assert sent["cwd"] == "/repo"
     assert sent["argv"] == ["codex", "--yolo"]
-    assert sent["tmux_session"] == f"spawn-agent--{agent_id}"
 
     await broker.unregister_daemon(daemon)
 

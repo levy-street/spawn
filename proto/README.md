@@ -356,7 +356,6 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "skills": [{"id": "uuid", "name": "spawn-control",
              "description": "House style for agents", "content": "..."}],
  "install": "npm install -g @anthropic-ai/claude-code",
- "tmux_session": "spawn-<uuid>",
  "cols": 120,
  "rows": 32,
  "create_cwd": true}
@@ -368,7 +367,6 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "env": {"FOO": "bar"},
  "skills": [],
  "install": "npm install -g @anthropic-ai/claude-code",
- "tmux_session": "spawn-<uuid>",
  "cols": 120,
  "rows": 32,
  "create_cwd": true}
@@ -441,7 +439,7 @@ distinguish healthy idle connections from dead sockets.
     directions through the server. Kept for rollout compatibility.
 - On legacy v1 only, `cols` and `rows` may be optional initial browser
   dimensions. When present,
-  the server resizes the tmux attach before producing the initial history
+  the server resizes the session worker before producing the initial history
   snapshot.
 
 ### Browser → server
@@ -454,9 +452,9 @@ distinguish healthy idle connections from dead sockets.
 ```
 Plus raw binary stdin bytes.
 
-`scroll` / `agent.scroll` is retained for legacy/manual tmux copy-mode
-operations. Normal browser UI scrollback is local to xterm and should not send
-scroll frames or mutate daemon-side viewport state.
+`scroll` / `agent.scroll` remains a temporary content-free compatibility no-op.
+Browser UI scrollback is local to xterm and must not mutate daemon-side
+viewport state.
 
 When the server advertises WebRTC support, the browser may additionally send
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
@@ -525,9 +523,9 @@ UUID and binds every response/chunk to its caller:
 The daemon clamps the protocol surface by rejecting, rather than silently
 changing, invalid values: history/snapshot is 1–10,000 lines, geometry is
 20–400 columns by 5–200 rows, and scroll is a non-zero delta from -200 to 200.
-Worker replay uses the requested line count to bound its byte request. Tmux
-range-checks the value but returns its complete exact checkpoint-plus-stream;
-raw terminal bytes cannot safely be line-truncated without losing parser state.
+Worker replay uses the requested line count to bound its byte request and
+returns a complete checkpoint-plus-stream; raw terminal bytes cannot safely be
+line-truncated without losing parser state.
 Only the daemon-selected display owner may resize; `take_control` transfers
 ownership. Viewer attach/detach/transfer produces a per-viewer E2E event:
 
@@ -554,21 +552,24 @@ Each binary chunk is at most 48 KiB of payload:
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
+The worker replay source is capped at 8 MiB; the control envelope retains a
+12 MiB hard rejection ceiling.
 
 `spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
 between them. Replay metadata therefore carries `pty_offset`, the exact
 per-viewer `spawn.pty` byte boundary represented by the replay. Worker output
 and replay share the worker's durable watermark, translated through the
-viewer's attach origin. Tmux takes a bounded pane-history seed when the daemon
-attaches, then appends every byte emitted by that attached client under the
-same producer lock that routes `spawn.pty` and advances its source coordinate.
-Replay snapshots therefore clone bytes and boundary atomically without
-signalling the pane process or its process group. The combined seed and stream
-is capped at 12 MiB; overflow makes replay unavailable until daemon reattach
-while live PTY delivery continues. The browser buffers live PTY data during
-bootstrap, applies the replay, discards buffered bytes through the anchor, and
-then applies only the suffix. Snapshot reconciliation uses the same explicit
-anchor; it never infers capture order from message arrival.
+viewer's attach origin. The worker logs output before forwarding it, so a replay
+watermark is a stable barrier: spawnd waits until the live source coordinate
+reaches it before returning the translated viewer anchor. The browser buffers
+live PTY data during bootstrap, applies the replay, discards buffered bytes
+through the anchor, and then applies only the suffix. Snapshot reconciliation
+uses the same explicit anchor; it never infers capture order from message
+arrival.
+
+The daemon has one mandatory session backend and no selection escape hatch.
+Old pre-cutover sessions are not adopted; operators must drain them before
+installing/restarting the worker-only daemon. See `docs/TRUST_PHASE2_PROGRESS.md`.
 
 The signaling server binds each active RTC session ID to its browser
 connection, agent, daemon connection and a server-minted generation. Active ID

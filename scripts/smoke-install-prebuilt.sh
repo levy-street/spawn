@@ -14,7 +14,6 @@ need() {
 need cargo
 need curl
 need python3
-need tmux
 
 tmp_dir="$(mktemp -d)"
 server_pid=""
@@ -84,4 +83,5 @@ HOME="$home" \
     --prebuilt-only
 
 "$install_root/bin/spawnd" --version >/dev/null
+test -x "$install_root/bin/spawn-worker"
 printf '%s\n' "smoke-install-prebuilt: passed"

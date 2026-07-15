@@ -31,6 +31,14 @@ exit 0
 """
 
 
+def _fake_worker_body() -> str:
+    return """#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/spawn-worker.log"
+exit 0
+"""
+
+
 def _write_fake_host_commands(fakebin: Path) -> None:
     _write_executable(
         fakebin / "uname",
@@ -42,7 +50,6 @@ case "${1:-}" in
 esac
 """,
     )
-    _write_executable(fakebin / "tmux", "#!/bin/sh\nexit 0\n")
     _write_executable(fakebin / "cc", "#!/bin/sh\nexit 0\n")
     _write_executable(
         fakebin / "curl",
@@ -51,11 +58,14 @@ set -eu
 printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/curl.log"
 out=""
 previous=""
+url=""
 for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     out="$arg"
-    break
   fi
+  case "$arg" in
+    http://*|https://*) url="$arg" ;;
+  esac
   previous="$arg"
 done
 
@@ -73,9 +83,18 @@ BIN
     ;;
   good|*)
     [ -n "$out" ] || exit 0
-    cat > "$out" <<'BIN'
+    case "$url" in
+      */api/install/spawn-worker/*)
+        cat > "$out" <<'BIN'
+{_fake_worker_body().rstrip()}
+BIN
+        ;;
+      *)
+        cat > "$out" <<'BIN'
 {_fake_spawnd_body().rstrip()}
 BIN
+        ;;
+    esac
     chmod 755 "$out"
     ;;
 esac
@@ -112,7 +131,10 @@ mkdir -p "$root/bin"
 cat > "$root/bin/spawnd" <<'BIN'
 {_fake_spawnd_body().rstrip()}
 BIN
-chmod 755 "$root/bin/spawnd"
+cat > "$root/bin/spawn-worker" <<'BIN'
+{_fake_worker_body().rstrip()}
+BIN
+chmod 755 "$root/bin/spawnd" "$root/bin/spawn-worker"
 """,
     )
     _write_executable(
@@ -234,8 +256,14 @@ class _SmokeInstallHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path.startswith("/api/install/spawnd/"):
-            body = _fake_spawnd_body().encode()
+        if self.path.startswith("/api/install/spawnd/") or self.path.startswith(
+            "/api/install/spawn-worker/"
+        ):
+            body = (
+                _fake_worker_body()
+                if self.path.startswith("/api/install/spawn-worker/")
+                else _fake_spawnd_body()
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -267,6 +295,7 @@ async def test_install_script_is_shell_and_uses_public_url(client):
     assert r.text.startswith("#!/bin/sh")
     assert "DEFAULT_SERVER=http" in r.text
     assert "/api/install/spawnd/$TARGET" in r.text
+    assert "/api/install/spawn-worker/$TARGET" in r.text
     assert "darwin-aarch64" in r.text
     assert "linux-x86_64" in r.text
     assert "start_launchd_service" in r.text
@@ -285,7 +314,6 @@ async def test_installer_smoke_uses_real_curl_against_local_http_server(client, 
     fakebin.mkdir()
     logs.mkdir()
     install_root.mkdir()
-    _write_executable(fakebin / "tmux", "#!/bin/sh\nexit 0\n")
 
     env = os.environ.copy()
     env.update(
@@ -320,9 +348,11 @@ async def test_installer_smoke_uses_real_curl_against_local_http_server(client, 
 
     assert result.returncode == 0, result.stderr
     assert "downloading prebuilt spawnd" in result.stdout
+    assert "spawn-worker" in result.stdout
     assert "installed spawnd fake 1.0" in result.stdout
     assert "skipping login" in result.stdout
     assert (install_root / "bin" / "spawnd").is_file()
+    assert (install_root / "bin" / "spawn-worker").is_file()
 
 
 async def test_unsupported_daemon_binary_target_404(client):
@@ -355,9 +385,11 @@ async def test_installer_downloads_prebuilt_for_supported_targets(
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"downloading prebuilt spawnd for {target}" in result.stdout
+    assert f"downloading prebuilt spawnd + spawn-worker for {target}" in result.stdout
     assert f"/api/install/spawnd/{target}" in _log(logs, "curl.log")
+    assert f"/api/install/spawn-worker/{target}" in _log(logs, "curl.log")
     assert (install_root / "bin" / "spawnd").is_file()
+    assert (install_root / "bin" / "spawn-worker").is_file()
     assert _log(logs, "git.log") == ""
     assert _log(logs, "cargo.log") == ""
     assert "skipping login" in result.stdout
@@ -401,6 +433,7 @@ async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_pat
     )
     assert "install --path" in _log(logs, "cargo.log")
     assert (install_root / "bin" / "spawnd").is_file()
+    assert (install_root / "bin" / "spawn-worker").is_file()
 
 
 async def test_installer_writes_and_starts_macos_launchagent(client, tmp_path: Path):
@@ -547,6 +580,10 @@ async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path:
         bin_dir / "spawnd",
         "#!/bin/sh\nprintf '%s\\n' 'old spawnd'\nexit 0\n",
     )
+    _write_executable(
+        bin_dir / "spawn-worker",
+        "#!/bin/sh\nprintf '%s\\n' 'old spawn-worker'\nexit 0\n",
+    )
 
     first, _logs, _home, install_root = _run_installer(
         script,
@@ -558,6 +595,7 @@ async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path:
     assert first.returncode == 0, first.stderr
     assert "installed spawnd fake 1.0" in first.stdout
     assert "old spawnd" not in first.stdout
+    assert "old spawn-worker" not in (bin_dir / "spawn-worker").read_text()
 
     second, _logs, _home, _install_root = _run_installer(
         script,
@@ -612,7 +650,7 @@ async def test_installer_start_flags_control_login_and_services(client, tmp_path
 async def test_daemon_binary_serves_supported_target(client, tmp_path: Path, monkeypatch):
     binary = tmp_path / "spawnd"
     binary.write_bytes(b"fake-daemon")
-    monkeypatch.setattr(install_routes, "_spawnd_binary_candidates", lambda target: [binary])
+    monkeypatch.setattr(install_routes, "_binary_candidates", lambda target, name: [binary])
 
     r = await client.get("/api/install/spawnd/linux-x86_64")
 
@@ -623,9 +661,21 @@ async def test_daemon_binary_serves_supported_target(client, tmp_path: Path, mon
     assert r.headers["cache-control"] == "no-store"
 
 
+async def test_worker_binary_serves_supported_target(client, tmp_path: Path, monkeypatch):
+    binary = tmp_path / "spawn-worker"
+    binary.write_bytes(b"fake-worker")
+    monkeypatch.setattr(install_routes, "_binary_candidates", lambda target, name: [binary])
+
+    r = await client.get("/api/install/spawn-worker/linux-x86_64")
+
+    assert r.status_code == 200
+    assert r.content == b"fake-worker"
+    assert 'filename="spawn-worker"' in r.headers["content-disposition"]
+
+
 async def test_daemon_binary_supported_target_missing_binary_404(client, tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        install_routes, "_spawnd_binary_candidates", lambda target: [tmp_path / "missing"]
+        install_routes, "_binary_candidates", lambda target, name: [tmp_path / "missing"]
     )
 
     r = await client.get("/api/install/spawnd/linux-x86_64")
@@ -634,22 +684,25 @@ async def test_daemon_binary_supported_target_missing_binary_404(client, tmp_pat
     assert r.json()["detail"] == "daemon binary is not available for linux-x86_64"
 
 
-def test_daemon_binary_candidates_include_local_release_fallback(tmp_path: Path, monkeypatch):
+def test_binary_candidates_include_local_release_fallback(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(install_routes, "_repo_root", lambda: tmp_path)
     monkeypatch.setattr(install_routes, "_local_target", lambda: "linux-x86_64")
 
-    local_paths = install_routes._spawnd_binary_candidates("linux-x86_64")
-    remote_paths = install_routes._spawnd_binary_candidates("linux-aarch64")
+    local_paths = install_routes._binary_candidates("linux-x86_64", "spawn-worker")
+    remote_paths = install_routes._binary_candidates("linux-aarch64", "spawn-worker")
 
-    assert tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "spawnd" in local_paths
+    assert (
+        tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "spawn-worker"
+        in local_paths
+    )
     assert (
         tmp_path
         / "daemon"
         / "target"
         / "x86_64-unknown-linux-gnu"
         / "release"
-        / "spawnd"
+        / "spawn-worker"
         in local_paths
     )
-    assert tmp_path / "daemon" / "target" / "release" / "spawnd" in local_paths
-    assert tmp_path / "daemon" / "target" / "release" / "spawnd" not in remote_paths
+    assert tmp_path / "daemon" / "target" / "release" / "spawn-worker" in local_paths
+    assert tmp_path / "daemon" / "target" / "release" / "spawn-worker" not in remote_paths

@@ -17,8 +17,8 @@
 //!
 //! The agent's fate is tied to the worker (the worker holds the PTY master),
 //! but NOT to spawnd: the worker runs in its own process group and keeps
-//! serving across spawnd restarts/upgrades. That is the tmux-survivability
-//! property, minus tmux.
+//! serving across spawnd restarts/upgrades without an intermediate terminal
+//! multiplexer.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;

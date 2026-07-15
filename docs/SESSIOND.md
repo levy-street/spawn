@@ -1,12 +1,11 @@
 # sessiond — replacing tmux with purpose-built session workers
 
-**Status: implemented behind a flag.** The worker backend ships in `daemon/`
-(`spawn-worker` binary + `spawnd` supervision) and is enabled per host with
-`SPAWND_SESSION_BACKEND=worker` or per agent with the same key in the agent's
-`env`. **tmux remains the default backend**; nothing in this design runs
-unless opted in. This document and the code are meant to agree — where they
-drift, the code under `daemon/src/sessiond/` and `daemon/src/worker_backend.rs`
-is the source of truth and this file has a bug.
+**Status: implemented as the mandatory backend; cutover review pending.**
+`spawn-worker` plus `spawnd` supervision is the only production session path.
+There is no backend selector, per-agent escape hatch, or fallback. The accepted
+cutover boundary and old-session drain procedure are in
+[TMUX_REMOVAL.md](TMUX_REMOVAL.md). Where this document and code drift,
+`daemon/src/sessiond/` and `daemon/src/worker_backend.rs` are authoritative.
 
 Governing trust document: [TRUST.md](TRUST.md). Every design choice below is
 tied back to it; the short version is that tmux was the last piece of
@@ -79,13 +78,12 @@ spawnd (host supervisor, one per host)
 ```
 
 - **spawnd stays the host supervisor.** It owns the control-plane connection,
-  WebRTC, agent registry, and the decision of which backend an agent uses.
-  It launches workers, adopts orphaned ones, routes input/output, and reaps
-  exits.
+  WebRTC, and agent registry. It launches workers, adopts orphaned ones, routes
+  input/output, and reaps exits.
 - **`spawn-worker`** (`daemon/src/bin/spawn-worker.rs`, logic in
   `daemon/src/sessiond/worker.rs`) is one process per agent. It binds its
   socket, waits for `Start`, spawns the agent argv on a PTY it owns
-  (portable-pty, same crate the tmux backend uses for its attach PTY),
+  with portable-pty,
   and from then on: streams output, accepts input/resize, maintains the
   scrollback log, serves replay.
 - The worker is spawned with `process_group(0)`: its fate is tied to the
@@ -170,20 +168,17 @@ spawnd: per-agent outbox → forwarder ──→ DataChannel direct sinks (per v
 browser: xterm.js — the only terminal emulator in the system
 ```
 
-The worker backend reuses the **existing** outbox → forwarder → sinks
-plumbing from the tmux backend (`pty::run_forwarder`, `ForwarderControl`), so
-the Phase-1 DataChannel PTY path (`rtc.rs`) needed zero changes: a
-worker-backed agent's `AgentHandle` exposes the same `write_stdin` / `resize`
-/ `control` surface, dispatching to `WorkerCmd`s over the socket instead of a
-locally-held PTY (`HandleBackend::{Tmux,Worker}` in `daemon/src/pty.rs`).
+`pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
+routing. `AgentHandle` has one implementation: `write_stdin`, `resize`,
+`replay`, and `shutdown` dispatch `WorkerCmd`s over the worker socket. `spawnd`
+does not hold a local agent PTY or a backend discriminator.
 
 Control-plane exposure of this path: **nothing**. The unix socket never
 crosses a machine boundary. Live bytes cross machines only inside DTLS.
-Snapshot/replay responses currently ride the browser WS as `agent.snapshot`
-JSON (base64) — the same Phase-1 status quo as the tmux backend, and the
-same Phase-2 work item (move history/snapshot onto a DataChannel stream)
-regardless of backend. The worker design makes that move trivial: the replay
-payload is already raw bytes with a stream-position watermark.
+Legacy snapshot responses can still ride the browser WS as `agent.snapshot`
+JSON (base64), while P2-AGENT-01 adds `spawn.ctl` replay with a stream-position
+watermark. P2-AGENT-02 must remove the remaining server content legs before
+Phase 2 is true.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -337,15 +332,13 @@ snapshot handler (`handle_agent_snapshot`, worker branch) samples the
 requesting viewer's DataChannel byte offset *before* issuing the replay;
 because the worker logs before forwarding, everything counted at that offset
 is guaranteed to be covered by the replay, and the browser can drop already
-seen live bytes deterministically (the existing `dc_offset` mechanism the
-tmux backend introduced for snapshot ordering — reused unchanged).
+seen live bytes deterministically using `dc_offset`.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
 `daemon/tests/worker_e2e.rs` against a real `/bin/sh` on a real PTY, and
 through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
-`worker_backend::tests::worker_launch_adopt_and_shutdown_roundtrip`. No tmux
-is involved in any of these tests.
+`worker_backend::tests::worker_launch_adopt_and_shutdown_roundtrip`.
 
 ## 9. Resize, flow control, multi-viewer
 
@@ -359,23 +352,16 @@ content), so the worker correctly stays a single-size PTY and needs no
 multi-size machinery.
 
 **Multi-viewer.** Fan-out happens in spawnd's forwarder via per-viewer
-DataChannel direct sinks, same as the tmux backend: every viewer gets the
-same raw byte stream, input is accepted from whichever peer the client-side
-control model lets type. One improvement falls out for free: there is no
-copy-mode to cancel, so the per-keystroke copy-mode check is skipped entirely
-for worker-backed agents (`rtc.rs` guards on `registry.is_worker`).
-Client-side scrollback/selection in xterm.js replaces tmux copy-mode.
+DataChannel direct sinks: every viewer gets the same raw byte stream, and input
+is accepted from whichever peer the control model lets type. There is no
+daemon-side copy-mode or per-keystroke subprocess check. Client-side
+scrollback/selection lives in xterm.js.
 
 **Flow control / backpressure — current, honest status.** The worker→spawnd
 socket write applies natural backpressure to the worker's forwarding loop
-(logging is unaffected), but the spawnd-side outbox and DataChannel sink
-channels are unbounded, exactly as they are for the tmux backend today: a
-slow viewer buffers in daemon memory, bounded in practice by session volume.
-The scrollback budget bounds *replay*, not live buffering. Planned follow-up
-(applies to both backends, so it is deliberately not gated on this
-migration): bound the per-viewer sink, drop-oldest on overflow, and re-seed
-the lagging viewer with replay-from-watermark — the worker protocol already
-carries everything that recovery needs.
+(logging is unaffected). The spawnd outbox is unbounded, but each direct viewer
+sink is bounded; a lagging viewer is disconnected and must reconnect/re-seed
+from the worker replay watermark. The replay log itself remains budgeted.
 
 ## 10. Crash isolation, restart, upgrades
 
@@ -386,38 +372,30 @@ carries everything that recovery needs.
 | **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, and adopts from the `Hello` (state, pid, geometry) — no persistent supervisor state, no fd handoff. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; a mismatched worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak. Old workers drain away as their agents exit. |
 | **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
-| **Host reboot** | everything dies, as with tmux. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
+| **Host reboot** | workers and agents die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
 
 Why no fd/socket handoff: the classic reason to pass fds (the supervisor owns
 the PTY) doesn't apply — the **worker** owns the PTY and its listener, and
 survives on its own. Adoption-by-reconnect is strictly simpler and has no
 handoff window to get wrong.
 
-## 11. Migration from tmux
+## 11. Worker-only cutover
 
-**Coexistence (now).** Backend is chosen per agent at `agent.create`:
-`SPAWND_SESSION_BACKEND` in the create env overrides the daemon-global env
-var, default tmux (`worker_backend::backend_for_create`). Both backends
-coexist on one host; restart/kill/rename/snapshot/redraw dispatch on
-`registry.is_worker`. Rename becomes a label update (nothing shells out);
-restart drives an escalating TERM→KILL shutdown through the worker before
-respawning. Startup discovery adopts workers first, then scans tmux sessions.
+P2-TMUX-01 is the hard cutover, not a default flip. The daemon module,
+subprocess calls, selector and escape hatch, creation/attach/discovery,
+capture/repaint/copy-mode behavior, session label, and exact replay buffer are
+removed. Agent restart performs escalating TERM→KILL through the worker before
+creating a replacement; startup discovery scans worker sockets only.
 
-**Cutover criteria** (flip the default to `worker`):
-1. `tools/term-conformance` green on the browser emulator (§12) — the worker
-   path has no server-side emulator to paper over client bugs.
-2. Worker backend soaked on real agents (claude/codex) on the dev instance ≥
-   a week: reattach-with-history, spawnd restart adoption, multi-viewer,
-   mobile.
-3. Backpressure follow-up from §9 landed or consciously deferred with data.
-4. Prod spawnd unit runs `KillMode=process` (verified, not assumed).
-5. An explicit escape hatch: per-agent `SPAWND_SESSION_BACKEND=tmux`
-   continues to work for one release cycle after the default flips.
+A live pre-cutover session cannot be adopted or transformed into a worker
+without unsafe content/state handling. Operators close ingress and drain it
+before installing/restarting the worker-only build. If one remains, the daemon
+fails it unavailable. This code change itself performs no deployment, signal,
+or purge. Rollback cannot restore the retired content path; remediation rolls
+forward with a corrected worker-only build. See [TMUX_REMOVAL.md](TMUX_REMOVAL.md).
 
-**Endgame.** tmux backend and the `tmux` module become dead code; delete
-them, drop the `TMUX_TMPDIR` machinery, and with them the last subprocess
-that ever touched terminal plaintext. (`agent.create`'s `tmux_session` field
-survives as the display label it already is for workers.)
+The server/API/web `tmux_session` field and `agent.rename` frame are removed in
+the same checkpoint. They are absent from daemon runtime structs as well.
 
 ## 12. Prior art
 
@@ -451,8 +429,8 @@ disk, tamper fails closed, budget enforcement, replay coherence
 (`sessiond::scrollback` tests), memory hygiene (`sessiond::secret` tests),
 and end-to-end PTY-in/bytes-out/reattach-replay through a real shell
 (`daemon/tests/worker_e2e.rs`) and through the full spawnd plumbing
-(`worker_backend` roundtrip test). `cargo test` in `daemon/` runs all of it;
-no tmux, no network, no browser.
+(`worker_backend` roundtrip test). `cargo test` in `daemon/` runs all of it
+without network or browser dependencies.
 
 **Emulation correctness (harness).** `tools/term-conformance/` owns this:
 a raw-byte corpus is fed to the system-under-test emulator (`@xterm/headless`

@@ -36,7 +36,7 @@ states which guarantee it delivers.
 
 | Party | Holds | Sees |
 |-------|-------|------|
-| **Host daemon** (`spawnd`) | tmux sessions, PTY, bounded local replay state, host identity key | everything on its own host (it is the user's machine) |
+| **Host endpoint** (`spawnd` + workers) | session workers, PTYs, encrypted bounded replay state, host identity key | everything on its own host (it is the user's machine) |
 | **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and agents it connects to |
 | **TURN relay** | nothing durable | ciphertext, peer IPs, traffic volume/timing |
 | **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | disclosed metadata only, including coarse activity, unattended-update, and encrypted-blob access timing (see "What the server still sees") |
@@ -192,15 +192,13 @@ pinned key; browsers refuse sessions with unpinned keys at L1+.
 
 What moves where, and the regressions we accept:
 
-- **Scrollback/replay** → endpoint-owned, bounded backend history rather than
-  a new durable transcript archive. tmux replay uses `capture_history`: each
-  request is capped at 10,000 lines and cannot exceed tmux's configured
-  `history-limit`. Worker replay uses its encrypted-at-rest rolling log: the
+- **Scrollback/replay** → endpoint-owned, bounded worker history rather than
+  a new durable transcript archive. Worker replay uses its encrypted-at-rest rolling log: the
   default plaintext budget is 8 MiB, whole oldest segments are deleted, and
   the non-persisted key dies with the worker. The browser fetches the available
   tail over the DataChannel at attach. A `spawnd` restart can adopt a surviving
-  tmux session or worker and recover only that retained history; once the
-  session/worker and its history are gone, replay is unavailable. Server
+  worker and recover only that retained history; once the worker and its
+  history are gone, replay is unavailable. Server
   `transcript.py` and the content pubsub path are deleted; any historical Redis
   ring keys are purged.
 - **Offline history** → **accepted regression.** Today the server can
@@ -370,13 +368,12 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   for directory listings, host file read/write/transfer, tool installer output,
   and launch manifests. A per-agent channel is insufficient because these
   operations exist without a running agent.
-- Use the existing bounded endpoint replay sources instead of adding a new
-  durable transcript archive: `tmux::capture_history` (at most 10,000 requested
-  lines and bounded by tmux `history-limit`) or the worker's encrypted rolling
-  scrollback (8 MiB plaintext default, oldest whole segments removed, key held
+- Use the existing bounded endpoint replay source instead of adding a new
+  durable transcript archive: the worker's encrypted rolling scrollback (8 MiB
+  plaintext default, oldest whole segments removed, key held
   only by the live worker). Browser requests the retained tail over
   `spawn.ctl`; daemon restart/adoption, rotation/retention boundaries, and loss
-  after session/worker exit are acceptance-tested and disclosed.
+  after worker exit are acceptance-tested and disclosed.
 - Delete `server/spawn_server/transcript.py`, the content Redis pubsub path, and
   all `agent.snapshot`/`upload`/`host.fs.*`/installer-output forwarding. Purge
   historical Redis ring keys. Remove the content-bearing REST/WS terminal,

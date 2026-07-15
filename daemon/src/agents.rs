@@ -16,14 +16,11 @@ use crate::pty::{AgentHandle, ForwarderControl};
 pub struct AgentRegistry {
     inner: Arc<Mutex<HashMap<Uuid, RegistryEntry>>>,
     generation: Arc<AtomicU64>,
-    /// One-shot guard for "have we already scanned tmux for orphaned sessions
-    /// from a previous daemon process this lifetime?". The first WS session
-    /// of the process triggers discovery; reconnects skip.
+    /// One-shot guard for startup worker discovery. The first WS session of
+    /// the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
-    /// Serializes lazy reattach: concurrent snapshot bursts and inbound stdin
-    /// both attach on demand, and racing attaches displace each other's
-    /// handles in `insert`, orphaning a live `tmux attach` pipeline (and its
-    /// PTY fds) until the session dies.
+    /// Serializes lazy worker adoption so concurrent snapshot/input bursts do
+    /// not create competing connections to the same worker.
     attach_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes the linearization point between a concrete backend
     /// generation and RTC peer insertion/teardown for its UUID. The registry
@@ -71,12 +68,12 @@ impl AgentRegistry {
     }
 
     /// Returns true the first time it's called per process. Subsequent calls
-    /// return false. Used to gate one-shot tmux discovery.
+    /// return false. Used to gate one-shot worker discovery.
     pub fn claim_discovery(&self) -> bool {
         !self.discovery_done.swap(true, Ordering::SeqCst)
     }
 
-    /// Guard held for the duration of a lazy reattach (tmux lookup + attach).
+    /// Guard held for the duration of a lazy worker adoption.
     pub async fn lock_attach(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.attach_lock.lock().await
     }
@@ -185,52 +182,12 @@ impl AgentRegistry {
         }
     }
 
-    pub fn session_for_binding(&self, binding: AgentBinding) -> Option<String> {
-        let guard = self.inner.lock().expect("agents lock");
-        guard
-            .get(&binding.agent_id)
-            .filter(|entry| entry.generation == binding.generation)
-            .and_then(|entry| entry.handle.session().ok())
-    }
-
-    pub fn is_worker_binding(&self, binding: AgentBinding) -> Option<bool> {
-        let guard = self.inner.lock().expect("agents lock");
-        guard
-            .get(&binding.agent_id)
-            .filter(|entry| entry.generation == binding.generation)
-            .map(|entry| entry.handle.is_worker())
-    }
-
     pub fn control_for_binding(&self, binding: AgentBinding) -> Option<ForwarderControl> {
         let guard = self.inner.lock().expect("agents lock");
         guard
             .get(&binding.agent_id)
             .filter(|entry| entry.generation == binding.generation)
             .map(|entry| entry.handle.control.clone())
-    }
-
-    pub fn session_for(&self, id: Uuid) -> Option<String> {
-        let guard = self.inner.lock().expect("agents lock");
-        guard.get(&id).and_then(|entry| entry.handle.session().ok())
-    }
-
-    pub fn update_session(&self, id: Uuid, next: String) -> bool {
-        let guard = self.inner.lock().expect("agents lock");
-        if let Some(entry) = guard.get(&id) {
-            if let Err(e) = entry.handle.set_session(next) {
-                tracing::warn!(%id, error = %e, "updating agent tmux session failed");
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether the agent runs on the worker backend (vs tmux). None when the
-    /// agent isn't in the registry.
-    pub fn is_worker(&self, id: Uuid) -> Option<bool> {
-        let guard = self.inner.lock().expect("agents lock");
-        guard.get(&id).map(|entry| entry.handle.is_worker())
     }
 
     pub fn control_for(&self, id: Uuid) -> Option<ForwarderControl> {

@@ -1,4 +1,4 @@
-//! sessiond — the tmux-replacement session layer (docs/SESSIOND.md).
+//! sessiond — the purpose-built session layer (docs/SESSIOND.md).
 //!
 //! A *session worker* is one process per agent that owns the agent's PTY,
 //! keeps an encrypted-at-rest scrollback log, and speaks a small framed

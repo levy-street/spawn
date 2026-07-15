@@ -13,7 +13,6 @@ need() {
 
 need curl
 need python3
-need tmux
 
 tmp_dir="$(mktemp -d)"
 server_pid=""
@@ -31,6 +30,11 @@ cleanup() {
       tail -200 "$daemon_log" >&2 || true
     fi
   fi
+  if [[ -n "${smoke_agent_id:-}" && -n "${smoke_token:-}" && -n "${base_url:-}" ]]; then
+    curl -fsS -X DELETE \
+      -H "Authorization: Bearer $smoke_token" \
+      "$base_url/api/agents/$smoke_agent_id" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$daemon_pid" ]]; then
     kill "$daemon_pid" >/dev/null 2>&1 || true
     wait "$daemon_pid" 2>/dev/null || true
@@ -38,14 +42,6 @@ cleanup() {
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" 2>/dev/null || true
-  fi
-  if [[ -d "${tmux_tmp:-}" ]]; then
-    TMUX_TMPDIR="$tmux_tmp" tmux kill-server >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${smoke_agent_id:-}" && -n "${smoke_token:-}" && -n "${base_url:-}" ]]; then
-    curl -fsS -X DELETE \
-      -H "Authorization: Bearer $smoke_token" \
-      "$base_url/api/agents/$smoke_agent_id" >/dev/null 2>&1 || true
   fi
   rm -rf "$tmp_dir"
   exit "$status"
@@ -69,8 +65,8 @@ daemon_log="$tmp_dir/daemon.log"
 daemon_home="$tmp_dir/daemon-home"
 agent_cwd="$tmp_dir/agent-cwd"
 fake_bin="$tmp_dir/fake-bin"
-tmux_tmp="$tmp_dir/tmux"
-mkdir -p "$daemon_home" "$agent_cwd" "$fake_bin" "$tmux_tmp"
+worker_dir="$tmp_dir/workers"
+mkdir -p "$daemon_home" "$agent_cwd" "$fake_bin" "$worker_dir"
 
 cat >"$fake_bin/codex" <<'SH'
 #!/usr/bin/env sh
@@ -155,8 +151,8 @@ start_daemon() {
   printf '%s\n' "smoke-local-daemon: starting spawnd for host $smoke_host_id"
   HOME="$daemon_home" \
     SPAWN_DISABLE_KEYRING=1 \
+    SPAWND_WORKER_DIR="$worker_dir" \
     PATH="$fake_bin:$PATH" \
-    TMUX_TMPDIR="$tmux_tmp" \
     daemon/target/debug/spawnd --server "$base_url" run \
     >>"$daemon_log" 2>&1 &
   daemon_pid=$!

@@ -311,10 +311,7 @@ test("previous-agent callbacks remain scoped to the previous terminal", async ({
     (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
   });
   await mockAuthenticatedApi(page, {
-    agents: [
-      agent(),
-      agent({ id: AGENT_B_ID, name: "second", tmux_session: `spawn-second--${AGENT_B_ID}` }),
-    ],
+    agents: [agent(), agent({ id: AGENT_B_ID, name: "second" })],
   });
   const sockets = new Map<string, WebSocketRoute>();
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
@@ -360,7 +357,7 @@ test("worker replay streams render exactly with geometry markers", async ({ page
   // Worker-backed agents ship history/snapshots as exact terminal byte
   // streams of geometry-tagged, self-contained chunks (CSI 8 ; rows ; cols t
   // + checkpoint repaint + output). The client must render them without the
-  // tmux-capture CR/LF reformatting — the lone-\r overwrite below would
+  // transcript CR/LF reformatting — the lone-\r overwrite below would
   // split into two lines under it. The LIVE terminal seeds from the final
   // chunk alone and is never resized through historical geometries; the
   // overlay renders every chunk at its own geometry.
@@ -476,10 +473,8 @@ test("terminal reconciles stale live content when returning from a fresh scrollb
   await page.mouse.wheel(0, 5000);
   await expect(overlay).not.toBeVisible();
   await expect(liveTerminalRows(page)).toContainText("RIGHT-SNAPSHOT-BOTTOM");
-  // After a local rewrite the browser asks tmux to repaint the true screen.
-  await expect
-    .poll(() => jsonMessages(messages).some((message) => message?.type === "redraw"))
-    .toBe(true);
+  // Worker checkpoints eliminate the old daemon redraw request.
+  expect(jsonMessages(messages).some((message) => message?.type === "redraw")).toBe(false);
 });
 
 test("exact worker streams skip the live rewrite when closing scrollback", async ({ page }) => {
@@ -512,7 +507,7 @@ test("exact worker streams skip the live rewrite when closing scrollback", async
 
   await page.mouse.wheel(0, 5000);
   await expect(overlay).not.toBeVisible();
-  // No duplicate of the streamed line, and no tmux-era redraw request.
+  // No duplicate of the streamed line and no legacy redraw request.
   await page.waitForTimeout(400);
   const rows = await liveTerminalRows(page).innerText();
   expect(rows.match(/streamed-while-open-001/g)?.length ?? 0).toBe(1);
@@ -564,7 +559,7 @@ test("resizing invalidates cached scrollback so history re-wraps at the new widt
     jsonMessages(messages).filter((message) => message?.type === "snapshot").length;
   const baseline = snapshotCount();
 
-  // Resize re-wraps the tmux pane; the cached capture is now stale-width and
+  // Resize changes the PTY geometry; the cached replay is now stale-width and
   // must be re-fetched in the background.
   await page.setViewportSize({ width: 700, height: 500 });
   await expect.poll(snapshotCount).toBeGreaterThan(baseline);

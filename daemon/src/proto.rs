@@ -212,11 +212,6 @@ pub enum Inbound {
         #[serde(default)]
         signal: Option<String>,
     },
-    #[serde(rename = "agent.rename")]
-    AgentRename {
-        agent_id: Uuid,
-        tmux_session: String,
-    },
     #[serde(rename = "agent.resize")]
     AgentResize {
         agent_id: Uuid,
@@ -307,7 +302,6 @@ pub struct AgentCreate {
     pub install: Option<String>,
     #[serde(default)]
     pub skills: Vec<AgentSkillConfig>,
-    pub tmux_session: String,
     pub cols: u16,
     pub rows: u16,
     #[serde(default)]

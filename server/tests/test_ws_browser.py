@@ -350,22 +350,15 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
     }
 
     ws.queue_text({"type": "redraw"})
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "agent.redraw" for item in daemon_ws.sent_text)
-    )
-    redraw = [
-        json.loads(item)
-        for item in daemon_ws.sent_text
-        if json.loads(item).get("type") == "agent.redraw"
-    ][-1]
-    assert redraw == {"type": "agent.redraw", "agent_id": agent_id}
-
     ws.queue_text({"type": "rtc.offer", "session_id": "rtc-browser-1", "sdp": "v=0\r\n"})
     await _wait_until(
         lambda: any(json.loads(item).get("type") == "rtc.offer" for item in daemon_ws.sent_text)
     )
     offer = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "rtc.offer"][-1]
     generation = offer.pop("generation")
+    assert not any(
+        json.loads(item).get("type") == "agent.redraw" for item in daemon_ws.sent_text
+    )
     assert isinstance(generation, str) and len(generation) == 32
     assert offer == {
         "type": "rtc.offer",

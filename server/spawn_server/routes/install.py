@@ -48,15 +48,15 @@ def _local_target() -> str | None:
     return f"{os_name}-{arch}"
 
 
-def _spawnd_binary_candidates(target: str) -> list[Path]:
+def _binary_candidates(target: str, name: str) -> list[Path]:
     triple = SUPPORTED_TARGETS[target]
     root = _repo_root()
     candidates = [
-        root / "daemon" / "target" / "prebuilt" / target / "spawnd",
-        root / "daemon" / "target" / triple / "release" / "spawnd",
+        root / "daemon" / "target" / "prebuilt" / target / name,
+        root / "daemon" / "target" / triple / "release" / name,
     ]
     if target == _local_target():
-        candidates.append(root / "daemon" / "target" / "release" / "spawnd")
+        candidates.append(root / "daemon" / "target" / "release" / name)
     return candidates
 
 
@@ -67,7 +67,7 @@ async def spawnd_binary(target: str) -> FileResponse:
     if target not in SUPPORTED_TARGETS:
         raise HTTPException(status_code=404, detail="unsupported daemon target")
 
-    binary = next((path for path in _spawnd_binary_candidates(target) if path.is_file()), None)
+    binary = next((path for path in _binary_candidates(target, "spawnd") if path.is_file()), None)
     if binary is None:
         raise HTTPException(
             status_code=404, detail=f"daemon binary is not available for {target}"
@@ -77,6 +77,27 @@ async def spawnd_binary(target: str) -> FileResponse:
         binary,
         media_type="application/octet-stream",
         filename="spawnd",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/api/install/spawn-worker/{target}")
+async def spawn_worker_binary(target: str) -> FileResponse:
+    """Serve the worker paired with the locally-built daemon binary."""
+
+    if target not in SUPPORTED_TARGETS:
+        raise HTTPException(status_code=404, detail="unsupported worker target")
+
+    binary = next(
+        (path for path in _binary_candidates(target, "spawn-worker") if path.is_file()), None
+    )
+    if binary is None:
+        raise HTTPException(status_code=404, detail=f"worker binary is not available for {target}")
+
+    return FileResponse(
+        binary,
+        media_type="application/octet-stream",
+        filename="spawn-worker",
         headers={"Cache-Control": "no-store"},
     )
 
@@ -120,6 +141,7 @@ INSTALL_SCRIPT = dedent(
     fi
     BIN_DIR="$INSTALL_ROOT/bin"
     BIN="$BIN_DIR/spawnd"
+    WORKER_BIN="$BIN_DIR/spawn-worker"
 
     say() {
       printf '%s\n' "spawn: $*"
@@ -228,12 +250,12 @@ INSTALL_SCRIPT = dedent(
       elif need sudo; then
         sudo "$@"
       else
-        die "need root privileges to install packages; install tmux, git, curl, and build tools manually, then rerun"
+        die "need root privileges to install packages; install git, curl, and build tools manually, then rerun"
       fi
     }
 
     install_runtime_prereqs() {
-      if need tmux && need curl; then
+      if need curl; then
         return
       fi
 
@@ -241,26 +263,26 @@ INSTALL_SCRIPT = dedent(
       OS_NAME=$(uname -s 2>/dev/null || printf unknown)
       if [ "$OS_NAME" = "Darwin" ]; then
         need brew || die "Homebrew is required to install missing prerequisites on macOS"
-        brew install tmux curl
+        brew install curl
         return
       fi
 
       if need apt-get; then
         as_root apt-get update
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          tmux curl ca-certificates
+          curl ca-certificates
       elif need dnf; then
-        as_root dnf install -y tmux curl ca-certificates
+        as_root dnf install -y curl ca-certificates
       elif need yum; then
-        as_root yum install -y tmux curl ca-certificates
+        as_root yum install -y curl ca-certificates
       elif need pacman; then
-        as_root pacman -Sy --needed --noconfirm tmux curl ca-certificates
+        as_root pacman -Sy --needed --noconfirm curl ca-certificates
       elif need zypper; then
-        as_root zypper --non-interactive install tmux curl ca-certificates
+        as_root zypper --non-interactive install curl ca-certificates
       elif need apk; then
-        as_root apk add --no-cache tmux curl ca-certificates
+        as_root apk add --no-cache curl ca-certificates
       else
-        die "unsupported package manager; install tmux and curl manually, then rerun"
+        die "unsupported package manager; install curl manually, then rerun"
       fi
     }
 
@@ -325,6 +347,7 @@ INSTALL_SCRIPT = dedent(
       git clone --depth 1 --branch "$BRANCH" "$REPO" "$TMP_DIR/spawn"
       cargo install --path "$TMP_DIR/spawn/daemon" --locked --root "$INSTALL_ROOT" --force
       [ -x "$BIN" ] || die "spawnd did not install to $BIN"
+      [ -x "$WORKER_BIN" ] || die "spawn-worker did not install to $WORKER_BIN"
     }
 
     host_target() {
@@ -353,19 +376,23 @@ INSTALL_SCRIPT = dedent(
       TARGET=$(host_target) || return 1
       need curl || return 1
       URL="${SERVER%/}/api/install/spawnd/$TARGET"
+      WORKER_URL="${SERVER%/}/api/install/spawn-worker/$TARGET"
       TMP_BIN="$BIN.tmp.$$"
-      say "downloading prebuilt spawnd for $TARGET"
-      if curl -fsSL "$URL" -o "$TMP_BIN"; then
+      TMP_WORKER="$WORKER_BIN.tmp.$$"
+      say "downloading prebuilt spawnd + spawn-worker for $TARGET"
+      if curl -fsSL "$URL" -o "$TMP_BIN" && curl -fsSL "$WORKER_URL" -o "$TMP_WORKER"; then
         chmod 755 "$TMP_BIN"
+        chmod 755 "$TMP_WORKER"
         if "$TMP_BIN" --version >/dev/null 2>&1; then
           mv "$TMP_BIN" "$BIN"
+          mv "$TMP_WORKER" "$WORKER_BIN"
           return 0
         fi
-        rm -f "$TMP_BIN"
+        rm -f "$TMP_BIN" "$TMP_WORKER"
         say "prebuilt daemon is not compatible with this host"
         return 1
       fi
-      rm -f "$TMP_BIN"
+      rm -f "$TMP_BIN" "$TMP_WORKER"
       return 1
     }
 
@@ -457,8 +484,8 @@ INSTALL_SCRIPT = dedent(
     ExecStart="$BIN" --server "$SERVER" run
     Restart=always
     RestartSec=2
-    # Only kill spawnd itself on stop/restart: the tmux server holding every
-    # agent session lives in this cgroup and must survive daemon updates.
+    # Only kill spawnd itself on stop/restart: per-agent session workers live
+    # in this cgroup and must survive supervisor updates.
     KillMode=process
     # Headroom against fd exhaustion taking the host offline.
     LimitNOFILE=65536
@@ -508,8 +535,9 @@ INSTALL_SCRIPT = dedent(
     fi
     install_runtime_prereqs
     "$BIN" --version >/dev/null 2>&1 || die "installed spawnd cannot run on this host"
+    [ -x "$WORKER_BIN" ] || die "installed spawn-worker is missing"
 
-    say "installed $("$BIN" --version 2>/dev/null || printf spawnd) at $BIN"
+    say "installed $("$BIN" --version 2>/dev/null || printf spawnd) at $BIN with $WORKER_BIN"
 
     if [ "$LOGIN_AFTER_INSTALL" = "0" ]; then
       say "skipping login"
