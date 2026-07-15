@@ -103,7 +103,7 @@ function AgentTerminal() {
     },
     onError: (err) => setActionError(String(err)),
   });
-  const { active: splitDropActive, dropProps: splitDropProps } = useAgentDrop(
+  const { active: splitDropActive, dropRef: splitDropRef } = useAgentDrop(
     (droppedId, droppedTitle) => {
       if (!q.data || droppedId === id || splitM.isPending) return;
       splitM.mutate({ droppedId, droppedTitle });
@@ -223,7 +223,7 @@ function AgentTerminal() {
           image path into their native attachment pill ([Image #1]), and
           pasting the path is also the sane behavior for plain shells. */}
       <div className="flex min-h-0 flex-1">
-        <div {...splitDropProps} className="relative min-h-0 min-w-0 flex-1 @container/term">
+        <div ref={splitDropRef} className="relative min-h-0 min-w-0 flex-1 @container/term">
           {splitDropActive && (
             <div className="pointer-events-none absolute inset-2 z-20 grid place-items-center rounded-xl border-2 border-dashed border-ring bg-background/60">
               <span className="rounded-lg border border-border bg-popover px-3 py-1.5 text-sm shadow-lg">

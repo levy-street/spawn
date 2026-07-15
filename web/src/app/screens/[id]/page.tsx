@@ -22,7 +22,6 @@ import {
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
-  type DragEvent as ReactDragEvent,
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
@@ -1055,22 +1054,6 @@ function SplitView({
 
 type DropZone = Side | "center";
 
-function zoneFromEvent(event: ReactDragEvent<HTMLElement>, allowCenter: boolean): DropZone {
-  const rect = event.currentTarget.getBoundingClientRect();
-  const x = (event.clientX - rect.left) / Math.max(1, rect.width);
-  const y = (event.clientY - rect.top) / Math.max(1, rect.height);
-  const edges: Array<[number, DropZone]> = [
-    [x, "left"],
-    [1 - x, "right"],
-    [y, "top"],
-    [1 - y, "bottom"],
-  ];
-  edges.sort((p, q) => p[0] - q[0]);
-  const [distance, side] = edges[0];
-  if (allowCenter && distance > 0.3) return "center";
-  return side;
-}
-
 const ZONE_CLASS: Record<DropZone, string> = {
   left: "inset-y-1 left-1 w-[calc(50%-0.5rem)]",
   right: "inset-y-1 right-1 w-[calc(50%-0.5rem)]",
@@ -1126,35 +1109,82 @@ function ScreenPane({
     onError: (err) => onPaneError(String(err)),
   });
 
-  const onDragEnter = (event: ReactDragEvent<HTMLElement>) => {
-    if (!dragHasAgent(event.dataTransfer)) return;
-    event.preventDefault();
-    depth.current += 1;
-  };
-  const onDragOver = (event: ReactDragEvent<HTMLElement>) => {
-    if (!dragHasAgent(event.dataTransfer)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = dragIsPane(event.dataTransfer) ? "move" : "copy";
-    setZone(zoneFromEvent(event, dragIsPane(event.dataTransfer)));
-  };
-  const onDragLeave = (event: ReactDragEvent<HTMLElement>) => {
-    if (!dragHasAgent(event.dataTransfer)) return;
-    depth.current = Math.max(0, depth.current - 1);
-    if (depth.current === 0) setZone(null);
-  };
-  const onDrop = (event: ReactDragEvent<HTMLElement>) => {
-    if (!dragHasAgent(event.dataTransfer)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    depth.current = 0;
-    const dropZone = zoneFromEvent(event, dragIsPane(event.dataTransfer));
-    setZone(null);
-    const droppedId = event.dataTransfer.getData(AGENT_DRAG_MIME);
-    const sourceScreen = event.dataTransfer.getData(PANE_SRC_MIME) || null;
-    if (!droppedId || droppedId === agentId) return;
-    onPlaceAgent(droppedId, agentId, dropZone, sourceScreen);
-  };
+  // The terminal is portaled from the root pool, so React events on it don't
+  // bubble to this section — drop targeting and focus tracking must use NATIVE
+  // listeners on the section DOM, which the nested terminal events do bubble
+  // to. Props are read through refs so the listeners attach once per element.
+  const onPlaceAgentRef = useRef(onPlaceAgent);
+  onPlaceAgentRef.current = onPlaceAgent;
+  const onFocusPaneRef = useRef(onFocusPane);
+  onFocusPaneRef.current = onFocusPane;
+  const sectionCleanupRef = useRef<(() => void) | null>(null);
+  const sectionRef = useCallback(
+    (el: HTMLElement | null) => {
+      sectionCleanupRef.current?.();
+      sectionCleanupRef.current = null;
+      if (!el) return;
+      const zoneOf = (e: globalThis.DragEvent, allowCenter: boolean): DropZone => {
+        const rect = el.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / Math.max(1, rect.width);
+        const y = (e.clientY - rect.top) / Math.max(1, rect.height);
+        const edges: Array<[number, DropZone]> = [
+          [x, "left"],
+          [1 - x, "right"],
+          [y, "top"],
+          [1 - y, "bottom"],
+        ];
+        edges.sort((p, q) => p[0] - q[0]);
+        const [distance, side] = edges[0];
+        return allowCenter && distance > 0.3 ? "center" : side;
+      };
+      const onEnter = (e: globalThis.DragEvent) => {
+        if (!dragHasAgent(e.dataTransfer)) return;
+        e.preventDefault();
+        depth.current += 1;
+      };
+      const onOver = (e: globalThis.DragEvent) => {
+        if (!dragHasAgent(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.dataTransfer)
+          e.dataTransfer.dropEffect = dragIsPane(e.dataTransfer) ? "move" : "copy";
+        setZone(zoneOf(e, dragIsPane(e.dataTransfer)));
+      };
+      const onLeave = (e: globalThis.DragEvent) => {
+        if (!dragHasAgent(e.dataTransfer)) return;
+        depth.current = Math.max(0, depth.current - 1);
+        if (depth.current === 0) setZone(null);
+      };
+      const onDropNative = (e: globalThis.DragEvent) => {
+        if (!dragHasAgent(e.dataTransfer) || !e.dataTransfer) return;
+        e.preventDefault();
+        e.stopPropagation();
+        depth.current = 0;
+        const dropZone = zoneOf(e, dragIsPane(e.dataTransfer));
+        setZone(null);
+        const droppedId = e.dataTransfer.getData(AGENT_DRAG_MIME);
+        const sourceScreen = e.dataTransfer.getData(PANE_SRC_MIME) || null;
+        if (!droppedId || droppedId === agentId) return;
+        onPlaceAgentRef.current(droppedId, agentId, dropZone, sourceScreen);
+      };
+      const onFocusPaneNative = () => onFocusPaneRef.current(agentId);
+      el.addEventListener("dragenter", onEnter);
+      el.addEventListener("dragover", onOver);
+      el.addEventListener("dragleave", onLeave);
+      el.addEventListener("drop", onDropNative);
+      el.addEventListener("focusin", onFocusPaneNative);
+      el.addEventListener("pointerdown", onFocusPaneNative, true);
+      sectionCleanupRef.current = () => {
+        el.removeEventListener("dragenter", onEnter);
+        el.removeEventListener("dragover", onOver);
+        el.removeEventListener("dragleave", onLeave);
+        el.removeEventListener("drop", onDropNative);
+        el.removeEventListener("focusin", onFocusPaneNative);
+        el.removeEventListener("pointerdown", onFocusPaneNative, true);
+      };
+    },
+    [agentId],
+  );
 
   // Stable host node the section always portals into — created once and
   // never replaced, so the terminal (and its socket + WebRTC) never
@@ -1169,13 +1199,8 @@ function ScreenPane({
 
   return createPortal(
     <section
+      ref={sectionRef}
       aria-label={agent ? agentTitle(agent) : "Missing agent"}
-      onDragEnter={onDragEnter}
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
-      onFocusCapture={() => onFocusPane(agentId)}
-      onPointerDownCapture={() => onFocusPane(agentId)}
       className={cn(
         "relative flex min-w-0 flex-1 flex-col overflow-hidden bg-background",
         stacked ? "min-h-[50dvh] flex-none" : "min-h-0",
