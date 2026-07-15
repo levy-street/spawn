@@ -3,13 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AGENT_CTL_MAX_PENDING_PTY_BYTES,
-  AGENT_CTL_MAX_REPLAY_BYTES,
-  AGENT_CTL_MAX_REPLAY_CHUNKS,
   type AgentCtlOperation,
-  type AgentCtlResponse,
-  combineAgentCtlChunks,
+  AgentCtlRequestTracker,
+  type AgentCtlTrackedResult,
+  AgentGenerationInputQueue,
   decodeAgentCtlChunk,
   makeAgentCtlRequest,
+  newAgentCtlRequestId,
+  OrderedAsyncQueue,
   parseAgentCtlText,
   slicePtyChunkAfterAnchor,
 } from "@/lib/agent-ctl";
@@ -61,6 +62,9 @@ export interface ConnInfo {
 const EMPTY_CONN_INFO: ConnInfo = { kind: null, rttMs: null, protocol: null };
 
 type RtcState = {
+  agentId: string | null;
+  agentGeneration: number;
+  rtcGeneration: number;
   pc: RTCPeerConnection | null;
   ptyDc: RTCDataChannel | null;
   ctlDc: RTCDataChannel | null;
@@ -114,9 +118,14 @@ export function useAgentSocket({
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
   const wsRef = useRef<WebSocket | null>(null);
   const wsV2Ref = useRef(false);
-  const pendingInputRef = useRef<Uint8Array[]>([]);
-  const pendingInputBytesRef = useRef(0);
+  const activeAgentIdRef = useRef<string | null>(null);
+  const agentGenerationRef = useRef(0);
+  const rtcGenerationRef = useRef(0);
+  const pendingInputRef = useRef(new AgentGenerationInputQueue(MAX_PENDING_INPUT_BYTES));
   const rtcRef = useRef<RtcState>({
+    agentId: null,
+    agentGeneration: 0,
+    rtcGeneration: 0,
     pc: null,
     ptyDc: null,
     ctlDc: null,
@@ -132,6 +141,7 @@ export function useAgentSocket({
   const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
+    agentId,
     onData,
     onHistory,
     onDisplayControl,
@@ -143,6 +153,7 @@ export function useAgentSocket({
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
+    agentId,
     onData,
     onHistory,
     onDisplayControl,
@@ -154,6 +165,14 @@ export function useAgentSocket({
   };
 
   useEffect(() => {
+    const agentGeneration = agentGenerationRef.current + 1;
+    agentGenerationRef.current = agentGeneration;
+    pendingInputRef.current.clear();
+    wsV2Ref.current = false;
+    sendControlRef.current = () => false;
+    activeAgentIdRef.current = enabled && agentId ? agentId : null;
+    setV2(false);
+    setDcOpen(false);
     if (!enabled || !agentId) return;
     let cancelled = false;
     let attempt = 0;
@@ -162,13 +181,22 @@ export function useAgentSocket({
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRelayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcRelayFallbackGeneration: number | null = null;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
     let lastRtcDataAt = 0;
     const pendingRelayChunks: Uint8Array[] = [];
 
+    const isCurrentAgentGeneration = () => agentGenerationRef.current === agentGeneration;
+    const isActiveAgentGeneration = () => !cancelled && isCurrentAgentGeneration();
+    const currentHandlers = () =>
+      isActiveAgentGeneration() && handlersRef.current.agentId === agentId
+        ? handlersRef.current
+        : null;
+
     const sendJsonOverWs = (msg: unknown) => {
+      if (!isCurrentAgentGeneration()) return false;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
       ws.send(JSON.stringify(msg));
@@ -188,11 +216,19 @@ export function useAgentSocket({
     const clearRelayFallback = () => {
       if (rtcRelayFallbackTimer) clearTimeout(rtcRelayFallbackTimer);
       rtcRelayFallbackTimer = null;
+      rtcRelayFallbackGeneration = null;
       pendingRelayChunks.splice(0);
     };
 
-    const cleanupRtc = (signal = true, retry = false) => {
+    const cleanupRtc = (signal = true, retry = false, expectedRtcGeneration?: number) => {
       const rtc = rtcRef.current;
+      if (
+        rtc.agentId !== agentId ||
+        rtc.agentGeneration !== agentGeneration ||
+        (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
+      ) {
+        return;
+      }
       const sessionId = rtc.sessionId;
       clearRtcConnectTimer();
       clearRtcDisconnectedTimer();
@@ -201,6 +237,9 @@ export function useAgentSocket({
         sendJsonOverWs({ type: "rtc.close", session_id: sessionId });
       }
       rtcRef.current = {
+        agentId: null,
+        agentGeneration: 0,
+        rtcGeneration: 0,
         pc: null,
         ptyDc: null,
         ctlDc: null,
@@ -225,14 +264,14 @@ export function useAgentSocket({
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
-      setDcOpen(false);
+      if (isCurrentAgentGeneration()) setDcOpen(false);
       if (retry) scheduleRtcRetry();
     };
 
     // A transient WebRTC failure (network switch, slow ICE) must not strand
     // the session on the relay path until the next WS reconnect.
     const scheduleRtcRetry = () => {
-      if (cancelled || rtcRetryTimer || !lastRtcIceServers) return;
+      if (!isActiveAgentGeneration() || rtcRetryTimer || !lastRtcIceServers) return;
       const delay = Math.min(
         RTC_RETRY_MAX_DELAY_MS,
         RTC_RETRY_BASE_DELAY_MS * 2 ** rtcRetryAttempts,
@@ -240,7 +279,7 @@ export function useAgentSocket({
       rtcRetryAttempts += 1;
       rtcRetryTimer = setTimeout(() => {
         rtcRetryTimer = null;
-        if (cancelled || rtcRef.current.pc) return;
+        if (!isActiveAgentGeneration() || rtcRef.current.pc) return;
         if (wsRef.current?.readyState !== WebSocket.OPEN) return;
         if (lastRtcIceServers) void startRtc(lastRtcIceServers);
       }, delay);
@@ -249,20 +288,34 @@ export function useAgentSocket({
     const scheduleRelayFallback = (bytes: Uint8Array) => {
       pendingRelayChunks.push(bytes);
       if (rtcRelayFallbackTimer) return;
+      rtcRelayFallbackGeneration = rtcRef.current.rtcGeneration;
       rtcRelayFallbackTimer = setTimeout(() => {
         rtcRelayFallbackTimer = null;
+        const expectedGeneration = rtcRelayFallbackGeneration;
+        rtcRelayFallbackGeneration = null;
         const chunks = pendingRelayChunks.splice(0);
-        cleanupRtc(true, true);
+        if (
+          expectedGeneration === null ||
+          rtcRef.current.rtcGeneration !== expectedGeneration ||
+          !currentHandlers()
+        ) {
+          return;
+        }
+        cleanupRtc(true, true, expectedGeneration);
+        const handlers = currentHandlers();
+        if (!handlers) return;
         for (const chunk of chunks) {
-          handlersRef.current.onData(chunk);
+          handlers.onData(chunk);
         }
       }, RTC_RELAY_FALLBACK_DELAY_MS);
     };
 
     const startRtc = async (iceServers: RTCIceServer[]) => {
-      if (cancelled || rtcStartInFlight || rtcRef.current.pc) return;
+      if (!isActiveAgentGeneration() || rtcStartInFlight || rtcRef.current.pc) return;
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
+      const rtcGeneration = rtcGenerationRef.current + 1;
+      rtcGenerationRef.current = rtcGeneration;
       const sessionId = newRtcSessionId();
       const forceRelay =
         typeof window !== "undefined" &&
@@ -276,10 +329,7 @@ export function useAgentSocket({
       const ctlDc = useControlChannel ? pc.createDataChannel("spawn.ctl", { ordered: true }) : null;
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       const pendingControlTexts: string[] = [];
-      const replayResponses = new Map<
-        string,
-        { metadata: AgentCtlResponse; chunks: Map<number, Uint8Array>; sawLast: boolean }
-      >();
+      const requests = new AgentCtlRequestTracker();
       const pendingBootstrapPty: Array<{ bytes: Uint8Array; offsetAfter: number }> = [];
       const pendingSnapshots: Array<{
         bytes: Uint8Array;
@@ -291,9 +341,22 @@ export function useAgentSocket({
       let bootstrapPtyAnchor: number | null = null;
       let initialHistoryRequestId: string | null = null;
       let offerSent = false;
+      const isCurrentRtcGeneration = () => {
+        const current = rtcRef.current;
+        return (
+          isActiveAgentGeneration() &&
+          current.agentId === agentId &&
+          current.agentGeneration === agentGeneration &&
+          current.rtcGeneration === rtcGeneration &&
+          current.sessionId === sessionId
+        );
+      };
       ptyDc.binaryType = "arraybuffer";
       if (ctlDc) ctlDc.binaryType = "arraybuffer";
       rtcRef.current = {
+        agentId,
+        agentGeneration,
+        rtcGeneration,
         pc,
         ptyDc,
         ctlDc,
@@ -305,8 +368,7 @@ export function useAgentSocket({
       };
 
       const flushPendingInput = () => {
-        const queued = pendingInputRef.current.splice(0);
-        pendingInputBytesRef.current = 0;
+        const queued = pendingInputRef.current.drain(agentGeneration);
         for (const chunk of queued) {
           try {
             ptyDc.send(
@@ -324,7 +386,7 @@ export function useAgentSocket({
       const markReady = () => {
         const current = rtcRef.current;
         if (
-          current.sessionId !== sessionId ||
+          !isCurrentRtcGeneration() ||
           current.open ||
           !current.ptyOpen ||
           !current.ctlOpen ||
@@ -336,30 +398,35 @@ export function useAgentSocket({
         clearRtcConnectTimer();
         rtcRetryAttempts = 0;
         lastRtcDataAt = Date.now();
-        setDcOpen(true);
+        if (isCurrentAgentGeneration()) setDcOpen(true);
         flushPendingInput();
       };
 
       const deliverAnchoredPtyChunk = (bytes: Uint8Array, offsetAfter: number) => {
+        if (!isCurrentRtcGeneration()) return;
         const sliced = slicePtyChunkAfterAnchor(bytes, offsetAfter, bootstrapPtyAnchor);
         bootstrapPtyAnchor = sliced.anchor;
-        if (sliced.bytes) handlersRef.current.onData(sliced.bytes, offsetAfter);
+        const handlers = currentHandlers();
+        if (sliced.bytes && handlers) handlers.onData(sliced.bytes, offsetAfter);
       };
 
       const flushPendingSnapshots = () => {
+        if (!isCurrentRtcGeneration()) return;
         const received = rtcRef.current.bytesReceived;
         while (pendingSnapshots.length > 0 && pendingSnapshots[0].ptyOffset <= received) {
           const snapshot = pendingSnapshots.shift();
           if (!snapshot) break;
-          handlersRef.current.onSnapshot?.(snapshot.bytes, snapshot.plain, snapshot.ptyOffset);
+          currentHandlers()?.onSnapshot?.(snapshot.bytes, snapshot.plain, snapshot.ptyOffset);
         }
       };
 
       const finishBootstrap = (bytes: Uint8Array, ptyOffset: number | null | undefined) => {
-        if (bootstrapDone || rtcRef.current.sessionId !== sessionId) return;
+        if (bootstrapDone || !isCurrentRtcGeneration()) return;
         const anchor = typeof ptyOffset === "number" && ptyOffset >= 0 ? ptyOffset : 0;
-        if (handlersRef.current.onHistory) handlersRef.current.onHistory(bytes);
-        else handlersRef.current.onData(bytes);
+        const handlers = currentHandlers();
+        if (!handlers) return;
+        if (handlers.onHistory) handlers.onHistory(bytes);
+        else handlers.onData(bytes);
         bootstrapPtyAnchor = anchor;
         for (const chunk of pendingBootstrapPty.splice(0)) {
           deliverAnchoredPtyChunk(chunk.bytes, chunk.offsetAfter);
@@ -370,34 +437,34 @@ export function useAgentSocket({
         markReady();
       };
 
-      const maybeFinishReplay = (requestId: string) => {
-        const response = replayResponses.get(requestId);
-        if (!response) return;
-        const expectedChunks = response.metadata.chunks ?? -1;
-        const expectedBytes = response.metadata.total_bytes ?? -1;
-        if (response.chunks.size !== expectedChunks) return;
-        if (expectedChunks > 0 && !response.sawLast) return;
-        const bytes = combineAgentCtlChunks(response.chunks, expectedChunks, expectedBytes);
-        replayResponses.delete(requestId);
-        if (!bytes) {
-          if (requestId === initialHistoryRequestId) finishBootstrap(new Uint8Array(), 0);
+      const acceptTrackedResult = (result: AgentCtlTrackedResult | null) => {
+        if (!result || !isCurrentRtcGeneration()) return;
+        const requestId = result.response.request_id;
+        if (result.kind === "response") {
+          if (!result.response.ok && requestId === initialHistoryRequestId) {
+            finishBootstrap(new Uint8Array(), 0);
+          }
           return;
         }
-        if (requestId === initialHistoryRequestId || response.metadata.operation === "history") {
-          finishBootstrap(bytes, response.metadata.pty_offset);
-        } else if (response.metadata.operation === "snapshot") {
+        if (requestId === initialHistoryRequestId || result.response.operation === "history") {
+          finishBootstrap(result.bytes, result.response.pty_offset);
+        } else if (result.response.operation === "snapshot") {
           const ptyOffset =
-            typeof response.metadata.pty_offset === "number" ? response.metadata.pty_offset : null;
+            typeof result.response.pty_offset === "number" ? result.response.pty_offset : null;
           if (ptyOffset !== null && ptyOffset > rtcRef.current.bytesReceived) {
             if (pendingSnapshots.length < 8) {
               pendingSnapshots.push({
-                bytes,
-                plain: Boolean(response.metadata.plain),
+                bytes: result.bytes,
+                plain: Boolean(result.response.plain),
                 ptyOffset,
               });
             }
           } else {
-            handlersRef.current.onSnapshot?.(bytes, Boolean(response.metadata.plain), ptyOffset);
+            currentHandlers()?.onSnapshot?.(
+              result.bytes,
+              Boolean(result.response.plain),
+              ptyOffset,
+            );
           }
         }
       };
@@ -406,23 +473,29 @@ export function useAgentSocket({
         operation: AgentCtlOperation,
         parameters: Record<string, unknown> = {},
       ): boolean => {
-        if (!ctlDc) return false;
-        const requestId = newRtcSessionId();
+        if (!ctlDc || !isCurrentRtcGeneration()) return false;
+        const requestId = newAgentCtlRequestId();
         const text = makeAgentCtlRequest(requestId, operation, parameters);
         if (!text) return false;
-        if (ctlDc.readyState === "open") {
-          ctlDc.send(text);
-        } else {
-          if (pendingControlTexts.length >= 128) return false;
-          pendingControlTexts.push(text);
+        if (ctlDc.readyState !== "open" && pendingControlTexts.length >= 128) return false;
+        if (!requests.register(requestId, operation)) return false;
+        try {
+          if (ctlDc.readyState === "open") {
+            ctlDc.send(text);
+          } else {
+            pendingControlTexts.push(text);
+          }
+        } catch {
+          requests.cancel(requestId);
+          return false;
         }
         return true;
       };
       sendControlRef.current = useControlChannel ? sendControl : () => false;
 
       rtcConnectTimer = setTimeout(() => {
-        if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
-          cleanupRtc(true, true);
+        if (isCurrentRtcGeneration() && !rtcRef.current.open) {
+          cleanupRtc(true, true, rtcGeneration);
         }
       }, RTC_CONNECT_TIMEOUT_MS);
 
@@ -430,12 +503,13 @@ export function useAgentSocket({
         sendJsonOverWs({ type: "rtc.candidate", session_id: sessionId, candidate });
 
       pc.onicecandidate = (event) => {
-        if (!event.candidate || cancelled) return;
+        if (!event.candidate || !isCurrentRtcGeneration()) return;
         const candidate = event.candidate.toJSON();
         if (offerSent) sendRtcCandidate(candidate);
         else pendingLocalCandidates.push(candidate);
       };
       pc.onconnectionstatechange = () => {
+        if (!isCurrentRtcGeneration()) return;
         if (pc.connectionState === "connected") {
           clearRtcDisconnectedTimer();
           return;
@@ -444,36 +518,35 @@ export function useAgentSocket({
           if (!rtcDisconnectedTimer) {
             rtcDisconnectedTimer = setTimeout(() => {
               if (rtcRef.current.sessionId === sessionId && pc.connectionState === "disconnected") {
-                cleanupRtc(true, true);
+                cleanupRtc(true, true, rtcGeneration);
               }
             }, RTC_DISCONNECTED_GRACE_MS);
           }
           return;
         }
         if (["failed", "closed"].includes(pc.connectionState)) {
-          cleanupRtc(pc.connectionState !== "closed", rtcRef.current.sessionId === sessionId);
+          cleanupRtc(pc.connectionState !== "closed", true, rtcGeneration);
         }
       };
 
       ptyDc.onopen = () => {
         const current = rtcRef.current;
-        if (current.sessionId !== sessionId) return;
+        if (!isCurrentRtcGeneration()) return;
         rtcRef.current = { ...current, ptyOpen: true };
         markReady();
       };
       ptyDc.onclose = () => {
-        const current = rtcRef.current;
-        if (current.sessionId !== sessionId) return;
-        cleanupRtc(true, true);
+        if (!isCurrentRtcGeneration()) return;
+        cleanupRtc(true, true, rtcGeneration);
       };
-      ptyDc.onerror = () => cleanupRtc(true, true);
+      ptyDc.onerror = () => cleanupRtc(true, true, rtcGeneration);
       const deliverPtyChunk = (bytes: Uint8Array) => {
         const current = rtcRef.current;
-        if (current.sessionId !== sessionId) return;
+        if (!isCurrentRtcGeneration()) return;
         current.bytesReceived += bytes.byteLength;
         if (!bootstrapDone) {
           if (pendingBootstrapPtyBytes + bytes.byteLength > AGENT_CTL_MAX_PENDING_PTY_BYTES) {
-            cleanupRtc(true, true);
+            cleanupRtc(true, true, rtcGeneration);
             return;
           }
           pendingBootstrapPty.push({ bytes, offsetAfter: current.bytesReceived });
@@ -483,121 +556,123 @@ export function useAgentSocket({
         deliverAnchoredPtyChunk(bytes, current.bytesReceived);
         flushPendingSnapshots();
       };
+      const ptyMessages = new OrderedAsyncQueue();
       ptyDc.onmessage = (event) => {
+        if (!isCurrentRtcGeneration()) return;
         lastRtcDataAt = Date.now();
         clearRelayFallback();
-        if (event.data instanceof ArrayBuffer) {
-          deliverPtyChunk(new Uint8Array(event.data));
-        } else if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((buffer) => {
-            if (!cancelled) deliverPtyChunk(new Uint8Array(buffer));
-          });
-        }
+        const data = event.data;
+        if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
+        void ptyMessages.enqueue(
+          async () => new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data),
+          (bytes) => {
+            if (isCurrentRtcGeneration()) deliverPtyChunk(bytes);
+          },
+        );
       };
 
       if (ctlDc) {
         ctlDc.onopen = () => {
+          if (!isCurrentRtcGeneration()) return;
           const current = rtcRef.current;
-          if (current.sessionId !== sessionId) return;
           rtcRef.current = { ...current, ctlOpen: true };
-          initialHistoryRequestId = newRtcSessionId();
+          initialHistoryRequestId = newAgentCtlRequestId();
           const size = initialSizeRef.current;
           const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
             lines: 400,
             plain: false,
             ...(size ? { cols: size.cols, rows: size.rows } : {}),
           });
-          if (!historyText) {
+          if (!historyText || !requests.register(initialHistoryRequestId, "history")) {
             finishBootstrap(new Uint8Array(), 0);
           } else {
-            ctlDc.send(historyText);
+            try {
+              ctlDc.send(historyText);
+            } catch {
+              requests.cancel(initialHistoryRequestId);
+              cleanupRtc(true, true, rtcGeneration);
+              return;
+            }
           }
-          for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
+          try {
+            for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
+          } catch {
+            cleanupRtc(true, true, rtcGeneration);
+            return;
+          }
           markReady();
         };
         ctlDc.onclose = () => {
-          const current = rtcRef.current;
-          if (current.sessionId !== sessionId) return;
-          cleanupRtc(true, true);
+          if (!isCurrentRtcGeneration()) return;
+          cleanupRtc(true, true, rtcGeneration);
         };
-        ctlDc.onerror = () => cleanupRtc(true, true);
+        ctlDc.onerror = () => cleanupRtc(true, true, rtcGeneration);
         const deliverControlBinary = (bytes: Uint8Array) => {
+          if (!isCurrentRtcGeneration()) return;
           const chunk = decodeAgentCtlChunk(bytes);
           if (!chunk) return;
-          const response = replayResponses.get(chunk.requestId);
-          if (!response || response.chunks.has(chunk.sequence)) return;
-          response.chunks.set(chunk.sequence, chunk.payload);
-          if (chunk.last) response.sawLast = true;
-          maybeFinishReplay(chunk.requestId);
+          acceptTrackedResult(requests.acceptChunk(chunk));
         };
+        const controlMessages = new OrderedAsyncQueue();
         ctlDc.onmessage = (event) => {
-          if (typeof event.data === "string") {
-            const message = parseAgentCtlText(event.data);
-            if (!message) return;
-            if (message.kind === "event") {
-              handlersRef.current.onDisplayControl?.({
-                owner: message.owner,
-                cols: message.cols,
-                rows: message.rows,
-                viewers: message.viewers,
-              });
-              return;
-            }
-            if (!message.ok) {
-              if (message.request_id === initialHistoryRequestId) {
-                finishBootstrap(new Uint8Array(), 0);
-              }
-              return;
-            }
-            if (
-              message.request_id &&
-              (message.operation === "history" || message.operation === "snapshot") &&
-              typeof message.total_bytes === "number" &&
-              message.total_bytes >= 0 &&
-              message.total_bytes <= AGENT_CTL_MAX_REPLAY_BYTES &&
-              typeof message.chunks === "number" &&
-              Number.isInteger(message.chunks) &&
-              message.chunks >= 0 &&
-              message.chunks <= AGENT_CTL_MAX_REPLAY_CHUNKS
-            ) {
-              replayResponses.set(message.request_id, {
-                metadata: message,
-                chunks: new Map(),
-                sawLast: message.chunks === 0,
-              });
-              maybeFinishReplay(message.request_id);
-            }
+          if (!isCurrentRtcGeneration()) return;
+          const data = event.data;
+          if (
+            typeof data !== "string" &&
+            !(data instanceof ArrayBuffer) &&
+            !(data instanceof Blob)
+          ) {
             return;
           }
-          if (event.data instanceof ArrayBuffer) {
-            deliverControlBinary(new Uint8Array(event.data));
-          } else if (event.data instanceof Blob) {
-            void event.data.arrayBuffer().then((buffer) => {
-              if (!cancelled) deliverControlBinary(new Uint8Array(buffer));
-            });
-          }
+          void controlMessages.enqueue(
+            async () =>
+              data instanceof Blob
+                ? new Uint8Array(await data.arrayBuffer())
+                : data instanceof ArrayBuffer
+                  ? new Uint8Array(data)
+                  : data,
+            (decoded) => {
+              if (!isCurrentRtcGeneration()) return;
+              if (typeof decoded !== "string") {
+                deliverControlBinary(decoded);
+                return;
+              }
+              const message = parseAgentCtlText(decoded);
+              if (!message) return;
+              if (message.kind === "event") {
+                currentHandlers()?.onDisplayControl?.({
+                  owner: message.owner,
+                  cols: message.cols,
+                  rows: message.rows,
+                  viewers: message.viewers,
+                });
+                return;
+              }
+              acceptTrackedResult(requests.acceptResponse(message));
+            },
+          );
         };
       }
 
       try {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        if (cancelled || rtcRef.current.sessionId !== sessionId) return;
+        if (!isCurrentRtcGeneration()) return;
         if (!sendJsonOverWs({ type: "rtc.offer", session_id: sessionId, sdp: offer.sdp })) {
-          cleanupRtc(false);
+          cleanupRtc(false, false, rtcGeneration);
           return;
         }
         offerSent = true;
         for (const candidate of pendingLocalCandidates.splice(0)) sendRtcCandidate(candidate);
       } catch {
-        cleanupRtc();
+        cleanupRtc(true, false, rtcGeneration);
       } finally {
-        rtcStartInFlight = false;
+        if (isCurrentRtcGeneration()) rtcStartInFlight = false;
       }
     };
 
     const connect = () => {
-      if (cancelled) return;
+      if (!isActiveAgentGeneration()) return;
       setState("connecting");
       let ws: WebSocket;
       try {
@@ -617,8 +692,10 @@ export function useAgentSocket({
       }
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
+      const isCurrentWs = () => isActiveAgentGeneration() && wsRef.current === ws;
 
       ws.onopen = () => {
+        if (!isCurrentWs()) return;
         attempt = 0;
         // The selected subprotocol decides the data plane: v2 servers never
         // relay PTY bytes, so the DataChannel is the only live path.
@@ -627,7 +704,9 @@ export function useAgentSocket({
         setState("open");
       };
       ws.onmessage = (ev) => {
-        const h = handlersRef.current;
+        if (!isCurrentWs()) return;
+        const h = currentHandlers();
+        if (!h) return;
         if (typeof ev.data === "string") {
           const msg = parseInbound(ev.data);
           if (!msg) return;
@@ -675,6 +754,13 @@ export function useAgentSocket({
             const current = rtcRef.current;
             if (current.sessionId === msg.session_id && current.pc) {
               void current.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
+                if (
+                  !isCurrentWs() ||
+                  rtcRef.current.rtcGeneration !== current.rtcGeneration ||
+                  rtcRef.current.pc !== current.pc
+                ) {
+                  return;
+                }
                 const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
                 for (const candidate of pending) {
                   void current.pc?.addIceCandidate(candidate).catch(() => {});
@@ -711,9 +797,11 @@ export function useAgentSocket({
         }
       };
       ws.onerror = () => {
+        if (!isCurrentWs()) return;
         setState("error");
       };
       ws.onclose = () => {
+        if (!isCurrentAgentGeneration() || wsRef.current !== ws) return;
         cleanupRtc(false);
         wsRef.current = null;
         setState("closed");
@@ -722,7 +810,7 @@ export function useAgentSocket({
     };
 
     const scheduleReconnect = () => {
-      if (cancelled) return;
+      if (!isActiveAgentGeneration()) return;
       attempt += 1;
       const delay = Math.min(10_000, 500 * attempt);
       reconnectTimer = setTimeout(connect, delay);
@@ -734,15 +822,22 @@ export function useAgentSocket({
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-      if (wsRef.current) {
+      if (isCurrentAgentGeneration() && wsRef.current) {
+        const ws = wsRef.current;
         try {
           cleanupRtc(true);
-          wsRef.current.close(1000, "unmount");
+          wsRef.current = null;
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close(1000, "unmount");
         } catch {
           // ignore
         }
-        wsRef.current = null;
       }
+      pendingInputRef.current.clear();
+      if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
     };
   }, [agentId, enabled]);
 
@@ -756,12 +851,21 @@ export function useAgentSocket({
     }
     let cancelled = false;
     const poll = async () => {
-      const pc = rtcRef.current.pc;
+      const observed = rtcRef.current;
+      const pc = observed.pc;
       if (!pc) return;
       let stats: RTCStatsReport;
       try {
         stats = await pc.getStats();
       } catch {
+        return;
+      }
+      if (
+        rtcRef.current.pc !== pc ||
+        rtcRef.current.agentId !== observed.agentId ||
+        rtcRef.current.agentGeneration !== observed.agentGeneration ||
+        rtcRef.current.rtcGeneration !== observed.rtcGeneration
+      ) {
         return;
       }
       interface PairStats {
@@ -818,6 +922,7 @@ export function useAgentSocket({
   }, [dcOpen]);
 
   const sendBinary = (bytes: Uint8Array | string) => {
+    if (activeAgentIdRef.current !== agentId) return false;
     const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     const rtc = rtcRef.current;
     if (rtc.open && rtc.ptyDc?.readyState === "open") {
@@ -828,10 +933,7 @@ export function useAgentSocket({
     }
     if (wsV2Ref.current) {
       // No relay on v2: hold input until the DataChannel (re)opens.
-      if (pendingInputBytesRef.current + buf.byteLength > MAX_PENDING_INPUT_BYTES) return false;
-      pendingInputRef.current.push(buf.slice());
-      pendingInputBytesRef.current += buf.byteLength;
-      return true;
+      return pendingInputRef.current.enqueue(agentGenerationRef.current, buf);
     }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -841,6 +943,7 @@ export function useAgentSocket({
   };
 
   const sendJson = (msg: unknown) => {
+    if (activeAgentIdRef.current !== agentId) return false;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     if (wsV2Ref.current && typeof msg === "object" && msg !== null) {

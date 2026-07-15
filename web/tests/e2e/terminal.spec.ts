@@ -1,5 +1,5 @@
 import { devices, expect, type Page, test, type WebSocketRoute } from "@playwright/test";
-import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+import { AGENT_B_ID, AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 
 function b64(value: string) {
   return Buffer.from(value, "utf8").toString("base64");
@@ -304,6 +304,56 @@ test("terminal reconnect restores a fresh terminal history snapshot", async ({ p
   await expect(liveTerminalRows(page)).toContainText("RED");
   await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
   await expect(liveTerminalRows(page)).toContainText("after reconnect");
+});
+
+test("previous-agent callbacks remain scoped to the previous terminal", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
+  });
+  await mockAuthenticatedApi(page, {
+    agents: [
+      agent(),
+      agent({ id: AGENT_B_ID, name: "second", tmux_session: `spawn-second--${AGENT_B_ID}` }),
+    ],
+  });
+  const sockets = new Map<string, WebSocketRoute>();
+  await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+    const agentId = new URL(ws.url()).searchParams.get("agent_id") ?? "unknown";
+    sockets.set(agentId, ws);
+    ws.send(
+      JSON.stringify({
+        type: "history",
+        bytes_b64: b64(agentId === AGENT_ID ? "FIRST-AGENT\n" : "SECOND-AGENT\n"),
+      }),
+    );
+    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+  });
+
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(liveTerminalRows(page)).toContainText("FIRST-AGENT");
+  const firstSocket = sockets.get(AGENT_ID);
+  expect(firstSocket).toBeDefined();
+
+  await page.getByRole("link", { name: /second/i }).click();
+  await expect(page).toHaveURL(new RegExp(`/agents/${AGENT_B_ID}$`));
+  const secondAgentRows = page
+    .locator('[data-testid="terminal-live-host"]:visible .xterm-rows')
+    .last();
+  await expect(secondAgentRows).toContainText("SECOND-AGENT");
+  firstSocket?.send(JSON.stringify({ type: "history", bytes_b64: b64("STALE-FIRST-CALLBACK\n") }));
+  firstSocket?.send(
+    JSON.stringify({
+      type: "display.control",
+      owner: false,
+      cols: 222,
+      rows: 88,
+      viewers: 9,
+    }),
+  );
+  await page.waitForTimeout(100);
+
+  await expect(secondAgentRows).not.toContainText("STALE-FIRST-CALLBACK");
+  await expect(page.getByText("Another session has control · 222x88 · 9 viewers")).toBeHidden();
 });
 
 test("worker replay streams render exactly with geometry markers", async ({ page }) => {
