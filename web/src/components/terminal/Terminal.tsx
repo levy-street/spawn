@@ -137,6 +137,11 @@ export interface TerminalProps {
   /** Claim the shared display on attach (default). Viewers get a dimmed
    *  terminal with a centered take-control button either way. */
   autoTakeControl?: boolean;
+  /** Foreground (interactive) vs parked in a warm pool. A parked instance
+   *  (active=false) stays connected but passive: it never resizes the PTY or
+   *  takes control, so it can't disturb another client. Re-activating it
+   *  reclaims control and fits to its container. Default true. */
+  active?: boolean;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: AgentConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
@@ -157,6 +162,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onDisplayControl,
     onConnectionInfo,
     autoTakeControl = true,
+    active = true,
     onExit,
   },
   ref,
@@ -174,7 +180,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const firstControlSeenRef = useRef(false);
   const autoTakeControlRef = useRef(autoTakeControl);
   autoTakeControlRef.current = autoTakeControl;
+  // Foreground/parked state for the warm pool. A parked instance stays
+  // connected but never fits or resizes (see fitTerminal), so moving its host
+  // into an offscreen park can't churn the PTY geometry.
+  const activeRef = useRef(active);
+  const activePrevRef = useRef(active);
   const takeControlNowRef = useRef<() => boolean>(() => false);
+  useEffect(() => {
+    const was = activePrevRef.current;
+    activePrevRef.current = active;
+    activeRef.current = active;
+    if (active && !was) {
+      // Brought to the foreground from a parked state: reclaim control and fit
+      // to the now-visible container. Two rAFs let the host's appendChild move
+      // and the container's layout settle before we measure + resize.
+      requestAnimationFrame(() => requestAnimationFrame(() => takeControlNowRef.current()));
+    }
+  }, [active]);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -2125,6 +2147,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     const fitTerminal = (preserveScroll: boolean) => {
+      // Parked (background) instance: never fit or resize. Its host may be in
+      // an offscreen park at a different size; fitting would churn the PTY
+      // geometry and disturb whoever is actually looking at this agent. It
+      // reclaims + fits when re-activated (see the `active` effect).
+      if (!activeRef.current) return;
       const anchor = preserveScroll ? captureScrollAnchor() : null;
       const followerGeometry =
         coarsePointerRef.current && displayOwnerRef.current === false

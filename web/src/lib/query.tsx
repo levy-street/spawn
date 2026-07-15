@@ -2,6 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
+import { LiveTerminalProvider } from "@/components/terminal/LiveTerminalProvider";
 import { useViewportInset } from "@/lib/viewport";
 
 /**
@@ -41,5 +42,9 @@ export function AppProviders({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("load", onLoad);
   }, []);
 
-  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={client}>
+      <LiveTerminalProvider>{children}</LiveTerminalProvider>
+    </QueryClientProvider>
+  );
 }

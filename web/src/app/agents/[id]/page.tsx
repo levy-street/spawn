@@ -4,14 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, LayoutGrid } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
-import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
-import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
@@ -20,8 +19,6 @@ import { useAgentDrop } from "@/lib/dnd";
 import { collectAgentIds } from "@/lib/layout";
 import { defaultScreenName } from "@/lib/screens";
 import type { DisplayControlState } from "@/lib/ws";
-
-const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 
 export default function AgentDetailPage() {
   return (
@@ -39,24 +36,22 @@ function AgentTerminal() {
   const router = useRouter();
   const qc = useQueryClient();
 
-  const termRef = useRef<TerminalHandle>(null);
+  // The terminal is a shared warm instance from the pool; this page just
+  // claims it into `attach` and reads its handle + live state. Switching to a
+  // screen showing the same agent reuses the instance — no reconnect.
+  const { attach, getHandle, connInfo, displayState } = useLiveTerminal(id ?? null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [displayState, setDisplayState] = useState<DisplayControlState | null>(null);
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
-  const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
-
-  useEffect(() => {
-    const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
-    if (desktop) requestAnimationFrame(() => termRef.current?.focus());
-  }, []);
 
   useEffect(() => {
     if (!id) return;
-    setDisplayState(null);
     setEditingName(false);
-  }, [id]);
+    const desktop = window.matchMedia("(min-width: 768px) and (pointer: fine)").matches;
+    const t = setTimeout(() => desktop && getHandle()?.focus(), 160);
+    return () => clearTimeout(t);
+  }, [id, getHandle]);
 
   const q = useQuery({
     queryKey: ["agent", id],
@@ -134,7 +129,7 @@ function AgentTerminal() {
         <AgentSurfaceHeader
           agent={agent}
           connInfo={connInfo}
-          getHandle={() => termRef.current}
+          getHandle={getHandle}
           onError={setActionError}
           onStartRename={() => {
             setDraftName(agent.name ?? agentTitle(agent));
@@ -236,16 +231,7 @@ function AgentTerminal() {
               </span>
             </div>
           )}
-          <Terminal
-            ref={termRef}
-            agentId={id}
-            rawInput
-            mobileReturnMode="newline"
-            mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
-            imagePasteMode="bracketed-path"
-            onDisplayControl={setDisplayState}
-            onConnectionInfo={setConnInfo}
-          />
+          <div ref={attach} className="size-full" />
         </div>
         {filesOpen && agent && <AgentFilesAside agent={agent} />}
       </div>
@@ -253,21 +239,21 @@ function AgentTerminal() {
       <ModifierBar
         className="hidden [@media(pointer:coarse)]:flex"
         onSend={(b) => {
-          termRef.current?.sendInput(b);
-          requestAnimationFrame(() => termRef.current?.focus());
+          getHandle()?.sendInput(b);
+          requestAnimationFrame(() => getHandle()?.focus());
         }}
         onPaste={(data) => {
-          termRef.current?.pasteDataTransfer(data);
+          getHandle()?.pasteDataTransfer(data);
         }}
         onPasteText={(text) => {
-          termRef.current?.pasteText(text);
+          getHandle()?.pasteText(text);
         }}
         onPasteClick={() => {
-          void termRef.current?.pasteFromClipboard();
+          void getHandle()?.pasteFromClipboard();
         }}
         onSubmit={() => {
-          termRef.current?.submit();
-          requestAnimationFrame(() => termRef.current?.focus());
+          getHandle()?.submit();
+          requestAnimationFrame(() => getHandle()?.focus());
         }}
       />
     </div>
