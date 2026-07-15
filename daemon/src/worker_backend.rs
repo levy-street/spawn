@@ -17,6 +17,8 @@
 //!   directory (the worker greets every connection with `Hello`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -292,14 +294,22 @@ fn assemble(
 
     let (read_half, write_half) = stream.into_split();
     let pending: PendingReplays = Default::default();
+    let alive = Arc::new(AtomicBool::new(true));
 
-    tokio::spawn(run_writer(write_half, cmd_rx, pending.clone(), agent_id));
+    tokio::spawn(run_writer(
+        write_half,
+        cmd_rx,
+        pending.clone(),
+        Arc::clone(&alive),
+        agent_id,
+    ));
     tokio::spawn(run_reader(
         read_half,
         outbox_tx.clone(),
         control.clone(),
         exit_tx,
         pending,
+        Arc::clone(&alive),
         agent_id,
     ));
 
@@ -307,6 +317,7 @@ fn assemble(
         agent_id,
         session,
         cmd_tx,
+        alive,
         cols,
         rows,
         outbox_tx,
@@ -329,9 +340,13 @@ async fn run_writer(
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     mut cmd_rx: mpsc::UnboundedReceiver<WorkerCmd>,
     pending: PendingReplays,
+    alive: Arc<AtomicBool>,
     agent_id: Uuid,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
+        if !alive.load(Ordering::Acquire) {
+            break;
+        }
         let res = match cmd {
             WorkerCmd::Input(bytes) => {
                 wire::write_frame(&mut write_half, wire::T_INPUT, &bytes).await
@@ -367,7 +382,12 @@ async fn run_writer(
             break;
         }
     }
+    alive.store(false, Ordering::Release);
     // Fail any replay waiters still queued.
+    fail_pending_replays(&pending);
+}
+
+fn fail_pending_replays(pending: &PendingReplays) {
     let mut pending = pending.lock().expect("pending lock");
     while let Some(waiter) = pending.pop_front() {
         let _ = waiter.send(Err(anyhow!("worker connection closed")));
@@ -381,22 +401,32 @@ async fn run_reader(
     control: ForwarderControl,
     exit_tx: oneshot::Sender<ExitReason>,
     pending: PendingReplays,
+    alive: Arc<AtomicBool>,
     agent_id: Uuid,
 ) {
     let mut exit_tx = Some(exit_tx);
     loop {
         match wire::read_frame(&mut read_half).await {
-            Ok(Some((wire::T_OUTPUT, payload))) => {
-                let chunk = pty::OutputChunk::classify(payload, &control);
-                if outbox_tx.send(chunk).is_err() {
+            Ok(Some((wire::T_OUTPUT, payload))) => match wire::decode_output(&payload) {
+                Ok((watermark, bytes)) => {
+                    let chunk =
+                        pty::OutputChunk::classify_at_source(bytes.to_vec(), watermark, &control);
+                    if outbox_tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%agent_id, %error, "invalid worker output frame");
                     break;
                 }
-            }
+            },
             Ok(Some((wire::T_REPLAY, payload))) => {
                 let waiter = pending.lock().expect("pending lock").pop_front();
                 if let Some(waiter) = waiter {
-                    let result = wire::decode_replay(&payload)
-                        .map(|(watermark, bytes)| (watermark, bytes.to_vec()));
+                    let result = wire::decode_replay(&payload).map(|(watermark, bytes)| {
+                        let _ = outbox_tx.send(pty::OutputChunk::source_barrier(watermark));
+                        (watermark, bytes.to_vec())
+                    });
                     let _ = waiter.send(result);
                 }
             }
@@ -436,6 +466,8 @@ async fn run_reader(
             }
         }
     }
+    alive.store(false, Ordering::Release);
+    fail_pending_replays(&pending);
 }
 
 async fn connect_with_retry(socket: &std::path::Path, timeout: Duration) -> Result<UnixStream> {
@@ -493,12 +525,17 @@ mod tests {
             control,
             exit_tx,
             Default::default(),
+            Arc::new(AtomicBool::new(true)),
             agent_id,
         ));
 
-        wire::write_frame(&mut worker_stream, wire::T_OUTPUT, b"12:34")
-            .await
-            .expect("worker output");
+        wire::write_frame(
+            &mut worker_stream,
+            wire::T_OUTPUT,
+            &wire::encode_output(5, b"12:34"),
+        )
+        .await
+        .expect("worker output");
         assert!(matches!(
             sink_rx.recv().await.unwrap(),
             pty::WsOutbound::Binary(_)
@@ -535,10 +572,7 @@ mod tests {
             .expect("worker bin path")
     }
 
-    async fn collect_direct_until(
-        rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-        needle: &[u8],
-    ) -> Vec<u8> {
+    async fn collect_direct_until(rx: &mut mpsc::Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
         let mut acc = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -600,18 +634,32 @@ mod tests {
         launched.handle.control.set_sink(ws_tx).await;
         tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
 
-        // DataChannel-style direct sink sees live output.
-        let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
+        // Establish the same replay barrier used before a real DataChannel is
+        // registered. Historical worker watermarks may predate this spawnd.
+        let initial_replay_rx = launched.handle.worker_replay(1 << 20).expect("replay req");
+        let (initial_watermark, initial_bytes) = initial_replay_rx
+            .await
+            .expect("replay resp")
+            .expect("replay ok");
         launched
             .handle
             .control
-            .add_direct_sink("test-dc".into(), dc_tx)
+            .wait_source_offset(initial_watermark)
             .await;
-        collect_direct_until(&mut dc_rx, b"wb-hello").await;
+        let initial_replay_has_hello = String::from_utf8_lossy(&initial_bytes).contains("wb-hello");
 
+        // DataChannel-style direct sink sees output after its exact origin.
+        let mut direct = launched
+            .handle
+            .control
+            .add_direct_sink("test-dc".into())
+            .await;
+        if !initial_replay_has_hello {
+            collect_direct_until(&mut direct.receiver, b"wb-hello").await;
+        }
         // stdin through the handle reaches the PTY (cat echoes).
         launched.handle.write_stdin(b"ping-1\n").expect("stdin");
-        collect_direct_until(&mut dc_rx, b"ping-1").await;
+        collect_direct_until(&mut direct.receiver, b"ping-1").await;
 
         // Replay covers everything so far.
         let replay_rx = launched.handle.worker_replay(1 << 20).expect("replay req");
@@ -636,15 +684,28 @@ mod tests {
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
         adopted.handle.control.set_sink(ws_tx).await;
         tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
-        let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
+        let adopted_replay_rx = adopted
+            .handle
+            .worker_replay(1 << 20)
+            .expect("adopt replay req");
+        let (adopted_watermark, adopted_bytes) = adopted_replay_rx
+            .await
+            .expect("adopt replay resp")
+            .expect("adopt replay ok");
         adopted
             .handle
             .control
-            .add_direct_sink("test-dc-2".into(), dc_tx)
+            .wait_source_offset(adopted_watermark)
+            .await;
+        assert!(String::from_utf8_lossy(&adopted_bytes).contains("ping-1"));
+        let mut direct = adopted
+            .handle
+            .control
+            .add_direct_sink("test-dc-2".into())
             .await;
 
         adopted.handle.write_stdin(b"ping-2\n").expect("stdin");
-        collect_direct_until(&mut dc_rx, b"ping-2").await;
+        collect_direct_until(&mut direct.receiver, b"ping-2").await;
 
         // Shutdown: exit_rx resolves and the worker cleans up its socket.
         assert!(adopted.handle.worker_shutdown(Some("TERM".into())));
@@ -663,6 +724,12 @@ mod tests {
                 "worker socket never went away"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if let Some(replay_after_exit) = adopted.handle.worker_replay(1 << 20) {
+            assert!(
+                !matches!(replay_after_exit.await, Ok(Ok(_))),
+                "replay unexpectedly remained available after worker exit"
+            );
         }
     }
 

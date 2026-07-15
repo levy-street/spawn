@@ -111,18 +111,21 @@ pub enum Outbound {
     #[serde(rename = "rtc.answer")]
     RtcAnswer {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
         sdp: String,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
         status: String,
         #[serde(default)]
@@ -258,6 +261,7 @@ pub enum Inbound {
     #[serde(rename = "rtc.offer")]
     RtcOffer {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
         sdp: String,
         #[serde(default)]
@@ -266,12 +270,14 @@ pub enum Inbound {
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.close")]
     RtcClose {
         session_id: String,
+        generation: String,
         agent_id: Uuid,
     },
 }

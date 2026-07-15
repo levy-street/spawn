@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 /// Upper bound on a single frame payload. Replay responses dominate; they are
 /// capped well below this by the scrollback budget.
@@ -105,6 +105,23 @@ pub fn decode_resize(payload: &[u8]) -> Result<(u16, u16)> {
     let cols = u16::from_le_bytes([payload[0], payload[1]]);
     let rows = u16::from_le_bytes([payload[2], payload[3]]);
     Ok((cols, rows))
+}
+
+/// Payload of `T_OUTPUT`: `u64 LE watermark` (total PTY output bytes logged
+/// after this chunk) followed by the raw output bytes.
+pub fn encode_output(watermark: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + bytes.len());
+    buf.extend_from_slice(&watermark.to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf
+}
+
+pub fn decode_output(payload: &[u8]) -> Result<(u64, &[u8])> {
+    if payload.len() < 8 {
+        bail!("output payload too short: {}", payload.len());
+    }
+    let watermark = u64::from_le_bytes(payload[..8].try_into().expect("checked length"));
+    Ok((watermark, &payload[8..]))
 }
 
 /// Payload of `T_REPLAY_REQ`: max plaintext bytes the caller wants back, LE.
@@ -245,6 +262,15 @@ mod tests {
         assert_eq!(watermark, 987_654);
         assert_eq!(bytes, b"screen bytes");
         assert!(decode_replay(&buf[..7]).is_err());
+    }
+
+    #[test]
+    fn output_round_trip() {
+        let buf = encode_output(42, b"\xf0\x9f\x98\x80\x1b[31m");
+        let (watermark, bytes) = decode_output(&buf).unwrap();
+        assert_eq!(watermark, 42);
+        assert_eq!(bytes, b"\xf0\x9f\x98\x80\x1b[31m");
+        assert!(decode_output(&buf[..7]).is_err());
     }
 
     #[tokio::test]

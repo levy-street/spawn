@@ -80,6 +80,16 @@ def _valid_rtc_session_id(value: object) -> str | None:
     return value
 
 
+def _valid_rtc_generation(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 32:
+        return None
+    try:
+        int(value, 16)
+    except ValueError:
+        return None
+    return value
+
+
 def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
@@ -324,14 +334,17 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "rtc.answer":
                     aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    generation = _valid_rtc_generation(obj.get("generation"))
                     sdp = obj.get("sdp")
-                    if aid and session_id and isinstance(sdp, str):
+                    if aid and session_id and generation and isinstance(sdp, str):
                         async with sm() as session:
                             agent = await session.get(Agent, aid)
                             if agent is None or agent.host_id != host.id:
                                 log.warning("rtc answer for unknown agent=%s", aid)
                                 continue
-                        browser = await broker.browser_for_rtc_session(session_id)
+                        browser = await broker.browser_for_rtc_signal(
+                            session_id, aid, conn, generation
+                        )
                         if browser is not None:
                             try:
                                 await browser.send_text(
@@ -348,14 +361,17 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "rtc.candidate":
                     aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    generation = _valid_rtc_generation(obj.get("generation"))
                     candidate = _valid_rtc_candidate(obj.get("candidate"))
-                    if aid and session_id and candidate is not None:
+                    if aid and session_id and generation and candidate is not None:
                         async with sm() as session:
                             agent = await session.get(Agent, aid)
                             if agent is None or agent.host_id != host.id:
                                 log.warning("rtc candidate for unknown agent=%s", aid)
                                 continue
-                        browser = await broker.browser_for_rtc_session(session_id)
+                        browser = await broker.browser_for_rtc_signal(
+                            session_id, aid, conn, generation
+                        )
                         if browser is not None:
                             try:
                                 await browser.send_text(
@@ -372,9 +388,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "rtc.status":
                     aid = obj.get("agent_id")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    generation = _valid_rtc_generation(obj.get("generation"))
                     status_value = obj.get("status")
-                    if aid and session_id and isinstance(status_value, str):
-                        browser = await broker.browser_for_rtc_session(session_id)
+                    if aid and session_id and generation and isinstance(status_value, str):
+                        browser = await broker.browser_for_rtc_signal(
+                            session_id, aid, conn, generation
+                        )
                         if browser is not None:
                             payload = {
                                 "type": "rtc.status",

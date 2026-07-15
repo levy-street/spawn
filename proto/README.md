@@ -216,16 +216,19 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid",
  "sdp": "v=0..."}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid",
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.status",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid",
  "status": "connected|failed",
  "message": "optional detail"}
@@ -393,17 +396,20 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
 
 {"type": "rtc.offer",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid",
  "sdp": "v=0...",
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid",
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.close",
  "session_id": "browser-generated-id",
+ "generation": "server-generated-hex",
  "agent_id": "uuid"}
 ```
 
@@ -547,11 +553,23 @@ Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
 
 `spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
-between them. Replay metadata therefore carries `pty_offset`, the cumulative
-bytes queued to that viewer before capture. The browser buffers live PTY data
-during bootstrap, applies the replay, discards buffered bytes through the
+between them. Replay metadata therefore carries `pty_offset`, the exact
+per-viewer `spawn.pty` byte boundary represented by the replay. Worker output
+and replay share the worker's durable watermark, translated through the
+viewer's attach origin. Tmux briefly stops the pane process group, drains its
+forwarder, captures and samples the boundary atomically, then resumes and
+forces a repaint; cancellation also resumes it. The browser buffers live PTY
+data during bootstrap, applies the replay, discards buffered bytes through the
 anchor, and then applies only the suffix. Snapshot reconciliation uses the
 same explicit anchor; it never infers capture order from message arrival.
+
+The signaling server binds each active RTC session ID to its browser
+connection, agent, daemon connection and a server-minted generation. Active ID
+collisions are rejected, and every candidate, close, answer and status must
+match that binding; stale generations cannot affect a replacement session.
+Per-viewer live and response queues are bounded. A viewer that stalls SCTP
+beyond the send timeout is disconnected and obtains a new bounded replay when
+it reconnects; display-state updates are latest-value/coalesced.
 
 ## Versioning
 

@@ -368,9 +368,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             }
                         }
                         if let Some(w) = conn_write.as_mut() {
-                            if wire::write_frame(w, wire::T_OUTPUT, &chunk).await.is_err() {
+                            let watermark = log
+                                .as_ref()
+                                .map_or(0, |active_log| active_log.total_logged());
+                            let framed = wire::encode_output(watermark, &chunk);
+                            if wire::write_frame(w, wire::T_OUTPUT, &framed).await.is_err() {
                                 conn_write = None;
                             }
+                            secret::wipe_vec(framed);
                         }
                         chunk.zeroize();
                     }

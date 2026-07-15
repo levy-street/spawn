@@ -780,7 +780,7 @@ export function useAgentSocket({
             if (
               msg.session_id &&
               rtcRef.current.sessionId === msg.session_id &&
-              ["failed", "disabled", "unavailable"].includes(msg.status)
+              ["failed", "disabled", "unavailable", "collision"].includes(msg.status)
             ) {
               cleanupRtc(false, msg.status !== "disabled");
             }

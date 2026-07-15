@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -17,6 +17,7 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub const MAX_REPLAY_BYTES: usize = 12 * 1024 * 1024;
 pub const CHUNK_PAYLOAD_BYTES: usize = 48 * 1024;
 pub const OUTBOUND_QUEUE_DEPTH: usize = 64;
+pub const OUTBOUND_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub const MAX_HISTORY_LINES: u16 = 10_000;
 pub const MIN_COLS: u16 = 20;
 pub const MAX_COLS: u16 = 400;
@@ -36,6 +37,7 @@ pub enum ControlOutbound {
 }
 
 pub type ControlSender = mpsc::Sender<ControlOutbound>;
+pub type DisplaySender = watch::Sender<Option<String>>;
 
 #[derive(Debug, Deserialize)]
 pub struct ControlRequest {
@@ -220,6 +222,27 @@ struct ReplayResponse<'a> {
     chunks: usize,
 }
 
+async fn enqueue(
+    sender: &ControlSender,
+    message: ControlOutbound,
+    request_id: Option<Uuid>,
+) -> Result<(), ProtocolError> {
+    sender
+        .send_timeout(message, OUTBOUND_ENQUEUE_TIMEOUT)
+        .await
+        .map_err(|error| {
+            let code = match error {
+                mpsc::error::SendTimeoutError::Timeout(_) => "viewer_backpressure",
+                mpsc::error::SendTimeoutError::Closed(_) => "channel_closed",
+            };
+            ProtocolError::new(
+                request_id,
+                code,
+                "spawn.ctl viewer is not accepting responses",
+            )
+        })
+}
+
 pub async fn send_error(sender: &ControlSender, error: &ProtocolError) {
     let response = ErrorResponse {
         version: PROTOCOL_VERSION,
@@ -232,11 +255,15 @@ pub async fn send_error(sender: &ControlSender, error: &ProtocolError) {
         },
     };
     if let Ok(text) = serde_json::to_string(&response) {
-        let _ = sender.send(ControlOutbound::Text(text)).await;
+        let _ = enqueue(sender, ControlOutbound::Text(text), error.request_id).await;
     }
 }
 
-pub async fn send_ack(sender: &ControlSender, request_id: Uuid, operation: &str) {
+pub async fn send_ack(
+    sender: &ControlSender,
+    request_id: Uuid,
+    operation: &str,
+) -> Result<(), ProtocolError> {
     let response = AckResponse {
         version: PROTOCOL_VERSION,
         kind: "response",
@@ -244,9 +271,14 @@ pub async fn send_ack(sender: &ControlSender, request_id: Uuid, operation: &str)
         operation,
         ok: true,
     };
-    if let Ok(text) = serde_json::to_string(&response) {
-        let _ = sender.send(ControlOutbound::Text(text)).await;
-    }
+    let text = serde_json::to_string(&response).map_err(|error| {
+        ProtocolError::new(
+            Some(request_id),
+            "encode_failed",
+            &format!("encoding acknowledgement failed: {error}"),
+        )
+    })?;
+    enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await
 }
 
 pub async fn send_replay(
@@ -283,23 +315,15 @@ pub async fn send_replay(
             &format!("encoding replay metadata failed: {error}"),
         )
     })?;
-    sender
-        .send(ControlOutbound::Text(text))
-        .await
-        .map_err(|_| ProtocolError::new(Some(request_id), "channel_closed", "channel closed"))?;
+    enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await?;
     for (sequence, payload) in bytes.chunks(CHUNK_PAYLOAD_BYTES).enumerate() {
         let last = sequence + 1 == chunks;
-        sender
-            .send(ControlOutbound::Binary(encode_chunk(
-                request_id,
-                sequence as u32,
-                last,
-                payload,
-            )))
-            .await
-            .map_err(|_| {
-                ProtocolError::new(Some(request_id), "channel_closed", "channel closed")
-            })?;
+        enqueue(
+            sender,
+            ControlOutbound::Binary(encode_chunk(request_id, sequence as u32, last, payload)),
+            Some(request_id),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -320,26 +344,44 @@ fn encode_chunk(request_id: Uuid, sequence: u32, last: bool, payload: &[u8]) -> 
 #[derive(Clone, Default)]
 pub struct AgentControlHub {
     inner: Arc<Mutex<HashMap<Uuid, DisplayState>>>,
+    transactions: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Default)]
 struct DisplayState {
-    viewers: HashMap<String, ControlSender>,
+    viewers: HashMap<String, ViewerEntry>,
     order: Vec<String>,
     owner: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
 
+struct ViewerEntry {
+    display: DisplaySender,
+}
+
 impl AgentControlHub {
-    pub async fn register(&self, agent_id: Uuid, session_id: String, sender: ControlSender) {
+    pub async fn transaction(&self, agent_id: Uuid) -> Arc<Mutex<()>> {
+        self.transactions
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn register(&self, agent_id: Uuid, session_id: String, display: DisplaySender) {
+        let transaction = self.transaction(agent_id).await;
+        let _guard = transaction.lock().await;
         {
             let mut states = self.inner.lock().await;
             let state = states.entry(agent_id).or_default();
             if !state.viewers.contains_key(&session_id) {
                 state.order.push(session_id.clone());
             }
-            state.viewers.insert(session_id.clone(), sender);
+            state
+                .viewers
+                .insert(session_id.clone(), ViewerEntry { display });
             state.order.retain(|id| state.viewers.contains_key(id));
             if state
                 .owner
@@ -353,6 +395,12 @@ impl AgentControlHub {
     }
 
     pub async fn unregister(&self, agent_id: Uuid, session_id: &str) {
+        let transaction = self.transaction(agent_id).await;
+        let _guard = transaction.lock().await;
+        self.unregister_in_transaction(agent_id, session_id).await;
+    }
+
+    async fn unregister_in_transaction(&self, agent_id: Uuid, session_id: &str) {
         let should_broadcast = {
             let mut states = self.inner.lock().await;
             let Some(state) = states.get_mut(&agent_id) else {
@@ -467,7 +515,7 @@ impl AgentControlHub {
             state
                 .viewers
                 .iter()
-                .filter_map(|(session_id, sender)| {
+                .filter_map(|(session_id, viewer)| {
                     let event = DisplayEvent {
                         version: PROTOCOL_VERSION,
                         kind: "event",
@@ -479,15 +527,15 @@ impl AgentControlHub {
                     };
                     serde_json::to_string(&event)
                         .ok()
-                        .map(|text| (sender.clone(), text))
+                        .map(|text| (viewer.display.clone(), text))
                 })
                 .collect::<Vec<_>>()
         };
         for (sender, text) in messages {
-            // Preserve state transitions behind any already-queued response
-            // chunks for this viewer. The queue is bounded; a closed channel
-            // fails immediately and its RTC cleanup removes the viewer.
-            let _ = sender.send(ControlOutbound::Text(text)).await;
+            // Display state is latest-value state, not an event log. A watch
+            // channel coalesces updates for a stalled viewer without blocking
+            // every other viewer behind its full response queue.
+            sender.send_replace(Some(text));
         }
     }
 }
@@ -585,35 +633,107 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_control_viewer_is_disconnected_by_bounded_enqueue() {
+        let request_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ControlOutbound::Text("occupied".into()))
+            .await
+            .unwrap();
+
+        let blocked_tx = tx.clone();
+        let blocked = tokio::spawn(async move {
+            send_ack(&blocked_tx, request_id, "redraw")
+                .await
+                .unwrap_err()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(OUTBOUND_ENQUEUE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+
+        let error = blocked.await.unwrap();
+        assert_eq!(error.request_id, Some(request_id));
+        assert_eq!(error.code, "viewer_backpressure");
+    }
+
     #[tokio::test]
     async fn display_ownership_promotes_and_notifies_multiple_viewers() {
         let hub = AgentControlHub::default();
         let agent_id = Uuid::new_v4();
-        let (first_tx, mut first_rx) = mpsc::channel(8);
-        let (second_tx, mut second_rx) = mpsc::channel(8);
+        let (first_tx, first_rx) = watch::channel(None);
+        let (second_tx, second_rx) = watch::channel(None);
         hub.register(agent_id, "first".into(), first_tx).await;
         assert!(hub.is_owner(agent_id, "first").await);
         hub.register(agent_id, "second".into(), second_tx).await;
         assert!(!hub.is_owner(agent_id, "second").await);
+        assert!(first_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":true") && text.contains("\"viewers\":2")));
+        assert!(second_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":false")));
+
+        let transaction = hub.transaction(agent_id).await;
+        let guard = transaction.lock().await;
         hub.take_control(agent_id, "second", 132, 40).await;
         assert!(hub.is_owner(agent_id, "second").await);
+        assert!(first_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":false")));
+        assert!(second_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":true")));
+        drop(guard);
+
         hub.unregister(agent_id, "second").await;
         assert!(hub.is_owner(agent_id, "first").await);
+        assert!(first_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":true") && text.contains("\"viewers\":1")));
+    }
 
-        let mut first_events = Vec::new();
-        while let Ok(ControlOutbound::Text(text)) = first_rx.try_recv() {
-            first_events.push(text);
-        }
-        assert!(first_events
-            .iter()
-            .any(|text| { text.contains("\"owner\":false") && text.contains("\"viewers\":2") }));
-        assert!(first_events.last().unwrap().contains("\"owner\":true"));
-        let mut second_events = Vec::new();
-        while let Ok(ControlOutbound::Text(text)) = second_rx.try_recv() {
-            second_events.push(text);
-        }
-        assert!(second_events
-            .iter()
-            .any(|text| text.contains("\"owner\":true")));
+    #[tokio::test]
+    async fn ownership_backend_await_and_disconnect_are_one_agent_transaction() {
+        let hub = AgentControlHub::default();
+        let agent_id = Uuid::new_v4();
+        let (first_tx, first_rx) = watch::channel(None);
+        let (second_tx, second_rx) = watch::channel(None);
+        hub.register(agent_id, "first".into(), first_tx).await;
+        hub.register(agent_id, "second".into(), second_tx).await;
+
+        let transaction = hub.transaction(agent_id).await;
+        let transfer_hub = hub.clone();
+        let transfer_transaction = transaction.clone();
+        let transfer = tokio::spawn(async move {
+            let _guard = transfer_transaction.lock().await;
+            // Represents the awaited backend resize. Ownership is not exposed
+            // until the same transaction commits its geometry.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            transfer_hub.take_control(agent_id, "second", 140, 44).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let disconnect_hub = hub.clone();
+        let disconnect = tokio::spawn(async move {
+            disconnect_hub.unregister(agent_id, "second").await;
+        });
+        assert!(!disconnect.is_finished());
+
+        transfer.await.unwrap();
+        disconnect.await.unwrap();
+        assert!(hub.is_owner(agent_id, "first").await);
+        assert!(first_rx.borrow().as_ref().is_some_and(|text| {
+            text.contains("\"owner\":true")
+                && text.contains("\"cols\":140")
+                && text.contains("\"viewers\":1")
+        }));
+        assert!(second_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| text.contains("\"owner\":true")));
     }
 }

@@ -575,12 +575,25 @@ async def browser_ws(
                             }
                         )
                         continue
-                    await broker.register_rtc_session(session_id, conn)
+                    binding = await broker.register_rtc_session(
+                        session_id, conn, agent_id, daemon
+                    )
+                    if binding is None:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "status": "collision",
+                                "message": "RTC session ID is already active.",
+                            }
+                        )
+                        continue
                     try:
                         await daemon.send_text(
                             {
                                 "type": "rtc.offer",
                                 "session_id": session_id,
+                                "generation": binding.generation,
                                 "agent_id": agent_id,
                                 "sdp": sdp,
                                 "ice_servers": ice_servers_for_session(
@@ -590,7 +603,7 @@ async def browser_ws(
                         )
                     except Exception as e:
                         log.warning("rtc offer forward failed: %s", e)
-                        await broker.unregister_rtc_session(session_id, conn)
+                        await broker.unregister_rtc_session(session_id, conn, agent_id)
                         await conn.send_text(
                             {
                                 "type": "rtc.status",
@@ -604,16 +617,15 @@ async def browser_ws(
                     candidate = _valid_rtc_candidate(obj.get("candidate"))
                     if session_id is None or candidate is None:
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is None:
+                    binding = await broker.rtc_binding_for_browser(session_id, conn, agent_id)
+                    if binding is None:
                         continue
                     try:
-                        await daemon.send_text(
+                        await binding.daemon.send_text(
                             {
                                 "type": "rtc.candidate",
                                 "session_id": session_id,
+                                "generation": binding.generation,
                                 "agent_id": agent_id,
                                 "candidate": candidate,
                             }
@@ -624,16 +636,14 @@ async def browser_ws(
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     if session_id is None:
                         continue
-                    await broker.unregister_rtc_session(session_id, conn)
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
+                    binding = await broker.unregister_rtc_session(session_id, conn, agent_id)
+                    if binding is not None:
                         try:
-                            await daemon.send_text(
+                            await binding.daemon.send_text(
                                 {
                                     "type": "rtc.close",
                                     "session_id": session_id,
+                                    "generation": binding.generation,
                                     "agent_id": agent_id,
                                 }
                             )
@@ -650,20 +660,19 @@ async def browser_ws(
                 await pump_task
             except (asyncio.CancelledError, Exception):
                 pass
-        session_ids = await broker.unregister_rtc_sessions_for(conn)
-        daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
-        if daemon is not None:
-            for session_id in session_ids:
-                try:
-                    await daemon.send_text(
-                        {
-                            "type": "rtc.close",
-                            "session_id": session_id,
-                            "agent_id": agent_id,
-                        }
-                    )
-                except Exception:
-                    pass
+        bindings = await broker.unregister_rtc_sessions_for(conn)
+        for binding in bindings:
+            try:
+                await binding.daemon.send_text(
+                    {
+                        "type": "rtc.close",
+                        "session_id": binding.session_id,
+                        "generation": binding.generation,
+                        "agent_id": binding.agent_id,
+                    }
+                )
+            except Exception:
+                pass
         if not v2:
             await broker.detach_browser(conn)
             await _broadcast_display_control(agent_id)

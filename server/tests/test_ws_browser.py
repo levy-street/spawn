@@ -12,7 +12,7 @@ from spawn_server import auth, transcript
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
-from spawn_server.ws.broker import DaemonConn, get_broker
+from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
 from spawn_server.ws.browser import INITIAL_SNAPSHOT_LINES, browser_ws
 from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 
@@ -365,6 +365,8 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         lambda: any(json.loads(item).get("type") == "rtc.offer" for item in daemon_ws.sent_text)
     )
     offer = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "rtc.offer"][-1]
+    generation = offer.pop("generation")
+    assert isinstance(generation, str) and len(generation) == 32
     assert offer == {
         "type": "rtc.offer",
         "session_id": "rtc-browser-1",
@@ -383,6 +385,7 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         for item in daemon_ws.sent_text
         if json.loads(item).get("type") == "rtc.candidate"
     ][-1]
+    assert rtc_candidate.pop("generation") == generation
     assert rtc_candidate == {
         "type": "rtc.candidate",
         "session_id": "rtc-browser-1",
@@ -393,6 +396,35 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
     await broker.unregister_daemon(daemon)
+
+
+async def test_rtc_session_binding_rejects_reuse_and_stale_browser_actions():
+    broker = get_broker()
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id="host-a", user_id="user-a", websocket=daemon_ws)  # type: ignore[arg-type]
+    first = BrowserConn(
+        user_id="user-a", agent_id="agent-a", websocket=FakeBrowserWebSocket()
+    )  # type: ignore[arg-type]
+    second = BrowserConn(
+        user_id="user-a", agent_id="agent-a", websocket=FakeBrowserWebSocket()
+    )  # type: ignore[arg-type]
+
+    binding = await broker.register_rtc_session("reused-id", first, "agent-a", daemon)
+    assert binding is not None
+    assert await broker.register_rtc_session("reused-id", second, "agent-a", daemon) is None
+    assert await broker.rtc_binding_for_browser("reused-id", second, "agent-a") is None
+    assert await broker.rtc_binding_for_browser("reused-id", first, "agent-b") is None
+    assert await broker.unregister_rtc_session("reused-id", second, "agent-a") is None
+    assert await broker.rtc_binding_for_browser("reused-id", first, "agent-a") == binding
+
+    assert await broker.unregister_rtc_session("reused-id", first, "agent-a") == binding
+    replacement = await broker.register_rtc_session("reused-id", second, "agent-a", daemon)
+    assert replacement is not None
+    assert replacement.generation != binding.generation
+    # A stale close from the old browser cannot remove the replacement.
+    assert await broker.unregister_rtc_session("reused-id", first, "agent-a") is None
+    assert await broker.rtc_binding_for_browser("reused-id", second, "agent-a") == replacement
+    await broker.unregister_rtc_session("reused-id", second, "agent-a")
 
 
 async def test_browser_ws_fans_out_live_bytes_and_isolates_agents(client):

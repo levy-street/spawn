@@ -100,7 +100,8 @@ async fn collect_output_until(stream: &mut UnixStream, needle: &[u8]) -> Vec<u8>
         );
         let (frame_type, payload) = read_frame(stream).await;
         if frame_type == wire::T_OUTPUT {
-            acc.extend_from_slice(&payload);
+            let (_watermark, bytes) = wire::decode_output(&payload).expect("valid output frame");
+            acc.extend_from_slice(bytes);
             if acc.windows(needle.len()).any(|w| w == needle) {
                 return acc;
             }

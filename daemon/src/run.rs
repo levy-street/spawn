@@ -405,14 +405,14 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcOffer {
                     session_id,
+                    generation,
                     agent_id,
                     sdp,
                     ice_servers,
                 } => {
                     rtc_sessions
                         .handle_offer(
-                            session_id,
-                            agent_id,
+                            crate::rtc::RtcSessionBinding::new(session_id, generation, agent_id),
                             sdp,
                             ice_servers,
                             registry.clone(),
@@ -422,16 +422,20 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcCandidate {
                     session_id,
-                    agent_id: _,
+                    generation,
+                    agent_id,
                     candidate,
                 } => {
-                    rtc_sessions.handle_candidate(session_id, candidate).await;
+                    rtc_sessions
+                        .handle_candidate(session_id, generation, agent_id, candidate)
+                        .await;
                 }
                 Inbound::RtcClose {
                     session_id,
-                    agent_id: _,
+                    generation,
+                    agent_id,
                 } => {
-                    rtc_sessions.close(&session_id).await;
+                    rtc_sessions.close(&session_id, &generation, agent_id).await;
                 }
             },
             WsInbound::Binary {

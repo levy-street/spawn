@@ -12,7 +12,7 @@ from sqlalchemy import select
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host, User
-from spawn_server.ws.broker import BrowserConn, get_broker
+from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 
@@ -217,15 +217,34 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     browser_ws = FakeDaemonWebSocket()
     browser_conn = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
     broker = get_broker()
-    await broker.register_rtc_session("rtc-daemon-1", browser_conn)
 
     ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    await _wait_until(lambda: broker.get_daemon_for_host(host_id) is not None)
+    daemon_conn = broker.get_daemon_for_host(host_id)
+    assert daemon_conn is not None
+    binding = await broker.register_rtc_session(
+        "rtc-daemon-1", browser_conn, agent_id, daemon_conn
+    )
+    assert binding is not None
 
     ws.queue_text(
         {
             "type": "rtc.answer",
             "session_id": "rtc-daemon-1",
+            "generation": "0" * 32,
+            "agent_id": agent_id,
+            "sdp": "stale",
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert _sent_json(browser_ws) == []
+
+    ws.queue_text(
+        {
+            "type": "rtc.answer",
+            "session_id": "rtc-daemon-1",
+            "generation": binding.generation,
             "agent_id": agent_id,
             "sdp": "v=0\r\n",
         }
@@ -243,6 +262,7 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         {
             "type": "rtc.candidate",
             "session_id": "rtc-daemon-1",
+            "generation": binding.generation,
             "agent_id": agent_id,
             "candidate": candidate,
         }
@@ -261,6 +281,7 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         {
             "type": "rtc.status",
             "session_id": "rtc-daemon-1",
+            "generation": binding.generation,
             "agent_id": agent_id,
             "status": "connected",
         }
@@ -275,7 +296,43 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
-    await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
+    await broker.unregister_rtc_session("rtc-daemon-1", browser_conn, agent_id)
+
+
+async def test_rtc_signal_binding_rejects_wrong_daemon_agent_and_generation():
+    broker = get_broker()
+    browser = BrowserConn(
+        user_id="user-a", agent_id="agent-a", websocket=FakeDaemonWebSocket()
+    )  # type: ignore[arg-type]
+    daemon = DaemonConn(
+        host_id="host-a", user_id="user-a", websocket=FakeDaemonWebSocket()
+    )  # type: ignore[arg-type]
+    other_daemon = DaemonConn(
+        host_id="host-a", user_id="user-a", websocket=FakeDaemonWebSocket()
+    )  # type: ignore[arg-type]
+    binding = await broker.register_rtc_session("bound", browser, "agent-a", daemon)
+    assert binding is not None
+
+    assert (
+        await broker.browser_for_rtc_signal(
+            "bound", "agent-a", daemon, binding.generation
+        )
+        is browser
+    )
+    assert (
+        await broker.browser_for_rtc_signal(
+            "bound", "agent-b", daemon, binding.generation
+        )
+        is None
+    )
+    assert (
+        await broker.browser_for_rtc_signal(
+            "bound", "agent-a", other_daemon, binding.generation
+        )
+        is None
+    )
+    assert await broker.browser_for_rtc_signal("bound", "agent-a", daemon, "f" * 32) is None
+    await broker.unregister_rtc_session("bound", browser, "agent-a")
 
 
 async def test_daemon_ws_activity_is_content_free_and_host_scoped(

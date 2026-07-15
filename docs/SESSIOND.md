@@ -125,7 +125,7 @@ scrollback key is process-ephemeral anyway (§7).
 
 `len` counts the payload only; `MAX_FRAME_LEN` = 32 MiB (replay dominates and
 is capped far below this by the scrollback budget). Structured payloads are
-JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 1`, checked at
+JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 2`, checked at
 adoption time from `Hello.version` — a version-skewed worker is refused, not
 guessed at.
 
@@ -134,7 +134,7 @@ guessed at.
 | `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, state, pid?, cols, rows}` | first frame on **every** accepted connection; enables stateless adoption |
 | `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the agent. Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
-| `T_OUTPUT` 0x04 | w→d | raw bytes | live PTY output |
+| `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
 | `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); forces a log checkpoint at the new geometry |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
@@ -493,7 +493,9 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 ## 15. Known gaps / future work
 
-- **Backpressure** (§9): bounded per-viewer sinks + replay-based catch-up.
+- **Backpressure follow-up** (§9): Phase 2 uses bounded per-viewer sinks,
+  disconnect-on-stall and replay-based catch-up; future work may add adaptive
+  queue sizing and transport telemetry.
 - **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
   connect history and snapshots from both backends using request-bound chunks
   and explicit PTY byte anchors; independent review and the later removal of
