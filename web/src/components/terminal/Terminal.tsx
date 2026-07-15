@@ -254,6 +254,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackCacheRefreshDeadlineRef = useRef<number | null>(null);
   const scrollbackLastUserScrollAtRef = useRef(0);
+  // The most recent scrolled-up overlay view (rows + position), remembered as
+  // the reader scrolls. Diagnostics read this so a refresh reports what the
+  // user was looking at even if the overlay closed in the instant before the
+  // click — the overlay buffer itself scrolls to the bottom on close, so it
+  // cannot be recovered from there.
+  const lastScrolledViewRef = useRef<{
+    at: number;
+    viewportY: number;
+    baseY: number;
+    length: number;
+    rows: string[];
+  } | null>(null);
   const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
@@ -315,14 +327,41 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
   }, []);
 
-  const recordScrollbackUserPosition = useCallback((overlay: HTMLElement) => {
-    scrollbackUserScrollGenerationRef.current += 1;
-    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-    scrollbackLastUserScrollAtRef.current = Date.now();
-    if (!scrollbackRenderInFlightRef.current) {
-      scrollbackStableLineRef.current = scrollbackTermRef.current?.buffer.active.viewportY ?? null;
+  // Snapshot the overlay's currently-visible rows while it is scrolled up, so
+  // a diagnostics refresh can report the reader's view even after the overlay
+  // has closed (which resets its buffer to the live edge). Cheap — one screen
+  // of translateToString — and only runs when there is scrolled history to
+  // capture.
+  const rememberScrolledView = useCallback(() => {
+    const historyTerm = scrollbackTermRef.current;
+    const buffer = historyTerm?.buffer.active;
+    if (!historyTerm || !buffer || buffer.viewportY >= buffer.baseY) return;
+    const rows: string[] = [];
+    for (let i = 0; i < historyTerm.rows; i += 1) {
+      rows.push(buffer.getLine(buffer.viewportY + i)?.translateToString(true) ?? "");
     }
+    lastScrolledViewRef.current = {
+      at: Date.now(),
+      viewportY: buffer.viewportY,
+      baseY: buffer.baseY,
+      length: buffer.length,
+      rows,
+    };
   }, []);
+
+  const recordScrollbackUserPosition = useCallback(
+    (overlay: HTMLElement) => {
+      scrollbackUserScrollGenerationRef.current += 1;
+      scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+      scrollbackLastUserScrollAtRef.current = Date.now();
+      if (!scrollbackRenderInFlightRef.current) {
+        scrollbackStableLineRef.current =
+          scrollbackTermRef.current?.buffer.active.viewportY ?? null;
+      }
+      rememberScrolledView();
+    },
+    [rememberScrolledView],
+  );
 
   // Live DataChannel chunks newer than the snapshot's capture offset. The
   // first replayed chunk may straddle the offset; slice off the part the
@@ -481,8 +520,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const buffer = scrollbackTermRef.current?.buffer.active;
       const reveal = buffer ? buffer.baseY > 0 && buffer.viewportY < buffer.baseY : false;
       setScrollbackReadyState(reveal);
+      if (reveal) rememberScrolledView();
     },
-    [healScrollbackScrollState, setScrollbackReadyState],
+    [healScrollbackScrollState, rememberScrolledView, setScrollbackReadyState],
   );
 
   const renderScrollbackSnapshot = useCallback(
@@ -2422,23 +2462,52 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               tail.push(buf.getLine(i)?.translateToString(true) ?? "");
             }
           }
-          // What the user is actually looking at right now: the visible rows
-          // of whichever surface holds their view — the scrollback overlay if
-          // they've scrolled up, otherwise the live terminal.
-          const overlayVisible = scrollbackVisibleRef.current;
-          const viewSource = overlayVisible ? scrollbackTermRef.current : term;
-          const viewBuf = viewSource?.buffer.active;
-          const visibleRows: string[] = [];
-          if (viewSource && viewBuf) {
-            for (let i = 0; i < viewSource.rows; i += 1) {
-              visibleRows.push(viewBuf.getLine(viewBuf.viewportY + i)?.translateToString(true) ?? "");
+          // What the user is actually looking at — decided from ground truth,
+          // not a single boolean that can flip in the instant before the
+          // click. In priority order:
+          //   1. overlay genuinely on-screen and scrolled up  -> its live rows
+          //   2. overlay just closed, but the reader was scrolled up a moment
+          //      ago                                          -> remembered rows
+          //      (the overlay buffer resets to the live edge on close, so it
+          //      can't be recovered from there — hence lastScrolledViewRef)
+          //   3. the live terminal is itself scrolled up      -> its rows
+          //   4. otherwise                                    -> the live edge
+          const overlayOnScreen = scrollbackOverlayRef.current?.style.visibility === "visible";
+          const historyTerm = scrollbackTermRef.current;
+          const historyBuf = historyTerm?.buffer.active;
+          const overlayScrolledUp =
+            !!historyBuf && historyBuf.baseY > 0 && historyBuf.viewportY < historyBuf.baseY;
+          const liveScrolledUp = !!buf && buf.viewportY < buf.baseY;
+          const remembered = lastScrolledViewRef.current;
+          const rememberedAgeMs = remembered ? Date.now() - remembered.at : null;
+          const rememberedFresh = rememberedAgeMs !== null && rememberedAgeMs < 12_000;
+          const rowsFrom = (t: XTerm, b: NonNullable<typeof buf>) => {
+            const out: string[] = [];
+            for (let i = 0; i < t.rows; i += 1) {
+              out.push(b.getLine(b.viewportY + i)?.translateToString(true) ?? "");
             }
+            return out;
+          };
+          let viewSource: string;
+          let visibleRows: string[] = [];
+          if (overlayOnScreen && overlayScrolledUp && historyTerm && historyBuf) {
+            viewSource = "scrollback-overlay";
+            visibleRows = rowsFrom(historyTerm, historyBuf);
+          } else if (!overlayOnScreen && rememberedFresh && remembered) {
+            viewSource = "scrollback-overlay-recent";
+            visibleRows = remembered.rows;
+          } else if (liveScrolledUp && term && buf) {
+            viewSource = "live-scrolled";
+            visibleRows = rowsFrom(term, buf);
+          } else {
+            viewSource = "live";
+            if (term && buf) visibleRows = rowsFrom(term, buf);
           }
           return {
             at: new Date().toISOString(),
             term: term ? { cols: term.cols, rows: term.rows } : null,
             lastSize: { ...lastSizeRef.current },
-            viewSource: overlayVisible ? "scrollback-overlay" : "live",
+            viewSource,
             visibleRows,
             hostRect: hostRect
               ? { w: Math.round(hostRect.width), h: Math.round(hostRect.height) }
@@ -2459,7 +2528,22 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dcActive: dcActiveRef.current,
             exactStream: exactStreamRef.current,
             overlay: {
-              visible: scrollbackVisibleRef.current,
+              // flagVisible is the transient ref; onScreen is the DOM truth.
+              // If they disagree, the flag raced the click.
+              flagVisible: scrollbackVisibleRef.current,
+              onScreen: overlayOnScreen,
+              scrolledUp: overlayScrolledUp,
+              buffer: historyBuf
+                ? {
+                    viewportY: historyBuf.viewportY,
+                    baseY: historyBuf.baseY,
+                    length: historyBuf.length,
+                  }
+                : null,
+              sinceLastScrollMs: scrollbackLastUserScrollAtRef.current
+                ? Date.now() - scrollbackLastUserScrollAtRef.current
+                : null,
+              rememberedAgeMs,
               cacheDirty: scrollbackCacheDirtyRef.current,
               reseedPending: historyReseedPendingRef.current,
               renderInFlight: scrollbackRenderInFlightRef.current,
@@ -2473,6 +2557,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         };
         const before = capture();
         hideScrollbackOverlay();
+        // The refresh deliberately returns to the live edge; drop the
+        // remembered scrolled view so the post-heal `after` snapshot reports
+        // the live state rather than replaying the pre-refresh scroll.
+        lastScrolledViewRef.current = null;
         fitTerminalRef.current(true);
         historyReseedPendingRef.current = true;
         invalidateScrollbackForResizeRef.current();
