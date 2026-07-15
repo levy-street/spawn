@@ -91,6 +91,8 @@ async def _mark_host_online(
     connection_id: str,
     generation: int,
     registration: dict[str, object],
+    *,
+    commit: bool = True,
 ) -> bool:
     values: dict[str, object] = {
         "daemon_connection_id": connection_id,
@@ -111,12 +113,17 @@ async def _mark_host_online(
         )
         .values(**values)
     )
-    await session.commit()
+    if commit:
+        await session.commit()
     return result.rowcount == 1
 
 
 async def _allocate_host_generation(
-    session: AsyncSession, host_id: str, connection_id: str
+    session: AsyncSession,
+    host_id: str,
+    connection_id: str,
+    *,
+    commit: bool = True,
 ) -> int | None:
     result = await session.execute(
         update(Host)
@@ -129,7 +136,8 @@ async def _allocate_host_generation(
         .returning(Host.daemon_generation)
     )
     generation = result.scalar_one_or_none()
-    await session.commit()
+    if commit:
+        await session.commit()
     return int(generation) if generation is not None else None
 
 
@@ -258,16 +266,16 @@ def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
 def _host_presence_value(conn: DaemonConn) -> bytes | None:
     if conn.host_generation is None:
         return None
-    return encode_host_presence_owner(
-        HostPresenceOwner(conn.id, conn.host_generation)
-    )
+    return encode_host_presence_owner(HostPresenceOwner(conn.id, conn.host_generation))
 
 
-async def _claim_host_signal_presence(conn: DaemonConn) -> bool:
+async def _claim_host_signal_presence(
+    conn: DaemonConn,
+) -> tuple[bool, HostPresenceOwner | None]:
     key = host_presence_key(conn.host_id)
     value = _host_presence_value(conn)
     if value is None or conn.host_generation is None:
-        return False
+        return False, None
     claimed, previous = await get_backend().set_ephemeral_if_newer(
         key,
         value,
@@ -275,18 +283,9 @@ async def _claim_host_signal_presence(conn: DaemonConn) -> bool:
         ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
     )
     if not claimed:
-        return False
+        return False, decode_host_presence_owner(previous)
     previous_owner = decode_host_presence_owner(previous)
-    if previous_owner is None or previous_owner.daemon_connection_id == conn.id:
-        return True
-    await publish_host_owner_revocation(
-        conn.host_id,
-        HostOwnerRevocation(
-            revoked_connection_id=previous_owner.daemon_connection_id,
-            replacement_connection_id=conn.id,
-        ),
-    )
-    return True
+    return True, previous_owner
 
 
 async def _refresh_host_signal_presence(conn: DaemonConn) -> bool:
@@ -416,11 +415,19 @@ async def _pump_host_rtc_signals(
                     revocation.revoked_connection_id == conn.id
                     and not await _owns_host_signal_presence(conn)
                 ):
-                    await _fence_superseded_daemon(conn)
+                    # A local acceptance already closed its predecessor while
+                    # atomically removing its routes. Remote predecessors still
+                    # need the distributed close, but the local one must not be
+                    # closed a second time merely to stop this signal pump.
+                    if broker.get_daemon_for_host(conn.host_id) is conn:
+                        await _fence_superseded_daemon(conn)
                     return
                 continue
             envelope = decode_host_signal(raw)
             if envelope is None or envelope.daemon_connection_id != conn.id:
+                continue
+            generation = conn.host_generation
+            if generation is None or not await broker.is_accepted_daemon_owner(conn, generation):
                 continue
             if not await _owns_host_signal_presence(conn):
                 await _fence_superseded_daemon(conn)
@@ -511,8 +518,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
 
     broker = get_broker()
     conn = DaemonConn(host_id=host.id, user_id=host.owner_user_id, websocket=websocket)
-    await broker.register_daemon(conn)
-    log.info("daemon connected host=%s user=%s", host.id, host.owner_user_id)
+    log.info("daemon pending host=%s user=%s", host.id, host.owner_user_id)
 
     signal_ready = asyncio.Event()
     expiry_tasks: set[asyncio.Task[None]] = set()
@@ -532,6 +538,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             data_bytes = msg.get("bytes")
 
             if data_bytes is not None:
+                if not registered:
+                    log.warning("pending daemon sent binary frame before register")
+                    continue
                 try:
                     frame = decode_binary_frame(data_bytes)
                 except ValueError as e:
@@ -583,6 +592,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     continue
                 ftype = obj.get("type")
 
+                if not registered and ftype != "register":
+                    log.warning("pending daemon sent frame before register type=%s", ftype)
+                    continue
+
                 if ftype == "register":
                     if registered:
                         log.warning("daemon repeated register host=%s", host.id)
@@ -590,54 +603,58 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     # The database is the authoritative serialized allocator.
                     # Redis only caches the resulting generation-bearing lease,
                     # so cache loss can never make an old token current again.
+                    previous_owner: HostPresenceOwner | None = None
                     async with sm() as session:
                         generation = await _allocate_host_generation(
-                            session, host.id, conn.id
+                            session,
+                            host.id,
+                            conn.id,
+                            commit=False,
                         )
                         if generation is None:
+                            await session.rollback()
                             await _fence_superseded_daemon(conn)
                             break
-                    conn.host_generation = generation
-                    if not await _claim_host_signal_presence(conn):
-                        async with sm() as session:
-                            await _mark_host_offline_if_owner(
-                                session, host.id, conn.id, generation
-                            )
-                        await _fence_superseded_daemon(conn)
-                        break
-                    if not await _is_durable_host_owner(
-                        host.id, conn.id, generation
-                    ):
-                        value = _host_presence_value(conn)
-                        if value is not None:
-                            await get_backend().delete_ephemeral_if(
-                                host_presence_key(host.id), value
-                            )
-                        await _fence_superseded_daemon(conn)
-                        break
-                    # Resync existing agents the daemon thinks it has.
-                    existing = obj.get("existing_agents") or []
-                    home_dir = obj.get("home_dir")
-                    async with sm() as session:
+                        conn.host_generation = generation
+                        claimed, previous_owner = await _claim_host_signal_presence(conn)
+                        if not claimed:
+                            await session.rollback()
+                            await _fence_superseded_daemon(conn)
+                            break
                         marked_online = await _mark_host_online(
-                            session, host.id, conn.id, generation, obj
+                            session,
+                            host.id,
+                            conn.id,
+                            generation,
+                            obj,
+                            commit=False,
                         )
                         if not marked_online:
+                            await session.rollback()
+                            value = _host_presence_value(conn)
+                            if value is not None:
+                                await get_backend().delete_ephemeral_if(
+                                    host_presence_key(host.id), value
+                                )
                             await _fence_superseded_daemon(conn)
                             break
-                        if not await _is_current_host_owner(conn):
-                            await _mark_host_offline_if_owner(
-                                session, host.id, conn.id, generation
-                            )
-                            await _fence_superseded_daemon(conn)
-                            break
-                    if not await broker.accept_daemon_owner(conn, generation):
+                        await session.commit()
+                    if not await _is_current_host_owner(conn):
                         async with sm() as session:
-                            await _mark_host_offline_if_owner(
-                                session, host.id, conn.id, generation
-                            )
+                            await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
                         await _fence_superseded_daemon(conn)
                         break
+                    acceptance = await broker.accept_daemon_owner(conn, generation)
+                    if not acceptance:
+                        async with sm() as session:
+                            await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
+                        await _fence_superseded_daemon(conn)
+                        break
+                    # Resync existing agents the daemon thinks it has only
+                    # after the broker has atomically exposed this accepted
+                    # owner and removed every route to its predecessor.
+                    existing = obj.get("existing_agents") or []
+                    home_dir = obj.get("home_dir")
                     if isinstance(home_dir, str) and home_dir:
                         conn.home_dir = home_dir
                     resync_current = True
@@ -647,10 +664,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 resync_current = False
                                 break
                             agent = await session.get(Agent, aid)
-                            if agent is not None and agent.host_id == host.id and not await broker.attach_agent_to_daemon(
-                                aid,
-                                conn,
-                                expected_host_generation=generation,
+                            if (
+                                agent is not None
+                                and agent.host_id == host.id
+                                and not await broker.attach_agent_to_daemon(
+                                    aid,
+                                    conn,
+                                    expected_host_generation=generation,
+                                )
                             ):
                                 resync_current = False
                                 break
@@ -660,12 +681,21 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         and await broker.is_accepted_daemon_owner(conn, generation)
                     ):
                         async with sm() as session:
-                            await _mark_host_offline_if_owner(
-                                session, host.id, conn.id, generation
-                            )
+                            await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
                         await _fence_superseded_daemon(conn)
                         break
                     registered = True
+                    if (
+                        previous_owner is not None
+                        and previous_owner.daemon_connection_id != conn.id
+                    ):
+                        await publish_host_owner_revocation(
+                            conn.host_id,
+                            HostOwnerRevocation(
+                                revoked_connection_id=previous_owner.daemon_connection_id,
+                                replacement_connection_id=conn.id,
+                            ),
+                        )
                     await conn.send_text({"type": "registered", "host_id": host.id})
 
                 elif ftype == "host.fs.list_result":
@@ -697,9 +727,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await _fence_superseded_daemon(conn)
                         break
                     async with sm() as session:
-                        if not await _touch_host(
-                            session, host.id, conn.id, generation
-                        ):
+                        if not await _touch_host(session, host.id, conn.id, generation):
                             await _fence_superseded_daemon(conn)
                             break
                     await conn.send_text({"type": "host.heartbeat"})
@@ -854,8 +882,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
-                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                                conn
+                            if (
+                                binding.scope_type == "host"
+                                and not await _owns_host_signal_presence(conn)
                             ):
                                 await _fence_superseded_daemon(conn)
                                 break
@@ -893,8 +922,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
-                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                                conn
+                            if (
+                                binding.scope_type == "host"
+                                and not await _owns_host_signal_presence(conn)
                             ):
                                 await _fence_superseded_daemon(conn)
                                 break
@@ -948,8 +978,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
-                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                                conn
+                            if (
+                                binding.scope_type == "host"
+                                and not await _owns_host_signal_presence(conn)
                             ):
                                 await _fence_superseded_daemon(conn)
                                 break
@@ -1002,15 +1033,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
         try:
             presence_value = _host_presence_value(conn)
             if presence_value is not None:
-                await get_backend().delete_ephemeral_if(
-                    host_presence_key(host.id), presence_value
-                )
+                await get_backend().delete_ephemeral_if(host_presence_key(host.id), presence_value)
         except Exception:
             log.warning("failed to release distributed host signaling ownership")
         await broker.unregister_daemon(conn)
         if conn.host_generation is not None:
             async with sm() as session:
-                await _mark_host_offline_if_owner(
-                    session, host.id, conn.id, conn.host_generation
-                )
+                await _mark_host_offline_if_owner(session, host.id, conn.id, conn.host_generation)
         log.info("daemon disconnected host=%s", host.id)

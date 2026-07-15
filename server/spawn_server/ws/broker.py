@@ -92,6 +92,15 @@ class RtcSessionBinding:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class DaemonOwnerAcceptance:
+    accepted: bool
+    superseded_connection_id: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
 @dataclass
 class _DisplayState:
     owner_conn_id: str | None = None
@@ -149,11 +158,9 @@ class Broker:
         async with self._lock:
             if self._daemons_by_host.get(conn.host_id) is conn:
                 self._daemons_by_host.pop(conn.host_id, None)
-            if (
-                conn.host_generation is not None
-                and self._accepted_daemon_owners.get(conn.host_id)
-                == (conn.id, conn.host_generation)
-            ):
+            if conn.host_generation is not None and self._accepted_daemon_owners.get(
+                conn.host_id
+            ) == (conn.id, conn.host_generation):
                 self._accepted_daemon_owners.pop(conn.host_id, None)
             for aid in list(conn.agent_ids):
                 if self._daemon_by_agent.get(aid) is conn:
@@ -172,17 +179,40 @@ class Broker:
         for session_id in stale:
             self._rtc_sessions.pop(session_id, None)
 
-    async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
+    async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> DaemonOwnerAcceptance:
+        """Atomically expose a fully claimed daemon to local routing.
+
+        Authenticated sockets remain absent from the broker until their durable
+        generation and distributed presence lease have both been established.
+        This transition is therefore also the one place where an accepted local
+        predecessor may be superseded.
+        """
         async with self._lock:
-            if self._daemons_by_host.get(conn.host_id) is not conn:
-                return False
             if conn.host_generation != generation:
-                return False
+                return DaemonOwnerAcceptance(False)
             current = self._accepted_daemon_owners.get(conn.host_id)
-            if current is not None and current[1] > generation:
-                return False
+            if current is not None and (
+                current[1] > generation or (current[1] == generation and current[0] != conn.id)
+            ):
+                return DaemonOwnerAcceptance(False)
+
+            existing = self._daemons_by_host.get(conn.host_id)
+            superseded_connection_id: str | None = None
+            if existing is not None and existing is not conn:
+                superseded_connection_id = existing.id
+                try:
+                    await existing.websocket.close(code=4000, reason="superseded")
+                except Exception:
+                    pass
+                for aid in list(existing.agent_ids):
+                    if self._daemon_by_agent.get(aid) is existing:
+                        self._daemon_by_agent.pop(aid, None)
+                existing.agent_ids.clear()
+                self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
+
+            self._daemons_by_host[conn.host_id] = conn
             self._accepted_daemon_owners[conn.host_id] = (conn.id, generation)
-            return True
+            return DaemonOwnerAcceptance(True, superseded_connection_id)
 
     async def is_accepted_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
         async with self._lock:
@@ -352,9 +382,7 @@ class Broker:
         now: float | None = None,
     ) -> RtcSessionBinding | None:
         async with self._lock:
-            self._prune_expired_rtc_sessions_locked(
-                time.monotonic() if now is None else now
-            )
+            self._prune_expired_rtc_sessions_locked(time.monotonic() if now is None else now)
             binding = self._rtc_sessions.get(session_id)
             if binding is None:
                 return None
@@ -373,9 +401,7 @@ class Broker:
         for session_id in expired:
             self._rtc_sessions.pop(session_id, None)
 
-    async def expire_rtc_session(
-        self, session_id: str, expected: RtcSessionBinding
-    ) -> bool:
+    async def expire_rtc_session(self, session_id: str, expected: RtcSessionBinding) -> bool:
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
             if current is not expected:
@@ -398,11 +424,7 @@ class Broker:
     async def rtc_sessions_for_daemon(self, daemon: DaemonConn) -> list[RtcSessionBinding]:
         async with self._lock:
             self._prune_expired_rtc_sessions_locked(time.monotonic())
-            return [
-                binding
-                for binding in self._rtc_sessions.values()
-                if binding.daemon is daemon
-            ]
+            return [binding for binding in self._rtc_sessions.values() if binding.daemon is daemon]
 
     async def browser_for_rtc_session(
         self, session_id: str

@@ -7,7 +7,8 @@ Revises: 0015
 import sqlalchemy as sa
 
 from alembic import op
-from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
+
+MAX_SAFE_FENCING_GENERATION = 9_007_199_254_740_991
 
 # revision identifiers
 revision = "0016"

@@ -442,7 +442,7 @@ async def main() -> None:
         id=old_owner,
         host_generation=1,
     )
-    await broker.register_daemon(daemon)
+    assert await broker.accept_daemon_owner(daemon, 1)
     await backend.set_ephemeral(
         host_presence_key(host_id),
         encode_host_presence_owner(HostPresenceOwner(old_owner, 1)),

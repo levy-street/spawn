@@ -157,11 +157,14 @@ not make the Phase 2 claim and does not remove any legacy host content route.
 Host signaling is routed between websocket workers through ephemeral Redis
 pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
 does not depend on process-local broker affinity. A replacement claim actively
-revokes the previous worker. Each claim atomically increments a durable
-database `BigInteger` fence token before caching that connection and generation
-in Redis. The Redis cache accepts only a newer token, and the authoritative
-database owner can reclaim a lost cache entry; heartbeat and offline transitions
-require the exact connection and generation. Every host signal also revalidates
+revokes the previous worker. Authenticated daemon sockets remain absent from
+broker host and agent routing until registration has allocated a durable database
+`BigInteger` fence token, claimed the matching Redis cache lease, committed the
+online owner, and passed an exact-owner recheck. A rejected cache claim rolls the
+database allocation back without disturbing the accepted local owner. The Redis
+cache accepts only a newer token, and the authoritative database owner can reclaim
+a lost cache entry; heartbeat and offline transitions require the exact connection
+and generation. Every host signal also revalidates
 the current lease, so a stale worker cannot retain or create host sessions or
 overwrite its replacement's durable status during either claim or notification
 races. Browser, host, and daemon session
