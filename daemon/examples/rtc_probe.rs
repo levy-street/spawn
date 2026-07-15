@@ -117,8 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some("candidate") => {
                     if let Some(c) = msg.get("candidate") {
-                        if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(c.clone())
-                        {
+                        if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(c.clone()) {
                             if let Err(e) = pc_signal.add_ice_candidate(init).await {
                                 eprintln!("EVENT add-candidate-error {e}");
                             }

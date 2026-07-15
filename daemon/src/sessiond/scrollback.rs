@@ -92,7 +92,13 @@ pub struct ScrollbackLog {
 
 impl ScrollbackLog {
     pub fn new(dir: &Path, key: &secret::SecretBytes, initial: Checkpoint<'_>) -> Result<Self> {
-        Self::with_limits(dir, key, DEFAULT_SEGMENT_BYTES, DEFAULT_MAX_LOG_BYTES, initial)
+        Self::with_limits(
+            dir,
+            key,
+            DEFAULT_SEGMENT_BYTES,
+            DEFAULT_MAX_LOG_BYTES,
+            initial,
+        )
     }
 
     pub fn with_limits(

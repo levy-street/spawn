@@ -377,10 +377,7 @@ fn cursor_point<T>(term: &Term<T>) -> Point {
 
 /// Reconstruct a DECSC register: position with the saved pen, save, and leave
 /// the pen for the caller to overwrite (every later emission resets it).
-fn emit_saved_cursor(
-    out: &mut Vec<u8>,
-    saved: &alacritty_terminal::grid::Cursor<Cell>,
-) {
+fn emit_saved_cursor(out: &mut Vec<u8>, saved: &alacritty_terminal::grid::Cursor<Cell>) {
     let mut pen = Pen::default();
     pen.apply_cell(out, &saved.template);
     emit_cup(out, saved.point);
@@ -616,8 +613,16 @@ mod tests {
                     (cb.c, cb.fg, cb.bg, cb.flags, cb.underline_color()),
                     "{context}: cell ({row},{col})"
                 );
-                assert_eq!(ca.hyperlink(), cb.hyperlink(), "{context}: link ({row},{col})");
-                assert_eq!(ca.zerowidth(), cb.zerowidth(), "{context}: zw ({row},{col})");
+                assert_eq!(
+                    ca.hyperlink(),
+                    cb.hyperlink(),
+                    "{context}: link ({row},{col})"
+                );
+                assert_eq!(
+                    ca.zerowidth(),
+                    cb.zerowidth(),
+                    "{context}: zw ({row},{col})"
+                );
             }
         }
         assert_eq!(ga.cursor.point, gb.cursor.point, "{context}: cursor");
