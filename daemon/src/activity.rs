@@ -4,7 +4,7 @@
 //! Terminal sequences and UTF-8 code points can be split across arbitrary PTY
 //! reads, so classification is deliberately stateful per agent. Carry is
 //! bounded: CSI/OSC parsing uses constant state and plausible tmux status text
-//! is capped before being conservatively discarded.
+//! is capped before being flushed through ordinary content classification.
 
 use std::time::Duration;
 
@@ -44,19 +44,12 @@ enum TextState {
     #[default]
     Normal,
     Candidate(Vec<ObservedChar>),
-    /// `[spawn-...` is noise through the next line boundary, matching the
-    /// former server classifier's tmux-status-fragment rule.
-    TmuxFragment,
-    /// An overlong plausible quoted status is conservatively ignored through
-    /// the next line boundary instead of growing carry without bound.
-    DiscardUntilBoundary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CandidateState {
     Possible,
     CompleteNoise,
-    TmuxFragment,
     Invalid,
 }
 
@@ -71,12 +64,27 @@ enum ClockState {
 /// chunk, including chunks received while output activity is throttled or
 /// suppressed. `eligible` controls whether visible characters from this chunk
 /// may contribute to activity while parser state always advances.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OutputClassifier {
     terminal: TerminalState,
     text: TextState,
     utf8: Vec<(u8, bool)>,
     meaningful_chars: u8,
+    segment_has_visible: bool,
+    segment_has_leading_whitespace: bool,
+}
+
+impl Default for OutputClassifier {
+    fn default() -> Self {
+        Self {
+            terminal: TerminalState::Ground,
+            text: TextState::Normal,
+            utf8: Vec::new(),
+            meaningful_chars: 0,
+            segment_has_visible: false,
+            segment_has_leading_whitespace: false,
+        }
+    }
 }
 
 impl OutputClassifier {
@@ -154,8 +162,14 @@ impl OutputClassifier {
             // match UTF-8 `errors="ignore"` by dropping that malformed carry.
             self.utf8.clear();
             match byte {
-                0x1b => self.terminal = TerminalState::Escape,
-                b'\r' | b'\n' => self.finish_text_line(meaningful),
+                0x1b => {
+                    // A cursor/control sequence is a visible-text boundary.
+                    // Flush anything merely status-like so an incomplete
+                    // fragment cannot swallow subsequent TUI output.
+                    self.finish_text_segment(meaningful);
+                    self.terminal = TerminalState::Escape;
+                }
+                b'\r' | b'\n' => self.finish_text_segment(meaningful),
                 0x00..=0x08 | 0x0b..=0x1f | 0x7f => {}
                 _ => self.consume_visible_char(
                     ObservedChar {
@@ -220,10 +234,17 @@ impl OutputClassifier {
         match std::mem::take(&mut self.text) {
             TextState::Normal => {
                 if observed.value.is_whitespace() {
+                    if !self.segment_has_visible {
+                        self.segment_has_leading_whitespace = true;
+                    }
                     return;
                 }
-                if observed.value == '[' || observed.value == '"' || observed.value.is_ascii_digit()
-                {
+                let can_start_status = !self.segment_has_visible
+                    && (observed.value == '['
+                        || observed.value.is_ascii_digit()
+                        || (observed.value == '"' && self.segment_has_leading_whitespace));
+                self.segment_has_visible = true;
+                if can_start_status {
                     self.text = TextState::Candidate(vec![observed]);
                     self.evaluate_candidate(meaningful);
                 } else {
@@ -233,14 +254,17 @@ impl OutputClassifier {
             TextState::Candidate(mut carry) => {
                 carry.push(observed);
                 if carry.len() > MAX_STATUS_CARRY_CHARS {
-                    self.text = TextState::DiscardUntilBoundary;
+                    // Ambiguity is bounded, not content: once the cap is hit,
+                    // flush as real output and resume ordinary classification.
+                    self.text = TextState::Normal;
+                    for observed in carry {
+                        self.record_char(observed, meaningful);
+                    }
                 } else {
                     self.text = TextState::Candidate(carry);
                     self.evaluate_candidate(meaningful);
                 }
             }
-            TextState::TmuxFragment => self.text = TextState::TmuxFragment,
-            TextState::DiscardUntilBoundary => self.text = TextState::DiscardUntilBoundary,
         }
     }
 
@@ -251,8 +275,11 @@ impl OutputClassifier {
         let text: String = carry.iter().map(|item| item.value).collect();
         match candidate_state(&text) {
             CandidateState::Possible => {}
-            CandidateState::CompleteNoise => self.text = TextState::Normal,
-            CandidateState::TmuxFragment => self.text = TextState::TmuxFragment,
+            CandidateState::CompleteNoise => {
+                self.text = TextState::Normal;
+                self.segment_has_visible = false;
+                self.segment_has_leading_whitespace = false;
+            }
             CandidateState::Invalid => {
                 let TextState::Candidate(carry) = std::mem::take(&mut self.text) else {
                     unreachable!()
@@ -264,7 +291,7 @@ impl OutputClassifier {
         }
     }
 
-    fn finish_text_line(&mut self, meaningful: &mut bool) {
+    fn finish_text_segment(&mut self, meaningful: &mut bool) {
         match std::mem::take(&mut self.text) {
             TextState::Candidate(carry) => {
                 // A complete status is discarded as soon as its final digit is
@@ -274,8 +301,10 @@ impl OutputClassifier {
                     self.record_char(observed, meaningful);
                 }
             }
-            TextState::Normal | TextState::TmuxFragment | TextState::DiscardUntilBoundary => {}
+            TextState::Normal => {}
         }
+        self.segment_has_visible = false;
+        self.segment_has_leading_whitespace = false;
     }
 
     fn record_char(&mut self, observed: ObservedChar, meaningful: &mut bool) {
@@ -293,7 +322,7 @@ impl OutputClassifier {
     fn buffered_len(&self) -> usize {
         let text = match &self.text {
             TextState::Candidate(carry) => carry.len(),
-            _ => 0,
+            TextState::Normal => 0,
         };
         self.utf8.len() + text + usize::from(self.meaningful_chars)
     }
@@ -305,7 +334,15 @@ fn candidate_state(text: &str) -> CandidateState {
         return CandidateState::Possible;
     }
     if text.starts_with(SPAWN_PREFIX) {
-        return CandidateState::TmuxFragment;
+        // A `[spawn-` prefix alone is only ambiguous. Discard it only after a
+        // complete status clock is present; CSI/EOL/carry-cap boundaries flush
+        // incomplete fragments as real content.
+        for (index, value) in text.char_indices() {
+            if value.is_ascii_digit() && clock_state(&text[index..]) == ClockState::Complete {
+                return CandidateState::CompleteNoise;
+            }
+        }
+        return CandidateState::Possible;
     }
     if let Some(rest) = text.strip_prefix('"') {
         let Some(closing_quote) = rest.find('"') else {
@@ -445,6 +482,17 @@ mod tests {
     }
 
     #[test]
+    fn status_fragments_recover_at_csi_before_real_output_at_every_boundary() {
+        assert_every_split(b"[spawn-oem] \"bash\" 12:34 15-Jul-26\x1b[10;1Habc", true);
+        assert_every_split(b"[spawn-incomplete\x1b[10;1Habc", true);
+    }
+
+    #[test]
+    fn quoted_real_output_without_newline_is_not_held_as_status() {
+        assert_every_split(b"\"quoted real output\"", true);
+    }
+
+    #[test]
     fn malformed_utf8_is_ignored_but_valid_replacement_chars_remain() {
         assert_every_split(b"\xff\xfe\xfd", false);
         assert_every_split(b"a\xffbc", true);
@@ -453,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_control_and_status_carry_is_bounded() {
+    fn unterminated_control_and_ambiguous_status_carry_is_bounded() {
         let mut osc = OutputClassifier::default();
         assert!(!osc.observe(b"\x1b]0;", true));
         for _ in 0..10_000 {
@@ -463,16 +511,36 @@ mod tests {
 
         let mut fragment = OutputClassifier::default();
         assert!(!fragment.observe(b"[spawn-", true));
+        let mut fragment_flushed = false;
         for _ in 0..10_000 {
-            assert!(!fragment.observe(b"x", true));
+            fragment_flushed |= fragment.observe(b"x", true);
             assert!(fragment.buffered_len() <= MAX_STATUS_CARRY_CHARS);
         }
+        assert!(
+            fragment_flushed,
+            "overlong spawn-like text was never classified"
+        );
 
         let mut quote = OutputClassifier::default();
-        assert!(!quote.observe(b"\"", true));
+        // Leading whitespace makes this plausibly the tmux title+clock suffix.
+        assert!(!quote.observe(b" \"", true));
+        let mut quote_flushed = false;
         for _ in 0..10_000 {
-            assert!(!quote.observe(b"unterminated", true));
+            quote_flushed |= quote.observe(b"unterminated", true);
             assert!(quote.buffered_len() <= MAX_STATUS_CARRY_CHARS);
         }
+        assert!(quote_flushed, "overlong quoted text was never classified");
+    }
+
+    #[test]
+    fn overlong_ambiguous_status_then_cursor_and_real_output_recovers() {
+        let mut classifier = OutputClassifier::default();
+        let mut meaningful = classifier.observe(b" \"", true);
+        for _ in 0..(MAX_STATUS_CARRY_CHARS + 10) {
+            meaningful |= classifier.observe(b"x", true);
+            assert!(classifier.buffered_len() <= MAX_STATUS_CARRY_CHARS);
+        }
+        meaningful |= classifier.observe(b"\x1b[20;1Hreal output", true);
+        assert!(meaningful);
     }
 }

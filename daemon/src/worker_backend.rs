@@ -283,7 +283,7 @@ fn assemble(
     rows: u16,
     stream: UnixStream,
 ) -> pty::Launched {
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<pty::OutputChunk>();
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
 
@@ -297,6 +297,7 @@ fn assemble(
     tokio::spawn(run_reader(
         read_half,
         outbox_tx.clone(),
+        control.clone(),
         exit_tx,
         pending,
         agent_id,
@@ -376,7 +377,8 @@ async fn run_writer(
 /// framed reads → outbox (output), replay responses, exit report.
 async fn run_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
-    outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbox_tx: mpsc::UnboundedSender<pty::OutputChunk>,
+    control: ForwarderControl,
     exit_tx: oneshot::Sender<ExitReason>,
     pending: PendingReplays,
     agent_id: Uuid,
@@ -385,7 +387,8 @@ async fn run_reader(
     loop {
         match wire::read_frame(&mut read_half).await {
             Ok(Some((wire::T_OUTPUT, payload))) => {
-                if outbox_tx.send(payload).is_err() {
+                let chunk = pty::OutputChunk::classify(payload, &control);
+                if outbox_tx.send(chunk).is_err() {
                     break;
                 }
             }

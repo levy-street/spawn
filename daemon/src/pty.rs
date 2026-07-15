@@ -50,6 +50,22 @@ pub enum WsOutbound {
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 
+/// Immutable result of handling one output event at its producer. Activity is
+/// decided before the raw bytes enter the asynchronous outbox, so later input,
+/// resize, or redraw suppression cannot retroactively change that event.
+#[derive(Debug)]
+pub(crate) struct OutputChunk {
+    bytes: Vec<u8>,
+    activity: bool,
+}
+
+impl OutputChunk {
+    pub(crate) fn classify(bytes: Vec<u8>, control: &ForwarderControl) -> Self {
+        let activity = control.note_output(&bytes);
+        Self { bytes, activity }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ActivityKind {
     Output,
@@ -341,7 +357,7 @@ pub struct AgentHandle {
     /// Reader thread pushes raw PTY bytes here. Held alive while the agent
     /// is alive; when dropped, the per-agent forwarder task exits.
     #[allow(dead_code)]
-    outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbox_tx: mpsc::UnboundedSender<OutputChunk>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
     backend: HandleBackend,
@@ -354,7 +370,7 @@ pub struct WorkerHandleParts {
     pub cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
     pub cols: u16,
     pub rows: u16,
-    pub outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub outbox_tx: mpsc::UnboundedSender<OutputChunk>,
     pub control: ForwarderControl,
 }
 
@@ -609,7 +625,7 @@ fn attach_to_session(
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
     // Per-agent outbox + forwarder.
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<OutputChunk>();
     let control = ForwarderControl::new();
 
     // Forwarder: outbox -> current sink (with reconnect-aware looping).
@@ -620,12 +636,14 @@ fn attach_to_session(
 
     // Reader thread: raw PTY -> outbox.
     let outbox_for_reader = outbox_tx.clone();
+    let control_for_reader = control.clone();
     std::thread::spawn(move || {
         run_reader_thread(
             agent_id,
             reader,
             child,
             outbox_for_reader,
+            control_for_reader,
             cancel_rx,
             exit_tx,
         );
@@ -651,7 +669,8 @@ fn run_reader_thread(
     agent_id: Uuid,
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    outbox: mpsc::UnboundedSender<Vec<u8>>,
+    outbox: mpsc::UnboundedSender<OutputChunk>,
+    control: ForwarderControl,
     mut cancel_rx: oneshot::Receiver<()>,
     exit_tx: oneshot::Sender<ExitReason>,
 ) {
@@ -669,7 +688,8 @@ fn run_reader_thread(
                 break;
             }
             Ok(n) => {
-                if outbox.send(buf[..n].to_vec()).is_err() {
+                let chunk = OutputChunk::classify(buf[..n].to_vec(), &control);
+                if outbox.send(chunk).is_err() {
                     // Forwarder gone (registry dropped this agent). We can stop.
                     tracing::debug!(%agent_id, "outbox closed; stopping reader");
                     break;
@@ -713,7 +733,7 @@ fn run_reader_thread(
 /// dropped).
 pub(crate) async fn run_forwarder(
     agent_id: Uuid,
-    mut outbox_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outbox_rx: mpsc::UnboundedReceiver<OutputChunk>,
     control: ForwarderControl,
 ) {
     let mut pending_mirror = VecDeque::new();
@@ -804,18 +824,16 @@ pub(crate) async fn run_forwarder(
 
 async fn queue_output_chunk(
     agent_id: Uuid,
-    chunk: Vec<u8>,
+    chunk: OutputChunk,
     control: &ForwarderControl,
     pending_mirror: &mut VecDeque<WsOutbound>,
 ) {
-    // Decide first, in PTY receipt order. Direct/browser and legacy/server
-    // delivery may block or reconnect, but neither can change this decision.
-    let meaningful = control.note_output(&chunk);
-    control.send_direct(&chunk).await;
+    control.send_direct(&chunk.bytes).await;
     pending_mirror.push_back(WsOutbound::Binary(frames::encode_pty_output(
-        agent_id, &chunk,
+        agent_id,
+        &chunk.bytes,
     )));
-    if meaningful {
+    if chunk.activity {
         if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
             pending_mirror.push_back(activity);
         }
@@ -825,6 +843,10 @@ async fn queue_output_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
+        OutputChunk::classify(bytes.to_vec(), control)
+    }
 
     #[test]
     fn output_activity_is_throttled_with_monotonic_time() {
@@ -929,10 +951,10 @@ mod tests {
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
         outbox_tx
-            .send(b"sensitive terminal output".to_vec())
+            .send(source_output(&control, b"sensitive terminal output"))
             .unwrap();
         drop(outbox_tx);
 
@@ -970,14 +992,18 @@ mod tests {
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
-        outbox_tx.send(b"ok".to_vec()).unwrap();
+        outbox_tx.send(source_output(&control, b"ok")).unwrap();
         assert_eq!(direct_rx.recv().await.unwrap(), b"ok");
 
-        outbox_tx.send(b"before suppression".to_vec()).unwrap();
+        outbox_tx
+            .send(source_output(&control, b"before suppression"))
+            .unwrap();
         assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
 
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
-        outbox_tx.send(b"during suppression".to_vec()).unwrap();
+        outbox_tx
+            .send(source_output(&control, b"during suppression"))
+            .unwrap();
         assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
 
         // Simulate reconnect after the suppression window. The stored decision
@@ -1032,10 +1058,14 @@ mod tests {
 
         // There is intentionally no server sink while both chunks are
         // classified. A later suppression cannot erase the first decision.
-        outbox_tx.send(b"before suppression".to_vec()).unwrap();
+        outbox_tx
+            .send(source_output(&control, b"before suppression"))
+            .unwrap();
         assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
-        outbox_tx.send(b"during suppression".to_vec()).unwrap();
+        outbox_tx
+            .send(source_output(&control, b"during suppression"))
+            .unwrap();
         assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
         control.activity.lock().unwrap().suppress_output_until = None;
 
@@ -1057,6 +1087,58 @@ mod tests {
             format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
         );
         assert!(matches!(third, WsOutbound::Binary(_)));
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn producer_decision_precedes_enqueue_and_later_suppression() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+
+        // The producer classifies and enqueues before the forwarder exists.
+        // A later control event cannot mutate the queued decision.
+        let chunk = source_output(&control, b"queued before suppression");
+        assert!(chunk.activity);
+        outbox_tx.send(chunk).unwrap();
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(2);
+        control.set_sink(sink_tx).await;
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        drop(outbox_tx);
+
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        assert!(matches!(sink_rx.recv().await.unwrap(), WsOutbound::Json(_)));
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn suppression_preceding_producer_decision_stays_with_queued_output() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        let chunk = source_output(&control, b"queued during suppression");
+        assert!(!chunk.activity);
+        outbox_tx.send(chunk).unwrap();
+        // Expiry/reconnect before forwarding must not cause reclassification.
+        control.activity.lock().unwrap().suppress_output_until = None;
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(2);
+        control.set_sink(sink_tx).await;
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        drop(outbox_tx);
+
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        forwarder.await.unwrap();
         assert!(sink_rx.try_recv().is_err());
     }
 }
