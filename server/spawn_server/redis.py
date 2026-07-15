@@ -8,6 +8,7 @@ multiple uvicorn workers can share state.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from .config import get_settings
 class _InProcPubSub:
     def __init__(self) -> None:
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
+        self._values: dict[str, tuple[bytes, float]] = {}
 
     async def publish(self, channel: str, data: bytes) -> None:
         for q in list(self._subs.get(channel, ())):
@@ -35,6 +37,31 @@ class _InProcPubSub:
 
     def unsubscribe(self, channel: str, q: asyncio.Queue) -> None:
         self._subs.get(channel, set()).discard(q)
+
+    def set_ephemeral(self, key: str, value: bytes, ttl_seconds: int) -> None:
+        self._values[key] = (value, time.monotonic() + ttl_seconds)
+
+    def get_ephemeral(self, key: str) -> bytes | None:
+        item = self._values.get(key)
+        if item is None:
+            return None
+        value, expires_at = item
+        if time.monotonic() >= expires_at:
+            self._values.pop(key, None)
+            return None
+        return value
+
+    def delete_ephemeral_if(self, key: str, value: bytes) -> bool:
+        if self.get_ephemeral(key) == value:
+            self._values.pop(key, None)
+            return True
+        return False
+
+    def refresh_ephemeral_if(self, key: str, value: bytes, ttl_seconds: int) -> bool:
+        if self.get_ephemeral(key) != value:
+            return False
+        self._values[key] = (value, time.monotonic() + ttl_seconds)
+        return True
 
 
 # ---------- backend abstraction ----------
@@ -76,11 +103,14 @@ class RedisBackend:
 
     async def publish(self, agent_id: str, payload: bytes) -> None:
         ch = self._agent_channel(agent_id)
+        await self.publish_channel(ch, payload)
+
+    async def publish_channel(self, channel: str, payload: bytes) -> None:
         if self._inproc is not None:
-            await self._inproc.publish(ch, payload)
+            await self._inproc.publish(channel, payload)
             return
         assert self._client is not None
-        await self._client.publish(ch, payload)
+        await self._client.publish(channel, payload)
 
     @asynccontextmanager
     async def subscribe(self, agent_id: str) -> AsyncIterator[AsyncIterator[bytes]]:
@@ -92,9 +122,17 @@ class RedisBackend:
         Works the same against real Redis and the in-process fallback so the
         consumer in `ws/browser.py` doesn't branch.
         """
-        ch = self._agent_channel(agent_id)
+        async with self.subscribe_channel(self._agent_channel(agent_id)) as stream:
+            yield stream
+
+    @asynccontextmanager
+    async def subscribe_channel(self, channel: str) -> AsyncIterator[AsyncIterator[bytes]]:
+        """Subscribe to an arbitrary internal binary pub/sub channel."""
         if self._inproc is not None:
-            queue = self._inproc.subscribe(ch)
+            # Capture the active fallback instance. Test/app shutdown can clear
+            # ``self._inproc`` while a websocket subscription is unwinding.
+            inproc = self._inproc
+            queue = inproc.subscribe(channel)
 
             async def _iter_inproc() -> AsyncIterator[bytes]:
                 try:
@@ -107,12 +145,12 @@ class RedisBackend:
             try:
                 yield _iter_inproc()
             finally:
-                self._inproc.unsubscribe(ch, queue)
+                inproc.unsubscribe(channel, queue)
             return
 
         assert self._client is not None
         pubsub = self._client.pubsub()
-        await pubsub.subscribe(ch)
+        await pubsub.subscribe(channel)
 
         async def _iter_redis() -> AsyncIterator[bytes]:
             try:
@@ -129,13 +167,56 @@ class RedisBackend:
             yield _iter_redis()
         finally:
             try:
-                await pubsub.unsubscribe(ch)
+                await pubsub.unsubscribe(channel)
             except Exception:
                 pass
             try:
                 await pubsub.aclose()
             except Exception:
                 pass
+
+    async def set_ephemeral(self, key: str, value: bytes, *, ttl_seconds: int) -> None:
+        if self._inproc is not None:
+            self._inproc.set_ephemeral(key, value, ttl_seconds)
+            return
+        assert self._client is not None
+        await self._client.set(key, value, ex=ttl_seconds)
+
+    async def get_ephemeral(self, key: str) -> bytes | None:
+        if self._inproc is not None:
+            return self._inproc.get_ephemeral(key)
+        assert self._client is not None
+        value = await self._client.get(key)
+        return value if isinstance(value, bytes) else None
+
+    async def delete_ephemeral_if(self, key: str, value: bytes) -> bool:
+        if self._inproc is not None:
+            return self._inproc.delete_ephemeral_if(key, value)
+        assert self._client is not None
+        deleted = await self._client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            key,
+            value,
+        )
+        return bool(deleted)
+
+    async def refresh_ephemeral_if(
+        self, key: str, value: bytes, *, ttl_seconds: int
+    ) -> bool:
+        if self._inproc is not None:
+            return self._inproc.refresh_ephemeral_if(key, value, ttl_seconds)
+        assert self._client is not None
+        refreshed = await self._client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+            1,
+            key,
+            value,
+            ttl_seconds,
+        )
+        return bool(refreshed)
 
 
 _backend = RedisBackend()

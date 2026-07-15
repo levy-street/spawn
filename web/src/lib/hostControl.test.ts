@@ -12,12 +12,16 @@ class FakeDataChannel {
   onmessage = null;
   onclose = null;
   onerror = null;
+  throwOnCancel = false;
 
   constructor(label: string) {
     this.label = label;
   }
 
   send(value: string) {
+    if (this.throwOnCancel && JSON.parse(value).type === "cancel") {
+      throw new Error("channel closed during cancellation");
+    }
     this.sent.push(value);
   }
 
@@ -103,8 +107,8 @@ const metadata = {
   protocol_version: 1,
 };
 
-async function readyClient() {
-  const client = new HostControlClient(hostId);
+async function readyClient(options = {}) {
+  const client = new HostControlClient(hostId, options);
   client.connect();
   const ws = FakeWebSocket.instances.at(-1);
   ws.onopen?.();
@@ -204,6 +208,151 @@ describe("HostControlClient", () => {
     });
     await Promise.resolve();
     expect(FakePeerConnection.instances).toHaveLength(0);
+    client.close();
+  });
+
+  test("times out before an answer or hello and reconnects exactly once", async () => {
+    const client = new HostControlClient(hostId, {
+      connectTimeoutMs: 1,
+      reconnectBaseDelayMs: 1,
+    });
+    client.connect();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await Bun.sleep(10);
+
+    expect(FakePeerConnection.instances[0].channel.closed).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(JSON.parse(ws.sent.at(-1)).type).toBe("rtc.close");
+    client.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const noHelloClient = new HostControlClient(hostId, {
+      connectTimeoutMs: 1,
+      reconnectBaseDelayMs: 1,
+    });
+    noHelloClient.connect();
+    const noHelloWs = FakeWebSocket.instances.at(-1);
+    noHelloWs.onopen?.();
+    noHelloWs.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const noHelloPc = FakePeerConnection.instances.at(-1);
+    const noHelloOffer = JSON.parse(noHelloWs.sent.at(-1));
+    noHelloWs.receive({
+      type: "rtc.answer",
+      session_id: noHelloOffer.session_id,
+      sdp: "v=0\r\nanswer",
+      ...metadata,
+    });
+    noHelloPc.channel.onopen?.();
+    await Bun.sleep(10);
+    expect(noHelloPc.channel.closed).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    noHelloClient.close();
+  });
+
+  test("channel, daemon, and browser loss each schedule only one reconnect", async () => {
+    const first = await readyClient({ reconnectBaseDelayMs: 1 });
+    const closeHandler = first.pc.channel.onclose;
+    closeHandler?.();
+    closeHandler?.();
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    first.client.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const second = await readyClient({ reconnectBaseDelayMs: 1 });
+    second.ws.receive({
+      type: "rtc.status",
+      session_id: second.offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    second.ws.receive({
+      type: "rtc.status",
+      session_id: second.offer.session_id,
+      status: "failed",
+      ...metadata,
+    });
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    second.client.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const third = await readyClient({ reconnectBaseDelayMs: 1 });
+    const wsCloseHandler = third.ws.onclose;
+    wsCloseHandler?.();
+    wsCloseHandler?.();
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    third.client.close();
+  });
+
+  test("bounds pending requests and ignores a response with the wrong request id", async () => {
+    const { client, pc } = await readyClient({ maxPendingRequests: 2, requestTimeoutMs: 1000 });
+    const first = client.ping();
+    const firstRequest = JSON.parse(pc.channel.sent.at(-1));
+    const second = client.request("second");
+    const secondRequest = JSON.parse(pc.channel.sent.at(-1));
+    await expect(client.request("over-cap")).rejects.toThrow("Too many pending");
+
+    let firstSettled = false;
+    void first.finally(() => {
+      firstSettled = true;
+    });
+    pc.channel.receive(
+      JSON.stringify({ version: 1, type: "response", request_id: "wrong-id", ok: true }),
+    );
+    await Promise.resolve();
+    expect(firstSettled).toBe(false);
+
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: firstRequest.request_id,
+        ok: true,
+        result: { pong: true },
+      }),
+    );
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: secondRequest.request_id,
+        ok: true,
+        result: "second-result",
+      }),
+    );
+    await expect(first).resolves.toEqual({ pong: true });
+    await expect(second).resolves.toBe("second-result");
+    client.close();
+  });
+
+  test("request timeout still settles when sending cancel fails", async () => {
+    const { client, pc } = await readyClient();
+    const request = client.ping({ timeoutMs: 1 });
+    pc.channel.throwOnCancel = true;
+    const assertion = expect(request).rejects.toThrow("timed out");
+    await Bun.sleep(5);
+    await assertion;
     client.close();
   });
 });

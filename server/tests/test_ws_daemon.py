@@ -208,6 +208,41 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     assert get_broker().get_daemon_for_agent(agent_id) is None
 
 
+async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_host_offline(client):
+    user_id, _ = await _signup(client, "ws-daemon-superseded@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "version": "old"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text({"type": "register", "version": "new"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
+
+    # A late heartbeat from the old worker compare-refreshes its lease, fails,
+    # and disconnects without overwriting the new worker's online state.
+    old.queue_text({"type": "host.heartbeat"})
+    await asyncio.wait_for(old_task, timeout=1)
+    assert old.closed == (4000, "superseded")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "online"
+        assert host.version == "new"
+
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.status == "offline"
+
+
 async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     user_id, _ = await _signup(client, "ws-daemon-rtc@example.com")
     host_id = await _create_host(user_id)

@@ -6,6 +6,7 @@
 //! server websocket for transcripts and fallback viewers.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,8 @@ const RTC_PROTOCOL_VERSION: u16 = 1;
 const HOST_CONTROL_MAX_FRAME_BYTES: usize = 16 * 1024;
 const HOST_CONTROL_MAX_REQUEST_ID_BYTES: usize = 128;
 const HOST_CONTROL_MAX_IN_FLIGHT: usize = 32;
+const MAX_RTC_PEERS: usize = 128;
+const MAX_HOST_RTC_PEERS: usize = 64;
 
 /// Peer connections that never reach `Connected` within this window are
 /// reaped. Closing is the daemon's own defense: `rtc.close` delivery from the
@@ -121,6 +124,26 @@ impl RtcBinding {
 struct RtcPeer {
     pc: Arc<RTCPeerConnection>,
     binding: RtcBinding,
+}
+
+fn rtc_capacity_available<'a>(
+    bindings: impl Iterator<Item = &'a RtcBinding>,
+    requested: &RtcBinding,
+) -> bool {
+    let mut total = 0;
+    let mut hosts = 0;
+    for binding in bindings {
+        total += 1;
+        if matches!(binding.scope, RtcScope::Host(_)) {
+            hosts += 1;
+        }
+    }
+    total < MAX_RTC_PEERS
+        && (!matches!(requested.scope, RtcScope::Host(_)) || hosts < MAX_HOST_RTC_PEERS)
+}
+
+fn accept_first_host_channel(accepted: &AtomicBool) -> bool {
+    !accepted.swap(true, Ordering::AcqRel)
 }
 
 pub struct RtcOfferSignal {
@@ -216,14 +239,19 @@ impl RtcSessions {
             }
             _ => {}
         }
-        if self
-            .peers
-            .lock()
-            .await
-            .get(&offer.session_id)
-            .is_some_and(|peer| peer.binding != binding)
-        {
-            tracing::warn!(session_id = %offer.session_id, "rejecting rtc session id reuse across scopes");
+        let peers = self.peers.lock().await;
+        let repeated = peers.contains_key(&offer.session_id);
+        let at_capacity =
+            !rtc_capacity_available(peers.values().map(|peer| &peer.binding), &binding);
+        drop(peers);
+        if repeated {
+            tracing::warn!(session_id = %offer.session_id, "rejecting repeated rtc offer");
+            send_status(&out_tx, offer.session_id, &binding, "failed", None).await;
+            return;
+        }
+        if at_capacity {
+            tracing::warn!(session_id = %offer.session_id, "rejecting rtc offer at peer capacity");
+            send_status(&out_tx, offer.session_id, &binding, "failed", None).await;
             return;
         }
 
@@ -250,8 +278,6 @@ impl RtcSessions {
         registry: AgentRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
     ) -> Result<()> {
-        self.close(&offer.session_id).await;
-
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -316,6 +342,7 @@ impl RtcSessions {
             offer.binding.clone(),
             registry,
             out_tx.clone(),
+            Arc::new(AtomicBool::new(false)),
         );
         self.install_reaper(&pc, offer.session_id.clone(), offer.binding.id());
 
@@ -532,12 +559,14 @@ fn install_data_channel_handler(
     binding: RtcBinding,
     registry: AgentRegistry,
     out_tx: mpsc::Sender<WsOutbound>,
+    host_channel_accepted: Arc<AtomicBool>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let session_id = session_id.clone();
         let binding = binding.clone();
         let registry = registry.clone();
         let out_tx = out_tx.clone();
+        let host_channel_accepted = Arc::clone(&host_channel_accepted);
         Box::pin(async move {
             if dc.label() != binding.data_channel_label() {
                 tracing::warn!(scope_id = %binding.id(), label = %dc.label(), "rejecting data channel for wrong rtc scope");
@@ -546,6 +575,11 @@ fn install_data_channel_handler(
             }
 
             if matches!(binding.scope, RtcScope::Host(_)) {
+                if !accept_first_host_channel(&host_channel_accepted) {
+                    tracing::warn!(scope_id = %binding.id(), "rejecting extra host control data channel");
+                    let _ = dc.close().await;
+                    return;
+                }
                 install_host_control_channel(dc, session_id, binding, out_tx);
                 return;
             }
@@ -1121,6 +1155,32 @@ mod tests {
         assert!(parse_ice_transport_policy(Some("unknown")).is_err());
     }
 
+    #[test]
+    fn rtc_peer_caps_and_single_host_channel_guard_are_deterministic() {
+        let host = RtcBinding {
+            scope: RtcScope::Host(Uuid::new_v4()),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let agent = RtcBinding {
+            scope: RtcScope::Agent(Uuid::new_v4()),
+            protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let mut host_bindings = vec![host.clone(); MAX_HOST_RTC_PEERS - 1];
+        assert!(rtc_capacity_available(host_bindings.iter(), &host));
+        host_bindings.push(host.clone());
+        assert!(!rtc_capacity_available(host_bindings.iter(), &host));
+        assert!(rtc_capacity_available(host_bindings.iter(), &agent));
+
+        let all_bindings = vec![agent.clone(); MAX_RTC_PEERS];
+        assert!(!rtc_capacity_available(all_bindings.iter(), &agent));
+
+        let accepted = AtomicBool::new(false);
+        assert!(accept_first_host_channel(&accepted));
+        assert!(!accept_first_host_channel(&accepted));
+    }
+
     #[tokio::test]
     async fn daemon_host_identity_binds_without_any_agent_and_cannot_be_rebound() {
         let sessions = RtcSessions::new();
@@ -1150,15 +1210,22 @@ mod tests {
             .create_data_channel(HOST_CONTROL_LABEL, None)
             .await
             .unwrap();
-        let (messages_tx, mut messages_rx) = mpsc::channel::<String>(4);
-        channel.on_message(Box::new(move |message: DataChannelMessage| {
+        let extra_channel = browser_pc
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(4);
+        for (index, data_channel) in [(0, &channel), (1, &extra_channel)] {
             let messages_tx = messages_tx.clone();
-            Box::pin(async move {
-                let _ = messages_tx
-                    .send(String::from_utf8_lossy(&message.data).into_owned())
-                    .await;
-            })
-        }));
+            data_channel.on_message(Box::new(move |message: DataChannelMessage| {
+                let messages_tx = messages_tx.clone();
+                Box::pin(async move {
+                    let _ = messages_tx
+                        .send((index, String::from_utf8_lossy(&message.data).into_owned()))
+                        .await;
+                })
+            }));
+        }
 
         let host_id = Uuid::new_v4();
         let binding = RtcBinding {
@@ -1173,6 +1240,7 @@ mod tests {
             binding,
             AgentRegistry::new(),
             out_tx,
+            Arc::new(AtomicBool::new(false)),
         );
 
         let offer = browser_pc.create_offer(None).await.unwrap();
@@ -1192,15 +1260,26 @@ mod tests {
             .await
             .unwrap();
 
-        let hello = tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
-            .await
-            .expect("host control channel did not open")
-            .expect("host control channel closed before hello");
+        let (accepted_index, hello) =
+            tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
+                .await
+                .expect("host control channel did not open")
+                .expect("host control channel closed before hello");
         let hello: Value = serde_json::from_str(&hello).unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["protocol"], HOST_CONTROL_LABEL);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
+                .await
+                .is_err()
+        );
 
-        channel
+        let accepted_channel = if accepted_index == 0 {
+            &channel
+        } else {
+            &extra_channel
+        };
+        accepted_channel
             .send_text(
                 json!({
                     "version": RTC_PROTOCOL_VERSION,
@@ -1212,7 +1291,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
+        let (_, response) = tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
             .await
             .expect("host control ping timed out")
             .expect("host control channel closed before ping response");

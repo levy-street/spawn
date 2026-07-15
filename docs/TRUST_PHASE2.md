@@ -154,6 +154,15 @@ bounded `hello`/`ping` request-response primitive. This permits ownership,
 zero-agent, TURN-only, reconnect, cancellation, size, and cross-scope behavior
 to be tested before any protected filesystem/tool payload is moved. It does
 not make the Phase 2 claim and does not remove any legacy host content route.
+Host signaling is routed between websocket workers through ephemeral Redis
+pub/sub channels and a compare-refreshed daemon ownership lease; it does not
+depend on process-local broker affinity. Browser, host, and daemon session
+counts are capped, pending offers expire, daemon peer connections have a hard
+ceiling, and only the first correctly labelled host DataChannel is accepted.
+The browser's negotiation deadline starts before offer creation and ends only
+after the versioned host-channel hello, so missing answers and half-open
+channels are cleaned up and reconnected. Host RTC status visible to the server
+is restricted to stable content-free values.
 
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 

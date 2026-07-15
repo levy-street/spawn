@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
+
+    from .host_signal import RedisBrowserConn
 
 
 @dataclass(eq=False)
@@ -24,6 +27,7 @@ class DaemonConn:
     host_id: str
     user_id: str
     websocket: WebSocket
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     home_dir: str | None = None
     agent_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -53,6 +57,10 @@ class BrowserConn:
         async with self.send_lock:
             await self.websocket.send_bytes(payload)
 
+    @property
+    def route_id(self) -> str:
+        return self.id
+
 
 @dataclass(eq=False)
 class HostBrowserConn:
@@ -66,16 +74,21 @@ class HostBrowserConn:
         async with self.send_lock:
             await self.websocket.send_text(json.dumps(payload))
 
+    @property
+    def route_id(self) -> str:
+        return self.id
+
 
 @dataclass(frozen=True)
 class RtcSessionBinding:
     session_id: str
-    browser: BrowserConn | HostBrowserConn
+    browser: BrowserConn | HostBrowserConn | RedisBrowserConn
     daemon: DaemonConn
     scope_type: str
     scope_id: str
     protocol: str
     protocol_version: int
+    expires_at: float
 
 
 @dataclass
@@ -208,17 +221,45 @@ class Broker:
     async def register_rtc_session(
         self,
         session_id: str,
-        conn: BrowserConn | HostBrowserConn,
+        conn: BrowserConn | HostBrowserConn | RedisBrowserConn,
         *,
         daemon: DaemonConn,
         scope_type: str,
         scope_id: str,
         protocol: str,
         protocol_version: int,
+        ttl_seconds: int | None = None,
+        now: float | None = None,
     ) -> bool:
         async with self._lock:
+            now = time.monotonic() if now is None else now
+            self._prune_expired_rtc_sessions_locked(now)
             if session_id in self._rtc_sessions:
                 return False
+            if scope_type == "host":
+                from .host_signal import (
+                    MAX_HOST_RTC_SESSIONS_PER_BROWSER,
+                    MAX_HOST_RTC_SESSIONS_PER_DAEMON,
+                    MAX_HOST_RTC_SESSIONS_PER_HOST,
+                )
+
+                host_bindings = [
+                    binding
+                    for binding in self._rtc_sessions.values()
+                    if binding.scope_type == "host" and binding.scope_id == scope_id
+                ]
+                if len(host_bindings) >= MAX_HOST_RTC_SESSIONS_PER_HOST:
+                    return False
+                if (
+                    sum(binding.daemon is daemon for binding in host_bindings)
+                    >= MAX_HOST_RTC_SESSIONS_PER_DAEMON
+                ):
+                    return False
+                if (
+                    sum(binding.browser.route_id == conn.route_id for binding in host_bindings)
+                    >= MAX_HOST_RTC_SESSIONS_PER_BROWSER
+                ):
+                    return False
             self._rtc_sessions[session_id] = RtcSessionBinding(
                 session_id=session_id,
                 browser=conn,
@@ -227,11 +268,14 @@ class Broker:
                 scope_id=scope_id,
                 protocol=protocol,
                 protocol_version=protocol_version,
+                expires_at=float("inf") if ttl_seconds is None else now + ttl_seconds,
             )
             return True
 
     async def unregister_rtc_session(
-        self, session_id: str, conn: BrowserConn | HostBrowserConn | None = None
+        self,
+        session_id: str,
+        conn: BrowserConn | HostBrowserConn | RedisBrowserConn | None = None,
     ) -> None:
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
@@ -239,7 +283,7 @@ class Broker:
                 self._rtc_sessions.pop(session_id, None)
 
     async def unregister_rtc_sessions_for(
-        self, conn: BrowserConn | HostBrowserConn
+        self, conn: BrowserConn | HostBrowserConn | RedisBrowserConn
     ) -> list[RtcSessionBinding]:
         async with self._lock:
             sessions = [
@@ -255,10 +299,14 @@ class Broker:
         self,
         session_id: str,
         *,
-        browser: BrowserConn | HostBrowserConn | None = None,
+        browser: BrowserConn | HostBrowserConn | RedisBrowserConn | None = None,
         daemon: DaemonConn | None = None,
+        now: float | None = None,
     ) -> RtcSessionBinding | None:
         async with self._lock:
+            self._prune_expired_rtc_sessions_locked(
+                time.monotonic() if now is None else now
+            )
             binding = self._rtc_sessions.get(session_id)
             if binding is None:
                 return None
@@ -268,7 +316,49 @@ class Broker:
                 return None
             return binding
 
-    async def browser_for_rtc_session(self, session_id: str) -> BrowserConn | HostBrowserConn | None:
+    def _prune_expired_rtc_sessions_locked(self, now: float) -> None:
+        expired = [
+            session_id
+            for session_id, binding in self._rtc_sessions.items()
+            if binding.expires_at <= now
+        ]
+        for session_id in expired:
+            self._rtc_sessions.pop(session_id, None)
+
+    async def expire_rtc_session(
+        self, session_id: str, expected: RtcSessionBinding
+    ) -> bool:
+        async with self._lock:
+            current = self._rtc_sessions.get(session_id)
+            if current is not expected:
+                return False
+            self._rtc_sessions.pop(session_id, None)
+            return True
+
+    async def mark_rtc_session_connected(
+        self, session_id: str, expected: RtcSessionBinding
+    ) -> RtcSessionBinding | None:
+        """Remove the negotiation TTL while preserving the session cap."""
+        async with self._lock:
+            current = self._rtc_sessions.get(session_id)
+            if current is not expected:
+                return None
+            connected = replace(current, expires_at=float("inf"))
+            self._rtc_sessions[session_id] = connected
+            return connected
+
+    async def rtc_sessions_for_daemon(self, daemon: DaemonConn) -> list[RtcSessionBinding]:
+        async with self._lock:
+            self._prune_expired_rtc_sessions_locked(time.monotonic())
+            return [
+                binding
+                for binding in self._rtc_sessions.values()
+                if binding.daemon is daemon
+            ]
+
+    async def browser_for_rtc_session(
+        self, session_id: str
+    ) -> BrowserConn | HostBrowserConn | RedisBrowserConn | None:
         binding = await self.rtc_session_for(session_id)
         return binding.browser if binding is not None else None
 

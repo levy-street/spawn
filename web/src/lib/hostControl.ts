@@ -7,6 +7,8 @@ const HOST_SIGNAL_SUBPROTOCOL = "spawn.host.v1";
 const MAX_CONTROL_FRAME_BYTES = 16 * 1024;
 const MAX_PENDING_REQUESTS = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_RECONNECT_BASE_DELAY_MS = 500;
 
 export type HostControlState = "idle" | "connecting" | "open" | "ready" | "closed" | "error";
 
@@ -40,6 +42,13 @@ export interface HostControlRequestOptions {
   timeoutMs?: number;
 }
 
+export interface HostControlClientOptions {
+  connectTimeoutMs?: number;
+  requestTimeoutMs?: number;
+  maxPendingRequests?: number;
+  reconnectBaseDelayMs?: number;
+}
+
 export class HostControlClient {
   private state: HostControlState = "idle";
   private ws: WebSocket | null = null;
@@ -48,13 +57,16 @@ export class HostControlClient {
   private sessionId: string | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
-  private helloTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private listeners = new Set<(state: HostControlState) => void>();
 
-  constructor(readonly hostId: string) {}
+  constructor(
+    readonly hostId: string,
+    private readonly options: HostControlClientOptions = {},
+  ) {}
 
   getState(): HostControlState {
     return this.state;
@@ -91,7 +103,7 @@ export class HostControlClient {
     if (this.state !== "ready" || this.channel?.readyState !== "open") {
       return Promise.reject(new Error("Host control channel is not ready"));
     }
-    if (this.pending.size >= MAX_PENDING_REQUESTS) {
+    if (this.pending.size >= (this.options.maxPendingRequests ?? MAX_PENDING_REQUESTS)) {
       return Promise.reject(new Error("Too many pending host control requests"));
     }
     if (options.signal?.aborted) {
@@ -110,7 +122,10 @@ export class HostControlClient {
     }
 
     return new Promise<T>((resolve, reject) => {
-      const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+      const timeoutMs = Math.max(
+        1,
+        options.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      );
       const timer = setTimeout(() => {
         const current = this.finishPending(requestId);
         if (!current) return;
@@ -186,7 +201,7 @@ export class HostControlClient {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
           })
-          .catch(() => this.failRtc());
+          .catch(() => this.failRtc(message.session_id));
       } else if (message.type === "rtc.candidate" && message.session_id === this.sessionId) {
         if (this.pc?.remoteDescription) {
           void this.pc.addIceCandidate(message.candidate).catch(() => {});
@@ -198,13 +213,13 @@ export class HostControlClient {
         message.session_id === this.sessionId &&
         ["failed", "disabled", "unavailable"].includes(message.status)
       ) {
-        this.cleanupRtc(false);
-        this.scheduleReconnect();
+        this.failRtc(message.session_id);
       }
     };
     ws.onerror = () => this.setState("error");
     ws.onclose = () => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws !== ws) return;
+      this.ws = null;
       this.cleanupRtc(false);
       if (!this.stopped) this.scheduleReconnect();
     };
@@ -223,6 +238,10 @@ export class HostControlClient {
     this.channel = channel;
     this.sessionId = sessionId;
     this.pendingRemoteCandidates = [];
+    this.connectTimer = setTimeout(
+      () => this.failRtc(sessionId),
+      Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
+    );
     pc.onicecandidate = (event) => {
       if (!event.candidate || this.sessionId !== sessionId) return;
       this.sendSignal({
@@ -233,28 +252,16 @@ export class HostControlClient {
     };
     pc.onconnectionstatechange = () => {
       if (["failed", "closed"].includes(pc.connectionState)) {
-        this.cleanupRtc(false);
-        this.scheduleReconnect();
+        this.failRtc(sessionId);
       }
     };
     channel.onmessage = (event) => this.handleControlMessage(event.data);
-    channel.onopen = () => {
-      this.helloTimer = setTimeout(() => {
-        this.helloTimer = null;
-        this.cleanupRtc(true);
-        this.scheduleReconnect();
-      }, 5_000);
-    };
     channel.onclose = () => {
-      this.rejectPending(new Error("Host control channel closed"));
-      if (!this.stopped) {
-        this.setState("open");
-        this.scheduleReconnect();
-      }
+      this.failRtc(sessionId);
     };
     channel.onerror = () => {
       this.setState("error");
-      this.failRtc();
+      this.failRtc(sessionId);
     };
 
     try {
@@ -263,8 +270,7 @@ export class HostControlClient {
       if (this.sessionId !== sessionId) return;
       this.sendSignal({ type: "rtc.offer", session_id: sessionId, sdp: offer.sdp ?? "" });
     } catch {
-      this.cleanupRtc(false);
-      this.scheduleReconnect();
+      this.failRtc(sessionId);
     }
   }
 
@@ -297,8 +303,8 @@ export class HostControlClient {
       return;
     }
     if (message.type === "hello" && message.protocol === HOST_CONTROL_PROTOCOL) {
-      if (this.helloTimer) clearTimeout(this.helloTimer);
-      this.helloTimer = null;
+      if (this.connectTimer) clearTimeout(this.connectTimer);
+      this.connectTimer = null;
       this.setState("ready");
       return;
     }
@@ -333,9 +339,14 @@ export class HostControlClient {
 
   private sendCancel(requestId: string): void {
     if (this.channel?.readyState !== "open") return;
-    this.channel.send(
-      JSON.stringify({ version: HOST_CONTROL_VERSION, type: "cancel", request_id: requestId }),
-    );
+    try {
+      this.channel.send(
+        JSON.stringify({ version: HOST_CONTROL_VERSION, type: "cancel", request_id: requestId }),
+      );
+    } catch {
+      // Cancellation is best-effort. Timeout/abort must still settle the
+      // original request even if the channel failed between those steps.
+    }
   }
 
   private finishPending(requestId: string): PendingRequest | undefined {
@@ -357,8 +368,8 @@ export class HostControlClient {
     const sessionId = this.sessionId;
     this.sessionId = null;
     if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
-    if (this.helloTimer) clearTimeout(this.helloTimer);
-    this.helloTimer = null;
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
     const channel = this.channel;
     const pc = this.pc;
     this.channel = null;
@@ -383,7 +394,11 @@ export class HostControlClient {
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return;
     this.reconnectAttempt += 1;
-    const delay = Math.min(10_000, 500 * this.reconnectAttempt);
+    const delay = Math.min(
+      10_000,
+      Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS) *
+        this.reconnectAttempt,
+    );
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       const ws = this.ws;
@@ -397,7 +412,9 @@ export class HostControlClient {
     }, delay);
   }
 
-  private failRtc(): void {
+  private failRtc(expectedSessionId?: string): void {
+    if (expectedSessionId !== undefined && this.sessionId !== expectedSessionId) return;
+    if (this.sessionId === null && this.reconnectTimer) return;
     this.cleanupRtc(true);
     this.scheduleReconnect();
   }

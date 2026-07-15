@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -13,8 +14,22 @@ from .. import auth as auth_mod
 from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, Host
+from ..redis import get_backend
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .frames import KIND_OUTPUT, decode_binary_frame
+from .host_signal import (
+    HOST_CONTROL_PROTOCOL,
+    HOST_CONTROL_VERSION,
+    HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    HOST_RTC_SESSION_TTL_SECONDS,
+    HOST_RTC_STATUS_ALLOWLIST,
+    RedisBrowserConn,
+    decode_host_signal,
+    host_presence_key,
+    host_signal_channel,
+    receive_with_signal_pump,
+    wait_for_signal_pump,
+)
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
@@ -124,6 +139,132 @@ def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
     return True
 
 
+def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
+    return (
+        obj.get("scope_type") == "host"
+        and obj.get("scope_id") == host_id
+        and obj.get("protocol") == HOST_CONTROL_PROTOCOL
+        and obj.get("protocol_version") == HOST_CONTROL_VERSION
+        and obj.get("agent_id") is None
+    )
+
+
+async def _refresh_host_signal_presence(conn: DaemonConn, *, claim: bool = False) -> bool:
+    key = host_presence_key(conn.host_id)
+    value = conn.id.encode("ascii")
+    if claim:
+        await get_backend().set_ephemeral(
+            key,
+            value,
+            ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+        )
+        return True
+    # A superseded daemon on another worker must never steal routing ownership
+    # back merely by sending a late heartbeat.
+    return await get_backend().refresh_ephemeral_if(
+        key,
+        value,
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+
+
+async def _expire_host_rtc_binding(
+    binding: RtcSessionBinding,
+    daemon: DaemonConn,
+) -> None:
+    await asyncio.sleep(HOST_RTC_SESSION_TTL_SECONDS)
+    if not await get_broker().expire_rtc_session(binding.session_id, binding):
+        return
+    try:
+        await daemon.send_text(
+            {
+                "type": "rtc.close",
+                "session_id": binding.session_id,
+                "scope_type": "host",
+                "scope_id": binding.scope_id,
+                "protocol": binding.protocol,
+                "protocol_version": binding.protocol_version,
+            }
+        )
+    except Exception:
+        pass
+
+
+async def _pump_host_rtc_signals(
+    conn: DaemonConn,
+    ready: asyncio.Event,
+    expiry_tasks: set[asyncio.Task[None]],
+) -> None:
+    broker = get_broker()
+    async with get_backend().subscribe_channel(host_signal_channel(conn.host_id)) as stream:
+        ready.set()
+        async for raw in stream:
+            envelope = decode_host_signal(raw)
+            if envelope is None or envelope.daemon_connection_id != conn.id:
+                continue
+            signal = envelope.signal
+            if not _host_rtc_metadata_matches(signal, conn.host_id):
+                continue
+            session_id = _valid_rtc_session_id(signal.get("session_id"))
+            if session_id is None:
+                continue
+            frame_type = signal.get("type")
+            if frame_type == "rtc.offer":
+                if _valid_rtc_sdp(signal.get("sdp")) is None:
+                    continue
+                remote_browser = RedisBrowserConn(
+                    user_id=conn.user_id,
+                    host_id=conn.host_id,
+                    channel=envelope.browser_channel,
+                )
+                registered = await broker.register_rtc_session(
+                    session_id,
+                    remote_browser,
+                    daemon=conn,
+                    scope_type="host",
+                    scope_id=conn.host_id,
+                    protocol=HOST_CONTROL_PROTOCOL,
+                    protocol_version=HOST_CONTROL_VERSION,
+                    ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
+                )
+                if not registered:
+                    await remote_browser.send_text(
+                        {
+                            "type": "rtc.status",
+                            "session_id": session_id,
+                            "scope_type": "host",
+                            "scope_id": conn.host_id,
+                            "protocol": HOST_CONTROL_PROTOCOL,
+                            "protocol_version": HOST_CONTROL_VERSION,
+                            "status": "failed",
+                        }
+                    )
+                    continue
+                binding = await broker.rtc_session_for(session_id, daemon=conn)
+                if binding is None:
+                    continue
+                expiry_task = asyncio.create_task(_expire_host_rtc_binding(binding, conn))
+                expiry_tasks.add(expiry_task)
+                expiry_task.add_done_callback(expiry_tasks.discard)
+                await conn.send_text(signal)
+                continue
+
+            binding = await broker.rtc_session_for(session_id, daemon=conn)
+            if (
+                binding is None
+                or binding.scope_type != "host"
+                or binding.scope_id != conn.host_id
+                or binding.browser.route_id != envelope.browser_channel
+            ):
+                continue
+            if frame_type == "rtc.candidate":
+                if _valid_rtc_candidate(signal.get("candidate")) is not None:
+                    await conn.send_text(signal)
+            elif frame_type == "rtc.close":
+                await broker.unregister_rtc_session(session_id, binding.browser)
+                await conn.send_text(signal)
+
+
 @router.websocket("/ws/daemon")
 async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
     # Pre-accept-time auth check: we accept first because most clients can't read
@@ -138,11 +279,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     await broker.register_daemon(conn)
     log.info("daemon connected host=%s user=%s", host.id, host.owner_user_id)
 
+    signal_ready = asyncio.Event()
+    expiry_tasks: set[asyncio.Task[None]] = set()
+    signal_task = asyncio.create_task(_pump_host_rtc_signals(conn, signal_ready, expiry_tasks))
+
     sm = get_sessionmaker()
 
     try:
+        await wait_for_signal_pump(signal_task, signal_ready)
         while True:
-            msg = await websocket.receive()
+            msg = await receive_with_signal_pump(websocket, signal_task)
             if msg["type"] == "websocket.disconnect":
                 break
 
@@ -184,8 +330,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 # Fan-out via pubsub (single source of truth; works the same
                 # in single-worker dev and multi-worker prod). Browsers
                 # subscribe in `ws/browser.py`.
-                from ..redis import get_backend
-
                 await get_backend().publish(frame.agent_id, frame.payload)
 
             elif data_text is not None:
@@ -197,6 +341,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 ftype = obj.get("type")
 
                 if ftype == "register":
+                    # Claim distributed routing before publishing online state.
+                    # That ordering ensures a superseded worker cannot race its
+                    # disconnect cleanup after this registration commits.
+                    await _refresh_host_signal_presence(conn, claim=True)
                     # Resync existing agents the daemon thinks it has.
                     existing = obj.get("existing_agents") or []
                     home_dir = obj.get("home_dir")
@@ -238,6 +386,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await broker.resolve_tool_install(request_id, obj)
 
                 elif ftype == "host.heartbeat":
+                    if not await _refresh_host_signal_presence(conn):
+                        await websocket.close(code=4000, reason="superseded")
+                        break
                     async with sm() as session:
                         h = await session.get(Host, host.id)
                         if h is not None:
@@ -422,6 +573,19 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc status did not match its registered session")
                             continue
+                        if (
+                            binding.scope_type == "host"
+                            and status_value not in HOST_RTC_STATUS_ALLOWLIST
+                        ):
+                            log.warning("daemon sent non-allowlisted host rtc status")
+                            continue
+                        if binding.scope_type == "host" and status_value == "connected":
+                            connected_binding = await broker.mark_rtc_session_connected(
+                                session_id, binding
+                            )
+                            if connected_binding is None:
+                                continue
+                            binding = connected_binding
                         payload = {
                             "type": "rtc.status",
                             "session_id": session_id,
@@ -477,11 +641,46 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     except Exception as e:  # noqa: BLE001
         log.exception("daemon ws crashed: %s", e)
     finally:
+        for binding in await broker.rtc_sessions_for_daemon(conn):
+            if binding.scope_type != "host":
+                continue
+            try:
+                await binding.browser.send_text(
+                    {
+                        "type": "rtc.status",
+                        "session_id": binding.session_id,
+                        "scope_type": "host",
+                        "scope_id": binding.scope_id,
+                        "protocol": binding.protocol,
+                        "protocol_version": binding.protocol_version,
+                        "status": "unavailable",
+                    }
+                )
+            except Exception:
+                pass
+        pending_expiry_tasks = list(expiry_tasks)
+        for task in pending_expiry_tasks:
+            task.cancel()
+        if pending_expiry_tasks:
+            await asyncio.gather(*pending_expiry_tasks, return_exceptions=True)
+        signal_task.cancel()
+        try:
+            await signal_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        released_signal_owner = False
+        try:
+            released_signal_owner = await get_backend().delete_ephemeral_if(
+                host_presence_key(host.id), conn.id.encode("ascii")
+            )
+        except Exception:
+            log.warning("failed to release distributed host signaling ownership")
         await broker.unregister_daemon(conn)
-        async with sm() as session:
-            h = await session.get(Host, host.id)
-            if h is not None:
-                h.status = "offline"
-                h.last_seen_at = _utcnow()
-                await session.commit()
+        if released_signal_owner:
+            async with sm() as session:
+                h = await session.get(Host, host.id)
+                if h is not None:
+                    h.status = "offline"
+                    h.last_seen_at = _utcnow()
+                    await session.commit()
         log.info("daemon disconnected host=%s", host.id)

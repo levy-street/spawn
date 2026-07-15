@@ -11,7 +11,7 @@ from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Host
-from spawn_server.ws.broker import DaemonConn, get_broker
+from spawn_server.ws.broker import get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.host import (
     HOST_CONTROL_PROTOCOL,
@@ -96,13 +96,34 @@ def _metadata(host_id: str) -> dict[str, object]:
     }
 
 
+async def _start_daemon(user_id: str, host_id: str) -> tuple[FakeWebSocket, asyncio.Task[None]]:
+    socket = FakeWebSocket(authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}")
+    task = asyncio.create_task(daemon_ws(socket))  # type: ignore[arg-type]
+    socket.queue_text(
+        {
+            "type": "register",
+            "host_name": "test-daemon",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "test",
+        }
+    )
+    await _wait_until(
+        lambda: any(message.get("type") == "registered" for message in _json_messages(socket))
+    )
+    return socket, task
+
+
+async def _stop_daemon(socket: FakeWebSocket, task: asyncio.Task[None]) -> None:
+    socket.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     user_id, token = await _signup(client, "host-rtc-zero@example.com")
     host_id = await _create_host(user_id, "zero-agents")
-    daemon_ws = FakeWebSocket()
-    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    daemon_socket, daemon_task = await _start_daemon(user_id, host_id)
     broker = get_broker()
-    await broker.register_daemon(daemon)
 
     browser_ws = FakeWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(host_ws(browser_ws, host_id=host_id))  # type: ignore[arg-type]
@@ -114,8 +135,10 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     browser_ws.queue_text(
         {"type": "rtc.offer", "session_id": "zero-agent-session", "sdp": "v=0\r\n", **_metadata(host_id)}
     )
-    await _wait_until(lambda: bool(daemon_ws.sent_text))
-    offer = _json_messages(daemon_ws)[-1]
+    await _wait_until(
+        lambda: any(message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket))
+    )
+    offer = _json_messages(daemon_socket)[-1]
     assert offer["type"] == "rtc.offer"
     assert offer["session_id"] == "zero-agent-session"
     assert "agent_id" not in offer
@@ -123,7 +146,7 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
 
     # Host-control payload-shaped JSON is not a signaling frame and is never
     # forwarded to the daemon websocket.
-    count = len(daemon_ws.sent_text)
+    count = len(daemon_socket.sent_text)
     browser_ws.queue_text(
         {
             "type": "request",
@@ -133,17 +156,18 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
         }
     )
     await asyncio.sleep(0.02)
-    assert len(daemon_ws.sent_text) == count
+    assert len(daemon_socket.sent_text) == count
 
     browser_ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
-    assert _json_messages(daemon_ws)[-1] == {
+    await _wait_until(lambda: _json_messages(daemon_socket)[-1].get("type") == "rtc.close")
+    assert _json_messages(daemon_socket)[-1] == {
         "type": "rtc.close",
         "session_id": "zero-agent-session",
         **_metadata(host_id),
     }
     assert await broker.rtc_session_for("zero-agent-session") is None
-    await broker.unregister_daemon(daemon)
+    await _stop_daemon(daemon_socket, daemon_task)
 
 
 async def test_host_signaling_rejects_non_owner_and_cross_host_session(client):
@@ -156,13 +180,8 @@ async def test_host_signaling_rejects_non_owner_and_cross_host_session(client):
     await host_ws(rejected, host_id=first_host)  # type: ignore[arg-type]
     assert rejected.closed == (1008, "host not found")
 
-    first_daemon_ws = FakeWebSocket()
-    second_daemon_ws = FakeWebSocket()
-    broker = get_broker()
-    first_daemon = DaemonConn(first_host, owner_id, first_daemon_ws)  # type: ignore[arg-type]
-    second_daemon = DaemonConn(second_host, owner_id, second_daemon_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(first_daemon)
-    await broker.register_daemon(second_daemon)
+    first_daemon_ws, first_daemon_task = await _start_daemon(owner_id, first_host)
+    second_daemon_ws, second_daemon_task = await _start_daemon(owner_id, second_host)
     first_ws = FakeWebSocket(authorization=f"Bearer {owner_token}")
     second_ws = FakeWebSocket(authorization=f"Bearer {owner_token}")
     first_task = asyncio.create_task(host_ws(first_ws, host_id=first_host))  # type: ignore[arg-type]
@@ -172,7 +191,12 @@ async def test_host_signaling_rejects_non_owner_and_cross_host_session(client):
     first_ws.queue_text(
         {"type": "rtc.offer", "session_id": "isolated", "sdp": "v=0\r\n", **_metadata(first_host)}
     )
-    await _wait_until(lambda: bool(first_daemon_ws.sent_text))
+    await _wait_until(
+        lambda: any(message.get("type") == "rtc.offer" for message in _json_messages(first_daemon_ws))
+    )
+    second_rtc_count = sum(
+        message.get("type") == "rtc.offer" for message in _json_messages(second_daemon_ws)
+    )
     second_ws.queue_text(
         {
             "type": "rtc.offer",
@@ -187,7 +211,9 @@ async def test_host_signaling_rejects_non_owner_and_cross_host_session(client):
             for message in _json_messages(second_ws)
         )
     )
-    assert second_daemon_ws.sent_text == []
+    assert sum(
+        message.get("type") == "rtc.offer" for message in _json_messages(second_daemon_ws)
+    ) == second_rtc_count
 
     second_ws.queue_text(
         {
@@ -198,13 +224,18 @@ async def test_host_signaling_rejects_non_owner_and_cross_host_session(client):
         }
     )
     await asyncio.sleep(0.02)
-    assert second_daemon_ws.sent_text == []
+    assert sum(
+        message.get("type") in {"rtc.offer", "rtc.candidate"}
+        for message in _json_messages(second_daemon_ws)
+    ) == second_rtc_count
 
     first_ws.queue_disconnect()
     second_ws.queue_disconnect()
     await asyncio.gather(first_task, second_task)
-    await broker.unregister_daemon(first_daemon)
-    await broker.unregister_daemon(second_daemon)
+    await asyncio.gather(
+        _stop_daemon(first_daemon_ws, first_daemon_task),
+        _stop_daemon(second_daemon_ws, second_daemon_task),
+    )
 
 
 async def test_host_signaling_turn_only_and_oversize_limit(client, monkeypatch):
@@ -214,10 +245,6 @@ async def test_host_signaling_turn_only_and_oversize_limit(client, monkeypatch):
     get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, token = await _signup(client, "host-rtc-turn@example.com")
     host_id = await _create_host(user_id, "turn-only")
-    daemon_socket = FakeWebSocket()
-    daemon = DaemonConn(host_id, user_id, daemon_socket)  # type: ignore[arg-type]
-    broker = get_broker()
-    await broker.register_daemon(daemon)
     browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
     await _wait_until(lambda: bool(browser_socket.sent_text))
@@ -228,18 +255,15 @@ async def test_host_signaling_turn_only_and_oversize_limit(client, monkeypatch):
     browser_socket.queue_raw_text("x" * (MAX_SIGNAL_FRAME_BYTES + 1))
     await asyncio.wait_for(task, timeout=1)
     assert browser_socket.closed == (1009, "signaling frame too large")
-    await broker.unregister_daemon(daemon)
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
-async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forwarded(client):
+async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forwarded(
+    client, caplog
+):
     user_id, token = await _signup(client, "host-rtc-answer@example.com")
     host_id = await _create_host(user_id, "answer-host")
-    daemon_socket = FakeWebSocket(
-        authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}"
-    )
-    daemon_task = asyncio.create_task(daemon_ws(daemon_socket))  # type: ignore[arg-type]
-    await _wait_until(lambda: get_broker().get_daemon_for_host(host_id) is not None)
+    daemon_socket, daemon_task = await _start_daemon(user_id, host_id)
 
     browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
     browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
@@ -306,6 +330,79 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
     assert status_message["status"] == "failed"
     assert "message" not in status_message
 
+    browser_message_count = len(browser_socket.sent_text)
+    daemon_socket.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": "bound-answer",
+            "status": "secret-endpoint-status",
+            **_metadata(host_id),
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert len(browser_socket.sent_text) == browser_message_count
+    assert "daemon sent non-allowlisted host rtc status" in caplog.text
+    assert "secret endpoint path must not transit" not in caplog.text
+    assert "secret-endpoint-status" not in caplog.text
+
     browser_socket.queue_disconnect()
-    daemon_socket.queue_disconnect()
-    await asyncio.gather(browser_task, daemon_task)
+    await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))
+
+
+async def test_host_signaling_rejects_repeated_offers_and_caps_pending_sessions(client):
+    user_id, token = await _signup(client, "host-rtc-bounds@example.com")
+    host_id = await _create_host(user_id, "bounded-host")
+    daemon_socket, daemon_task = await _start_daemon(user_id, host_id)
+    browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
+    browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
+    await _wait_until(lambda: bool(browser_socket.sent_text))
+
+    first = {"type": "rtc.offer", "session_id": "pending-0", "sdp": "v=0\r\n", **_metadata(host_id)}
+    browser_socket.queue_text(first)
+    await _wait_until(
+        lambda: sum(message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket))
+        == 1
+    )
+    browser_socket.queue_text(first)
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "rtc.status"
+            and message.get("session_id") == "pending-0"
+            and message.get("status") == "failed"
+            for message in _json_messages(browser_socket)
+        )
+    )
+    assert sum(
+        message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket)
+    ) == 1
+
+    for index in range(1, 8):
+        browser_socket.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": f"pending-{index}",
+                "sdp": "v=0\r\n",
+                **_metadata(host_id),
+            }
+        )
+    await _wait_until(
+        lambda: sum(message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket))
+        == 8
+    )
+    browser_socket.queue_text(
+        {"type": "rtc.offer", "session_id": "over-cap", "sdp": "v=0\r\n", **_metadata(host_id)}
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "rtc.status"
+            and message.get("session_id") == "over-cap"
+            and message.get("status") == "failed"
+            for message in _json_messages(browser_socket)
+        )
+    )
+    assert sum(
+        message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket)
+    ) == 8
+
+    browser_socket.queue_disconnect()
+    await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))

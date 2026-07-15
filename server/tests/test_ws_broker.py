@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
+from spawn_server.ws.broker import Broker, BrowserConn, DaemonConn, HostBrowserConn, get_broker
 from spawn_server.ws.frames import (
     KIND_INPUT,
     KIND_OUTPUT,
@@ -414,3 +414,87 @@ async def test_pubsub_publish_subscribe_roundtrip(app):
         pass
 
     assert received == [b"hello ", b"world"]
+
+
+@pytest.mark.asyncio
+async def test_host_rtc_bindings_enforce_caps_and_expire_deterministically(monkeypatch):
+    from spawn_server.ws import host_signal
+
+    monkeypatch.setattr(host_signal, "MAX_HOST_RTC_SESSIONS_PER_BROWSER", 2)
+    monkeypatch.setattr(host_signal, "MAX_HOST_RTC_SESSIONS_PER_HOST", 3)
+    monkeypatch.setattr(host_signal, "MAX_HOST_RTC_SESSIONS_PER_DAEMON", 3)
+    broker = Broker()
+    daemon = DaemonConn("bounded-host", "owner", FakeWS())  # type: ignore[arg-type]
+    first = HostBrowserConn("owner", "bounded-host", FakeWS())  # type: ignore[arg-type]
+    second = HostBrowserConn("owner", "bounded-host", FakeWS())  # type: ignore[arg-type]
+
+    async def register(session_id: str, browser: HostBrowserConn) -> bool:
+        return await broker.register_rtc_session(
+            session_id,
+            browser,
+            daemon=daemon,
+            scope_type="host",
+            scope_id="bounded-host",
+            protocol="spawn.host.ctl",
+            protocol_version=1,
+            ttl_seconds=10,
+            now=100,
+        )
+
+    assert await register("bounded-1", first)
+    assert await register("bounded-2", first)
+    assert not await register("browser-over-cap", first)
+    assert await register("bounded-3", second)
+    assert not await register("host-and-daemon-over-cap", second)
+    first_binding = await broker.rtc_session_for("bounded-1", now=109)
+    assert first_binding is not None
+    assert await broker.mark_rtc_session_connected("bounded-1", first_binding) is not None
+    assert await broker.rtc_session_for("bounded-1", now=110) is not None
+    assert await broker.rtc_session_for("bounded-2", now=110) is None
+
+    # Expiry prunes every stale binding, freeing capacity for a fresh offer.
+    assert await register("after-expiry", first)
+
+
+@pytest.mark.asyncio
+async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
+    from spawn_server.redis import get_backend
+
+    backend = get_backend()
+    key = "spawn:rtc:host:presence-test:owner"
+    old = b"old-daemon"
+    new = b"new-daemon"
+    await backend.set_ephemeral(key, old, ttl_seconds=60)
+    await backend.set_ephemeral(key, new, ttl_seconds=60)
+
+    assert not await backend.refresh_ephemeral_if(key, old, ttl_seconds=60)
+    assert await backend.get_ephemeral(key) == new
+    assert await backend.refresh_ephemeral_if(key, new, ttl_seconds=60)
+
+
+def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
+    from spawn_server.ws.host_signal import (
+        MAX_HOST_SIGNAL_ENVELOPE_BYTES,
+        HostSignalEnvelope,
+        decode_host_signal,
+        encode_host_signal,
+    )
+
+    response_channel = f"spawn:rtc:browser:{'b' * 32}"
+    valid = HostSignalEnvelope(
+        daemon_connection_id="a" * 32,
+        browser_channel=response_channel,
+        signal={"type": "rtc.close"},
+    )
+    assert decode_host_signal(encode_host_signal(valid)) == valid
+    assert decode_host_signal(
+        encode_host_signal(valid).replace(b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', b'"invalid"')
+    ) is None
+    with pytest.raises(ValueError, match="too large"):
+        encode_host_signal(
+            HostSignalEnvelope(
+                daemon_connection_id="a" * 32,
+                browser_channel=response_channel,
+                signal={"value": "x" * MAX_HOST_SIGNAL_ENVELOPE_BYTES},
+            )
+        )

@@ -206,6 +206,15 @@ async def main() -> None:
     backend = get_backend()
     await backend.startup()
     try:
+        owner_key = f"spawn:rtc:host:{agent_id}:owner"
+        await backend.set_ephemeral(owner_key, b"old", ttl_seconds=60)
+        await backend.set_ephemeral(owner_key, b"new", ttl_seconds=60)
+        assert not await backend.refresh_ephemeral_if(owner_key, b"old", ttl_seconds=60)
+        assert await backend.refresh_ephemeral_if(owner_key, b"new", ttl_seconds=60)
+        assert await backend.get_ephemeral(owner_key) == b"new"
+        assert not await backend.delete_ephemeral_if(owner_key, b"old")
+        assert await backend.delete_ephemeral_if(owner_key, b"new")
+        assert await backend.get_ephemeral(owner_key) is None
         await backend.publish(agent_id, b"hello ")
         await backend.publish(agent_id, b"redis ")
         await backend.publish(agent_id, b"pubsub")
