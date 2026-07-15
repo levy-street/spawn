@@ -277,25 +277,29 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   // Recents: agents and screens as one recency-sorted list (pinned agents
   // float to the top), so the sidebar has a single mental model instead of
   // "agents grouped by host" plus a separate "screens" shelf.
-  const recents = useMemo<RecentItem[]>(() => {
-    const agentItems: RecentItem[] = (agentsQ.data ?? []).map((agent) => ({
+  // Pinned agents render in their own group above the "Recents" label; the
+  // rest sort by recency. Recency keys off last *input* (and screen edits),
+  // not output, so a chattering agent doesn't reshuffle the list every tick.
+  const { pinnedItems, recentItems } = useMemo(() => {
+    const agentItems: AgentItem[] = (agentsQ.data ?? []).map((agent) => ({
       kind: "agent",
       id: agent.id,
       recency: agentRecency(agent),
       pinned: Boolean(agent.pinned_at),
       agent,
     }));
-    const screenItems: RecentItem[] = allScreens.map((item) => ({
+    const screenItems: ScreenItem[] = allScreens.map((item) => ({
       kind: "screen",
       id: item.id,
       recency: screenRecency(item, agentsById),
       pinned: false,
       screen: item,
     }));
-    return [...agentItems, ...screenItems].sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      return b.recency - a.recency;
-    });
+    const byRecency = (a: RecentItem, b: RecentItem) => b.recency - a.recency;
+    return {
+      pinnedItems: agentItems.filter((item) => item.pinned).sort(byRecency),
+      recentItems: [...agentItems.filter((item) => !item.pinned), ...screenItems].sort(byRecency),
+    };
   }, [agentsQ.data, allScreens, agentsById]);
 
   const [actionError, setActionError] = useState<string | null>(null);
@@ -375,6 +379,41 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     renameM.mutate({ id: agent.id, name });
   };
 
+  const renderAgent = (agent: Agent) => {
+    const onCurrentScreen = currentScreenId !== null && currentScreenAgentIds.includes(agent.id);
+    return (
+      <AgentRow
+        key={`agent-${agent.id}`}
+        agent={agent}
+        collapsed={collapsed}
+        active={pathname === `/agents/${agent.id}`}
+        href={
+          onCurrentScreen ? `/screens/${currentScreenId}?focus=${agent.id}` : `/agents/${agent.id}`
+        }
+        // Already on this screen: the URL wouldn't change, so ask the screen
+        // to focus the pane via an event instead of a dead navigation.
+        onActivate={
+          onCurrentScreen
+            ? () =>
+                window.dispatchEvent(
+                  new CustomEvent("spawn:focus-pane", { detail: { agentId: agent.id } }),
+                )
+            : undefined
+        }
+        busy={busy}
+        onRename={() => promptRename(agent)}
+        onPin={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
+        onRestart={() => {
+          if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
+        }}
+        onArchive={() => archiveM.mutate(agent.id)}
+        onDelete={() => {
+          if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
+        }}
+      />
+    );
+  };
+
   return (
     <section
       aria-label="Recents"
@@ -383,18 +422,15 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
       {actionError && !collapsed && (
         <p className="mb-1 px-1.5 text-[11px] text-destructive">{actionError}</p>
       )}
+      {pinnedItems.length > 0 && (
+        <ul className="mb-1">
+          <SidebarSectionLabel collapsed={collapsed}>Pinned</SidebarSectionLabel>
+          {pinnedItems.map((item) => renderAgent(item.agent))}
+        </ul>
+      )}
       <ul>
-        <li aria-hidden={collapsed}>
-          <span
-            className={cn(
-              "flex items-center overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
-              collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
-            )}
-          >
-            Recents
-          </span>
-        </li>
-        {recents.map((item) =>
+        <SidebarSectionLabel collapsed={collapsed}>Recents</SidebarSectionLabel>
+        {recentItems.map((item) =>
           item.kind === "screen" ? (
             <ScreenRow
               key={`screen-${item.id}`}
@@ -408,43 +444,41 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
               }}
             />
           ) : (
-            <AgentRow
-              key={`agent-${item.id}`}
-              agent={item.agent}
-              collapsed={collapsed}
-              active={pathname === `/agents/${item.id}`}
-              href={
-                currentScreenId !== null && currentScreenAgentIds.includes(item.id)
-                  ? `/screens/${currentScreenId}?focus=${item.id}`
-                  : `/agents/${item.id}`
-              }
-              busy={busy}
-              onRename={() => promptRename(item.agent)}
-              onPin={() => pinM.mutate({ id: item.id, pinned: !item.agent.pinned_at })}
-              onRestart={() => {
-                if (confirm(`Restart ${agentTitle(item.agent)}?`)) restartM.mutate(item.id);
-              }}
-              onArchive={() => archiveM.mutate(item.id)}
-              onDelete={() => {
-                if (confirm(`Delete ${agentTitle(item.agent)}?`)) deleteM.mutate(item.id);
-              }}
-            />
+            renderAgent(item.agent)
           ),
         )}
-        {!agentsQ.isLoading && recents.length === 0 && !collapsed && (
-          <li className="px-1.5 py-1 text-xs text-muted-foreground">Nothing yet</li>
-        )}
+        {!agentsQ.isLoading &&
+          recentItems.length === 0 &&
+          pinnedItems.length === 0 &&
+          !collapsed && <li className="px-1.5 py-1 text-xs text-muted-foreground">Nothing yet</li>}
       </ul>
     </section>
   );
 }
 
-type RecentItem =
-  | { kind: "agent"; id: string; recency: number; pinned: boolean; agent: Agent }
-  | { kind: "screen"; id: string; recency: number; pinned: false; screen: Screen };
+type AgentItem = { kind: "agent"; id: string; recency: number; pinned: boolean; agent: Agent };
+type ScreenItem = { kind: "screen"; id: string; recency: number; pinned: false; screen: Screen };
+type RecentItem = AgentItem | ScreenItem;
+
+function SidebarSectionLabel({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
+  return (
+    <li aria-hidden={collapsed}>
+      <span
+        className={cn(
+          "flex items-center overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
+          collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
+        )}
+      >
+        {children}
+      </span>
+    </li>
+  );
+}
 
 function agentRecency(agent: Agent): number {
-  const value = agent.last_activity_at ?? agent.last_input_at ?? agent.started_at;
+  // Last *input* (or start), not output — user-driven order that doesn't
+  // churn while an agent streams.
+  const value = agent.last_input_at ?? agent.started_at;
   const time = Date.parse(value);
   return Number.isFinite(time) ? time : 0;
 }
@@ -454,6 +488,7 @@ function AgentRow({
   collapsed,
   active,
   href,
+  onActivate,
   busy,
   onRename,
   onPin,
@@ -465,6 +500,9 @@ function AgentRow({
   collapsed: boolean;
   active: boolean;
   href: string;
+  /** When set, clicking runs this instead of navigating (the target is the
+   *  current view already, so navigation would be a no-op). */
+  onActivate?: () => void;
   busy: boolean;
   onRename: () => void;
   onPin: () => void;
@@ -485,6 +523,14 @@ function AgentRow({
           onDragStart={(event) => {
             setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
           }}
+          onClick={
+            onActivate
+              ? (event) => {
+                  event.preventDefault();
+                  onActivate();
+                }
+              : undefined
+          }
           className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
         >
           <IconSlot>

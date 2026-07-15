@@ -19,11 +19,12 @@ export function screenAttentionCount(screen: Screen, agentsById: Map<string, Age
   }).length;
 }
 
-/** Recency for sorting the unified Recents list: the newest activity across
- *  the screen's panes, falling back to when the screen itself changed. */
+/** Recency for sorting the unified Recents list: the newest *input* across
+ *  the screen's panes (user-driven, so it doesn't churn while panes stream),
+ *  falling back to when the screen layout itself changed. */
 export function screenRecency(screen: Screen, agentsById: Map<string, Agent>): number {
   const times = screenAgentIds(screen)
-    .map((id) => agentsById.get(id)?.last_activity_at)
+    .map((id) => agentsById.get(id)?.last_input_at)
     .filter((value): value is string => Boolean(value))
     .map((value) => Date.parse(value))
     .filter((value) => Number.isFinite(value));

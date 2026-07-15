@@ -26,6 +26,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type RefObject,
   Suspense,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -225,17 +226,31 @@ function ScreenView({ id }: { id: string }) {
     }
   }, [screenAgentIds, focusedId]);
 
-  // Deep links (?focus=<agentId>) land with that pane focused — the sidebar
-  // and agent-page chips use this to jump straight to a pane.
+  // Deep links (?focus=<agentId>) land with that pane focused — used when
+  // arriving from another page.
   const focusParam = useSearchParams()?.get("focus") ?? null;
   const focusParamApplied = useRef(false);
+  const focusPane = useCallback((agentId: string) => {
+    setFocusedId(agentId);
+    requestAnimationFrame(() => paneHandles.current.get(agentId)?.focus());
+  }, []);
   useEffect(() => {
     if (focusParamApplied.current || !focusParam) return;
     if (!screenAgentIds.includes(focusParam)) return;
     focusParamApplied.current = true;
-    setFocusedId(focusParam);
-    requestAnimationFrame(() => paneHandles.current.get(focusParam)?.focus());
-  }, [focusParam, screenAgentIds]);
+    focusPane(focusParam);
+  }, [focusParam, screenAgentIds, focusPane]);
+
+  // Focus a pane on demand even when already on this screen (clicking the
+  // agent in the sidebar can't change the URL, so it dispatches an event).
+  useEffect(() => {
+    const onFocus = (event: Event) => {
+      const agentId = (event as CustomEvent<{ agentId: string }>).detail?.agentId;
+      if (agentId && screenAgentIds.includes(agentId)) focusPane(agentId);
+    };
+    window.addEventListener("spawn:focus-pane", onFocus);
+    return () => window.removeEventListener("spawn:focus-pane", onFocus);
+  }, [screenAgentIds, focusPane]);
 
   // Keyboard: Alt+arrows cycle pane focus, Alt+Z zooms, Alt+1..9 switches
   // screens. Capture phase so the focused terminal doesn't swallow them.
