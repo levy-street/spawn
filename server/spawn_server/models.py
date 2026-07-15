@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     String,
@@ -16,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .limits import MAX_SAFE_FENCING_GENERATION
 
 
 def _utcnow() -> datetime:
@@ -98,7 +101,16 @@ class Host(Base):
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="offline", nullable=False)
     daemon_connection_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    daemon_generation: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
+    daemon_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        CheckConstraint(
+            f"daemon_generation BETWEEN 0 AND {MAX_SAFE_FENCING_GENERATION}",
+            name="ck_hosts_daemon_generation_safe",
+        ),
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

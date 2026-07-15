@@ -17,6 +17,25 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from .config import get_settings
+from .limits import MAX_SAFE_FENCING_GENERATION
+
+
+def _lease_generation(value: bytes) -> int | None:
+    try:
+        generation_raw, owner_raw = value.split(b":", 1)
+        generation_text = generation_raw.decode("ascii")
+        owner = owner_raw.decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if len(owner) != 32 or any(character not in "0123456789abcdef" for character in owner):
+        return None
+    if not generation_text or not generation_text.isascii() or not generation_text.isdecimal():
+        return None
+    generation = int(generation_text)
+    if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+        return None
+    return generation
+
 
 # ---------- in-process pubsub ----------
 
@@ -25,7 +44,6 @@ class _InProcPubSub:
     def __init__(self) -> None:
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._values: dict[str, tuple[bytes, float]] = {}
-        self._generations: dict[str, int] = {}
 
     async def publish(self, channel: str, data: bytes) -> None:
         for q in list(self._subs.get(channel, ())):
@@ -47,19 +65,24 @@ class _InProcPubSub:
         self.set_ephemeral(key, value, ttl_seconds)
         return previous
 
-    def claim_ephemeral(
+    def set_ephemeral_if_newer(
         self,
         key: str,
-        generation_key: str,
         value: bytes,
-        minimum_generation: int,
+        generation: int,
         ttl_seconds: int,
-    ) -> tuple[bytes | None, int]:
-        generation = max(self._generations.get(generation_key, 0), minimum_generation) + 1
-        self._generations[generation_key] = generation
+    ) -> tuple[bool, bytes | None]:
         previous = self.get_ephemeral(key)
+        if previous is not None:
+            previous_generation = _lease_generation(previous)
+            if previous_generation is None:
+                return False, previous
+            if previous_generation > generation:
+                return False, previous
+            if previous_generation == generation and previous != value:
+                return False, previous
         self.set_ephemeral(key, value, ttl_seconds)
-        return previous, generation
+        return True, previous
 
     def get_ephemeral(self, key: str) -> bytes | None:
         item = self._values.get(key)
@@ -220,58 +243,61 @@ class RedisBackend:
         )
         return previous if isinstance(previous, bytes) else None
 
-    async def claim_ephemeral(
+    async def set_ephemeral_if_newer(
         self,
         key: str,
-        generation_key: str,
         value: bytes,
         *,
-        minimum_generation: int,
+        generation: int,
         ttl_seconds: int,
-    ) -> tuple[bytes | None, int]:
-        """Atomically claim a lease with a monotonically increasing fence token.
-
-        ``minimum_generation`` lets a durable database generation seed the
-        counter after Redis data loss. The counter intentionally outlives the
-        expiring lease so a delayed claimant can never become newer again.
-        """
-        if minimum_generation < 0:
-            raise ValueError("minimum_generation must be non-negative")
+    ) -> tuple[bool, bytes | None]:
+        """Set a generation-prefixed lease only if it is not older than Redis."""
+        if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+            raise ValueError("generation is outside Redis's exact integer range")
+        if _lease_generation(value) != generation:
+            raise ValueError("lease value does not contain the supplied generation")
         if self._inproc is not None:
-            return self._inproc.claim_ephemeral(
+            return self._inproc.set_ephemeral_if_newer(
                 key,
-                generation_key,
                 value,
-                minimum_generation,
+                generation,
                 ttl_seconds,
             )
         assert self._client is not None
-        claimed = await self._client.eval(
-            "local current = tonumber(redis.call('get', KEYS[2]) or '0'); "
-            "local minimum = tonumber(ARGV[3]); "
-            "local generation = math.max(current, minimum) + 1; "
-            "redis.call('set', KEYS[2], generation); "
+        result = await self._client.eval(
             "local old = redis.call('get', KEYS[1]); "
+            "if old then "
+            "local separator = string.find(old, ':', 1, true); "
+            "if not separator then return {-1, old}; end; "
+            "local current_raw = string.sub(old, 1, separator - 1); "
+            "if not string.match(current_raw, '^%d+$') then return {-1, old}; end; "
+            "local current_owner = string.sub(old, separator + 1); "
+            "if string.len(current_owner) ~= 32 "
+            "or not string.match(current_owner, '^[0-9a-f]+$') "
+            "then return {-1, old}; end; "
+            "local current = tonumber(current_raw); "
+            "if not current or current < 1 or current > tonumber(ARGV[4]) "
+            "or current ~= math.floor(current) then return {-1, old}; end; "
+            "if current > tonumber(ARGV[3]) then return {0, old}; end; "
+            "if current == tonumber(ARGV[3]) and old ~= ARGV[1] "
+            "then return {-1, old}; end; "
+            "end; "
             "redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2]); "
-            "return {old or false, generation}",
-            2,
+            "return {1, old or false}",
+            1,
             key,
-            generation_key,
             value,
             ttl_seconds,
-            minimum_generation,
+            generation,
+            MAX_SAFE_FENCING_GENERATION,
         )
-        if not isinstance(claimed, (list, tuple)) or len(claimed) != 2:
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
             raise RuntimeError("Redis returned an invalid lease claim")
-        previous_raw, generation_raw = claimed
+        status_raw, previous_raw = result
         previous = previous_raw if isinstance(previous_raw, bytes) else None
-        if isinstance(generation_raw, bytes):
-            generation = int(generation_raw)
-        elif isinstance(generation_raw, int):
-            generation = generation_raw
-        else:
-            raise RuntimeError("Redis returned an invalid lease generation")
-        return previous, generation
+        if not isinstance(status_raw, int):
+            raise RuntimeError("Redis returned an invalid lease claim status")
+        return status_raw == 1, previous
 
     async def get_ephemeral(self, key: str) -> bytes | None:
         if self._inproc is not None:

@@ -111,6 +111,7 @@ class BrowserDisplayState:
 class Broker:
     def __init__(self) -> None:
         self._daemons_by_host: dict[str, DaemonConn] = {}
+        self._accepted_daemon_owners: dict[str, tuple[str, int]] = {}
         self._daemon_by_agent: dict[str, DaemonConn] = {}
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
         self._display_by_agent: dict[str, _DisplayState] = {}
@@ -148,6 +149,12 @@ class Broker:
         async with self._lock:
             if self._daemons_by_host.get(conn.host_id) is conn:
                 self._daemons_by_host.pop(conn.host_id, None)
+            if (
+                conn.host_generation is not None
+                and self._accepted_daemon_owners.get(conn.host_id)
+                == (conn.id, conn.host_generation)
+            ):
+                self._accepted_daemon_owners.pop(conn.host_id, None)
             for aid in list(conn.agent_ids):
                 if self._daemon_by_agent.get(aid) is conn:
                     self._daemon_by_agent.pop(aid, None)
@@ -165,10 +172,44 @@ class Broker:
         for session_id in stale:
             self._rtc_sessions.pop(session_id, None)
 
-    async def attach_agent_to_daemon(self, agent_id: str, conn: DaemonConn) -> None:
+    async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
         async with self._lock:
+            if self._daemons_by_host.get(conn.host_id) is not conn:
+                return False
+            if conn.host_generation != generation:
+                return False
+            current = self._accepted_daemon_owners.get(conn.host_id)
+            if current is not None and current[1] > generation:
+                return False
+            self._accepted_daemon_owners[conn.host_id] = (conn.id, generation)
+            return True
+
+    async def is_accepted_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
+        async with self._lock:
+            return (
+                self._daemons_by_host.get(conn.host_id) is conn
+                and conn.host_generation == generation
+                and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
+            )
+
+    async def attach_agent_to_daemon(
+        self,
+        agent_id: str,
+        conn: DaemonConn,
+        *,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        async with self._lock:
+            if expected_host_generation is not None and not (
+                self._daemons_by_host.get(conn.host_id) is conn
+                and conn.host_generation == expected_host_generation
+                and self._accepted_daemon_owners.get(conn.host_id)
+                == (conn.id, expected_host_generation)
+            ):
+                return False
             conn.agent_ids.add(agent_id)
             self._daemon_by_agent[agent_id] = conn
+            return True
 
     async def detach_agent(self, agent_id: str) -> None:
         async with self._lock:

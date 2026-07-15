@@ -25,10 +25,10 @@ from .host_signal import (
     MAX_HOST_RTC_SESSIONS_PER_BROWSER,
     HostSignalEnvelope,
     browser_signal_channel,
+    decode_host_presence_owner,
     host_presence_key,
     publish_host_signal,
     receive_with_signal_pump,
-    valid_daemon_connection_id,
     wait_for_signal_pump,
 )
 
@@ -44,6 +44,7 @@ WS_CLOSE_BINARY = 4002
 class BrowserRtcSession:
     session_id: str
     daemon_connection_id: str
+    daemon_generation: int
     expires_at: float
 
 
@@ -93,8 +94,13 @@ async def _send_status(
 
 
 async def _binding_is_current_owner(host_id: str, binding: BrowserRtcSession) -> bool:
-    owner = await get_backend().get_ephemeral(host_presence_key(host_id))
-    return owner == binding.daemon_connection_id.encode("ascii")
+    owner = decode_host_presence_owner(
+        await get_backend().get_ephemeral(host_presence_key(host_id))
+    )
+    return owner is not None and (
+        owner.daemon_connection_id == binding.daemon_connection_id
+        and owner.generation == binding.daemon_generation
+    )
 
 
 async def _pump_browser_signals(
@@ -136,8 +142,13 @@ async def _pump_browser_signals(
                     continue
             else:
                 continue
-            current_owner = await get_backend().get_ephemeral(host_presence_key(host_id))
-            binding_is_current = current_owner == binding.daemon_connection_id.encode("ascii")
+            current_owner = decode_host_presence_owner(
+                await get_backend().get_ephemeral(host_presence_key(host_id))
+            )
+            binding_is_current = current_owner is not None and (
+                current_owner.daemon_connection_id == binding.daemon_connection_id
+                and current_owner.generation == binding.daemon_generation
+            )
             if not binding_is_current:
                 if frame_type != "rtc.status" or signal.get("status") != "unavailable":
                     continue
@@ -151,6 +162,7 @@ async def _pump_browser_signals(
                     sessions[session_id] = BrowserRtcSession(
                         session_id=current.session_id,
                         daemon_connection_id=current.daemon_connection_id,
+                        daemon_generation=current.daemon_generation,
                         expires_at=float("inf"),
                     )
             await conn.send_text(signal)
@@ -258,18 +270,13 @@ async def host_ws(
                 sdp = _valid_rtc_sdp(obj.get("sdp"))
                 if sdp is None:
                     continue
-                daemon_id_raw = await get_backend().get_ephemeral(host_presence_key(host_id))
-                if daemon_id_raw is None:
+                daemon_owner = decode_host_presence_owner(
+                    await get_backend().get_ephemeral(host_presence_key(host_id))
+                )
+                if daemon_owner is None:
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
-                try:
-                    daemon_connection_id = daemon_id_raw.decode("ascii")
-                except UnicodeDecodeError:
-                    await _send_status(conn, host_id, session_id, "unavailable")
-                    continue
-                if not valid_daemon_connection_id(daemon_connection_id):
-                    await _send_status(conn, host_id, session_id, "unavailable")
-                    continue
+                daemon_connection_id = daemon_owner.daemon_connection_id
                 now = time.monotonic()
                 async with sessions_lock:
                     _prune_sessions(sessions, now)
@@ -282,6 +289,7 @@ async def host_ws(
                         binding = BrowserRtcSession(
                             session_id=session_id,
                             daemon_connection_id=daemon_connection_id,
+                            daemon_generation=daemon_owner.generation,
                             expires_at=now + HOST_RTC_SESSION_TTL_SECONDS,
                         )
                         sessions[session_id] = binding

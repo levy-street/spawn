@@ -7,6 +7,7 @@ Revises: 0015
 import sqlalchemy as sa
 
 from alembic import op
+from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
 
 # revision identifiers
 revision = "0016"
@@ -22,7 +23,16 @@ def upgrade() -> None:
     )
     op.add_column(
         "hosts",
-        sa.Column("daemon_generation", sa.Integer(), server_default="0", nullable=False),
+        sa.Column(
+            "daemon_generation",
+            sa.BigInteger(),
+            sa.CheckConstraint(
+                f"daemon_generation BETWEEN 0 AND {MAX_SAFE_FENCING_GENERATION}",
+                name="ck_hosts_daemon_generation_safe",
+            ),
+            server_default="0",
+            nullable=False,
+        ),
     )
 
 

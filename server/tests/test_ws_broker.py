@@ -458,39 +458,75 @@ async def test_host_rtc_bindings_enforce_caps_and_expire_deterministically(monke
 
 @pytest.mark.asyncio
 async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
+    from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
     from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import (
+        HostPresenceOwner,
+        decode_host_presence_owner,
+        encode_host_presence_owner,
+    )
 
     backend = get_backend()
     key = "spawn:rtc:host:presence-test:owner"
-    old = b"a" * 32
-    new = b"b" * 32
+    old = encode_host_presence_owner(HostPresenceOwner("a" * 32, 1))
+    new = encode_host_presence_owner(HostPresenceOwner("b" * 32, 2))
     await backend.set_ephemeral(key, old, ttl_seconds=60)
-    assert await backend.swap_ephemeral(key, new, ttl_seconds=60) == old
+    claimed, previous = await backend.set_ephemeral_if_newer(
+        key, new, generation=2, ttl_seconds=60
+    )
+    assert claimed
+    assert previous == old
 
     assert not await backend.refresh_ephemeral_if(key, old, ttl_seconds=60)
     assert await backend.get_ephemeral(key) == new
     assert await backend.refresh_ephemeral_if(key, new, ttl_seconds=60)
 
-    generation_key = f"{key}:generation"
-    first_previous, first_generation = await backend.claim_ephemeral(
-        key,
-        generation_key,
-        old,
-        minimum_generation=0,
-        ttl_seconds=60,
+    claimed, previous = await backend.set_ephemeral_if_newer(
+        key, old, generation=1, ttl_seconds=60
     )
-    assert first_previous == new
-    assert first_generation == 1
-    second_previous, second_generation = await backend.claim_ephemeral(
-        key,
-        generation_key,
-        new,
-        minimum_generation=100,
-        ttl_seconds=60,
-    )
-    assert second_previous == old
-    assert second_generation == 101
+    assert not claimed
+    assert previous == new
     assert await backend.get_ephemeral(key) == new
+
+    for corrupt in (
+        b"corrupt",
+        b"NaN:" + b"c" * 32,
+        f"{MAX_SAFE_FENCING_GENERATION + 1}:{'c' * 32}".encode(),
+        b"3:invalid-owner",
+    ):
+        await backend.set_ephemeral(key, corrupt, ttl_seconds=60)
+        claimed, previous = await backend.set_ephemeral_if_newer(
+            key,
+            encode_host_presence_owner(HostPresenceOwner("c" * 32, 3)),
+            generation=3,
+            ttl_seconds=60,
+        )
+        assert not claimed
+        assert previous == corrupt
+        assert await backend.get_ephemeral(key) == corrupt
+    assert decode_host_presence_owner(b"not-a-generation:invalid") is None
+    assert decode_host_presence_owner(
+        f"{MAX_SAFE_FENCING_GENERATION + 1}:{'d' * 32}".encode()
+    ) is None
+
+    await backend.delete_ephemeral_if(key, b"3:invalid-owner")
+    maximum = encode_host_presence_owner(
+        HostPresenceOwner("d" * 32, MAX_SAFE_FENCING_GENERATION)
+    )
+    claimed, _ = await backend.set_ephemeral_if_newer(
+        key,
+        maximum,
+        generation=MAX_SAFE_FENCING_GENERATION,
+        ttl_seconds=60,
+    )
+    assert claimed
+    with pytest.raises(ValueError, match="exact integer range"):
+        await backend.set_ephemeral_if_newer(
+            key,
+            maximum,
+            generation=MAX_SAFE_FENCING_GENERATION + 1,
+            ttl_seconds=60,
+        )
 
 
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():

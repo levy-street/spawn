@@ -206,8 +206,12 @@ from spawn_server.config import get_settings
 from spawn_server.db import Base
 from spawn_server.models import Host, User
 from spawn_server.redis import get_backend
-from spawn_server.ws.daemon import _mark_host_online
-from spawn_server.ws.host_signal import host_presence_generation_key, host_presence_key
+from spawn_server.ws.daemon import _allocate_host_generation, _mark_host_online
+from spawn_server.ws.host_signal import (
+    HostPresenceOwner,
+    encode_host_presence_owner,
+    host_presence_key,
+)
 
 agent_id = os.environ["SPAWN_REDIS_SMOKE_AGENT_ID"]
 
@@ -222,26 +226,9 @@ async def main() -> None:
         # The older fence token must make A's database CAS a no-op.
         inverse_host_id = "00000000-0000-4000-8000-000000000099"
         inverse_user_id = "00000000-0000-4000-8000-000000000098"
-        old_owner = b"a" * 32
-        new_owner = b"b" * 32
+        old_owner = "a" * 32
+        new_owner = "b" * 32
         inverse_owner_key = host_presence_key(inverse_host_id)
-        inverse_generation_key = host_presence_generation_key(inverse_host_id)
-        _, old_generation = await backend.claim_ephemeral(
-            inverse_owner_key,
-            inverse_generation_key,
-            old_owner,
-            minimum_generation=0,
-            ttl_seconds=60,
-        )
-        previous, new_generation = await backend.claim_ephemeral(
-            inverse_owner_key,
-            inverse_generation_key,
-            new_owner,
-            minimum_generation=0,
-            ttl_seconds=60,
-        )
-        assert previous == old_owner
-        assert new_generation > old_generation
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -258,18 +245,53 @@ async def main() -> None:
             )
             await session.commit()
         async with sessions() as session:
+            old_generation = await _allocate_host_generation(
+                session, inverse_host_id, old_owner
+            )
+        assert old_generation == 1
+        # Redis can disappear after A's durable allocation without making its
+        # token reusable. B's allocation is still generation 2.
+        await backend.set_ephemeral(inverse_owner_key, b"lost-cache", ttl_seconds=60)
+        assert await backend.delete_ephemeral_if(inverse_owner_key, b"lost-cache")
+        async with sessions() as session:
+            new_generation = await _allocate_host_generation(
+                session, inverse_host_id, new_owner
+            )
+        assert new_generation == 2
+        new_lease = encode_host_presence_owner(
+            HostPresenceOwner(new_owner, new_generation)
+        )
+        claimed, _ = await backend.set_ephemeral_if_newer(
+            inverse_owner_key,
+            new_lease,
+            generation=new_generation,
+            ttl_seconds=60,
+        )
+        assert claimed
+        async with sessions() as session:
             assert await _mark_host_online(
                 session,
                 inverse_host_id,
-                new_owner.decode("ascii"),
+                new_owner,
                 new_generation,
                 {"version": "new"},
             )
+        old_lease = encode_host_presence_owner(
+            HostPresenceOwner(old_owner, old_generation)
+        )
+        claimed, previous = await backend.set_ephemeral_if_newer(
+            inverse_owner_key,
+            old_lease,
+            generation=old_generation,
+            ttl_seconds=60,
+        )
+        assert not claimed
+        assert previous == new_lease
         async with sessions() as session:
             assert not await _mark_host_online(
                 session,
                 inverse_host_id,
-                old_owner.decode("ascii"),
+                old_owner,
                 old_generation,
                 {"version": "old"},
             )
@@ -277,11 +299,11 @@ async def main() -> None:
             assert durable is not None
             assert durable.status == "online"
             assert durable.version == "new"
-            assert durable.daemon_connection_id == new_owner.decode("ascii")
+            assert durable.daemon_connection_id == new_owner
             assert durable.daemon_generation == new_generation
-        assert await backend.get_ephemeral(inverse_owner_key) == new_owner
+        assert await backend.get_ephemeral(inverse_owner_key) == new_lease
         assert await backend.refresh_ephemeral_if(
-            inverse_owner_key, new_owner, ttl_seconds=60
+            inverse_owner_key, new_lease, ttl_seconds=60
         )
         await engine.dispose()
 
@@ -325,11 +347,13 @@ host_result_file="$tmp_dir/host-worker.result"
 old_owner="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 new_owner="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 browser_route="cccccccccccccccccccccccccccccccc"
+host_database_url="sqlite+aiosqlite:///$tmp_dir/host-race.db"
 
 printf '%s\n' "smoke-redis-pubsub: starting old host-signaling worker"
 (
   cd server
   SPAWN_REDIS_URL="$redis_url" \
+    SPAWN_DATABASE_URL="$host_database_url" \
     SPAWN_USE_INPROCESS_PUBSUB=0 \
     SPAWN_REDIS_SMOKE_HOST_ID="$agent_id" \
     SPAWN_REDIS_SMOKE_OLD_OWNER="$old_owner" \
@@ -344,10 +368,17 @@ import os
 from pathlib import Path
 
 from spawn_server.config import get_settings
+from spawn_server.db import Base, dispose_engine, get_engine, get_sessionmaker
+from spawn_server.models import Host, User
 from spawn_server.redis import get_backend
 from spawn_server.ws.broker import DaemonConn, get_broker
 from spawn_server.ws.daemon import _pump_host_rtc_signals
-from spawn_server.ws.host_signal import browser_signal_channel, host_presence_key
+from spawn_server.ws.host_signal import (
+    HostPresenceOwner,
+    browser_signal_channel,
+    encode_host_presence_owner,
+    host_presence_key,
+)
 
 host_id = os.environ["SPAWN_REDIS_SMOKE_HOST_ID"]
 old_owner = os.environ["SPAWN_REDIS_SMOKE_OLD_OWNER"]
@@ -356,6 +387,7 @@ ready_file = Path(os.environ["SPAWN_REDIS_SMOKE_READY"])
 established_file = Path(os.environ["SPAWN_REDIS_SMOKE_ESTABLISHED"])
 result_file = Path(os.environ["SPAWN_REDIS_SMOKE_RESULT"])
 session_id = "redis-established-session"
+user_id = "00000000-0000-4000-8000-000000000097"
 
 
 class FakeWebSocket:
@@ -385,17 +417,36 @@ async def main() -> None:
     get_settings.cache_clear()  # type: ignore[attr-defined]
     backend = get_backend()
     await backend.startup()
+    engine = get_engine()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with get_sessionmaker()() as session:
+        session.add(User(id=user_id, email="host-race@example.com", password_hash="x"))
+        session.add(
+            Host(
+                id=host_id,
+                owner_user_id=user_id,
+                name="host-race",
+                status="online",
+                daemon_connection_id=old_owner,
+                daemon_generation=1,
+            )
+        )
+        await session.commit()
     broker = get_broker()
     websocket = FakeWebSocket()
     daemon = DaemonConn(
         host_id=host_id,
-        user_id="redis-smoke-user",
+        user_id=user_id,
         websocket=websocket,  # type: ignore[arg-type]
         id=old_owner,
+        host_generation=1,
     )
     await broker.register_daemon(daemon)
     await backend.set_ephemeral(
-        host_presence_key(host_id), old_owner.encode("ascii"), ttl_seconds=60
+        host_presence_key(host_id),
+        encode_host_presence_owner(HostPresenceOwner(old_owner, 1)),
+        ttl_seconds=60,
     )
     signal_ready = asyncio.Event()
     expiry_tasks: set[asyncio.Task[None]] = set()
@@ -440,6 +491,7 @@ async def main() -> None:
         await asyncio.gather(pump, return_exceptions=True)
         await broker.unregister_daemon(daemon)
         await backend.shutdown()
+        await dispose_engine()
 
 
 asyncio.run(main())
@@ -462,6 +514,7 @@ printf '%s\n' "smoke-redis-pubsub: racing a replacement host-signaling worker"
 (
   cd server
   SPAWN_REDIS_URL="$redis_url" \
+    SPAWN_DATABASE_URL="$host_database_url" \
     SPAWN_USE_INPROCESS_PUBSUB=0 \
     SPAWN_REDIS_SMOKE_HOST_ID="$agent_id" \
     SPAWN_REDIS_SMOKE_OLD_OWNER="$old_owner" \
@@ -474,15 +527,18 @@ import os
 from pathlib import Path
 
 from spawn_server.config import get_settings
+from spawn_server.db import dispose_engine, get_sessionmaker
 from spawn_server.redis import get_backend
+from spawn_server.ws.daemon import _allocate_host_generation
 from spawn_server.ws.host_signal import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
     HostOwnerRevocation,
+    HostPresenceOwner,
     HostSignalEnvelope,
     browser_signal_channel,
+    encode_host_presence_owner,
     host_presence_key,
-    host_presence_generation_key,
     publish_host_owner_revocation,
     publish_host_signal,
 )
@@ -524,15 +580,23 @@ async def main() -> None:
             await asyncio.sleep(0.01)
         assert established_file.exists(), "old worker did not establish the session"
 
-        previous, generation = await backend.claim_ephemeral(
+        async with get_sessionmaker()() as session:
+            generation = await _allocate_host_generation(session, host_id, new_owner)
+        assert generation == 2
+
+        replacement_lease = encode_host_presence_owner(
+            HostPresenceOwner(new_owner, generation)
+        )
+        claimed, previous = await backend.set_ephemeral_if_newer(
             host_presence_key(host_id),
-            host_presence_generation_key(host_id),
-            new_owner.encode("ascii"),
-            minimum_generation=0,
+            replacement_lease,
+            generation=generation,
             ttl_seconds=60,
         )
-        assert previous == old_owner.encode("ascii")
-        assert generation > 0
+        assert claimed
+        assert previous == encode_host_presence_owner(
+            HostPresenceOwner(old_owner, 1)
+        )
         # Deliberately publish the stale offer before the revocation event. The
         # old worker must fence on the current lease generation, not event order.
         await publish_host_signal(
@@ -545,6 +609,7 @@ async def main() -> None:
         )
     finally:
         await backend.shutdown()
+        await dispose_engine()
 
 
 asyncio.run(main())

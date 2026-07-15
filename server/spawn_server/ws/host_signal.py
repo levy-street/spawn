@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..redis import get_backend
 
 HOST_CONTROL_PROTOCOL = "spawn.host.ctl"
@@ -74,12 +75,37 @@ def host_presence_key(host_id: str) -> str:
     return f"spawn:rtc:host:{host_id}:owner"
 
 
-def host_presence_generation_key(host_id: str) -> str:
-    return f"spawn:rtc:host:{host_id}:owner-generation"
-
-
 def valid_daemon_connection_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
+
+
+@dataclass(frozen=True)
+class HostPresenceOwner:
+    daemon_connection_id: str
+    generation: int
+
+
+def encode_host_presence_owner(owner: HostPresenceOwner) -> bytes:
+    if not valid_daemon_connection_id(owner.daemon_connection_id):
+        raise ValueError("invalid host signaling owner")
+    if owner.generation < 1 or owner.generation > MAX_SAFE_FENCING_GENERATION:
+        raise ValueError("invalid host signaling generation")
+    return f"{owner.generation}:{owner.daemon_connection_id}".encode("ascii")
+
+
+def decode_host_presence_owner(value: bytes | None) -> HostPresenceOwner | None:
+    if value is None or len(value) > 64:
+        return None
+    try:
+        generation_raw, connection_id_raw = value.decode("ascii").split(":", 1)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not generation_raw.isdecimal() or not valid_daemon_connection_id(connection_id_raw):
+        return None
+    generation = int(generation_raw)
+    if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+        return None
+    return HostPresenceOwner(connection_id_raw, generation)
 
 
 @dataclass(frozen=True)
