@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_spawn_ctl_data_channel_routes_versioned_request_and_cleans_up() {
+    async fn real_spawn_pty_and_ctl_channels_replay_live_input_and_cleanup() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -1487,90 +1487,187 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let client_dc = offer_pc
+        let client_pty = offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let client_ctl = offer_pc
             .create_data_channel(CONTROL_DATA_CHANNEL_LABEL, None)
             .await
             .unwrap();
-        let (open_tx, open_rx) = oneshot::channel();
-        let open_tx = Arc::new(Mutex::new(Some(open_tx)));
-        let open_signal = Arc::clone(&open_tx);
-        client_dc.on_open(Box::new(move || {
-            let open_signal = Arc::clone(&open_signal);
+
+        let (pty_open_tx, pty_open_rx) = oneshot::channel();
+        let pty_open_tx = Arc::new(Mutex::new(Some(pty_open_tx)));
+        let pty_open_signal = Arc::clone(&pty_open_tx);
+        client_pty.on_open(Box::new(move || {
+            let open_signal = Arc::clone(&pty_open_signal);
             Box::pin(async move {
                 if let Some(tx) = open_signal.lock().await.take() {
                     let _ = tx.send(());
                 }
             })
         }));
-        let (message_tx, mut message_rx) = mpsc::channel::<String>(8);
-        client_dc.on_message(Box::new(move |message| {
-            let message_tx = message_tx.clone();
+        let (ctl_open_tx, ctl_open_rx) = oneshot::channel();
+        let ctl_open_tx = Arc::new(Mutex::new(Some(ctl_open_tx)));
+        let ctl_open_signal = Arc::clone(&ctl_open_tx);
+        client_ctl.on_open(Box::new(move || {
+            let open_signal = Arc::clone(&ctl_open_signal);
             Box::pin(async move {
-                if message.is_string {
-                    if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                        let _ = message_tx.send(text).await;
-                    }
+                if let Some(tx) = open_signal.lock().await.take() {
+                    let _ = tx.send(());
                 }
+            })
+        }));
+
+        let (pty_message_tx, mut pty_message_rx) = mpsc::channel::<Vec<u8>>(8);
+        client_pty.on_message(Box::new(move |message| {
+            let message_tx = pty_message_tx.clone();
+            Box::pin(async move {
+                let _ = message_tx.send(message.data.to_vec()).await;
+            })
+        }));
+        let (ctl_message_tx, mut ctl_message_rx) = mpsc::channel::<(bool, Vec<u8>)>(16);
+        client_ctl.on_message(Box::new(move |message| {
+            let message_tx = ctl_message_tx.clone();
+            Box::pin(async move {
+                let _ = message_tx
+                    .send((message.is_string, message.data.to_vec()))
+                    .await;
             })
         }));
 
         let agent_id = Uuid::new_v4();
         let viewer = "rtc-real:generation".to_string();
         let hub = AgentControlHub::default();
-        let server_hub = hub.clone();
-        let server_viewer = viewer.clone();
         let registry = AgentRegistry::new();
-        let (agent, _cmd_rx) = insert_test_worker(&registry, agent_id, "rtc-real");
-        let server_registry = registry.clone();
-        answer_pc.on_data_channel(Box::new(move |dc| {
-            install_control_data_channel(
-                dc,
-                server_viewer.clone(),
+        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id, "rtc-real");
+        let control = registry.control_for_binding(agent).unwrap();
+        let worker_control = control.clone();
+        let replay_bytes = b"worker-history\r\n".to_vec();
+        let worker_replay_bytes = replay_bytes.clone();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = worker_commands.recv().await {
+                match command {
+                    crate::pty::WorkerCmd::Replay { resp, .. } => {
+                        let _ = resp.send(Ok((
+                            worker_control.source_offset(),
+                            worker_replay_bytes.clone(),
+                        )));
+                    }
+                    crate::pty::WorkerCmd::Input(bytes) => {
+                        let _ = input_tx.send(bytes);
+                    }
+                    crate::pty::WorkerCmd::Resize { .. }
+                    | crate::pty::WorkerCmd::Shutdown { .. } => {}
+                }
+            }
+        });
+        let signaling =
+            RtcSessionBinding::new("rtc-real".to_string(), "generation".to_string(), agent_id);
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        install_data_channel_handler(
+            &answer_pc,
+            BoundRtcSession {
+                signaling,
                 agent,
-                server_registry.clone(),
-                server_hub.clone(),
-                Arc::new(AtomicBool::new(true)),
-                Arc::new(tokio::sync::RwLock::new(())),
-            );
-            Box::pin(async {})
-        }));
+                control: control.clone(),
+            },
+            registry,
+            hub.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(tokio::sync::RwLock::new(())),
+            out_tx,
+        );
 
         connect_peer_pair(&offer_pc, &answer_pc).await;
-        tokio::time::timeout(Duration::from_secs(10), open_rx)
-            .await
-            .expect("spawn.ctl did not open")
-            .expect("open callback dropped");
+        for (label, opened) in [
+            (PTY_DATA_CHANNEL_LABEL, pty_open_rx),
+            (CONTROL_DATA_CHANNEL_LABEL, ctl_open_rx),
+        ] {
+            tokio::time::timeout(Duration::from_secs(10), opened)
+                .await
+                .unwrap_or_else(|_| panic!("{label} did not open"))
+                .unwrap_or_else(|_| panic!("{label} open callback dropped"));
+        }
         let request_id = Uuid::new_v4();
-        client_dc
+        client_ctl
             .send_text(format!(
-                r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"redraw"}}"#
+                r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":400,"plain":false}}"#
             ))
             .await
             .unwrap();
 
-        let response = tokio::time::timeout(Duration::from_secs(10), async {
+        let metadata = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let text = message_rx.recv().await.expect("spawn.ctl closed");
-                if text.contains(&request_id.to_string()) {
-                    break text;
+                let (is_string, bytes) = ctl_message_rx.recv().await.expect("spawn.ctl closed");
+                if is_string {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if value.get("request_id").and_then(|id| id.as_str())
+                        == Some(&request_id.to_string())
+                    {
+                        break value;
+                    }
                 }
             }
         })
         .await
         .expect("spawn.ctl response timed out");
-        assert!(response.contains("\"operation\":\"redraw\""));
-        assert!(response.contains("\"ok\":true"));
+        assert_eq!(metadata["operation"], "history");
+        assert_eq!(metadata["ok"], true);
+        assert_eq!(metadata["pty_offset"], 0);
+        assert_eq!(metadata["total_bytes"], replay_bytes.len());
+        assert_eq!(metadata["chunks"], 1);
 
-        client_dc.close().await.unwrap();
+        let replay_chunk = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (is_string, bytes) = ctl_message_rx.recv().await.expect("spawn.ctl closed");
+                if !is_string && bytes.get(8..24) == Some(request_id.as_bytes()) {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("spawn.ctl replay chunk timed out");
+        assert_eq!(&replay_chunk[..4], b"SPCT");
+        assert_eq!(replay_chunk[4], agent_ctl::PROTOCOL_VERSION);
+        assert_eq!(&replay_chunk[28..], replay_bytes);
+
+        let live = b"live-after-replay\r\n";
+        control.route_direct_for_test(live).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), pty_message_rx.recv())
+                .await
+                .expect("spawn.pty live output timed out")
+                .expect("spawn.pty closed"),
+            live
+        );
+        client_pty
+            .send(&Bytes::from_static(b"endpoint-input"))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
+                .await
+                .expect("spawn.pty input timed out")
+                .expect("worker command channel closed"),
+            b"endpoint-input"
+        );
+
+        client_ctl.close().await.unwrap();
+        client_pty.close().await.unwrap();
         offer_pc.close().await.unwrap();
         answer_pc.close().await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while hub.contains_viewer(agent_id, &viewer).await {
+            while hub.contains_viewer(agent_id, &viewer).await
+                || control.direct_sink_offset(&viewer).await.is_some()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("spawn.ctl viewer cleanup timed out");
+        .expect("RTC viewer cleanup timed out");
+        worker.abort();
     }
 
     #[tokio::test]

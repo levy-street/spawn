@@ -525,6 +525,9 @@ UUID and binds every response/chunk to its caller:
 The daemon clamps the protocol surface by rejecting, rather than silently
 changing, invalid values: history/snapshot is 1–10,000 lines, geometry is
 20–400 columns by 5–200 rows, and scroll is a non-zero delta from -200 to 200.
+Worker replay uses the requested line count to bound its byte request. Tmux
+range-checks the value but returns its complete exact checkpoint-plus-stream;
+raw terminal bytes cannot safely be line-truncated without losing parser state.
 Only the daemon-selected display owner may resize; `take_control` transfers
 ownership. Viewer attach/detach/transfer produces a per-viewer E2E event:
 
@@ -556,17 +559,24 @@ Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 between them. Replay metadata therefore carries `pty_offset`, the exact
 per-viewer `spawn.pty` byte boundary represented by the replay. Worker output
 and replay share the worker's durable watermark, translated through the
-viewer's attach origin. Tmux briefly stops the pane process group, drains its
-forwarder, captures and samples the boundary atomically, then resumes and
-forces a repaint; cancellation also resumes it. The browser buffers live PTY
-data during bootstrap, applies the replay, discards buffered bytes through the
-anchor, and then applies only the suffix. Snapshot reconciliation uses the
-same explicit anchor; it never infers capture order from message arrival.
+viewer's attach origin. Tmux takes a bounded pane-history seed when the daemon
+attaches, then appends every byte emitted by that attached client under the
+same producer lock that routes `spawn.pty` and advances its source coordinate.
+Replay snapshots therefore clone bytes and boundary atomically without
+signalling the pane process or its process group. The combined seed and stream
+is capped at 12 MiB; overflow makes replay unavailable until daemon reattach
+while live PTY delivery continues. The browser buffers live PTY data during
+bootstrap, applies the replay, discards buffered bytes through the anchor, and
+then applies only the suffix. Snapshot reconciliation uses the same explicit
+anchor; it never infers capture order from message arrival.
 
 The signaling server binds each active RTC session ID to its browser
 connection, agent, daemon connection and a server-minted generation. Active ID
 collisions are rejected, and every candidate, close, answer and status must
 match that binding; stale generations cannot affect a replacement session.
+The daemon additionally binds every RTC callback to the concrete agent-backend
+generation and drains its callback fence before replacing or removing that
+backend.
 Per-viewer live and response queues are bounded. A viewer that stalls SCTP
 beyond the send timeout is disconnected and obtains a new bounded replay when
 it reconnects; display-state updates are latest-value/coalesced.

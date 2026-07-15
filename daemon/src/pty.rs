@@ -601,6 +601,11 @@ impl ForwarderControl {
             true
         });
     }
+
+    #[cfg(test)]
+    pub(crate) async fn route_direct_for_test(&self, chunk: &[u8]) {
+        self.route_direct(chunk, None).await;
+    }
 }
 
 /// Commands routed from spawnd to a session worker's connection tasks
@@ -1668,6 +1673,18 @@ mod tests {
         forwarder.await.unwrap();
     }
 
+    #[test]
+    fn exact_replay_overflow_fails_closed_without_retaining_partial_content() {
+        let mut replay = ExactReplayBuffer::seeded(vec![b'x'; EXACT_REPLAY_MAX_BYTES], Vec::new());
+        replay.append(b"overflow", 8);
+
+        assert!(replay.snapshot(false).is_err());
+        assert!(replay.snapshot(true).is_err());
+        assert!(replay.styled.is_empty());
+        assert!(replay.plain.bytes.is_empty());
+        assert_eq!(replay.source_end, 8);
+    }
+
     #[tokio::test]
     async fn stalled_direct_sink_is_bounded_and_disconnected_for_replay_catchup() {
         let agent_id = Uuid::new_v4();
@@ -1772,12 +1789,129 @@ mod tests {
             .control
             .add_direct_sink("reattached".into())
             .await;
+        let (_, adopted_replay) = reattached
+            .handle
+            .control
+            .exact_replay_snapshot(false)
+            .await
+            .expect("reattached exact replay snapshot");
+        assert!(String::from_utf8_lossy(&adopted_replay).contains("after-capture"));
         reattached.handle.write_stdin(b"after-reattach\n").unwrap();
         collect_direct_until(&mut reattached_direct.receiver, b"after-reattach").await;
+        let (_, post_reattach_replay) = reattached
+            .handle
+            .control
+            .exact_replay_snapshot(false)
+            .await
+            .expect("post-reattach exact replay snapshot");
+        assert!(String::from_utf8_lossy(&post_reattach_replay).contains("after-reattach"));
 
         tmux::kill_session(&session)
             .await
             .expect("cleanup tmux session");
+    }
+
+    #[tokio::test]
+    async fn tmux_exact_replay_preserves_prestopped_and_background_jobs() {
+        let agent_id = Uuid::new_v4();
+        let session = format!("spawn-test-job-control-{agent_id}");
+        let pid_file = std::env::temp_dir().join(format!("spawn-stopped-{agent_id}.pid"));
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            concat!(
+                "sleep 600 & stopped=$!; ",
+                "printf '%s' \"$stopped\" > \"$1\"; ",
+                "kill -STOP \"$stopped\"; ",
+                "(sleep 0.6; printf 'background-writer\\n') & ",
+                "printf 'jobs-ready\\n'; exec cat"
+            )
+            .to_string(),
+            "spawn-test".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        let env = [
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            ),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let launched = launch(LaunchSpec {
+            agent_id,
+            session: &session,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &env,
+        })
+        .await
+        .expect("launch tmux job-control agent");
+        let (mirror_tx, mut mirror_rx) = mpsc::channel(128);
+        launched.handle.control.set_sink(mirror_tx).await;
+        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
+        let mut direct = launched
+            .handle
+            .control
+            .add_direct_sink("viewer".into())
+            .await;
+
+        let stopped_pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stopped child pid was not recorded");
+        let stopped_pid = stopped_pid.to_string();
+        let state_before = tokio::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &stopped_pid])
+            .output()
+            .await
+            .expect("inspect stopped child before replay");
+        assert!(String::from_utf8_lossy(&state_before.stdout)
+            .trim()
+            .starts_with('T'));
+
+        launched
+            .handle
+            .control
+            .exact_replay_snapshot(false)
+            .await
+            .expect("exact replay while child is stopped");
+        collect_direct_until(&mut direct.receiver, b"background-writer").await;
+        launched
+            .handle
+            .control
+            .exact_replay_snapshot(true)
+            .await
+            .expect("plain exact replay after background output");
+
+        let state_after = tokio::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &stopped_pid])
+            .output()
+            .await
+            .expect("inspect stopped child after replay");
+        assert!(String::from_utf8_lossy(&state_after.stdout)
+            .trim()
+            .starts_with('T'));
+
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &stopped_pid])
+            .status()
+            .await;
+        tmux::kill_session(&session)
+            .await
+            .expect("cleanup tmux session");
+        let _ = std::fs::remove_file(pid_file);
     }
 
     #[tokio::test]
