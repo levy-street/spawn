@@ -29,24 +29,33 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 | `e03fb3f` | 0 | Deleted the dead Redis PTY ring buffer (`ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`). No production callers; its stale operational smoke dependency is fixed below. |
 | `98b28b4` | 0A | Repaired the real Redis pub/sub smoke after ring removal and added a test-matrix guard against stale ring calls. |
 | `f69b5fc` | — | `docs/TRUST_PHASE2.md` implementation spec (the cut sequence). |
-| `4b245f1` | 1 | **Content-free activity ping.** Classifier moved daemon-side; server no longer parses bytes for activity. |
+| `4b245f1` | 1 | Initial **content-free activity ping**: classifier moved daemon-side; server stopped parsing bytes for activity. |
+| `ea8169f`, `8d5966e`, `4b00aff` | DOC-01 | Independently reviewed trust inventory, transport schedule, purge runbook, retained-metadata disclosure, and guarantee/sequence corrections. |
+| `47b9c75`, `5b887bc`, `c7f3802`, `83c4295` | GATE-02–05 | Independently reviewed input activity, repaint suppression, streaming classifier, monotonic timing, producer ordering, bounded idle resolution, and activity-path test corrections. |
+| `31d3442` | GATE-02–05 | Merge commit integrating the complete reviewed activity-correction series on `master`. |
+| `ec1f86e` | QUAL-03 | Full Ruff baseline fixed. |
+| `aa524d9` | QUAL-05 | Full server suite made hermetic against ambient auth-provider environment and prior migration connection state. |
+| `1bb9fe9`, `775b7d0` | QUAL-02, QUAL-04 | Independently reviewed repository-wide daemon format cleanup and strict Clippy fixes. |
+| `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
 
 ### Increment 1 detail (the keystone)
 
-- `daemon/src/activity.rs` (NEW): initial Rust port of the server's
-  `output_payload_is_meaningful` (strip OSC/CSI/charset/tmux-clock/control,
-  require ≥3 non-whitespace chars). Its invalid/incomplete UTF-8 and chunk-boundary
-  behavior needs the corrective gate tracked in `TRUST_PHASE2_TASKS.md`.
-- `daemon/src/pty.rs`: `ForwarderControl` gained `last_activity_ms` +
-  `suppress_until_ms` atomics + `suppress_activity()` + `note_output()`.
-  `run_forwarder` classifies each chunk (throttled to `OUTPUT_TOUCH_INTERVAL`
-  2s) and emits `Outbound::AgentActivity{agent_id}` (best-effort `try_send`).
-  `write_stdin`/`resize` suppress echo/repaint; `handle_agent_redraw`
-  (`run.rs`) suppresses too.
-- `daemon/src/proto.rs`: `Outbound::AgentActivity` = `"agent.activity"`.
+- `daemon/src/activity.rs`: streaming, stateful output classifier. It consumes
+  arbitrary UTF-8 and terminal-sequence chunk boundaries in producer order,
+  retains bounded candidate state, and requires ≥3 meaningful characters.
+- `daemon/src/pty.rs`: monotonic per-agent input/output throttles and output
+  suppression state; activity eligibility is decided at the producer so later
+  resize/input/redraw events cannot retroactively change a queued chunk.
+  Ambiguous status-like fragments resolve after a bounded idle interval.
+- `daemon/src/proto.rs`: content-free `agent.activity` and
+  `agent.input_activity` frames.
+- `daemon/src/rtc.rs` and `daemon/src/run.rs`: DataChannel input stamps
+  input activity, while input echo, resize, redraw, scroll, and copy-mode
+  repaint paths suppress false output activity.
 - `server/spawn_server/ws/daemon.py`: handle `agent.activity` → stamp
-  `last_output_at` + `host.last_seen_at`; **deleted** the `0x01` byte
-  classification. `tests/test_ws_daemon.py`: new round-trip test.
+  `last_output_at`, and handle `agent.input_activity` → stamp
+  `last_input_at`, after host/agent ownership validation. The server does not
+  classify `0x01` bytes. Server and daemon tests cover the moved behavior.
 
 **Historical Increment 1 validation:** daemon `cargo test --bins --lib` = 40
 pass; the full server run recorded 127 passed and 2 failed
@@ -55,54 +64,56 @@ pass; the full server run recorded 127 passed and 2 failed
 `last_output_at` updates via `agent.activity` (server no longer sees bytes for
 activity); no post-restart `unknown frame` logs; no errors.
 
-The later comprehensive review ran 88 daemon tests successfully and 9 focused
-server tests successfully. Its full server run recorded 128 passed plus the two
-known failures. It found the Redis smoke failure (now fixed by `98b28b4`) and
-global quality findings listed in the task schedule: Rust formatting drift
-including Increment 1 activity code, one existing Ruff import-order failure in
-`routes/hosts.py`, and two existing Clippy warnings (`type_complexity` in
-`pty.rs`, `nonminimal_bool` in `upload.rs`). Trust-touched formatting is an
-immediate gate; the unrelated baseline items are scheduled but do not
-retroactively invalidate the focused trust validation. No document should
-summarize the historical state as "both suites pass."
+The later comprehensive review found the Redis smoke regression, v2 input
+timestamp gap, incomplete repaint suppression, streaming-classifier and clock
+boundary issues, missing integration coverage, and global format/Ruff/Clippy
+drift. Those findings are now all corrected, independently reviewed, and
+integrated through `640a2e0`. The originally recorded failures above remain
+historical facts; they should not be rewritten as a passing run.
+
+**Current integrated validation at `640a2e0`:** strict repository-wide daemon
+format and Clippy checks pass; `cargo test --locked` passes 113 daemon tests;
+full server Ruff passes; the hermetic full server suite passes 128 tests; and
+the real-Redis pub/sub smoke passes.
 
 ## Exactly where we're up to
+
+Wave 0 is complete on `master` through `640a2e0`: the expanded trust design,
+Redis smoke repair, all activity correctness gates, hermetic server baseline,
+and repository-wide format/Ruff/Clippy cleanup passed independent review.
 
 Increment 1's output-activity path is **shipped to the dev stack**. The `0x01`
 output leg still exists (it persists the transcript and feeds the v1 pubsub
 relay), so the server still receives all PTY output. The server no longer needs
 those bytes for activity, which is the precondition for cutting the mirror.
 
-The comprehensive review opened an immediate pre-Increment-2 gate: v2 input
-does not stamp `last_input_at`; scroll/copy-mode suppression is incomplete; the
-classifier and clock need boundary corrections; activity integration coverage
-is incomplete; and trust-touched Rust needs formatting. The Redis smoke gate is
-already complete on `master` at `98b28b4`. No Increment 2 implementation has
-started. The detailed status/dependencies are in `TRUST_PHASE2_TASKS.md`.
+Wave 1 is now active in parallel worktrees: P2-AGENT-01 is implementing the
+per-agent `spawn.ctl` root and P2-HOST-01 the independent host-scoped
+`spawn.host.ctl` root. At this checkpoint no Wave 1 transport code has passed
+review or been integrated on `master`. The detailed status/dependencies are in
+`TRUST_PHASE2_TASKS.md`.
 
 ## Remaining sequence
 
-1. Finish and independently review every remaining activity/format gate. The
-   Redis smoke repair is already done.
-2. In parallel, build per-agent `spawn.ctl` for history/snapshot and a separate
+1. In parallel, build per-agent `spawn.ctl` for history/snapshot and a separate
    host-scoped `spawn.host.ctl`. Per-agent RTC is not sufficient for file/tool
    operations on a host with no agent.
-3. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
+2. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
    REST/WS terminal content and viewport-control surfaces.
-4. Move host listings/read/write/transfer onto the host channel and ship a
+3. Move host listings/read/write/transfer onto the host channel and ship a
    parallel E2E path for interactive installer detail. Cross-host bytes stream
    through the trusted browser, not the server. Keep the legacy tool route until
    its endpoint-owned durable targets exist; this wave is not the final tool cut.
-5. Move full launch manifests, `Agent.env`, preset environment/install/tool
+4. Move full launch manifests, `Agent.env`, preset environment/install/tool
    targets, and skill bodies to the approved endpoint-owned/encrypted store.
    Stop cwd-derived default names, then make the interactive E2E tool path
    mandatory, remove its legacy server route, finish unattended tool migration,
    and replace free-form server-visible daemon errors with E2E details.
-6. Only after replacements and endpoint recovery tests pass, drain/restart
+5. Only after replacements and endpoint recovery tests pass, drain/restart
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-7. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
+6. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
    bound to SDP, session, agent-or-host scope, protocol version, sender role, and
    intended peer key. Trusted/verifiable endpoints test fingerprint substitution
    and cross-session/cross-scope replay for both agent- and host-scoped peer

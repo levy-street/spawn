@@ -3,9 +3,9 @@
 Last updated: 2026-07-15. Governing model: `docs/TRUST.md`. Build sequence and
 purge runbook: `docs/TRUST_PHASE2.md`.
 
-This is the execution ledger for the trust-model review. It distinguishes work
-already shipped from corrective gates that must land before Increment 2 and
-later work that depends on the new encrypted transports.
+This is the execution ledger for the trust-model review. It distinguishes
+reviewed work already integrated on `master` from the active transport roots
+and later work that depends on those new encrypted transports.
 
 ## Status and merge protocol
 
@@ -37,35 +37,46 @@ behavior.
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
 | BASE-00 | DONE | Remove the unused production Redis PTY ring API (`e03fb3f`) and repair the stale real-Redis smoke (`98b28b4`) | — | Runtime API is gone; real pub/sub smoke and matrix guard pass without ring calls |
-| BASE-01 | SHIPPED | Move meaningful-output classification to daemon and emit content-free `agent.activity` (`4b245f1`) | — | Server no longer parses `0x01` payloads; correctness tasks GATE-02–05 remain |
-| DOC-01 | ACTIVE | Expand trust inventory, transports, schedule, purge, retained metadata, and progress wording | — | Documentation diff is internally consistent and grounded in current routes/frames/models |
+| BASE-01 | DONE | Move meaningful-output classification to daemon and emit content-free `agent.activity` (`4b245f1`), then land the independently reviewed correctness series (`47b9c75`, `5b887bc`, `c7f3802`, `83c4295`; merged by `31d3442`) | — | Server no longer parses `0x01` payloads; GATE-02–05 passed before the Increment 2 transport roots started |
+| DOC-01 | DONE | Expand trust inventory, transports, schedule, purge, retained metadata, and progress wording (`ea8169f`, `8d5966e`, `4b00aff`) | — | Independently reviewed documentation is internally consistent and grounded in current routes/frames/models |
 
-## Immediate gate — must finish before Increment 2
+## Immediate gate — complete
 
-These tasks are intentionally small enough to run in parallel. All must be
-`DONE` before `spawn.ctl` implementation starts.
+These tasks ran in parallel and passed independent implementation review. Their
+completion is the gate that allowed the `spawn.ctl` transport work to start.
 
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
 | GATE-01 | DONE | Update `scripts/smoke-redis-pubsub.sh` after ring API removal; preserve live pub/sub coverage and remove stale ring calls (`98b28b4`) | BASE-00 | Real Redis smoke passed; test-matrix guard prevents ring calls returning |
-| GATE-02 | ACTIVE | Emit a content-free, monotonic-throttled daemon input-activity frame for `spawn.pty` input and stamp `last_input_at` after host/agent ownership validation | BASE-01 | A v2 DataChannel typing test produces the documented Input sent transition without server terminal bytes and preserves at-most-once-per-second disclosure |
-| GATE-03 | ACTIVE | Cover every daemon-induced repaint suppression path, especially tmux scroll and copy-mode cancellation before stdin | BASE-01 | Tests prove scroll/resize/redraw/input echo do not create false output activity while later genuine output does |
-| GATE-04 | ACTIVE | Correct classifier behavior for invalid/incomplete UTF-8 and split escape sequences; use monotonic throttle/suppression clocks | BASE-01 | Differential/boundary tests cover invalid bytes, multibyte chunk splits, escape splits, backward wall-clock changes, and the three-character threshold |
-| GATE-05 | ACTIVE | Add end-to-end activity tests and remove dead server classifier/suppression code when imports reach zero | GATE-02, GATE-03, GATE-04 | Tests cover throttling, frame emission/backpressure, ownership rejection, input stamping, and binary output not stamping server activity |
-| QUAL-01 | ACTIVE | Format all Increment 1 trust-touched Rust, including `activity.rs` and activity paths in `pty.rs`; require the same for every later trust change | BASE-01 | `rustfmt --check` passes on every trust-touched Rust file/diff before Increment 2 starts |
+| GATE-02 | DONE | Emit a content-free, monotonic-throttled daemon input-activity frame for `spawn.pty` input and stamp `last_input_at` after host/agent ownership validation (`47b9c75`; reviewed series merged by `31d3442`) | BASE-01 | A v2 DataChannel typing test produces the documented Input sent transition without server terminal bytes and preserves at-most-once-per-second disclosure |
+| GATE-03 | DONE | Cover every daemon-induced repaint suppression path, especially tmux scroll and copy-mode cancellation before stdin (`47b9c75`; reviewed series merged by `31d3442`) | BASE-01 | Tests prove scroll/resize/redraw/input echo do not create false output activity while later genuine output does |
+| GATE-04 | DONE | Correct classifier behavior for invalid/incomplete UTF-8 and split escape sequences; use monotonic throttle/suppression clocks (`47b9c75`, `5b887bc`, `c7f3802`, `83c4295`; merged by `31d3442`) | BASE-01 | Differential/boundary tests cover invalid bytes, multibyte chunk splits, escape splits, clock boundaries, and the three-character threshold |
+| GATE-05 | DONE | Add end-to-end activity tests and remove dead server classifier/suppression behavior when imports reached zero (`47b9c75`, `5b887bc`, `c7f3802`, `83c4295`; merged by `31d3442`) | GATE-02, GATE-03, GATE-04 | Tests cover throttling, frame emission/backpressure, ownership rejection, input stamping, streaming/binary output classification, and suppression |
+| QUAL-01 | DONE | Format all Increment 1 trust-touched Rust, including `activity.rs` and activity paths in `pty.rs`; require the same for every later trust change (activity merge `31d3442`; repository check confirmed at `640a2e0`) | BASE-01 | `cargo fmt --all -- --check` passes |
 
 ## Global quality ledger
 
-These findings predate the trust review and do not by themselves block the
-start of Increment 2. They are still real scheduled work. If a trust task
-touches an affected file, that finding becomes part of that task's merge gate;
-no new change may expand the baseline.
+These findings predated the trust review and did not by themselves block the
+start of Increment 2. They have now also been independently reviewed and
+integrated, leaving a clean quality baseline for the transport work.
 
 | ID | Status | Scope | Blocking rule | Review/acceptance gate |
 |----|--------|-------|---------------|------------------------|
-| QUAL-02 | READY | Resolve repository-wide `cargo fmt --all -- --check` drift outside the Increment 1 activity changes (including `rtc_probe`, sessiond emulator/scrollback, RTC/run/tmux formatting) | Nonblocking baseline unless an affected file is touched | Global format check passes in its dedicated worktree |
-| QUAL-03 | READY | Fix the existing Ruff import-order failure in `server/spawn_server/routes/hosts.py` | Nonblocking now; mandatory before P2-HOST-02/03 merge because they touch the file | `uv run ruff check spawn_server tests` passes |
-| QUAL-04 | READY | Fix the two existing Clippy warnings: `type_complexity` at `pty.rs` worker replay and `nonminimal_bool` in `upload.rs` | Nonblocking now; mandatory before overlapping agent-control/upload work merges | `cargo clippy --all-targets --all-features -- -D warnings` passes |
+| QUAL-02 | DONE | Resolve repository-wide `cargo fmt --all -- --check` drift outside the Increment 1 activity changes (`1bb9fe9`; merged with the parallel Clippy cleanup by `640a2e0`) | Completed baseline cleanup | Global format check passes |
+| QUAL-03 | DONE | Fix the Ruff import-order failure in `server/spawn_server/routes/hosts.py` (`ec1f86e`) | Completed baseline cleanup | `uv run ruff check spawn_server tests` passes |
+| QUAL-04 | DONE | Fix the two Clippy warnings: `type_complexity` at `pty.rs` worker replay and `nonminimal_bool` in `upload.rs` (`775b7d0`; merged with the parallel format cleanup by `640a2e0`) | Completed baseline cleanup | `cargo clippy --all-targets --all-features -- -D warnings` passes |
+| QUAL-05 | DONE | Make the full server test baseline hermetic by isolating auth-provider environment and migration connection state (`aa524d9`) | Completed test-harness cleanup | Full server suite passes without relying on ambient environment or prior engine state |
+
+### Integrated validation at `640a2e0`
+
+The reviewed Wave 0 commits were validated together on `master` at `640a2e0`:
+
+- `cd daemon && cargo fmt --all -- --check` — passed.
+- `cd daemon && cargo clippy --all-targets --all-features -- -D warnings` — passed.
+- `cd daemon && cargo test --locked` — 113 tests passed.
+- `cd server && uv run ruff check spawn_server tests` — passed.
+- `cd server && uv run pytest -q` — 128 tests passed.
+- `scripts/smoke-redis-pubsub.sh` — passed against real Redis.
 
 ## Phase 2 runtime schedule
 
@@ -77,7 +88,7 @@ protocol is already reviewed and stable.
 |----|--------|-------|------------|------------------------|
 | P2-AGENT-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/scroll/redraw/display ownership to it using the existing bounded tmux/worker replay sources | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; tmux capture respects the 10,000-line request cap and configured history limit; worker replay rotates whole segments at its 8 MiB default and becomes unavailable after worker exit; both backends replay after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; reviewer notes that `0x01` still remains |
 | P2-AGENT-02 | PLANNED | Retire `spawn.v1`, daemon `0x01` output and `0x02` input, server transcript writes/history forwarding/pubsub relay | P2-AGENT-01 | Mandatory DataChannel behavior and old-client failure mode tested; server cannot receive live PTY bytes; offline-history regression documented |
-| P2-HOST-01 | PLANNED | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
+| P2-HOST-01 | ACTIVE | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
 | P2-HOST-02 | PLANNED | Move host list/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to host channel; browser mediates cross-host streaming | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; streaming is bounded and hash/length checked; two-host authorization tests pass |
 | P2-HOST-03A | PLANNED | Add the parallel interactive tool path on `spawn.host.ctl`: commands, paths, installed/latest versions, detailed errors, and stdout/stderr remain E2E while the legacy route is temporarily retained | P2-HOST-01, QUAL-03 | Interactive check/install works with bounded/cancellable requests and no new server content; compatibility route retention is explicit and Phase 2 remains incomplete |
 | P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
@@ -137,10 +148,11 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 
 ## Parallel waves
 
-1. **Wave 0 (active):** GATE-01 is done. DOC-01, GATE-02–04, and QUAL-01 run in
-   separate worktrees; GATE-05 integrates the reviewed activity corrections.
-   QUAL-02–04 may run independently as nonblocking baseline cleanup.
-2. **Wave 1:** P2-AGENT-01 and P2-HOST-01 in parallel after the gate.
+1. **Wave 0 (complete):** DOC-01, GATE-01–05, and QUAL-01–05 passed
+   independent review and are integrated on `master` through `640a2e0`.
+2. **Wave 1 (active):** P2-AGENT-01 and P2-HOST-01 are being implemented in
+   parallel worktrees. No transport implementation has yet passed review or
+   been integrated on `master` at this checkpoint.
 3. **Wave 2:** P2-AGENT-02/P2-TERM-01/P2-TERM-02 on the agent protocol while
    P2-HOST-02 and P2-HOST-03A implement separate host-channel operations
    (rebasing/serializing shared route edits before merge). P2-DATA-01 design
