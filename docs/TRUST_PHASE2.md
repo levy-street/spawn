@@ -9,7 +9,7 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
 ## Current reality (why this is the sequence)
 
 - Both session backends (tmux `pty.rs`, worker `worker_backend.rs`) converge on
-  one `run_forwarder` (`daemon/src/pty.rs:594-627`) that sends every output
+  one `run_forwarder` (`daemon/src/pty.rs:658-702`) that sends every output
   chunk to **two sinks unconditionally**: the WebRTC DataChannel direct-sinks
   **and** the server-bound `0x01` WS leg. No v2 gate on the daemon side.
 - The only DataChannel is a raw per-agent `spawn.pty` byte pipe
@@ -33,20 +33,32 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   from the result.
 - REST `/api/agents/{id}/input` and `/snapshot` are content-bearing terminal
   paths independent of the browser WebSocket flow.
+- Terminal resize/scroll/redraw and display-control traffic exposes dimensions,
+  scroll deltas, and viewport timing through REST, `/ws/browser`, and
+  server↔daemon `agent.resize`/`scroll`/`redraw` frames.
 - `Agent.cwd`/`argv`/`env`, `Skill.content`, and
   `Preset.default_argv`/`env_template`/`install` are plaintext database fields.
   Preset templates are merged into the launch environment in `routes/agents.py`;
   the resulting launch manifest transits the server in `agent.create`.
+- When no explicit name is supplied, `_default_agent_name` copies the protected
+  `cwd` basename into the retained `Agent.name` column. Existing rows do not
+  record whether a name was explicit or derived.
+- Daemon `Outbound::Error.message` frames contain full `anyhow` chains (often
+  including cwd/file paths). `ws/daemon.py` forwards upload messages and logs
+  every free-form message; other detailed status/exit strings can do the same.
 - Removing future writes is insufficient: existing transcript files, database
-  values, legacy `spawn:agent:*:ring` Redis keys, and infrastructure
-  backups/snapshots remain readable until explicitly purged.
+  values, derived names, server/observability logs, legacy
+  `spawn:agent:*:ring` Redis keys, and infrastructure backups/snapshots remain
+  readable until explicitly purged.
 
 ## Increments
 
 ### 0 — delete the dead Redis ring buffer  ✅ done (`e03fb3f`)
+
 Zero production callers. `ws/ringbuffer.py`, `RedisBackend.ring_*`,
 `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`. The operational
-Redis smoke still referenced the removed methods and was repaired separately.
+Redis smoke still referenced the removed methods and was repaired by `98b28b4`;
+the real pub/sub smoke and a test-matrix guard now pass without the ring API.
 
 ### 1 — content-free output activity ping ✅ shipped (`4b245f1`)
 
@@ -76,27 +88,35 @@ gate yet:
   emission, channel backpressure/drop behavior, and the guarantee that binary
   PTY output never updates activity server-side. Delete the unused server-side
   classifier/suppression code once no live path imports it.
-- Repair `scripts/smoke-redis-pubsub.sh`, which still exercises the removed ring
-  API, so `scripts/test-all.sh` becomes a real gate again.
+
+Trust-touched Rust formatting is also a pre-Increment-2 gate. Repository-wide
+formatting, lint, and Clippy debt is tracked separately from trust correctness in
+`docs/TRUST_PHASE2_TASKS.md`; pre-existing unrelated findings do not silently
+become Phase 2 blockers, but any file touched by a trust task must leave its
+relevant gate clean.
 
 ### 2 — DataChannel control channel (`spawn.ctl`) + history/snapshot over it
 Add a second DC label `spawn.ctl` (daemon already gates on label at
 `rtc.rs:348`; browser creates only `spawn.pty` at `useAgentSocket.ts:244`).
 Carry snapshot/replay **requests + responses** over it, framed. On DC-open the
 browser requests the connect-time backfill + scrollback from the daemon over
-`spawn.ctl` (worker: `worker_replay` `pty.rs:340`; tmux: `tmux::capture_history`)
+`spawn.ctl` (worker: `worker_replay` `pty.rs:404`; tmux: `tmux::capture_history`)
 instead of the server `history`/`snapshot` frames. This removes those two v2
 content paths only. It does **not** complete the server cut: the daemon still
 mirrors every output chunk on `0x01` until Increment 3. The
 `dc_offset`/`rtc_session_id` cross-transport ordering machinery collapses once
 both live + backfill use the peer connection.
 
+The same channel carries resize/scroll/redraw, multi-viewer display ownership,
+and their acknowledgements. The daemon, not the server, arbitrates viewport
+state so geometry, deltas, and event timing remain E2E.
+
 ### 3 — drop the `0x01` output leg + delete server content stores
 Safe once (1) and (2) land and the DataChannel is mandatory (v1 retired):
 - Daemon: drop the `WsOutbound::Binary` sink in `run_forwarder`
-  (`pty.rs:601-621`); reroute `send_pty_text`/`send_snapshot_text` banners onto
+  (`pty.rs:658-702`); reroute `send_pty_text`/`send_snapshot_text` banners onto
   `spawn.ctl` or drop them.
-- Server: delete `transcript.py` + `daemon.py:158` append + `browser.py`
+- Server: delete `transcript.py` + `daemon.py:148` append + `browser.py`
   history/snapshot forwarding + the v1 `_pump_pubsub`/`0x02` input legs +
   `redis.py` pubsub. Drop `spawn.v1` + `WS_CLOSE_BINARY_ON_V2` branching.
 - **Accepted regression:** offline-host history replay (documented in TRUST.md).
@@ -116,7 +136,7 @@ authorizes operations to its own host identity; the browser binds every
 response to the requested host/session. Phase 3 adds signed signaling to both
 agent- and host-scoped peer connections.
 
-### 5 — host filesystem and tool operations over `spawn.host.ctl`
+### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
@@ -126,35 +146,42 @@ agent- and host-scoped peer connections.
   authorized host sessions and streams source daemon → browser → destination
   daemon; the server never buffers the file. Preserve bounded memory and
   destination overwrite semantics.
-- Treat tool commands, paths, versions, stdout, and stderr as protected content.
-  User-initiated check/install traffic uses the host channel. For unattended
-  updates, move the executable policy/target to the endpoint; the server may
-  retain only preset/host identifiers, schedule timestamps, and a content-free
-  success/failure/exit-code signal. Do not persist detailed errors in
-  `last_auto_update_error`.
-- Delete the corresponding REST content proxies and server broker waiters only
-  after the web client and daemon path is live.
+- Add E2E request/response support for interactive tool checks/installs,
+  including commands, paths, installed/latest versions, stdout/stderr, and
+  detailed errors. The server-side tool routes cannot be removed yet because
+  their durable target still comes from plaintext `Preset.install` and
+  `Preset.default_argv`; the full cut waits for Increment 7.
+- Delete the filesystem REST content proxies and server broker waiters only
+  after the web client and daemon path is live. Tool route deletion remains
+  deferred to Increment 7.
 
-### 6 — agent uploads and terminal REST retirement
+### 6 — agent uploads and terminal control-plane retirement
 
 Replace agent `bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`,
 and `agent_control.decode_upload`) with a chunked per-agent `spawn.ctl` stream.
 Keep only a content-free saved/failed acknowledgement; paths remain on the
 encrypted channel.
 
-Remove `/api/agents/{id}/input` and `/snapshot` plus their schemas/broker
-helpers. Browser input already uses `spawn.pty`; snapshot/history uses
-`spawn.ctl`. Migrate smoke/integration tooling to an RTC endpoint harness
-instead of keeping a server content proxy for tests. Return a non-content
-deprecation response only during a bounded compatibility window.
+Remove REST input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`
+viewport/display-control handlers, and their schemas/broker/server↔daemon
+frames. Browser input already uses `spawn.pty`; snapshot/history and viewport
+control use `spawn.ctl`. Migrate smoke/integration tooling to an RTC endpoint
+harness instead of keeping a server content proxy for tests. Return a
+non-content deprecation response only during a bounded compatibility window.
 
-### 7 — launch manifests, presets, and skills E2E
+Replace agent-scoped free-form daemon error messages with stable server-visible
+codes and E2E detail on `spawn.ctl`. Remove server forwarding/logging of error
+text; lifecycle status and exit code remain disclosed metadata.
+
+### 7 — launch manifests, presets, skills, and tool policy E2E
 
 REST agent creation persists only retained metadata (id, owner, host, name,
-status, lifecycle fields). `cwd`, `argv`, `env`, preset install data, preset
-environment values, and skill bodies travel over `spawn.host.ctl`; remove them
-from `_dispatch_agent_launch` and other server↔daemon frames. The daemon keeps a
-local launch manifest so restart does not require server plaintext.
+status, lifecycle fields). `cwd`, `argv`, `env`, preset install/default-command
+data, preset environment values, and skill bodies travel over
+`spawn.host.ctl`; remove them from `_dispatch_agent_launch` and other
+server↔daemon frames. The daemon keeps a local launch manifest so restart does
+not require server plaintext. Pre-launch and host-scoped detailed errors travel
+back on `spawn.host.ctl`; the server receives only a stable lifecycle code.
 
 Before implementation, choose and threat-model the durable endpoint store:
 
@@ -163,11 +190,28 @@ Before implementation, choose and threat-model the durable endpoint store:
 2. opaque client-encrypted server blobs with versioned AEAD envelopes and a
    recovery/key-distribution design in which the server never receives keys.
 
+The second option still leaks object identifiers, ciphertext sizes, version
+counts, and create/update/access timing/patterns. Its design and UI must disclose
+that metadata and test that no key or plaintext reaches server logs/telemetry.
+
 The security invariant is non-negotiable: no plaintext `Agent.env`,
 `Skill.content`, or `Preset.env_template` remains server-readable. Existing
 values are copied and verified through the chosen endpoint path before any
 database field is cleared. Preset/skill names and descriptions remain disclosed
 metadata and must not contain secrets.
+
+Stop deriving `Agent.name` from `cwd`; use an explicit user-supplied metadata
+label or a neutral ID-based default. Before clearing `Agent.cwd`, conservatively
+identify rows whose name equals the historical host/cwd-derived default and
+replace them with a neutral value (or reclassify/move the name E2E if exact
+provenance cannot be established). Record counts, never the old names.
+
+Once endpoint-owned `Preset.install`/`default_argv` and tool targets are durable,
+finish the tool cut: user-initiated traffic is E2E; unattended execution policy
+and targets live at the daemon/endpoint. The server retains only the enabled
+flag, host/preset identifiers, check/update/result timestamps, and content-free
+success/failure/exit-code status. Clear `last_auto_update_error` and remove all
+detailed result forwarding/logging.
 
 ### 8 — live-data migration and plaintext purge
 
@@ -180,11 +224,13 @@ skill recovery tests.
    values) for every file under the configured `SPAWN_TRANSCRIPT_DIR`, non-empty
    `Agent.cwd`/`argv`/`env`, `Skill.content`,
    `Preset.default_argv`/`env_template`/`install`, and
-   `HostToolPolicy.last_auto_update_error` rows; Redis keys matching the
-   historical `spawn:agent:*:ring` namespace; server logs/temp files/exports;
+   `HostToolPolicy.last_auto_update_error` rows; cwd-derived `Agent.name` rows;
+   Redis keys matching the historical `spawn:agent:*:ring` namespace; server,
+   daemon-forwarded, proxy, container/journal, audit, APM/trace, crash-report,
+   and third-party observability logs; temp files/exports/core dumps/swap;
    database/Redis persistence files and WAL/AOF; volume snapshots; replicas;
-   and provider backups. Record owners, encryption/key scope, retention, and
-   the oldest restorable point.
+   and provider backups. Record owners, encryption/key scope, retention,
+   deletion capability, and the oldest restorable point.
 2. **Migrate and verify endpoint copies.** Move transcript/history ownership to
    the daemon and launch/preset/skill data to the approved endpoint store.
    Server-only offline/archived transcripts are an accepted retirement, not a
@@ -194,10 +240,15 @@ skill recovery tests.
    endpoints, then exercise daemon restart, agent restart, history attach,
    preset edit/use, and skill edit/use. The audit record contains identifiers/
    counts only.
-3. **Close every ingress before purge.** Require upgraded browser/daemon
+3. **Close, drain, and restart every ingress before purge.** Require upgraded browser/daemon
    versions; retire `spawn.v1`, `0x01`/`0x02`, content REST routes, broker
-   waiters, and plaintext model writes. Monitor and reject attempted legacy
-   frames. Take the final inventory after the last accepted plaintext write.
+   waiters, free-form error/status messages, viewport control frames, and
+   plaintext model writes. Stop new requests; drain in-flight HTTP/WS queues,
+   broker waiters, Redis client/pubsub buffers, log pipelines, and telemetry
+   exporters; then restart every server worker/container and any relay process
+   that could retain plaintext memory. Monitor and reject attempted legacy
+   frames. Take the final inventory only after the last accepted plaintext write
+   and the drain/restart completes.
 4. **Purge primaries.** Delete transcript files and empty directories; scrub
    plaintext database values in a transaction before dropping/replacing the
    columns; delete legacy Redis ring keys (including keys not reachable through
@@ -207,43 +258,57 @@ skill recovery tests.
    volume or destroy/rotate the storage encryption key where raw-block recovery
    is possible. Never print a value in migration output. Plain Redis pub/sub
    messages are ephemeral but their application path must already be removed.
-5. **Purge recoverable copies.** Destroy database dumps, machine/volume
+5. **Purge runtime and observability residue.** Delete historical server/proxy/
+   container/journal logs, APM traces, error events, crash reports, core dumps,
+   and third-party log copies containing derived names or detailed errors.
+   Disable plaintext core capture. Wipe/recreate unencrypted swap or destroy its
+   encryption key, and reboot/restart as required to make old process memory,
+   queues, and swapped pages unrecoverable. Verify retention/deletion at every
+   external observability provider rather than assuming local deletion reaches
+   it.
+6. **Purge recoverable copies.** Destroy database dumps, machine/volume
    snapshots, object-store versions, and backups that contain plaintext, or let
    them expire under a documented retention policy while withholding the Phase
    2 completion claim. Where backups are envelope-encrypted, verified key
    destruction is acceptable if it makes every copy unrecoverable. Coordinate
    provider replicas and disaster-recovery stores, not just the live node.
-6. **Verify as the server operator.** Run negative disk/database/Redis scans,
-   inspect server logs, and restore the oldest remaining backup into an isolated
-   environment to confirm the protected fields/content are absent or
-   cryptographically unrecoverable. A second operator reviews the evidence.
-   Record timestamps, code/schema versions, counts, and backup IDs—not content.
-7. **Rollback rule.** Roll back binaries/configuration only. Do not restore a
+7. **Verify as the server operator.** Run negative disk/database/Redis/swap/core
+   scans; inspect process memory, queues, local and external observability
+   stores; and restore the oldest remaining backup into an isolated environment
+   to confirm the protected fields/content are absent or cryptographically
+   unrecoverable. Confirm ciphertext-only storage leaks only the disclosed
+   metadata. A second operator reviews the evidence. Record timestamps,
+   code/schema versions, counts, and backup IDs—not content.
+8. **Rollback rule.** Roll back binaries/configuration only. Do not restore a
    plaintext content store. If endpoint recovery fails, stop the rollout before
    Step 4 rather than purging early.
 
 ## Operational staging (do not break live sessions)
 
-Most remaining increments modify the **daemon**; restarting it restarts every
-session riding it (including any live agent). For each daemon increment: build
-(`cargo build`), run `daemon` test suite + `scripts/smoke-local-*`, stage on a
-throwaway host/agent first, and only then roll the live daemon during a quiet
-window. Server-only pieces deploy independently with just a server restart.
+Most remaining increments modify the **daemon**. Restarting it tears down RTC
+and server-control connections and makes browsers reconnect, but tmux sessions
+and worker processes normally survive and are rediscovered/adopted. Treat that
+as a tested behavior, not a guarantee: for each daemon increment build (`cargo
+build`), run the daemon suite + `scripts/smoke-local-*`, verify tmux and worker
+adoption on a throwaway host, and only then roll the live daemon during a quiet
+window. Server-only pieces deploy independently with a server restart.
 
 The purge has its own change window and rollback boundary. Take no fresh
 plaintext backup for convenience: backup policy must already be compatible
-with Step 8 before the purge begins.
+with the Increment 8 purge runbook before the purge begins.
 
 ## Acceptance (end of Phase 2)
 
 All tasks and review gates in `docs/TRUST_PHASE2_TASKS.md` are complete. A
 route/frame/schema inventory and adversarial tests show no server path can
 receive or return PTY/history/snapshot bytes, agent or host file data, directory
-entries/paths, tool commands/paths/versions/output/detailed errors, launch
-`cwd`/`argv`/`env`, preset default arguments/environment/install values, or
-skill bodies. Server-process memory, disk, database, Redis, logs, backups,
-snapshots, and restored oldest-retained backup contain no recoverable plaintext
-from those classes.
+entries/paths/sizes/mtimes/errors, tool commands/paths/installed/latest
+versions/output/detailed errors, launch
+`cwd`/`argv`/`env`, cwd-derived labels, terminal geometry/viewport events,
+preset default arguments/environment/install values, free-form daemon errors,
+or skill bodies. Server-process memory, queues, disk, database, Redis, swap,
+core dumps, local/external observability, backups, snapshots, and restored
+oldest-retained backup contain no recoverable plaintext from those classes.
 
 The server continues to see the metadata explicitly disclosed in
 `docs/TRUST.md`, including user-input and meaningful-output timestamps. An active

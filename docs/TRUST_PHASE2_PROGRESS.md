@@ -24,7 +24,8 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 
 | commit | increment | what |
 |--------|-----------|------|
-| `e03fb3f` | 0 | Deleted the dead Redis PTY ring buffer (`ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`). No production callers; the stale operational Redis smoke was repaired separately. |
+| `e03fb3f` | 0 | Deleted the dead Redis PTY ring buffer (`ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`). No production callers; its stale operational smoke dependency is fixed below. |
+| `98b28b4` | 0A | Repaired the real Redis pub/sub smoke after ring removal and added a test-matrix guard against stale ring calls. |
 | `f69b5fc` | — | `docs/TRUST_PHASE2.md` implementation spec (the cut sequence). |
 | `4b245f1` | 1 | **Content-free activity ping.** Classifier moved daemon-side; server no longer parses bytes for activity. |
 
@@ -54,9 +55,14 @@ activity); no post-restart `unknown frame` logs; no errors.
 
 The later comprehensive review ran 88 daemon tests successfully and 9 focused
 server tests successfully. Its full server run recorded 128 passed plus the two
-known failures. It also found the Redis smoke failure and global formatting/
-lint warnings listed in the task schedule; no document should summarize that
-state as "both suites pass."
+known failures. It found the Redis smoke failure (now fixed by `98b28b4`) and
+global quality findings listed in the task schedule: Rust formatting drift
+including Increment 1 activity code, one existing Ruff import-order failure in
+`routes/hosts.py`, and two existing Clippy warnings (`type_complexity` in
+`pty.rs`, `nonminimal_bool` in `upload.rs`). Trust-touched formatting is an
+immediate gate; the unrelated baseline items are scheduled but do not
+retroactively invalidate the focused trust validation. No document should
+summarize the historical state as "both suites pass."
 
 ## Exactly where we're up to
 
@@ -67,25 +73,31 @@ those bytes for activity, which is the precondition for cutting the mirror.
 
 The comprehensive review opened an immediate pre-Increment-2 gate: v2 input
 does not stamp `last_input_at`; scroll/copy-mode suppression is incomplete; the
-classifier and clock need boundary corrections; the Redis smoke is stale; and
-activity integration coverage is incomplete. No Increment 2 implementation has
+classifier and clock need boundary corrections; activity integration coverage
+is incomplete; and trust-touched Rust needs formatting. The Redis smoke gate is
+already complete on `master` at `98b28b4`. No Increment 2 implementation has
 started. The detailed status/dependencies are in `TRUST_PHASE2_TASKS.md`.
 
 ## Remaining sequence
 
-1. Finish and independently review every immediate activity/smoke gate.
+1. Finish and independently review every remaining activity/format gate. The
+   Redis smoke repair is already done.
 2. In parallel, build per-agent `spawn.ctl` for history/snapshot and a separate
    host-scoped `spawn.host.ctl`. Per-agent RTC is not sufficient for file/tool
    operations on a host with no agent.
 3. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
-   REST terminal content surfaces.
-4. Move host listings/read/write/transfer and installer detail onto the host
-   channel. Cross-host bytes stream through the trusted browser, not the server.
-5. Move full launch manifests, `Agent.env`, `Preset.env_template`, and skill
-   bodies to the approved endpoint-owned/encrypted store and host channel.
-6. Only after replacements and endpoint recovery tests pass, run the historical
-   plaintext purge across live disk/DB/Redis and every backup/snapshot. Verify
-   the oldest retained restore before making the Phase 2 claim.
+   REST/WS terminal content and viewport-control surfaces.
+4. Move host listings/read/write/transfer and interactive installer detail onto
+   the host channel. Cross-host bytes stream through the trusted browser, not
+   the server.
+5. Move full launch manifests, `Agent.env`, preset environment/install/tool
+   targets, and skill bodies to the approved endpoint-owned/encrypted store.
+   Stop cwd-derived default names, then finish unattended tool migration and
+   replace free-form server-visible daemon errors with E2E details.
+6. Only after replacements and endpoint recovery tests pass, drain/restart
+   server paths and run the historical plaintext purge across process memory,
+   disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
+   Verify the oldest retained restore before making the Phase 2 claim.
 7. Phase 3 adds Ed25519 host keys, browser device keys, signed signaling, and
    TOFU pinning to both agent- and host-scoped peer connections.
 
