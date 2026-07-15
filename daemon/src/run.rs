@@ -1576,12 +1576,18 @@ async fn handle_agent_create(
     // the registry — that way the first PTY bytes (tmux's initial pane draw)
     // route through cleanly instead of piling up in the outbox.
     launched.handle.control.set_sink(out_tx.clone()).await;
+    let transition = registry.lock_generation_transition(agent_id).await;
     if let Some(previous) = registry.binding_for(agent_id) {
+        // Invalidate first. Any offer that captured `previous` must acquire
+        // this same transition lock before peer insertion and will fail its
+        // generation recheck after the guard is released.
+        let _ = registry.remove_if_generation(agent_id, previous.generation());
         rtc_sessions
             .close_for_agent(agent_id, previous.generation())
             .await;
     }
     let generation = registry.insert(launched.handle);
+    drop(transition);
 
     // Tell server it's up.
     let started = Outbound::AgentStarted { agent_id, pid };
@@ -1598,11 +1604,11 @@ async fn handle_agent_create(
             exit_code: None,
             signal: None,
         });
+        let transition = registry.lock_generation_transition(agent_id).await;
+        let removed = registry.remove_if_generation(agent_id, generation);
         rtc_sessions.close_for_agent(agent_id, generation).await;
-        if registry
-            .remove_if_generation(agent_id, generation)
-            .is_none()
-        {
+        drop(transition);
+        if removed.is_none() {
             tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
             return;
         }
@@ -2169,14 +2175,16 @@ async fn handle_agent_restart(
     // Remove the current handle before killing tmux. Its exit task will see
     // that its generation is no longer current and will not emit agent.exit.
     let mut was_worker = false;
+    let transition = registry.lock_generation_transition(agent_id).await;
     let current = registry.binding_for(agent_id);
+    let removed =
+        current.and_then(|binding| registry.remove_if_generation(agent_id, binding.generation()));
     if let Some(binding) = current {
         rtc_sessions
             .close_for_agent(agent_id, binding.generation())
             .await;
     }
-    let removed =
-        current.and_then(|binding| registry.remove_if_generation(agent_id, binding.generation()));
+    drop(transition);
     let session = if let Some(handle) = removed {
         let session = handle
             .session()
@@ -2606,11 +2614,11 @@ async fn spawn_exit_forwarder(
         exit_code: None,
         signal: None,
     });
+    let transition = registry.lock_generation_transition(agent_id).await;
+    let removed = registry.remove_if_generation(agent_id, generation);
     rtc_sessions.close_for_agent(agent_id, generation).await;
-    if registry
-        .remove_if_generation(agent_id, generation)
-        .is_none()
-    {
+    drop(transition);
+    if removed.is_none() {
         tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
         return;
     }
@@ -2690,7 +2698,15 @@ async fn register_attached(
     let exit_rx = launched.exit_rx;
 
     launched.handle.control.set_sink(out_tx.clone()).await;
+    let transition = registry.lock_generation_transition(agent_id).await;
+    if let Some(previous) = registry.binding_for(agent_id) {
+        let _ = registry.remove_if_generation(agent_id, previous.generation());
+        rtc_sessions
+            .close_for_agent(agent_id, previous.generation())
+            .await;
+    }
     let generation = registry.insert(launched.handle);
+    drop(transition);
 
     if notify_started {
         let started = Outbound::AgentStarted { agent_id, pid };

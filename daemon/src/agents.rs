@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use uuid::Uuid;
 
@@ -23,6 +25,11 @@ pub struct AgentRegistry {
     /// handles in `insert`, orphaning a live `tmux attach` pipeline (and its
     /// PTY fds) until the session dies.
     attach_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the linearization point between a concrete backend
+    /// generation and RTC peer insertion/teardown for its UUID. The registry
+    /// entry itself remains behind the small synchronous lock above; this
+    /// async lock is held only across replacement lifecycle awaits.
+    generation_transitions: Arc<Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>>,
 }
 
 struct RegistryEntry {
@@ -72,6 +79,30 @@ impl AgentRegistry {
     /// Guard held for the duration of a lazy reattach (tmux lookup + attach).
     pub async fn lock_attach(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.attach_lock.lock().await
+    }
+
+    /// Lock one agent UUID's backend-generation transition.
+    ///
+    /// RTC offer insertion revalidates its captured binding while holding
+    /// this guard. Removal/replacement invalidates the registry binding and
+    /// scans old peers under the same guard, so an old peer is either visible
+    /// to that scan or rejected before insertion.
+    pub async fn lock_generation_transition(&self, id: Uuid) -> OwnedMutexGuard<()> {
+        let transition = {
+            let mut transitions = self
+                .generation_transitions
+                .lock()
+                .expect("agent generation transitions lock");
+            transitions.retain(|_, transition| transition.strong_count() > 0);
+            if let Some(transition) = transitions.get(&id).and_then(Weak::upgrade) {
+                transition
+            } else {
+                let transition = Arc::new(AsyncMutex::new(()));
+                transitions.insert(id, Arc::downgrade(&transition));
+                transition
+            }
+        };
+        transition.lock_owned().await
     }
 
     pub fn contains(&self, id: Uuid) -> bool {

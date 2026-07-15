@@ -58,6 +58,8 @@ pub struct RtcSessions {
     peers: Arc<Mutex<HashMap<String, RtcPeer>>>,
     agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
+    #[cfg(test)]
+    peer_insert_attempted: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -215,8 +217,23 @@ impl RtcSessions {
         let active = Arc::new(AtomicBool::new(true));
         let fence = Arc::new(tokio::sync::RwLock::new(()));
 
-        // Track the peer connection BEFORE negotiation so every exit path —
-        // including negotiation errors below — can reach it and close it.
+        // Linearize peer insertion with backend replacement. Construction and
+        // SDP work stay outside this guard, but the captured binding is
+        // revalidated while insertion is protected by the same per-agent lock
+        // used to invalidate the registry entry and scan old peers.
+        #[cfg(test)]
+        self.peer_insert_attempted.notify_waiters();
+        let transition = registry
+            .lock_generation_transition(binding.signaling.agent_id)
+            .await;
+        if !registry.is_current(binding.agent) {
+            drop(transition);
+            let _ = pc.close().await;
+            anyhow::bail!("agent backend was replaced during RTC negotiation");
+        }
+
+        // Track the peer connection BEFORE SDP negotiation so every exit path
+        // below can reach it and close it.
         let collision = {
             let mut peers = self.peers.lock().await;
             if peers.contains_key(&binding.signaling.session_id) {
@@ -236,22 +253,10 @@ impl RtcSessions {
                 false
             }
         };
+        drop(transition);
         if collision {
             let _ = pc.close().await;
             anyhow::bail!("rtc session id is already active");
-        }
-
-        // The backend may have been replaced while the peer connection was
-        // being constructed. Once the peer is visible, either this check or
-        // the replacement path's `close_for_agent` owns closing it.
-        if !registry.is_current(binding.agent) {
-            self.close_if_same(
-                &binding.signaling.session_id,
-                &binding.signaling.generation,
-                &pc,
-            )
-            .await;
-            anyhow::bail!("agent backend was replaced during RTC negotiation");
         }
 
         install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
@@ -515,6 +520,11 @@ impl RtcSessions {
         for (session_id, peer) in peers {
             self.deactivate_peer(&session_id, peer).await;
         }
+    }
+
+    #[cfg(test)]
+    async fn resident_session_count(&self) -> usize {
+        self.peers.lock().await.len()
     }
 }
 
@@ -1715,6 +1725,139 @@ mod tests {
 
         assert!(!rtc_output_allowed(&registry, old));
         assert!(rtc_output_allowed(&registry, current));
+    }
+
+    #[tokio::test]
+    async fn backend_transition_rejects_offer_waiting_to_insert_old_generation() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = offer_pc.create_offer(None).await.unwrap();
+        let mut gathered = offer_pc.gathering_complete_promise().await;
+        offer_pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
+
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(agent_id).await;
+        let insert_attempted = sessions.peer_insert_attempted.notified();
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let offer_sessions = sessions.clone();
+        let offer_registry = registry.clone();
+        let offer_task = tokio::spawn(async move {
+            offer_sessions
+                .handle_offer(
+                    RtcSessionBinding::new(
+                        "racing-offer".to_string(),
+                        "offer-generation".to_string(),
+                        agent_id,
+                    ),
+                    offer_sdp,
+                    Vec::new(),
+                    offer_registry,
+                    out_tx,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(10), insert_attempted)
+            .await
+            .expect("offer did not reach guarded peer insertion");
+
+        assert!(registry
+            .remove_if_generation(agent_id, old.generation())
+            .is_some());
+        sessions.close_for_agent(agent_id, old.generation()).await;
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        drop(transition);
+        offer_task.await.unwrap();
+
+        assert!(registry.is_current(current));
+        assert!(!registry.is_current(old));
+        assert_eq!(sessions.resident_session_count().await, 0);
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let WsOutbound::Json(json) = out_rx.recv().await.expect("status channel closed")
+                else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                if value["type"] == "rtc.status" {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("failed status timed out");
+        assert_eq!(status["session_id"], "racing-offer");
+        assert_eq!(status["generation"], "offer-generation");
+        assert_eq!(status["status"], "failed");
+        assert_eq!(sessions.resident_session_count().await, 0);
+        offer_pc.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_transition_closes_real_offer_inserted_before_replacement() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = offer_pc.create_offer(None).await.unwrap();
+        let mut gathered = offer_pc.gathering_complete_promise().await;
+        offer_pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
+
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let sessions = RtcSessions::new();
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        sessions
+            .handle_offer(
+                RtcSessionBinding::new(
+                    "inserted-offer".to_string(),
+                    "offer-generation".to_string(),
+                    agent_id,
+                ),
+                offer_sdp,
+                Vec::new(),
+                registry.clone(),
+                out_tx,
+            )
+            .await;
+        assert_eq!(sessions.resident_session_count().await, 1);
+
+        let transition = registry.lock_generation_transition(agent_id).await;
+        assert!(registry
+            .remove_if_generation(agent_id, old.generation())
+            .is_some());
+        sessions.close_for_agent(agent_id, old.generation()).await;
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        drop(transition);
+
+        assert!(registry.is_current(current));
+        assert_eq!(sessions.resident_session_count().await, 0);
+        offer_pc.close().await.unwrap();
     }
 
     #[tokio::test]
