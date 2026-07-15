@@ -57,7 +57,8 @@ pub async fn save_upload(
     // Attachments accept images (terminal paste/drop) plus application/json
     // (the terminal refresh button's diagnostics bundles); mirrors the server
     // gate in agent_control.decode_upload.
-    if !save_to_cwd && !(mime_type.starts_with("image/") || mime_type == "application/json") {
+    let is_attachment_type = mime_type.starts_with("image/") || mime_type == "application/json";
+    if !save_to_cwd && !is_attachment_type {
         anyhow::bail!("upload is not an image");
     }
     if cwd.trim().is_empty() {

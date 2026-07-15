@@ -388,6 +388,9 @@ impl ForwarderControl {
 
 /// Commands routed from spawnd to a session worker's connection tasks
 /// (worker backend only; see `worker_backend`).
+pub type WorkerReplayResult = Result<(u64, Vec<u8>)>;
+pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
+
 #[derive(Debug)]
 pub enum WorkerCmd {
     Input(Vec<u8>),
@@ -400,7 +403,7 @@ pub enum WorkerCmd {
     /// capture time.
     Replay {
         max_bytes: u32,
-        resp: oneshot::Sender<Result<(u64, Vec<u8>)>>,
+        resp: oneshot::Sender<WorkerReplayResult>,
     },
     Shutdown {
         signal: Option<String>,
@@ -553,10 +556,7 @@ impl AgentHandle {
 
     /// Worker backend: request decrypted scrollback replay. Returns None for
     /// tmux (callers use `tmux::capture_history`).
-    pub fn worker_replay(
-        &self,
-        max_bytes: u32,
-    ) -> Option<oneshot::Receiver<Result<(u64, Vec<u8>)>>> {
+    pub fn worker_replay(&self, max_bytes: u32) -> Option<WorkerReplayReceiver> {
         match &self.backend {
             HandleBackend::Worker { cmd_tx } => {
                 let (resp, rx) = oneshot::channel();
