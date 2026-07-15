@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import {
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   useCallback,
@@ -11,6 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 
 type Align = "start" | "end";
@@ -43,31 +45,54 @@ export function DropdownMenu({
   menuClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [flipped, setFlipped] = useState(false);
+  const [coords, setCoords] = useState<CSSProperties | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
   const close = useCallback(() => setOpen(false), []);
 
-  // Flip to the opposite side when the menu would leave the viewport (e.g.
-  // rows near the bottom of the scrollable sidebar). Layout effect so the
-  // correction lands before paint.
+  // The menu renders in a portal (position: fixed) so it can never be clipped
+  // by an ancestor's overflow — e.g. the horizontally-scrolling screen tab
+  // strip or the scrollable sidebar. Position it against the trigger's rect,
+  // flipping side/edge when it would leave the viewport. Recomputed on open
+  // and on scroll/resize so it tracks the trigger.
   useLayoutEffect(() => {
     if (!open) {
-      setFlipped(false);
+      setCoords(null);
       return;
     }
-    const rect = menuRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    if (side === "bottom" && rect.bottom > window.innerHeight - 8) setFlipped(true);
-    if (side === "top" && rect.top < 8) setFlipped(true);
-  }, [open, side]);
+    const place = () => {
+      const anchor = rootRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const menu = menuRef.current?.getBoundingClientRect();
+      const menuH = menu?.height ?? 0;
+      const menuW = menu?.width ?? 176;
+      const style: CSSProperties = { position: "fixed" };
+      const opensUp =
+        side === "top"
+          ? anchor.top - menuH - 4 > 8
+          : anchor.bottom + menuH + 4 > window.innerHeight - 8 && anchor.top - menuH - 4 > 8;
+      if (opensUp) style.bottom = window.innerHeight - anchor.top + 4;
+      else style.top = anchor.bottom + 4;
+      if (align === "end") style.right = Math.max(8, window.innerWidth - anchor.right);
+      else style.left = Math.min(anchor.left, window.innerWidth - menuW - 8);
+      setCoords(style);
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, side, align]);
 
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) close();
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) close();
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") close();
@@ -102,7 +127,7 @@ export function DropdownMenu({
   };
 
   return (
-    <div ref={rootRef} className={cn("relative inline-block", open && "z-50", className)}>
+    <div ref={rootRef} className={cn("relative inline-block", className)}>
       {renderTrigger({
         onClick: () => setOpen((v) => !v),
         onKeyDown: (event) => {
@@ -116,27 +141,25 @@ export function DropdownMenu({
         "aria-controls": menuId,
       })}
       {open &&
-        (() => {
-          const effectiveSide = flipped ? (side === "bottom" ? "top" : "bottom") : side;
-          return (
-            <div
-              id={menuId}
-              ref={menuRef}
-              role="menu"
-              onKeyDown={onMenuKeyDown}
-              onClick={close}
-              className={cn(
-                "absolute z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
-                "animate-in fade-in-0 zoom-in-95 duration-100",
-                effectiveSide === "bottom" ? "top-full mt-1" : "bottom-full mb-1",
-                align === "end" ? "right-0" : "left-0",
-                menuClassName,
-              )}
-            >
-              {children}
-            </div>
-          );
-        })()}
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            id={menuId}
+            ref={menuRef}
+            role="menu"
+            onKeyDown={onMenuKeyDown}
+            onClick={close}
+            style={coords ?? { position: "fixed", visibility: "hidden" }}
+            className={cn(
+              "z-[100] min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+              "animate-in fade-in-0 zoom-in-95 duration-100",
+              menuClassName,
+            )}
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

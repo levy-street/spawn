@@ -253,17 +253,6 @@ function ScreenView({ id }: { id: string }) {
     focusPane(focusParam);
   }, [focusParam, screenAgentIds, focusPane]);
 
-  // Focus a pane on demand even when already on this screen (clicking the
-  // agent in the sidebar can't change the URL, so it dispatches an event).
-  useEffect(() => {
-    const onFocus = (event: Event) => {
-      const agentId = (event as CustomEvent<{ agentId: string }>).detail?.agentId;
-      if (agentId && screenAgentIds.includes(agentId)) focusPane(agentId);
-    };
-    window.addEventListener("spawn:focus-pane", onFocus);
-    return () => window.removeEventListener("spawn:focus-pane", onFocus);
-  }, [screenAgentIds, focusPane]);
-
   // Keyboard: Alt+arrows cycle pane focus, Alt+Z zooms, Alt+1..9 switches
   // screens. Capture phase so the focused terminal doesn't swallow them.
   const keyboardStateRef = useRef({ screenAgentIds, focusedId, zoomedId });

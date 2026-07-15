@@ -35,12 +35,7 @@ import { agentActivityDetail, agentTitle } from "@/lib/agents";
 import { type Agent, agents, type Screen, screens } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { setAgentDragData } from "@/lib/dnd";
-import {
-  screenAgentIds,
-  screenAttentionCount,
-  screenPaneCount,
-  screenRecency,
-} from "@/lib/screens";
+import { screenAttentionCount, screenPaneCount, screenRecency } from "@/lib/screens";
 import { cn } from "@/lib/utils";
 
 export const SIDEBAR_RAIL_WIDTH = 56;
@@ -264,11 +259,6 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   });
   const allScreens = screensQ.data ?? [];
   const currentScreenId = /^\/screens\/([^/?]+)/.exec(pathname)?.[1] ?? null;
-  const currentScreen = allScreens.find((item) => item.id === currentScreenId) ?? null;
-  const currentScreenAgentIds = useMemo(
-    () => (currentScreen ? screenAgentIds(currentScreen) : []),
-    [currentScreen],
-  );
   const agentsById = useMemo(
     () => new Map((agentsQ.data ?? []).map((agent) => [agent.id, agent])),
     [agentsQ.data],
@@ -379,40 +369,28 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     renameM.mutate({ id: agent.id, name });
   };
 
-  const renderAgent = (agent: Agent) => {
-    const onCurrentScreen = currentScreenId !== null && currentScreenAgentIds.includes(agent.id);
-    return (
-      <AgentRow
-        key={`agent-${agent.id}`}
-        agent={agent}
-        collapsed={collapsed}
-        active={pathname === `/agents/${agent.id}`}
-        href={
-          onCurrentScreen ? `/screens/${currentScreenId}?focus=${agent.id}` : `/agents/${agent.id}`
-        }
-        // Already on this screen: the URL wouldn't change, so ask the screen
-        // to focus the pane via an event instead of a dead navigation.
-        onActivate={
-          onCurrentScreen
-            ? () =>
-                window.dispatchEvent(
-                  new CustomEvent("spawn:focus-pane", { detail: { agentId: agent.id } }),
-                )
-            : undefined
-        }
-        busy={busy}
-        onRename={() => promptRename(agent)}
-        onPin={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
-        onRestart={() => {
-          if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
-        }}
-        onArchive={() => archiveM.mutate(agent.id)}
-        onDelete={() => {
-          if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
-        }}
-      />
-    );
-  };
+  const renderAgent = (agent: Agent) => (
+    <AgentRow
+      key={`agent-${agent.id}`}
+      agent={agent}
+      collapsed={collapsed}
+      active={pathname === `/agents/${agent.id}`}
+      // Always open the full agent view — even when the agent is a pane on
+      // the screen you're viewing. To jump back into the screen, use the
+      // membership chip in the agent header or the pane itself.
+      href={`/agents/${agent.id}`}
+      busy={busy}
+      onRename={() => promptRename(agent)}
+      onPin={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
+      onRestart={() => {
+        if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
+      }}
+      onArchive={() => archiveM.mutate(agent.id)}
+      onDelete={() => {
+        if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
+      }}
+    />
+  );
 
   return (
     <section
@@ -488,7 +466,6 @@ function AgentRow({
   collapsed,
   active,
   href,
-  onActivate,
   busy,
   onRename,
   onPin,
@@ -500,9 +477,6 @@ function AgentRow({
   collapsed: boolean;
   active: boolean;
   href: string;
-  /** When set, clicking runs this instead of navigating (the target is the
-   *  current view already, so navigation would be a no-op). */
-  onActivate?: () => void;
   busy: boolean;
   onRename: () => void;
   onPin: () => void;
@@ -523,14 +497,6 @@ function AgentRow({
           onDragStart={(event) => {
             setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
           }}
-          onClick={
-            onActivate
-              ? (event) => {
-                  event.preventDefault();
-                  onActivate();
-                }
-              : undefined
-          }
           className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
         >
           <IconSlot>
