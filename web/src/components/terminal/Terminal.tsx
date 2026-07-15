@@ -295,6 +295,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const prepareScrollbackSnapshotRef = useRef<() => void>(() => {});
   const revealRenderedScrollbackRef = useRef<() => boolean>(() => false);
   const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
+  const requestSnapshotRef = useRef<(purpose: ScrollbackSnapshotPurpose) => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
   const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
   // True once a snapshot/history proved this agent ships exact worker
@@ -1166,6 +1167,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }, SCROLLBACK_SNAPSHOT_TIMEOUT_MS);
     return true;
   }, []);
+  requestSnapshotRef.current = requestSnapshot;
 
   const scheduleScrollbackCacheRefresh = useCallback(
     (delayMs?: number) => {
@@ -2557,21 +2559,43 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         };
         const before = capture();
         // A refresh heals the frame; it must NOT yank the reader's viewport.
-        // Never scroll to the live edge: if the overlay is open it re-renders
-        // in place (invalidateScrollbackForResize, below); if the reader is at
-        // the live edge the live buffer reseeds under them. (Closing the
-        // overlay here is what used to snap the view to the bottom on every
-        // click.) Drop the remembered scroll so the post-heal `after` snapshot
-        // reports the healed state rather than replaying the old position.
+        // Drop the remembered scroll so the post-heal `after` snapshot reports
+        // the healed state rather than replaying the old position.
         lastScrolledViewRef.current = null;
         fitTerminalRef.current(true);
-        historyReseedPendingRef.current = true;
-        invalidateScrollbackForResizeRef.current();
         if (displayOwnerRef.current === true) {
           const { cols, rows } = lastSizeRef.current;
           socketRef.current.sendJson({ type: "resize", cols, rows });
         }
-        await new Promise((resolve) => setTimeout(resolve, 2200));
+        if (scrollbackVisibleRef.current) {
+          // Scrolled up: re-render the overlay in place from a fresh capture.
+          // Never rewrite the live buffer under an open overlay.
+          invalidateScrollbackForResizeRef.current();
+          await new Promise((resolve) => setTimeout(resolve, 2200));
+        } else {
+          // At the live edge: drive a fresh authoritative reseed to
+          // convergence. The reseed only applies a snapshot that lands "clean"
+          // (no live bytes since it was requested), so on the relay path — no
+          // DataChannel offset to anchor a replay — a single 5s-debounced
+          // request almost never lands inside the window, and the panel looks
+          // unrefreshed until a manual scroll. Keep requesting promptly until
+          // one converges (or we give up); only clean snapshots apply, so this
+          // can never roll the live terminal back.
+          historyReseedPendingRef.current = true;
+          const deadline = Date.now() + 6000;
+          while (
+            historyReseedPendingRef.current &&
+            !scrollbackVisibleRef.current &&
+            socketRef.current.state === "open" &&
+            Date.now() < deadline
+          ) {
+            if (!scrollbackSnapshotInFlightRef.current) {
+              scrollbackCacheDirtyRef.current = true;
+              requestSnapshotRef.current("cache");
+            }
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
+        }
         const after = capture();
         return {
           kind: "terminal-refresh-diagnostics",
