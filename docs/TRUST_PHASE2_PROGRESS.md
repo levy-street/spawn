@@ -17,8 +17,10 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 - **Phase 2** — server has no plaintext protected-content path or recoverable
   plaintext store. Acceptance includes runtime path tests plus primary and
   backup purge evidence; grep alone is insufficient.
-- **Phase 3** — signed signaling + fingerprint pinning, so a hostile server
-  can't MITM the DataChannel.
+- **Phase 3** — signed signaling + fingerprint pinning makes signaling MITM
+  detectable to independently trusted/verifiable endpoint builds. A hostile
+  operator can still replace an unverified hosted web client, disable the
+  checks, or exfiltrate content.
 
 ## Done (committed on `master`)
 
@@ -87,19 +89,25 @@ started. The detailed status/dependencies are in `TRUST_PHASE2_TASKS.md`.
    operations on a host with no agent.
 3. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
    REST/WS terminal content and viewport-control surfaces.
-4. Move host listings/read/write/transfer and interactive installer detail onto
-   the host channel. Cross-host bytes stream through the trusted browser, not
-   the server.
+4. Move host listings/read/write/transfer onto the host channel and ship a
+   parallel E2E path for interactive installer detail. Cross-host bytes stream
+   through the trusted browser, not the server. Keep the legacy tool route until
+   its endpoint-owned durable targets exist; this wave is not the final tool cut.
 5. Move full launch manifests, `Agent.env`, preset environment/install/tool
    targets, and skill bodies to the approved endpoint-owned/encrypted store.
-   Stop cwd-derived default names, then finish unattended tool migration and
-   replace free-form server-visible daemon errors with E2E details.
+   Stop cwd-derived default names, then make the interactive E2E tool path
+   mandatory, remove its legacy server route, finish unattended tool migration,
+   and replace free-form server-visible daemon errors with E2E details.
 6. Only after replacements and endpoint recovery tests pass, drain/restart
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-7. Phase 3 adds Ed25519 host keys, browser device keys, signed signaling, and
-   TOFU pinning to both agent- and host-scoped peer connections.
+7. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
+   bound to SDP, session, agent-or-host scope, protocol version, sender role, and
+   intended peer key. Trusted/verifiable endpoints test fingerprint substitution
+   and cross-session/cross-scope replay for both agent- and host-scoped peer
+   connections; unverified operator-hosted JavaScript remains outside that
+   guarantee.
 
 ## Operational playbook (how to build/deploy/validate — no secrets here)
 

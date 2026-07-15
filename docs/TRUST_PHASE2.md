@@ -107,6 +107,16 @@ mirrors every output chunk on `0x01` until Increment 3. The
 `dc_offset`/`rtc_session_id` cross-transport ordering machinery collapses once
 both live + backfill use the peer connection.
 
+This increment reuses the backend's actual bounded history; it does not add a
+durable daemon transcript archive. tmux captures at most 10,000 requested lines
+and only what its configured `history-limit` retains. A worker keeps an
+encrypted-at-rest rolling log with an 8 MiB plaintext default, deletes whole
+oldest segments beyond the budget, and retains its key only in the live worker
+process. Acceptance covers both backends at their retention boundary, replay
+after `spawnd` restart/adoption, and history becoming unavailable after the
+underlying session/worker exits. Browser-side history beyond those bounds is not
+a server backup and is outside the reconnect guarantee.
+
 The same channel carries resize/scroll/redraw, multi-viewer display ownership,
 and their acknowledgements. The daemon, not the server, arbitrates viewport
 state so geometry, deltas, and event timing remain E2E.
@@ -146,11 +156,13 @@ agent- and host-scoped peer connections.
   authorized host sessions and streams source daemon → browser → destination
   daemon; the server never buffers the file. Preserve bounded memory and
   destination overwrite semantics.
-- Add E2E request/response support for interactive tool checks/installs,
+- Add a parallel E2E request/response path for interactive tool checks/installs,
   including commands, paths, installed/latest versions, stdout/stderr, and
-  detailed errors. The server-side tool routes cannot be removed yet because
-  their durable target still comes from plaintext `Preset.install` and
-  `Preset.default_argv`; the full cut waits for Increment 7.
+  detailed errors. This increment proves and ships the endpoint transport, but
+  does not claim the tool cut complete. The legacy server-side tool routes
+  cannot be removed yet because their durable target still comes from plaintext
+  `Preset.install` and `Preset.default_argv`; the final and unattended cut waits
+  for Increment 7.
 - Delete the filesystem REST content proxies and server broker waiters only
   after the web client and daemon path is live. Tool route deletion remains
   deferred to Increment 7.
@@ -207,11 +219,12 @@ replace them with a neutral value (or reclassify/move the name E2E if exact
 provenance cannot be established). Record counts, never the old names.
 
 Once endpoint-owned `Preset.install`/`default_argv` and tool targets are durable,
-finish the tool cut: user-initiated traffic is E2E; unattended execution policy
-and targets live at the daemon/endpoint. The server retains only the enabled
-flag, host/preset identifiers, check/update/result timestamps, and content-free
-success/failure/exit-code status. Clear `last_auto_update_error` and remove all
-detailed result forwarding/logging.
+finish the tool cut begun in Increment 5: make the E2E interactive path
+mandatory and remove its compatibility server route; unattended execution
+policy and targets live at the daemon/endpoint. The server retains only the
+enabled flag, host/preset identifiers, check/update/result timestamps, and
+content-free success/failure/exit-code status. Clear `last_auto_update_error`
+and remove all detailed result forwarding/logging.
 
 ### 8 — live-data migration and plaintext purge
 
@@ -231,15 +244,16 @@ skill recovery tests.
    database/Redis persistence files and WAL/AOF; volume snapshots; replicas;
    and provider backups. Record owners, encryption/key scope, retention,
    deletion capability, and the oldest restorable point.
-2. **Migrate and verify endpoint copies.** Move transcript/history ownership to
-   the daemon and launch/preset/skill data to the approved endpoint store.
-   Server-only offline/archived transcripts are an accepted retirement, not a
-   silent migration: announce a bounded export/reconnect window before the cut,
-   let users re-establish history from an online daemon or export it, and record
-   the deletion deadline. Check record counts, byte counts or keyed digests at
-   endpoints, then exercise daemon restart, agent restart, history attach,
-   preset edit/use, and skill edit/use. The audit record contains identifiers/
-   counts only.
+2. **Migrate and verify endpoint copies.** Retire server transcripts in favor of
+   the existing bounded tmux/worker replay described in Increment 2, and move
+   launch/preset/skill data to the approved endpoint store. Server-only
+   offline/archived transcripts are an accepted retirement, not a silent
+   migration: announce a bounded export/reconnect window before the cut, let
+   users re-establish available history from an online endpoint or export it,
+   and record the deletion deadline. Check record counts, byte counts or keyed
+   digests at endpoints, then exercise both replay backends across retention,
+   daemon restart/adoption, agent exit, history attach, preset edit/use, and
+   skill edit/use. The audit record contains identifiers/counts only.
 3. **Close, drain, and restart every ingress before purge.** Require upgraded browser/daemon
    versions; retire `spawn.v1`, `0x01`/`0x02`, content REST routes, broker
    waiters, free-form error/status messages, viewport control frames, and
@@ -299,8 +313,11 @@ with the Increment 8 purge runbook before the purge begins.
 
 ## Acceptance (end of Phase 2)
 
-All tasks and review gates in `docs/TRUST_PHASE2_TASKS.md` are complete. A
-route/frame/schema inventory and adversarial tests show no server path can
+All Phase 2 tasks through `P2-AUDIT-01`, plus the immediate and overlapping
+quality gates required by their dependency/merge rules in
+`docs/TRUST_PHASE2_TASKS.md`, are complete. The Phase 3 follow-on identity task
+is explicitly excluded from this completion condition. A route/frame/schema
+inventory and adversarial tests show no server path can
 receive or return PTY/history/snapshot bytes, agent or host file data, directory
 entries/paths/sizes/mtimes/errors, tool commands/paths/installed/latest
 versions/output/detailed errors, launch

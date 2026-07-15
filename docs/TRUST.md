@@ -36,7 +36,7 @@ states which guarantee it delivers.
 
 | Party | Holds | Sees |
 |-------|-------|------|
-| **Host daemon** (`spawnd`) | tmux sessions, PTY, transcripts, host identity key | everything on its own host (it is the user's machine) |
+| **Host daemon** (`spawnd`) | tmux sessions, PTY, bounded local replay state, host identity key | everything on its own host (it is the user's machine) |
 | **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and agents it connects to |
 | **TURN relay** | nothing durable | ciphertext, peer IPs, traffic volume/timing |
 | **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | disclosed metadata only, including coarse activity, unattended-update, and encrypted-blob access timing (see "What the server still sees") |
@@ -77,12 +77,23 @@ Adversaries and what they get, once the migration is complete:
 | Adversary | Can | Cannot |
 |-----------|-----|--------|
 | **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection/signaling timing, user-input/meaningful-output times, unattended-update metadata, and opaque-blob sizes/access patterns; refuse service; delete accounts | read PTY data, transcripts, host or agent file data, viewport controls, tool details, env vars, skill bodies, MCP credentials |
-| **Malicious control-plane operator** (or compromised server) | everything above; attempt key-substitution MITM at pairing or signaling time | silently MITM sessions between endpoints that verify identity keys (Phase 3+); recover data from past sessions (no stored ciphertext, DTLS is ephemeral per session) |
+| **Malicious control-plane operator** (or compromised server) | everything above; record DTLS/TURN traffic and durable opaque blobs; alter signaling or operator-hosted client code; attempt key-substitution MITM at pairing or signaling time | passively decrypt recorded DTLS traffic when the negotiated suite provides forward secrecy and endpoint/session keys remain uncompromised; decrypt durable opaque blobs without their endpoint-held data/recovery keys. Phase 3 makes signaling substitution detectable only to trusted/verifiable endpoint code; it does not constrain hostile hosted JavaScript |
 | **Network attacker (on-path)** | observe/black-hole encrypted flows, learn peer IPs | read or modify session content (DTLS), impersonate either peer |
 | **TURN operator** | observe ciphertext volume/timing and peer IPs | decrypt anything |
 | **Malicious co-tenant** | attack the API surface | reach another user's daemons or agents (all REST + WS paths filter by `owner_user_id`; daemon tokens are host-scoped) |
 | **Attacker with the user's browser device** | full access as that user | — out of scope; this is device security |
 | **Compromised host daemon** | everything on that host | other hosts' sessions (per-host tokens and keys) |
+
+Past-session confidentiality has two distinct cases; it is not based on
+ciphertext being absent. A control plane, TURN operator, or network
+observer can record ephemeral-session DTLS ciphertext. Its resistance to later
+decryption depends on the negotiated cipher suite's forward-secrecy properties
+and on endpoint/session key material not being compromised. Optional durable
+opaque blobs are intentionally stored ciphertext: their confidentiality depends
+on the reviewed AEAD envelope plus endpoint key generation, distribution,
+recovery, rotation, and destruction. Compromise of an endpoint or its recovery
+keys can therefore expose the affected blobs and is not prevented by the server
+being unable to decrypt them on its own.
 
 Explicitly **in scope**: protecting user content from spawn's own
 infrastructure and anyone who compromises or compels it.
@@ -114,7 +125,7 @@ answer for users for whom this metadata is itself sensitive.
 | Today | Where it leaks | Target |
 |-------|----------------|--------|
 | PTY bytes (fallback relay) | binary frames on `/ws/browser`, `/ws/daemon` | DataChannel only; relay path deleted |
-| Transcripts (~64 MB/agent on server disk) | `transcript.py`; historical Redis ring keys may remain | daemon-owned; fetched over DataChannel; historical copies purged |
+| Transcripts (~64 MB/agent on server disk) | `transcript.py`; historical Redis ring keys may remain | replaced by bounded backend replay fetched over DataChannel; no new archive; historical copies purged |
 | History replay | `{"type":"history"}` on `/ws/browser` | DataChannel history stream |
 | Agent file uploads | `upload` frames, `bytes_b64` through both WS legs and REST | per-agent DataChannel file stream |
 | Terminal snapshots / card previews | `agent.snapshot` frames | rendered from DataChannel output |
@@ -150,17 +161,25 @@ exchange keys yet. Target design:
 - **Browser device identity**: on first login, the browser generates a
   non-extractable WebCrypto keypair (IndexedDB). The public key is
   registered with the account.
-- **Signed signaling**: `rtc.offer` / `rtc.answer` carry a signature by
-  the sender's identity key over (SDP ‖ session_id ‖ agent_id ‖ peer
-  public key). Each side verifies against keys pinned at pairing, so the
-  DTLS fingerprints inside the SDP inherit endpoint identity. The server
-  still forwards signaling but can no longer forge it.
+- **Signed signaling**: every `rtc.offer` / `rtc.answer` carries a signature by
+  the sender's identity key over an unambiguous, versioned canonical transcript:
+  `(protocol_version, session_id, scope_type, scope_id, sender_role,
+  peer_identity_public_key, SDP)`. `scope_type` is `agent` or `host`, and
+  `scope_id` is the corresponding agent or host UUID; the role distinguishes
+  browser from daemon. Binding all of these fields prevents a valid offer or
+  answer from being replayed across sessions, agents, hosts, protocol versions,
+  roles, or intended peers. Each side verifies against keys pinned at pairing,
+  so the DTLS fingerprints inside the signed SDP inherit endpoint identity.
+  The forwarding server cannot alter this transcript undetected **provided the
+  endpoint verifier and its delivered build are themselves trusted/verifiable**.
 - **Assurance levels** (mirror how Tailscale layers tailnet lock):
   - **L0 (today)** — trust the server for introductions. No content
     visibility once Phases 1–2 land, but a malicious server could MITM
     at session setup.
-  - **L1 (Phase 3)** — signed signaling + TOFU pinning. Server key
-    substitution is detectable except at first contact.
+  - **L1 (Phase 3)** — signed signaling + TOFU pinning. For a trusted or
+    independently verifiable endpoint build, server key substitution is
+    detectable except at first contact. Operator-hosted, unverified JavaScript
+    does not receive this assurance from protocol signatures alone.
   - **L2 (later)** — out-of-band verification UX (compare fingerprint
     shown by `spawnd status` with the web UI) and/or a key-transparency
     log, closing the first-contact gap.
@@ -173,10 +192,17 @@ pinned key; browsers refuse sessions with unpinned keys at L1+.
 
 What moves where, and the regressions we accept:
 
-- **Scrollback/replay** → daemon-owned. tmux + the daemon-side
-  scrollback cache are already the source of truth; the browser fetches
-  history over the DataChannel at attach. Server `transcript.py` and the
-  content pubsub path are deleted; any historical Redis ring keys are purged.
+- **Scrollback/replay** → endpoint-owned, bounded backend history rather than
+  a new durable transcript archive. tmux replay uses `capture_history`: each
+  request is capped at 10,000 lines and cannot exceed tmux's configured
+  `history-limit`. Worker replay uses its encrypted-at-rest rolling log: the
+  default plaintext budget is 8 MiB, whole oldest segments are deleted, and
+  the non-persisted key dies with the worker. The browser fetches the available
+  tail over the DataChannel at attach. A `spawnd` restart can adopt a surviving
+  tmux session or worker and recover only that retained history; once the
+  session/worker and its history are gone, replay is unavailable. Server
+  `transcript.py` and the content pubsub path are deleted; any historical Redis
+  ring keys are purged.
 - **Offline history** → **accepted regression.** Today the server can
   replay a transcript while the host is asleep; in the operator model,
   daemon offline = history unavailable. Mitigation later: optional
@@ -243,7 +269,11 @@ worthless:
 
 1. **Web client delivery.** The hosted PWA is JavaScript served by the
    same operator the model distrusts; a hostile operator could ship
-   exfiltrating JS. Mitigations, in increasing strength: open source +
+   exfiltrating JS or disable signature/pinning checks before connecting.
+   Consequently, Phase 3's hostile-signaling-server guarantee applies only
+   when the endpoint code is independently trusted or verifiable; an
+   operator-hosted unverified web client remains an operator-trust endpoint.
+   Mitigations, in increasing strength: open source +
    self-hosting (threat collapses to "trust your own machines"),
    reproducible web builds + signed releases, subresource integrity, and
    eventually a packaged client (PWA store build / Tauri) whose update
@@ -255,7 +285,12 @@ worthless:
    blobs, their size, versions, and access patterns also leak. TURN learns IP
    pairs and volumes. We do not claim metadata privacy; self-host if that
    matters.
-4. **Endpoint compromise** is out of scope and undiminished: an agent
+4. **Durable ciphertext keys.** If opaque endpoint-encrypted blobs are used,
+   confidentiality and availability depend on endpoint key/recovery design.
+   Key compromise can expose retained versions; key loss or destruction can
+   make them unrecoverable. Rotation does not erase old ciphertext unless old
+   keys and recoverable copies are also retired.
+5. **Endpoint compromise** is out of scope and undiminished: an agent
    with your credentials running on your machine is exactly as dangerous
    as it is without spawn.
 
@@ -335,9 +370,13 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   for directory listings, host file read/write/transfer, tool installer output,
   and launch manifests. A per-agent channel is insufficient because these
   operations exist without a running agent.
-- Daemon persists transcripts locally (rotate like today's server
-  files); browser requests tail-on-attach exactly like the current
-  `max_bytes` read.
+- Use the existing bounded endpoint replay sources instead of adding a new
+  durable transcript archive: `tmux::capture_history` (at most 10,000 requested
+  lines and bounded by tmux `history-limit`) or the worker's encrypted rolling
+  scrollback (8 MiB plaintext default, oldest whole segments removed, key held
+  only by the live worker). Browser requests the retained tail over
+  `spawn.ctl`; daemon restart/adoption, rotation/retention boundaries, and loss
+  after session/worker exit are acceptance-tested and disclosed.
 - Delete `server/spawn_server/transcript.py`, the content Redis pubsub path, and
   all `agent.snapshot`/`upload`/`host.fs.*`/installer-output forwarding. Purge
   historical Redis ring keys. Remove the content-bearing REST/WS terminal,
@@ -368,10 +407,17 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 
 - Ed25519 host keys minted at `spawnd login`, registered through the
   device-code flow; WebCrypto device keys per browser.
-- Signed `rtc.offer`/`rtc.answer`; TOFU pinning; refuse unpinned keys.
+- Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
+  scope, protocol version, sender role, and intended peer key tuple; TOFU
+  pinning; refuse unpinned keys.
 - Fingerprints surfaced in `spawnd status` and the web UI host page.
-- Acceptance: a test-harness server that swaps SDP fingerprints causes
-  both endpoints to abort the session loudly.
+- Acceptance, using independently trusted/verifiable browser and daemon builds:
+  a test-harness server that substitutes an SDP fingerprint or replays a valid
+  signature across session, agent, host, scope type, protocol version, role, or
+  intended peer makes both endpoints abort loudly for both agent- and
+  host-scoped connections. A hostile operator can still replace an unverified
+  hosted web client with code that disables verification or exfiltrates content;
+  Phase 3 does not claim otherwise.
 
 ### Phase 4 — publish
 
