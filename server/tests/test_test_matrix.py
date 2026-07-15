@@ -8,6 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 TEST_ALL = SCRIPTS_DIR / "test-all.sh"
+REDIS_SMOKE = SCRIPTS_DIR / "smoke-redis-pubsub.sh"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
 
 
@@ -17,6 +18,10 @@ def _script_body() -> str:
 
 def _workflow_body() -> str:
     return CI_WORKFLOW.read_text(encoding="utf-8")
+
+
+def _redis_smoke_body() -> str:
+    return REDIS_SMOKE.read_text(encoding="utf-8")
 
 
 def test_all_shell_scripts_are_executable():
@@ -44,6 +49,22 @@ def test_test_all_runs_required_local_smoke_matrix():
     ]
     missing = [item for item in expected if item not in body]
     assert missing == []
+
+
+def test_redis_smoke_exercises_supported_cross_process_pubsub():
+    body = _redis_smoke_body()
+    expected = [
+        "SPAWN_USE_INPROCESS_PUBSUB=0",
+        "async with backend.subscribe(agent_id) as stream:",
+        "await backend.publish(agent_id,",
+        "subscriber did not receive published payload",
+    ]
+    missing = [item for item in expected if item not in body]
+    assert missing == []
+
+    removed_ring_calls = ["ring_append", "ring_read", "ring_clear"]
+    stale = [item for item in removed_ring_calls if item in body]
+    assert stale == []
 
 
 def test_test_all_keeps_external_smokes_explicitly_gated():

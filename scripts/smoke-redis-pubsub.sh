@@ -32,7 +32,7 @@ cleanup() {
     wait "$redis_pid" 2>/dev/null || true
   fi
   if [[ "$status" != "0" ]]; then
-    for log in "$tmp_dir"/redis.log "$tmp_dir"/subscriber.log "$tmp_dir"/publisher.log "$tmp_dir"/reader.log; do
+    for log in "$tmp_dir"/redis.log "$tmp_dir"/subscriber.log "$tmp_dir"/publisher.log; do
       if [[ -f "$log" ]]; then
         printf '%s\n' "---- $(basename "$log") ----" >&2
         tail -200 "$log" >&2 || true
@@ -185,7 +185,7 @@ if [[ ! -f "$ready_file" ]]; then
   exit 1
 fi
 
-printf '%s\n' "smoke-redis-pubsub: publishing and writing ring data from a second process"
+printf '%s\n' "smoke-redis-pubsub: publishing from a second process"
 (
   cd server
   SPAWN_REDIS_URL="$redis_url" \
@@ -209,8 +209,6 @@ async def main() -> None:
         await backend.publish(agent_id, b"hello ")
         await backend.publish(agent_id, b"redis ")
         await backend.publish(agent_id, b"pubsub")
-        await backend.ring_append(agent_id, b"ring-before-")
-        await backend.ring_append(agent_id, b"ring-after")
     finally:
         await backend.shutdown()
 
@@ -229,42 +227,6 @@ if [[ "$(cat "$received_file" 2>/dev/null || true)" != "hello redis pubsub" ]]; 
   printf '%s\n' "smoke-redis-pubsub: subscriber did not receive published payload" >&2
   exit 1
 fi
-
-printf '%s\n' "smoke-redis-pubsub: reading ring data from a third process"
-(
-  cd server
-  SPAWN_REDIS_URL="$redis_url" \
-    SPAWN_USE_INPROCESS_PUBSUB=0 \
-    SPAWN_REDIS_SMOKE_AGENT_ID="$agent_id" \
-    uv run python - <<'PY'
-import asyncio
-import os
-
-from spawn_server.config import get_settings
-from spawn_server.redis import get_backend
-
-agent_id = os.environ["SPAWN_REDIS_SMOKE_AGENT_ID"]
-
-
-async def main() -> None:
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    backend = get_backend()
-    await backend.startup()
-    try:
-        body = await backend.ring_read(agent_id)
-        if body != b"ring-before-ring-after":
-            raise SystemExit(f"unexpected ring data: {body!r}")
-        await backend.ring_clear(agent_id)
-        cleared = await backend.ring_read(agent_id)
-        if cleared:
-            raise SystemExit(f"ring did not clear: {cleared!r}")
-    finally:
-        await backend.shutdown()
-
-
-asyncio.run(main())
-PY
-) >"$tmp_dir/reader.log" 2>&1
 
 wait "$subscriber_pid"
 subscriber_pid=""

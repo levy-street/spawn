@@ -24,8 +24,9 @@ upload bytes, env values, or skill bodies.*
 ## Increments
 
 ### 0 — delete the dead Redis ring buffer  ✅ done (`e03fb3f`)
-Zero callers. `ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring
-methods, `config.ringbuffer_max_bytes`. Behaviour-neutral.
+Zero production callers. `ws/ringbuffer.py`, `RedisBackend.ring_*`,
+`_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`. The operational
+Redis smoke still referenced the removed methods and was repaired separately.
 
 ### 1 — content-free activity ping (the one genuine "replace")
 The server derives an agent's `active/quiet/waiting` badge by **parsing** PTY

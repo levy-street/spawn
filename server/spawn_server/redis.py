@@ -1,8 +1,8 @@
 """Redis connection and pub/sub helpers, with an in-process fallback for tests.
 
-The fallback implements just enough of the publish/subscribe + ring-buffer API
-that the broker uses, keyed off agent UUIDs, in a single process. Production
-deployments use real Redis so multiple uvicorn workers can share state.
+The fallback implements the publish/subscribe API that the broker uses, keyed
+off agent UUIDs, in a single process. Production deployments use real Redis so
+multiple uvicorn workers can share state.
 """
 
 from __future__ import annotations

@@ -20,7 +20,7 @@ DataChannel). Goal of this work ("Tier 2"):
 
 | commit | increment | what |
 |--------|-----------|------|
-| `e03fb3f` | 0 | Deleted the dead Redis PTY ring buffer (`ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`). No callers. Behaviour-neutral. |
+| `e03fb3f` | 0 | Deleted the dead Redis PTY ring buffer (`ws/ringbuffer.py`, `RedisBackend.ring_*`, `_InProcPubSub` ring methods, `config.ringbuffer_max_bytes`). No production callers; the stale operational Redis smoke was repaired separately. |
 | `f69b5fc` | — | `docs/TRUST_PHASE2.md` implementation spec (the cut sequence). |
 | `4b245f1` | 1 | **Content-free activity ping.** Classifier moved daemon-side; server no longer parses bytes for activity. |
 
