@@ -242,6 +242,9 @@ async fn install_session_sinks(registry: &AgentRegistry, out_tx: &mpsc::Sender<W
             continue;
         }
         if let Some(session) = registry.session_for(id) {
+            if let Some(control) = registry.control_for(id) {
+                control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+            }
             tmux::force_repaint(&session).await;
         }
     }
@@ -449,6 +452,7 @@ async fn dispatch_loop(
                     if registry.is_worker(agent_id) != Some(true) {
                         if let Some(control) = registry.control_for(agent_id) {
                             if control.copy_mode_cached(&session) {
+                                control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
                                 tmux::cancel_copy_mode(&session).await;
                                 control.clear_copy_mode();
                             }
@@ -2305,6 +2309,12 @@ async fn handle_agent_scroll(agent_id: Uuid, lines: i16, registry: &AgentRegistr
         tracing::debug!(%agent_id, "ignoring scroll for unknown agent");
         return;
     };
+    // Entering/exiting tmux copy-mode repaints the attached client. Suppress
+    // before asking tmux to scroll so the first repaint bytes cannot race the
+    // daemon-side activity classifier.
+    if let Some(control) = registry.control_for(agent_id) {
+        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+    }
     if let Err(e) = tmux::scroll_history(&session, lines).await {
         tracing::warn!(%agent_id, lines, error = %e, "tmux scroll failed");
     }
@@ -2470,6 +2480,9 @@ async fn handle_agent_upload(
             if paste {
                 let paste_text = upload::paste_text_for_path(&cwd, &path, paste_prefix.as_deref());
                 if let Some(session) = registry.session_for(agent_id) {
+                    if let Some(control) = registry.control_for(agent_id) {
+                        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+                    }
                     tmux::cancel_copy_mode(&session).await;
                 }
                 let found = registry.with_handle(agent_id, |h| {

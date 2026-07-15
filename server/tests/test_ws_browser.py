@@ -305,6 +305,14 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
     resize = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.resize"][-1]
     assert resize == {"type": "agent.resize", "agent_id": agent_id, "cols": 111, "rows": 33}
 
+    # Legacy spawn.v1 input still stamps activity on the server because its
+    # bytes traverse this websocket path.
+    sm = get_sessionmaker()
+    async with sm() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        assert agent.last_input_at is not None
+
     ws.queue_text({"type": "scroll", "lines": 999})
     await _wait_until(
         lambda: any(json.loads(item).get("type") == "agent.scroll" for item in daemon_ws.sent_text)

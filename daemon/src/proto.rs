@@ -38,6 +38,11 @@ pub enum Outbound {
     /// classified daemon-side (see `activity.rs`).
     #[serde(rename = "agent.activity")]
     AgentActivity { agent_id: Uuid },
+    /// Content-free input-activity ping for WebRTC DataChannel input. The
+    /// server cannot observe `spawn.pty` bytes, so this daemon-throttled signal
+    /// is the only metadata it needs to maintain `last_input_at` for v2.
+    #[serde(rename = "agent.input_activity")]
+    AgentInputActivity { agent_id: Uuid },
     #[serde(rename = "agent.uploaded")]
     AgentUploaded {
         agent_id: Uuid,

@@ -283,7 +283,7 @@ fn assemble(
     rows: u16,
     stream: UnixStream,
 ) -> pty::Launched {
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<pty::OutputChunk>();
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
 
@@ -297,6 +297,7 @@ fn assemble(
     tokio::spawn(run_reader(
         read_half,
         outbox_tx.clone(),
+        control.clone(),
         exit_tx,
         pending,
         agent_id,
@@ -376,7 +377,8 @@ async fn run_writer(
 /// framed reads → outbox (output), replay responses, exit report.
 async fn run_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
-    outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbox_tx: mpsc::UnboundedSender<pty::OutputChunk>,
+    control: ForwarderControl,
     exit_tx: oneshot::Sender<ExitReason>,
     pending: PendingReplays,
     agent_id: Uuid,
@@ -385,7 +387,8 @@ async fn run_reader(
     loop {
         match wire::read_frame(&mut read_half).await {
             Ok(Some((wire::T_OUTPUT, payload))) => {
-                if outbox_tx.send(payload).is_err() {
+                let chunk = pty::OutputChunk::classify(payload, &control);
+                if outbox_tx.send(chunk).is_err() {
                     break;
                 }
             }
@@ -471,6 +474,48 @@ async fn read_hello(stream: &mut UnixStream) -> Result<wire::Hello> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_output_uses_bounded_idle_activity_resolution() {
+        let agent_id = Uuid::new_v4();
+        let (daemon_stream, mut worker_stream) = UnixStream::pair().expect("unix pair");
+        let (read_half, _write_half) = daemon_stream.into_split();
+
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
+        let (exit_tx, _exit_rx) = oneshot::channel();
+        let reader = tokio::spawn(run_reader(
+            read_half,
+            outbox_tx,
+            control,
+            exit_tx,
+            Default::default(),
+            agent_id,
+        ));
+
+        wire::write_frame(&mut worker_stream, wire::T_OUTPUT, b"12:34")
+            .await
+            .expect("worker output");
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            pty::WsOutbound::Binary(_)
+        ));
+        assert!(sink_rx.try_recv().is_err());
+
+        tokio::time::advance(crate::activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            sink_rx.try_recv().unwrap(),
+            pty::WsOutbound::Json(_)
+        ));
+
+        drop(worker_stream);
+        reader.await.unwrap();
+        forwarder.await.unwrap();
+    }
 
     #[test]
     fn backend_parses_and_defaults_to_tmux() {

@@ -22,12 +22,7 @@ from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import get_backend
 from ..turn import ice_servers_for_session
-from .activity import (
-    REDRAW_SUPPRESS_WINDOW,
-    should_record_agent_input,
-    suppress_agent_output_activity,
-    utcnow,
-)
+from .activity import should_record_agent_input, utcnow
 from .broker import BrowserConn, BrowserDisplayState, get_broker
 from .frames import KIND_INPUT, encode_binary_frame
 
@@ -393,9 +388,6 @@ async def browser_ws(
                         ) or broker.get_daemon_for_host(host_id)
                         if daemon is not None:
                             try:
-                                suppress_agent_output_activity(
-                                    agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                                )
                                 await daemon.send_text(
                                     {
                                         "type": "agent.resize",
@@ -420,9 +412,6 @@ async def browser_ws(
                     )
                     if daemon is not None:
                         try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
                             await daemon.send_text(
                                 {
                                     "type": "agent.resize",
@@ -445,9 +434,6 @@ async def browser_ws(
                     )
                     if daemon is not None:
                         try:
-                            suppress_agent_output_activity(
-                                agent_id, duration=REDRAW_SUPPRESS_WINDOW
-                            )
                             await daemon.send_text(
                                 {
                                     "type": "agent.scroll",
@@ -686,7 +672,6 @@ async def _request_agent_redraw(agent_id: str, host_id: str) -> None:
     if daemon is None:
         return
     try:
-        suppress_agent_output_activity(agent_id, duration=REDRAW_SUPPRESS_WINDOW)
         await daemon.send_text({"type": "agent.redraw", "agent_id": agent_id})
     except Exception as e:
         log.warning("redraw forward failed: %s", e)

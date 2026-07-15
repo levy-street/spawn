@@ -242,6 +242,22 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     host_obj.last_seen_at = now
                                 await session.commit()
 
+                elif ftype == "agent.input_activity":
+                    # `spawn.pty` input bypasses the server on v2. The daemon
+                    # throttles this content-free signal so the activity badge
+                    # remains accurate without revealing input bytes.
+                    aid = obj.get("agent_id")
+                    if aid:
+                        now = _utcnow()
+                        async with sm() as session:
+                            agent = await session.get(Agent, aid)
+                            if agent is not None and agent.host_id == host.id:
+                                agent.last_input_at = now
+                                host_obj = await session.get(Host, host.id)
+                                if host_obj is not None:
+                                    host_obj.last_seen_at = now
+                                await session.commit()
+
                 elif ftype == "agent.exit":
                     aid = obj.get("agent_id")
                     code = obj.get("exit_code")

@@ -21,10 +21,13 @@
 //! Because tmux owns the underlying agent process, the agent also survives
 //! `spawnd` restarts (see `reattach`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -36,7 +39,7 @@ use crate::frames;
 use crate::proto::Outbound;
 use crate::tmux;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum WsOutbound {
     /// A serialized JSON frame.
     Json(String),
@@ -48,6 +51,89 @@ pub enum WsOutbound {
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
+
+/// Immutable result of handling one output event at its producer. Immediate
+/// activity and the eligibility/generation of an ambiguous idle candidate are
+/// stamped before raw bytes enter the asynchronous outbox, so later input,
+/// resize, or redraw suppression cannot retroactively change that event.
+#[derive(Debug)]
+pub(crate) struct OutputChunk {
+    bytes: Vec<u8>,
+    activity: bool,
+    idle_resolution: Option<PendingIdleResolution>,
+}
+
+impl OutputChunk {
+    pub(crate) fn classify(bytes: Vec<u8>, control: &ForwarderControl) -> Self {
+        let now = Instant::now();
+        let decision = control.classify_output_at(now, &bytes);
+        let idle_resolution = decision
+            .idle_generation
+            .map(|generation| PendingIdleResolution {
+                generation,
+                deadline: now
+                    .checked_add(activity::OUTPUT_IDLE_RESOLUTION_DELAY)
+                    .unwrap_or(now),
+            });
+        Self {
+            bytes,
+            activity: decision.activity,
+            idle_resolution,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputDecision {
+    activity: bool,
+    idle_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingIdleResolution {
+    generation: u64,
+    deadline: Instant,
+}
+
+struct IdleResolutionTimer {
+    generation: u64,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl IdleResolutionTimer {
+    fn new(pending: PendingIdleResolution) -> Self {
+        let remaining = pending.deadline.saturating_duration_since(Instant::now());
+        Self {
+            generation: pending.generation,
+            sleep: Box::pin(tokio::time::sleep(remaining)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ActivityKind {
+    Output,
+    Input,
+}
+
+/// The only activity serializer: its API cannot accept terminal bytes or any
+/// content-carrying outbound frame.
+fn activity_message(agent_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> {
+    let event = match kind {
+        ActivityKind::Output => Outbound::AgentActivity { agent_id },
+        ActivityKind::Input => Outbound::AgentInputActivity { agent_id },
+    };
+    serde_json::to_string(&event).ok().map(WsOutbound::Json)
+}
+
+/// Best-effort emission used by the WebRTC input callback. Output activity is
+/// queued in order beside its mirrored binary frame by `run_forwarder`.
+pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
+    let Some(message) = activity_message(agent_id, kind) else {
+        return false;
+    };
+    out_tx.try_send(message).is_ok()
+}
 
 /// A direct terminal sink plus a cumulative count of PTY bytes queued to it.
 /// The counter lets snapshot responses carry the stream position at capture
@@ -70,18 +156,19 @@ pub struct ForwarderControl {
     /// tmux subprocess per keystroke; refreshed lazily in the background.
     copy_mode: Arc<AtomicBool>,
     copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Output-activity ping state (trust Phase 2). `last_activity_ms` throttles
-    /// the ping; `suppress_until_ms` is bumped by injected input/resize/redraw
-    /// so their echoes don't count as agent work. Both are unix-millis, 0=unset.
-    last_activity_ms: Arc<AtomicI64>,
-    suppress_until_ms: Arc<AtomicI64>,
+    /// Monotonic activity state. Input/output pings have independent throttle
+    /// clocks; injected input/resize/redraw extend the output suppression
+    /// deadline so their echoes and repaints do not count as agent work.
+    activity: Arc<Mutex<ActivityState>>,
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+#[derive(Debug, Default)]
+struct ActivityState {
+    last_output_at: Option<Instant>,
+    last_input_at: Option<Instant>,
+    suppress_output_until: Option<Instant>,
+    output_classifier: activity::OutputClassifier,
+    output_generation: u64,
 }
 
 /// How stale the cached copy-mode flag may get before a background refresh
@@ -98,26 +185,26 @@ impl ForwarderControl {
             notify: Arc::new(Notify::new()),
             copy_mode: Arc::new(AtomicBool::new(false)),
             copy_mode_checked_at: Arc::new(Mutex::new(None)),
-            last_activity_ms: Arc::new(AtomicI64::new(0)),
-            suppress_until_ms: Arc::new(AtomicI64::new(0)),
+            activity: Arc::new(Mutex::new(ActivityState::default())),
         }
     }
 
     /// Suppress output-activity classification for `window` — an injected
     /// resize/redraw or local input echo must not register as agent work.
-    pub fn suppress_activity(&self, window: std::time::Duration) {
-        let until = now_ms() + window.as_millis() as i64;
-        let mut cur = self.suppress_until_ms.load(Ordering::Relaxed);
-        while until > cur {
-            match self.suppress_until_ms.compare_exchange_weak(
-                cur,
-                until,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
+    pub fn suppress_activity(&self, window: Duration) {
+        self.suppress_activity_at(Instant::now(), window);
+    }
+
+    fn suppress_activity_at(&self, now: Instant, window: Duration) {
+        let until = now.checked_add(window).unwrap_or(now);
+        let Ok(mut state) = self.activity.lock() else {
+            return;
+        };
+        if state
+            .suppress_output_until
+            .is_none_or(|previous| previous < until)
+        {
+            state.suppress_output_until = Some(until);
         }
     }
 
@@ -125,23 +212,90 @@ impl ForwarderControl {
     /// outside the throttle window, not suppressed, and carrying meaningful
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
-    fn note_output(&self, chunk: &[u8]) -> bool {
-        let now = now_ms();
-        // Cheap throttle check first, so the classifier only runs when a ping
-        // could actually be emitted.
-        let last = self.last_activity_ms.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < activity::OUTPUT_TOUCH_INTERVAL.as_millis() as i64
-        {
+    #[cfg(test)]
+    fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
+        self.classify_output_at(now, chunk).activity
+    }
+
+    fn classify_output_at(&self, now: Instant, chunk: &[u8]) -> OutputDecision {
+        let Ok(mut state) = self.activity.lock() else {
+            return OutputDecision {
+                activity: false,
+                idle_generation: None,
+            };
+        };
+        state.output_generation = state.output_generation.wrapping_add(1);
+        let generation = state.output_generation;
+        let throttle_open = !state.last_output_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < activity::OUTPUT_TOUCH_INTERVAL
+        });
+        let suppressed = state.suppress_output_until.is_some_and(|until| now < until);
+        if !suppressed {
+            state.suppress_output_until = None;
+        }
+
+        // Always consume the bytes so UTF-8 and terminal-control state stays
+        // aligned across arbitrary PTY chunk boundaries. Ineligible bytes
+        // advance parsing but cannot become delayed activity later.
+        let meaningful = state
+            .output_classifier
+            .observe(chunk, throttle_open && !suppressed);
+        if !throttle_open {
+            state.output_classifier.discard_meaningful_carry();
+            return OutputDecision {
+                activity: false,
+                idle_generation: state
+                    .output_classifier
+                    .needs_idle_resolution()
+                    .then_some(generation),
+            };
+        }
+        if meaningful {
+            state.last_output_at = Some(now);
+        }
+        OutputDecision {
+            activity: meaningful,
+            idle_generation: state
+                .output_classifier
+                .needs_idle_resolution()
+                .then_some(generation),
+        }
+    }
+
+    /// Resolve only the candidate associated with the latest producer event.
+    /// Stale timers are harmless, and eligibility remains the value captured
+    /// when each character arrived.
+    fn resolve_output_idle(&self, generation: u64) -> bool {
+        let now = Instant::now();
+        let Ok(mut state) = self.activity.lock() else {
+            return false;
+        };
+        if state.output_generation != generation {
             return false;
         }
-        let sup = self.suppress_until_ms.load(Ordering::Relaxed);
-        if sup != 0 && now < sup {
+        let meaningful = state.output_classifier.resolve_idle();
+        if meaningful {
+            state.last_output_at = Some(now);
+        }
+        meaningful
+    }
+
+    /// Record local DataChannel input without revealing its contents. The
+    /// caller emits `agent.input_activity` only when this returns true.
+    pub fn note_input(&self) -> bool {
+        self.note_input_at(Instant::now())
+    }
+
+    fn note_input_at(&self, now: Instant) -> bool {
+        let Ok(mut state) = self.activity.lock() else {
+            return false;
+        };
+        if state.last_input_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < activity::INPUT_TOUCH_INTERVAL
+        }) {
             return false;
         }
-        if !activity::output_is_meaningful(chunk) {
-            return false;
-        }
-        self.last_activity_ms.store(now, Ordering::Relaxed);
+        state.last_input_at = Some(now);
         true
     }
 
@@ -180,7 +334,7 @@ impl ForwarderControl {
     /// task so any backlog drains immediately.
     pub async fn set_sink(&self, sink: SessionSink) {
         *self.slot.lock().await = Some(sink);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     /// Clear the sink (called when the WS session ends). The forwarder will
@@ -283,7 +437,7 @@ pub struct AgentHandle {
     /// Reader thread pushes raw PTY bytes here. Held alive while the agent
     /// is alive; when dropped, the per-agent forwarder task exits.
     #[allow(dead_code)]
-    outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbox_tx: mpsc::UnboundedSender<OutputChunk>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
     backend: HandleBackend,
@@ -296,7 +450,7 @@ pub struct WorkerHandleParts {
     pub cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
     pub cols: u16,
     pub rows: u16,
-    pub outbox_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub outbox_tx: mpsc::UnboundedSender<OutputChunk>,
     pub control: ForwarderControl,
 }
 
@@ -392,9 +546,7 @@ impl AgentHandle {
     /// Worker backend: signal the agent process. Returns false for tmux.
     pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
         match &self.backend {
-            HandleBackend::Worker { cmd_tx } => {
-                cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok()
-            }
+            HandleBackend::Worker { cmd_tx } => cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok(),
             HandleBackend::Tmux { .. } => false,
         }
     }
@@ -553,7 +705,7 @@ fn attach_to_session(
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
     // Per-agent outbox + forwarder.
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<OutputChunk>();
     let control = ForwarderControl::new();
 
     // Forwarder: outbox -> current sink (with reconnect-aware looping).
@@ -564,12 +716,14 @@ fn attach_to_session(
 
     // Reader thread: raw PTY -> outbox.
     let outbox_for_reader = outbox_tx.clone();
+    let control_for_reader = control.clone();
     std::thread::spawn(move || {
         run_reader_thread(
             agent_id,
             reader,
             child,
             outbox_for_reader,
+            control_for_reader,
             cancel_rx,
             exit_tx,
         );
@@ -595,7 +749,8 @@ fn run_reader_thread(
     agent_id: Uuid,
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    outbox: mpsc::UnboundedSender<Vec<u8>>,
+    outbox: mpsc::UnboundedSender<OutputChunk>,
+    control: ForwarderControl,
     mut cancel_rx: oneshot::Receiver<()>,
     exit_tx: oneshot::Sender<ExitReason>,
 ) {
@@ -613,7 +768,8 @@ fn run_reader_thread(
                 break;
             }
             Ok(n) => {
-                if outbox.send(buf[..n].to_vec()).is_err() {
+                let chunk = OutputChunk::classify(buf[..n].to_vec(), &control);
+                if outbox.send(chunk).is_err() {
                     // Forwarder gone (registry dropped this agent). We can stop.
                     tracing::debug!(%agent_id, "outbox closed; stopping reader");
                     break;
@@ -657,49 +813,680 @@ fn run_reader_thread(
 /// dropped).
 pub(crate) async fn run_forwarder(
     agent_id: Uuid,
-    mut outbox_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outbox_rx: mpsc::UnboundedReceiver<OutputChunk>,
     control: ForwarderControl,
 ) {
-    while let Some(chunk) = outbox_rx.recv().await {
-        control.send_direct(&chunk).await;
-        let frame = frames::encode_pty_output(agent_id, &chunk);
-        // Loop until the chunk is sent (or wait for a sink to be installed).
-        loop {
-            // Snapshot the current sink under lock, drop the lock, then send.
-            let current = control.slot.lock().await.clone();
-            match current {
-                Some(s) => match s.send(WsOutbound::Binary(frame.clone())).await {
-                    Ok(_) => break,
-                    Err(_) => {
-                        // Sink closed mid-send (WS likely just dropped). Clear
-                        // it if it's still the closed one we just tried — but
-                        // not if a new session has already swapped a fresh
-                        // sink in.
-                        let mut g = control.slot.lock().await;
-                        if g.as_ref().map(|x| x.is_closed()).unwrap_or(false) {
-                            *g = None;
-                        }
-                        // Loop and retry; if slot is now None, the next
-                        // iteration will park on the notifier.
-                    }
-                },
-                None => {
-                    control.notify.notified().await;
+    let mut pending_mirror = VecDeque::new();
+    let mut idle_timer: Option<IdleResolutionTimer> = None;
+    let mut outbox_open = true;
+
+    loop {
+        // Keep content classification and eligibility at the source side of
+        // the queue. Drain a bounded batch before servicing the mirror so a
+        // missing/full server sink cannot defer producer decisions; the only
+        // delayed step is a generation-guarded, content-free idle timeout.
+        for _ in 0..64 {
+            match outbox_rx.try_recv() {
+                Ok(chunk) => {
+                    queue_output_chunk(
+                        agent_id,
+                        chunk,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    )
+                    .await;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    outbox_open = false;
+                    idle_timer = None;
+                    break;
                 }
             }
         }
-        // Content-free activity ping (trust Phase 2): classified + throttled
-        // + suppression-aware daemon-side, so the server can stamp
-        // `last_output_at` without ever seeing the bytes. Best-effort: dropped
-        // if the control channel is momentarily full — the throttle means a
-        // later chunk re-emits soon.
-        if control.note_output(&chunk) {
-            if let Ok(json) = serde_json::to_string(&Outbound::AgentActivity { agent_id }) {
-                if let Some(sink) = control.slot.lock().await.clone() {
-                    let _ = sink.try_send(WsOutbound::Json(json));
+
+        if idle_timer
+            .as_ref()
+            .is_some_and(|timer| timer.sleep.is_elapsed())
+        {
+            resolve_idle_activity(agent_id, &control, &mut pending_mirror, &mut idle_timer);
+        }
+
+        if !outbox_open && pending_mirror.is_empty() {
+            break;
+        }
+
+        if pending_mirror.is_empty() {
+            tokio::select! {
+                chunk = outbox_rx.recv() => match chunk {
+                    Some(chunk) => {
+                        queue_output_chunk(
+                            agent_id,
+                            chunk,
+                            &control,
+                            &mut pending_mirror,
+                            &mut idle_timer,
+                        ).await;
+                    }
+                    None => {
+                        outbox_open = false;
+                        idle_timer = None;
+                    }
+                },
+                generation = wait_for_idle(&mut idle_timer) => {
+                    resolve_idle_generation(
+                        agent_id,
+                        generation,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    );
+                }
+            }
+            continue;
+        }
+
+        let current = control.slot.lock().await.clone();
+        let Some(sink) = current else {
+            if outbox_open {
+                tokio::select! {
+                    chunk = outbox_rx.recv() => match chunk {
+                        Some(chunk) => {
+                            queue_output_chunk(
+                                agent_id,
+                                chunk,
+                                &control,
+                                &mut pending_mirror,
+                                &mut idle_timer,
+                            ).await;
+                        }
+                        None => {
+                            outbox_open = false;
+                            idle_timer = None;
+                        }
+                    },
+                    _ = control.notify.notified() => {},
+                    generation = wait_for_idle(&mut idle_timer) => {
+                        resolve_idle_generation(
+                            agent_id,
+                            generation,
+                            &control,
+                            &mut pending_mirror,
+                            &mut idle_timer,
+                        );
+                    },
+                }
+            } else {
+                control.notify.notified().await;
+            }
+            continue;
+        };
+
+        let message = pending_mirror.front().cloned().expect("checked non-empty");
+        let send_result = if outbox_open {
+            tokio::select! {
+                chunk = outbox_rx.recv() => {
+                    match chunk {
+                        Some(chunk) => {
+                            queue_output_chunk(
+                                agent_id,
+                                chunk,
+                                &control,
+                                &mut pending_mirror,
+                                &mut idle_timer,
+                            ).await;
+                        }
+                        None => {
+                            outbox_open = false;
+                            idle_timer = None;
+                        }
+                    }
+                    continue;
+                },
+                result = sink.send(message) => result,
+                generation = wait_for_idle(&mut idle_timer) => {
+                    resolve_idle_generation(
+                        agent_id,
+                        generation,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    );
+                    continue;
+                },
+            }
+        } else {
+            sink.send(message).await
+        };
+
+        match send_result {
+            Ok(()) => {
+                pending_mirror.pop_front();
+            }
+            Err(_) => {
+                // Keep the unsent frame at the front for the replacement sink.
+                let mut slot = control.slot.lock().await;
+                if slot.as_ref().is_some_and(|current| current.is_closed()) {
+                    *slot = None;
                 }
             }
         }
     }
     tracing::debug!(%agent_id, "forwarder exiting (outbox closed)");
+}
+
+async fn queue_output_chunk(
+    agent_id: Uuid,
+    chunk: OutputChunk,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
+) {
+    *idle_timer = chunk.idle_resolution.map(IdleResolutionTimer::new);
+    control.send_direct(&chunk.bytes).await;
+    pending_mirror.push_back(WsOutbound::Binary(frames::encode_pty_output(
+        agent_id,
+        &chunk.bytes,
+    )));
+    if chunk.activity {
+        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+            pending_mirror.push_back(activity);
+        }
+    }
+}
+
+async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
+    let Some(timer) = idle_timer else {
+        return future::pending().await;
+    };
+    timer.sleep.as_mut().await;
+    timer.generation
+}
+
+fn resolve_idle_activity(
+    agent_id: Uuid,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
+) {
+    let generation = idle_timer
+        .as_ref()
+        .expect("checked elapsed idle timer")
+        .generation;
+    resolve_idle_generation(agent_id, generation, control, pending_mirror, idle_timer);
+}
+
+fn resolve_idle_generation(
+    agent_id: Uuid,
+    generation: u64,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
+) {
+    *idle_timer = None;
+    if control.resolve_output_idle(generation) {
+        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+            pending_mirror.push_back(activity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
+        OutputChunk::classify(bytes.to_vec(), control)
+    }
+
+    #[test]
+    fn output_activity_is_throttled_with_monotonic_time() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(control.note_output_at(start, b"meaningful output"));
+        assert!(!control.note_output_at(
+            start + activity::OUTPUT_TOUCH_INTERVAL - Duration::from_millis(1),
+            b"more meaningful output"
+        ));
+        assert!(control.note_output_at(
+            start + activity::OUTPUT_TOUCH_INTERVAL,
+            b"more meaningful output"
+        ));
+    }
+
+    #[test]
+    fn suppression_extends_and_expires_deterministically() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+        control.suppress_activity_at(start, Duration::from_secs(1));
+        control.suppress_activity_at(start + Duration::from_millis(100), Duration::from_secs(2));
+
+        assert!(!control.note_output_at(start + Duration::from_secs(1), b"meaningful output"));
+        assert!(!control.note_output_at(start + Duration::from_millis(2099), b"meaningful output"));
+        assert!(control.note_output_at(start + Duration::from_millis(2100), b"meaningful output"));
+    }
+
+    #[test]
+    fn suppressed_or_noise_output_does_not_consume_throttle() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+        control.suppress_activity_at(start, Duration::from_millis(10));
+
+        assert!(!control.note_output_at(start, b"meaningful output"));
+        assert!(!control.note_output_at(start + Duration::from_millis(10), b"ok"));
+        assert!(control.note_output_at(start + Duration::from_millis(10), b"meaningful output"));
+    }
+
+    #[test]
+    fn classifier_state_advances_while_throttled_and_suppressed() {
+        let throttled = ForwarderControl::new();
+        let start = Instant::now();
+        assert!(throttled.note_output_at(start, b"abc"));
+        assert!(
+            !throttled.note_output_at(start + Duration::from_millis(10), b"\x1b]0;hidden title")
+        );
+        assert!(throttled.note_output_at(start + activity::OUTPUT_TOUCH_INTERVAL, b"\x07abc"));
+
+        let suppressed = ForwarderControl::new();
+        suppressed.suppress_activity_at(start, Duration::from_secs(1));
+        assert!(!suppressed.note_output_at(start, b"\xe2\x80"));
+        assert!(suppressed.note_output_at(start + Duration::from_secs(1), b"\xa2abc"));
+
+        let no_delay = ForwarderControl::new();
+        no_delay.suppress_activity_at(start, Duration::from_secs(1));
+        assert!(!no_delay.note_output_at(start, b"ab"));
+        assert!(!no_delay.note_output_at(start + Duration::from_secs(1), b"c"));
+    }
+
+    #[test]
+    fn input_activity_has_an_independent_throttle() {
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(control.note_input_at(start));
+        assert!(!control
+            .note_input_at(start + activity::INPUT_TOUCH_INTERVAL - Duration::from_millis(1)));
+        assert!(control.note_input_at(start + activity::INPUT_TOUCH_INTERVAL));
+        assert!(control.note_output_at(start, b"independent output"));
+    }
+
+    #[tokio::test]
+    async fn activity_frames_serialize_without_terminal_content() {
+        let agent_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Output));
+        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Input));
+
+        let WsOutbound::Json(output_json) = rx.recv().await.unwrap() else {
+            panic!("expected JSON output activity")
+        };
+        let WsOutbound::Json(input_json) = rx.recv().await.unwrap() else {
+            panic!("expected JSON input activity")
+        };
+        assert_eq!(
+            output_json,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert_eq!(
+            input_json,
+            format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_emits_binary_output_then_content_free_activity() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        outbox_tx
+            .send(source_output(&control, b"sensitive terminal output"))
+            .unwrap();
+        drop(outbox_tx);
+
+        let WsOutbound::Binary(binary) = sink_rx.recv().await.unwrap() else {
+            panic!("expected binary PTY output")
+        };
+        let (kind, decoded_id, payload) = frames::decode_binary(&binary).unwrap();
+        assert_eq!(kind, frames::KIND_PTY_OUTPUT);
+        assert_eq!(decoded_id, agent_id);
+        assert_eq!(payload, b"sensitive terminal output");
+
+        let WsOutbound::Json(activity_json) = sink_rx.recv().await.unwrap() else {
+            panic!("expected JSON output activity")
+        };
+        assert_eq!(
+            activity_json,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(!activity_json.contains("sensitive terminal output"));
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarder_decides_activity_before_mirror_backpressure_and_suppression() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
+        control.add_direct_sink("test".into(), direct_tx).await;
+
+        // Capacity one deliberately blocks the mirror after its first binary
+        // frame. Subsequent direct receipts prove classification has still
+        // consumed those chunks in source order.
+        let (sink_tx, mut sink_rx) = mpsc::channel(1);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        outbox_tx.send(source_output(&control, b"ok")).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"ok");
+
+        outbox_tx
+            .send(source_output(&control, b"before suppression"))
+            .unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        outbox_tx
+            .send(source_output(&control, b"during suppression"))
+            .unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+
+        // Simulate reconnect after the suppression window. The stored decision
+        // for earlier output remains, while suppressed output cannot appear as
+        // a delayed activity event.
+        control.activity.lock().unwrap().suppress_output_until = None;
+        drop(outbox_tx);
+
+        let first = sink_rx.recv().await.unwrap();
+        let second = sink_rx.recv().await.unwrap();
+        let third = sink_rx.recv().await.unwrap();
+        let fourth = sink_rx.recv().await.unwrap();
+        forwarder.await.unwrap();
+
+        let frames = [first, second, third, fourth];
+        let mut binary_payloads = Vec::new();
+        let mut activity_frames = Vec::new();
+        for frame in frames {
+            match frame {
+                WsOutbound::Binary(binary) => {
+                    let (_, _, payload) = frames::decode_binary(&binary).unwrap();
+                    binary_payloads.push(payload.to_vec());
+                }
+                WsOutbound::Json(json) => activity_frames.push(json),
+            }
+        }
+        assert_eq!(
+            binary_payloads,
+            vec![
+                b"ok".to_vec(),
+                b"before suppression".to_vec(),
+                b"during suppression".to_vec()
+            ]
+        );
+        assert_eq!(
+            activity_frames,
+            vec![format!(
+                r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#
+            )]
+        );
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarder_does_not_reclassify_suppressed_output_when_sink_reconnects() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
+        control.add_direct_sink("test".into(), direct_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        // There is intentionally no server sink while both chunks are
+        // classified. A later suppression cannot erase the first decision.
+        outbox_tx
+            .send(source_output(&control, b"before suppression"))
+            .unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        outbox_tx
+            .send(source_output(&control, b"during suppression"))
+            .unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+        control.activity.lock().unwrap().suppress_output_until = None;
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        drop(outbox_tx);
+
+        let first = sink_rx.recv().await.unwrap();
+        let second = sink_rx.recv().await.unwrap();
+        let third = sink_rx.recv().await.unwrap();
+        forwarder.await.unwrap();
+
+        assert!(matches!(first, WsOutbound::Binary(_)));
+        let WsOutbound::Json(activity) = second else {
+            panic!("pre-suppression output decision was lost")
+        };
+        assert_eq!(
+            activity,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(matches!(third, WsOutbound::Binary(_)));
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn producer_decision_precedes_enqueue_and_later_suppression() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+
+        // The producer classifies and enqueues before the forwarder exists.
+        // A later control event cannot mutate the queued decision.
+        let chunk = source_output(&control, b"queued before suppression");
+        assert!(chunk.activity);
+        outbox_tx.send(chunk).unwrap();
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(2);
+        control.set_sink(sink_tx).await;
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        drop(outbox_tx);
+
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        assert!(matches!(sink_rx.recv().await.unwrap(), WsOutbound::Json(_)));
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn suppression_preceding_producer_decision_stays_with_queued_output() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        let chunk = source_output(&control, b"queued during suppression");
+        assert!(!chunk.activity);
+        outbox_tx.send(chunk).unwrap();
+        // Expiry/reconnect before forwarding must not cause reclassification.
+        control.activity.lock().unwrap().suppress_output_until = None;
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(2);
+        control.set_sink(sink_tx).await;
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        drop(outbox_tx);
+
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        forwarder.await.unwrap();
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_ambiguous_output_emits_after_bounded_idle_without_blocking_bytes() {
+        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
+            let agent_id = Uuid::new_v4();
+            let control = ForwarderControl::new();
+            let (sink_tx, mut sink_rx) = mpsc::channel(4);
+            control.set_sink(sink_tx).await;
+            let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+            let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+            let chunk = source_output(&control, payload);
+            assert!(!chunk.activity);
+            assert!(chunk.idle_resolution.is_some());
+            outbox_tx.send(chunk).unwrap();
+
+            // Terminal bytes are never held behind the classification debounce.
+            assert!(matches!(
+                sink_rx.recv().await.unwrap(),
+                WsOutbound::Binary(_)
+            ));
+            assert!(sink_rx.try_recv().is_err());
+
+            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
+            tokio::task::yield_now().await;
+            assert!(sink_rx.try_recv().is_err());
+
+            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY).await;
+            tokio::task::yield_now().await;
+            let WsOutbound::Json(json) = sink_rx.try_recv().expect("idle activity") else {
+                panic!("expected idle activity JSON")
+            };
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            );
+
+            drop(outbox_tx);
+            forwarder.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_decision_preserves_receipt_time_suppression_ordering() {
+        // Suppression after receipt cannot erase eligible candidate text.
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        control.suppress_activity(Duration::from_secs(60));
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(sink_rx.try_recv().unwrap(), WsOutbound::Json(_)));
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+
+        // Suppression at receipt remains immutable even if it is cleared before
+        // the candidate resolves.
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        control.suppress_activity(Duration::from_secs(60));
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        outbox_tx
+            .send(source_output(&control, b" \"quoted real output\""))
+            .unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        control.activity.lock().unwrap().suppress_output_until = None;
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(sink_rx.try_recv().is_err());
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_tmux_status_stays_suppressed_at_every_split_with_idle_debounce() {
+        for payload in [
+            b"[spawn-oem] \"bash\" 12:34 15-Jul-26".as_slice(),
+            b"           \"project\" 04:49 08-May-26".as_slice(),
+            b"12:34 15-Jul-26".as_slice(),
+        ] {
+            for split in 0..=payload.len() {
+                let agent_id = Uuid::new_v4();
+                let control = ForwarderControl::new();
+                let (sink_tx, mut sink_rx) = mpsc::channel(4);
+                control.set_sink(sink_tx).await;
+                let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+                let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+                // Let the first half reach the forwarder and arm its timer,
+                // then complete the status before the debounce expires.
+                outbox_tx
+                    .send(source_output(&control, &payload[..split]))
+                    .unwrap();
+                assert!(matches!(
+                    sink_rx.recv().await.unwrap(),
+                    WsOutbound::Binary(_)
+                ));
+                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
+                tokio::task::yield_now().await;
+                assert!(sink_rx.try_recv().is_err());
+
+                outbox_tx
+                    .send(source_output(&control, &payload[split..]))
+                    .unwrap();
+                assert!(matches!(
+                    sink_rx.recv().await.unwrap(),
+                    WsOutbound::Binary(_)
+                ));
+                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    sink_rx.try_recv().is_err(),
+                    "status emitted activity at split {split} for {payload:?}"
+                );
+
+                drop(outbox_tx);
+                forwarder.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_idle_timer_is_cancelled_when_agent_outbox_closes() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(sink_rx.try_recv().is_err());
+    }
 }

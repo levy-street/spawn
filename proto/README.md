@@ -197,6 +197,14 @@ Agent IDs are big-endian 16-byte UUIDs.
  "agent_id": "uuid",
  "pid": 12345}
 
+{"type": "agent.activity", "agent_id": "uuid"}
+
+{"type": "agent.input_activity", "agent_id": "uuid"}
+
+Both activity frames are daemon-throttled metadata signals. They contain no
+terminal bytes: `agent.activity` records meaningful PTY output timing, while
+`agent.input_activity` records input timing for the direct WebRTC DataChannel.
+
 {"type": "agent.uploaded",
  "agent_id": "uuid",
  "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
