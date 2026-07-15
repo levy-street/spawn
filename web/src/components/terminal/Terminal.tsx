@@ -2556,10 +2556,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           };
         };
         const before = capture();
-        hideScrollbackOverlay();
-        // The refresh deliberately returns to the live edge; drop the
-        // remembered scrolled view so the post-heal `after` snapshot reports
-        // the live state rather than replaying the pre-refresh scroll.
+        // A refresh heals the frame; it must NOT yank the reader's viewport.
+        // Never scroll to the live edge: if the overlay is open it re-renders
+        // in place (invalidateScrollbackForResize, below); if the reader is at
+        // the live edge the live buffer reseeds under them. (Closing the
+        // overlay here is what used to snap the view to the bottom on every
+        // click.) Drop the remembered scroll so the post-heal `after` snapshot
+        // reports the healed state rather than replaying the old position.
         lastScrolledViewRef.current = null;
         fitTerminalRef.current(true);
         historyReseedPendingRef.current = true;
