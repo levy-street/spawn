@@ -29,10 +29,12 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
 import { AuthGate } from "@/components/auth/AuthGate";
@@ -772,6 +774,40 @@ type PaneAreaProps = {
   onPaneError: (message: string) => void;
 };
 
+/** A DOM slot a pane portals its content into, plus whether that slot is in
+ *  the stacked (narrow) layout. */
+type Slot = { el: HTMLElement; stacked: boolean };
+type RegisterSlot = (agentId: string, el: HTMLElement | null, stacked: boolean) => void;
+
+/** A positioned placeholder in the split tree / stack; the matching pane's
+ *  terminal is portaled here. Keeping the terminal in a stable keyed layer
+ *  (not in the reshaping tree) is what preserves its socket + WebRTC across
+ *  pane moves — remounting on every layout change was dropping connections. */
+function PaneSlot({
+  agentId,
+  stacked,
+  registerSlot,
+}: {
+  agentId: string;
+  stacked: boolean;
+  registerSlot: RegisterSlot;
+}) {
+  // Stable ref: an inline `ref={el => ...}` is a fresh function each render,
+  // so React would detach+reattach it every render (null→el) and the
+  // registerSlot setState would loop. useCallback pins it so it fires only on
+  // mount/unmount.
+  const setRef = useCallback(
+    (el: HTMLDivElement | null) => registerSlot(agentId, el, stacked),
+    [agentId, stacked, registerSlot],
+  );
+  return (
+    <div
+      ref={setRef}
+      className={stacked ? "flex min-h-[50dvh] w-full shrink-0" : "flex min-h-0 min-w-0 flex-1"}
+    />
+  );
+}
+
 function useIsWide(ref: RefObject<HTMLElement | null>): boolean {
   const [wide, setWide] = useState(true);
   useEffect(() => {
@@ -792,6 +828,24 @@ function PaneArea(props: PaneAreaProps) {
   const router = useRouter();
   const areaRef = useRef<HTMLDivElement>(null);
   const wide = useIsWide(areaRef);
+  const agentIds = useMemo(() => collectAgentIds(root), [root]);
+
+  // Slot registry: pane content portals into these, keyed by agentId, so the
+  // terminal instances persist even as the split tree reshapes on a move.
+  const [slots, setSlots] = useState<Record<string, Slot>>({});
+  const registerSlot = useCallback<RegisterSlot>((agentId, el, stacked) => {
+    setSlots((prev) => {
+      if (el === null) {
+        if (!(agentId in prev)) return prev;
+        const next = { ...prev };
+        delete next[agentId];
+        return next;
+      }
+      const cur = prev[agentId];
+      if (cur && cur.el === el && cur.stacked === stacked) return prev;
+      return { ...prev, [agentId]: { el, stacked } };
+    });
+  }, []);
 
   // Empty screen: whole area is one drop target plus a picker tile.
   const { active: emptyDropActive, dropProps: emptyDropProps } = useAgentDrop(
@@ -852,35 +906,46 @@ function PaneArea(props: PaneAreaProps) {
     );
   }
 
-  if (!wide) {
-    // Narrow containers stack panes in tree order; structure editing is a
-    // desktop-width affair.
-    const ids = collectAgentIds(root);
-    return (
-      <div
-        ref={areaRef}
-        className="flex min-h-0 min-w-0 flex-1 flex-col gap-px overflow-y-auto bg-border"
-      >
-        {ids.map((agentId) => (
-          <ScreenPane key={agentId} agentId={agentId} stacked {...props} />
-        ))}
-      </div>
-    );
-  }
-
   return (
-    <div
-      ref={areaRef}
-      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
-    >
-      <NodeView node={root} path={[]} {...props} />
-    </div>
+    <>
+      {wide ? (
+        <div
+          ref={areaRef}
+          className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
+        >
+          <NodeView node={root} path={[]} registerSlot={registerSlot} {...props} />
+        </div>
+      ) : (
+        // Narrow containers stack panes in tree order; structure editing is a
+        // desktop-width affair.
+        <div
+          ref={areaRef}
+          className="flex min-h-0 min-w-0 flex-1 flex-col gap-px overflow-y-auto bg-border"
+        >
+          {agentIds.map((agentId) => (
+            <PaneSlot key={agentId} agentId={agentId} stacked registerSlot={registerSlot} />
+          ))}
+        </div>
+      )}
+      {/* Keep-alive pane layer: one instance per agent, stable across moves,
+          portaled into whichever slot the layout currently exposes. */}
+      {agentIds.map((agentId) => (
+        <ScreenPane key={agentId} agentId={agentId} slot={slots[agentId]} {...props} />
+      ))}
+    </>
   );
 }
 
-function NodeView({ node, path, ...props }: { node: LayoutNode; path: SplitPath } & PaneAreaProps) {
+function NodeView({
+  node,
+  path,
+  registerSlot,
+  ...props
+}: { node: LayoutNode; path: SplitPath; registerSlot: RegisterSlot } & PaneAreaProps) {
   if (node.type === "pane") {
-    return <ScreenPane agentId={node.agent_id} {...props} />;
+    // The tree only positions a slot; the pane itself lives in the keep-alive
+    // layer and portals here.
+    return <PaneSlot agentId={node.agent_id} stacked={false} registerSlot={registerSlot} />;
   }
 
   const zoomed = props.zoomedId;
@@ -893,25 +958,27 @@ function NodeView({ node, path, ...props }: { node: LayoutNode; path: SplitPath 
     return (
       <div className="flex min-h-0 min-w-0 flex-1">
         <div className={cn(zoomInA ? "flex min-h-0 min-w-0 flex-1" : "hidden")}>
-          <NodeView node={node.a} path={[...path, "a"]} {...props} />
+          <NodeView node={node.a} path={[...path, "a"]} registerSlot={registerSlot} {...props} />
         </div>
         <div className={cn(zoomInB ? "flex min-h-0 min-w-0 flex-1" : "hidden")}>
-          <NodeView node={node.b} path={[...path, "b"]} {...props} />
+          <NodeView node={node.b} path={[...path, "b"]} registerSlot={registerSlot} {...props} />
         </div>
       </div>
     );
   }
 
-  return <SplitView node={node} path={path} {...props} />;
+  return <SplitView node={node} path={path} registerSlot={registerSlot} {...props} />;
 }
 
 function SplitView({
   node,
   path,
+  registerSlot,
   ...props
 }: {
   node: Extract<LayoutNode, { type: "split" }>;
   path: SplitPath;
+  registerSlot: RegisterSlot;
 } & PaneAreaProps) {
   const row = node.direction === "row";
   const containerRef = useRef<HTMLDivElement>(null);
@@ -957,7 +1024,7 @@ function SplitView({
         className="flex min-h-0 min-w-0"
         style={{ flexGrow: node.ratio, flexShrink: 1, flexBasis: 0 }}
       >
-        <NodeView node={node.a} path={[...path, "a"]} {...props} />
+        <NodeView node={node.a} path={[...path, "a"]} registerSlot={registerSlot} {...props} />
       </div>
       <button
         type="button"
@@ -981,7 +1048,7 @@ function SplitView({
         className="flex min-h-0 min-w-0"
         style={{ flexGrow: 1 - node.ratio, flexShrink: 1, flexBasis: 0 }}
       >
-        <NodeView node={node.b} path={[...path, "b"]} {...props} />
+        <NodeView node={node.b} path={[...path, "b"]} registerSlot={registerSlot} {...props} />
       </div>
     </div>
   );
@@ -1015,9 +1082,10 @@ const ZONE_CLASS: Record<DropZone, string> = {
 
 function ScreenPane({
   agentId,
-  stacked = false,
+  slot,
   ...props
-}: { agentId: string; stacked?: boolean } & PaneAreaProps) {
+}: { agentId: string; slot: Slot | undefined } & PaneAreaProps) {
+  const stacked = slot?.stacked ?? false;
   const {
     agentsById,
     screenId,
@@ -1033,11 +1101,17 @@ function ScreenPane({
   } = props;
   const agent = agentsById.get(agentId);
   const termRef = useRef<TerminalHandle>(null);
+  const hostRef = useRef<HTMLDivElement | null>(null);
   const { registerPane } = props;
   useEffect(() => {
     registerPane(agentId, termRef.current);
     return () => registerPane(agentId, null);
   });
+  // Move the stable host into whatever slot the layout currently exposes.
+  useLayoutEffect(() => {
+    const host = hostRef.current;
+    if (host && slot?.el && host.parentElement !== slot.el) slot.el.appendChild(host);
+  }, [slot]);
   const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
   const [displayOwner, setDisplayOwner] = useState<boolean | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
@@ -1082,7 +1156,18 @@ function ScreenPane({
     onPlaceAgent(droppedId, agentId, dropZone, sourceScreen);
   };
 
-  return (
+  // Stable host node the section always portals into — created once and
+  // never replaced, so the terminal (and its socket + WebRTC) never
+  // remounts. On a move the host is *moved* between slot divs via
+  // appendChild, which relocates the DOM without React reconciliation.
+  if (!hostRef.current && typeof document !== "undefined") {
+    const host = document.createElement("div");
+    host.style.display = "contents";
+    hostRef.current = host;
+  }
+  if (!hostRef.current) return null; // SSR only
+
+  return createPortal(
     <section
       aria-label={agent ? agentTitle(agent) : "Missing agent"}
       onDragEnter={onDragEnter}
@@ -1208,6 +1293,7 @@ function ScreenPane({
           This agent was deleted — remove the pane.
         </div>
       )}
-    </section>
+    </section>,
+    hostRef.current,
   );
 }
