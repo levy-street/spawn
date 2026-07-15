@@ -288,6 +288,14 @@ test("arrange presets rebuild the split tree", async ({ page }) => {
     });
 });
 
+test("a screen that no longer exists redirects to the switchboard", async ({ page }) => {
+  // Only agentA's screen exists in the mock; navigating to a stale id 404s.
+  await mockAuthenticatedApi(page, { agents: [agentA, agentB], screens: [screen()] });
+  await page.goto(`/screens/00000000-0000-4000-8000-0000000000ff`);
+  // The switchboard forwards to the one real screen instead of stranding us.
+  await page.waitForURL(`**/screens/${SCREEN_ID}`, { timeout: 10000 });
+});
+
 test("dropping an agent on another agent's terminal creates a split screen", async ({ page }) => {
   let createdBody: Record<string, unknown> | null = null;
   await mockAuthenticatedApi(page, {

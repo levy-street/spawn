@@ -109,9 +109,21 @@ function ScreenView({ id }: { id: string }) {
   const q = useQuery({
     queryKey: ["screen", id],
     queryFn: () => screens.get(id),
-    staleTime: 60_000,
-    refetchOnWindowFocus: false,
+    // Short and refetch-on-focus so a screen deleted elsewhere (or emptied)
+    // is noticed promptly instead of lingering as a stale ghost tab.
+    staleTime: 10_000,
+    refetchOnWindowFocus: true,
+    retry: false,
   });
+  // A screen that no longer exists must not strand the user on a dead tab
+  // showing cached panes — bounce to the switchboard, which forwards to a
+  // live screen or the empty state.
+  useEffect(() => {
+    if (q.error instanceof ApiError && q.error.status === 404) {
+      qc.invalidateQueries({ queryKey: ["screens"] });
+      router.replace("/screens");
+    }
+  }, [q.error, qc, router]);
   const screensQ = useQuery({ queryKey: ["screens"], queryFn: screens.list });
   const agentsQ = useQuery({
     queryKey: ["agents"],
@@ -531,7 +543,10 @@ function ScreenView({ id }: { id: string }) {
                       destructive
                       disabled={deleteM.isPending}
                       onSelect={() => {
-                        if (screen && confirm(`Delete screen ${screen.name}?`)) deleteM.mutate();
+                        // `item` is the tab's own screen (always present),
+                        // unlike `screen` which is undefined once the fetch
+                        // 404s — so delete works even on a stale tab.
+                        if (confirm(`Delete screen ${item.name}?`)) deleteM.mutate();
                       }}
                     >
                       <Trash2 className="size-4" aria-hidden />
