@@ -266,6 +266,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     length: number;
     rows: string[];
   } | null>(null);
+  // Resize->repaint instrumentation: when a resize is sent, mark the time;
+  // record when the app's repaint bytes first arrive and when they settle, so
+  // the reshape lag is measured (and surfaced in diagnostics), not guessed.
+  const resizeMarkRef = useRef<{
+    sentAt: number;
+    cols: number;
+    rows: number;
+    firstByteAt: number | null;
+    lastByteAt: number | null;
+  } | null>(null);
+  const resizeSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resizeTimingsRef = useRef<
+    Array<{ at: string; cols: number; rows: number; toFirstByteMs: number; toSettleMs: number }>
+  >([]);
+  const markResizeSentRef = useRef((cols: number, rows: number) => {
+    resizeMarkRef.current = { sentAt: Date.now(), cols, rows, firstByteAt: null, lastByteAt: null };
+  });
   const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
@@ -816,6 +833,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (cols !== last.cols || rows !== last.rows) {
       invalidateScrollbackForResizeRef.current();
     }
+    markResizeSentRef.current(cols, rows);
     socketRef.current.sendJson({ type: "take_control", cols, rows });
     // Ownership + geometry both just changed hands; force a clean repaint
     // once the daemon has resized the PTY to our size.
@@ -959,6 +977,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       scrollbackCacheDirtyRef.current = true;
       scrollbackLiveBytesAtRef.current = Date.now();
+      // Resize->repaint timing: attribute the output burst that follows a
+      // resize to that resize; finalize once it settles (250ms quiet).
+      const rm = resizeMarkRef.current;
+      if (rm) {
+        const now = Date.now();
+        if (rm.firstByteAt === null) rm.firstByteAt = now;
+        rm.lastByteAt = now;
+        if (resizeSettleTimerRef.current) clearTimeout(resizeSettleTimerRef.current);
+        resizeSettleTimerRef.current = setTimeout(() => {
+          resizeSettleTimerRef.current = null;
+          const m = resizeMarkRef.current;
+          resizeMarkRef.current = null;
+          if (m && m.firstByteAt !== null && m.lastByteAt !== null) {
+            resizeTimingsRef.current.push({
+              at: new Date().toISOString(),
+              cols: m.cols,
+              rows: m.rows,
+              toFirstByteMs: Math.round(m.firstByteAt - m.sentAt),
+              toSettleMs: Math.round(m.lastByteAt - m.sentAt),
+            });
+            while (resizeTimingsRef.current.length > 12) resizeTimingsRef.current.shift();
+          }
+        }, 250);
+      }
       scheduleScrollbackCacheRefreshRef.current();
       writeScrollbackLiveBytes(bytes);
       termRef.current?.write(bytes);
@@ -2067,6 +2109,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (cols === last.cols && rows === last.rows) return;
       lastSizeRef.current = { cols, rows };
       invalidateScrollbackForResizeRef.current();
+      markResizeSentRef.current(cols, rows);
       if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
         // tmux repaints on SIGWINCH, but rapid geometry churn (mobile
@@ -2554,6 +2597,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dpr: window.devicePixelRatio,
             viewport: { w: window.innerWidth, h: window.innerHeight },
             visibility: document.visibilityState,
+            // Recent resize->repaint latencies (ms): toFirstByte is the app's
+            // first response, toSettle is when the repaint burst went quiet.
+            resizeTimings: resizeTimingsRef.current.slice(-12),
             tail,
           };
         };
