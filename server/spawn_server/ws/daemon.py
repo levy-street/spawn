@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import json
 import logging
 from datetime import UTC, datetime
@@ -15,7 +13,6 @@ from .. import auth as auth_mod
 from .. import transcript
 from ..db import get_sessionmaker
 from ..models import Agent, Host
-from .activity import should_record_agent_output
 from .broker import DaemonConn, get_broker
 from .frames import KIND_OUTPUT, decode_binary_frame
 
@@ -139,18 +136,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             continue
                     await broker.attach_agent_to_daemon(frame.agent_id, conn)
 
-                # Touch activity timestamps at most once per throttle window;
-                # a DB commit per output chunk head-of-line blocks the relay.
-                now = _utcnow()
-                if should_record_agent_output(str(frame.agent_id), now, frame.payload):
-                    async with sm() as session:
-                        agent = await session.get(Agent, frame.agent_id)
-                        if agent is not None:
-                            agent.last_output_at = now
-                        host_obj = await session.get(Host, host.id)
-                        if host_obj is not None:
-                            host_obj.last_seen_at = now
-                        await session.commit()
+                # Activity is no longer derived from these bytes — the daemon
+                # classifies output locally and emits a content-free
+                # `agent.activity` frame (trust Phase 2), handled below. This
+                # path stays only to persist/relay until the DataChannel owns
+                # history (Phase 2 step 3), at which point it is deleted.
 
                 # Persist to the agent's on-disk transcript first so a server
                 # restart doesn't lose recent history. The file write is
@@ -235,6 +225,22 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         )
                                     except Exception:
                                         pass
+
+                elif ftype == "agent.activity":
+                    # Content-free output-activity ping (trust Phase 2). The
+                    # daemon already classified meaningful output and throttled
+                    # it, so the server just stamps — it never sees the bytes.
+                    aid = obj.get("agent_id")
+                    if aid:
+                        now = _utcnow()
+                        async with sm() as session:
+                            agent = await session.get(Agent, aid)
+                            if agent is not None and agent.host_id == host.id:
+                                agent.last_output_at = now
+                                host_obj = await session.get(Host, host.id)
+                                if host_obj is not None:
+                                    host_obj.last_seen_at = now
+                                await session.commit()
 
                 elif ftype == "agent.exit":
                     aid = obj.get("agent_id")

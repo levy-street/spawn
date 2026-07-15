@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -31,7 +31,9 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
+use crate::activity;
 use crate::frames;
+use crate::proto::Outbound;
 use crate::tmux;
 
 #[derive(Debug)]
@@ -68,6 +70,18 @@ pub struct ForwarderControl {
     /// tmux subprocess per keystroke; refreshed lazily in the background.
     copy_mode: Arc<AtomicBool>,
     copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Output-activity ping state (trust Phase 2). `last_activity_ms` throttles
+    /// the ping; `suppress_until_ms` is bumped by injected input/resize/redraw
+    /// so their echoes don't count as agent work. Both are unix-millis, 0=unset.
+    last_activity_ms: Arc<AtomicI64>,
+    suppress_until_ms: Arc<AtomicI64>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// How stale the cached copy-mode flag may get before a background refresh
@@ -84,7 +98,51 @@ impl ForwarderControl {
             notify: Arc::new(Notify::new()),
             copy_mode: Arc::new(AtomicBool::new(false)),
             copy_mode_checked_at: Arc::new(Mutex::new(None)),
+            last_activity_ms: Arc::new(AtomicI64::new(0)),
+            suppress_until_ms: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    /// Suppress output-activity classification for `window` — an injected
+    /// resize/redraw or local input echo must not register as agent work.
+    pub fn suppress_activity(&self, window: std::time::Duration) {
+        let until = now_ms() + window.as_millis() as i64;
+        let mut cur = self.suppress_until_ms.load(Ordering::Relaxed);
+        while until > cur {
+            match self.suppress_until_ms.compare_exchange_weak(
+                cur,
+                until,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Decide whether this output chunk should emit an `agent.activity` ping:
+    /// outside the throttle window, not suppressed, and carrying meaningful
+    /// content. Records the emit time on success. Mirrors the former
+    /// server-side classifier, now content-free on the wire.
+    fn note_output(&self, chunk: &[u8]) -> bool {
+        let now = now_ms();
+        // Cheap throttle check first, so the classifier only runs when a ping
+        // could actually be emitted.
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < activity::OUTPUT_TOUCH_INTERVAL.as_millis() as i64
+        {
+            return false;
+        }
+        let sup = self.suppress_until_ms.load(Ordering::Relaxed);
+        if sup != 0 && now < sup {
+            return false;
+        }
+        if !activity::output_is_meaningful(chunk) {
+            return false;
+        }
+        self.last_activity_ms.store(now, Ordering::Relaxed);
+        true
     }
 
     /// Cached answer to "is the pane in copy-mode?", kicking off a background
@@ -278,6 +336,9 @@ impl AgentHandle {
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
+        // The echo of this input shouldn't count as agent output-activity.
+        self.control
+            .suppress_activity(activity::INPUT_ECHO_SUPPRESS_WINDOW);
         match &self.backend {
             HandleBackend::Tmux { stdin, .. } => {
                 let mut stdin = stdin
@@ -301,6 +362,9 @@ impl AgentHandle {
         if *size == (cols, rows) {
             return Ok(false);
         }
+        // The repaint this resize triggers shouldn't count as agent activity.
+        self.control
+            .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
         match &self.backend {
             HandleBackend::Tmux { master, .. } => {
                 let master = master
@@ -621,6 +685,18 @@ pub(crate) async fn run_forwarder(
                 },
                 None => {
                     control.notify.notified().await;
+                }
+            }
+        }
+        // Content-free activity ping (trust Phase 2): classified + throttled
+        // + suppression-aware daemon-side, so the server can stamp
+        // `last_output_at` without ever seeing the bytes. Best-effort: dropped
+        // if the control channel is momentarily full — the throttle means a
+        // later chunk re-emits soon.
+        if control.note_output(&chunk) {
+            if let Ok(json) = serde_json::to_string(&Outbound::AgentActivity { agent_id }) {
+                if let Some(sink) = control.slot.lock().await.clone() {
+                    let _ = sink.try_send(WsOutbound::Json(json));
                 }
             }
         }

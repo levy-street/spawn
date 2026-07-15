@@ -272,3 +272,36 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
     await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
+
+
+async def test_daemon_ws_agent_activity_stamps_last_output_at_without_bytes(client):
+    """Trust Phase 2: the daemon emits a content-free `agent.activity` frame;
+    the server stamps `last_output_at` from it, never inspecting PTY bytes."""
+    user_id, _ = await _signup(client, "ws-daemon-activity@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id, name="worker")
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "host_name": "spawnd",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.1.0",
+        }
+    )
+    ws.queue_text({"type": "agent.activity", "agent_id": agent_id})
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=token)  # type: ignore[arg-type]
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        assert agent.last_output_at is not None
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.last_seen_at is not None

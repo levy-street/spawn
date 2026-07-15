@@ -2432,6 +2432,10 @@ async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
         tracing::debug!(%agent_id, "ignoring redraw for unknown agent");
         return;
     };
+    // The forced repaint is not agent work — don't let it ping activity.
+    if let Some(control) = registry.control_for(agent_id) {
+        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+    }
     // A full client repaint restores cursor position AND terminal modes in
     // the browser's freshly-seeded xterm; a same-size SIGWINCH nudge is a
     // silent no-op after a refresh at unchanged geometry.

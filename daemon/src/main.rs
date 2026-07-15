@@ -11,6 +11,7 @@
 // restarts. On reconnect the daemon re-registers with the list of agents it
 // still owns, and the server resyncs its routing map without disturbing them.
 
+mod activity;
 mod agents;
 mod cli;
 mod config;

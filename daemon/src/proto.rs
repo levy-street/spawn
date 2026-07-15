@@ -33,6 +33,11 @@ pub enum Outbound {
     },
     #[serde(rename = "agent.started")]
     AgentStarted { agent_id: Uuid, pid: u32 },
+    /// Content-free "meaningful output happened" ping (trust Phase 2): lets the
+    /// server stamp `last_output_at` without seeing PTY bytes. Throttled and
+    /// classified daemon-side (see `activity.rs`).
+    #[serde(rename = "agent.activity")]
+    AgentActivity { agent_id: Uuid },
     #[serde(rename = "agent.uploaded")]
     AgentUploaded {
         agent_id: Uuid,
