@@ -464,7 +464,12 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
     from spawn_server.redis import get_backend
 
     user_id, token = await _signup(client, "ws-browser-v2@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_id)
+    host_id, agent_id = await _create_host_and_agent(user_id)
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    await broker.register_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
 
     ws = FakeBrowserWebSocket(
         authorization=f"Bearer {token}", subprotocols=["spawn.v2", "spawn.v1"]
@@ -476,6 +481,17 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
         assert ws.accepted_subprotocol == "spawn.v2"
         # Control frames still flow: signaling config reaches the browser.
         assert len(_messages_of_type(ws, "rtc.config")) == 1
+        # History, snapshots, geometry and display ownership are now carried
+        # only by the endpoint-to-endpoint spawn.ctl DataChannel.
+        assert _messages_of_type(ws, "history") == []
+        assert _messages_of_type(ws, "snapshot") == []
+        assert _messages_of_type(ws, "display.control") == []
+        daemon_frames = [json.loads(item) for item in daemon_ws.sent_text]
+        assert not any(
+            frame.get("type")
+            in {"agent.snapshot", "agent.resize", "agent.scroll", "agent.redraw"}
+            for frame in daemon_frames
+        )
 
         # v2 browsers are never subscribed to the PTY pubsub feed.
         backend = get_backend()
@@ -487,6 +503,7 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
     finally:
         ws.queue_disconnect()
         await asyncio.wait_for(task, timeout=1)
+        await broker.unregister_daemon(daemon)
 
 
 async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
@@ -502,6 +519,22 @@ async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
 
     assert ws.closed is not None
     assert ws.closed[0] == 4002
+
+
+async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
+    user_id, token = await _signup(client, "ws-browser-v2-control@example.com")
+    _host_id, agent_id = await _create_host_and_agent(user_id)
+
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None, cols=None, rows=None)  # type: ignore[arg-type]
+    )
+
+    await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
+    ws.queue_text({"type": "resize", "cols": 132, "rows": 40})
+    await asyncio.wait_for(task, timeout=1)
+
+    assert ws.closed == (4002, "terminal control belongs on spawn.ctl")
 
 
 async def test_browser_ws_v2_falls_back_to_v1_when_webrtc_disabled(client, monkeypatch):

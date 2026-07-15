@@ -420,18 +420,21 @@ The server sends
 `host.heartbeat` acknowledgements for daemon heartbeats so the daemon can
 distinguish healthy idle connections from dead sockets.
 
-## Browser WebSocket — `/ws/browser?agent_id=<uuid>&cols=<n>&rows=<n>`
+## Browser WebSocket — `/ws/browser?agent_id=<uuid>`
 
 - Auth: session cookie (or `?token=` for testing).
 - Subprotocol: clients offer `spawn.v2, spawn.v1` in preference order; the
   server selects `spawn.v2` when WebRTC is enabled, else `spawn.v1`.
   - **`spawn.v2`** (docs/TRUST.md Phase 1): the WS is control + signaling
     only. The server never sends binary frames (live PTY output flows over
-    the WebRTC DataChannel exclusively) and closes the socket with code
-    `4002` if the browser sends one. All JSON frames below are unchanged.
+    the WebRTC DataChannels exclusively) and closes the socket with code
+    `4002` if the browser sends a binary frame or a terminal viewport/snapshot
+    JSON frame. History, snapshots, geometry, scrolling, redraw and display
+    ownership use `spawn.ctl`; the server does not receive them.
   - **`spawn.v1`** (legacy): binary frames relay PTY bytes in both
     directions through the server. Kept for rollout compatibility.
-- `cols` and `rows` are optional initial browser dimensions. When present,
+- On legacy v1 only, `cols` and `rows` may be optional initial browser
+  dimensions. When present,
   the server resizes the tmux attach before producing the initial history
   snapshot.
 
@@ -473,19 +476,22 @@ plane and fallback terminal relay.
 ```
 Plus raw binary stdout bytes.
 
-## Direct terminal DataChannel
+## Direct per-agent DataChannels
 
 The low-latency terminal data plane is an optional WebRTC DataChannel layered
 on top of the websocket control plane.
 
-- The browser creates a DataChannel named `spawn.pty`.
+- The browser creates ordered DataChannels named `spawn.pty` and `spawn.ctl`.
 - Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
 - DataChannel messages are raw binary PTY bytes:
   - browser → daemon: stdin bytes for the authorized agent
   - daemon → browser: stdout/stderr PTY bytes for that agent
-- The server-relayed binary PTY path stays active as fallback and transcript
-  source. Browsers should prefer DataChannel output once it is open to avoid
-  duplicate terminal rendering.
+- `spawn.ctl` carries the versioned bounded control protocol below. A v2
+  terminal is ready only after both channels open and its initial history
+  response is applied.
+- Legacy `spawn.v1` keeps the server-relayed binary PTY fallback. The daemon
+  still mirrors output to the server for transcripts until P2-AGENT-02, but
+  a `spawn.v2` browser neither subscribes to nor renders that relay.
 - `SPAWN_WEBRTC_ENABLED` enables the direct path, and
   `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
   enough for many LAN/home-network cases; TURN is required for reliable
@@ -495,6 +501,57 @@ on top of the websocket control plane.
   per-session HMAC credentials and appends them to the ICE list in
   `rtc.config` (browser) and `rtc.offer.ice_servers` (daemon). The relay
   only ever carries DTLS ciphertext between the peers.
+
+### `spawn.ctl` version 1
+
+Requests are JSON text messages no larger than 16 KiB. `request_id` is a fresh
+UUID and binds every response/chunk to its caller:
+
+```json
+{"version":1,"kind":"request","request_id":"uuid","operation":"history","lines":400,"plain":false,"cols":120,"rows":32}
+{"version":1,"kind":"request","request_id":"uuid","operation":"snapshot","lines":10000,"plain":false}
+{"version":1,"kind":"request","request_id":"uuid","operation":"resize","cols":120,"rows":32}
+{"version":1,"kind":"request","request_id":"uuid","operation":"take_control","cols":120,"rows":32}
+{"version":1,"kind":"request","request_id":"uuid","operation":"scroll","lines":-8}
+{"version":1,"kind":"request","request_id":"uuid","operation":"redraw"}
+```
+
+The daemon clamps the protocol surface by rejecting, rather than silently
+changing, invalid values: history/snapshot is 1–10,000 lines, geometry is
+20–400 columns by 5–200 rows, and scroll is a non-zero delta from -200 to 200.
+Only the daemon-selected display owner may resize; `take_control` transfers
+ownership. Viewer attach/detach/transfer produces a per-viewer E2E event:
+
+```json
+{"version":1,"kind":"event","event":"display_state","owner":true,"cols":120,"rows":32,"viewers":2}
+```
+
+Small operations receive an `ok` response. History/snapshot metadata precedes
+zero or more request-bound binary chunks and caps the complete response at
+12 MiB:
+
+```json
+{"version":1,"kind":"response","request_id":"uuid","operation":"snapshot","ok":true,"plain":false,"pty_offset":42,"total_bytes":90000,"chunks":2}
+```
+
+Each binary chunk is at most 48 KiB of payload:
+
+```text
++----------+---------+------+-------+----------------+----------+---------+
+| "SPCT"   | version | kind | flags | request UUID   | sequence | payload |
+| 4 bytes  | u8 (=1) | u8=1 | u16LE | 16 raw bytes   | u32LE    | bytes   |
++----------+---------+------+-------+----------------+----------+---------+
+```
+
+Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
+`ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
+
+`spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
+between them. Replay metadata therefore carries `pty_offset`, the cumulative
+bytes queued to that viewer before capture. The browser buffers live PTY data
+during bootstrap, applies the replay, discards buffered bytes through the
+anchor, and then applies only the suffix. Snapshot reconciliation uses the
+same explicit anchor; it never infers capture order from message arrival.
 
 ## Versioning
 

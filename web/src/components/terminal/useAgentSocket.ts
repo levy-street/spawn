@@ -2,6 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  AGENT_CTL_MAX_PENDING_PTY_BYTES,
+  AGENT_CTL_MAX_REPLAY_BYTES,
+  AGENT_CTL_MAX_REPLAY_CHUNKS,
+  type AgentCtlOperation,
+  type AgentCtlResponse,
+  combineAgentCtlChunks,
+  decodeAgentCtlChunk,
+  makeAgentCtlRequest,
+  parseAgentCtlText,
+  slicePtyChunkAfterAnchor,
+} from "@/lib/agent-ctl";
+import {
   base64ToBytes,
   buildAgentWsUrl,
   type DisplayControlState,
@@ -50,8 +62,11 @@ const EMPTY_CONN_INFO: ConnInfo = { kind: null, rttMs: null, protocol: null };
 
 type RtcState = {
   pc: RTCPeerConnection | null;
-  dc: RTCDataChannel | null;
+  ptyDc: RTCDataChannel | null;
+  ctlDc: RTCDataChannel | null;
   sessionId: string | null;
+  ptyOpen: boolean;
+  ctlOpen: boolean;
   open: boolean;
   /** Cumulative PTY bytes received over this session's DataChannel. */
   bytesReceived: number;
@@ -103,11 +118,17 @@ export function useAgentSocket({
   const pendingInputBytesRef = useRef(0);
   const rtcRef = useRef<RtcState>({
     pc: null,
-    dc: null,
+    ptyDc: null,
+    ctlDc: null,
     sessionId: null,
+    ptyOpen: false,
+    ctlOpen: false,
     open: false,
     bytesReceived: 0,
   });
+  const sendControlRef = useRef<
+    (operation: AgentCtlOperation, parameters?: Record<string, unknown>) => boolean
+  >(() => false);
   const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
@@ -179,8 +200,19 @@ export function useAgentSocket({
       if (signal && sessionId) {
         sendJsonOverWs({ type: "rtc.close", session_id: sessionId });
       }
+      rtcRef.current = {
+        pc: null,
+        ptyDc: null,
+        ctlDc: null,
+        sessionId: null,
+        ptyOpen: false,
+        ctlOpen: false,
+        open: false,
+        bytesReceived: 0,
+      };
       try {
-        rtc.dc?.close();
+        rtc.ptyDc?.close();
+        rtc.ctlDc?.close();
       } catch {
         // ignore
       }
@@ -189,7 +221,7 @@ export function useAgentSocket({
       } catch {
         // ignore
       }
-      rtcRef.current = { pc: null, dc: null, sessionId: null, open: false, bytesReceived: 0 };
+      sendControlRef.current = () => false;
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
@@ -232,8 +264,6 @@ export function useAgentSocket({
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
       const sessionId = newRtcSessionId();
-      // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
-      // survive networks where no direct path exists (docs/TRUST.md Phase 1).
       const forceRelay =
         typeof window !== "undefined" &&
         (window as { __spawnRtcForceRelay?: boolean }).__spawnRtcForceRelay === true;
@@ -241,11 +271,155 @@ export function useAgentSocket({
         iceServers,
         iceTransportPolicy: forceRelay ? "relay" : "all",
       });
-      const dc = pc.createDataChannel("spawn.pty", { ordered: true });
+      const ptyDc = pc.createDataChannel("spawn.pty", { ordered: true });
+      const useControlChannel = wsV2Ref.current;
+      const ctlDc = useControlChannel ? pc.createDataChannel("spawn.ctl", { ordered: true }) : null;
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+      const pendingControlTexts: string[] = [];
+      const replayResponses = new Map<
+        string,
+        { metadata: AgentCtlResponse; chunks: Map<number, Uint8Array>; sawLast: boolean }
+      >();
+      const pendingBootstrapPty: Array<{ bytes: Uint8Array; offsetAfter: number }> = [];
+      const pendingSnapshots: Array<{
+        bytes: Uint8Array;
+        plain: boolean;
+        ptyOffset: number;
+      }> = [];
+      let pendingBootstrapPtyBytes = 0;
+      let bootstrapDone = !useControlChannel;
+      let bootstrapPtyAnchor: number | null = null;
+      let initialHistoryRequestId: string | null = null;
       let offerSent = false;
-      dc.binaryType = "arraybuffer";
-      rtcRef.current = { pc, dc, sessionId, open: false, bytesReceived: 0 };
+      ptyDc.binaryType = "arraybuffer";
+      if (ctlDc) ctlDc.binaryType = "arraybuffer";
+      rtcRef.current = {
+        pc,
+        ptyDc,
+        ctlDc,
+        sessionId,
+        ptyOpen: false,
+        ctlOpen: !useControlChannel,
+        open: false,
+        bytesReceived: 0,
+      };
+
+      const flushPendingInput = () => {
+        const queued = pendingInputRef.current.splice(0);
+        pendingInputBytesRef.current = 0;
+        for (const chunk of queued) {
+          try {
+            ptyDc.send(
+              chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength,
+              ) as ArrayBuffer,
+            );
+          } catch {
+            break;
+          }
+        }
+      };
+
+      const markReady = () => {
+        const current = rtcRef.current;
+        if (
+          current.sessionId !== sessionId ||
+          current.open ||
+          !current.ptyOpen ||
+          !current.ctlOpen ||
+          !bootstrapDone
+        ) {
+          return;
+        }
+        rtcRef.current = { ...current, open: true };
+        clearRtcConnectTimer();
+        rtcRetryAttempts = 0;
+        lastRtcDataAt = Date.now();
+        setDcOpen(true);
+        flushPendingInput();
+      };
+
+      const deliverAnchoredPtyChunk = (bytes: Uint8Array, offsetAfter: number) => {
+        const sliced = slicePtyChunkAfterAnchor(bytes, offsetAfter, bootstrapPtyAnchor);
+        bootstrapPtyAnchor = sliced.anchor;
+        if (sliced.bytes) handlersRef.current.onData(sliced.bytes, offsetAfter);
+      };
+
+      const flushPendingSnapshots = () => {
+        const received = rtcRef.current.bytesReceived;
+        while (pendingSnapshots.length > 0 && pendingSnapshots[0].ptyOffset <= received) {
+          const snapshot = pendingSnapshots.shift();
+          if (!snapshot) break;
+          handlersRef.current.onSnapshot?.(snapshot.bytes, snapshot.plain, snapshot.ptyOffset);
+        }
+      };
+
+      const finishBootstrap = (bytes: Uint8Array, ptyOffset: number | null | undefined) => {
+        if (bootstrapDone || rtcRef.current.sessionId !== sessionId) return;
+        const anchor = typeof ptyOffset === "number" && ptyOffset >= 0 ? ptyOffset : 0;
+        if (handlersRef.current.onHistory) handlersRef.current.onHistory(bytes);
+        else handlersRef.current.onData(bytes);
+        bootstrapPtyAnchor = anchor;
+        for (const chunk of pendingBootstrapPty.splice(0)) {
+          deliverAnchoredPtyChunk(chunk.bytes, chunk.offsetAfter);
+        }
+        pendingBootstrapPtyBytes = 0;
+        bootstrapDone = true;
+        flushPendingSnapshots();
+        markReady();
+      };
+
+      const maybeFinishReplay = (requestId: string) => {
+        const response = replayResponses.get(requestId);
+        if (!response) return;
+        const expectedChunks = response.metadata.chunks ?? -1;
+        const expectedBytes = response.metadata.total_bytes ?? -1;
+        if (response.chunks.size !== expectedChunks) return;
+        if (expectedChunks > 0 && !response.sawLast) return;
+        const bytes = combineAgentCtlChunks(response.chunks, expectedChunks, expectedBytes);
+        replayResponses.delete(requestId);
+        if (!bytes) {
+          if (requestId === initialHistoryRequestId) finishBootstrap(new Uint8Array(), 0);
+          return;
+        }
+        if (requestId === initialHistoryRequestId || response.metadata.operation === "history") {
+          finishBootstrap(bytes, response.metadata.pty_offset);
+        } else if (response.metadata.operation === "snapshot") {
+          const ptyOffset =
+            typeof response.metadata.pty_offset === "number" ? response.metadata.pty_offset : null;
+          if (ptyOffset !== null && ptyOffset > rtcRef.current.bytesReceived) {
+            if (pendingSnapshots.length < 8) {
+              pendingSnapshots.push({
+                bytes,
+                plain: Boolean(response.metadata.plain),
+                ptyOffset,
+              });
+            }
+          } else {
+            handlersRef.current.onSnapshot?.(bytes, Boolean(response.metadata.plain), ptyOffset);
+          }
+        }
+      };
+
+      const sendControl = (
+        operation: AgentCtlOperation,
+        parameters: Record<string, unknown> = {},
+      ): boolean => {
+        if (!ctlDc) return false;
+        const requestId = newRtcSessionId();
+        const text = makeAgentCtlRequest(requestId, operation, parameters);
+        if (!text) return false;
+        if (ctlDc.readyState === "open") {
+          ctlDc.send(text);
+        } else {
+          if (pendingControlTexts.length >= 128) return false;
+          pendingControlTexts.push(text);
+        }
+        return true;
+      };
+      sendControlRef.current = useControlChannel ? sendControl : () => false;
+
       rtcConnectTimer = setTimeout(() => {
         if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
           cleanupRtc(true, true);
@@ -253,20 +427,13 @@ export function useAgentSocket({
       }, RTC_CONNECT_TIMEOUT_MS);
 
       const sendRtcCandidate = (candidate: RTCIceCandidateInit) =>
-        sendJsonOverWs({
-          type: "rtc.candidate",
-          session_id: sessionId,
-          candidate,
-        });
+        sendJsonOverWs({ type: "rtc.candidate", session_id: sessionId, candidate });
 
       pc.onicecandidate = (event) => {
         if (!event.candidate || cancelled) return;
         const candidate = event.candidate.toJSON();
-        if (offerSent) {
-          sendRtcCandidate(candidate);
-        } else {
-          pendingLocalCandidates.push(candidate);
-        }
+        if (offerSent) sendRtcCandidate(candidate);
+        else pendingLocalCandidates.push(candidate);
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === "connected") {
@@ -287,67 +454,130 @@ export function useAgentSocket({
           cleanupRtc(pc.connectionState !== "closed", rtcRef.current.sessionId === sessionId);
         }
       };
-      dc.onopen = () => {
+
+      ptyDc.onopen = () => {
         const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          rtcRef.current = { ...current, open: true };
-          clearRtcConnectTimer();
-          rtcRetryAttempts = 0;
-          // The daemon starts mirroring PTY bytes onto this channel from its
-          // side of the open handshake; treat relay copies that race the
-          // first DataChannel byte as duplicates from the start.
-          lastRtcDataAt = Date.now();
-          setDcOpen(true);
-          // Flush keystrokes typed before the channel came up (v2 has no
-          // relay to carry them). Order is preserved: this runs before any
-          // subsequent sendBinary can see the channel as open.
-          const queued = pendingInputRef.current.splice(0);
-          pendingInputBytesRef.current = 0;
-          for (const chunk of queued) {
-            try {
-              dc.send(
-                chunk.buffer.slice(
-                  chunk.byteOffset,
-                  chunk.byteOffset + chunk.byteLength,
-                ) as ArrayBuffer,
-              );
-            } catch {
-              break;
-            }
-          }
-        }
+        if (current.sessionId !== sessionId) return;
+        rtcRef.current = { ...current, ptyOpen: true };
+        markReady();
       };
-      dc.onclose = () => {
+      ptyDc.onclose = () => {
         const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          rtcRef.current = { ...current, open: false };
-          setDcOpen(false);
-        }
-      };
-      dc.onerror = () => {
+        if (current.sessionId !== sessionId) return;
         cleanupRtc(true, true);
       };
-      const deliverDcChunk = (bytes: Uint8Array) => {
-        const h = handlersRef.current;
+      ptyDc.onerror = () => cleanupRtc(true, true);
+      const deliverPtyChunk = (bytes: Uint8Array) => {
         const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          current.bytesReceived += bytes.length;
-          h.onData(bytes, current.bytesReceived);
-        } else {
-          h.onData(bytes);
+        if (current.sessionId !== sessionId) return;
+        current.bytesReceived += bytes.byteLength;
+        if (!bootstrapDone) {
+          if (pendingBootstrapPtyBytes + bytes.byteLength > AGENT_CTL_MAX_PENDING_PTY_BYTES) {
+            cleanupRtc(true, true);
+            return;
+          }
+          pendingBootstrapPty.push({ bytes, offsetAfter: current.bytesReceived });
+          pendingBootstrapPtyBytes += bytes.byteLength;
+          return;
         }
+        deliverAnchoredPtyChunk(bytes, current.bytesReceived);
+        flushPendingSnapshots();
       };
-      dc.onmessage = (event) => {
+      ptyDc.onmessage = (event) => {
         lastRtcDataAt = Date.now();
         clearRelayFallback();
         if (event.data instanceof ArrayBuffer) {
-          deliverDcChunk(new Uint8Array(event.data));
+          deliverPtyChunk(new Uint8Array(event.data));
         } else if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((buf) => {
-            if (!cancelled) deliverDcChunk(new Uint8Array(buf));
+          void event.data.arrayBuffer().then((buffer) => {
+            if (!cancelled) deliverPtyChunk(new Uint8Array(buffer));
           });
         }
       };
+
+      if (ctlDc) {
+        ctlDc.onopen = () => {
+          const current = rtcRef.current;
+          if (current.sessionId !== sessionId) return;
+          rtcRef.current = { ...current, ctlOpen: true };
+          initialHistoryRequestId = newRtcSessionId();
+          const size = initialSizeRef.current;
+          const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
+            lines: 400,
+            plain: false,
+            ...(size ? { cols: size.cols, rows: size.rows } : {}),
+          });
+          if (!historyText) {
+            finishBootstrap(new Uint8Array(), 0);
+          } else {
+            ctlDc.send(historyText);
+          }
+          for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
+          markReady();
+        };
+        ctlDc.onclose = () => {
+          const current = rtcRef.current;
+          if (current.sessionId !== sessionId) return;
+          cleanupRtc(true, true);
+        };
+        ctlDc.onerror = () => cleanupRtc(true, true);
+        const deliverControlBinary = (bytes: Uint8Array) => {
+          const chunk = decodeAgentCtlChunk(bytes);
+          if (!chunk) return;
+          const response = replayResponses.get(chunk.requestId);
+          if (!response || response.chunks.has(chunk.sequence)) return;
+          response.chunks.set(chunk.sequence, chunk.payload);
+          if (chunk.last) response.sawLast = true;
+          maybeFinishReplay(chunk.requestId);
+        };
+        ctlDc.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            const message = parseAgentCtlText(event.data);
+            if (!message) return;
+            if (message.kind === "event") {
+              handlersRef.current.onDisplayControl?.({
+                owner: message.owner,
+                cols: message.cols,
+                rows: message.rows,
+                viewers: message.viewers,
+              });
+              return;
+            }
+            if (!message.ok) {
+              if (message.request_id === initialHistoryRequestId) {
+                finishBootstrap(new Uint8Array(), 0);
+              }
+              return;
+            }
+            if (
+              message.request_id &&
+              (message.operation === "history" || message.operation === "snapshot") &&
+              typeof message.total_bytes === "number" &&
+              message.total_bytes >= 0 &&
+              message.total_bytes <= AGENT_CTL_MAX_REPLAY_BYTES &&
+              typeof message.chunks === "number" &&
+              Number.isInteger(message.chunks) &&
+              message.chunks >= 0 &&
+              message.chunks <= AGENT_CTL_MAX_REPLAY_CHUNKS
+            ) {
+              replayResponses.set(message.request_id, {
+                metadata: message,
+                chunks: new Map(),
+                sawLast: message.chunks === 0,
+              });
+              maybeFinishReplay(message.request_id);
+            }
+            return;
+          }
+          if (event.data instanceof ArrayBuffer) {
+            deliverControlBinary(new Uint8Array(event.data));
+          } else if (event.data instanceof Blob) {
+            void event.data.arrayBuffer().then((buffer) => {
+              if (!cancelled) deliverControlBinary(new Uint8Array(buffer));
+            });
+          }
+        };
+      }
 
       try {
         const offer = await pc.createOffer();
@@ -358,9 +588,7 @@ export function useAgentSocket({
           return;
         }
         offerSent = true;
-        for (const candidate of pendingLocalCandidates.splice(0)) {
-          sendRtcCandidate(candidate);
-        }
+        for (const candidate of pendingLocalCandidates.splice(0)) sendRtcCandidate(candidate);
       } catch {
         cleanupRtc();
       } finally {
@@ -373,7 +601,15 @@ export function useAgentSocket({
       setState("connecting");
       let ws: WebSocket;
       try {
-        ws = new WebSocket(buildAgentWsUrl(agentId, initialSizeRef.current), spawnWsSubprotocols());
+        const forceV1 =
+          typeof window !== "undefined" &&
+          (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 === true;
+        // Geometry is protected viewport content. Only an explicitly forced
+        // legacy-v1 test/client sends it in the server-visible URL.
+        ws = new WebSocket(
+          buildAgentWsUrl(agentId, forceV1 ? initialSizeRef.current : null),
+          spawnWsSubprotocols(),
+        );
       } catch {
         setState("error");
         scheduleReconnect();
@@ -396,10 +632,12 @@ export function useAgentSocket({
           const msg = parseInbound(ev.data);
           if (!msg) return;
           if (msg.type === "history") {
+            if (wsV2Ref.current) return;
             const bytes = base64ToBytes(msg.bytes_b64);
             if (h.onHistory) h.onHistory(bytes);
             else h.onData(bytes);
           } else if (msg.type === "display.control") {
+            if (wsV2Ref.current) return;
             h.onDisplayControl?.({
               owner: msg.owner,
               cols: msg.cols,
@@ -407,6 +645,7 @@ export function useAgentSocket({
               viewers: msg.viewers,
             });
           } else if (msg.type === "snapshot") {
+            if (wsV2Ref.current) return;
             const current = rtcRef.current;
             const dcOffset =
               current.open &&
@@ -581,8 +820,10 @@ export function useAgentSocket({
   const sendBinary = (bytes: Uint8Array | string) => {
     const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     const rtc = rtcRef.current;
-    if (rtc.open && rtc.dc?.readyState === "open") {
-      rtc.dc.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+    if (rtc.open && rtc.ptyDc?.readyState === "open") {
+      rtc.ptyDc.send(
+        buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer,
+      );
       return true;
     }
     if (wsV2Ref.current) {
@@ -602,18 +843,21 @@ export function useAgentSocket({
   const sendJson = (msg: unknown) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    // Stamp snapshot requests with the live RTC session so the daemon can
-    // return the DataChannel stream offset at capture time.
-    const rtc = rtcRef.current;
-    const payload =
-      typeof msg === "object" &&
-      msg !== null &&
-      (msg as { type?: string }).type === "snapshot" &&
-      rtc.open &&
-      rtc.sessionId
-        ? { ...(msg as Record<string, unknown>), rtc_session_id: rtc.sessionId }
-        : msg;
-    ws.send(JSON.stringify(payload));
+    if (wsV2Ref.current && typeof msg === "object" && msg !== null) {
+      const payload = msg as Record<string, unknown>;
+      const type = payload.type;
+      const operation =
+        type === "take_control"
+          ? "take_control"
+          : type === "resize" || type === "scroll" || type === "redraw" || type === "snapshot"
+            ? type
+            : null;
+      if (operation) {
+        const { type: _type, rtc_session_id: _rtcSessionId, ...parameters } = payload;
+        return sendControlRef.current(operation, parameters);
+      }
+    }
+    ws.send(JSON.stringify(msg));
     return true;
   };
 

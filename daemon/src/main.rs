@@ -12,6 +12,7 @@
 // still owns, and the server resyncs its routing map without disturbing them.
 
 mod activity;
+mod agent_ctl;
 mod agents;
 mod cli;
 mod config;

@@ -104,8 +104,9 @@ browser requests the connect-time backfill + scrollback from the daemon over
 instead of the server `history`/`snapshot` frames. This removes those two v2
 content paths only. It does **not** complete the server cut: the daemon still
 mirrors every output chunk on `0x01` until Increment 3. The
-`dc_offset`/`rtc_session_id` cross-transport ordering machinery collapses once
-both live + backfill use the peer connection.
+The server-bound `rtc_session_id` correlation collapses once both live and
+backfill use the peer connection. An endpoint-only PTY byte anchor remains
+necessary: separate ordered DataChannels do not share a total order.
 
 This increment reuses the backend's actual bounded history; it does not add a
 durable daemon transcript archive. tmux captures at most 10,000 requested lines
@@ -120,6 +121,14 @@ a server backup and is outside the reconnect guarantee.
 The same channel carries resize/scroll/redraw, multi-viewer display ownership,
 and their acknowledgements. The daemon, not the server, arbitrates viewport
 state so geometry, deltas, and event timing remain E2E.
+
+**Implementation checkpoint (independent review pending):** `spawn.ctl` v1 is
+implemented as bounded request-bound JSON plus chunked binary replay frames.
+The browser uses explicit per-viewer PTY byte anchors and a bounded bootstrap
+queue because ordering on one DataChannel does not imply ordering against the
+other. Legacy v1 server history/snapshot/viewport paths remain temporarily for
+compatibility, and daemon `0x01` mirroring still remains for Increment 3; this
+checkpoint therefore does not make the Phase 2 claim.
 
 ### 3 — drop the `0x01` output leg + delete server content stores
 Safe once (1) and (2) land and the DataChannel is mandatory (v1 retired):

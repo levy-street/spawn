@@ -494,8 +494,10 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 ## 15. Known gaps / future work
 
 - **Backpressure** (§9): bounded per-viewer sinks + replay-based catch-up.
-- **History over DataChannel** (Phase 2): move `agent.snapshot`'s base64-WS
-  leg onto a DataChannel stream; the replay watermark already supports it.
+- **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
+  connect history and snapshots from both backends using request-bound chunks
+  and explicit PTY byte anchors; independent review and the later removal of
+  the legacy base64-WS leg remain before the cut is complete.
 - **spawnd-side plaintext hygiene**: extend zeroize discipline into the
   outbox/forwarder if profiling shows the buffers are long-lived.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed

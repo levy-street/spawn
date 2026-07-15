@@ -280,10 +280,10 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
 }) => {
   const { messages } = await openTerminalWithMockSocket(page, { v2: true, rtc: true });
 
-  // Control frames still ride the WS on v2.
-  await expect
-    .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
-    .toBe(true);
+  // Viewport state belongs to spawn.ctl on v2 and must not be observable by
+  // the application server. This mock deliberately never opens DataChannels.
+  await page.waitForTimeout(300);
+  expect(jsonMessages(messages).some((message) => message?.type === "resize")).toBe(false);
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "rtc.offer"))
     .toBe(true);

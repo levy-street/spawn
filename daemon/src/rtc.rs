@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -26,12 +26,17 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
+use crate::agent_ctl::{
+    self, AgentControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
+    ProtocolError,
+};
 use crate::agents::AgentRegistry;
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::WsOutbound;
 use crate::tmux;
 
-const DATA_CHANNEL_LABEL: &str = "spawn.pty";
+const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
+const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
 
 /// Peer connections that never reach `Connected` within this window are
 /// reaped. Closing is the daemon's own defense: `rtc.close` delivery from the
@@ -47,6 +52,7 @@ const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 #[derive(Default, Clone)]
 pub struct RtcSessions {
     peers: Arc<Mutex<HashMap<String, Arc<RTCPeerConnection>>>>,
+    controls: AgentControlHub,
 }
 
 impl RtcSessions {
@@ -151,7 +157,14 @@ impl RtcSessions {
             .insert(session_id.clone(), Arc::clone(&pc));
 
         install_ice_handler(&pc, session_id.clone(), agent_id, out_tx.clone());
-        install_data_channel_handler(&pc, session_id.clone(), agent_id, registry, out_tx.clone());
+        install_data_channel_handler(
+            &pc,
+            session_id.clone(),
+            agent_id,
+            registry,
+            self.controls.clone(),
+            out_tx.clone(),
+        );
         self.install_reaper(&pc, session_id.clone(), agent_id);
 
         let local_sdp = match negotiate(&pc, sdp).await {
@@ -233,14 +246,20 @@ impl RtcSessions {
     /// Close `pc`, removing its map entry only if the entry still refers to
     /// this same instance (a newer offer may have replaced it).
     async fn close_if_same(&self, session_id: &str, pc: &Arc<RTCPeerConnection>) {
-        {
+        let removed = {
             let mut peers = self.peers.lock().await;
             if peers
                 .get(session_id)
                 .is_some_and(|current| Arc::ptr_eq(current, pc))
             {
                 peers.remove(session_id);
+                true
+            } else {
+                false
             }
+        };
+        if removed {
+            self.controls.unregister_session(session_id).await;
         }
         let _ = pc.close().await;
     }
@@ -264,6 +283,7 @@ impl RtcSessions {
 
     pub async fn close(&self, session_id: &str) {
         let pc = self.peers.lock().await.remove(session_id);
+        self.controls.unregister_session(session_id).await;
         if let Some(pc) = pc {
             let _ = pc.close().await;
         }
@@ -271,7 +291,8 @@ impl RtcSessions {
 
     pub async fn close_all(&self) {
         let peers = std::mem::take(&mut *self.peers.lock().await);
-        for (_, pc) in peers {
+        for (session_id, pc) in peers {
+            self.controls.unregister_session(&session_id).await;
             let _ = pc.close().await;
         }
     }
@@ -338,14 +359,20 @@ fn install_data_channel_handler(
     session_id: String,
     agent_id: Uuid,
     registry: AgentRegistry,
+    controls: AgentControlHub,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let session_id = session_id.clone();
         let registry = registry.clone();
+        let controls = controls.clone();
         let out_tx = out_tx.clone();
         Box::pin(async move {
-            if dc.label() != DATA_CHANNEL_LABEL {
+            if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
+                install_control_data_channel(dc, session_id, agent_id, registry, controls);
+                return;
+            }
+            if dc.label() != PTY_DATA_CHANNEL_LABEL {
                 tracing::debug!(%agent_id, label = %dc.label(), "ignoring unknown rtc data channel");
                 return;
             }
@@ -443,6 +470,418 @@ fn install_data_channel_handler(
             }));
         })
     }));
+}
+
+fn install_control_data_channel(
+    dc: Arc<RTCDataChannel>,
+    session_id: String,
+    agent_id: Uuid,
+    registry: AgentRegistry,
+    controls: AgentControlHub,
+) {
+    let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
+    let (close_tx, mut close_rx) = oneshot::channel();
+    let close_tx = Arc::new(Mutex::new(Some(close_tx)));
+    let send_dc = Arc::clone(&dc);
+    let send_controls = controls.clone();
+    let send_session_id = session_id.clone();
+    tokio::spawn(async move {
+        loop {
+            let message = tokio::select! {
+                message = receiver.recv() => message,
+                _ = &mut close_rx => None,
+            };
+            let Some(message) = message else {
+                break;
+            };
+            let result = match message {
+                ControlOutbound::Text(text) => send_dc.send_text(text).await,
+                ControlOutbound::Binary(bytes) => send_dc.send(&Bytes::from(bytes)).await,
+            };
+            if let Err(error) = result {
+                tracing::debug!(%agent_id, %send_session_id, %error, "spawn.ctl send failed");
+                break;
+            }
+        }
+        send_controls.unregister(agent_id, &send_session_id).await;
+    });
+
+    // webrtc-rs may invoke multiple message callbacks concurrently. Serialize
+    // each viewer's requests so state-changing operations and their replies
+    // retain the ordered DataChannel's request order.
+    let request_lock = Arc::new(Mutex::new(()));
+    let message_registry = registry;
+    let message_controls = controls.clone();
+    let message_sender = sender.clone();
+    let message_session_id = session_id.clone();
+    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+        let registry = message_registry.clone();
+        let controls = message_controls.clone();
+        let sender = message_sender.clone();
+        let session_id = message_session_id.clone();
+        let request_lock = request_lock.clone();
+        Box::pin(async move {
+            let _guard = request_lock.lock().await;
+            if !msg.is_string {
+                agent_ctl::send_error(
+                    &sender,
+                    &ProtocolError::new(
+                        None,
+                        "unexpected_binary",
+                        "spawn.ctl requests must be JSON text frames",
+                    ),
+                )
+                .await;
+                return;
+            }
+            let text = match std::str::from_utf8(&msg.data) {
+                Ok(text) => text,
+                Err(_) => {
+                    agent_ctl::send_error(
+                        &sender,
+                        &ProtocolError::new(None, "malformed_request", "request is not UTF-8"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match ControlRequest::decode(text) {
+                Ok(request) => {
+                    if !controls.contains_viewer(agent_id, &session_id).await {
+                        controls
+                            .register(agent_id, session_id.clone(), sender.clone())
+                            .await;
+                    }
+                    handle_control_request(
+                        agent_id,
+                        &session_id,
+                        request,
+                        &registry,
+                        &controls,
+                        &sender,
+                    )
+                    .await;
+                }
+                Err(error) => agent_ctl::send_error(&sender, &error).await,
+            }
+        })
+    }));
+
+    let open_controls = controls.clone();
+    let open_session_id = session_id.clone();
+    let open_sender = sender;
+    dc.on_open(Box::new(move || {
+        let controls = open_controls.clone();
+        let session_id = open_session_id.clone();
+        let sender = open_sender.clone();
+        Box::pin(async move {
+            controls.register(agent_id, session_id, sender).await;
+        })
+    }));
+
+    dc.on_close(Box::new(move || {
+        let controls = controls.clone();
+        let session_id = session_id.clone();
+        let close_tx = close_tx.clone();
+        Box::pin(async move {
+            if let Some(close_tx) = close_tx.lock().await.take() {
+                let _ = close_tx.send(());
+            }
+            controls.unregister(agent_id, &session_id).await;
+        })
+    }));
+}
+
+async fn handle_control_request(
+    agent_id: Uuid,
+    session_id: &str,
+    request: ControlRequest,
+    registry: &AgentRegistry,
+    controls: &AgentControlHub,
+    sender: &ControlSender,
+) {
+    let request_id = request.request_id;
+    if let Err(mut error) =
+        execute_control_request(agent_id, session_id, request, registry, controls, sender).await
+    {
+        if error.request_id.is_none() {
+            error.request_id = Some(request_id);
+        }
+        agent_ctl::send_error(sender, &error).await;
+    }
+}
+
+async fn execute_control_request(
+    agent_id: Uuid,
+    session_id: &str,
+    request: ControlRequest,
+    registry: &AgentRegistry,
+    controls: &AgentControlHub,
+    sender: &ControlSender,
+) -> Result<(), ProtocolError> {
+    let request_id = request.request_id;
+    let operation_name = request.operation_name();
+    match request.operation {
+        ControlOperation::History {
+            lines,
+            plain,
+            cols,
+            rows,
+        } => {
+            if let Some((cols, rows)) = cols.zip(rows) {
+                if controls.is_owner(agent_id, session_id).await {
+                    resize_agent(agent_id, cols, rows, registry).await?;
+                    let _ = controls.update_size(agent_id, session_id, cols, rows).await;
+                    // tmux reflows asynchronously after refresh-client.
+                    if registry.is_worker(agent_id) != Some(true) {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                }
+            }
+            send_agent_replay(
+                agent_id,
+                ReplaySpec {
+                    session_id,
+                    request_id,
+                    operation: operation_name,
+                    lines,
+                    plain,
+                },
+                registry,
+                sender,
+            )
+            .await
+        }
+        ControlOperation::Snapshot { lines, plain } => {
+            send_agent_replay(
+                agent_id,
+                ReplaySpec {
+                    session_id,
+                    request_id,
+                    operation: operation_name,
+                    lines,
+                    plain,
+                },
+                registry,
+                sender,
+            )
+            .await
+        }
+        ControlOperation::Resize { cols, rows } => {
+            if !controls.is_owner(agent_id, session_id).await {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "not_display_owner",
+                    "only the controlling viewer may resize the shared PTY",
+                ));
+            }
+            resize_agent(agent_id, cols, rows, registry).await?;
+            let _ = controls.update_size(agent_id, session_id, cols, rows).await;
+            agent_ctl::send_ack(sender, request_id, operation_name).await;
+            Ok(())
+        }
+        ControlOperation::TakeControl { cols, rows } => {
+            if !controls.contains_viewer(agent_id, session_id).await {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "unknown_viewer",
+                    "viewer is not registered on this control channel",
+                ));
+            }
+            resize_agent(agent_id, cols, rows, registry).await?;
+            let _ = controls
+                .take_control(agent_id, session_id, cols, rows)
+                .await;
+            redraw_agent(agent_id, registry).await;
+            agent_ctl::send_ack(sender, request_id, operation_name).await;
+            Ok(())
+        }
+        ControlOperation::Scroll { lines } => {
+            scroll_agent(agent_id, lines, registry).await?;
+            agent_ctl::send_ack(sender, request_id, operation_name).await;
+            Ok(())
+        }
+        ControlOperation::Redraw => {
+            redraw_agent(agent_id, registry).await;
+            agent_ctl::send_ack(sender, request_id, operation_name).await;
+            Ok(())
+        }
+    }
+}
+
+struct ReplaySpec<'a> {
+    session_id: &'a str,
+    request_id: Uuid,
+    operation: &'a str,
+    lines: u16,
+    plain: bool,
+}
+
+async fn send_agent_replay(
+    agent_id: Uuid,
+    spec: ReplaySpec<'_>,
+    registry: &AgentRegistry,
+    sender: &ControlSender,
+) -> Result<(), ProtocolError> {
+    // The offset is sampled before capture. It is not an ordering assumption:
+    // the browser buffers spawn.pty until this response and replays only bytes
+    // beyond this explicit boundary.
+    let pty_offset = match registry.control_for(agent_id) {
+        Some(control) => control.direct_sink_offset(spec.session_id).await,
+        None => None,
+    };
+    let capture = capture_agent_replay(agent_id, spec.lines, spec.plain, registry);
+    tokio::pin!(capture);
+    let bytes = tokio::select! {
+        result = &mut capture => result?,
+        _ = sender.closed() => {
+            return Err(ProtocolError::new(
+                Some(spec.request_id),
+                "request_cancelled",
+                "control channel closed while replay was in progress",
+            ));
+        }
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+            return Err(ProtocolError::new(
+                Some(spec.request_id),
+                "request_timeout",
+                "replay did not complete within 10 seconds",
+            ));
+        }
+    };
+    agent_ctl::send_replay(
+        sender,
+        spec.request_id,
+        spec.operation,
+        spec.plain,
+        pty_offset,
+        bytes,
+    )
+    .await
+}
+
+async fn capture_agent_replay(
+    agent_id: Uuid,
+    lines: u16,
+    plain: bool,
+    registry: &AgentRegistry,
+) -> Result<Vec<u8>, ProtocolError> {
+    if registry.is_worker(agent_id) == Some(true) {
+        let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
+            8 * 1024 * 1024
+        } else {
+            (lines as u32)
+                .saturating_mul(256)
+                .clamp(64 * 1024, 8 * 1024 * 1024)
+        };
+        let mut replay_rx = None;
+        registry.with_handle(agent_id, |handle| {
+            replay_rx = handle.worker_replay(max_bytes);
+        });
+        return match replay_rx {
+            Some(receiver) => match receiver.await {
+                Ok(Ok((_watermark, bytes))) => Ok(bytes),
+                Ok(Err(error)) => Err(ProtocolError::new(
+                    None,
+                    "replay_failed",
+                    &format!("worker replay failed: {error:#}"),
+                )),
+                Err(_) => Err(ProtocolError::new(
+                    None,
+                    "replay_unavailable",
+                    "worker replay channel closed",
+                )),
+            },
+            None => Err(ProtocolError::new(
+                None,
+                "replay_unavailable",
+                "worker replay is unavailable",
+            )),
+        };
+    }
+
+    let Some(session) = registry.session_for(agent_id) else {
+        return Err(ProtocolError::new(
+            None,
+            "agent_unavailable",
+            "agent is not attached to this daemon",
+        ));
+    };
+    tmux::capture_history(&session, lines, !plain)
+        .await
+        .map_err(|error| {
+            ProtocolError::new(
+                None,
+                "replay_failed",
+                &format!("tmux replay failed: {error:#}"),
+            )
+        })
+}
+
+async fn resize_agent(
+    agent_id: Uuid,
+    cols: u16,
+    rows: u16,
+    registry: &AgentRegistry,
+) -> Result<(), ProtocolError> {
+    let mut result = None;
+    let found = registry.with_handle(agent_id, |handle| {
+        result = Some(handle.resize(cols, rows));
+    });
+    if !found {
+        return Err(ProtocolError::new(
+            None,
+            "agent_unavailable",
+            "agent is not running on this daemon",
+        ));
+    }
+    let changed = result
+        .expect("found handle sets result")
+        .map_err(|error| ProtocolError::new(None, "resize_failed", &format!("{error:#}")))?;
+    if changed && registry.is_worker(agent_id) != Some(true) {
+        if let Some(session) = registry.session_for(agent_id) {
+            tmux::refresh_client(&session, cols, rows).await;
+        }
+    }
+    Ok(())
+}
+
+async fn scroll_agent(
+    agent_id: Uuid,
+    lines: i16,
+    registry: &AgentRegistry,
+) -> Result<(), ProtocolError> {
+    if registry.is_worker(agent_id) == Some(true) {
+        return Ok(());
+    }
+    let Some(session) = registry.session_for(agent_id) else {
+        return Err(ProtocolError::new(
+            None,
+            "agent_unavailable",
+            "agent is not running on this daemon",
+        ));
+    };
+    if let Some(control) = registry.control_for(agent_id) {
+        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+    }
+    tmux::scroll_history(&session, lines)
+        .await
+        .map_err(|error| {
+            ProtocolError::new(None, "scroll_failed", &format!("scroll failed: {error:#}"))
+        })
+}
+
+async fn redraw_agent(agent_id: Uuid, registry: &AgentRegistry) {
+    if registry.is_worker(agent_id) == Some(true) {
+        return;
+    }
+    let Some(session) = registry.session_for(agent_id) else {
+        return;
+    };
+    if let Some(control) = registry.control_for(agent_id) {
+        control.suppress_activity(crate::activity::REDRAW_SUPPRESS_WINDOW);
+    }
+    tmux::force_repaint(&session).await;
 }
 
 /// Testable core of the `spawn.pty` input callback. Activity is recorded only

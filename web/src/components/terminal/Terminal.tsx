@@ -550,7 +550,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot]);
 
   const updateScrollbackReveal = useCallback(
-    (overlay: HTMLElement) => {
+    (_overlay: HTMLElement) => {
       // While a reset+rewrite is in flight the buffer is transiently
       // collapsed; deciding visibility against it would blink the overlay
       // out under the reader. The render's own completion callback re-runs
@@ -825,9 +825,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (redrawTimerRef.current) clearTimeout(redrawTimerRef.current);
     redrawTimerRef.current = setTimeout(() => {
       redrawTimerRef.current = null;
-      agentsApi.redraw(agentId).catch(() => {});
+      socketRef.current.sendJson({ type: "redraw" });
     }, 600);
-  }, [agentId]);
+  }, []);
   const scheduleRedrawRef = useRef(scheduleRedraw);
   scheduleRedrawRef.current = scheduleRedraw;
   useEffect(() => {
@@ -1177,10 +1177,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const dcWasOpenRef = useRef(false);
   useEffect(() => {
     if (socket.v2 && socket.dcOpen && !dcWasOpenRef.current) {
-      agentsApi.redraw(agentId).catch(() => {});
+      socket.sendJson({ type: "redraw" });
     }
     dcWasOpenRef.current = socket.dcOpen;
-  }, [socket.v2, socket.dcOpen, agentId]);
+  }, [socket.v2, socket.dcOpen, socket.sendJson]);
 
   // Only surface "waiting for the direct channel" after a grace period —
   // the DC normally opens within a second or two of attach.
@@ -2697,6 +2697,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteFromClipboard,
       pasteText,
       socket,
+      agentId,
     ],
   );
 
@@ -2941,7 +2942,8 @@ type ReplayChunk = { cols: number; rows: number; data: string };
  */
 function parseExactReplay(text: string): ReplayChunk[] | null {
   if (!text.startsWith("\x1b[8;")) return null;
-  const marker = /\x1b\[8;(\d{1,5});(\d{1,5})t/g;
+  // biome-ignore lint/complexity/useRegexLiterals: a constructor avoids embedding ESC in a regex literal
+  const marker = new RegExp("\\x1b\\[8;(\\d{1,5});(\\d{1,5})t", "g");
   const first = marker.exec(text);
   if (!first || first.index !== 0) return null;
   const chunks: ReplayChunk[] = [];
