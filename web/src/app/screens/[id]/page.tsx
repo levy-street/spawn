@@ -40,9 +40,9 @@ import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
-import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
-import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import type { TerminalHandle } from "@/components/terminal/Terminal";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -77,7 +77,6 @@ import {
 import { defaultScreenName } from "@/lib/screens";
 import { cn } from "@/lib/utils";
 
-const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 const MAX_PANES_PER_SCREEN = 8;
 const WIDE_CONTAINER_PX = 672;
 
@@ -1100,11 +1099,14 @@ function ScreenPane({
     root,
   } = props;
   const agent = agentsById.get(agentId);
-  const termRef = useRef<TerminalHandle>(null);
+  // Terminal comes from the shared warm pool — same instance as the agent
+  // page, so switching between them (or moving the pane) never reconnects.
+  const { attach, getHandle, connInfo, displayState } = useLiveTerminal(agentId);
+  const displayOwner = displayState?.owner ?? null;
   const hostRef = useRef<HTMLDivElement | null>(null);
   const { registerPane } = props;
   useEffect(() => {
-    registerPane(agentId, termRef.current);
+    registerPane(agentId, getHandle());
     return () => registerPane(agentId, null);
   });
   // Move the stable host into whatever slot the layout currently exposes.
@@ -1112,15 +1114,13 @@ function ScreenPane({
     const host = hostRef.current;
     if (host && slot?.el && host.parentElement !== slot.el) slot.el.appendChild(host);
   }, [slot]);
-  const [connInfo, setConnInfo] = useState<AgentConnectionInfo | null>(null);
-  const [displayOwner, setDisplayOwner] = useState<boolean | null>(null);
   const [zone, setZone] = useState<DropZone | null>(null);
   const depth = useRef(0);
   const zoomed = zoomedId === agentId;
   const attention = agent ? agentNeedsAttention(agent) : null;
   const restartM = useMutation({
     mutationFn: () => {
-      const size = termRef.current?.getSize();
+      const size = getHandle()?.getSize();
       return agents.restart(agentId, size ? { ...size, create_cwd: true } : undefined);
     },
     onError: (err) => onPaneError(String(err)),
@@ -1201,7 +1201,7 @@ function ScreenPane({
           connInfo={connInfo}
           displayOwner={displayOwner}
           dense
-          getHandle={() => termRef.current}
+          getHandle={getHandle}
           onError={onPaneError}
           onDeleted={() => onRootChange(removePane(root, agentId))}
           headerProps={{
@@ -1264,16 +1264,7 @@ function ScreenPane({
 
       {agent ? (
         <div className="relative min-h-0 flex-1 @container/term">
-          <Terminal
-            ref={termRef}
-            agentId={agentId}
-            rawInput
-            mobileReturnMode="newline"
-            mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
-            imagePasteMode="bracketed-path"
-            onConnectionInfo={setConnInfo}
-            onDisplayControl={(state) => setDisplayOwner(state.owner)}
-          />
+          <div ref={attach} className="size-full" />
           {attention === "dead" && (
             <div className="absolute inset-x-0 bottom-4 z-20 flex justify-center">
               <button
