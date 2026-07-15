@@ -21,7 +21,7 @@
 //! Because tmux owns the underlying agent process, the agent also survives
 //! `spawnd` restarts (see `reattach`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ use crate::frames;
 use crate::proto::Outbound;
 use crate::tmux;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum WsOutbound {
     /// A serialized JSON frame.
     Json(String),
@@ -56,18 +56,23 @@ pub(crate) enum ActivityKind {
     Input,
 }
 
-/// Best-effort activity emission shared by the PTY output forwarder and the
-/// WebRTC input path. These frames deliberately contain only an event type and
-/// agent id; its API cannot accept terminal bytes or other outbound payloads.
-pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
+/// The only activity serializer: its API cannot accept terminal bytes or any
+/// content-carrying outbound frame.
+fn activity_message(agent_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> {
     let event = match kind {
         ActivityKind::Output => Outbound::AgentActivity { agent_id },
         ActivityKind::Input => Outbound::AgentInputActivity { agent_id },
     };
-    let Ok(json) = serde_json::to_string(&event) else {
+    serde_json::to_string(&event).ok().map(WsOutbound::Json)
+}
+
+/// Best-effort emission used by the WebRTC input callback. Output activity is
+/// queued in order beside its mirrored binary frame by `run_forwarder`.
+pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
+    let Some(message) = activity_message(agent_id, kind) else {
         return false;
     };
-    out_tx.try_send(WsOutbound::Json(json)).is_ok()
+    out_tx.try_send(message).is_ok()
 }
 
 /// A direct terminal sink plus a cumulative count of PTY bytes queued to it.
@@ -102,6 +107,7 @@ struct ActivityState {
     last_output_at: Option<Instant>,
     last_input_at: Option<Instant>,
     suppress_output_until: Option<Instant>,
+    output_classifier: activity::OutputClassifier,
 }
 
 /// How stale the cached copy-mode flag may get before a background refresh
@@ -153,18 +159,25 @@ impl ForwarderControl {
         let Ok(mut state) = self.activity.lock() else {
             return false;
         };
-        // Cheap state checks first, so the classifier only runs when a ping
-        // could actually be emitted.
-        if state.last_output_at.is_some_and(|last| {
+        let throttle_open = !state.last_output_at.is_some_and(|last| {
             now.saturating_duration_since(last) < activity::OUTPUT_TOUCH_INTERVAL
-        }) {
+        });
+        let suppressed = state.suppress_output_until.is_some_and(|until| now < until);
+        if !suppressed {
+            state.suppress_output_until = None;
+        }
+
+        // Always consume the bytes so UTF-8 and terminal-control state stays
+        // aligned across arbitrary PTY chunk boundaries. Ineligible bytes
+        // advance parsing but cannot become delayed activity later.
+        let meaningful = state
+            .output_classifier
+            .observe(chunk, throttle_open && !suppressed);
+        if !throttle_open {
+            state.output_classifier.discard_meaningful_carry();
             return false;
         }
-        if state.suppress_output_until.is_some_and(|until| now < until) {
-            return false;
-        }
-        state.suppress_output_until = None;
-        if !activity::output_is_meaningful(chunk) {
+        if !meaningful {
             return false;
         }
         state.last_output_at = Some(now);
@@ -225,7 +238,7 @@ impl ForwarderControl {
     /// task so any backlog drains immediately.
     pub async fn set_sink(&self, sink: SessionSink) {
         *self.slot.lock().await = Some(sink);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     /// Clear the sink (called when the WS session ends). The forwarder will
@@ -437,9 +450,7 @@ impl AgentHandle {
     /// Worker backend: signal the agent process. Returns false for tmux.
     pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
         match &self.backend {
-            HandleBackend::Worker { cmd_tx } => {
-                cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok()
-            }
+            HandleBackend::Worker { cmd_tx } => cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok(),
             HandleBackend::Tmux { .. } => false,
         }
     }
@@ -705,46 +716,110 @@ pub(crate) async fn run_forwarder(
     mut outbox_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     control: ForwarderControl,
 ) {
-    while let Some(chunk) = outbox_rx.recv().await {
-        control.send_direct(&chunk).await;
-        let frame = frames::encode_pty_output(agent_id, &chunk);
-        // Loop until the chunk is sent (or wait for a sink to be installed).
-        loop {
-            // Snapshot the current sink under lock, drop the lock, then send.
-            let current = control.slot.lock().await.clone();
-            match current {
-                Some(s) => match s.send(WsOutbound::Binary(frame.clone())).await {
-                    Ok(_) => break,
-                    Err(_) => {
-                        // Sink closed mid-send (WS likely just dropped). Clear
-                        // it if it's still the closed one we just tried — but
-                        // not if a new session has already swapped a fresh
-                        // sink in.
-                        let mut g = control.slot.lock().await;
-                        if g.as_ref().map(|x| x.is_closed()).unwrap_or(false) {
-                            *g = None;
-                        }
-                        // Loop and retry; if slot is now None, the next
-                        // iteration will park on the notifier.
-                    }
-                },
-                None => {
-                    control.notify.notified().await;
+    let mut pending_mirror = VecDeque::new();
+    let mut outbox_open = true;
+
+    loop {
+        // Keep classification at the source side of the queue. Drain a bounded
+        // batch before servicing the mirror so a missing/full server sink can
+        // never defer activity decisions until after suppression state changes.
+        for _ in 0..64 {
+            match outbox_rx.try_recv() {
+                Ok(chunk) => {
+                    queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    outbox_open = false;
+                    break;
                 }
             }
         }
-        // Content-free activity ping (trust Phase 2): classified + throttled
-        // + suppression-aware daemon-side, so the server can stamp
-        // `last_output_at` without ever seeing the bytes. Best-effort: dropped
-        // if the control channel is momentarily full — the throttle means a
-        // later chunk re-emits soon.
-        if control.note_output(&chunk) {
-            if let Some(sink) = control.slot.lock().await.clone() {
-                try_emit_activity(&sink, agent_id, ActivityKind::Output);
+
+        if !outbox_open && pending_mirror.is_empty() {
+            break;
+        }
+
+        if pending_mirror.is_empty() {
+            match outbox_rx.recv().await {
+                Some(chunk) => {
+                    queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                }
+                None => outbox_open = false,
+            }
+            continue;
+        }
+
+        let current = control.slot.lock().await.clone();
+        let Some(sink) = current else {
+            if outbox_open {
+                tokio::select! {
+                    chunk = outbox_rx.recv() => match chunk {
+                        Some(chunk) => {
+                            queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                        }
+                        None => outbox_open = false,
+                    },
+                    _ = control.notify.notified() => {},
+                }
+            } else {
+                control.notify.notified().await;
+            }
+            continue;
+        };
+
+        let message = pending_mirror.front().cloned().expect("checked non-empty");
+        let send_result = if outbox_open {
+            tokio::select! {
+                chunk = outbox_rx.recv() => {
+                    match chunk {
+                        Some(chunk) => {
+                            queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                        }
+                        None => outbox_open = false,
+                    }
+                    continue;
+                },
+                result = sink.send(message) => result,
+            }
+        } else {
+            sink.send(message).await
+        };
+
+        match send_result {
+            Ok(()) => {
+                pending_mirror.pop_front();
+            }
+            Err(_) => {
+                // Keep the unsent frame at the front for the replacement sink.
+                let mut slot = control.slot.lock().await;
+                if slot.as_ref().is_some_and(|current| current.is_closed()) {
+                    *slot = None;
+                }
             }
         }
     }
     tracing::debug!(%agent_id, "forwarder exiting (outbox closed)");
+}
+
+async fn queue_output_chunk(
+    agent_id: Uuid,
+    chunk: Vec<u8>,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+) {
+    // Decide first, in PTY receipt order. Direct/browser and legacy/server
+    // delivery may block or reconnect, but neither can change this decision.
+    let meaningful = control.note_output(&chunk);
+    control.send_direct(&chunk).await;
+    pending_mirror.push_back(WsOutbound::Binary(frames::encode_pty_output(
+        agent_id, &chunk,
+    )));
+    if meaningful {
+        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+            pending_mirror.push_back(activity);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -788,6 +863,27 @@ mod tests {
         assert!(!control.note_output_at(start, b"meaningful output"));
         assert!(!control.note_output_at(start + Duration::from_millis(10), b"ok"));
         assert!(control.note_output_at(start + Duration::from_millis(10), b"meaningful output"));
+    }
+
+    #[test]
+    fn classifier_state_advances_while_throttled_and_suppressed() {
+        let throttled = ForwarderControl::new();
+        let start = Instant::now();
+        assert!(throttled.note_output_at(start, b"abc"));
+        assert!(
+            !throttled.note_output_at(start + Duration::from_millis(10), b"\x1b]0;hidden title")
+        );
+        assert!(throttled.note_output_at(start + activity::OUTPUT_TOUCH_INTERVAL, b"\x07abc"));
+
+        let suppressed = ForwarderControl::new();
+        suppressed.suppress_activity_at(start, Duration::from_secs(1));
+        assert!(!suppressed.note_output_at(start, b"\xe2\x80"));
+        assert!(suppressed.note_output_at(start + Duration::from_secs(1), b"\xa2abc"));
+
+        let no_delay = ForwarderControl::new();
+        no_delay.suppress_activity_at(start, Duration::from_secs(1));
+        assert!(!no_delay.note_output_at(start, b"ab"));
+        assert!(!no_delay.note_output_at(start + Duration::from_secs(1), b"c"));
     }
 
     #[test]
@@ -857,5 +953,110 @@ mod tests {
         );
         assert!(!activity_json.contains("sensitive terminal output"));
         forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarder_decides_activity_before_mirror_backpressure_and_suppression() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
+        control.add_direct_sink("test".into(), direct_tx).await;
+
+        // Capacity one deliberately blocks the mirror after its first binary
+        // frame. Subsequent direct receipts prove classification has still
+        // consumed those chunks in source order.
+        let (sink_tx, mut sink_rx) = mpsc::channel(1);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        outbox_tx.send(b"ok".to_vec()).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"ok");
+
+        outbox_tx.send(b"before suppression".to_vec()).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        outbox_tx.send(b"during suppression".to_vec()).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+
+        // Simulate reconnect after the suppression window. The stored decision
+        // for earlier output remains, while suppressed output cannot appear as
+        // a delayed activity event.
+        control.activity.lock().unwrap().suppress_output_until = None;
+        drop(outbox_tx);
+
+        let first = sink_rx.recv().await.unwrap();
+        let second = sink_rx.recv().await.unwrap();
+        let third = sink_rx.recv().await.unwrap();
+        let fourth = sink_rx.recv().await.unwrap();
+        forwarder.await.unwrap();
+
+        let frames = [first, second, third, fourth];
+        let mut binary_payloads = Vec::new();
+        let mut activity_frames = Vec::new();
+        for frame in frames {
+            match frame {
+                WsOutbound::Binary(binary) => {
+                    let (_, _, payload) = frames::decode_binary(&binary).unwrap();
+                    binary_payloads.push(payload.to_vec());
+                }
+                WsOutbound::Json(json) => activity_frames.push(json),
+            }
+        }
+        assert_eq!(
+            binary_payloads,
+            vec![
+                b"ok".to_vec(),
+                b"before suppression".to_vec(),
+                b"during suppression".to_vec()
+            ]
+        );
+        assert_eq!(
+            activity_frames,
+            vec![format!(
+                r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#
+            )]
+        );
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarder_does_not_reclassify_suppressed_output_when_sink_reconnects() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
+        control.add_direct_sink("test".into(), direct_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        // There is intentionally no server sink while both chunks are
+        // classified. A later suppression cannot erase the first decision.
+        outbox_tx.send(b"before suppression".to_vec()).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+        control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
+        outbox_tx.send(b"during suppression".to_vec()).unwrap();
+        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+        control.activity.lock().unwrap().suppress_output_until = None;
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        drop(outbox_tx);
+
+        let first = sink_rx.recv().await.unwrap();
+        let second = sink_rx.recv().await.unwrap();
+        let third = sink_rx.recv().await.unwrap();
+        forwarder.await.unwrap();
+
+        assert!(matches!(first, WsOutbound::Binary(_)));
+        let WsOutbound::Json(activity) = second else {
+            panic!("pre-suppression output decision was lost")
+        };
+        assert_eq!(
+            activity,
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(matches!(third, WsOutbound::Binary(_)));
+        assert!(sink_rx.try_recv().is_err());
     }
 }

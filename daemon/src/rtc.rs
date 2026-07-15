@@ -16,9 +16,9 @@ use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -356,12 +356,12 @@ fn install_data_channel_handler(
                 let registry = input_registry.clone();
                 let out_tx = input_out_tx.clone();
                 Box::pin(async move {
-                    if msg.is_string || msg.data.is_empty() {
-                        return;
-                    }
                     // Cached check: never pay a tmux subprocess per keystroke.
                     // Worker-backed agents have no tmux copy-mode at all.
-                    if registry.is_worker(agent_id) != Some(true) {
+                    if !msg.is_string
+                        && !msg.data.is_empty()
+                        && registry.is_worker(agent_id) != Some(true)
+                    {
                         if let Some(session) = registry.session_for(agent_id) {
                             if let Some(control) = registry.control_for(agent_id) {
                                 if control.copy_mode_cached(&session) {
@@ -374,25 +374,21 @@ fn install_data_channel_handler(
                             }
                         }
                     }
-                    let mut wrote_input = false;
-                    let found = registry.with_handle(agent_id, |h| match h.write_stdin(&msg.data) {
-                        Ok(()) => wrote_input = true,
-                        Err(e) => {
-                            tracing::warn!(%agent_id, error = %e, "rtc PTY stdin write failed");
-                        }
+                    let mut result = None;
+                    let found = registry.with_handle(agent_id, |h| {
+                        result = Some(forward_data_channel_input(
+                            agent_id,
+                            msg.is_string,
+                            &msg.data,
+                            &h.control,
+                            &out_tx,
+                            |bytes| h.write_stdin(bytes),
+                        ));
                     });
                     if !found {
                         tracing::debug!(%agent_id, "ignoring rtc stdin for unknown agent");
-                    } else if wrote_input {
-                        if let Some(control) = registry.control_for(agent_id) {
-                            if control.note_input() {
-                                crate::pty::try_emit_activity(
-                                    &out_tx,
-                                    agent_id,
-                                    crate::pty::ActivityKind::Input,
-                                );
-                            }
-                        }
+                    } else if let Some(Err(e)) = result {
+                        tracing::warn!(%agent_id, error = %e, "rtc PTY stdin write failed");
                     }
                 })
             }));
@@ -449,6 +445,30 @@ fn install_data_channel_handler(
     }));
 }
 
+/// Testable core of the `spawn.pty` input callback. Activity is recorded only
+/// after a successful, non-empty binary write, and the helper API exposes no
+/// input bytes to the content-free activity serializer.
+fn forward_data_channel_input<W>(
+    agent_id: Uuid,
+    is_string: bool,
+    data: &[u8],
+    control: &crate::pty::ForwarderControl,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    write_stdin: W,
+) -> Result<bool>
+where
+    W: FnOnce(&[u8]) -> Result<()>,
+{
+    if is_string || data.is_empty() {
+        return Ok(false);
+    }
+    write_stdin(data)?;
+    if control.note_input() {
+        crate::pty::try_emit_activity(out_tx, agent_id, crate::pty::ActivityKind::Input);
+    }
+    Ok(true)
+}
+
 fn to_webrtc_ice_server(config: RtcIceServerConfig) -> RTCIceServer {
     RTCIceServer {
         urls: config.urls,
@@ -479,5 +499,82 @@ async fn send_status(
 async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::Json(s)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtc_binary_input_writes_and_emits_one_throttled_content_free_signal() {
+        let agent_id = Uuid::new_v4();
+        let control = crate::pty::ForwarderControl::new();
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let writes = std::sync::Mutex::new(Vec::<Vec<u8>>::new());
+
+        for data in [b"first secret".as_slice(), b"second secret".as_slice()] {
+            assert!(forward_data_channel_input(
+                agent_id,
+                false,
+                data,
+                &control,
+                &out_tx,
+                |bytes| {
+                    writes.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+            )
+            .unwrap());
+        }
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"first secret".to_vec(), b"second secret".to_vec()]
+        );
+        let WsOutbound::Json(json) = out_rx.try_recv().unwrap() else {
+            panic!("expected content-free input activity JSON")
+        };
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(!json.contains("secret"));
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rtc_text_empty_and_failed_input_do_not_emit_activity() {
+        let agent_id = Uuid::new_v4();
+        let control = crate::pty::ForwarderControl::new();
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let write_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            !forward_data_channel_input(agent_id, true, b"text", &control, &out_tx, |_| {
+                write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },)
+            .unwrap()
+        );
+        assert!(
+            !forward_data_channel_input(agent_id, false, b"", &control, &out_tx, |_| {
+                write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },)
+            .unwrap()
+        );
+        assert!(forward_data_channel_input(
+            agent_id,
+            false,
+            b"failed secret",
+            &control,
+            &out_tx,
+            |_| anyhow::bail!("write failed"),
+        )
+        .is_err());
+
+        assert_eq!(write_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(out_rx.try_recv().is_err());
     }
 }
