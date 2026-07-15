@@ -13,6 +13,18 @@ if (!command) {
   process.exit(2);
 }
 
+// Rewrites are baked into .next/routes-manifest.json at build time, so a
+// silent fallback here ships builds that proxy to a dead port (2026-07-15
+// minivac login outage). Only `dev` may default; build/start must be explicit.
+if (!process.env.SPAWN_API_PROXY_TARGET && command !== "dev") {
+  console.error(
+    `[spawn-web] SPAWN_API_PROXY_TARGET must be set for \`next ${command}\`: ` +
+      "the proxy target is baked into the build, and defaulting would bake " +
+      `${DEFAULT_PROXY_TARGET} into production assets.`,
+  );
+  process.exit(2);
+}
+
 const proxyTarget = process.env.SPAWN_API_PROXY_TARGET || DEFAULT_PROXY_TARGET;
 
 try {
