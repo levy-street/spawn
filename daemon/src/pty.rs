@@ -22,7 +22,9 @@
 //! `spawnd` restarts (see `reattach`).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future;
 use std::io::{Read, Write};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,19 +52,61 @@ pub enum WsOutbound {
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 
-/// Immutable result of handling one output event at its producer. Activity is
-/// decided before the raw bytes enter the asynchronous outbox, so later input,
+/// Immutable result of handling one output event at its producer. Immediate
+/// activity and the eligibility/generation of an ambiguous idle candidate are
+/// stamped before raw bytes enter the asynchronous outbox, so later input,
 /// resize, or redraw suppression cannot retroactively change that event.
 #[derive(Debug)]
 pub(crate) struct OutputChunk {
     bytes: Vec<u8>,
     activity: bool,
+    idle_resolution: Option<PendingIdleResolution>,
 }
 
 impl OutputChunk {
     pub(crate) fn classify(bytes: Vec<u8>, control: &ForwarderControl) -> Self {
-        let activity = control.note_output(&bytes);
-        Self { bytes, activity }
+        let now = Instant::now();
+        let decision = control.classify_output_at(now, &bytes);
+        let idle_resolution = decision
+            .idle_generation
+            .map(|generation| PendingIdleResolution {
+                generation,
+                deadline: now
+                    .checked_add(activity::OUTPUT_IDLE_RESOLUTION_DELAY)
+                    .unwrap_or(now),
+            });
+        Self {
+            bytes,
+            activity: decision.activity,
+            idle_resolution,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputDecision {
+    activity: bool,
+    idle_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingIdleResolution {
+    generation: u64,
+    deadline: Instant,
+}
+
+struct IdleResolutionTimer {
+    generation: u64,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl IdleResolutionTimer {
+    fn new(pending: PendingIdleResolution) -> Self {
+        let remaining = pending.deadline.saturating_duration_since(Instant::now());
+        Self {
+            generation: pending.generation,
+            sleep: Box::pin(tokio::time::sleep(remaining)),
+        }
     }
 }
 
@@ -124,6 +168,7 @@ struct ActivityState {
     last_input_at: Option<Instant>,
     suppress_output_until: Option<Instant>,
     output_classifier: activity::OutputClassifier,
+    output_generation: u64,
 }
 
 /// How stale the cached copy-mode flag may get before a background refresh
@@ -167,14 +212,20 @@ impl ForwarderControl {
     /// outside the throttle window, not suppressed, and carrying meaningful
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
-    fn note_output(&self, chunk: &[u8]) -> bool {
-        self.note_output_at(Instant::now(), chunk)
+    #[cfg(test)]
+    fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
+        self.classify_output_at(now, chunk).activity
     }
 
-    fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
+    fn classify_output_at(&self, now: Instant, chunk: &[u8]) -> OutputDecision {
         let Ok(mut state) = self.activity.lock() else {
-            return false;
+            return OutputDecision {
+                activity: false,
+                idle_generation: None,
+            };
         };
+        state.output_generation = state.output_generation.wrapping_add(1);
+        let generation = state.output_generation;
         let throttle_open = !state.last_output_at.is_some_and(|last| {
             now.saturating_duration_since(last) < activity::OUTPUT_TOUCH_INTERVAL
         });
@@ -191,13 +242,42 @@ impl ForwarderControl {
             .observe(chunk, throttle_open && !suppressed);
         if !throttle_open {
             state.output_classifier.discard_meaningful_carry();
+            return OutputDecision {
+                activity: false,
+                idle_generation: state
+                    .output_classifier
+                    .needs_idle_resolution()
+                    .then_some(generation),
+            };
+        }
+        if meaningful {
+            state.last_output_at = Some(now);
+        }
+        OutputDecision {
+            activity: meaningful,
+            idle_generation: state
+                .output_classifier
+                .needs_idle_resolution()
+                .then_some(generation),
+        }
+    }
+
+    /// Resolve only the candidate associated with the latest producer event.
+    /// Stale timers are harmless, and eligibility remains the value captured
+    /// when each character arrived.
+    fn resolve_output_idle(&self, generation: u64) -> bool {
+        let now = Instant::now();
+        let Ok(mut state) = self.activity.lock() else {
+            return false;
+        };
+        if state.output_generation != generation {
             return false;
         }
-        if !meaningful {
-            return false;
+        let meaningful = state.output_classifier.resolve_idle();
+        if meaningful {
+            state.last_output_at = Some(now);
         }
-        state.last_output_at = Some(now);
-        true
+        meaningful
     }
 
     /// Record local DataChannel input without revealing its contents. The
@@ -737,23 +817,40 @@ pub(crate) async fn run_forwarder(
     control: ForwarderControl,
 ) {
     let mut pending_mirror = VecDeque::new();
+    let mut idle_timer: Option<IdleResolutionTimer> = None;
     let mut outbox_open = true;
 
     loop {
-        // Keep classification at the source side of the queue. Drain a bounded
-        // batch before servicing the mirror so a missing/full server sink can
-        // never defer activity decisions until after suppression state changes.
+        // Keep content classification and eligibility at the source side of
+        // the queue. Drain a bounded batch before servicing the mirror so a
+        // missing/full server sink cannot defer producer decisions; the only
+        // delayed step is a generation-guarded, content-free idle timeout.
         for _ in 0..64 {
             match outbox_rx.try_recv() {
                 Ok(chunk) => {
-                    queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                    queue_output_chunk(
+                        agent_id,
+                        chunk,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    )
+                    .await;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     outbox_open = false;
+                    idle_timer = None;
                     break;
                 }
             }
+        }
+
+        if idle_timer
+            .as_ref()
+            .is_some_and(|timer| timer.sleep.is_elapsed())
+        {
+            resolve_idle_activity(agent_id, &control, &mut pending_mirror, &mut idle_timer);
         }
 
         if !outbox_open && pending_mirror.is_empty() {
@@ -761,11 +858,31 @@ pub(crate) async fn run_forwarder(
         }
 
         if pending_mirror.is_empty() {
-            match outbox_rx.recv().await {
-                Some(chunk) => {
-                    queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+            tokio::select! {
+                chunk = outbox_rx.recv() => match chunk {
+                    Some(chunk) => {
+                        queue_output_chunk(
+                            agent_id,
+                            chunk,
+                            &control,
+                            &mut pending_mirror,
+                            &mut idle_timer,
+                        ).await;
+                    }
+                    None => {
+                        outbox_open = false;
+                        idle_timer = None;
+                    }
+                },
+                generation = wait_for_idle(&mut idle_timer) => {
+                    resolve_idle_generation(
+                        agent_id,
+                        generation,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    );
                 }
-                None => outbox_open = false,
             }
             continue;
         }
@@ -776,11 +893,29 @@ pub(crate) async fn run_forwarder(
                 tokio::select! {
                     chunk = outbox_rx.recv() => match chunk {
                         Some(chunk) => {
-                            queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                            queue_output_chunk(
+                                agent_id,
+                                chunk,
+                                &control,
+                                &mut pending_mirror,
+                                &mut idle_timer,
+                            ).await;
                         }
-                        None => outbox_open = false,
+                        None => {
+                            outbox_open = false;
+                            idle_timer = None;
+                        }
                     },
                     _ = control.notify.notified() => {},
+                    generation = wait_for_idle(&mut idle_timer) => {
+                        resolve_idle_generation(
+                            agent_id,
+                            generation,
+                            &control,
+                            &mut pending_mirror,
+                            &mut idle_timer,
+                        );
+                    },
                 }
             } else {
                 control.notify.notified().await;
@@ -794,13 +929,32 @@ pub(crate) async fn run_forwarder(
                 chunk = outbox_rx.recv() => {
                     match chunk {
                         Some(chunk) => {
-                            queue_output_chunk(agent_id, chunk, &control, &mut pending_mirror).await;
+                            queue_output_chunk(
+                                agent_id,
+                                chunk,
+                                &control,
+                                &mut pending_mirror,
+                                &mut idle_timer,
+                            ).await;
                         }
-                        None => outbox_open = false,
+                        None => {
+                            outbox_open = false;
+                            idle_timer = None;
+                        }
                     }
                     continue;
                 },
                 result = sink.send(message) => result,
+                generation = wait_for_idle(&mut idle_timer) => {
+                    resolve_idle_generation(
+                        agent_id,
+                        generation,
+                        &control,
+                        &mut pending_mirror,
+                        &mut idle_timer,
+                    );
+                    continue;
+                },
             }
         } else {
             sink.send(message).await
@@ -827,13 +981,51 @@ async fn queue_output_chunk(
     chunk: OutputChunk,
     control: &ForwarderControl,
     pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
 ) {
+    *idle_timer = chunk.idle_resolution.map(IdleResolutionTimer::new);
     control.send_direct(&chunk.bytes).await;
     pending_mirror.push_back(WsOutbound::Binary(frames::encode_pty_output(
         agent_id,
         &chunk.bytes,
     )));
     if chunk.activity {
+        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+            pending_mirror.push_back(activity);
+        }
+    }
+}
+
+async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
+    let Some(timer) = idle_timer else {
+        return future::pending().await;
+    };
+    timer.sleep.as_mut().await;
+    timer.generation
+}
+
+fn resolve_idle_activity(
+    agent_id: Uuid,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
+) {
+    let generation = idle_timer
+        .as_ref()
+        .expect("checked elapsed idle timer")
+        .generation;
+    resolve_idle_generation(agent_id, generation, control, pending_mirror, idle_timer);
+}
+
+fn resolve_idle_generation(
+    agent_id: Uuid,
+    generation: u64,
+    control: &ForwarderControl,
+    pending_mirror: &mut VecDeque<WsOutbound>,
+    idle_timer: &mut Option<IdleResolutionTimer>,
+) {
+    *idle_timer = None;
+    if control.resolve_output_idle(generation) {
         if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
             pending_mirror.push_back(activity);
         }
@@ -1139,6 +1331,162 @@ mod tests {
             WsOutbound::Binary(_)
         ));
         forwarder.await.unwrap();
+        assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_ambiguous_output_emits_after_bounded_idle_without_blocking_bytes() {
+        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
+            let agent_id = Uuid::new_v4();
+            let control = ForwarderControl::new();
+            let (sink_tx, mut sink_rx) = mpsc::channel(4);
+            control.set_sink(sink_tx).await;
+            let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+            let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+            let chunk = source_output(&control, payload);
+            assert!(!chunk.activity);
+            assert!(chunk.idle_resolution.is_some());
+            outbox_tx.send(chunk).unwrap();
+
+            // Terminal bytes are never held behind the classification debounce.
+            assert!(matches!(
+                sink_rx.recv().await.unwrap(),
+                WsOutbound::Binary(_)
+            ));
+            assert!(sink_rx.try_recv().is_err());
+
+            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
+            tokio::task::yield_now().await;
+            assert!(sink_rx.try_recv().is_err());
+
+            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY).await;
+            tokio::task::yield_now().await;
+            let WsOutbound::Json(json) = sink_rx.try_recv().expect("idle activity") else {
+                panic!("expected idle activity JSON")
+            };
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            );
+
+            drop(outbox_tx);
+            forwarder.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_decision_preserves_receipt_time_suppression_ordering() {
+        // Suppression after receipt cannot erase eligible candidate text.
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        control.suppress_activity(Duration::from_secs(60));
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(sink_rx.try_recv().unwrap(), WsOutbound::Json(_)));
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+
+        // Suppression at receipt remains immutable even if it is cleared before
+        // the candidate resolves.
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        control.suppress_activity(Duration::from_secs(60));
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        outbox_tx
+            .send(source_output(&control, b" \"quoted real output\""))
+            .unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        control.activity.lock().unwrap().suppress_output_until = None;
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert!(sink_rx.try_recv().is_err());
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_tmux_status_stays_suppressed_at_every_split_with_idle_debounce() {
+        for payload in [
+            b"[spawn-oem] \"bash\" 12:34 15-Jul-26".as_slice(),
+            b"           \"project\" 04:49 08-May-26".as_slice(),
+            b"12:34 15-Jul-26".as_slice(),
+        ] {
+            for split in 0..=payload.len() {
+                let agent_id = Uuid::new_v4();
+                let control = ForwarderControl::new();
+                let (sink_tx, mut sink_rx) = mpsc::channel(4);
+                control.set_sink(sink_tx).await;
+                let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+                let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+                // Let the first half reach the forwarder and arm its timer,
+                // then complete the status before the debounce expires.
+                outbox_tx
+                    .send(source_output(&control, &payload[..split]))
+                    .unwrap();
+                assert!(matches!(
+                    sink_rx.recv().await.unwrap(),
+                    WsOutbound::Binary(_)
+                ));
+                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
+                tokio::task::yield_now().await;
+                assert!(sink_rx.try_recv().is_err());
+
+                outbox_tx
+                    .send(source_output(&control, &payload[split..]))
+                    .unwrap();
+                assert!(matches!(
+                    sink_rx.recv().await.unwrap(),
+                    WsOutbound::Binary(_)
+                ));
+                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    sink_rx.try_recv().is_err(),
+                    "status emitted activity at split {split} for {payload:?}"
+                );
+
+                drop(outbox_tx);
+                forwarder.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_idle_timer_is_cancelled_when_agent_outbox_closes() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        control.set_sink(sink_tx).await;
+        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
+        assert!(matches!(
+            sink_rx.recv().await.unwrap(),
+            WsOutbound::Binary(_)
+        ));
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+
+        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
+        tokio::task::yield_now().await;
         assert!(sink_rx.try_recv().is_err());
     }
 }

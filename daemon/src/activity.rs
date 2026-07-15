@@ -4,7 +4,8 @@
 //! Terminal sequences and UTF-8 code points can be split across arbitrary PTY
 //! reads, so classification is deliberately stateful per agent. Carry is
 //! bounded: CSI/OSC parsing uses constant state and plausible tmux status text
-//! is capped before being flushed through ordinary content classification.
+//! is capped or resolved after a short idle debounce before being flushed
+//! through ordinary content classification.
 
 use std::time::Duration;
 
@@ -16,6 +17,10 @@ pub const INPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(1);
 pub const INPUT_ECHO_SUPPRESS_WINDOW: Duration = Duration::from_millis(750);
 /// After an injected resize/redraw, suppress the resulting repaint.
 pub const REDRAW_SUPPRESS_WINDOW: Duration = Duration::from_millis(1500);
+/// Resolve a short status-like fragment as real output after this much PTY
+/// inactivity. Tmux writes a complete status line as one burst, while a real
+/// command may legitimately stop at text such as `12:34`.
+pub const OUTPUT_IDLE_RESOLUTION_DELAY: Duration = Duration::from_millis(250);
 
 const MIN_MEANINGFUL_OUTPUT_CHARS: u8 = 3;
 const MAX_STATUS_CARRY_CHARS: usize = 512;
@@ -97,7 +102,25 @@ impl OutputClassifier {
             // This observation has already represented all visible text it
             // consumed; do not let a remainder from the same PTY chunk become
             // a second, delayed event after throttle expiry.
-            self.meaningful_chars = 0;
+            self.discard_meaningful_carry();
+        }
+        meaningful
+    }
+
+    /// Whether visible text is waiting for enough context to distinguish a
+    /// tmux status repaint from real output.
+    pub fn needs_idle_resolution(&self) -> bool {
+        matches!(self.text, TextState::Candidate(_))
+    }
+
+    /// Resolve status-like text after the producer has been idle for the
+    /// bounded debounce interval. Eligibility was captured on receipt, so a
+    /// later suppression event cannot change this decision.
+    pub fn resolve_idle(&mut self) -> bool {
+        let mut meaningful = false;
+        self.finish_text_segment(&mut meaningful);
+        if meaningful {
+            self.discard_meaningful_carry();
         }
         meaningful
     }
@@ -106,6 +129,11 @@ impl OutputClassifier {
     /// turn into a delayed activity event after that window expires.
     pub fn discard_meaningful_carry(&mut self) {
         self.meaningful_chars = 0;
+        if let TextState::Candidate(carry) = &mut self.text {
+            for observed in carry {
+                observed.eligible = false;
+            }
+        }
     }
 
     fn consume_terminal_byte(&mut self, byte: u8, eligible: bool, meaningful: &mut bool) {
@@ -542,5 +570,24 @@ mod tests {
         }
         meaningful |= classifier.observe(b"\x1b[20;1Hreal output", true);
         assert!(meaningful);
+    }
+
+    #[test]
+    fn idle_resolution_flushes_short_ambiguous_output_but_not_complete_status() {
+        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
+            let mut classifier = OutputClassifier::default();
+            assert!(!classifier.observe(payload, true));
+            assert!(classifier.needs_idle_resolution());
+            assert!(
+                classifier.resolve_idle(),
+                "idle payload was lost: {payload:?}"
+            );
+            assert!(!classifier.needs_idle_resolution());
+        }
+
+        let mut classifier = OutputClassifier::default();
+        assert!(!classifier.observe(b"[spawn-oem] \"bash\" 12:34 15-Jul-26", true));
+        assert!(!classifier.needs_idle_resolution());
+        assert!(!classifier.resolve_idle());
     }
 }
