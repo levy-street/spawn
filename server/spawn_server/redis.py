@@ -23,8 +23,6 @@ from .config import get_settings
 class _InProcPubSub:
     def __init__(self) -> None:
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
-        # Per-channel ring buffer of bytes (already limited by size).
-        self._buf: dict[str, bytearray] = defaultdict(bytearray)
 
     async def publish(self, channel: str, data: bytes) -> None:
         for q in list(self._subs.get(channel, ())):
@@ -37,18 +35,6 @@ class _InProcPubSub:
 
     def unsubscribe(self, channel: str, q: asyncio.Queue) -> None:
         self._subs.get(channel, set()).discard(q)
-
-    async def append_ring(self, channel: str, data: bytes, max_bytes: int) -> None:
-        buf = self._buf[channel]
-        buf.extend(data)
-        if len(buf) > max_bytes:
-            del buf[: len(buf) - max_bytes]
-
-    async def read_ring(self, channel: str) -> bytes:
-        return bytes(self._buf.get(channel, b""))
-
-    async def clear_ring(self, channel: str) -> None:
-        self._buf.pop(channel, None)
 
 
 # ---------- backend abstraction ----------
@@ -81,42 +67,6 @@ class RedisBackend:
     @property
     def client(self) -> aioredis.Redis | None:
         return self._client
-
-    # ----- ring buffer -----
-
-    @staticmethod
-    def _ring_key(agent_id: str) -> str:
-        return f"spawn:agent:{agent_id}:ring"
-
-    async def ring_append(self, agent_id: str, data: bytes) -> None:
-        max_bytes = get_settings().ringbuffer_max_bytes
-        if self._inproc is not None:
-            await self._inproc.append_ring(agent_id, data, max_bytes)
-            return
-        assert self._client is not None
-        key = self._ring_key(agent_id)
-        # APPEND then trim by reading length and using GETRANGE — simplest correct approach.
-        async with self._client.pipeline(transaction=True) as p:
-            p.append(key, data)
-            p.strlen(key)
-            _, length = await p.execute()
-        if length > max_bytes:
-            tail = await self._client.getrange(key, length - max_bytes, length - 1)
-            await self._client.set(key, tail)
-
-    async def ring_read(self, agent_id: str) -> bytes:
-        if self._inproc is not None:
-            return await self._inproc.read_ring(agent_id)
-        assert self._client is not None
-        v = await self._client.get(self._ring_key(agent_id))
-        return v or b""
-
-    async def ring_clear(self, agent_id: str) -> None:
-        if self._inproc is not None:
-            await self._inproc.clear_ring(agent_id)
-            return
-        assert self._client is not None
-        await self._client.delete(self._ring_key(agent_id))
 
     # ----- pubsub -----
 

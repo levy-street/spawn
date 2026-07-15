@@ -68,8 +68,6 @@ class Settings(BaseSettings):
     turn_secret: str | None = Field(default=None)
     turn_ttl_seconds: int = Field(default=24 * 3600)
 
-    ringbuffer_max_bytes: int = 256 * 1024  # legacy; kept for API compatibility
-
     # On-disk transcripts give each agent durable scrollback that survives
     # server restarts. Default ~32 MB per file × 2 rotated files = ~64 MB
     # of scrollback per agent before old data is dropped.
