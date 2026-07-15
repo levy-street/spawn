@@ -23,6 +23,7 @@ import { type ReactNode, useMemo, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
 import { ScreenIcon } from "@/components/screens/ScreenIcon";
+import { useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
 import {
   DropdownMenu,
   type DropdownMenuHandle,
@@ -469,6 +470,33 @@ function agentRecency(agent: Agent): number {
   return Number.isFinite(time) ? time : 0;
 }
 
+/** Small dot showing whether this browser currently holds a live connection to
+ *  the agent (via the warm terminal pool): solid = viewing now, hollow = warm
+ *  in the background, amber pulse = connecting. Absent when not connected. */
+function PoolConnDot({ agentId }: { agentId: string }) {
+  const state = useAgentConnState(agentId);
+  if (state === "off") return null;
+  return (
+    <span
+      title={
+        state === "connected"
+          ? "Connected"
+          : state === "warm"
+            ? "Warm — connected in the background"
+            : "Connecting…"
+      }
+      className={cn(
+        "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
+        state === "connected"
+          ? "bg-emerald-500"
+          : state === "warm"
+            ? "bg-emerald-500/40"
+            : "animate-pulse bg-amber-400",
+      )}
+    />
+  );
+}
+
 function AgentRow({
   agent,
   collapsed,
@@ -522,6 +550,7 @@ function AgentRow({
             <span className="relative">
               <AgentKindIcon agent={agent} />
               <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
+              <PoolConnDot agentId={agent.id} />
             </span>
           </IconSlot>
           <RowLabel collapsed={collapsed}>
