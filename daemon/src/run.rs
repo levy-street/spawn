@@ -930,7 +930,10 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
                 Some(&env),
             )
             .await;
-            let after = read_tool_version(&target.command, &env).await.ok().flatten();
+            let after = read_tool_version(&target.command, &env)
+                .await
+                .ok()
+                .flatten();
             if self_capture.success && after != version_before {
                 capture = Some(self_capture);
             }
@@ -939,7 +942,13 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
     let capture = match capture {
         Some(capture) => capture,
         None => {
-            run_shell_capture(&install, TOOL_INSTALL_TIMEOUT, TOOL_OUTPUT_LIMIT, Some(&env)).await
+            run_shell_capture(
+                &install,
+                TOOL_INSTALL_TIMEOUT,
+                TOOL_OUTPUT_LIMIT,
+                Some(&env),
+            )
+            .await
         }
     };
 

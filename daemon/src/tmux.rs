@@ -254,7 +254,11 @@ pub async fn list_sessions() -> anyhow::Result<Vec<String>> {
         if stderr.contains("no server running") || stderr.contains("error connecting to") {
             return Ok(Vec::new());
         }
-        anyhow::bail!("tmux list-sessions failed ({}): {}", out.status, stderr.trim());
+        anyhow::bail!(
+            "tmux list-sessions failed ({}): {}",
+            out.status,
+            stderr.trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -407,7 +411,14 @@ pub async fn force_repaint(session: &str) {
 /// None if tmux can't be queried.
 pub async fn pane_in_mode(session: &str) -> Option<bool> {
     let out = tmux_command()
-        .args(["display-message", "-p", "-t", session, "-F", "#{pane_in_mode}"])
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            session,
+            "-F",
+            "#{pane_in_mode}",
+        ])
         .stdin(Stdio::null())
         .output()
         .await
