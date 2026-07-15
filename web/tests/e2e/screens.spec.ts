@@ -238,7 +238,7 @@ test("pane kebab exposes agent actions and restarts the agent", async ({ page })
 
   await page.goto(`/screens/${SCREEN_ID}`);
   const alpha = page.getByRole("region", { name: "alpha" });
-  await alpha.getByRole("button", { name: "alpha pane actions" }).click();
+  await alpha.getByRole("button", { name: "alpha actions" }).click();
   await expect(page.getByRole("menuitem", { name: "Open full page" })).toBeVisible();
   await page.getByRole("menuitem", { name: "Restart agent" }).click();
   await expect.poll(() => restarted).toBe(true);
@@ -312,7 +312,9 @@ test("dropping an agent on another agent's terminal creates a split screen", asy
   await expect
     .poll(() => createdBody)
     .toMatchObject({
-      name: "palette · beta",
+      // Ad-hoc splits are ephemeral and default-named "Screen N".
+      name: "Screen 2",
+      ephemeral: true,
       layout: {
         root: {
           type: "split",

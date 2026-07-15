@@ -1,45 +1,24 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  Archive,
-  ArchiveRestore,
-  ArrowLeft,
-  Check,
-  FolderOpen,
-  LayoutGrid,
-  MoreHorizontal,
-  Pencil,
-  Pin,
-  PinOff,
-  RefreshCw,
-  RotateCcw,
-  Trash2,
-} from "lucide-react";
+import { ArrowLeft, FolderOpen, LayoutGrid } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
+import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
-import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
+import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
-import { agentAccess, agents, screens } from "@/lib/api";
-import { runDiagnosticRefresh } from "@/lib/diagnostics";
+import { agents, screens } from "@/lib/api";
 import { useAgentDrop } from "@/lib/dnd";
 import { collectAgentIds } from "@/lib/layout";
+import { defaultScreenName } from "@/lib/screens";
 import type { DisplayControlState } from "@/lib/ws";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -85,19 +64,10 @@ function AgentTerminal() {
     enabled: !!id,
     refetchInterval: 5_000,
   });
-  const accessQ = useQuery({
-    queryKey: ["agent-access", id],
-    queryFn: () => agentAccess.get(id as string),
-    enabled: !!id,
-    refetchInterval: 10_000,
-  });
   const screensQ = useQuery({ queryKey: ["screens"], queryFn: screens.list, staleTime: 30_000 });
   const memberScreens = (screensQ.data ?? []).filter((item) =>
     collectAgentIds(item.layout.root ?? null).includes(id as string),
   );
-  const skillsSummary = accessQ.data?.skills.length
-    ? accessQ.data.skills.map((skill) => skill.name).join(", ")
-    : null;
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["agents"] });
@@ -114,76 +84,11 @@ function AgentTerminal() {
     },
     onError: (err) => setActionError(String(err)),
   });
-  const pinM = useMutation({
-    mutationFn: (pinned: boolean) =>
-      pinned ? agents.pin(id as string) : agents.unpin(id as string),
-    onSuccess: () => {
-      setActionError(null);
-      invalidate();
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const archiveM = useMutation({
-    mutationFn: () => agents.archive(id as string),
-    onSuccess: () => {
-      setActionError(null);
-      invalidate();
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const unarchiveM = useMutation({
-    mutationFn: () => agents.unarchive(id as string),
-    onSuccess: () => {
-      setActionError(null);
-      invalidate();
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const deleteM = useMutation({
-    mutationFn: () => agents.remove(id as string),
-    onSuccess: () => {
-      invalidate();
-      router.push("/agents");
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const [diagBusy, setDiagBusy] = useState(false);
-  const [diagSaved, setDiagSaved] = useState(false);
-  // Manual terminal refresh that records before/after diagnostics and saves
-  // them to the agent host (cwd/.spawn/attachments) for offline review.
-  const handleDiagnosticRefresh = async () => {
-    const handle = termRef.current;
-    if (!handle || diagBusy) return;
-    setDiagBusy(true);
-    setDiagSaved(false);
-    try {
-      await runDiagnosticRefresh(handle, id as string);
-      setActionError(null);
-      setDiagSaved(true);
-      setTimeout(() => setDiagSaved(false), 2500);
-    } catch (err) {
-      setActionError(`diagnostic refresh: ${String(err)}`);
-    } finally {
-      setDiagBusy(false);
-    }
-  };
-  const restartM = useMutation({
-    mutationFn: () => {
-      const size = termRef.current?.getSize();
-      return agents.restart(id as string, size ? { ...size, create_cwd: true } : undefined);
-    },
-    onSuccess: () => {
-      setActionError(null);
-      invalidate();
-    },
-    onError: (err) => setActionError(String(err)),
-  });
+
   const splitM = useMutation({
-    mutationFn: ({ droppedId, droppedTitle }: { droppedId: string; droppedTitle: string }) => {
-      const current = q.data ? agentTitle(q.data) : "agent";
-      const name = `${current} · ${droppedTitle || "split"}`.slice(0, 128);
+    mutationFn: ({ droppedId }: { droppedId: string; droppedTitle: string }) => {
       return screens.create({
-        name,
+        name: defaultScreenName(screensQ.data ?? []),
         // Ad-hoc: dissolves if emptied, promotes on rename or a third pane.
         ephemeral: true,
         layout: {
@@ -225,225 +130,94 @@ function AgentTerminal() {
 
   return (
     <div className="flex h-vv flex-col bg-background pad-safe-top">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0"
-          onClick={() => router.back()}
-          aria-label="Back"
-        >
-          <ArrowLeft className="size-4" />
-        </Button>
-
-        {agent && (
-          <span className="relative shrink-0">
-            <AgentKindIcon agent={agent} />
-            <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
-          </span>
-        )}
-
-        <div className="min-w-0 flex-1">
-          {editingName ? (
-            <Input
-              aria-label="Agent name"
-              autoFocus
-              value={draftName}
-              onChange={(e) => setDraftName(e.target.value)}
-              onBlur={submitRename}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submitRename();
-                if (e.key === "Escape") setEditingName(false);
-              }}
-              className="h-7 max-w-64 text-sm"
-              disabled={renameM.isPending}
-            />
-          ) : (
-            <button
-              type="button"
-              className="block max-w-full truncate rounded px-0.5 text-left text-sm font-medium leading-5 hover:bg-accent/50"
-              title="Rename agent"
-              onClick={() => {
-                if (!agent) return;
-                setDraftName(agent.name ?? agentTitle(agent));
-                setEditingName(true);
-              }}
-            >
-              {agent ? agentTitle(agent) : "…"}
-            </button>
-          )}
-          <div className="flex items-center gap-1 truncate px-0.5 text-[11px] leading-4 text-muted-foreground">
-            <span className="truncate">
-              {agent
-                ? `${agentActivityDetail(agent)}${archived ? " · archived" : ""} · ${agent.host_name ?? "?"} · ${agent.cwd}`
-                : "loading…"}
-            </span>
-            {memberScreens.slice(0, 2).map((item) => (
-              <Link
-                key={item.id}
-                href={`/screens/${item.id}?focus=${id}`}
-                title={`Focus this pane on ${item.name}`}
-                className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border px-1 leading-4 transition-colors hover:bg-accent/60 hover:text-foreground"
-              >
-                <LayoutGrid className="size-2.5" aria-hidden />
-                {item.name}
-              </Link>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex shrink-0 items-center gap-1">
-          <ConnectionChip info={connInfo} compact className="sm:hidden" />
-          <ConnectionChip info={connInfo} className="hidden sm:block" />
-          <TerminalDisplayControl state={displayState} />
-          <Button
-            variant={filesOpen ? "secondary" : "ghost"}
-            size="icon"
-            className="hidden size-8 md:inline-flex"
-            aria-label="Toggle files panel"
-            title="Files"
-            aria-pressed={filesOpen}
-            onClick={() => setFilesOpen((v) => !v)}
-          >
-            <FolderOpen className="size-4" />
-          </Button>
-          {agent && (
+      {agent ? (
+        <AgentSurfaceHeader
+          agent={agent}
+          connInfo={connInfo}
+          getHandle={() => termRef.current}
+          onError={setActionError}
+          onStartRename={() => {
+            setDraftName(agent.name ?? agentTitle(agent));
+            setEditingName(true);
+          }}
+          onDeleted={() => router.push("/agents")}
+          leading={
             <Button
-              asChild
               variant="ghost"
               size="icon"
-              className="size-8 md:hidden"
-              aria-label="Browse files"
+              className="size-8 shrink-0"
+              onClick={() => router.back()}
+              aria-label="Back"
             >
-              <Link href={`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`}>
-                <FolderOpen className="size-4" />
-              </Link>
+              <ArrowLeft className="size-4" />
             </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            aria-label="Refresh terminal"
-            title={
-              diagSaved
-                ? "Diagnostics saved to the agent host"
-                : "Refresh terminal (saves before/after diagnostics)"
-            }
-            disabled={diagBusy}
-            onClick={handleDiagnosticRefresh}
-          >
-            {diagSaved ? (
-              <Check className="size-4 text-emerald-500" />
-            ) : (
-              <RefreshCw className={`size-4 ${diagBusy ? "animate-spin" : ""}`} />
-            )}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            aria-label="Restart agent"
-            title="Restart agent"
-            disabled={!agent || restartM.isPending}
-            onClick={() => {
-              if (confirm("Restart this agent?")) restartM.mutate();
-            }}
-          >
-            <RotateCcw className={`size-4 ${restartM.isPending ? "animate-spin" : ""}`} />
-          </Button>
-          <DropdownMenu
-            menuClassName="w-64"
-            renderTrigger={(props) => (
+          }
+          titleSlot={
+            editingName ? (
+              <Input
+                aria-label="Agent name"
+                autoFocus
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                onBlur={submitRename}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submitRename();
+                  if (e.key === "Escape") setEditingName(false);
+                }}
+                className="h-7 max-w-64 text-sm"
+                disabled={renameM.isPending}
+              />
+            ) : undefined
+          }
+          meta={
+            <div className="flex items-center gap-1 truncate px-0.5 text-[11px] leading-4 text-muted-foreground">
+              <span className="truncate">
+                {`${agentActivityDetail(agent)}${archived ? " · archived" : ""} · ${agent.host_name ?? "?"} · ${agent.cwd}`}
+              </span>
+              {memberScreens.slice(0, 2).map((item) => (
+                <Link
+                  key={item.id}
+                  href={`/screens/${item.id}?focus=${id}`}
+                  title={`Focus this pane on ${item.name}`}
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border px-1 leading-4 transition-colors hover:bg-accent/60 hover:text-foreground"
+                >
+                  <LayoutGrid className="size-2.5" aria-hidden />
+                  {item.name}
+                </Link>
+              ))}
+            </div>
+          }
+          trailing={
+            <>
+              <TerminalDisplayControl state={displayState} />
               <Button
-                {...props}
-                variant="ghost"
+                variant={filesOpen ? "secondary" : "ghost"}
                 size="icon"
-                className="size-8"
-                aria-label="Agent actions"
+                className="hidden size-8 md:inline-flex"
+                aria-label="Toggle files panel"
+                title="Files"
+                aria-pressed={filesOpen}
+                onClick={() => setFilesOpen((v) => !v)}
               >
-                <MoreHorizontal className="size-4" />
+                <FolderOpen className="size-4" />
               </Button>
-            )}
+            </>
+          }
+        />
+      ) : (
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0"
+            onClick={() => router.back()}
+            aria-label="Back"
           >
-            <DropdownMenuItem
-              disabled={!agent || renameM.isPending}
-              onSelect={() => {
-                if (!agent) return;
-                setDraftName(agent.name ?? agentTitle(agent));
-                setEditingName(true);
-              }}
-            >
-              <Pencil className="size-4" aria-hidden />
-              Rename
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={!agent || pinM.isPending}
-              onSelect={() => pinM.mutate(!agent?.pinned_at)}
-            >
-              {agent?.pinned_at ? (
-                <PinOff className="size-4" aria-hidden />
-              ) : (
-                <Pin className="size-4" aria-hidden />
-              )}
-              {agent?.pinned_at ? "Unpin" : "Pin"}
-            </DropdownMenuItem>
-            {agent && (
-              <DropdownMenuItem
-                href={`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`}
-              >
-                <FolderOpen className="size-4" aria-hidden />
-                Browse files
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem
-              disabled={!agent || archiveM.isPending || unarchiveM.isPending}
-              onSelect={() => (archived ? unarchiveM.mutate() : archiveM.mutate())}
-            >
-              {archived ? (
-                <ArchiveRestore className="size-4" aria-hidden />
-              ) : (
-                <Archive className="size-4" aria-hidden />
-              )}
-              {archived ? "Unarchive" : "Archive"}
-            </DropdownMenuItem>
-            {agent && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel className="space-y-1">
-                  <div className="truncate font-mono" title={agent.argv.join(" ")}>
-                    {agent.argv.join(" ")}
-                  </div>
-                  <div className="truncate font-mono" title={agent.cwd}>
-                    {agent.cwd}
-                  </div>
-                  {agent.tmux_session && (
-                    <div className="truncate font-mono" title={agent.tmux_session}>
-                      tmux {agent.tmux_session}
-                    </div>
-                  )}
-                  {skillsSummary && (
-                    <div className="truncate" title={skillsSummary}>
-                      skills: {skillsSummary}
-                    </div>
-                  )}
-                </DropdownMenuLabel>
-              </>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              destructive
-              disabled={deleteM.isPending}
-              onSelect={() => {
-                if (confirm("Delete this agent?")) deleteM.mutate();
-              }}
-            >
-              <Trash2 className="size-4" aria-hidden />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenu>
-        </div>
-      </header>
+            <ArrowLeft className="size-4" />
+          </Button>
+          <span className="text-sm text-muted-foreground">loading…</span>
+        </header>
+      )}
 
       {q.error && (
         <p className="p-4 text-sm text-destructive">Failed to load agent: {String(q.error)}</p>

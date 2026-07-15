@@ -4,13 +4,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
   Columns3,
-  ExternalLink,
   FolderOpen,
   Grid2x2,
   Home,
   Maximize2,
   Minimize2,
-  MoreHorizontal,
   PanelLeft,
   Pencil,
   Pin,
@@ -34,11 +32,11 @@ import {
   useState,
 } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
-import { AgentPaneMenuItems } from "@/components/agents/AgentPaneMenu";
+import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
-import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
+import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import {
@@ -48,8 +46,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { AgentStatusDot } from "@/components/ui/status";
-import { agentActivityDetail, agentNeedsAttention, agentTitle } from "@/lib/agents";
+import { agentNeedsAttention, agentTitle } from "@/lib/agents";
 import { type Agent, ApiError, agents, type Screen, screens } from "@/lib/api";
 import {
   AGENT_DRAG_MIME,
@@ -73,6 +70,7 @@ import {
   type SplitPath,
   setRatioAt,
 } from "@/lib/layout";
+import { defaultScreenName } from "@/lib/screens";
 import { cn } from "@/lib/utils";
 
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -184,12 +182,8 @@ function ScreenView({ id }: { id: string }) {
     onError,
   });
   const createM = useMutation({
-    mutationFn: () => {
-      const existing = new Set((screensQ.data ?? []).map((screen) => screen.name));
-      let n = (screensQ.data?.length ?? 0) + 1;
-      while (existing.has(`Screen ${n}`)) n += 1;
-      return screens.create({ name: `Screen ${n}`, layout: { root: null } });
-    },
+    mutationFn: () =>
+      screens.create({ name: defaultScreenName(screensQ.data ?? []), layout: { root: null } }),
     onSuccess: (created) => {
       qc.invalidateQueries({ queryKey: ["screens"] });
       router.push(`/screens/${created.id}`);
@@ -1076,110 +1070,75 @@ function ScreenPane({
         />
       )}
 
-      {/* Mini pane header — draggable to rearrange or move across screens.
-          Double-click mirrors the zoom button; every action has a button
-          equivalent, so the handler is a pointer convenience only. */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: drag handle with button equivalents */}
-      <div
-        draggable={Boolean(agent)}
-        onDragStart={(event) => {
-          if (!agent) return;
-          setAgentDragData(event.dataTransfer, agentId, agentTitle(agent), screenId);
-        }}
-        onDoubleClick={() => !stacked && onToggleZoom(agentId)}
-        className="flex h-8 shrink-0 cursor-grab items-center gap-1.5 border-b border-border/70 bg-card/60 px-2 active:cursor-grabbing"
-      >
-        {agent ? (
-          <>
-            <span className="relative shrink-0">
-              <AgentKindIcon agent={agent} className="size-5 rounded-md" iconClassName="size-3" />
-              <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5 size-1.5" />
-            </span>
-            <span className="min-w-0 truncate text-xs font-medium">{agentTitle(agent)}</span>
-            {attention && (
-              <span
-                title={attention === "dead" ? "Agent exited" : "Awaiting input"}
-                className={cn(
-                  "size-1.5 shrink-0 rounded-full",
-                  attention === "dead" ? "bg-red-500" : "animate-pulse bg-amber-400",
-                )}
-              />
-            )}
-            <span className="hidden min-w-0 truncate text-[10px] text-muted-foreground lg:inline">
-              {agentActivityDetail(agent)}
-            </span>
-            {displayOwner === false && (
-              <span
-                title="Another window controls this terminal's size"
-                className="shrink-0 rounded border border-border px-1 text-[9px] uppercase tracking-wide text-muted-foreground"
-              >
-                viewer
-              </span>
-            )}
-            <ConnectionChip info={connInfo} compact className="shrink-0" />
-            <span className="flex-1" />
-            <DropdownMenu
-              align="end"
-              menuClassName="w-56"
-              renderTrigger={(triggerProps) => (
+      {/* Pane header — the same AgentSurfaceHeader the full agent page uses,
+          in its dense variant, so a pane and the standalone view are one
+          surface at two sizes. The header itself is the drag handle. */}
+      {agent ? (
+        <AgentSurfaceHeader
+          agent={agent}
+          connInfo={connInfo}
+          displayOwner={displayOwner}
+          dense
+          getHandle={() => termRef.current}
+          onError={onPaneError}
+          onDeleted={() => onRootChange(removePane(root, agentId))}
+          headerProps={{
+            draggable: true,
+            onDragStart: (event) =>
+              setAgentDragData(
+                (event as unknown as React.DragEvent).dataTransfer,
+                agentId,
+                agentTitle(agent),
+                screenId,
+              ),
+            onDoubleClick: () => !stacked && onToggleZoom(agentId),
+            className: "cursor-grab active:cursor-grabbing",
+          }}
+          trailing={
+            <>
+              {!stacked && (
                 <button
-                  {...triggerProps}
                   type="button"
-                  aria-label={`${agentTitle(agent)} pane actions`}
+                  aria-label={zoomed ? "Restore pane" : "Zoom pane"}
+                  title={zoomed ? "Restore" : "Zoom (fill the screen)"}
+                  onClick={() => onToggleZoom(agentId)}
                   className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
                 >
-                  <MoreHorizontal className="size-3" aria-hidden />
+                  {zoomed ? (
+                    <Minimize2 className="size-3" aria-hidden />
+                  ) : (
+                    <Maximize2 className="size-3" aria-hidden />
+                  )}
                 </button>
               )}
-            >
-              <AgentPaneMenuItems
-                agent={agent}
-                getHandle={() => termRef.current}
-                onError={onPaneError}
-              />
-            </DropdownMenu>
-            {!stacked && (
               <button
                 type="button"
-                aria-label={zoomed ? "Restore pane" : "Zoom pane"}
-                title={zoomed ? "Restore" : "Zoom (fill the screen)"}
-                onClick={() => onToggleZoom(agentId)}
+                aria-label="Remove pane"
+                title="Remove from screen"
+                onClick={() => onRootChange(removePane(root, agentId))}
                 className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
               >
-                {zoomed ? (
-                  <Minimize2 className="size-3" aria-hidden />
-                ) : (
-                  <Maximize2 className="size-3" aria-hidden />
-                )}
+                <X className="size-3" aria-hidden />
               </button>
-            )}
-            <Link
-              href={`/agents/${agentId}`}
-              aria-label={`Open ${agentTitle(agent)} full screen`}
-              title="Open full page"
-              className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
-            >
-              <ExternalLink className="size-3" aria-hidden />
-            </Link>
-          </>
-        ) : (
-          <>
-            <span className="min-w-0 truncate text-xs text-muted-foreground">
-              Agent no longer exists
-            </span>
-            <span className="flex-1" />
-          </>
-        )}
-        <button
-          type="button"
-          aria-label="Remove pane"
-          title="Remove from screen"
-          onClick={() => onRootChange(removePane(root, agentId))}
-          className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
-        >
-          <X className="size-3" aria-hidden />
-        </button>
-      </div>
+            </>
+          }
+        />
+      ) : (
+        <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border/70 bg-card/60 px-2">
+          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+            Agent no longer exists
+          </span>
+          <button
+            type="button"
+            aria-label="Remove pane"
+            title="Remove from screen"
+            onClick={() => onRootChange(removePane(root, agentId))}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+          >
+            <X className="size-3" aria-hidden />
+          </button>
+        </div>
+      )}
 
       {agent ? (
         <div className="relative min-h-0 flex-1 @container/term">

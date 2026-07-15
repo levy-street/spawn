@@ -4,12 +4,14 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   Archive,
+  ArchiveRestore,
   ExternalLink,
   FolderOpen,
   Pencil,
   Pin,
   PinOff,
   RotateCcw,
+  Trash2,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
@@ -30,10 +32,12 @@ export function AgentPaneMenuItems({
   agent,
   getHandle,
   onError,
+  onDeleted,
 }: {
   agent: Agent;
   getHandle?: () => TerminalHandle | null;
   onError: (message: string) => void;
+  onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
   const router = useRouter();
@@ -60,8 +64,16 @@ export function AgentPaneMenuItems({
     onError: (err) => onError(String(err)),
   });
   const archiveM = useMutation({
-    mutationFn: () => agents.archive(agent.id),
+    mutationFn: () => (agent.archived_at ? agents.unarchive(agent.id) : agents.archive(agent.id)),
     onSuccess: invalidate,
+    onError: (err) => onError(String(err)),
+  });
+  const deleteM = useMutation({
+    mutationFn: () => agents.remove(agent.id),
+    onSuccess: () => {
+      invalidate();
+      onDeleted?.();
+    },
     onError: (err) => onError(String(err)),
   });
 
@@ -72,9 +84,7 @@ export function AgentPaneMenuItems({
         Open full page
       </DropdownMenuItem>
       <DropdownMenuItem
-        onSelect={() =>
-          router.push(`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`)
-        }
+        href={`/hosts/${agent.host_id}/files?path=${encodeURIComponent(agent.cwd)}`}
       >
         <FolderOpen className="size-4" aria-hidden />
         Browse files
@@ -116,9 +126,22 @@ export function AgentPaneMenuItems({
         </DropdownMenuItem>
       )}
       <DropdownMenuSeparator />
-      <DropdownMenuItem destructive onSelect={() => archiveM.mutate()}>
-        <Archive className="size-4" aria-hidden />
-        Archive
+      <DropdownMenuItem onSelect={() => archiveM.mutate()}>
+        {agent.archived_at ? (
+          <ArchiveRestore className="size-4" aria-hidden />
+        ) : (
+          <Archive className="size-4" aria-hidden />
+        )}
+        {agent.archived_at ? "Unarchive" : "Archive"}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        destructive
+        onSelect={() => {
+          if (confirm(`Delete ${agentTitle(agent)}? This cannot be undone.`)) deleteM.mutate();
+        }}
+      >
+        <Trash2 className="size-4" aria-hidden />
+        Delete agent
       </DropdownMenuItem>
       <DropdownMenuSeparator />
       <DropdownMenuLabel className="space-y-1">

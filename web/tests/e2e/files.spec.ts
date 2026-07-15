@@ -246,7 +246,7 @@ test("agent menu links to the host file explorer at the agent cwd", async ({ pag
   await mockAuthenticatedApi(page, { agents: [agent()] });
 
   await page.goto(`/agents/${agent().id}`);
-  await page.getByRole("button", { name: "Agent actions" }).click();
+  await page.locator("header").getByRole("button", { name: "palette actions" }).click();
 
   const item = page.getByRole("menuitem", { name: "Browse files" });
   await expect(item).toHaveAttribute(

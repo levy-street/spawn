@@ -19,22 +19,28 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Fragment, type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
+import { ScreenIcon } from "@/components/screens/ScreenIcon";
 import {
   DropdownMenu,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { AgentStatusDot, hostStatusTone, StatusDot } from "@/components/ui/status";
+import { AgentStatusDot } from "@/components/ui/status";
 import { RailTooltip } from "@/components/ui/tooltip";
-import { agentActivityDetail, agentNeedsAttention, agentTitle } from "@/lib/agents";
-import { type Agent, agents, type Host, hosts, type Screen, screens } from "@/lib/api";
+import { agentActivityDetail, agentTitle } from "@/lib/agents";
+import { type Agent, agents, type Screen, screens } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { setAgentDragData } from "@/lib/dnd";
-import { collectAgentIds } from "@/lib/layout";
+import {
+  screenAgentIds,
+  screenAttentionCount,
+  screenPaneCount,
+  screenRecency,
+} from "@/lib/screens";
 import { cn } from "@/lib/utils";
 
 export const SIDEBAR_RAIL_WIDTH = 56;
@@ -242,13 +248,6 @@ export function Sidebar({
   );
 }
 
-type HostGroup = {
-  hostId: string;
-  hostName: string;
-  host: Host | undefined;
-  agents: Agent[];
-};
-
 function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boolean }) {
   const qc = useQueryClient();
   const router = useRouter();
@@ -257,16 +256,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     queryFn: () => agents.list(),
     refetchInterval: 5_000,
   });
-  const hostsQ = useQuery({
-    queryKey: ["hosts"],
-    queryFn: hosts.list,
-    refetchInterval: 30_000,
-  });
 
-  const groups = useMemo(
-    () => groupAgentsByHost(agentsQ.data ?? [], hostsQ.data ?? []),
-    [agentsQ.data, hostsQ.data],
-  );
   const screensQ = useQuery({
     queryKey: ["screens"],
     queryFn: screens.list,
@@ -276,18 +266,37 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
   const currentScreenId = /^\/screens\/([^/?]+)/.exec(pathname)?.[1] ?? null;
   const currentScreen = allScreens.find((item) => item.id === currentScreenId) ?? null;
   const currentScreenAgentIds = useMemo(
-    () => (currentScreen ? collectAgentIds(currentScreen.layout.root ?? null) : []),
+    () => (currentScreen ? screenAgentIds(currentScreen) : []),
     [currentScreen],
   );
   const agentsById = useMemo(
     () => new Map((agentsQ.data ?? []).map((agent) => [agent.id, agent])),
     [agentsQ.data],
   );
-  const screenAttention = (item: Screen) =>
-    collectAgentIds(item.layout.root ?? null).filter((agentId) => {
-      const agent = agentsById.get(agentId);
-      return agent && agentNeedsAttention(agent) !== null;
-    }).length;
+
+  // Recents: agents and screens as one recency-sorted list (pinned agents
+  // float to the top), so the sidebar has a single mental model instead of
+  // "agents grouped by host" plus a separate "screens" shelf.
+  const recents = useMemo<RecentItem[]>(() => {
+    const agentItems: RecentItem[] = (agentsQ.data ?? []).map((agent) => ({
+      kind: "agent",
+      id: agent.id,
+      recency: agentRecency(agent),
+      pinned: Boolean(agent.pinned_at),
+      agent,
+    }));
+    const screenItems: RecentItem[] = allScreens.map((item) => ({
+      kind: "screen",
+      id: item.id,
+      recency: screenRecency(item, agentsById),
+      pinned: false,
+      screen: item,
+    }));
+    return [...agentItems, ...screenItems].sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return b.recency - a.recency;
+    });
+  }, [agentsQ.data, allScreens, agentsById]);
 
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -331,6 +340,15 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     },
     onError: (err) => setActionError(String(err)),
   });
+  const deleteScreenM = useMutation({
+    mutationFn: (screenId: string) => screens.remove(screenId),
+    onSuccess: (_result, screenId) => {
+      setActionError(null);
+      qc.invalidateQueries({ queryKey: ["screens"] });
+      if (pathname === `/screens/${screenId}`) router.push("/agents");
+    },
+    onError: (err) => setActionError(String(err)),
+  });
   const pinM = useMutation({
     mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
       pinned ? agents.pin(id) : agents.unpin(id),
@@ -347,6 +365,7 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
     deleteM.isPending ||
     restartM.isPending ||
     pinM.isPending;
+  const screenBusy = deleteScreenM.isPending;
 
   const promptRename = (agent: Agent) => {
     const next = prompt("Rename agent", agent.name ?? agentTitle(agent));
@@ -358,255 +377,264 @@ function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boole
 
   return (
     <section
-      aria-label="Agents by host"
+      aria-label="Recents"
       className="mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2.5 pb-2"
     >
       {actionError && !collapsed && (
         <p className="mb-1 px-1.5 text-[11px] text-destructive">{actionError}</p>
       )}
-      {allScreens.length > 0 && (
-        <ul className="mb-1">
-          <li aria-hidden={collapsed}>
-            <span
-              className={cn(
-                "flex items-center gap-1.5 overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
-                collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
-              )}
-            >
-              Screens
-            </span>
-          </li>
-          {allScreens.map((item) => {
-            const active = currentScreenId === item.id;
-            const attention = screenAttention(item);
-            const paneTotal = collectAgentIds(item.layout.root ?? null).length;
-            return (
-              <li key={item.id} className="my-0.5">
-                <RailTooltip label={item.name} disabled={!collapsed}>
-                  <Link
-                    href={`/screens/${item.id}`}
-                    aria-current={active ? "page" : undefined}
-                    className={rowClass(active)}
-                  >
-                    <IconSlot>
-                      <span className="relative">
-                        <LayoutGrid className="size-4" aria-hidden />
-                        {attention > 0 && (
-                          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-amber-400" />
-                        )}
-                      </span>
-                    </IconSlot>
-                    <RowLabel collapsed={collapsed}>
-                      <span className="flex items-center gap-1 text-xs font-medium leading-4">
-                        <span className="truncate">{item.name}</span>
-                        <span className="shrink-0 text-[10px] font-normal text-muted-foreground">
-                          {paneTotal}
-                        </span>
-                        {attention > 0 && (
-                          <span className="shrink-0 rounded-full bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-500">
-                            {attention}
-                          </span>
-                        )}
-                      </span>
-                    </RowLabel>
-                  </Link>
-                </RailTooltip>
-              </li>
-            );
-          })}
-        </ul>
-      )}
       <ul>
-        {groups.map((group) => (
-          <Fragment key={group.hostId}>
-            <li aria-hidden={collapsed} className="relative">
-              {/* Host header cross-fades into a rail divider when collapsed. */}
-              <Link
-                href={group.host ? `/hosts/${group.hostId}` : "/hosts"}
-                tabIndex={collapsed ? -1 : 0}
-                className={cn(
-                  "flex items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all hover:text-foreground",
-                  collapsed
-                    ? "pointer-events-none h-4 opacity-0 duration-100"
-                    : "h-7 opacity-100 delay-75 duration-150",
-                )}
-              >
-                <StatusDot
-                  tone={hostStatusTone(group.host?.status ?? "offline")}
-                  className="size-1.5"
-                />
-                <span className="truncate">{group.hostName}</span>
-                <span className="font-normal normal-case">{group.agents.length}</span>
-              </Link>
-              <span
-                aria-hidden
-                className={cn(
-                  "absolute left-1/2 top-1/2 h-px w-6 -translate-x-1/2 -translate-y-1/2 bg-border transition-opacity",
-                  collapsed ? "opacity-100 delay-75 duration-150" : "opacity-0 duration-100",
-                )}
-              />
-            </li>
-            {group.agents.map((agent) => {
-              const onCurrentScreen =
-                currentScreenId !== null && currentScreenAgentIds.includes(agent.id);
-              const agentHref = onCurrentScreen
-                ? `/screens/${currentScreenId}?focus=${agent.id}`
-                : `/agents/${agent.id}`;
-              const active = pathname === `/agents/${agent.id}`;
-              return (
-                <li key={agent.id} className="group/agentrow relative my-0.5">
-                  <RailTooltip
-                    label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}`}
-                    disabled={!collapsed}
-                  >
-                    <Link
-                      href={agentHref}
-                      aria-current={active ? "page" : undefined}
-                      draggable
-                      onDragStart={(event) => {
-                        setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
-                      }}
-                      className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
-                    >
-                      <IconSlot>
-                        <span className="relative">
-                          <AgentKindIcon agent={agent} />
-                          <AgentStatusDot
-                            agent={agent}
-                            className="absolute -bottom-0.5 -right-0.5"
-                          />
-                        </span>
-                      </IconSlot>
-                      <RowLabel collapsed={collapsed}>
-                        <span className="flex items-center gap-1 text-xs font-medium leading-4">
-                          <span className="truncate">{agentTitle(agent)}</span>
-                          {agent.pinned_at && (
-                            <Pin
-                              className="size-3 shrink-0 text-muted-foreground"
-                              aria-label="Pinned"
-                            />
-                          )}
-                        </span>
-                        <span className="block truncate text-[10px] leading-3 opacity-70">
-                          {agentActivityDetail(agent)}
-                        </span>
-                      </RowLabel>
-                    </Link>
-                  </RailTooltip>
-                  {!collapsed && (
-                    <DropdownMenu
-                      className="absolute right-1 top-1/2 -translate-y-1/2"
-                      menuClassName="w-44"
-                      renderTrigger={(props) => (
-                        <button
-                          {...props}
-                          type="button"
-                          aria-label={`${agentTitle(agent)} actions`}
-                          className={cn(
-                            "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
-                            "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
-                          )}
-                        >
-                          <MoreHorizontal className="size-3.5" aria-hidden />
-                        </button>
-                      )}
-                    >
-                      <DropdownMenuItem disabled={busy} onSelect={() => promptRename(agent)}>
-                        <Pencil className="size-4" aria-hidden />
-                        Rename
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        disabled={busy}
-                        onSelect={() => pinM.mutate({ id: agent.id, pinned: !agent.pinned_at })}
-                      >
-                        {agent.pinned_at ? (
-                          <PinOff className="size-4" aria-hidden />
-                        ) : (
-                          <Pin className="size-4" aria-hidden />
-                        )}
-                        {agent.pinned_at ? "Unpin" : "Pin"}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        disabled={busy}
-                        onSelect={() => {
-                          if (confirm(`Restart ${agentTitle(agent)}?`)) restartM.mutate(agent.id);
-                        }}
-                      >
-                        <RotateCcw className="size-4" aria-hidden />
-                        Restart
-                      </DropdownMenuItem>
-                      <DropdownMenuItem disabled={busy} onSelect={() => archiveM.mutate(agent.id)}>
-                        <Archive className="size-4" aria-hidden />
-                        Archive
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        destructive
-                        disabled={busy}
-                        onSelect={() => {
-                          if (confirm(`Delete ${agentTitle(agent)}?`)) deleteM.mutate(agent.id);
-                        }}
-                      >
-                        <Trash2 className="size-4" aria-hidden />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenu>
-                  )}
-                </li>
-              );
-            })}
-          </Fragment>
-        ))}
-        {!agentsQ.isLoading && groups.length === 0 && !collapsed && (
-          <li className="px-1.5 py-1 text-xs text-muted-foreground">No agents yet</li>
+        <li aria-hidden={collapsed}>
+          <span
+            className={cn(
+              "flex items-center overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
+              collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
+            )}
+          >
+            Recents
+          </span>
+        </li>
+        {recents.map((item) =>
+          item.kind === "screen" ? (
+            <ScreenRow
+              key={`screen-${item.id}`}
+              screen={item.screen}
+              agentsById={agentsById}
+              collapsed={collapsed}
+              active={currentScreenId === item.id}
+              busy={screenBusy}
+              onDelete={() => {
+                if (confirm(`Delete screen ${item.screen.name}?`)) deleteScreenM.mutate(item.id);
+              }}
+            />
+          ) : (
+            <AgentRow
+              key={`agent-${item.id}`}
+              agent={item.agent}
+              collapsed={collapsed}
+              active={pathname === `/agents/${item.id}`}
+              href={
+                currentScreenId !== null && currentScreenAgentIds.includes(item.id)
+                  ? `/screens/${currentScreenId}?focus=${item.id}`
+                  : `/agents/${item.id}`
+              }
+              busy={busy}
+              onRename={() => promptRename(item.agent)}
+              onPin={() => pinM.mutate({ id: item.id, pinned: !item.agent.pinned_at })}
+              onRestart={() => {
+                if (confirm(`Restart ${agentTitle(item.agent)}?`)) restartM.mutate(item.id);
+              }}
+              onArchive={() => archiveM.mutate(item.id)}
+              onDelete={() => {
+                if (confirm(`Delete ${agentTitle(item.agent)}?`)) deleteM.mutate(item.id);
+              }}
+            />
+          ),
+        )}
+        {!agentsQ.isLoading && recents.length === 0 && !collapsed && (
+          <li className="px-1.5 py-1 text-xs text-muted-foreground">Nothing yet</li>
         )}
       </ul>
     </section>
   );
 }
 
-function groupAgentsByHost(agentList: Agent[], hostList: Host[]): HostGroup[] {
-  const hostsById = new Map(hostList.map((host) => [host.id, host]));
-  const byHost = new Map<string, Agent[]>();
-  for (const agent of agentList) {
-    const list = byHost.get(agent.host_id) ?? [];
-    list.push(agent);
-    byHost.set(agent.host_id, list);
-  }
-  const groups: HostGroup[] = [];
-  for (const [hostId, list] of byHost) {
-    const host = hostsById.get(hostId);
-    groups.push({
-      hostId,
-      hostName: host?.name ?? list[0]?.host_name ?? "unknown host",
-      host,
-      agents: list.sort(compareAgents),
-    });
-  }
-  return groups.sort((a, b) => {
-    const aOnline = a.host?.status === "online" ? 0 : 1;
-    const bOnline = b.host?.status === "online" ? 0 : 1;
-    if (aOnline !== bOnline) return aOnline - bOnline;
-    // Surface the host you touched last so its agents sit on top.
-    const byRecency = groupRecency(b) - groupRecency(a);
-    if (byRecency !== 0) return byRecency;
-    return a.hostName.localeCompare(b.hostName);
-  });
-}
+type RecentItem =
+  | { kind: "agent"; id: string; recency: number; pinned: boolean; agent: Agent }
+  | { kind: "screen"; id: string; recency: number; pinned: false; screen: Screen };
 
-function groupRecency(group: HostGroup): number {
-  return Math.max(0, ...group.agents.map(lastInputTime));
-}
-
-function compareAgents(a: Agent, b: Agent): number {
-  if (Boolean(a.pinned_at) !== Boolean(b.pinned_at)) return a.pinned_at ? -1 : 1;
-  const byInput = lastInputTime(b) - lastInputTime(a);
-  if (byInput !== 0) return byInput;
-  return agentTitle(a).localeCompare(agentTitle(b));
-}
-
-function lastInputTime(agent: Agent): number {
-  const value = agent.last_input_at ?? agent.started_at;
+function agentRecency(agent: Agent): number {
+  const value = agent.last_activity_at ?? agent.last_input_at ?? agent.started_at;
   const time = Date.parse(value);
   return Number.isFinite(time) ? time : 0;
+}
+
+function AgentRow({
+  agent,
+  collapsed,
+  active,
+  href,
+  busy,
+  onRename,
+  onPin,
+  onRestart,
+  onArchive,
+  onDelete,
+}: {
+  agent: Agent;
+  collapsed: boolean;
+  active: boolean;
+  href: string;
+  busy: boolean;
+  onRename: () => void;
+  onPin: () => void;
+  onRestart: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <li className="group/agentrow relative my-0.5">
+      <RailTooltip
+        label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}`}
+        disabled={!collapsed}
+      >
+        <Link
+          href={href}
+          aria-current={active ? "page" : undefined}
+          draggable
+          onDragStart={(event) => {
+            setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
+          }}
+          className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
+        >
+          <IconSlot>
+            <span className="relative">
+              <AgentKindIcon agent={agent} />
+              <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
+            </span>
+          </IconSlot>
+          <RowLabel collapsed={collapsed}>
+            <span className="flex items-center gap-1 text-xs font-medium leading-4">
+              <span className="truncate">{agentTitle(agent)}</span>
+              {agent.pinned_at && (
+                <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
+              )}
+            </span>
+            <span className="block truncate text-[10px] leading-3 opacity-70">
+              {agentActivityDetail(agent)}
+            </span>
+          </RowLabel>
+        </Link>
+      </RailTooltip>
+      {!collapsed && (
+        <DropdownMenu
+          className="absolute right-1 top-1/2 -translate-y-1/2"
+          menuClassName="w-44"
+          renderTrigger={(props) => (
+            <button
+              {...props}
+              type="button"
+              aria-label={`${agentTitle(agent)} actions`}
+              className={cn(
+                "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
+                "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
+              )}
+            >
+              <MoreHorizontal className="size-3.5" aria-hidden />
+            </button>
+          )}
+        >
+          <DropdownMenuItem disabled={busy} onSelect={onRename}>
+            <Pencil className="size-4" aria-hidden />
+            Rename
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={busy} onSelect={onPin}>
+            {agent.pinned_at ? (
+              <PinOff className="size-4" aria-hidden />
+            ) : (
+              <Pin className="size-4" aria-hidden />
+            )}
+            {agent.pinned_at ? "Unpin" : "Pin"}
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={busy} onSelect={onRestart}>
+            <RotateCcw className="size-4" aria-hidden />
+            Restart
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={busy} onSelect={onArchive}>
+            <Archive className="size-4" aria-hidden />
+            Archive
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>
+            <Trash2 className="size-4" aria-hidden />
+            Delete
+          </DropdownMenuItem>
+        </DropdownMenu>
+      )}
+    </li>
+  );
+}
+
+function ScreenRow({
+  screen,
+  agentsById,
+  collapsed,
+  active,
+  busy,
+  onDelete,
+}: {
+  screen: Screen;
+  agentsById: Map<string, Agent>;
+  collapsed: boolean;
+  active: boolean;
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const paneCount = screenPaneCount(screen);
+  const attention = screenAttentionCount(screen, agentsById);
+  return (
+    <li className="group/agentrow relative my-0.5">
+      <RailTooltip label={`${screen.name} · ${paneCount} panes`} disabled={!collapsed}>
+        <Link
+          href={`/screens/${screen.id}`}
+          aria-current={active ? "page" : undefined}
+          className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
+        >
+          <IconSlot>
+            <span className="relative">
+              <ScreenIcon paneCount={paneCount} />
+              {attention > 0 && (
+                <span className="absolute -right-1 -top-1 size-2 rounded-full bg-amber-400" />
+              )}
+            </span>
+          </IconSlot>
+          <RowLabel collapsed={collapsed}>
+            <span className="flex items-center gap-1 text-xs font-medium leading-4">
+              <span className={cn("truncate", screen.ephemeral && "italic opacity-80")}>
+                {screen.name}
+              </span>
+              {attention > 0 && (
+                <span className="shrink-0 rounded-full bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-500">
+                  {attention}
+                </span>
+              )}
+            </span>
+            <span className="block truncate text-[10px] leading-3 opacity-70">
+              {paneCount} {paneCount === 1 ? "pane" : "panes"}
+              {screen.ephemeral ? " · temporary" : ""}
+            </span>
+          </RowLabel>
+        </Link>
+      </RailTooltip>
+      {!collapsed && (
+        <DropdownMenu
+          className="absolute right-1 top-1/2 -translate-y-1/2"
+          menuClassName="w-44"
+          renderTrigger={(props) => (
+            <button
+              {...props}
+              type="button"
+              aria-label={`${screen.name} actions`}
+              className={cn(
+                "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
+                "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
+              )}
+            >
+              <MoreHorizontal className="size-3.5" aria-hidden />
+            </button>
+          )}
+        >
+          <DropdownMenuItem href={`/screens/${screen.id}`}>
+            <LayoutGrid className="size-4" aria-hidden />
+            Open screen
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>
+            <Trash2 className="size-4" aria-hidden />
+            Delete screen
+          </DropdownMenuItem>
+        </DropdownMenu>
+      )}
+    </li>
+  );
 }
