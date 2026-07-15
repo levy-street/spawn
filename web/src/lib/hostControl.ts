@@ -37,6 +37,10 @@ type SignalMessage =
   | ({ type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit } & SignalMetadata)
   | ({ type: "rtc.status"; session_id?: string; status: string } & SignalMetadata);
 
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export interface HostControlRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -88,6 +92,7 @@ export class HostControlClient {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.clearConnectDeadline();
     this.cleanupRtc(true);
     this.ws?.close(1000, "host control closed");
     this.ws = null;
@@ -103,7 +108,7 @@ export class HostControlClient {
     if (this.state !== "ready" || this.channel?.readyState !== "open") {
       return Promise.reject(new Error("Host control channel is not ready"));
     }
-    if (this.pending.size >= (this.options.maxPendingRequests ?? MAX_PENDING_REQUESTS)) {
+    if (this.pending.size >= this.maxPendingRequests()) {
       return Promise.reject(new Error("Too many pending host control requests"));
     }
     if (options.signal?.aborted) {
@@ -164,6 +169,14 @@ export class HostControlClient {
   private openWebSocket(): void {
     if (this.stopped) return;
     this.setState("connecting");
+    this.clearConnectDeadline();
+    this.connectTimer = setTimeout(
+      () => {
+        this.connectTimer = null;
+        this.failRtc();
+      },
+      Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
+    );
     let ws: WebSocket;
     try {
       ws = new WebSocket(buildHostWsUrl(this.hostId), HOST_SIGNAL_SUBPROTOCOL);
@@ -174,17 +187,22 @@ export class HostControlClient {
     }
     this.ws = ws;
     ws.onopen = () => {
-      this.reconnectAttempt = 0;
       this.setState("open");
     };
     ws.onmessage = (event) => {
       if (typeof event.data !== "string") return;
-      let message: SignalMessage;
+      let parsed: unknown;
       try {
-        message = JSON.parse(event.data) as SignalMessage;
+        parsed = JSON.parse(event.data);
       } catch {
+        this.failRtc();
         return;
       }
+      if (!isJsonObject(parsed)) {
+        this.failRtc();
+        return;
+      }
+      const message = parsed as unknown as SignalMessage;
       if (!this.matchesMetadata(message)) return;
       if (message.type === "rtc.config" && message.enabled) {
         void this.startRtc(
@@ -220,6 +238,7 @@ export class HostControlClient {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.clearConnectDeadline();
       this.cleanupRtc(false);
       if (!this.stopped) this.scheduleReconnect();
     };
@@ -238,10 +257,6 @@ export class HostControlClient {
     this.channel = channel;
     this.sessionId = sessionId;
     this.pendingRemoteCandidates = [];
-    this.connectTimer = setTimeout(
-      () => this.failRtc(sessionId),
-      Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
-    );
     pc.onicecandidate = (event) => {
       if (!event.candidate || this.sessionId !== sessionId) return;
       this.sendSignal({
@@ -255,7 +270,7 @@ export class HostControlClient {
         this.failRtc(sessionId);
       }
     };
-    channel.onmessage = (event) => this.handleControlMessage(event.data);
+    channel.onmessage = (event) => this.handleControlMessage(event.data, sessionId);
     channel.onclose = () => {
       this.failRtc(sessionId);
     };
@@ -274,16 +289,28 @@ export class HostControlClient {
     }
   }
 
-  private handleControlMessage(raw: unknown): void {
+  private handleControlMessage(raw: unknown, sessionId: string): void {
+    if (this.sessionId !== sessionId) return;
     if (typeof raw !== "string") {
-      this.failRtc();
+      this.failRtc(sessionId);
       return;
     }
     if (new TextEncoder().encode(raw).byteLength > MAX_CONTROL_FRAME_BYTES) {
-      this.failRtc();
+      this.failRtc(sessionId);
       return;
     }
-    let message: {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.failRtc(sessionId);
+      return;
+    }
+    if (!isJsonObject(parsed)) {
+      this.failRtc(sessionId);
+      return;
+    }
+    const message = parsed as {
       version?: number;
       type?: string;
       protocol?: string;
@@ -292,19 +319,13 @@ export class HostControlClient {
       result?: unknown;
       error?: { code?: string };
     };
-    try {
-      message = JSON.parse(raw);
-    } catch {
-      this.failRtc();
-      return;
-    }
     if (message.version !== HOST_CONTROL_VERSION) {
-      this.failRtc();
+      this.failRtc(sessionId);
       return;
     }
     if (message.type === "hello" && message.protocol === HOST_CONTROL_PROTOCOL) {
-      if (this.connectTimer) clearTimeout(this.connectTimer);
-      this.connectTimer = null;
+      this.clearConnectDeadline();
+      this.reconnectAttempt = 0;
       this.setState("ready");
       return;
     }
@@ -368,8 +389,6 @@ export class HostControlClient {
     const sessionId = this.sessionId;
     this.sessionId = null;
     if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
-    if (this.connectTimer) clearTimeout(this.connectTimer);
-    this.connectTimer = null;
     const channel = this.channel;
     const pc = this.pc;
     this.channel = null;
@@ -393,6 +412,7 @@ export class HostControlClient {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return;
+    this.clearConnectDeadline();
     this.reconnectAttempt += 1;
     const delay = Math.min(
       10_000,
@@ -417,6 +437,17 @@ export class HostControlClient {
     if (this.sessionId === null && this.reconnectTimer) return;
     this.cleanupRtc(true);
     this.scheduleReconnect();
+  }
+
+  private clearConnectDeadline(): void {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+  }
+
+  private maxPendingRequests(): number {
+    const configured = this.options.maxPendingRequests;
+    if (configured === undefined || !Number.isFinite(configured)) return MAX_PENDING_REQUESTS;
+    return Math.max(0, Math.min(MAX_PENDING_REQUESTS, Math.floor(configured)));
   }
 
   private setState(state: HostControlState): void {

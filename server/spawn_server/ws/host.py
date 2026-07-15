@@ -92,6 +92,11 @@ async def _send_status(
     await conn.send_text(_signal_payload("rtc.status", session_id, host_id, status=status_value))
 
 
+async def _binding_is_current_owner(host_id: str, binding: BrowserRtcSession) -> bool:
+    owner = await get_backend().get_ephemeral(host_presence_key(host_id))
+    return owner == binding.daemon_connection_id.encode("ascii")
+
+
 async def _pump_browser_signals(
     conn: HostBrowserConn,
     host_id: str,
@@ -116,7 +121,8 @@ async def _pump_browser_signals(
                 continue
             async with sessions_lock:
                 _prune_sessions(sessions, time.monotonic())
-                if session_id not in sessions:
+                binding = sessions.get(session_id)
+                if binding is None:
                     continue
             frame_type = signal.get("type")
             if frame_type == "rtc.answer":
@@ -128,18 +134,25 @@ async def _pump_browser_signals(
             elif frame_type == "rtc.status":
                 if signal.get("status") not in HOST_RTC_STATUS_ALLOWLIST:
                     continue
-                if signal.get("status") == "connected":
-                    async with sessions_lock:
-                        current = sessions.get(session_id)
-                        if current is None:
-                            continue
-                        sessions[session_id] = BrowserRtcSession(
-                            session_id=current.session_id,
-                            daemon_connection_id=current.daemon_connection_id,
-                            expires_at=float("inf"),
-                        )
             else:
                 continue
+            current_owner = await get_backend().get_ephemeral(host_presence_key(host_id))
+            binding_is_current = current_owner == binding.daemon_connection_id.encode("ascii")
+            if not binding_is_current:
+                if frame_type != "rtc.status" or signal.get("status") != "unavailable":
+                    continue
+                async with sessions_lock:
+                    sessions.pop(session_id, None)
+            elif frame_type == "rtc.status" and signal.get("status") == "connected":
+                async with sessions_lock:
+                    current = sessions.get(session_id)
+                    if current is None:
+                        continue
+                    sessions[session_id] = BrowserRtcSession(
+                        session_id=current.session_id,
+                        daemon_connection_id=current.daemon_connection_id,
+                        expires_at=float("inf"),
+                    )
             await conn.send_text(signal)
 
 
@@ -275,6 +288,11 @@ async def host_ws(
                 if binding is None:
                     await _send_status(conn, host_id, session_id, "failed")
                     continue
+                if not await _binding_is_current_owner(host_id, binding):
+                    async with sessions_lock:
+                        sessions.pop(session_id, None)
+                    await _send_status(conn, host_id, session_id, "unavailable")
+                    continue
                 await _publish_signal(
                     host_id,
                     response_channel,
@@ -296,6 +314,11 @@ async def host_ws(
                     binding = sessions.get(session_id)
                 if candidate is None or binding is None:
                     continue
+                if not await _binding_is_current_owner(host_id, binding):
+                    async with sessions_lock:
+                        sessions.pop(session_id, None)
+                    await _send_status(conn, host_id, session_id, "unavailable")
+                    continue
                 await _publish_signal(
                     host_id,
                     response_channel,
@@ -308,7 +331,7 @@ async def host_ws(
             elif frame_type == "rtc.close":
                 async with sessions_lock:
                     binding = sessions.pop(session_id, None)
-                if binding is not None:
+                if binding is not None and await _binding_is_current_owner(host_id, binding):
                     await _publish_signal(
                         host_id,
                         response_channel,
@@ -325,6 +348,8 @@ async def host_ws(
             sessions.clear()
         for binding in remaining:
             try:
+                if not await _binding_is_current_owner(host_id, binding):
+                    continue
                 await _publish_signal(
                     host_id,
                     response_channel,

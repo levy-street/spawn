@@ -41,6 +41,11 @@ class _InProcPubSub:
     def set_ephemeral(self, key: str, value: bytes, ttl_seconds: int) -> None:
         self._values[key] = (value, time.monotonic() + ttl_seconds)
 
+    def swap_ephemeral(self, key: str, value: bytes, ttl_seconds: int) -> bytes | None:
+        previous = self.get_ephemeral(key)
+        self.set_ephemeral(key, value, ttl_seconds)
+        return previous
+
     def get_ephemeral(self, key: str) -> bytes | None:
         item = self._values.get(key)
         if item is None:
@@ -181,6 +186,24 @@ class RedisBackend:
             return
         assert self._client is not None
         await self._client.set(key, value, ex=ttl_seconds)
+
+    async def swap_ephemeral(
+        self, key: str, value: bytes, *, ttl_seconds: int
+    ) -> bytes | None:
+        """Atomically replace a leased value and return its previous owner."""
+        if self._inproc is not None:
+            return self._inproc.swap_ephemeral(key, value, ttl_seconds)
+        assert self._client is not None
+        previous = await self._client.eval(
+            "local old = redis.call('get', KEYS[1]); "
+            "redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2]); "
+            "return old",
+            1,
+            key,
+            value,
+            ttl_seconds,
+        )
+        return previous if isinstance(previous, bytes) else None
 
     async def get_ephemeral(self, key: str) -> bytes | None:
         if self._inproc is not None:

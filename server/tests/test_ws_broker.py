@@ -462,10 +462,10 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
 
     backend = get_backend()
     key = "spawn:rtc:host:presence-test:owner"
-    old = b"old-daemon"
-    new = b"new-daemon"
+    old = b"a" * 32
+    new = b"b" * 32
     await backend.set_ephemeral(key, old, ttl_seconds=60)
-    await backend.set_ephemeral(key, new, ttl_seconds=60)
+    assert await backend.swap_ephemeral(key, new, ttl_seconds=60) == old
 
     assert not await backend.refresh_ephemeral_if(key, old, ttl_seconds=60)
     assert await backend.get_ephemeral(key) == new
@@ -475,8 +475,11 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     from spawn_server.ws.host_signal import (
         MAX_HOST_SIGNAL_ENVELOPE_BYTES,
+        HostOwnerRevocation,
         HostSignalEnvelope,
+        decode_host_owner_revocation,
         decode_host_signal,
+        encode_host_owner_revocation,
         encode_host_signal,
     )
 
@@ -490,6 +493,9 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     assert decode_host_signal(
         encode_host_signal(valid).replace(b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', b'"invalid"')
     ) is None
+    revocation = HostOwnerRevocation("a" * 32, "d" * 32)
+    assert decode_host_owner_revocation(encode_host_owner_revocation(revocation)) == revocation
+    assert decode_host_owner_revocation(b"null") is None
     with pytest.raises(ValueError, match="too large"):
         encode_host_signal(
             HostSignalEnvelope(

@@ -19,6 +19,7 @@ MAX_HOST_RTC_SESSIONS_PER_HOST = 64
 MAX_HOST_RTC_SESSIONS_PER_DAEMON = 64
 MAX_HOST_SIGNAL_ENVELOPE_BYTES = 1200 * 1024
 HOST_RTC_STATUS_ALLOWLIST = frozenset({"connected", "failed", "unavailable"})
+HOST_OWNER_REVOKED_EVENT = "host.owner_revoked"
 
 
 async def wait_for_signal_pump(pump: asyncio.Task[None], ready: asyncio.Event) -> None:
@@ -84,6 +85,49 @@ class HostSignalEnvelope:
     signal: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class HostOwnerRevocation:
+    revoked_connection_id: str
+    replacement_connection_id: str
+
+
+def encode_host_owner_revocation(event: HostOwnerRevocation) -> bytes:
+    if not valid_daemon_connection_id(
+        event.revoked_connection_id
+    ) or not valid_daemon_connection_id(event.replacement_connection_id):
+        raise ValueError("invalid host signaling owner")
+    return json.dumps(
+        {
+            "type": HOST_OWNER_REVOKED_EVENT,
+            "revoked_connection_id": event.revoked_connection_id,
+            "replacement_connection_id": event.replacement_connection_id,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def decode_host_owner_revocation(payload: bytes) -> HostOwnerRevocation | None:
+    if not payload or len(payload) > 512:
+        return None
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("type") != HOST_OWNER_REVOKED_EVENT:
+        return None
+    revoked = value.get("revoked_connection_id")
+    replacement = value.get("replacement_connection_id")
+    if (
+        not isinstance(revoked, str)
+        or not valid_daemon_connection_id(revoked)
+        or not isinstance(replacement, str)
+        or not valid_daemon_connection_id(replacement)
+        or revoked == replacement
+    ):
+        return None
+    return HostOwnerRevocation(revoked, replacement)
+
+
 def encode_host_signal(envelope: HostSignalEnvelope) -> bytes:
     payload = json.dumps(
         {
@@ -124,6 +168,12 @@ def decode_host_signal(payload: bytes) -> HostSignalEnvelope | None:
 
 async def publish_host_signal(host_id: str, envelope: HostSignalEnvelope) -> None:
     await get_backend().publish_channel(host_signal_channel(host_id), encode_host_signal(envelope))
+
+
+async def publish_host_owner_revocation(host_id: str, event: HostOwnerRevocation) -> None:
+    await get_backend().publish_channel(
+        host_signal_channel(host_id), encode_host_owner_revocation(event)
+    )
 
 
 @dataclass(eq=False, frozen=True)

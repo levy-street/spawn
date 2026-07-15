@@ -155,8 +155,11 @@ zero-agent, TURN-only, reconnect, cancellation, size, and cross-scope behavior
 to be tested before any protected filesystem/tool payload is moved. It does
 not make the Phase 2 claim and does not remove any legacy host content route.
 Host signaling is routed between websocket workers through ephemeral Redis
-pub/sub channels and a compare-refreshed daemon ownership lease; it does not
-depend on process-local broker affinity. Browser, host, and daemon session
+pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
+does not depend on process-local broker affinity. A replacement claim actively
+revokes the previous worker and every host signal revalidates the current lease
+generation, so a stale worker cannot retain or create host sessions during the
+notification race. Browser, host, and daemon session
 counts are capped, pending offers expire, daemon peer connections have a hard
 ceiling, and only the first correctly labelled host DataChannel is accepted.
 The browser's negotiation deadline starts before offer creation and ends only

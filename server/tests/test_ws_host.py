@@ -132,6 +132,8 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     assert config["type"] == "rtc.config"
     assert {key: config[key] for key in _metadata(host_id)} == _metadata(host_id)
 
+    for primitive in ("null", "7", '"primitive"'):
+        browser_ws.queue_raw_text(primitive)
     browser_ws.queue_text(
         {"type": "rtc.offer", "session_id": "zero-agent-session", "sdp": "v=0\r\n", **_metadata(host_id)}
     )
@@ -406,3 +408,56 @@ async def test_host_signaling_rejects_repeated_offers_and_caps_pending_sessions(
 
     browser_socket.queue_disconnect()
     await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))
+
+
+async def test_new_daemon_claim_actively_revokes_established_old_worker_session(client):
+    user_id, token = await _signup(client, "host-rtc-revocation@example.com")
+    host_id = await _create_host(user_id, "revoked-host")
+    old_socket, old_task = await _start_daemon(user_id, host_id)
+    browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
+    browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
+    await _wait_until(lambda: bool(browser_socket.sent_text))
+    browser_socket.queue_text(
+        {
+            "type": "rtc.offer",
+            "session_id": "established-old-owner",
+            "sdp": "v=0\r\n",
+            **_metadata(host_id),
+        }
+    )
+    await _wait_until(
+        lambda: any(message.get("type") == "rtc.offer" for message in _json_messages(old_socket))
+    )
+    old_socket.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": "established-old-owner",
+            "status": "connected",
+            **_metadata(host_id),
+        }
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "rtc.status" and message.get("status") == "connected"
+            for message in _json_messages(browser_socket)
+        )
+    )
+
+    new_socket, new_task = await _start_daemon(user_id, host_id)
+    await asyncio.wait_for(old_task, timeout=1)
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "rtc.status" and message.get("status") == "unavailable"
+            for message in _json_messages(browser_socket)
+        )
+    )
+    assert old_socket.closed == (4000, "superseded")
+    assert any(
+        message.get("type") == "rtc.close"
+        and message.get("session_id") == "established-old-owner"
+        for message in _json_messages(old_socket)
+    )
+    assert await get_broker().rtc_session_for("established-old-owner") is None
+
+    browser_socket.queue_disconnect()
+    await asyncio.gather(browser_task, _stop_daemon(new_socket, new_task))

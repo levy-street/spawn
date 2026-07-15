@@ -23,11 +23,15 @@ from .host_signal import (
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
+    HostOwnerRevocation,
     RedisBrowserConn,
+    decode_host_owner_revocation,
     decode_host_signal,
     host_presence_key,
     host_signal_channel,
+    publish_host_owner_revocation,
     receive_with_signal_pump,
+    valid_daemon_connection_id,
     wait_for_signal_pump,
 )
 
@@ -149,16 +153,34 @@ def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
     )
 
 
-async def _refresh_host_signal_presence(conn: DaemonConn, *, claim: bool = False) -> bool:
+async def _claim_host_signal_presence(conn: DaemonConn) -> None:
     key = host_presence_key(conn.host_id)
     value = conn.id.encode("ascii")
-    if claim:
-        await get_backend().set_ephemeral(
-            key,
-            value,
-            ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
-        )
-        return True
+    previous = await get_backend().swap_ephemeral(
+        key,
+        value,
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+    if previous is None or previous == value:
+        return
+    try:
+        previous_id = previous.decode("ascii")
+    except UnicodeDecodeError:
+        return
+    if not valid_daemon_connection_id(previous_id):
+        return
+    await publish_host_owner_revocation(
+        conn.host_id,
+        HostOwnerRevocation(
+            revoked_connection_id=previous_id,
+            replacement_connection_id=conn.id,
+        ),
+    )
+
+
+async def _refresh_host_signal_presence(conn: DaemonConn) -> bool:
+    key = host_presence_key(conn.host_id)
+    value = conn.id.encode("ascii")
     # A superseded daemon on another worker must never steal routing ownership
     # back merely by sending a late heartbeat.
     return await get_backend().refresh_ephemeral_if(
@@ -168,12 +190,64 @@ async def _refresh_host_signal_presence(conn: DaemonConn, *, claim: bool = False
     )
 
 
+async def _owns_host_signal_presence(conn: DaemonConn) -> bool:
+    return await get_backend().get_ephemeral(host_presence_key(conn.host_id)) == conn.id.encode(
+        "ascii"
+    )
+
+
+async def _revoke_host_rtc_sessions(conn: DaemonConn) -> None:
+    broker = get_broker()
+    for binding in await broker.rtc_sessions_for_daemon(conn):
+        if binding.scope_type != "host":
+            continue
+        try:
+            await binding.browser.send_text(
+                {
+                    "type": "rtc.status",
+                    "session_id": binding.session_id,
+                    "scope_type": "host",
+                    "scope_id": binding.scope_id,
+                    "protocol": binding.protocol,
+                    "protocol_version": binding.protocol_version,
+                    "status": "unavailable",
+                }
+            )
+        except Exception:
+            pass
+        await broker.unregister_rtc_session(binding.session_id, binding.browser)
+        try:
+            await conn.send_text(
+                {
+                    "type": "rtc.close",
+                    "session_id": binding.session_id,
+                    "scope_type": "host",
+                    "scope_id": binding.scope_id,
+                    "protocol": binding.protocol,
+                    "protocol_version": binding.protocol_version,
+                }
+            )
+        except Exception:
+            pass
+
+
+async def _fence_superseded_daemon(conn: DaemonConn) -> None:
+    await _revoke_host_rtc_sessions(conn)
+    try:
+        await conn.websocket.close(code=4000, reason="superseded")
+    except Exception:
+        pass
+
+
 async def _expire_host_rtc_binding(
     binding: RtcSessionBinding,
     daemon: DaemonConn,
 ) -> None:
     await asyncio.sleep(HOST_RTC_SESSION_TTL_SECONDS)
     if not await get_broker().expire_rtc_session(binding.session_id, binding):
+        return
+    if not await _owns_host_signal_presence(daemon):
+        await _fence_superseded_daemon(daemon)
         return
     try:
         await daemon.send_text(
@@ -199,9 +273,21 @@ async def _pump_host_rtc_signals(
     async with get_backend().subscribe_channel(host_signal_channel(conn.host_id)) as stream:
         ready.set()
         async for raw in stream:
+            revocation = decode_host_owner_revocation(raw)
+            if revocation is not None:
+                if (
+                    revocation.revoked_connection_id == conn.id
+                    and not await _owns_host_signal_presence(conn)
+                ):
+                    await _fence_superseded_daemon(conn)
+                    return
+                continue
             envelope = decode_host_signal(raw)
             if envelope is None or envelope.daemon_connection_id != conn.id:
                 continue
+            if not await _owns_host_signal_presence(conn):
+                await _fence_superseded_daemon(conn)
+                return
             signal = envelope.signal
             if not _host_rtc_metadata_matches(signal, conn.host_id):
                 continue
@@ -228,6 +314,9 @@ async def _pump_host_rtc_signals(
                     ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
                 )
                 if not registered:
+                    if not await _owns_host_signal_presence(conn):
+                        await _fence_superseded_daemon(conn)
+                        return
                     await remote_browser.send_text(
                         {
                             "type": "rtc.status",
@@ -246,6 +335,9 @@ async def _pump_host_rtc_signals(
                 expiry_task = asyncio.create_task(_expire_host_rtc_binding(binding, conn))
                 expiry_tasks.add(expiry_task)
                 expiry_task.add_done_callback(expiry_tasks.discard)
+                if not await _owns_host_signal_presence(conn):
+                    await _fence_superseded_daemon(conn)
+                    return
                 await conn.send_text(signal)
                 continue
 
@@ -259,8 +351,14 @@ async def _pump_host_rtc_signals(
                 continue
             if frame_type == "rtc.candidate":
                 if _valid_rtc_candidate(signal.get("candidate")) is not None:
+                    if not await _owns_host_signal_presence(conn):
+                        await _fence_superseded_daemon(conn)
+                        return
                     await conn.send_text(signal)
             elif frame_type == "rtc.close":
+                if not await _owns_host_signal_presence(conn):
+                    await _fence_superseded_daemon(conn)
+                    return
                 await broker.unregister_rtc_session(session_id, binding.browser)
                 await conn.send_text(signal)
 
@@ -338,13 +436,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 except json.JSONDecodeError:
                     log.warning("daemon sent non-JSON text frame")
                     continue
+                if not isinstance(obj, dict):
+                    log.warning("daemon sent non-object JSON text frame")
+                    continue
                 ftype = obj.get("type")
 
                 if ftype == "register":
                     # Claim distributed routing before publishing online state.
                     # That ordering ensures a superseded worker cannot race its
                     # disconnect cleanup after this registration commits.
-                    await _refresh_host_signal_presence(conn, claim=True)
+                    await _claim_host_signal_presence(conn)
                     # Resync existing agents the daemon thinks it has.
                     existing = obj.get("existing_agents") or []
                     home_dir = obj.get("home_dir")
@@ -387,7 +488,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
 
                 elif ftype == "host.heartbeat":
                     if not await _refresh_host_signal_presence(conn):
-                        await websocket.close(code=4000, reason="superseded")
+                        await _fence_superseded_daemon(conn)
                         break
                     async with sm() as session:
                         h = await session.get(Host, host.id)
@@ -515,6 +616,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc answer did not match its registered session")
                             continue
+                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                            conn
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
                         payload: dict[str, object] = {
                             "type": "rtc.answer",
                             "session_id": session_id,
@@ -532,6 +638,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
+                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                                conn
+                            ):
+                                await _fence_superseded_daemon(conn)
+                                break
                             await binding.browser.send_text(payload)
                         except Exception as e:
                             log.warning("rtc answer route failed: %s", e)
@@ -544,6 +655,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc candidate did not match its registered session")
                             continue
+                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                            conn
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
                         payload = {
                             "type": "rtc.candidate",
                             "session_id": session_id,
@@ -561,6 +677,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
+                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                                conn
+                            ):
+                                await _fence_superseded_daemon(conn)
+                                break
                             await binding.browser.send_text(payload)
                         except Exception as e:
                             log.warning("rtc candidate route failed: %s", e)
@@ -573,6 +694,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc status did not match its registered session")
                             continue
+                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                            conn
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
                         if (
                             binding.scope_type == "host"
                             and status_value not in HOST_RTC_STATUS_ALLOWLIST
@@ -606,6 +732,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 }
                             )
                         try:
+                            if binding.scope_type == "host" and not await _owns_host_signal_presence(
+                                conn
+                            ):
+                                await _fence_superseded_daemon(conn)
+                                break
                             await binding.browser.send_text(payload)
                         except Exception as e:
                             log.warning("rtc status route failed: %s", e)
@@ -641,23 +772,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     except Exception as e:  # noqa: BLE001
         log.exception("daemon ws crashed: %s", e)
     finally:
-        for binding in await broker.rtc_sessions_for_daemon(conn):
-            if binding.scope_type != "host":
-                continue
-            try:
-                await binding.browser.send_text(
-                    {
-                        "type": "rtc.status",
-                        "session_id": binding.session_id,
-                        "scope_type": "host",
-                        "scope_id": binding.scope_id,
-                        "protocol": binding.protocol,
-                        "protocol_version": binding.protocol_version,
-                        "status": "unavailable",
-                    }
-                )
-            except Exception:
-                pass
+        await _revoke_host_rtc_sessions(conn)
         pending_expiry_tasks = list(expiry_tasks)
         for task in pending_expiry_tasks:
             task.cancel()

@@ -46,6 +46,9 @@ class FakeDaemonWebSocket:
     def queue_text(self, payload: dict[str, Any]) -> None:
         self._incoming.put_nowait({"type": "websocket.receive", "text": json.dumps(payload)})
 
+    def queue_raw_text(self, payload: str) -> None:
+        self._incoming.put_nowait({"type": "websocket.receive", "text": payload})
+
     def queue_bytes(self, payload: bytes) -> None:
         self._incoming.put_nowait({"type": "websocket.receive", "bytes": payload})
 
@@ -134,6 +137,9 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
     token = auth.issue_daemon_token(host_id, user_id)
 
     ws = FakeDaemonWebSocket()
+    ws.queue_raw_text("null")
+    ws.queue_raw_text("7")
+    ws.queue_raw_text('"primitive"')
     ws.queue_text(
         {
             "type": "register",
@@ -223,9 +229,8 @@ async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_h
     new.queue_text({"type": "register", "version": "new"})
     await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
 
-    # A late heartbeat from the old worker compare-refreshes its lease, fails,
-    # and disconnects without overwriting the new worker's online state.
-    old.queue_text({"type": "host.heartbeat"})
+    # The atomic claim publishes an active revocation; no heartbeat grace
+    # interval is needed to fence the old worker.
     await asyncio.wait_for(old_task, timeout=1)
     assert old.closed == (4000, "superseded")
     sm = get_sessionmaker()

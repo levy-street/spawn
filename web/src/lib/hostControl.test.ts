@@ -97,6 +97,10 @@ class FakeWebSocket {
   receive(value) {
     this.onmessage?.({ data: JSON.stringify(value) });
   }
+
+  receiveRaw(value: string) {
+    this.onmessage?.({ data: value });
+  }
 }
 
 const hostId = "00000000-0000-4000-8000-000000000001";
@@ -213,7 +217,7 @@ describe("HostControlClient", () => {
 
   test("times out before an answer or hello and reconnects exactly once", async () => {
     const client = new HostControlClient(hostId, {
-      connectTimeoutMs: 1,
+      connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
     client.connect();
@@ -226,7 +230,7 @@ describe("HostControlClient", () => {
       ice_transport_policy: "all",
       ...metadata,
     });
-    await Bun.sleep(10);
+    await Bun.sleep(8);
 
     expect(FakePeerConnection.instances[0].channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -236,7 +240,7 @@ describe("HostControlClient", () => {
     FakeWebSocket.instances = [];
     FakePeerConnection.instances = [];
     const noHelloClient = new HostControlClient(hostId, {
-      connectTimeoutMs: 1,
+      connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
     noHelloClient.connect();
@@ -260,10 +264,109 @@ describe("HostControlClient", () => {
       ...metadata,
     });
     noHelloPc.channel.onopen?.();
-    await Bun.sleep(10);
+    await Bun.sleep(8);
     expect(noHelloPc.channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
     noHelloClient.close();
+  });
+
+  test("attempt deadline covers a websocket that never opens or never receives config", async () => {
+    const neverOpen = new HostControlClient(hostId, {
+      connectTimeoutMs: 5,
+      reconnectBaseDelayMs: 1,
+    });
+    neverOpen.connect();
+    await Bun.sleep(8);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    neverOpen.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const noConfig = new HostControlClient(hostId, {
+      connectTimeoutMs: 5,
+      reconnectBaseDelayMs: 1,
+    });
+    noConfig.connect();
+    FakeWebSocket.instances[0].onopen?.();
+    await Bun.sleep(8);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    noConfig.close();
+  });
+
+  test("null and primitive signaling or control JSON close and reconnect cleanly", async () => {
+    for (const value of [null, 7, "primitive"]) {
+      FakeWebSocket.instances = [];
+      FakePeerConnection.instances = [];
+      const signaling = await readyClient({ reconnectBaseDelayMs: 1 });
+      signaling.ws.receive(value);
+      await Bun.sleep(5);
+      expect(signaling.pc.channel.closed).toBe(true);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      signaling.client.close();
+    }
+
+    for (const raw of ["null", "7", JSON.stringify("primitive")]) {
+      FakeWebSocket.instances = [];
+      FakePeerConnection.instances = [];
+      const control = await readyClient({ reconnectBaseDelayMs: 1 });
+      control.pc.channel.receive(raw);
+      await Bun.sleep(5);
+      expect(control.pc.channel.closed).toBe(true);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      control.client.close();
+    }
+  });
+
+  test("repeated unavailable attempts increase backoff until a valid hello", async () => {
+    const client = new HostControlClient(hostId, {
+      connectTimeoutMs: 1000,
+      reconnectBaseDelayMs: 20,
+    });
+    client.connect();
+    const firstWs = FakeWebSocket.instances[0];
+    firstWs.onopen?.();
+    firstWs.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const firstOffer = JSON.parse(firstWs.sent.at(-1));
+    firstWs.receive({
+      type: "rtc.status",
+      session_id: firstOffer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    await Bun.sleep(25);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    const secondWs = FakeWebSocket.instances[1];
+    secondWs.onopen?.();
+    secondWs.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const secondOffer = JSON.parse(secondWs.sent.at(-1));
+    secondWs.receive({
+      type: "rtc.status",
+      session_id: secondOffer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    await Bun.sleep(25);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    await Bun.sleep(25);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    client.close();
   });
 
   test("channel, daemon, and browser loss each schedule only one reconnect", async () => {
@@ -354,5 +457,19 @@ describe("HostControlClient", () => {
     await Bun.sleep(5);
     await assertion;
     client.close();
+  });
+
+  test("configured pending cap can lower but never raise the protocol maximum", async () => {
+    const { client, pc } = await readyClient({
+      maxPendingRequests: 1000,
+      requestTimeoutMs: 1000,
+    });
+    const pending = Array.from({ length: 32 }, (_, index) =>
+      client.request(`pending-${index}`).catch((error) => error),
+    );
+    expect(pc.channel.sent).toHaveLength(32);
+    await expect(client.request("hard-cap")).rejects.toThrow("Too many pending");
+    client.close();
+    await Promise.all(pending);
   });
 });

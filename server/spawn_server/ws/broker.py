@@ -136,7 +136,11 @@ class Broker:
                 for aid in list(existing.agent_ids):
                     self._daemon_by_agent.pop(aid, None)
                 existing.agent_ids.clear()
-                self._drop_rtc_sessions_for_daemon_locked(existing)
+                # Host sessions are actively revoked by the distributed owner
+                # event after the replacement daemon claims its Redis lease.
+                # Keep them long enough to send unavailable/rtc.close instead
+                # of silently orphaning an established DataChannel.
+                self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
             self._daemons_by_host[conn.host_id] = conn
 
     async def unregister_daemon(self, conn: DaemonConn) -> None:
@@ -149,11 +153,13 @@ class Broker:
             conn.agent_ids.clear()
             self._drop_rtc_sessions_for_daemon_locked(conn)
 
-    def _drop_rtc_sessions_for_daemon_locked(self, conn: DaemonConn) -> None:
+    def _drop_rtc_sessions_for_daemon_locked(
+        self, conn: DaemonConn, *, include_host: bool = True
+    ) -> None:
         stale = [
             session_id
             for session_id, binding in self._rtc_sessions.items()
-            if binding.daemon is conn
+            if binding.daemon is conn and (include_host or binding.scope_type != "host")
         ]
         for session_id in stale:
             self._rtc_sessions.pop(session_id, None)

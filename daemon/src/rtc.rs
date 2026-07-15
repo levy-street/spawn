@@ -1079,6 +1079,12 @@ mod tests {
             host_control_response(b"not json", true),
             HostControlAction::Close
         ));
+        for primitive in [b"null".as_slice(), b"7".as_slice(), br#""primitive""#] {
+            assert!(matches!(
+                host_control_response(primitive, true),
+                HostControlAction::Close
+            ));
+        }
         assert!(matches!(
             host_control_response(
                 br#"{"version":2,"type":"request","request_id":"r","operation":"ping"}"#,
