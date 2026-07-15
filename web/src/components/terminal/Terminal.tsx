@@ -6,7 +6,6 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { Upload } from "lucide-react";
 import Image from "next/image";
 import {
   type ChangeEvent,
@@ -119,6 +118,8 @@ export interface TerminalHandle {
   pasteText: (text: string) => void;
   /** Promote this browser to the shared PTY geometry controller. */
   takeControl: () => void;
+  /** Open the native file picker to upload files to this agent. */
+  openUpload: () => void;
 }
 
 export interface TerminalProps {
@@ -405,13 +406,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
         ...liveSeedWriteOps(text),
       ];
-      writeSequenced(
-        term,
-        [...ops, ...replaySlices.map((slice) => ({ data: slice }))],
-        () => {
-          term.scrollToBottom();
-        },
-      );
+      writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
+        term.scrollToBottom();
+      });
       liveRewriteAtRef.current = Date.now();
       return true;
     },
@@ -2425,10 +2422,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               tail.push(buf.getLine(i)?.translateToString(true) ?? "");
             }
           }
+          // What the user is actually looking at right now: the visible rows
+          // of whichever surface holds their view — the scrollback overlay if
+          // they've scrolled up, otherwise the live terminal.
+          const overlayVisible = scrollbackVisibleRef.current;
+          const viewSource = overlayVisible ? scrollbackTermRef.current : term;
+          const viewBuf = viewSource?.buffer.active;
+          const visibleRows: string[] = [];
+          if (viewSource && viewBuf) {
+            for (let i = 0; i < viewSource.rows; i += 1) {
+              visibleRows.push(viewBuf.getLine(viewBuf.viewportY + i)?.translateToString(true) ?? "");
+            }
+          }
           return {
             at: new Date().toISOString(),
             term: term ? { cols: term.cols, rows: term.rows } : null,
             lastSize: { ...lastSizeRef.current },
+            viewSource: overlayVisible ? "scrollback-overlay" : "live",
+            visibleRows,
             hostRect: hostRect
               ? { w: Math.round(hostRect.width), h: Math.round(hostRect.height) }
               : null,
@@ -2489,6 +2500,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteDataTransfer,
       pasteText,
       takeControl: () => takeControlNowRef.current(),
+      openUpload: () => fileInputRef.current?.click(),
     }),
     [
       appendAttachmentsForSubmit,
@@ -2635,6 +2647,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           </div>
         </div>
       )}
+      {/* Upload is triggered from the surface header (openUpload on the
+          handle); the picker input stays here since the file logic lives in
+          the terminal. Drag-and-drop onto the terminal still works. */}
       <input
         ref={fileInputRef}
         type="file"
@@ -2642,15 +2657,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         className="hidden"
         onChange={onFileInputChange}
       />
-      <button
-        type="button"
-        aria-label="Upload files"
-        title="Upload files"
-        className="pointer-events-auto absolute right-2 top-8 z-20 grid size-8 place-items-center rounded-md border border-border bg-card/90 text-muted-foreground shadow-sm backdrop-blur hover:bg-accent hover:text-accent-foreground"
-        onClick={() => fileInputRef.current?.click()}
-      >
-        <Upload className="size-4" aria-hidden="true" />
-      </button>
       {/* Viewer mode: another session owns the shared display. Dim the
           terminal (output stays visible underneath) and put take-control
           front and center; input is blocked until control is claimed. */}

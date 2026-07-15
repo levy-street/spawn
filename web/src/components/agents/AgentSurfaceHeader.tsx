@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, MoreHorizontal, RefreshCw } from "lucide-react";
+import { Check, MoreHorizontal, RefreshCw, Upload } from "lucide-react";
 import type { HTMLAttributes, ReactNode } from "react";
 import { useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
@@ -148,6 +148,15 @@ export function AgentSurfaceHeader({
       <ConnectionChip info={connInfo} compact className={dense ? undefined : "sm:hidden"} />
       {!dense && <ConnectionChip info={connInfo} className="hidden sm:block" />}
       {trailing}
+      <button
+        type="button"
+        aria-label="Upload files"
+        title="Upload files to this agent"
+        onClick={() => getHandle()?.openUpload()}
+        className={cn(btn, btnSize)}
+      >
+        <Upload className={dense ? "size-3" : "size-4"} aria-hidden />
+      </button>
       <button
         type="button"
         aria-label="Refresh terminal"
