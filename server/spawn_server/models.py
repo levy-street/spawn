@@ -111,6 +111,33 @@ class Host(Base):
         server_default="0",
         nullable=False,
     )
+    daemon_generation_counter: Mapped[int] = mapped_column(
+        BigInteger,
+        CheckConstraint(
+            f"daemon_generation_counter BETWEEN 0 AND {MAX_SAFE_FENCING_GENERATION}",
+            name="ck_hosts_daemon_generation_counter_safe",
+        ),
+        CheckConstraint(
+            "daemon_generation_counter >= daemon_generation",
+            name="ck_hosts_daemon_generation_counter_monotonic",
+        ),
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    daemon_pending_connection_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    daemon_pending_generation: Mapped[int | None] = mapped_column(
+        BigInteger,
+        CheckConstraint(
+            f"daemon_pending_generation IS NULL OR daemon_pending_generation BETWEEN 1 AND {MAX_SAFE_FENCING_GENERATION}",
+            name="ck_hosts_daemon_pending_generation_safe",
+        ),
+        CheckConstraint(
+            "(daemon_pending_connection_id IS NULL) = (daemon_pending_generation IS NULL)",
+            name="ck_hosts_daemon_pending_owner_pair",
+        ),
+        nullable=True,
+    )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

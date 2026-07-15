@@ -159,10 +159,14 @@ pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
 does not depend on process-local broker affinity. A replacement claim actively
 revokes the previous worker. Authenticated daemon sockets remain absent from
 broker host and agent routing until registration has allocated a durable database
-`BigInteger` fence token, claimed the matching Redis cache lease, committed the
-online owner, and passed an exact-owner recheck. A rejected cache claim rolls the
-database allocation back without disturbing the accepted local owner. The Redis
-cache accepts only a newer token, and the authoritative database owner can reclaim
+`BigInteger` fence token and a matching, non-routable Redis pending reservation.
+Promotion uses an exact pending-and-predecessor CAS; the active lease is restored
+by exact token if the database activation commit fails. A reservation cannot alter
+the previous database owner, active Redis lease, browser target, or broker routes.
+During the bounded promotion-to-commit bridge B is still non-routable and A remains
+authorized; a browser requires the database and Redis active tokens to agree. The
+Redis cache accepts only a newer reservation token, and
+the authoritative database owner can reclaim
 a lost cache entry; heartbeat and offline transitions require the exact connection
 and generation. Every host signal also revalidates
 the current lease, so a stale worker cannot retain or create host sessions or

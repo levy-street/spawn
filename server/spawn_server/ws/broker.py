@@ -13,6 +13,7 @@ import json
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -216,11 +217,20 @@ class Broker:
 
     async def is_accepted_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
         async with self._lock:
-            return (
-                self._daemons_by_host.get(conn.host_id) is conn
-                and conn.host_generation == generation
-                and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
-            )
+            return self._is_accepted_daemon_owner_locked(conn, generation)
+
+    def _is_accepted_daemon_owner_locked(self, conn: DaemonConn, generation: int) -> bool:
+        return (
+            self._daemons_by_host.get(conn.host_id) is conn
+            and conn.host_generation == generation
+            and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
+        )
+
+    @asynccontextmanager
+    async def accepted_daemon_guard(self, conn: DaemonConn, generation: int):
+        """Linearize a daemon side effect against local owner acceptance."""
+        async with self._lock:
+            yield self._is_accepted_daemon_owner_locked(conn, generation)
 
     async def attach_agent_to_daemon(
         self,
@@ -241,11 +251,27 @@ class Broker:
             self._daemon_by_agent[agent_id] = conn
             return True
 
-    async def detach_agent(self, agent_id: str) -> None:
+    async def detach_agent(
+        self,
+        agent_id: str,
+        *,
+        expected_daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            conn = self._daemon_by_agent.get(agent_id)
+            if expected_daemon is not None and (
+                conn is not expected_daemon
+                or expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    expected_daemon, expected_host_generation
+                )
+            ):
+                return False
             conn = self._daemon_by_agent.pop(agent_id, None)
             if conn is not None:
                 conn.agent_ids.discard(agent_id)
+            return conn is not None
 
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
@@ -549,12 +575,27 @@ class Broker:
                     if not waiters:
                         self._snapshot_waiters.pop(agent_id, None)
 
-    async def resolve_snapshot(self, agent_id: str, payload: dict) -> None:
+    async def resolve_snapshot(
+        self,
+        agent_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             waiters = list(self._snapshot_waiters.pop(agent_id, ()))
         for fut in waiters:
             if not fut.done():
                 fut.set_result(payload)
+        return True
 
     async def request_dir_list(
         self,
@@ -584,11 +625,26 @@ class Broker:
                 if self._dir_list_waiters.get(request_id) is fut:
                     self._dir_list_waiters.pop(request_id, None)
 
-    async def resolve_dir_list(self, request_id: str, payload: dict) -> None:
+    async def resolve_dir_list(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             fut = self._dir_list_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
+        return True
 
     async def _request_fs(
         self,
@@ -665,11 +721,26 @@ class Broker:
             timeout=timeout,
         )
 
-    async def resolve_fs_result(self, request_id: str, payload: dict) -> None:
+    async def resolve_fs_result(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             fut = self._fs_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
+        return True
 
     async def request_tool_check(
         self,
@@ -699,11 +770,26 @@ class Broker:
                 if self._tool_check_waiters.get(request_id) is fut:
                     self._tool_check_waiters.pop(request_id, None)
 
-    async def resolve_tool_check(self, request_id: str, payload: dict) -> None:
+    async def resolve_tool_check(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             fut = self._tool_check_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
+        return True
 
     async def request_tool_install(
         self,
@@ -733,11 +819,26 @@ class Broker:
                 if self._tool_install_waiters.get(request_id) is fut:
                     self._tool_install_waiters.pop(request_id, None)
 
-    async def resolve_tool_install(self, request_id: str, payload: dict) -> None:
+    async def resolve_tool_install(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             fut = self._tool_install_waiters.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(payload)
+        return True
 
     async def request_upload(
         self,
@@ -763,20 +864,50 @@ class Broker:
                 if current is not None and current[1] is fut:
                     self._upload_waiters.pop(client_id, None)
 
-    async def resolve_upload(self, agent_id: str, client_id: str | None, payload: dict) -> None:
+    async def resolve_upload(
+        self,
+        agent_id: str,
+        client_id: str | None,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         if not client_id:
-            return
+            return False
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             waiter = self._upload_waiters.pop(client_id, None)
         if waiter is None:
-            return
+            return False
         waiter_agent_id, fut = waiter
         if waiter_agent_id != agent_id or fut.done():
-            return
+            return False
         fut.set_result(payload)
+        return True
 
-    async def reject_uploads_for_agent(self, agent_id: str, message: str) -> None:
+    async def reject_uploads_for_agent(
+        self,
+        agent_id: str,
+        message: str,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            if daemon is not None and (
+                expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    daemon, expected_host_generation
+                )
+            ):
+                return False
             rejected = [
                 (client_id, fut)
                 for client_id, (waiter_agent_id, fut) in self._upload_waiters.items()
@@ -787,6 +918,7 @@ class Broker:
         for _, fut in rejected:
             if not fut.done():
                 fut.set_exception(RuntimeError(message))
+        return True
 
 
 _broker = Broker()

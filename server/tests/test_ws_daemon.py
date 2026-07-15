@@ -22,6 +22,7 @@ from spawn_server.ws.host_signal import (
     HostPresenceOwner,
     decode_host_presence_owner,
     encode_host_presence_owner,
+    host_pending_presence_key,
     host_presence_key,
 )
 
@@ -280,6 +281,72 @@ async def test_pending_daemon_cannot_evict_or_reroute_accepted_owner(client):
     await asyncio.wait_for(accepted_task, timeout=1)
 
 
+async def test_stalled_generation_reservation_keeps_active_owner_and_routes(client, monkeypatch):
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-stalled-reservation@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    broker = get_broker()
+
+    accepted = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    accepted_task = asyncio.create_task(daemon_ws(accepted, token=None))  # type: ignore[arg-type]
+    accepted.queue_text(
+        {"type": "register", "version": "accepted", "existing_agents": [agent_id]}
+    )
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(accepted))
+    )
+    accepted_conn = broker.get_daemon_for_host(host_id)
+    assert accepted_conn is not None
+    accepted_value = encode_host_presence_owner(
+        HostPresenceOwner(accepted_conn.id, accepted_conn.host_generation)
+    )
+
+    original_claim = daemon_mod._claim_host_signal_presence
+    reserved = asyncio.Event()
+    release = asyncio.Event()
+
+    async def claim_then_stall(conn):
+        result = await original_claim(conn)
+        reserved.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(daemon_mod, "_claim_host_signal_presence", claim_then_stall)
+    pending = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    pending_task = asyncio.create_task(daemon_ws(pending, token=None))  # type: ignore[arg-type]
+    pending.queue_text({"type": "register", "version": "pending"})
+    await asyncio.wait_for(reserved.wait(), timeout=1)
+
+    assert broker.get_daemon_for_host(host_id) is accepted_conn
+    assert broker.get_daemon_for_agent(agent_id) is accepted_conn
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == accepted_value
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is not None
+    accepted.queue_text({"type": "host.heartbeat"})
+    await _wait_until(
+        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(accepted))
+    )
+
+    pending_task.cancel()
+    await asyncio.gather(pending_task, return_exceptions=True)
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == accepted_value
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is None
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == accepted_conn.id
+        assert host.daemon_generation == accepted_conn.host_generation
+        assert host.daemon_pending_connection_id is None
+        assert host.daemon_pending_generation is None
+
+    release.set()
+    accepted.queue_disconnect()
+    await asyncio.wait_for(accepted_task, timeout=1)
+
+
 async def test_corrupt_cache_rejects_pending_owner_without_evicting_accepted_routes(client):
     user_id, _ = await _signup(client, "ws-daemon-corrupt-pending@example.com")
     host_id = await _create_host(user_id)
@@ -336,6 +403,76 @@ async def test_corrupt_cache_rejects_pending_owner_without_evicting_accepted_rou
     await asyncio.wait_for(accepted_task, timeout=1)
 
 
+async def test_activation_commit_failure_cas_restores_accepted_owner(client, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-activation-rollback@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    broker = get_broker()
+
+    accepted = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    accepted_task = asyncio.create_task(daemon_ws(accepted, token=None))  # type: ignore[arg-type]
+    accepted.queue_text(
+        {"type": "register", "version": "accepted", "existing_agents": [agent_id]}
+    )
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(accepted))
+    )
+    accepted_conn = broker.get_daemon_for_host(host_id)
+    assert accepted_conn is not None
+    assert accepted_conn.host_generation is not None
+    accepted_value = encode_host_presence_owner(
+        HostPresenceOwner(accepted_conn.id, accepted_conn.host_generation)
+    )
+
+    original_prepare = daemon_mod._prepare_host_activation
+    original_commit = AsyncSession.commit
+
+    async def prepare_then_fail_commit(session, *args, **kwargs):
+        prepared = await original_prepare(session, *args, **kwargs)
+        if prepared:
+            session.info["fail_activation_commit"] = True
+        return prepared
+
+    async def fail_selected_commit(session):
+        if session.info.pop("fail_activation_commit", False):
+            raise RuntimeError("injected activation commit failure")
+        await original_commit(session)
+
+    monkeypatch.setattr(daemon_mod, "_prepare_host_activation", prepare_then_fail_commit)
+    monkeypatch.setattr(AsyncSession, "commit", fail_selected_commit)
+
+    pending = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    pending_task = asyncio.create_task(daemon_ws(pending, token=None))  # type: ignore[arg-type]
+    pending.queue_text({"type": "register", "version": "must-rollback"})
+    await asyncio.wait_for(pending_task, timeout=1)
+
+    assert broker.get_daemon_for_host(host_id) is accepted_conn
+    assert broker.get_daemon_for_agent(agent_id) is accepted_conn
+    assert accepted.close_calls == []
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == accepted_value
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is None
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == accepted_conn.id
+        assert host.daemon_generation == accepted_conn.host_generation
+        assert host.daemon_pending_connection_id is None
+        assert host.daemon_pending_generation is None
+
+    accepted.queue_text({"type": "host.heartbeat"})
+    await _wait_until(
+        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(accepted))
+    )
+    accepted.queue_disconnect()
+    await asyncio.wait_for(accepted_task, timeout=1)
+
+
 async def test_generation_max_rejects_pending_owner_without_evicting_accepted_routes(client):
     user_id, _ = await _signup(client, "ws-daemon-max-pending@example.com")
     host_id = await _create_host(user_id)
@@ -358,6 +495,7 @@ async def test_generation_max_rejects_pending_owner_without_evicting_accepted_ro
         host = await session.get(Host, host_id)
         assert host is not None
         host.daemon_generation = MAX_SAFE_FENCING_GENERATION
+        host.daemon_generation_counter = MAX_SAFE_FENCING_GENERATION
         await session.commit()
     await get_backend().set_ephemeral(
         host_presence_key(host_id),
@@ -392,7 +530,7 @@ async def test_durable_generation_allocator_fails_closed_at_redis_safe_maximum(c
     async with sm() as session:
         host = await session.get(Host, host_id)
         assert host is not None
-        host.daemon_generation = MAX_SAFE_FENCING_GENERATION - 1
+        host.daemon_generation_counter = MAX_SAFE_FENCING_GENERATION - 1
         await session.commit()
 
     async with sm() as session:
@@ -402,8 +540,11 @@ async def test_durable_generation_allocator_fails_closed_at_redis_safe_maximum(c
         assert await _allocate_host_generation(session, host_id, "b" * 32) is None
         host = await session.get(Host, host_id)
         assert host is not None
-        assert host.daemon_connection_id == "a" * 32
-        assert host.daemon_generation == MAX_SAFE_FENCING_GENERATION
+        assert host.daemon_connection_id is None
+        assert host.daemon_generation == 0
+        assert host.daemon_pending_connection_id == "a" * 32
+        assert host.daemon_pending_generation == MAX_SAFE_FENCING_GENERATION
+        assert host.daemon_generation_counter == MAX_SAFE_FENCING_GENERATION
 
 
 async def test_distributed_daemon_supersession_cannot_reclaim_presence_or_mark_host_offline(client):
@@ -469,6 +610,10 @@ async def test_redis_loss_cannot_make_an_older_durable_generation_current(client
     backend = get_backend()
     await backend.shutdown()
     await backend.startup()
+    old.queue_text({"type": "host.heartbeat"})
+    await _wait_until(
+        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(old))
+    )
 
     new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
@@ -604,6 +749,56 @@ async def test_delayed_resync_cannot_overwrite_new_broker_owner(client, monkeypa
     await asyncio.wait_for(new_task, timeout=1)
 
 
+async def test_dequeued_stale_exit_cannot_mutate_or_detach_replacement(client, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    user_id, _ = await _signup(client, "ws-daemon-stale-exit@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    broker = get_broker()
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "existing_agents": [agent_id]})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+
+    original_get = AsyncSession.get
+    old_exit_dequeued = asyncio.Event()
+    release_old_exit = asyncio.Event()
+
+    async def get_with_exit_barrier(session, entity, ident, *args, **kwargs):
+        value = await original_get(session, entity, ident, *args, **kwargs)
+        if entity is Agent and ident == agent_id and not old_exit_dequeued.is_set():
+            old_exit_dequeued.set()
+            await release_old_exit.wait()
+        return value
+
+    monkeypatch.setattr(AsyncSession, "get", get_with_exit_barrier)
+    old.queue_text({"type": "agent.exit", "agent_id": agent_id, "exit_code": 17})
+    await asyncio.wait_for(old_exit_dequeued.wait(), timeout=1)
+
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text({"type": "register", "existing_agents": [agent_id]})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
+    new_conn = broker.get_daemon_for_host(host_id)
+    assert new_conn is not None
+    assert broker.get_daemon_for_agent(agent_id) is new_conn
+
+    release_old_exit.set()
+    await asyncio.wait_for(old_task, timeout=1)
+    async with get_sessionmaker()() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        assert agent.status == "running"
+        assert agent.exit_code is None
+    assert broker.get_daemon_for_agent(agent_id) is new_conn
+
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+
+
 async def test_old_cleanup_cannot_overwrite_replacement_database_ownership(client, monkeypatch):
     user_id, _ = await _signup(client, "ws-daemon-cleanup-race@example.com")
     host_id = await _create_host(user_id)
@@ -634,6 +829,11 @@ async def test_old_cleanup_cannot_overwrite_replacement_database_ownership(clien
     old.queue_disconnect()
     await asyncio.wait_for(old_deleted_lease.wait(), timeout=1)
 
+    # The old active lease is removed before its exact database offline mark.
+    # Finish that CAS-guarded cleanup before a no-predecessor activation.
+    release_old_cleanup.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
     new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
     new.queue_text({"type": "register", "version": "new"})
@@ -648,9 +848,6 @@ async def test_old_cleanup_cannot_overwrite_replacement_database_ownership(clien
         assert host is not None
         assert host.status == "online"
         assert host.daemon_connection_id == new_conn.id
-
-    release_old_cleanup.set()
-    await asyncio.wait_for(old_task, timeout=1)
 
     async with sm() as session:
         host = await session.get(Host, host_id)

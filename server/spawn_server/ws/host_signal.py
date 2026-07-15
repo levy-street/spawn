@@ -75,6 +75,10 @@ def host_presence_key(host_id: str) -> str:
     return f"spawn:rtc:host:{host_id}:owner"
 
 
+def host_pending_presence_key(host_id: str) -> str:
+    return f"spawn:rtc:host:{host_id}:pending"
+
+
 def valid_daemon_connection_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 

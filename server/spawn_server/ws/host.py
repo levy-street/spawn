@@ -97,10 +97,19 @@ async def _binding_is_current_owner(host_id: str, binding: BrowserRtcSession) ->
     owner = decode_host_presence_owner(
         await get_backend().get_ephemeral(host_presence_key(host_id))
     )
-    return owner is not None and (
+    if owner is None or not (
         owner.daemon_connection_id == binding.daemon_connection_id
         and owner.generation == binding.daemon_generation
-    )
+    ):
+        return False
+    sm = get_sessionmaker()
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        return host is not None and (
+            host.daemon_connection_id == binding.daemon_connection_id
+            and host.daemon_generation == binding.daemon_generation
+            and host.status == "online"
+        )
 
 
 async def _pump_browser_signals(

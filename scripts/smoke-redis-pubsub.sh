@@ -206,10 +206,15 @@ from spawn_server.config import get_settings
 from spawn_server.db import Base
 from spawn_server.models import Host, User
 from spawn_server.redis import get_backend
-from spawn_server.ws.daemon import _allocate_host_generation, _mark_host_online
+from spawn_server.ws.daemon import (
+    _allocate_host_generation,
+    _host_activation_predecessor,
+    _prepare_host_activation,
+)
 from spawn_server.ws.host_signal import (
     HostPresenceOwner,
     encode_host_presence_owner,
+    host_pending_presence_key,
     host_presence_key,
 )
 
@@ -221,14 +226,14 @@ async def main() -> None:
     backend = get_backend()
     await backend.startup()
     try:
-        # Reproduce the inverse durable-ownership race with real Redis: A
-        # claims and stalls, B claims later and commits first, then A resumes.
-        # The older fence token must make A's database CAS a no-op.
+        # Exercise explicit non-routable reservation followed by exact active
+        # promotion against real Redis.
         inverse_host_id = "00000000-0000-4000-8000-000000000099"
         inverse_user_id = "00000000-0000-4000-8000-000000000098"
         old_owner = "a" * 32
         new_owner = "b" * 32
         inverse_owner_key = host_presence_key(inverse_host_id)
+        inverse_pending_key = host_pending_presence_key(inverse_host_id)
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -249,10 +254,28 @@ async def main() -> None:
                 session, inverse_host_id, old_owner
             )
         assert old_generation == 1
-        # Redis can disappear after A's durable allocation without making its
-        # token reusable. B's allocation is still generation 2.
-        await backend.set_ephemeral(inverse_owner_key, b"lost-cache", ttl_seconds=60)
-        assert await backend.delete_ephemeral_if(inverse_owner_key, b"lost-cache")
+        old_lease = encode_host_presence_owner(HostPresenceOwner(old_owner, old_generation))
+        claimed, _ = await backend.set_ephemeral_if_newer(
+            inverse_pending_key, old_lease, generation=old_generation, ttl_seconds=60
+        )
+        assert claimed
+        async with sessions() as session:
+            assert await _host_activation_predecessor(
+                session, inverse_host_id, old_owner, old_generation
+            ) is None
+            assert await _prepare_host_activation(
+                session, inverse_host_id, old_owner, old_generation, {"version": "old"}
+            )
+            assert await backend.activate_ephemeral(
+                inverse_pending_key,
+                old_lease,
+                inverse_owner_key,
+                None,
+                old_lease,
+                ttl_seconds=60,
+            )
+            await session.commit()
+
         async with sessions() as session:
             new_generation = await _allocate_host_generation(
                 session, inverse_host_id, new_owner
@@ -262,39 +285,31 @@ async def main() -> None:
             HostPresenceOwner(new_owner, new_generation)
         )
         claimed, _ = await backend.set_ephemeral_if_newer(
-            inverse_owner_key,
+            inverse_pending_key,
             new_lease,
             generation=new_generation,
             ttl_seconds=60,
         )
         assert claimed
+        # Reservation is deliberately non-active: old routing remains intact.
+        assert await backend.get_ephemeral(inverse_owner_key) == old_lease
         async with sessions() as session:
-            assert await _mark_host_online(
-                session,
-                inverse_host_id,
-                new_owner,
-                new_generation,
-                {"version": "new"},
+            assert await _host_activation_predecessor(
+                session, inverse_host_id, new_owner, new_generation
+            ) == HostPresenceOwner(old_owner, old_generation)
+            assert await _prepare_host_activation(
+                session, inverse_host_id, new_owner, new_generation, {"version": "new"}
             )
-        old_lease = encode_host_presence_owner(
-            HostPresenceOwner(old_owner, old_generation)
-        )
-        claimed, previous = await backend.set_ephemeral_if_newer(
-            inverse_owner_key,
-            old_lease,
-            generation=old_generation,
-            ttl_seconds=60,
-        )
-        assert not claimed
-        assert previous == new_lease
+            assert await backend.activate_ephemeral(
+                inverse_pending_key,
+                new_lease,
+                inverse_owner_key,
+                old_lease,
+                new_lease,
+                ttl_seconds=60,
+            )
+            await session.commit()
         async with sessions() as session:
-            assert not await _mark_host_online(
-                session,
-                inverse_host_id,
-                old_owner,
-                old_generation,
-                {"version": "old"},
-            )
             durable = await session.get(Host, inverse_host_id)
             assert durable is not None
             assert durable.status == "online"
@@ -430,6 +445,7 @@ async def main() -> None:
                 status="online",
                 daemon_connection_id=old_owner,
                 daemon_generation=1,
+                daemon_generation_counter=1,
             )
         )
         await session.commit()
@@ -529,7 +545,11 @@ from pathlib import Path
 from spawn_server.config import get_settings
 from spawn_server.db import dispose_engine, get_sessionmaker
 from spawn_server.redis import get_backend
-from spawn_server.ws.daemon import _allocate_host_generation
+from spawn_server.ws.daemon import (
+    _allocate_host_generation,
+    _host_activation_predecessor,
+    _prepare_host_activation,
+)
 from spawn_server.ws.host_signal import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
@@ -538,6 +558,7 @@ from spawn_server.ws.host_signal import (
     HostSignalEnvelope,
     browser_signal_channel,
     encode_host_presence_owner,
+    host_pending_presence_key,
     host_presence_key,
     publish_host_owner_revocation,
     publish_host_signal,
@@ -588,15 +609,31 @@ async def main() -> None:
             HostPresenceOwner(new_owner, generation)
         )
         claimed, previous = await backend.set_ephemeral_if_newer(
-            host_presence_key(host_id),
+            host_pending_presence_key(host_id),
             replacement_lease,
             generation=generation,
             ttl_seconds=60,
         )
         assert claimed
-        assert previous == encode_host_presence_owner(
-            HostPresenceOwner(old_owner, 1)
-        )
+        assert previous is None
+        old_lease = encode_host_presence_owner(HostPresenceOwner(old_owner, 1))
+        assert await backend.get_ephemeral(host_presence_key(host_id)) == old_lease
+        async with get_sessionmaker()() as session:
+            assert await _host_activation_predecessor(
+                session, host_id, new_owner, generation
+            ) == HostPresenceOwner(old_owner, 1)
+            assert await _prepare_host_activation(
+                session, host_id, new_owner, generation, {"version": "replacement"}
+            )
+            assert await backend.activate_ephemeral(
+                host_pending_presence_key(host_id),
+                replacement_lease,
+                host_presence_key(host_id),
+                old_lease,
+                replacement_lease,
+                ttl_seconds=60,
+            )
+            await session.commit()
         # Deliberately publish the stale offer before the revocation event. The
         # old worker must fence on the current lease generation, not event order.
         await publish_host_signal(

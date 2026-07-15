@@ -106,6 +106,38 @@ class _InProcPubSub:
         self._values[key] = (value, time.monotonic() + ttl_seconds)
         return True
 
+    def activate_ephemeral(
+        self,
+        pending_key: str,
+        pending_value: bytes,
+        active_key: str,
+        expected_active: bytes | None,
+        active_value: bytes,
+        ttl_seconds: int,
+    ) -> bool:
+        if self.get_ephemeral(pending_key) != pending_value:
+            return False
+        if self.get_ephemeral(active_key) != expected_active:
+            return False
+        self.set_ephemeral(active_key, active_value, ttl_seconds)
+        self._values.pop(pending_key, None)
+        return True
+
+    def restore_ephemeral_if(
+        self,
+        key: str,
+        expected: bytes,
+        restored: bytes | None,
+        ttl_seconds: int,
+    ) -> bool:
+        if self.get_ephemeral(key) != expected:
+            return False
+        if restored is None:
+            self._values.pop(key, None)
+        else:
+            self.set_ephemeral(key, restored, ttl_seconds)
+        return True
+
 
 # ---------- backend abstraction ----------
 
@@ -334,6 +366,71 @@ class RedisBackend:
             ttl_seconds,
         )
         return bool(refreshed)
+
+    async def activate_ephemeral(
+        self,
+        pending_key: str,
+        pending_value: bytes,
+        active_key: str,
+        expected_active: bytes | None,
+        active_value: bytes,
+        *,
+        ttl_seconds: int,
+    ) -> bool:
+        """Promote an exact pending reservation into the active routing lease."""
+        if self._inproc is not None:
+            return self._inproc.activate_ephemeral(
+                pending_key,
+                pending_value,
+                active_key,
+                expected_active,
+                active_value,
+                ttl_seconds,
+            )
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "local active = redis.call('get', KEYS[2]); "
+            "if ARGV[2] == '1' and active ~= ARGV[3] then return 0 end; "
+            "if ARGV[2] ~= '1' and active then return 0 end; "
+            "redis.call('set', KEYS[2], ARGV[4], 'EX', ARGV[5]); "
+            "redis.call('del', KEYS[1]); return 1",
+            2,
+            pending_key,
+            active_key,
+            pending_value,
+            "1" if expected_active is not None else "0",
+            expected_active or b"",
+            active_value,
+            ttl_seconds,
+        )
+        return bool(result)
+
+    async def restore_ephemeral_if(
+        self,
+        key: str,
+        expected: bytes,
+        restored: bytes | None,
+        *,
+        ttl_seconds: int,
+    ) -> bool:
+        """CAS-restore an active lease after a failed database commit."""
+        if self._inproc is not None:
+            return self._inproc.restore_ephemeral_if(key, expected, restored, ttl_seconds)
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "if ARGV[2] == '1' then "
+            "redis.call('set', KEYS[1], ARGV[3], 'EX', ARGV[4]); "
+            "else redis.call('del', KEYS[1]); end; return 1",
+            1,
+            key,
+            expected,
+            "1" if restored is not None else "0",
+            restored or b"",
+            ttl_seconds,
+        )
+        return bool(result)
 
 
 _backend = RedisBackend()
