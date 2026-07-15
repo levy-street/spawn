@@ -1,18 +1,22 @@
 # Trust Phase 2/3 — progress + resume notes
 
 Working savefile for the "operator model" migration. Design spec:
-`docs/TRUST_PHASE2.md`. Governing doc: `docs/TRUST.md`. Read both first.
+`docs/TRUST_PHASE2.md`. Governing doc: `docs/TRUST.md`. Tracked execution
+schedule: `docs/TRUST_PHASE2_TASKS.md`. Read all three first.
 
 ## What we're doing and why
 
-A security audit found the server currently **sees terminal content**: even for
-v2 (DataChannel) clients the daemon mirrors PTY output to the server as
-plaintext (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames
-still transit the server. Signaling is also unsigned (server can MITM the
-DataChannel). Goal of this work ("Tier 2"):
+A security audit found the server currently **sees protected content**: even
+for v2 (DataChannel) clients the daemon mirrors PTY output to the server as
+plaintext (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot
+frames still transit the server. Host paths/files/transfers, installer output,
+REST terminal surfaces, launch values, preset environment templates, and skill
+bodies also have server-readable paths or stores. Signaling is unsigned (server
+can MITM the DataChannel). Goal of this work ("Tier 2"):
 
-- **Phase 2** — server holds *zero* terminal content. Acceptance: grep the
-  server, no path touches PTY bytes / uploads / env / skill bodies.
+- **Phase 2** — server has no plaintext protected-content path or recoverable
+  plaintext store. Acceptance includes runtime path tests plus primary and
+  backup purge evidence; grep alone is insufficient.
 - **Phase 3** — signed signaling + fingerprint pinning, so a hostile server
   can't MITM the DataChannel.
 
@@ -25,9 +29,11 @@ DataChannel). Goal of this work ("Tier 2"):
 | `4b245f1` | 1 | **Content-free activity ping.** Classifier moved daemon-side; server no longer parses bytes for activity. |
 
 ### Increment 1 detail (the keystone)
-- `daemon/src/activity.rs` (NEW): faithful Rust port of the server's
+
+- `daemon/src/activity.rs` (NEW): initial Rust port of the server's
   `output_payload_is_meaningful` (strip OSC/CSI/charset/tmux-clock/control,
-  require ≥3 non-whitespace chars). 4 unit tests.
+  require ≥3 non-whitespace chars). Its invalid/incomplete UTF-8 and chunk-boundary
+  behavior needs the corrective gate tracked in `TRUST_PHASE2_TASKS.md`.
 - `daemon/src/pty.rs`: `ForwarderControl` gained `last_activity_ms` +
   `suppress_until_ms` atomics + `suppress_activity()` + `note_output()`.
   `run_forwarder` classifies each chunk (throttled to `OUTPUT_TOUCH_INTERVAL`
@@ -39,44 +45,49 @@ DataChannel). Goal of this work ("Tier 2"):
   `last_output_at` + `host.last_seen_at`; **deleted** the `0x01` byte
   classification. `tests/test_ws_daemon.py`: new round-trip test.
 
-**Validation done:** daemon `cargo test --bins --lib` = 40 pass; server suite =
-127 pass (2 pre-existing unrelated failures: `test_auth_providers`,
-`test_migrations`). **Deployed + live-validated** on dev: this session's
+**Historical Increment 1 validation:** daemon `cargo test --bins --lib` = 40
+pass; the full server run recorded 127 passed and 2 failed
+(`test_auth_providers`, `test_migrations`), so it was not a passing full suite.
+**Deployed + live-validated** on dev: this session's
 `last_output_at` updates via `agent.activity` (server no longer sees bytes for
 activity); no post-restart `unknown frame` logs; no errors.
 
+The later comprehensive review ran 88 daemon tests successfully and 9 focused
+server tests successfully. Its full server run recorded 128 passed plus the two
+known failures. It also found the Redis smoke failure and global formatting/
+lint warnings listed in the task schedule; no document should summarize that
+state as "both suites pass."
+
 ## Exactly where we're up to
 
-Increment 1 is **fully shipped to the dev stack**. The `0x01` output leg still
-*exists* (it now only persists the transcript + feeds the pubsub relay) — the
-server no longer *needs* it for activity, which is the precondition for cutting
-it. Nothing is half-done; `master` builds and both test suites pass.
+Increment 1's output-activity path is **shipped to the dev stack**. The `0x01`
+output leg still exists (it persists the transcript and feeds the v1 pubsub
+relay), so the server still receives all PTY output. The server no longer needs
+those bytes for activity, which is the precondition for cutting the mirror.
 
-## Remaining
+The comprehensive review opened an immediate pre-Increment-2 gate: v2 input
+does not stamp `last_input_at`; scroll/copy-mode suppression is incomplete; the
+classifier and clock need boundary corrections; the Redis smoke is stale; and
+activity integration coverage is incomplete. No Increment 2 implementation has
+started. The detailed status/dependencies are in `TRUST_PHASE2_TASKS.md`.
 
-- **Increment 2 (NEXT, large — daemon + web):** add a second DataChannel label
-  `spawn.ctl` (daemon gates on label at `rtc.rs:348`; browser creates only
-  `spawn.pty` at `useAgentSocket.ts:244`). Carry snapshot/replay **requests +
-  responses** over it; on DC-open the browser fetches connect-time backfill +
-  scrollback from the daemon (worker: `worker_replay` `pty.rs:340`; tmux:
-  `tmux::capture_history`) instead of the server `history`/`snapshot` frames.
-  Removes the last content that transits the server for v2 clients. Collapses
-  the `dc_offset`/`rtc_session_id` cross-transport ordering machinery.
-- **Increment 3:** drop the `WsOutbound::Binary` `0x01` sink in `run_forwarder`
-  (`pty.rs`); delete `server/spawn_server/transcript.py` + `daemon.py:148`
-  append + `browser.py` history/snapshot forwarding + the v1 `_pump_pubsub` /
-  `0x02` input legs + `redis.py` pubsub. Requires the DataChannel to be
-  mandatory (retire `spawn.v1`). Accepted regression: offline-host history.
-- **Increment 4:** uploads over a `spawn.ctl` file stream; delete the
-  `bytes_b64` legs (`browser.py:497-539`, REST `agents.py:449-494`).
-- **Increment 5:** env + skill bodies E2E at spawn over the host-control
-  channel; REST `agent.create` persists only the row. Stop persisting
-  `Agent.env`/`Skill.content`; drop `"env"`/`"skills"` from
-  `_dispatch_agent_launch` (`agents.py:201,203`).
-- **Phase 3 (task #48):** Ed25519 host keys at `spawnd login` + per-browser
-  WebCrypto device keys; sign `rtc.offer`/`rtc.answer` over
-  `(SDP‖session‖agent‖peer key)`; TOFU-pin, refuse unpinned. Acceptance: a test
-  server that swaps SDP fingerprints makes both endpoints abort loudly.
+## Remaining sequence
+
+1. Finish and independently review every immediate activity/smoke gate.
+2. In parallel, build per-agent `spawn.ctl` for history/snapshot and a separate
+   host-scoped `spawn.host.ctl`. Per-agent RTC is not sufficient for file/tool
+   operations on a host with no agent.
+3. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
+   REST terminal content surfaces.
+4. Move host listings/read/write/transfer and installer detail onto the host
+   channel. Cross-host bytes stream through the trusted browser, not the server.
+5. Move full launch manifests, `Agent.env`, `Preset.env_template`, and skill
+   bodies to the approved endpoint-owned/encrypted store and host channel.
+6. Only after replacements and endpoint recovery tests pass, run the historical
+   plaintext purge across live disk/DB/Redis and every backup/snapshot. Verify
+   the oldest retained restore before making the Phase 2 claim.
+7. Phase 3 adds Ed25519 host keys, browser device keys, signed signaling, and
+   TOFU pinning to both agent- and host-scoped peer connections.
 
 ## Operational playbook (how to build/deploy/validate — no secrets here)
 
@@ -113,4 +124,6 @@ committed), then `curl -H "Cookie: spawn_session=<tok>" <dev-web>/api/agents`
 and check `activity_state` / `last_output_at`, or drive Playwright from `web/`
 with the cookie.
 
-**Tasks:** #45–#48 track Phase 2 items + Phase 3.
+**Tasks:** `docs/TRUST_PHASE2_TASKS.md` is the repository task ledger and maps
+every review finding to an implementation, independent review, merge, and
+acceptance gate.

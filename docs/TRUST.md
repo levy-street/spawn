@@ -11,29 +11,33 @@ DESIGN.md describes the mechanics.
 
 ## The principle
 
-> The only parties that handle terminal data are the host daemon, the
+> The only parties that handle protected content are the host daemon, the
 > user's browser(s), and — when NAT requires it — a TURN relay that
 > carries ciphertext it cannot decrypt. The server introduces the
 > parties; it never sees the conversation.
 
-"Terminal data" means: PTY input/output, scrollback/history, file
-uploads, snapshots, directory listings, agent environment variables,
-skill contents, and MCP credentials. Everything on that list either
-already has an end-to-end path today or gets one in a migration phase
-below.
+"Protected content" in this document means: PTY input/output,
+scrollback/history, terminal snapshots, agent and host file names and
+contents (including listings, uploads, downloads, and cross-host transfers),
+tool installer output, agent and preset environment values, launch working
+directories/arguments, skill bodies, and MCP credentials. Everything on that
+list either already has an end-to-end path today or gets one in a migration
+phase below.
 
-The claim we are building toward is **"the server cannot see your
-data"** (cryptographic), not merely **"the server does not look"**
-(policy). Each phase below states which of the two it delivers.
+The precise claim we are building toward is **"the server cannot see your
+protected content"** (cryptographic), not merely **"the server does not look"**
+(policy). We do not use the unqualified phrase "cannot see your data," because
+the control plane deliberately retains the metadata disclosed below. Each phase
+states which guarantee it delivers.
 
 ## Roles
 
 | Party | Holds | Sees |
 |-------|-------|------|
 | **Host daemon** (`spawnd`) | tmux sessions, PTY, transcripts, host identity key | everything on its own host (it is the user's machine) |
-| **Browser client(s)** | rendered terminal, device identity key | everything for agents it attaches to |
+| **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and agents it connects to |
 | **TURN relay** | nothing durable | ciphertext, peer IPs, traffic volume/timing |
-| **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | metadata only (see "What the server still sees") |
+| **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | metadata only, including coarse meaningful activity timing (see "What the server still sees") |
 
 ## Why the cryptography already works in our favor
 
@@ -55,11 +59,11 @@ not come for free:
    control plane could substitute fingerprints and man-in-the-middle a
    session. Fixing this requires endpoint identity keys that sign the
    SDP (Phase 3).
-2. **The last-resort relay.** Today, when WebRTC fails, terminal data
-   falls back to plaintext binary frames on `/ws/browser` ↔
-   `/ws/daemon`, and the server persists them as transcripts. That path
-   is the single biggest violation of the principle and is removed in
-   Phase 1–2.
+2. **The legacy relay and mirror.** `spawn.v1` can still relay terminal data as
+   plaintext binary frames on `/ws/browser` ↔ `/ws/daemon`. Independently, the
+   daemon mirrors every output chunk to the server, which persists it as a
+   transcript even for v2 viewers. Those paths are the largest current
+   violation of the principle and are removed in Phase 2.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.
@@ -70,7 +74,7 @@ Adversaries and what they get, once the migration is complete:
 
 | Adversary | Can | Cannot |
 |-----------|-----|--------|
-| **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection timing; refuse service; delete accounts | read PTY data, transcripts, uploads, env vars, skill bodies, MCP credentials |
+| **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection/signaling timing, and user-input/meaningful-output activity times; refuse service; delete accounts | read PTY data, transcripts, host or agent file data, installer output, env vars, skill bodies, MCP credentials |
 | **Malicious control-plane operator** (or compromised server) | everything above; attempt key-substitution MITM at pairing or signaling time | silently MITM sessions between endpoints that verify identity keys (Phase 3+); recover data from past sessions (no stored ciphertext, DTLS is ephemeral per session) |
 | **Network attacker (on-path)** | observe/black-hole encrypted flows, learn peer IPs | read or modify session content (DTLS), impersonate either peer |
 | **TURN operator** | observe ciphertext volume/timing and peer IPs | decrypt anything |
@@ -92,8 +96,11 @@ Honest inventory, from the current wire protocol:
 
 **Metadata the server keeps seeing by design** — accounts and password
 hashes, host names/OS/arch/version/last-seen, agent names and lifecycle
-status, exit codes, presence, connection and signaling timing, IP
-addresses. Self-hosting is the answer for users for whom this metadata
+status, preset and skill names/descriptions, exit codes, presence, connection
+and signaling timing, IP addresses, and per-agent timestamps for meaningful
+output and user input. The activity frames contain no terminal bytes and are
+throttled, but their timing is behavioral metadata and can reveal when a person
+or agent is active. Self-hosting is the answer for users for whom this metadata
 is itself sensitive.
 
 **Content the server sees today and must stop seeing:**
@@ -101,20 +108,25 @@ is itself sensitive.
 | Today | Where it leaks | Target |
 |-------|----------------|--------|
 | PTY bytes (fallback relay) | binary frames on `/ws/browser`, `/ws/daemon` | DataChannel only; relay path deleted |
-| Transcripts (~64 MB/agent on server disk) | `transcript.py`, Redis ring buffer | daemon-owned; fetched over DataChannel |
+| Transcripts (~64 MB/agent on server disk) | `transcript.py`; historical Redis ring keys may remain | daemon-owned; fetched over DataChannel; historical copies purged |
 | History replay | `{"type":"history"}` on `/ws/browser` | DataChannel history stream |
-| File uploads | `upload` frames, `bytes_b64` through both WS legs | DataChannel file stream |
+| Agent file uploads | `upload` frames, `bytes_b64` through both WS legs and REST | per-agent DataChannel file stream |
 | Terminal snapshots / card previews | `agent.snapshot` frames | rendered from DataChannel output |
-| Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-side |
-| Skill bodies | `agent.create`, `skills` table | client-encrypted at rest, decrypted only by daemon |
+| REST terminal input and snapshots | `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
+| Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-readably |
+| Preset environment templates | `presets.env_template`, merged into agent `env` | endpoint-owned or client-encrypted; values sent E2E at spawn time |
+| Launch paths/arguments and preset commands | `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | endpoint-owned or client-encrypted; launch manifest sent E2E |
+| Skill bodies | `agent.create`, `skills` table | endpoint-owned or client-encrypted at rest; decrypted only at endpoints |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
-| Directory listings | `host.fs.list_result` | DataChannel control stream |
-| Tool install output | `host.tools.install_result` | DataChannel or accepted as low-sensitivity (decide in Phase 2) |
+| Host paths, listings, reads, and writes | REST host-file routes plus `host.fs.*` server↔daemon frames | host-scoped `spawn.host.ctl` DataChannel |
+| Cross-host file transfer | server reads the source and forwards its bytes to the destination | browser streams source host → browser → destination host over two host channels |
+| Tool check/install commands, paths, versions, output, and errors | `host.tools.*`; policy errors can persist in Postgres | host-scoped DataChannel; unattended jobs return content-free status only |
 
-`cwd`/`argv` sit in between: they are content-adjacent metadata the
-server currently needs to orchestrate `agent.create`. They move E2E when
-agent creation itself moves onto the host control channel (Phase 2+);
-until then the docs must not claim otherwise.
+Preset names, skill names/descriptions, and agent names remain server-visible
+metadata; users must not place secrets in those labels. `cwd`/`argv` are
+protected content rather than retained metadata: they currently transit the
+server for `agent.create` and move E2E with the rest of the launch manifest in
+Phase 2.
 
 ## Identity and pairing
 
@@ -154,7 +166,7 @@ What moves where, and the regressions we accept:
 - **Scrollback/replay** → daemon-owned. tmux + the daemon-side
   scrollback cache are already the source of truth; the browser fetches
   history over the DataChannel at attach. Server `transcript.py` and the
-  Redis ring buffer are deleted.
+  content pubsub path are deleted; any historical Redis ring keys are purged.
 - **Offline history** → **accepted regression.** Today the server can
   replay a transcript while the host is asleep; in the operator model,
   daemon offline = history unavailable. Mitigation later: optional
@@ -167,6 +179,27 @@ What moves where, and the regressions we accept:
   is small.
 - **File upload** → DataChannel file stream (also removes today's
   base64-over-JSON overhead and server memory spike).
+- **Host filesystem operations** → a host-scoped browser↔daemon WebRTC
+  connection with a `spawn.host.ctl` DataChannel. It exists independently of
+  any agent, because the file browser must work on a host with no running
+  agent. The server authorizes the browser for the host and relays only
+  signaling/ICE; paths, listings, file bytes, and operation errors stay on the
+  DataChannel. Cross-host transfer is browser-mediated between two such
+  channels, so the control plane never buffers the file.
+- **Tool installation** → user-initiated requests and stdout/stderr use
+  `spawn.host.ctl`. Installer output is not treated as low-sensitivity: it can
+  contain paths, commands, versions, and secrets. Unattended update checks may
+  report only preset/host identifiers, schedule timestamps, and content-free
+  success/failure/exit-code metadata to the control plane; stdout/stderr and
+  detailed errors remain daemon-local until an endpoint fetches them E2E.
+- **REST terminal surfaces** → removed once direct replacements ship. Terminal
+  input uses `spawn.pty`; history/snapshot uses per-agent `spawn.ctl`. The
+  server cannot implement a content-returning compatibility REST proxy without
+  violating the model.
+- **Launch manifests, preset environment values, and skill bodies** → delivered
+  over `spawn.host.ctl` and retained only at endpoints or as opaque
+  endpoint-encrypted blobs. The migration must establish a working endpoint
+  copy before clearing the current plaintext database fields.
 - **The spawn MCP surface** — *resolved: cut entirely (2026-07-09).* The
   `/mcp` endpoint sent terminal input and captured snapshots *through
   the server* by design, the managed MCP-server registry stored bearer
@@ -194,9 +227,10 @@ worthless:
    eventually a packaged client (PWA store build / Tauri) whose update
    channel is independently signed.
 2. **First-contact key substitution** until L2 verification lands.
-3. **Metadata.** The control plane necessarily learns who owns which
-   hosts and when they talk. TURN learns IP pairs and volumes. We do not
-   claim metadata privacy; self-host if that matters.
+3. **Metadata.** The control plane necessarily learns who owns which hosts,
+   when they connect, and the coarse times at which meaningful agent output or
+   user input occurs. TURN learns IP pairs and volumes. We do not claim
+   metadata privacy; self-host if that matters.
 4. **Endpoint compromise** is out of scope and undiminished: an agent
    with your credentials running on your machine is exactly as dangerous
    as it is without spawn.
@@ -234,8 +268,8 @@ Each phase ships independently; the product works throughout.
 
 ### Phase 1 — TURN + WebRTC as the only terminal path
 
-*Delivers: "server does not relay PTY data" (policy claim; transcripts
-still server-side).*
+*Delivers: v2 browsers do not send or receive live PTY through the server
+(policy claim; the daemon mirror and transcripts remain server-side).*
 
 *Status 2026-07-10: shipped for spawn.v2 clients.* coturn (already on the
 prod box) now runs `use-auth-secret`; the server mints ephemeral HMAC
@@ -257,31 +291,48 @@ server-side transcripts, is Phase 2 work.
   daemon-bound `0x02` input frames from `/ws/daemon`.
 - Keep `/ws/*` as control + signaling only. Bump subprotocol to
   `spawn.v2`; support v1 during rollout per proto/README versioning.
-- Acceptance: PTY bytes never traverse the server in either direction
-  (assert in the broker: any binary frame on v2 is a protocol error);
-  sessions survive on TURN-only networks (test with UDP blocked).
+- Acceptance: no v2 browser uses a plaintext server relay in either direction
+  (assert browser binary input is a protocol error and no v2 pubsub pump is
+  started); sessions survive on TURN-only networks (test with UDP blocked).
+  This does not assert that the server cannot see output: daemon `0x01` remains
+  until Phase 2.
 
-### Phase 2 — daemon-owned data, server data stores deleted
+### Phase 2 — endpoint-owned data, server data stores deleted
 
-*Delivers: "server cannot see terminal content" for all rungs except
-signaling MITM.*
+*Delivers: no plaintext protected-content path or recoverable plaintext store
+on the control plane. Signaling remains vulnerable to active MITM until Phase
+3.*
 
-- Add multiplexed DataChannel streams beside `spawn.pty`: history
-  fetch (replaces the `history` frame), file upload (replaces `upload`
-  frames), snapshot, directory listing.
+- Add per-agent `spawn.ctl` beside `spawn.pty` for history, snapshots, and agent
+  uploads. Moving history/snapshots does **not** complete the cut while the
+  daemon still mirrors every output chunk on the server-bound `0x01` leg.
+- Add a separate host-scoped WebRTC session and `spawn.host.ctl` DataChannel
+  for directory listings, host file read/write/transfer, tool installer output,
+  and launch manifests. A per-agent channel is insufficient because these
+  operations exist without a running agent.
 - Daemon persists transcripts locally (rotate like today's server
   files); browser requests tail-on-attach exactly like the current
   `max_bytes` read.
-- Delete `server/spawn_server/transcript.py`, the Redis PTY ring
-  buffer, and `agent.snapshot`/`upload`/`fs.list` content forwarding.
-- Move `env` and skill bodies out of server persistence: sent over the
-  host control DataChannel at spawn time. Agent creation becomes: REST
-  creates the agent *row* (id, name, host, status); content-bearing
-  spawn parameters travel E2E. (The `/mcp` question is already
-  resolved: the whole MCP surface was cut on 2026-07-09.)
-- Acceptance: `grep` the server for any code path that touches PTY
-  bytes, upload bytes, env values, or skill bodies — none exist; a
-  compromised server's disk + Redis + memory contain no session content.
+- Delete `server/spawn_server/transcript.py`, the content Redis pubsub path, and
+  all `agent.snapshot`/`upload`/`host.fs.*`/installer-output forwarding. Purge
+  historical Redis ring keys. Remove the content-bearing REST terminal and
+  host-file routes.
+- Move `env`, `Preset.env_template`, `cwd`, `argv`, and skill bodies out of
+  server-readable persistence and transport. REST creates only the metadata
+  row; the launch manifest travels E2E over the host channel. (The `/mcp`
+  question is already resolved: the whole MCP surface was cut on 2026-07-09.)
+- After all replacement paths are live and compatibility traffic is disabled,
+  execute and verify the plaintext purge for transcript files, database rows,
+  legacy Redis ring keys, temporary exports, and every retained backup or
+  deployment snapshot. Do not claim Phase 2 complete while any recoverable
+  plaintext copy remains. See `docs/TRUST_PHASE2.md` for the staged purge.
+- Acceptance: a route/frame inventory and tests show that no server code path
+  can receive or return the protected-content classes listed above; a
+  server-process memory inspection sees only signaling and disclosed metadata;
+  primary disk, database, Redis, logs, backups, and snapshots contain no
+  recoverable plaintext protected content. Historical stores are checked
+  independently of code grep. The detailed task gates live in
+  `docs/TRUST_PHASE2_TASKS.md`.
 
 ### Phase 3 — endpoint identity and signed signaling (L1)
 
