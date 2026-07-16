@@ -22,6 +22,9 @@ printf '%s\n' "== worker-only daemon guard =="
 scripts/check-worker-only-daemon.sh --self-test
 scripts/check-worker-only-daemon.sh
 
+printf '%s\n' "== local daemon smoke cleanup guard =="
+scripts/smoke-local-daemon.sh --self-test
+
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
 

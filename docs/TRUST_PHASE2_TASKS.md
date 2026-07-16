@@ -1,6 +1,6 @@
 # Trust Phase 2 — tracked task schedule
 
-Last updated: 2026-07-15. Governing model: `docs/TRUST.md`. Build sequence and
+Last updated: 2026-07-16. Governing model: `docs/TRUST.md`. Build sequence and
 purge runbook: `docs/TRUST_PHASE2.md`.
 
 This is the execution ledger for the trust-model review. It distinguishes
@@ -66,6 +66,24 @@ integrated, leaving a clean quality baseline for the transport work.
 | QUAL-03 | DONE | Fix the Ruff import-order failure in `server/spawn_server/routes/hosts.py` (`ec1f86e`) | Completed baseline cleanup | `uv run ruff check spawn_server tests` passes |
 | QUAL-04 | DONE | Fix the two Clippy warnings: `type_complexity` at `pty.rs` worker replay and `nonminimal_bool` in `upload.rs` (`775b7d0`; merged with the parallel format cleanup by `640a2e0`) | Completed baseline cleanup | `cargo clippy --all-targets --all-features -- -D warnings` passes |
 | QUAL-05 | DONE | Make the full server test baseline hermetic by isolating auth-provider environment and migration connection state (`aa524d9`) | Completed test-harness cleanup | Full server suite passes without relying on ambient environment or prior engine state |
+| QUAL-FLAKE-01 | ACTIVE — REVIEW PENDING | Remove three observed baseline races without weakening assertions: await background auto-update persistence by its completion task; make local-daemon smoke worker/process teardown identity-scoped and bounded before filesystem cleanup; gate persistent-agent create on explicit daemon lifecycle readiness after the intentionally failing agent is deleted | Blocks accepting a flaky all-checks baseline | Focused server repeats, cleanup/reconnect self-tests, repeated local-daemon smoke, trust guards, exact gates, and current-master mergeability pass with bounded fail-closed diagnostics |
+
+QUAL-FLAKE-01 keeps all three independently reproduced failures visible until
+review accepts the correction:
+
+1. **ACTIVE — REVIEW PENDING:** the server auto-update assertion could outrun
+   the detached result-persistence task despite a one-second polling allowance.
+2. **ACTIVE — REVIEW PENDING:** local-daemon cleanup could remove its private
+   filesystem while a worker was still tearing down or writing late state.
+3. **ACTIVE — REVIEW PENDING:** persistent-shell creation could race the
+   daemon control connection recovering after deletion of the capability-test
+   agent.
+
+Candidate validation (still review pending): the auto-update regression passed
+30 fresh-process repetitions; the local-daemon smoke passed 10 repetitions
+with zero scoped server, daemon, or worker processes after every run; and the
+forced mid-run failure removed its private fixture and left zero scoped
+processes. The full server suite and both trust guards also pass.
 
 ### Integrated validation at `640a2e0`
 
@@ -163,9 +181,10 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 2. **Wave 1 (complete):** P2-AGENT-01, its P2-TMUX-01 worker-only cutover, and
    P2-HOST-01 passed independent review and are integrated on `master` through
    `1f66d2d`.
-3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 are implemented with review
-   pending; P2-TERM-01 remains planned on the agent protocol while
-   P2-HOST-02 and P2-HOST-03A implement separate host-channel operations
+3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 and QUAL-FLAKE-01 are
+   implemented or active with review pending; P2-TERM-01 remains planned on
+   the agent protocol while P2-HOST-02 and P2-HOST-03A implement separate
+   host-channel operations
    (rebasing/serializing shared route edits before merge). P2-DATA-01 design
    review may run alongside them once P2-HOST-01 fixes the transport boundary.
 4. **Wave 3:** P2-DATA-02 after its design pass, then P2-HOST-03B and

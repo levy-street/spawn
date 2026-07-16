@@ -735,7 +735,8 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             daemon=daemon,
             expected_host_generation=daemon.host_generation,
         )
-        await first_task
+        first_updates = await first_task
+        assert len(first_updates) == 1
 
         install = await _wait_for_text_frame(fake_ws, "host.tools.install", start=first_start)
         assert install["target"]["preset_id"] == preset_id
@@ -760,16 +761,12 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             daemon=daemon,
             expected_host_generation=daemon.host_generation,
         )
-
-        for _ in range(100):
-            async with sm() as session:
-                stored = await session.get(HostToolPolicy, policy_id)
-                assert stored is not None
-                last_auto_update_at = stored.last_auto_update_at
-                last_auto_update_error = stored.last_auto_update_error
-            if last_auto_update_error == "failed install":
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.gather(*first_updates)
+        async with sm() as session:
+            stored = await session.get(HostToolPolicy, policy_id)
+            assert stored is not None
+            last_auto_update_at = stored.last_auto_update_at
+            last_auto_update_error = stored.last_auto_update_error
         assert last_auto_update_at is not None
         assert last_auto_update_error == "failed install"
 
@@ -800,8 +797,8 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             daemon=daemon,
             expected_host_generation=daemon.host_generation,
         )
-        await second_task
-        await asyncio.sleep(0)
+        second_updates = await second_task
+        assert second_updates == ()
         assert not any(
             json.loads(raw).get("type") == "host.tools.install"
             for raw in fake_ws.sent_text[second_start:]

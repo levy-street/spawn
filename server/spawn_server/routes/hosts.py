@@ -238,7 +238,8 @@ async def _run_auto_update(
         _AUTO_UPDATE_IN_FLIGHT.discard(key)
 
 
-async def run_auto_update_checks_once() -> None:
+async def run_auto_update_checks_once() -> tuple[asyncio.Task[None], ...]:
+    started_updates: list[asyncio.Task[None]] = []
     sm = get_sessionmaker()
     async with sm() as session:
         rows = (
@@ -286,15 +287,18 @@ async def run_auto_update_checks_once() -> None:
                     _AUTO_UPDATE_IN_FLIGHT.add(key)
                     policy.last_auto_update_at = now
                     policy.last_auto_update_error = None
-                    asyncio.create_task(
-                        _run_auto_update(
-                            user_id=user_id,
-                            host_id=host_id,
-                            preset_id=tool.preset_id,
-                            target=target,
+                    started_updates.append(
+                        asyncio.create_task(
+                            _run_auto_update(
+                                user_id=user_id,
+                                host_id=host_id,
+                                preset_id=tool.preset_id,
+                                target=target,
+                            )
                         )
                     )
             await session.commit()
+    return tuple(started_updates)
 
 
 async def _auto_update_check_loop() -> None:
