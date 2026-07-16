@@ -2,28 +2,28 @@
 //
 // `spawnd` is the small static binary that runs on a user's host. It dials WSS
 // out to the central spawn-server, registers the host, and accepts agent
-// lifecycle frames. For each agent it launches the agent inside its own tmux
-// session, attaches a PTY for streaming, and multiplexes PTY I/O over the
-// single WS. Agent provider auth (e.g. `claude /login`) is handled by each
-// CLI itself on the host — spawn does not manage agent credentials.
+// lifecycle frames. For each agent it launches a purpose-built session worker
+// that owns the PTY and multiplexes control through spawnd. Agent provider auth
+// (e.g. `claude /login`) is handled by each CLI itself on the host — spawn does
+// not manage agent credentials.
 //
-// Process model: tmux owns the agent process, so the agent survives `spawnd`
-// restarts. On reconnect the daemon re-registers with the list of agents it
-// still owns, and the server resyncs its routing map without disturbing them.
+// Process model: one spawn-worker owns each agent process and survives `spawnd`
+// restarts. On reconnect the daemon adopts live workers and re-registers them.
 
 mod activity;
+mod agent_ctl;
 mod agents;
 mod cli;
 mod config;
 mod creds;
 mod frames;
+mod host_control;
 mod host_files;
 mod login;
 mod proto;
 mod pty;
 mod rtc;
 mod run;
-mod tmux;
 mod upload;
 mod worker_backend;
 mod ws;

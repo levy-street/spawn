@@ -3,12 +3,12 @@
  *
  * See `proto/README.md`:
  *   - URL: `${WS_URL}/ws/browser?agent_id=<uuid>`
- *   - Subprotocol: `spawn.v1`
- *   - Inbound: text JSON ({type:"history", bytes_b64} | {type:"display.control",...} |
+ *   - Subprotocol: `spawn.v2` preferred, `spawn.v1` legacy.
+ *   - Legacy-v1 inbound: text JSON ({type:"history", bytes_b64} | {type:"display.control",...} |
  *             {type:"agent.exit",...} | {type:"agent.status",...} |
  *             {type:"upload.saved",...} | {type:"upload.error",...} |
  *             WebRTC signaling frames); binary stdout bytes.
- *   - Outbound: text JSON ({type:"resize",cols,rows} | {type:"take_control",cols,rows} |
+ *   - Legacy-v1 outbound: text JSON ({type:"resize",cols,rows} | {type:"take_control",cols,rows} |
  *              {type:"scroll",lines} | {type:"upload",...});
  *               binary stdin bytes.
  */
@@ -18,10 +18,11 @@
 // The Next rewrite proxies /ws/* to the API server in local development.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
-// Offered in preference order. On spawn.v2 the WS is control/signaling only:
-// the server never relays PTY bytes (binary frames are a protocol error) and
-// live terminal data flows exclusively over the WebRTC DataChannel
-// (docs/TRUST.md Phase 1). spawn.v1 keeps the legacy relay for old servers.
+// Offered in preference order. On spawn.v2 browser input and browser-requested
+// history use spawn.pty/spawn.ctl WebRTC DataChannels. Until P2-AGENT-02,
+// however, spawnd still mirrors live output through the legacy server path;
+// the protocol label must not imply that the server cannot observe content.
+// spawn.v1 also keeps browser input/history on the legacy relay.
 export const SPAWN_WS_SUBPROTOCOLS = ["spawn.v2", "spawn.v1"];
 
 export function spawnWsSubprotocols(): string[] {

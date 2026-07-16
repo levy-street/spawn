@@ -37,6 +37,7 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 | `aa524d9` | QUAL-05 | Full server suite made hermetic against ambient auth-provider environment and prior migration connection state. |
 | `1bb9fe9`, `775b7d0` | QUAL-02, QUAL-04 | Independently reviewed repository-wide daemon format cleanup and strict Clippy fixes. |
 | `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
+| `1f66d2d` | P2-AGENT-01, P2-TMUX-01 | Reviewed integration of per-agent `spawn.ctl` and the mandatory worker-only cutover. |
 
 ### Increment 1 detail (the keystone)
 
@@ -94,13 +95,39 @@ browser download/upload, and browser-mediated cross-host transfer use bounded,
 hash-and-length-checked DataChannel streams. Registration `home_dir`, filesystem
 REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
 are removed in that branch. This is **implementation-complete, review-pending**,
-not an integrated or `DONE` claim. P2-AGENT-01 remains on its independent track.
+not an integrated or `DONE` claim.
+
+P2-AGENT-01 and P2-TMUX-01 subsequently passed independent review and were
+integrated on `master` through `1f66d2d`; P2-HOST-02 is being rebased onto that
+worker-only checkpoint before its own independent review.
+
+**P2-TMUX-01 cutover checkpoint (reviewed and integrated):** production daemon
+creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
+tmux module, backend selector/env escape hatch, session-name protocol state,
+tmux discovery/attach/capture/copy/repaint paths, exact tmux replay buffer, and
+tmux-status classifier/tests are deleted. `scripts/check-worker-only-daemon.sh`
+guards that boundary in `scripts/test-all.sh`. The decision and operator
+boundary are recorded in `docs/TMUX_REMOVAL.md`.
+
+This is a source checkpoint only: it has not deployed, restarted a service,
+signalled a live process, or deleted an external session. Old sessions cannot
+be transparently migrated and are intentionally unavailable to the new daemon.
+Operators must close ingress, drain them under a change window, install both
+worker-only binaries, restart, and later complete P2-PURGE-01. Rollback cannot
+restore the retired content path. The server/API/web `tmux_session` display
+field and `agent.rename` frame are removed in this checkpoint because their
+derived labels were not guaranteed content-free.
+
+P2-AGENT-02 remains planned: daemon WebSocket `0x01` output mirroring and
+`0x02` input still exist, so this checkpoint alone does not stop the server
+seeing terminal content and does not satisfy Phase 2.
 
 ## Remaining sequence
 
-1. In parallel, build per-agent `spawn.ctl` for history/snapshot and a separate
-   host-scoped `spawn.host.ctl`. Per-agent RTC is not sufficient for file/tool
-   operations on a host with no agent.
+1. Independently review and merge per-agent `spawn.ctl` plus the mandatory
+   worker cutover, while the separate host-scoped `spawn.host.ctl` proceeds.
+   Per-agent RTC is not sufficient for file/tool operations on a host with no
+   agent.
 2. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
    REST/WS terminal content and viewport-control surfaces.
 3. Move host listings/read/write/transfer onto the host channel and ship a
@@ -129,21 +156,21 @@ not an integrated or `DONE` claim. P2-AGENT-01 remains on its independent track.
 - `spawnd.service` → **PROD** (`spawnd.dev`, AWS, an *earlier* commit). Binary
   `~/.local/bin/spawnd`. **DO NOT TOUCH.**
 - `spawnd-dev.service` → **DEV** (dream → the minivac dev web instance).
-  Binary `~/.local/bin/spawnd-dev` (separate!). `SPAWND_SESSION_BACKEND=worker`,
-  workers under `~/.local/state/spawn-dev/workers`. This is where THIS session's
-  agent (`9e4e2296`) runs.
+  Binary `~/.local/bin/spawnd-dev` (separate!), with workers under
+  `~/.local/state/spawn-dev/workers`. This is where THIS session's agent
+  (`9e4e2296`) runs.
 - Dev server + web on **minivac**: `systemctl --user` units
   `spawn-dev-server.service` (127.0.0.1:18330) and `spawn-dev-web.service`
   (0.0.0.0:8330). Repo at `~/projects/spawn`; web build needs
   `SPAWN_API_PROXY_TARGET=http://127.0.0.1:18330`.
 
-**Deploy the daemon (dev):** `cargo build --release --bin spawnd` (oem box) →
-install via *atomic rename* (`cp target/release/spawnd ~/.local/bin/spawnd-dev.new
-&& mv -f ...spawnd-dev.new ~/.local/bin/spawnd-dev`; in-place `cp` fails "text
-file busy") → `systemctl --user restart spawnd-dev.service`. **Safe for this
-session:** the worker backend *adopts* running workers on restart (see the
-`adopting session worker` journal lines), so the claude process keeps running
-and the browser reconnects. Keep a `.bak` of the old binary for rollback.
+**Deploy the daemon (dev):** do not deploy this cutover as an ordinary hot
+restart. Follow `docs/TMUX_REMOVAL.md`: close ingress, inventory and drain old
+sessions without capture, build/install both `spawnd` and `spawn-worker`, then
+restart and verify worker adoption/replay. Compatible workers survive a
+supervisor restart; old sessions are unavailable. A binary rollback must not
+restore the retired content path, so remediation is a corrected worker-only
+roll-forward rather than re-enabling the old backend.
 
 **Deploy the server (dev):** `git push origin master` → `ssh minivac 'cd
 ~/projects/spawn && git pull --ff-only && systemctl --user restart

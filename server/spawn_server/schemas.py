@@ -323,7 +323,6 @@ class AgentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str | None = None
-    tmux_session: str | None = None
     host_id: str
     host_name: str | None = None
     preset_id: str | None = None

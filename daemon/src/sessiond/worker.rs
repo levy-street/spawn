@@ -2,35 +2,38 @@
 //!
 //! Lifecycle:
 //! 1. `spawn-worker --socket <p> --agent-id <uuid> --log-dir <p>` binds the
-//!    unix socket and waits for the supervising `spawnd` to connect.
+//!    ordinary unix socket and an independent lifecycle socket, then waits
+//!    for the supervising `spawnd` to connect.
 //! 2. Every accepted connection is greeted with a `Hello` frame carrying the
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
 //! 3. `Start` spawns the agent argv on a PTY the worker owns. Raw output
 //!    feeds a headless screen emulator (`sessiond::emulator`), is encrypted
-//!    into the scrollback log the moment it leaves the PTY read buffer, then
-//!    forwarded to the current connection; the plaintext buffer is zeroized
-//!    after each hop. Log rotations checkpoint the emulator's serialized
+//!    into the scrollback log before any disk write, then forwarded through a
+//!    bounded connection queue; plaintext chunks and PTY scratch are zeroized
+//!    after each hop/drop. Log rotations checkpoint the emulator's serialized
 //!    screen — the agent process is never signaled to provoke a repaint.
 //! 4. On PTY EOF the worker reports `Exit`, deletes its scrollback (the key
 //!    dies with the process anyway), unlinks its socket, and exits.
 //!
 //! The agent's fate is tied to the worker (the worker holds the PTY master),
 //! but NOT to spawnd: the worker runs in its own process group and keeps
-//! serving across spawnd restarts/upgrades. That is the tmux-survivability
-//! property, minus tmux.
+//! serving across spawnd restarts/upgrades without an intermediate terminal
+//! multiplexer.
 
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixListener;
+use tokio::net::{UnixDatagram, UnixListener};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -52,6 +55,109 @@ enum PendingCheckpoint {
 /// endless string), checkpoint anyway — a bounded rare glitch beats an
 /// unbounded segment.
 const CHECKPOINT_DEFER_CAP: usize = 32 * 1024;
+const PTY_READ_CHUNK_BYTES: usize = 8 * 1024;
+/// At most this many 8 KiB PTY reads may wait for the async worker loop. A
+/// stalled supervisor socket therefore backpressures the kernel PTY rather
+/// than accumulating plaintext Vecs in worker memory.
+const PTY_OUTPUT_QUEUE_DEPTH: usize = 8;
+/// Bound daemon frames waiting for the worker loop (notably PTY input).
+const CONNECTION_FRAME_QUEUE_DEPTH: usize = 1;
+/// Bound input waiting for a child that has stopped reading its PTY.
+const PTY_INPUT_QUEUE_DEPTH: usize = 32;
+const MAX_START_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PTY_INPUT_FRAME_BYTES: usize = 64 * 1024;
+const MAX_SHUTDOWN_FRAME_BYTES: usize = 64;
+const SUPERVISOR_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[cfg(test)]
+type WipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+struct PlaintextChunk {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    wipe_probe: Option<WipeProbe>,
+}
+
+impl std::fmt::Debug for PlaintextChunk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlaintextChunk")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlaintextChunk {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_wipe_probe(bytes: Vec<u8>, wipe_probe: WipeProbe) -> Self {
+        Self {
+            bytes,
+            wipe_probe: Some(wipe_probe),
+        }
+    }
+}
+
+impl std::ops::Deref for PlaintextChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl Drop for PlaintextChunk {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe(&self.bytes);
+        }
+    }
+}
+
+fn take_pty_read(scratch: &mut [u8], len: usize) -> PlaintextChunk {
+    let chunk = PlaintextChunk::new(scratch[..len].to_vec());
+    secret::wipe(&mut scratch[..len]);
+    chunk
+}
+
+fn pty_output_channel() -> (mpsc::Sender<PlaintextChunk>, mpsc::Receiver<PlaintextChunk>) {
+    mpsc::channel(PTY_OUTPUT_QUEUE_DEPTH)
+}
+
+fn inbound_frame_limit(frame_type: u8) -> Option<usize> {
+    match frame_type {
+        wire::T_START => Some(MAX_START_FRAME_BYTES),
+        wire::T_INPUT => Some(MAX_PTY_INPUT_FRAME_BYTES),
+        wire::T_RESIZE => Some(4),
+        wire::T_REDRAW => Some(0),
+        wire::T_REPLAY_REQ => Some(4),
+        wire::T_SHUTDOWN => Some(MAX_SHUTDOWN_FRAME_BYTES),
+        _ => None,
+    }
+}
+
+fn inbound_frame_size_exact(frame_type: u8, len: usize) -> bool {
+    match frame_type {
+        wire::T_RESIZE | wire::T_REPLAY_REQ => len == 4,
+        wire::T_REDRAW => len == 0,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
+    inbound_frame_limit(frame_type).is_some_and(|limit| len <= limit)
+        && inbound_frame_size_exact(frame_type, len)
+}
 
 #[derive(Default)]
 struct CheckpointGate {
@@ -62,7 +168,11 @@ struct CheckpointGate {
 
 /// Serialize the emulator and cut the log: a rotation for size-triggered
 /// checkpoints, a geometry checkpoint for resize-triggered ones.
-fn checkpoint_now(log: &mut ScrollbackLog, emulator: &mut Emulator, kind: PendingCheckpoint) {
+fn checkpoint_now(
+    log: &mut ScrollbackLog,
+    emulator: &mut Emulator,
+    kind: PendingCheckpoint,
+) -> bool {
     let (cols, rows) = emulator.geometry();
     let state = emulator.serialize();
     let checkpoint = Checkpoint {
@@ -74,17 +184,27 @@ fn checkpoint_now(log: &mut ScrollbackLog, emulator: &mut Emulator, kind: Pendin
         PendingCheckpoint::Rotate => log.rotate(&checkpoint),
         PendingCheckpoint::Resize => log.resize_checkpoint(&checkpoint),
     };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "checkpoint failed");
-    }
+    let succeeded = match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "checkpoint failed; disabling replay for this worker");
+            false
+        }
+    };
     secret::wipe_vec(state);
+    succeeded
 }
 
 /// Feed bytes to the emulator and the log; a due rotation is queued on the
 /// gate (checkpoints land only on sequence boundaries).
-fn ingest(emu: &mut Emulator, log: &mut ScrollbackLog, bytes: &[u8], gate: &mut CheckpointGate) {
+fn ingest(
+    emu: &mut Emulator,
+    log: &mut ScrollbackLog,
+    bytes: &[u8],
+    gate: &mut CheckpointGate,
+) -> bool {
     if bytes.is_empty() {
-        return;
+        return true;
     }
     emu.feed(bytes);
     match log.append_output(bytes) {
@@ -92,9 +212,13 @@ fn ingest(emu: &mut Emulator, log: &mut ScrollbackLog, bytes: &[u8], gate: &mut 
             if gate.pending.is_none() {
                 gate.pending = Some(PendingCheckpoint::Rotate);
             }
+            true
         }
-        Ok(false) => {}
-        Err(e) => tracing::warn!(error = %e, "scrollback append failed"),
+        Ok(false) => true,
+        Err(error) => {
+            tracing::warn!(%error, "scrollback append failed; disabling replay for this worker");
+            false
+        }
     }
 }
 
@@ -110,6 +234,7 @@ pub struct WorkerArgs {
     pub log_dir: PathBuf,
     pub segment_bytes: u64,
     pub max_log_bytes: u64,
+    pub lock_fd: Option<RawFd>,
 }
 
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs> {
@@ -118,6 +243,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
     let mut log_dir = None;
     let mut segment_bytes = super::scrollback::DEFAULT_SEGMENT_BYTES;
     let mut max_log_bytes = super::scrollback::DEFAULT_MAX_LOG_BYTES;
+    let mut lock_fd = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| -> Result<String> {
             args.next()
@@ -131,6 +257,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--segment-bytes" => segment_bytes = value("--segment-bytes")?.parse()?,
             "--max-log-bytes" => max_log_bytes = value("--max-log-bytes")?.parse()?,
+            "--lock-fd" => lock_fd = Some(value("--lock-fd")?.parse()?),
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -140,6 +267,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
         log_dir: log_dir.context("--log-dir is required")?,
         segment_bytes,
         max_log_bytes,
+        lock_fd,
     })
 }
 
@@ -170,17 +298,32 @@ enum State {
 
 struct Pty {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: mpsc::Sender<PlaintextChunk>,
     pid: u32,
+    child: SharedChild,
     /// Desired size; jiggles always restore to this.
     size: Arc<Mutex<(u16, u16)>>,
+}
+
+type SharedChild = Arc<Mutex<ChildState>>;
+
+/// The unreaped child handle is the stable process identity. Lifecycle
+/// signaling and the exit monitor both hold this same lock, so the PID cannot
+/// be reused between validation and `killpg` and reaping cannot race a signal.
+enum ChildState {
+    AwaitingStart,
+    Running {
+        child: Box<dyn Child + Send + Sync>,
+        pid: u32,
+    },
+    Exited,
 }
 
 /// Frames from the *current* connection's reader task, tagged with the
 /// connection generation so frames from a displaced connection are ignored.
 struct ConnFrame {
     generation: u64,
-    frame: Option<(u8, Vec<u8>)>,
+    frame: Option<(u8, PlaintextChunk)>,
 }
 
 /// Everything needed to open the scrollback log at `Start` time (the log's
@@ -208,22 +351,43 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut emulator: Option<Emulator> = None;
     let mut gate = CheckpointGate::default();
 
-    if let Some(parent) = args.socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    let parent = args
+        .socket
+        .parent()
+        .context("worker socket has no parent directory")?;
+    super::endpoint::ensure_private_dir(parent)?;
+    let _endpoint_lock = match args.lock_fd {
+        Some(fd) => {
+            // SAFETY: production launch passes an owned descriptor inherited
+            // across exec. Identity and lock ownership are revalidated before
+            // either endpoint is touched.
+            unsafe { super::endpoint::WorkerLock::from_inherited(fd, &args.socket) }?
         }
-    }
-    let _ = std::fs::remove_file(&args.socket);
-    let listener = UnixListener::bind(&args.socket)
-        .with_context(|| format!("binding {}", args.socket.display()))?;
+        None => match super::endpoint::try_reserve(&args.socket)? {
+            super::endpoint::LockAttempt::Acquired(lock) => lock,
+            super::endpoint::LockAttempt::Busy => bail!("worker endpoint is already owned"),
+        },
+    };
+    let lifecycle_socket = wire::lifecycle_socket_path(&args.socket);
+    super::endpoint::remove_stale_socket(&args.socket)?;
+    super::endpoint::remove_stale_socket(&lifecycle_socket)?;
+    let listener = UnixListener::bind(&args.socket).context("binding ordinary worker endpoint")?;
+    let ordinary_identity = super::endpoint::secure_bound_socket(&args.socket)?;
+    let lifecycle_listener =
+        UnixDatagram::bind(&lifecycle_socket).context("binding lifecycle worker endpoint")?;
+    let lifecycle_identity = super::endpoint::secure_bound_socket(&lifecycle_socket)?;
+    let instance_id = Uuid::new_v4();
+    let child_state = Arc::new(Mutex::new(ChildState::AwaitingStart));
+    let lifecycle_task = tokio::spawn(run_lifecycle_listener(
+        lifecycle_listener,
+        instance_id,
+        Arc::clone(&child_state),
+        args.agent_id,
+    ));
     tracing::info!(agent_id = %args.agent_id, socket = %args.socket.display(), "worker listening");
 
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<ConnFrame>();
-    let (pty_tx, mut pty_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<ConnFrame>(CONNECTION_FRAME_QUEUE_DEPTH);
+    let (pty_tx, mut pty_rx) = pty_output_channel();
     let (exit_tx, mut exit_rx) = oneshot::channel::<wire::ExitInfo>();
     let mut exit_tx = Some(exit_tx);
     let mut pty_tx = Some(pty_tx);
@@ -231,9 +395,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut state = State::AwaitingStart;
     let mut pty: Option<Pty> = None;
     let mut conn_write: Option<OwnedWriteHalf> = None;
+    let mut conn_reader: Option<JoinHandle<()>> = None;
     let mut generation: u64 = 0;
     let mut pty_open = false;
     let mut exit_reported = false;
+    let mut pty_source_offset = 0u64;
 
     let started_at = tokio::time::Instant::now();
     let mut exited_at: Option<tokio::time::Instant> = None;
@@ -255,11 +421,15 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accepting connection")?;
-                generation += 1;
+                if super::endpoint::validate_stream_peer(&stream).is_err() {
+                    tracing::warn!("rejecting worker supervisor with invalid peer ownership");
+                    continue;
+                }
                 let (read_half, mut write_half) = stream.into_split();
                 let hello = wire::Hello {
                     version: wire::PROTO_VERSION,
                     agent_id: args.agent_id,
+                    instance_id,
                     state: match &state {
                         State::AwaitingStart => "awaiting_start".into(),
                         State::Running => "running".into(),
@@ -269,7 +439,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     cols: pty.as_ref().map(|p| p.size.lock().unwrap().0).unwrap_or(0),
                     rows: pty.as_ref().map(|p| p.size.lock().unwrap().1).unwrap_or(0),
                 };
-                if wire::write_json_frame(&mut write_half, wire::T_HELLO, &hello).await.is_err() {
+                let hello_sent = tokio::time::timeout(
+                    SUPERVISOR_HELLO_TIMEOUT,
+                    wire::write_json_frame(&mut write_half, wire::T_HELLO, &hello),
+                )
+                .await;
+                if !matches!(hello_sent, Ok(Ok(()))) {
                     continue;
                 }
                 // If the agent already exited, deliver Exit immediately.
@@ -279,18 +454,23 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     let _ = write_half.shutdown().await;
                     break;
                 }
+                // The candidate is now authenticated and has accepted its
+                // Hello. Fully close and await the previous connection before
+                // allowing the new reader to feed the command queue.
+                close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
+                generation = generation.wrapping_add(1);
                 conn_write = Some(write_half);
-                spawn_conn_reader(read_half, generation, frame_tx.clone());
+                conn_reader = Some(spawn_conn_reader(read_half, generation, frame_tx.clone()));
                 tracing::debug!(generation, "connection accepted");
             }
 
-            Some(conn_frame) = frame_rx.recv() => {
+            Some(mut conn_frame) = frame_rx.recv() => {
                 if conn_frame.generation != generation {
                     continue; // frame from a displaced connection
                 }
-                let Some((frame_type, payload)) = conn_frame.frame else {
+                let Some((frame_type, payload)) = conn_frame.frame.take() else {
                     tracing::debug!("connection closed by peer");
-                    conn_write = None;
+                    close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
                     continue;
                 };
                 match handle_frame(
@@ -305,6 +485,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &setup,
                     &mut pty_tx,
                     &mut exit_tx,
+                    &child_state,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => pty_open = true,
@@ -324,11 +505,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
             chunk = pty_rx.recv(), if pty_open => {
                 match chunk {
-                    Some(mut chunk) => {
-                        // Feed the screen emulator, then encrypt-on-read into
-                        // the log, then forward live. Checkpoints only land
+                    Some(chunk) => {
+                        // Feed the screen emulator, encrypt before any disk
+                        // write, then forward live. Checkpoints only land
                         // on escape-sequence boundaries; the agent process is
                         // never signaled or disturbed by any of it.
+                        let mut replay_failed = false;
                         if let (Some(emu), Some(active_log)) = (emulator.as_mut(), log.as_mut()) {
                             let split = match gate.pending {
                                 Some(_) => gate.scanner.first_boundary(&chunk),
@@ -339,40 +521,61 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             };
                             match (gate.pending, split) {
                                 (Some(kind), Some(i)) => {
-                                    ingest(emu, active_log, &chunk[..i], &mut gate);
-                                    checkpoint_now(active_log, emu, kind);
-                                    gate.pending = None;
-                                    gate.deferred_bytes = 0;
-                                    ingest(emu, active_log, &chunk[i..], &mut gate);
+                                    replay_failed = !ingest(emu, active_log, &chunk[..i], &mut gate);
+                                    if !replay_failed {
+                                        replay_failed = !checkpoint_now(active_log, emu, kind);
+                                    }
+                                    if !replay_failed {
+                                        gate.pending = None;
+                                        gate.deferred_bytes = 0;
+                                        replay_failed =
+                                            !ingest(emu, active_log, &chunk[i..], &mut gate);
+                                    }
                                 }
                                 (Some(kind), None) => {
-                                    ingest(emu, active_log, &chunk, &mut gate);
-                                    gate.deferred_bytes += chunk.len();
-                                    if gate.deferred_bytes > CHECKPOINT_DEFER_CAP {
-                                        checkpoint_now(active_log, emu, kind);
+                                    replay_failed = !ingest(emu, active_log, &chunk, &mut gate);
+                                    if !replay_failed {
+                                        gate.deferred_bytes += chunk.len();
+                                    }
+                                    if !replay_failed && gate.deferred_bytes > CHECKPOINT_DEFER_CAP {
+                                        replay_failed = !checkpoint_now(active_log, emu, kind);
                                         gate.pending = None;
                                         gate.deferred_bytes = 0;
                                     }
                                 }
-                                (None, _) => ingest(emu, active_log, &chunk, &mut gate),
+                                (None, _) => {
+                                    replay_failed = !ingest(emu, active_log, &chunk, &mut gate);
+                                }
                             }
                             // A checkpoint that became due in this chunk can
                             // land right away when the stream sits at a
                             // sequence boundary.
-                            if let Some(kind) = gate.pending {
-                                if gate.scanner.at_boundary() {
-                                    checkpoint_now(active_log, emu, kind);
+                            if !replay_failed && gate.scanner.at_boundary() {
+                                if let Some(kind) = gate.pending {
+                                    replay_failed = !checkpoint_now(active_log, emu, kind);
                                     gate.pending = None;
                                     gate.deferred_bytes = 0;
                                 }
                             }
                         }
-                        if let Some(w) = conn_write.as_mut() {
-                            if wire::write_frame(w, wire::T_OUTPUT, &chunk).await.is_err() {
-                                conn_write = None;
+                        if replay_failed {
+                            gate.pending = None;
+                            gate.deferred_bytes = 0;
+                            if let Some(failed_log) = log.take() {
+                                failed_log.destroy();
                             }
                         }
-                        chunk.zeroize();
+                        pty_source_offset = pty_source_offset.saturating_add(chunk.len() as u64);
+                        debug_assert!(log
+                            .as_ref()
+                            .is_none_or(|active_log| active_log.total_logged() == pty_source_offset));
+                        if let Some(w) = conn_write.as_mut() {
+                            let framed = wire::encode_output(pty_source_offset, &chunk);
+                            if wire::write_frame(w, wire::T_OUTPUT, &framed).await.is_err() {
+                                conn_write = None;
+                            }
+                            secret::wipe_vec(framed);
+                        }
                     }
                     None => {
                         // Reader thread finished: PTY EOF. Wait for the exit
@@ -414,13 +617,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    if let Some(mut w) = conn_write.take() {
-        let _ = w.shutdown().await;
-    }
+    close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
     if let Some(log) = log {
         log.destroy();
     }
-    let _ = std::fs::remove_file(&args.socket);
+    lifecycle_task.abort();
+    let _ = lifecycle_task.await;
+    ordinary_identity.cleanup()?;
+    lifecycle_identity.cleanup()?;
     Ok(())
 }
 
@@ -433,7 +637,7 @@ enum LoopAction {
 #[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame_type: u8,
-    payload: Vec<u8>,
+    payload: PlaintextChunk,
     state: &mut State,
     pty: &mut Option<Pty>,
     conn_write: &mut Option<OwnedWriteHalf>,
@@ -441,8 +645,9 @@ async fn handle_frame(
     emulator: &mut Option<Emulator>,
     gate: &mut CheckpointGate,
     setup: &LogSetup,
-    pty_tx: &mut Option<mpsc::UnboundedSender<Vec<u8>>>,
+    pty_tx: &mut Option<mpsc::Sender<PlaintextChunk>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
+    child_state: &SharedChild,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
@@ -470,7 +675,8 @@ async fn handle_frame(
             *emulator = Some(emu);
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
-            let started = spawn_pty(&spec, out_tx, ex_tx).context("spawning agent PTY")?;
+            let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
+                .context("spawning agent PTY")?;
             let pid = started.pid;
             *pty = Some(started);
             *state = State::Running;
@@ -482,7 +688,10 @@ async fn handle_frame(
         }
         wire::T_INPUT => {
             if let Some(p) = pty {
-                let _ = p.input_tx.send(payload);
+                p.input_tx
+                    .send(payload)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("agent PTY input channel closed"))?;
             }
             Ok(LoopAction::Continue)
         }
@@ -499,11 +708,19 @@ async fn handle_frame(
             // a resize supersedes a pending size rotation (it rotates too).
             if let Some(emu) = emulator.as_mut() {
                 emu.resize(cols, rows);
+                let mut replay_failed = false;
                 if let Some(active_log) = log.as_mut() {
                     if gate.pending.is_none() && gate.scanner.at_boundary() {
-                        checkpoint_now(active_log, emu, PendingCheckpoint::Resize);
+                        replay_failed = !checkpoint_now(active_log, emu, PendingCheckpoint::Resize);
                     } else {
                         gate.pending = Some(PendingCheckpoint::Resize);
+                    }
+                }
+                if replay_failed {
+                    gate.pending = None;
+                    gate.deferred_bytes = 0;
+                    if let Some(failed_log) = log.take() {
+                        failed_log.destroy();
                     }
                 }
             }
@@ -517,13 +734,11 @@ async fn handle_frame(
         }
         wire::T_REPLAY_REQ => {
             let max_bytes = wire::decode_replay_req(&payload)?;
-            let (replay, watermark) = match log.as_mut() {
-                Some(active_log) => {
-                    let replay = active_log.replay(max_bytes as u64)?;
-                    (replay, active_log.total_logged())
-                }
-                None => (Vec::new(), 0),
-            };
+            let active_log = log
+                .as_mut()
+                .context("worker replay is unavailable for this agent")?;
+            let replay = active_log.replay(max_bytes as u64)?;
+            let watermark = active_log.total_logged();
             if let Some(w) = conn_write.as_mut() {
                 let framed = wire::encode_replay(watermark, &replay);
                 let _ = wire::write_frame(w, wire::T_REPLAY, &framed).await;
@@ -533,11 +748,14 @@ async fn handle_frame(
             Ok(LoopAction::Continue)
         }
         wire::T_SHUTDOWN => {
-            let shutdown: wire::Shutdown =
-                wire::decode_json(&payload).unwrap_or(wire::Shutdown { signal: None });
+            let shutdown: wire::Shutdown = wire::decode_json(&payload)?;
             match pty {
                 Some(p) => {
-                    signal_child(p.pid, shutdown.signal.as_deref());
+                    let signal = shutdown.signal.unwrap_or(wire::LifecycleSignal::Term);
+                    match signal_owned_child(&p.child, signal) {
+                        LifecycleOutcome::Delivered | LifecycleOutcome::Gone => {}
+                        LifecycleOutcome::Failed => bail!("worker lifecycle delivery failed"),
+                    }
                     // PTY EOF will drive Exit reporting and cleanup.
                     Ok(LoopAction::Continue)
                 }
@@ -562,41 +780,74 @@ fn state_name(state: &State) -> &'static str {
     }
 }
 
+async fn close_supervisor_connection(
+    writer: &mut Option<OwnedWriteHalf>,
+    reader: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(mut writer) = writer.take() {
+        let _ = writer.shutdown().await;
+    }
+    if let Some(reader) = reader.take() {
+        reader.abort();
+        let _ = reader.await;
+    }
+}
+
 fn spawn_conn_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     generation: u64,
-    frame_tx: mpsc::UnboundedSender<ConnFrame>,
-) {
+    frame_tx: mpsc::Sender<ConnFrame>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match wire::read_frame(&mut read_half).await {
+            match wire::read_frame_limited(&mut read_half, inbound_frame_limit).await {
                 Ok(Some(frame)) => {
+                    let (frame_type, payload) = frame;
+                    let payload = PlaintextChunk::new(payload);
+                    if !inbound_frame_size_exact(frame_type, payload.len()) {
+                        tracing::warn!(
+                            frame_type,
+                            payload_len = payload.len(),
+                            "rejecting oversized or malformed worker command frame"
+                        );
+                        let _ = frame_tx
+                            .send(ConnFrame {
+                                generation,
+                                frame: None,
+                            })
+                            .await;
+                        break;
+                    }
                     if frame_tx
                         .send(ConnFrame {
                             generation,
-                            frame: Some(frame),
+                            frame: Some((frame_type, payload)),
                         })
+                        .await
                         .is_err()
                     {
                         break;
                     }
                 }
                 Ok(None) | Err(_) => {
-                    let _ = frame_tx.send(ConnFrame {
-                        generation,
-                        frame: None,
-                    });
+                    let _ = frame_tx
+                        .send(ConnFrame {
+                            generation,
+                            frame: None,
+                        })
+                        .await;
                     break;
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_pty(
     spec: &wire::StartSpec,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::Sender<PlaintextChunk>,
     exit_tx: oneshot::Sender<wire::ExitInfo>,
+    child_state: SharedChild,
 ) -> Result<Pty> {
     if spec.argv.is_empty() {
         bail!("argv is empty");
@@ -621,12 +872,25 @@ fn spawn_pty(
     }
     cmd.cwd(&spec.cwd);
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .context("spawning agent in PTY")?;
     let pid = child.process_id().unwrap_or(0);
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        bail!("agent PTY returned an invalid process id");
+    }
     drop(pair.slave);
+
+    {
+        let mut state = child_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child state lock poisoned"))?;
+        if !matches!(*state, ChildState::AwaitingStart) {
+            bail!("agent child state is already occupied");
+        }
+        *state = ChildState::Running { child, pid };
+    }
 
     let mut reader = pair
         .master
@@ -636,25 +900,27 @@ fn spawn_pty(
 
     // Blocking writer thread: PTY input can block when the agent stops
     // reading; keep that off the async loop.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (input_tx, mut input_rx) = mpsc::channel::<PlaintextChunk>(PTY_INPUT_QUEUE_DEPTH);
     std::thread::spawn(move || {
-        while let Some(mut bytes) = input_rx.blocking_recv() {
+        while let Some(bytes) = input_rx.blocking_recv() {
             if writer.write_all(&bytes).is_err() {
                 break;
             }
             let _ = writer.flush();
-            bytes.zeroize();
         }
     });
 
-    // Blocking reader thread: PTY output -> async loop.
+    // Blocking reader thread: PTY output -> async loop. Child reaping is
+    // intentionally separate so it can share stable ownership with the
+    // independent lifecycle listener.
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                    let chunk = take_pty_read(&mut buf, n);
+                    if out_tx.blocking_send(chunk).is_err() {
                         break;
                     }
                 }
@@ -663,23 +929,16 @@ fn spawn_pty(
         }
         buf.zeroize();
         drop(out_tx); // closes the channel: signals PTY EOF to the main loop
-        let info = match child.wait() {
-            Ok(status) => wire::ExitInfo {
-                exit_code: Some(status.exit_code() as i32),
-                signal: None,
-            },
-            Err(_) => wire::ExitInfo {
-                exit_code: None,
-                signal: Some("wait_failed".into()),
-            },
-        };
-        let _ = exit_tx.send(info);
     });
+
+    let monitor_child = Arc::clone(&child_state);
+    tokio::spawn(monitor_child_exit(monitor_child, exit_tx));
 
     Ok(Pty {
         master: Arc::new(Mutex::new(pair.master)),
         input_tx,
         pid,
+        child: child_state,
         size: Arc::new(Mutex::new((spec.cols, spec.rows))),
     })
 }
@@ -695,27 +954,130 @@ fn resize_master(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, cols: u16, rows
     }
 }
 
-fn signal_child(pid: u32, signal: Option<&str>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleOutcome {
+    Delivered,
+    Gone,
+    Failed,
+}
+
+fn signal_owned_child(
+    child_state: &SharedChild,
+    signal: wire::LifecycleSignal,
+) -> LifecycleOutcome {
+    use nix::errno::Errno;
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
-    let sig = match signal.unwrap_or("TERM").trim_start_matches("SIG") {
-        "KILL" => Signal::SIGKILL,
-        "INT" => Signal::SIGINT,
-        "HUP" => Signal::SIGHUP,
-        "QUIT" => Signal::SIGQUIT,
-        _ => Signal::SIGTERM,
+    let Ok(mut state) = child_state.lock() else {
+        return LifecycleOutcome::Failed;
     };
-    let pid = Pid::from_raw(pid as i32);
-    // The PTY child is a session leader (setsid by the PTY layer), so its
-    // pgid == pid; fall back to a direct kill if killpg fails.
-    if killpg(pid, sig).is_err() {
-        let _ = nix::sys::signal::kill(pid, sig);
+    let ChildState::Running { child, pid } = &mut *state else {
+        return LifecycleOutcome::Gone;
+    };
+    if child.process_id() != Some(*pid) {
+        return LifecycleOutcome::Failed;
+    }
+    let signal = match signal {
+        wire::LifecycleSignal::Term => Signal::SIGTERM,
+        wire::LifecycleSignal::Kill => Signal::SIGKILL,
+    };
+    // portable-pty makes this child a session leader, so pgid == pid. The
+    // unreaped Child remains locked across validation and this syscall: the
+    // numeric identity cannot be recycled. ESRCH is a safe already-gone
+    // result. Never fall back to signalling the bare numeric PID.
+    match killpg(Pid::from_raw(*pid as i32), signal) {
+        Ok(()) => LifecycleOutcome::Delivered,
+        Err(Errno::ESRCH) => LifecycleOutcome::Gone,
+        Err(error) => {
+            tracing::warn!(pid = *pid, %error, "agent process-group signal failed");
+            LifecycleOutcome::Failed
+        }
+    }
+}
+
+async fn monitor_child_exit(child_state: SharedChild, exit_tx: oneshot::Sender<wire::ExitInfo>) {
+    loop {
+        let info = match child_state.lock() {
+            Err(_) => Some(wire::ExitInfo {
+                exit_code: None,
+                signal: Some("wait_failed".into()),
+            }),
+            Ok(mut state) => match &mut *state {
+                ChildState::Running { child, .. } => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let info = wire::ExitInfo {
+                            exit_code: Some(status.exit_code() as i32),
+                            signal: None,
+                        };
+                        *state = ChildState::Exited;
+                        Some(info)
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        *state = ChildState::Exited;
+                        Some(wire::ExitInfo {
+                            exit_code: None,
+                            signal: Some("wait_failed".into()),
+                        })
+                    }
+                },
+                ChildState::Exited => return,
+                ChildState::AwaitingStart => None,
+            },
+        };
+        if let Some(info) = info {
+            let _ = exit_tx.send(info);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_lifecycle_listener(
+    socket: UnixDatagram,
+    instance_id: Uuid,
+    child_state: SharedChild,
+    agent_id: Uuid,
+) {
+    // One fixed buffer and one task serve atomic datagrams. Partial writers
+    // cannot retain a connection, handler slot, fd, or allocation, and the
+    // kernel receive queue provides the hard resource bound under floods.
+    let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN + 1];
+    loop {
+        let Ok((len, peer)) = socket.recv_from(&mut request).await else {
+            break;
+        };
+        let ack = if len != wire::LIFECYCLE_REQUEST_LEN {
+            wire::LIFECYCLE_ACK_FAILED
+        } else {
+            let exact: &[u8; wire::LIFECYCLE_REQUEST_LEN] = request[..len]
+                .try_into()
+                .expect("validated lifecycle datagram length");
+            match wire::decode_lifecycle_request(exact) {
+                Ok((requested_instance, _)) if requested_instance != instance_id => {
+                    wire::LIFECYCLE_ACK_WRONG_INSTANCE
+                }
+                Ok((_, signal)) => match signal_owned_child(&child_state, signal) {
+                    LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
+                    LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
+                    LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
+                },
+                Err(_) => wire::LIFECYCLE_ACK_FAILED,
+            }
+        };
+        let Some(peer_path) = peer.as_pathname() else {
+            continue;
+        };
+        if socket.try_send_to(&[ack], peer_path).is_err() {
+            tracing::debug!(%agent_id, "lifecycle requester closed before acknowledgement");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn parse_args_requires_the_essentials() {
@@ -738,5 +1100,268 @@ mod tests {
             super::super::scrollback::DEFAULT_MAX_LOG_BYTES
         );
         assert!(args(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn pty_read_scratch_is_wiped_immediately() {
+        let mut scratch = [0u8; 32];
+        scratch[..9].copy_from_slice(b"sensitive");
+        let chunk = take_pty_read(&mut scratch, 9);
+        assert_eq!(&*chunk, b"sensitive");
+        assert!(scratch[..9].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn worker_command_frames_have_type_specific_limits() {
+        assert!(inbound_frame_size_allowed(
+            wire::T_START,
+            MAX_START_FRAME_BYTES
+        ));
+        assert!(!inbound_frame_size_allowed(
+            wire::T_START,
+            MAX_START_FRAME_BYTES + 1
+        ));
+        assert!(inbound_frame_size_allowed(
+            wire::T_INPUT,
+            MAX_PTY_INPUT_FRAME_BYTES
+        ));
+        assert!(!inbound_frame_size_allowed(
+            wire::T_INPUT,
+            MAX_PTY_INPUT_FRAME_BYTES + 1
+        ));
+        assert!(inbound_frame_size_allowed(wire::T_RESIZE, 4));
+        assert!(!inbound_frame_size_allowed(wire::T_RESIZE, 5));
+        assert!(!inbound_frame_size_allowed(wire::T_REDRAW, 1));
+    }
+
+    #[tokio::test]
+    async fn stalled_consumer_caps_chunks_and_zeroizes_drops() {
+        let (tx, mut rx) = pty_output_channel();
+        for index in 0..PTY_OUTPUT_QUEUE_DEPTH {
+            tx.try_send(PlaintextChunk::new(vec![index as u8; PTY_READ_CHUNK_BYTES]))
+                .unwrap();
+        }
+        assert_eq!(tx.capacity(), 0);
+
+        let wiped = Arc::new(AtomicBool::new(false));
+        let wiped_probe = Arc::clone(&wiped);
+        let rejected = PlaintextChunk::with_wipe_probe(
+            b"must-wipe-on-backpressure".to_vec(),
+            Arc::new(move |bytes| {
+                wiped_probe.store(bytes.iter().all(|byte| *byte == 0), Ordering::Release);
+            }),
+        );
+        let error = tx.try_send(rejected).unwrap_err();
+        assert!(matches!(error, mpsc::error::TrySendError::Full(_)));
+        drop(error);
+        assert!(wiped.load(Ordering::Acquire));
+
+        // Releasing exactly one slot admits exactly one more fixed-size read;
+        // no hidden unbounded side queue exists in the production handoff.
+        drop(rx.recv().await.unwrap());
+        assert_eq!(tx.capacity(), 1);
+        tx.try_send(PlaintextChunk::new(vec![0x5a; PTY_READ_CHUNK_BYTES]))
+            .unwrap();
+        assert_eq!(tx.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn exited_child_identity_cannot_signal_an_unrelated_process_after_pid_churn() {
+        use std::os::unix::process::CommandExt;
+
+        let child = std::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("short-lived child");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let monitor_state = Arc::clone(&child_state);
+        tokio::spawn(monitor_child_exit(monitor_state, exit_tx));
+        tokio::time::timeout(Duration::from_secs(3), exit_rx)
+            .await
+            .expect("child reap timed out")
+            .expect("exit monitor dropped");
+
+        // Exercise allocator/PID churn after the stable child was reaped.
+        for _ in 0..128 {
+            std::process::Command::new("/bin/true")
+                .status()
+                .expect("pid churn child");
+        }
+        let mut unrelated = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("unrelated sentinel");
+
+        assert_eq!(
+            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            LifecycleOutcome::Gone
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            unrelated.try_wait().expect("sentinel status").is_none(),
+            "late KILL reached an unrelated process"
+        );
+        unrelated.kill().expect("clean sentinel");
+        unrelated.wait().expect("reap sentinel");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_listener_rejects_a_stale_worker_instance_without_signaling() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.lifecycle.sock");
+        let listener = UnixDatagram::bind(&socket).unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("worker-owned sentinel");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let current_instance = Uuid::new_v4();
+        let task = tokio::spawn(run_lifecycle_listener(
+            listener,
+            current_instance,
+            Arc::clone(&child_state),
+            Uuid::new_v4(),
+        ));
+
+        let client_path = dir.path().join("client.sock");
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client
+            .send_to(
+                &wire::encode_lifecycle_request(Uuid::new_v4(), wire::LifecycleSignal::Kill),
+                &socket,
+            )
+            .await
+            .unwrap();
+        let mut ack = [0u8; 1];
+        client.recv(&mut ack).await.unwrap();
+        assert_eq!(ack[0], wire::LIFECYCLE_ACK_WRONG_INSTANCE);
+
+        {
+            let mut state = child_state.lock().unwrap();
+            let ChildState::Running { child, .. } = &mut *state else {
+                panic!("stale instance changed child state");
+            };
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        assert_eq!(
+            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            LifecycleOutcome::Delivered
+        );
+        let mut owned =
+            match std::mem::replace(&mut *child_state.lock().unwrap(), ChildState::Exited) {
+                ChildState::Running { child, .. } => child,
+                _ => panic!("missing owned child"),
+            };
+        owned.wait().expect("reap worker-owned sentinel");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_datagrams_remain_fair_under_replenished_partial_flood() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = dir.path().join("agent.lifecycle.sock");
+        let listener = UnixDatagram::bind(&server_path).unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("signal-resistant child");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let instance = Uuid::new_v4();
+        let server = tokio::spawn(run_lifecycle_listener(
+            listener,
+            instance,
+            Arc::clone(&child_state),
+            Uuid::new_v4(),
+        ));
+
+        let attacker_path = dir.path().join("attacker.sock");
+        let attacker = UnixDatagram::bind(&attacker_path).unwrap();
+        let attack_server = server_path.clone();
+        let flood = tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + Duration::from_millis(750);
+            while tokio::time::Instant::now() < until {
+                let _ = attacker.try_send_to(&[0xAA], &attack_server);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let client_path = dir.path().join("legitimate.sock");
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client.connect(&server_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        async fn deliver(client: &UnixDatagram, request: &[u8; wire::LIFECYCLE_REQUEST_LEN]) -> u8 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                assert!(tokio::time::Instant::now() < deadline, "delivery starved");
+                if client.send(request).await.is_ok() {
+                    let mut ack = [0u8; 2];
+                    if let Ok(Ok(1)) =
+                        tokio::time::timeout(Duration::from_millis(100), client.recv(&mut ack))
+                            .await
+                    {
+                        return ack[0];
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert_eq!(
+            deliver(
+                &client,
+                &wire::encode_lifecycle_request(instance, wire::LifecycleSignal::Term),
+            )
+            .await,
+            wire::LIFECYCLE_ACK_DELIVERED
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut state = child_state.lock().unwrap();
+            let ChildState::Running { child, .. } = &mut *state else {
+                panic!("TERM changed stable child ownership");
+            };
+            assert!(child.try_wait().unwrap().is_none(), "TERM was not ignored");
+        }
+        assert_eq!(
+            deliver(
+                &client,
+                &wire::encode_lifecycle_request(instance, wire::LifecycleSignal::Kill),
+            )
+            .await,
+            wire::LIFECYCLE_ACK_DELIVERED
+        );
+
+        let mut owned =
+            match std::mem::replace(&mut *child_state.lock().unwrap(), ChildState::Exited) {
+                ChildState::Running { child, .. } => child,
+                _ => panic!("missing stable child after KILL"),
+            };
+        owned.wait().expect("reap killed child");
+        flood.await.unwrap();
+        server.abort();
     }
 }

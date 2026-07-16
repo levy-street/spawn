@@ -1,43 +1,39 @@
-//! Per-agent PTY + tmux session management.
+//! Per-agent terminal routing shared by `spawnd` and the mandatory session
+//! worker backend.
 //!
-//! For each `agent.create`:
-//!   1. `tmux new-session -d -s spawn-<name>--<id>` launches the real argv detached,
-//!      with the final env injected into the pane process. Spawn does not
-//!      manage agent credentials — the daemon's process env (HOME,
-//!      XDG_CONFIG_HOME, PATH, etc.) flows through, and the agent CLI finds
-//!      whatever it logged in with on the host.
-//!   2. We open a portable_pty PTY and spawn `tmux attach -t <session>`
-//!      inside it. A blocking reader thread pushes raw PTY bytes into a
-//!      per-agent **outbox** (an unbounded mpsc). A long-lived per-agent
-//!      **forwarder** task encodes those bytes as binary frames and ships
-//!      them to the WS session's outbound sink. Stdin from the WS goes into
-//!      the PTY's writer.
-//!
-//! The reader thread + forwarder task survive across WS reconnects: the
-//! WS session installs/clears the forwarder's sink on connect/disconnect,
-//! and the outbox buffers any bytes received in between. This is what makes
-//! "bounce uvicorn while an agent is running" not break the agent.
-//!
-//! Because tmux owns the underlying agent process, the agent also survives
-//! `spawnd` restarts (see `reattach`).
+//! A `spawn-worker` owns each agent's PTY. Its output enters a bounded
+//! per-agent outbox and a long-lived forwarder routes it to the current server
+//! connection plus bounded direct DataChannel sinks. Workers and their PTYs
+//! survive `spawnd` reconnects/restarts; `spawnd` never owns a second terminal
+//! emulator or shells out to a multiplexer.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::future;
-use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use anyhow::Result;
+use spawnd::sessiond::wire;
+use tokio::net::UnixDatagram;
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::activity;
 use crate::frames;
 use crate::proto::Outbound;
-use crate::tmux;
+
+#[cfg(test)]
+type OutboundWipeProbe = Box<dyn Fn(&[u8])>;
+
+#[cfg(test)]
+thread_local! {
+    static OUTBOUND_WIPE_PROBE: std::cell::RefCell<Option<OutboundWipeProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Clone, Debug)]
 pub enum WsOutbound {
@@ -47,10 +43,109 @@ pub enum WsOutbound {
     Binary(Vec<u8>),
 }
 
+impl WsOutbound {
+    pub(crate) fn wipe(&mut self) {
+        match self {
+            Self::Json(text) => text.zeroize(),
+            Self::Binary(bytes) => bytes.zeroize(),
+        }
+    }
+}
+
+impl Drop for WsOutbound {
+    fn drop(&mut self) {
+        self.wipe();
+        #[cfg(test)]
+        OUTBOUND_WIPE_PROBE.with(|slot| {
+            if let Some(probe) = slot.borrow_mut().take() {
+                match self {
+                    Self::Json(text) => probe(text.as_bytes()),
+                    Self::Binary(bytes) => probe(bytes),
+                }
+            }
+        });
+    }
+}
+
 /// The thing the WS session hands to a per-agent forwarder so that bytes
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
-pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
+
+#[cfg(test)]
+type DirectWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Plaintext owned by a bounded direct-viewer queue. It wipes itself whether
+/// consumed normally, rejected by a full queue, or drained during teardown.
+pub struct DirectPayload {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    wipe_probe: Option<DirectWipeProbe>,
+}
+
+impl DirectPayload {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_wipe_probe(bytes: Vec<u8>, wipe_probe: DirectWipeProbe) -> Self {
+        Self {
+            bytes,
+            wipe_probe: Some(wipe_probe),
+        }
+    }
+}
+
+impl std::fmt::Debug for DirectPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPayload")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for DirectPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for DirectPayload {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.bytes.as_slice() == other.as_slice()
+    }
+}
+
+impl Drop for DirectPayload {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe(&self.bytes);
+        }
+    }
+}
+
+/// A direct viewer receives bounded chunks. If it cannot keep up, the
+/// forwarder disconnects it and the browser reconnects through replay.
+pub struct DirectSinkReceiver {
+    pub receiver: mpsc::Receiver<DirectPayload>,
+    pub disconnected: watch::Receiver<bool>,
+}
+
+pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
+pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
+pub const WORKER_OUTPUT_QUEUE_DEPTH: usize = 32;
+pub const WORKER_COMMAND_QUEUE_DEPTH: usize = 32;
+pub const MAX_WORKER_INPUT_BYTES: usize = 64 * 1024;
+const LIFECYCLE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Immutable result of handling one output event at its producer. Immediate
 /// activity and the eligibility/generation of an ambiguous idle candidate are
@@ -59,6 +154,10 @@ pub type DirectSink = mpsc::UnboundedSender<Vec<u8>>;
 #[derive(Debug)]
 pub(crate) struct OutputChunk {
     bytes: Vec<u8>,
+    /// End watermark in the producer's byte coordinate. Worker output carries
+    /// its durable log watermark.
+    source_end: Option<u64>,
+    source_barrier: bool,
     activity: bool,
     idle_resolution: Option<PendingIdleResolution>,
 }
@@ -77,9 +176,42 @@ impl OutputChunk {
             });
         Self {
             bytes,
+            source_end: None,
+            source_barrier: false,
             activity: decision.activity,
             idle_resolution,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_activity(&self) -> bool {
+        self.activity
+    }
+
+    pub(crate) fn classify_at_source(
+        bytes: Vec<u8>,
+        source_end: u64,
+        control: &ForwarderControl,
+    ) -> Self {
+        let mut chunk = Self::classify(bytes, control);
+        chunk.source_end = Some(source_end);
+        chunk
+    }
+
+    pub(crate) fn source_barrier(source_end: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            source_end: Some(source_end),
+            source_barrier: true,
+            activity: false,
+            idle_resolution: None,
+        }
+    }
+}
+
+impl Drop for OutputChunk {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
     }
 }
 
@@ -140,22 +272,22 @@ pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: Acti
 /// time, so browsers can order snapshot content against live DataChannel
 /// bytes (which outrun the relayed snapshot response).
 struct DirectSinkEntry {
-    sink: DirectSink,
+    sink: mpsc::Sender<DirectPayload>,
+    disconnected: watch::Sender<bool>,
+    source_origin: u64,
     bytes_sent: Arc<AtomicU64>,
 }
 
 /// Shared between an agent's forwarder task and the WS session lifecycle.
-/// `slot` holds the current session's outbound sink (or `None` between
-/// sessions). `notify` wakes the forwarder when a sink becomes available.
+/// `slot` holds the current session's bounded outbound sink (or `None` between
+/// sessions).
 #[derive(Clone)]
 pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
     direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
-    notify: Arc<Notify>,
-    /// Cached `#{pane_in_mode}` so the stdin hot path never has to spawn a
-    /// tmux subprocess per keystroke; refreshed lazily in the background.
-    copy_mode: Arc<AtomicBool>,
-    copy_mode_checked_at: Arc<Mutex<Option<std::time::Instant>>>,
+    direct_sink_notify: Arc<Notify>,
+    source_offset: Arc<AtomicU64>,
+    source_notify: Arc<Notify>,
     /// Monotonic activity state. Input/output pings have independent throttle
     /// clocks; injected input/resize/redraw extend the output suppression
     /// deadline so their echoes and repaints do not count as agent work.
@@ -171,20 +303,14 @@ struct ActivityState {
     output_generation: u64,
 }
 
-/// How stale the cached copy-mode flag may get before a background refresh
-/// is kicked off. A keystroke landing within this window of the user
-/// entering copy-mode may slip through uncancelled — the same best-effort
-/// semantics the old always-cancel had for its own races.
-const COPY_MODE_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
-
 impl ForwarderControl {
     pub(crate) fn new() -> Self {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
-            notify: Arc::new(Notify::new()),
-            copy_mode: Arc::new(AtomicBool::new(false)),
-            copy_mode_checked_at: Arc::new(Mutex::new(None)),
+            direct_sink_notify: Arc::new(Notify::new()),
+            source_offset: Arc::new(AtomicU64::new(0)),
+            source_notify: Arc::new(Notify::new()),
             activity: Arc::new(Mutex::new(ActivityState::default())),
         }
     }
@@ -299,47 +425,14 @@ impl ForwarderControl {
         true
     }
 
-    /// Cached answer to "is the pane in copy-mode?", kicking off a background
-    /// refresh when the cache is stale. Never blocks on tmux.
-    pub fn copy_mode_cached(&self, session: &str) -> bool {
-        let needs_refresh = match self.copy_mode_checked_at.lock() {
-            Ok(mut guard) => match *guard {
-                Some(at) if at.elapsed() < COPY_MODE_CACHE_TTL => false,
-                _ => {
-                    *guard = Some(std::time::Instant::now());
-                    true
-                }
-            },
-            Err(_) => false,
-        };
-        if needs_refresh {
-            let flag = Arc::clone(&self.copy_mode);
-            let session = session.to_string();
-            tokio::spawn(async move {
-                if let Some(in_mode) = tmux::pane_in_mode(&session).await {
-                    flag.store(in_mode, Ordering::Relaxed);
-                }
-            });
-        }
-        self.copy_mode.load(Ordering::Relaxed)
-    }
-
-    /// Record that copy-mode was just cancelled without waiting for the next
-    /// background refresh.
-    pub fn clear_copy_mode(&self) {
-        self.copy_mode.store(false, Ordering::Relaxed);
-    }
-
-    /// Install the current WS session's outbound sink. Wakes the forwarder
-    /// task so any backlog drains immediately.
+    /// Install the current WS session's outbound sink. Output produced while
+    /// no sink was present is recovered from worker replay, not retained here.
     pub async fn set_sink(&self, sink: SessionSink) {
         *self.slot.lock().await = Some(sink);
-        self.notify.notify_one();
     }
 
-    /// Clear the sink (called when the WS session ends). The forwarder will
-    /// park on `notify` until a new sink is installed; bytes accumulate in
-    /// the agent's outbox in the meantime.
+    /// Clear the sink (called when the WS session ends). Direct routing keeps
+    /// draining the bounded worker outbox; no legacy plaintext backlog forms.
     pub async fn clear_sink(&self) {
         *self.slot.lock().await = None;
     }
@@ -347,18 +440,48 @@ impl ForwarderControl {
     /// Add a direct terminal transport sink, such as a browser WebRTC
     /// DataChannel. These sinks receive raw PTY output bytes without the
     /// daemon->server->browser relay hop.
-    pub async fn add_direct_sink(&self, id: String, sink: DirectSink) {
-        self.direct_sinks.lock().await.insert(
+    pub async fn add_direct_sink(&self, id: String) -> DirectSinkReceiver {
+        let (sink, receiver) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH);
+        let (disconnected, disconnected_rx) = watch::channel(false);
+        let mut sinks = self.direct_sinks.lock().await;
+        let source_origin = self.source_offset.load(Ordering::Acquire);
+        let previous = sinks.insert(
             id,
             DirectSinkEntry {
                 sink,
+                disconnected,
+                source_origin,
                 bytes_sent: Arc::new(AtomicU64::new(0)),
             },
         );
+        if let Some(previous) = previous {
+            let _ = previous.disconnected.send(true);
+        }
+        drop(sinks);
+        self.direct_sink_notify.notify_waiters();
+        DirectSinkReceiver {
+            receiver,
+            disconnected: disconnected_rx,
+        }
     }
 
     pub async fn remove_direct_sink(&self, id: &str) {
-        self.direct_sinks.lock().await.remove(id);
+        if let Some(entry) = self.direct_sinks.lock().await.remove(id) {
+            let _ = entry.disconnected.send(true);
+        }
+    }
+
+    pub async fn wait_for_direct_sink(&self, id: &str, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.direct_sink_notify.notified();
+            if self.direct_sinks.lock().await.contains_key(id) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
     }
 
     /// Cumulative bytes queued to the given direct sink, or None if the sink
@@ -371,29 +494,142 @@ impl ForwarderControl {
             .map(|entry| entry.bytes_sent.load(Ordering::Relaxed))
     }
 
-    async fn send_direct(&self, chunk: &[u8]) {
+    /// Translate a producer watermark into the cumulative byte coordinate
+    /// observed by this viewer's `spawn.pty` channel.
+    pub async fn direct_sink_anchor(&self, id: &str, source_boundary: u64) -> Option<u64> {
+        let sinks = self.direct_sinks.lock().await;
+        let entry = sinks.get(id)?;
+        source_boundary.checked_sub(entry.source_origin)
+    }
+
+    pub fn source_offset(&self) -> u64 {
+        self.source_offset.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_source_offset(&self, target: u64) {
+        loop {
+            let notified = self.source_notify.notified();
+            if self.source_offset() >= target {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn route_direct(&self, chunk: &[u8], explicit_source_end: Option<u64>) {
         let mut sinks = self.direct_sinks.lock().await;
+        let previous_source_end = self.source_offset.load(Ordering::Acquire);
+        let source_end = explicit_source_end
+            .unwrap_or_else(|| previous_source_end.saturating_add(chunk.len() as u64));
+        let expected_start = source_end.saturating_sub(chunk.len() as u64);
+        if !chunk.is_empty() && expected_start != previous_source_end {
+            // A producer-coordinate discontinuity means a viewer cannot
+            // safely reconcile this live stream. Disconnect every current
+            // sink; reconnect performs a bounded replay from a new origin.
+            for entry in sinks.values() {
+                let _ = entry.disconnected.send(true);
+            }
+            sinks.clear();
+        }
+        if source_end > previous_source_end {
+            self.source_offset.store(source_end, Ordering::Release);
+            self.source_notify.notify_waiters();
+        }
         sinks.retain(|_, entry| {
-            if entry.sink.send(chunk.to_vec()).is_ok() {
+            for part in chunk.chunks(DIRECT_SINK_CHUNK_BYTES) {
+                if entry
+                    .sink
+                    .try_send(DirectPayload::new(part.to_vec()))
+                    .is_err()
+                {
+                    let _ = entry.disconnected.send(true);
+                    return false;
+                }
                 entry
                     .bytes_sent
-                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                true
-            } else {
-                false
+                    .fetch_add(part.len() as u64, Ordering::Relaxed);
             }
+            true
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn route_direct_for_test(&self, chunk: &[u8]) {
+        self.route_direct(chunk, None).await;
     }
 }
 
-/// Commands routed from spawnd to a session worker's connection tasks
-/// (worker backend only; see `worker_backend`).
-pub type WorkerReplayResult = Result<(u64, Vec<u8>)>;
+#[cfg(test)]
+type ReplayWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Decrypted replay owned by spawnd. The bytes wipe on every drop path,
+/// including receiver cancellation after a successful oneshot send.
+pub struct WorkerReplay {
+    watermark: u64,
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    wipe_probe: Option<ReplayWipeProbe>,
+}
+
+impl WorkerReplay {
+    pub(crate) fn new(watermark: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            watermark,
+            bytes,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    pub fn watermark(&self) -> u64 {
+        self.watermark
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wipe_probe(
+        watermark: u64,
+        bytes: Vec<u8>,
+        wipe_probe: ReplayWipeProbe,
+    ) -> Self {
+        Self {
+            watermark,
+            bytes,
+            wipe_probe: Some(wipe_probe),
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkerReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerReplay")
+            .field("watermark", &self.watermark)
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WorkerReplay {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe(&self.bytes);
+        }
+    }
+}
+
+/// Commands routed from spawnd to a session worker's socket writer.
+pub type WorkerReplayResult = Result<WorkerReplay>;
 pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
 
 #[derive(Debug)]
 pub enum WorkerCmd {
-    Input(Vec<u8>),
+    Input(DirectPayload),
     Resize {
         cols: u16,
         rows: u16,
@@ -405,55 +641,98 @@ pub enum WorkerCmd {
         max_bytes: u32,
         resp: oneshot::Sender<WorkerReplayResult>,
     },
-    Shutdown {
-        signal: Option<String>,
-    },
 }
 
-/// What actually carries stdin/resize/etc. for this agent.
-enum HandleBackend {
-    /// `tmux attach` running inside a daemon-owned PTY.
-    Tmux {
-        /// Stdin into the PTY (writer half).
-        stdin: Arc<Mutex<Box<dyn Write + Send>>>,
-        /// Master PTY (kept alive so resize works).
-        master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    },
-    /// A spawn-worker process owning the PTY, reached over a unix socket.
-    Worker {
-        cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
-    },
+#[derive(Clone)]
+pub struct AgentLifecycle {
+    socket: PathBuf,
+    instance_id: Uuid,
+}
+
+impl AgentLifecycle {
+    pub(crate) fn new(socket: PathBuf, instance_id: Uuid) -> Self {
+        Self {
+            socket,
+            instance_id,
+        }
+    }
+
+    pub async fn shutdown(&self, signal: wire::LifecycleSignal) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
+        let request = wire::encode_lifecycle_request(self.instance_id, signal);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("worker lifecycle delivery deadline exceeded");
+            }
+            if spawnd::sessiond::endpoint::validate_private_socket(&self.socket).is_err() {
+                anyhow::bail!("worker lifecycle endpoint validation failed");
+            }
+            let parent = self
+                .socket
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
+            let client_path = parent.join(format!(
+                ".lifecycle-client-{}-{}.sock",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            let socket = UnixDatagram::bind(&client_path)
+                .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
+            let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
+                .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
+            if socket.connect(&self.socket).is_err() || socket.send(&request).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let mut ack = [0u8; 2];
+            let attempt_deadline = std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            );
+            let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
+            let Ok(Ok(1)) = received else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            return match ack[0] {
+                wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
+                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("agent process already exited"),
+                wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
+                    anyhow::bail!("worker lifecycle instance changed")
+                }
+                _ => anyhow::bail!("worker lifecycle delivery failed"),
+            };
+        }
+    }
 }
 
 /// Per-agent runtime handle.
 pub struct AgentHandle {
     pub agent_id: Uuid,
-    /// tmux session name (e.g. "spawn-palette--<uuid>"). For the worker
-    /// backend this is a display label only; nothing shells out with it.
-    session: Arc<Mutex<String>>,
-    /// Optional token used to cancel the read thread; consumed on shutdown.
-    #[allow(dead_code)]
-    cancel_tx: Option<oneshot::Sender<()>>,
-    /// Last size applied through this handle. Used to avoid expensive tmux
-    /// refreshes when browsers repeat the same geometry.
+    /// Last size applied through this handle.
     size: Arc<Mutex<(u16, u16)>>,
-    /// Reader thread pushes raw PTY bytes here. Held alive while the agent
-    /// is alive; when dropped, the per-agent forwarder task exits.
+    /// Held alive while the agent is alive; when dropped, the per-agent
+    /// forwarder task exits after the worker connection closes.
     #[allow(dead_code)]
-    outbox_tx: mpsc::UnboundedSender<OutputChunk>,
+    outbox_tx: mpsc::Sender<OutputChunk>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
-    backend: HandleBackend,
+    cmd_tx: mpsc::Sender<WorkerCmd>,
+    lifecycle: AgentLifecycle,
+    alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    input_copies: Arc<AtomicU64>,
 }
 
 /// Everything `worker_backend` needs to assemble a worker-backed handle.
 pub struct WorkerHandleParts {
     pub agent_id: Uuid,
-    pub session: String,
-    pub cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
+    pub cmd_tx: mpsc::Sender<WorkerCmd>,
+    pub lifecycle: AgentLifecycle,
+    pub alive: Arc<AtomicBool>,
     pub cols: u16,
     pub rows: u16,
-    pub outbox_tx: mpsc::UnboundedSender<OutputChunk>,
+    pub outbox_tx: mpsc::Sender<OutputChunk>,
     pub control: ForwarderControl,
 }
 
@@ -461,54 +740,50 @@ impl AgentHandle {
     pub fn new_worker(parts: WorkerHandleParts) -> Self {
         Self {
             agent_id: parts.agent_id,
-            session: Arc::new(Mutex::new(parts.session)),
-            cancel_tx: None,
             size: Arc::new(Mutex::new((parts.cols, parts.rows))),
             outbox_tx: parts.outbox_tx,
             control: parts.control,
-            backend: HandleBackend::Worker {
-                cmd_tx: parts.cmd_tx,
-            },
+            cmd_tx: parts.cmd_tx,
+            lifecycle: parts.lifecycle,
+            alive: parts.alive,
+            #[cfg(test)]
+            input_copies: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    pub fn is_worker(&self) -> bool {
-        matches!(self.backend, HandleBackend::Worker { .. })
-    }
-
-    pub fn session(&self) -> Result<String> {
-        self.session
-            .lock()
-            .map(|s| s.clone())
-            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))
-    }
-
-    pub fn set_session(&self, next: String) -> Result<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("tmux session lock poisoned"))?;
-        *session = next;
-        Ok(())
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
-        // The echo of this input shouldn't count as agent output-activity.
+        self.validate_input(bytes.len())?;
+        #[cfg(test)]
+        self.input_copies.fetch_add(1, Ordering::Relaxed);
+        self.write_stdin_owned(DirectPayload::new(bytes.to_vec()))
+    }
+
+    pub(crate) fn write_stdin_owned(&self, bytes: DirectPayload) -> Result<()> {
+        self.validate_input(bytes.len())?;
+        self.enqueue_input(bytes)
+    }
+
+    fn validate_input(&self, len: usize) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            anyhow::bail!("worker connection gone");
+        }
+        if len > MAX_WORKER_INPUT_BYTES {
+            anyhow::bail!("worker input exceeds {MAX_WORKER_INPUT_BYTES} byte limit");
+        }
+        Ok(())
+    }
+
+    fn enqueue_input(&self, bytes: DirectPayload) -> Result<()> {
+        self.cmd_tx
+            .try_send(WorkerCmd::Input(bytes))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("worker command queue full"),
+                mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
+            })?;
+        // Only admitted input can have an echo that should suppress activity.
         self.control
             .suppress_activity(activity::INPUT_ECHO_SUPPRESS_WINDOW);
-        match &self.backend {
-            HandleBackend::Tmux { stdin, .. } => {
-                let mut stdin = stdin
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pty stdin lock poisoned"))?;
-                stdin.write_all(bytes).context("writing PTY stdin")?;
-                stdin.flush().ok();
-                Ok(())
-            }
-            HandleBackend::Worker { cmd_tx } => cmd_tx
-                .send(WorkerCmd::Input(bytes.to_vec()))
-                .map_err(|_| anyhow::anyhow!("worker connection gone")),
-        }
+        Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
@@ -519,80 +794,58 @@ impl AgentHandle {
         if *size == (cols, rows) {
             return Ok(false);
         }
-        // The repaint this resize triggers shouldn't count as agent activity.
+        if !self.alive.load(Ordering::Acquire) {
+            anyhow::bail!("worker connection gone");
+        }
+        self.cmd_tx
+            .try_send(WorkerCmd::Resize { cols, rows })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("worker command queue full"),
+                mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
+            })?;
+        *size = (cols, rows);
+        // Only an admitted resize can trigger a repaint.
         self.control
             .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
-        match &self.backend {
-            HandleBackend::Tmux { master, .. } => {
-                let master = master
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pty master lock poisoned"))?;
-                master
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("resizing PTY")?;
-            }
-            HandleBackend::Worker { cmd_tx } => {
-                cmd_tx
-                    .send(WorkerCmd::Resize { cols, rows })
-                    .map_err(|_| anyhow::anyhow!("worker connection gone"))?;
-            }
-        }
-        *size = (cols, rows);
         Ok(true)
     }
 
-    /// Worker backend: signal the agent process. Returns false for tmux.
-    pub fn worker_shutdown(&self, signal: Option<String>) -> bool {
-        match &self.backend {
-            HandleBackend::Worker { cmd_tx } => cmd_tx.send(WorkerCmd::Shutdown { signal }).is_ok(),
-            HandleBackend::Tmux { .. } => false,
-        }
+    pub fn lifecycle(&self) -> AgentLifecycle {
+        self.lifecycle.clone()
     }
 
-    /// Worker backend: request decrypted scrollback replay. Returns None for
-    /// tmux (callers use `tmux::capture_history`).
-    pub fn worker_replay(&self, max_bytes: u32) -> Option<WorkerReplayReceiver> {
-        match &self.backend {
-            HandleBackend::Worker { cmd_tx } => {
-                let (resp, rx) = oneshot::channel();
-                cmd_tx.send(WorkerCmd::Replay { max_bytes, resp }).ok()?;
-                Some(rx)
-            }
-            HandleBackend::Tmux { .. } => None,
-        }
+    #[cfg(test)]
+    pub(crate) fn input_copy_count(&self) -> u64 {
+        self.input_copies.load(Ordering::Relaxed)
     }
 
-    /// Drop the cancel channel so the reader exits next iteration.
-    #[allow(dead_code)]
-    pub fn cancel(&mut self) {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(());
+    /// Request decrypted scrollback replay from the owning worker.
+    pub fn replay(&self, max_bytes: u32) -> Option<WorkerReplayReceiver> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
         }
+        let (resp, rx) = oneshot::channel();
+        self.cmd_tx
+            .try_send(WorkerCmd::Replay { max_bytes, resp })
+            .ok()?;
+        Some(rx)
     }
 }
 
 pub struct LaunchSpec<'a> {
     pub agent_id: Uuid,
-    pub session: &'a str,
     pub cwd: &'a str,
     pub cols: u16,
     pub rows: u16,
     pub argv: &'a [String],
-    /// Final env to pass to the launched agent (and to tmux via `-e`).
+    /// Final env to pass to the launched agent.
     pub env: &'a BTreeMap<String, String>,
 }
 
 /// Result of a successful launch.
 pub struct Launched {
     pub handle: AgentHandle,
-    /// PID of the `tmux attach` we spawned in the PTY (reported via
-    /// `agent.started`). Note this is NOT the agent's pid; the real agent
-    /// runs under tmux.
+    /// PID of the real agent process, reported by its session worker.
     pub pid: u32,
     /// Future-style: receives the exit reason once the PTY EOFs.
     pub exit_rx: oneshot::Receiver<ExitReason>,
@@ -604,371 +857,33 @@ pub struct ExitReason {
     pub signal: Option<String>,
 }
 
-/// 1) tmux new-session -d
-/// 2) attach in a portable-pty
-/// 3) spawn a reader thread (raw bytes -> outbox)
-/// 4) spawn a forwarder task (outbox -> current WS sink)
-pub async fn launch(spec: LaunchSpec<'_>) -> Result<Launched> {
-    let session = spec.session;
-
-    tmux::new_session_detached(session, spec.cwd, spec.cols, spec.rows, spec.argv, spec.env)
-        .await
-        .context("starting tmux session")?;
-
-    // If the agent's argv exits within a few hundred ms (bad binary, missing
-    // flag, smart-quote garbage), the tmux session is already gone by the
-    // time we try to attach — and the user just sees a confusing
-    // "can't find session" from `tmux attach`. Detect that case here and
-    // surface a clearer error.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if !tmux::has_session(session).await {
-        anyhow::bail!(
-            "agent process exited before we could attach — check argv: {:?}",
-            spec.argv
-        );
-    }
-
-    attach_to_session(spec.agent_id, session, spec.cwd, spec.cols, spec.rows)
-}
-
-/// Re-attach to an existing tmux session that was started by a previous
-/// `spawnd` instance. Used during daemon discovery on startup so agents
-/// survive daemon restarts without losing state.
-pub async fn reattach(agent_id: uuid::Uuid, session: &str) -> Result<Launched> {
-    if !tmux::has_session(session).await {
-        anyhow::bail!("tmux session {session:?} not found");
-    }
-    let (cols, rows) = tmux::window_size(session).await.unwrap_or((120, 32));
-    // We don't know the original cwd; default to the current daemon's working
-    // directory (which is typically the user's home). The PTY child only
-    // needs cwd to be a valid dir; the agent's actual cwd is preserved by
-    // tmux.
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "/".to_string());
-    tracing::info!(%agent_id, %session, cols, rows, "reattaching to existing tmux session");
-    attach_to_session(agent_id, session, &cwd, cols, rows)
-}
-
-/// Shared core: open a portable-pty, run `tmux attach` in it, start the
-/// reader thread + per-agent forwarder task. Returns once the structures
-/// are wired up; bytes will start flowing as soon as the WS session installs
-/// a sink via `handle.control.set_sink(...)`.
-fn attach_to_session(
-    agent_id: uuid::Uuid,
-    session: &str,
-    cwd: &str,
-    cols: u16,
-    rows: u16,
-) -> Result<Launched> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("openpty")?;
-
-    let mut cmd = CommandBuilder::new("tmux");
-    cmd.args(["attach", "-t", session]);
-    cmd.env("TERM", "xterm-256color");
-    if let Ok(p) = std::env::var("PATH") {
-        cmd.env("PATH", p);
-    }
-    // Match the socket resolution of every other tmux invocation: honor the
-    // daemon's TMUX_TMPDIR, never an inherited $TMUX, so an attach from a
-    // daemon started inside a tmux pane can't target the outer server.
-    cmd.env_remove("TMUX");
-    if let Ok(t) = std::env::var("TMUX_TMPDIR") {
-        cmd.env("TMUX_TMPDIR", t);
-    }
-    cmd.cwd(cwd);
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("spawning tmux attach inside PTY")?;
-    let pid = child.process_id().unwrap_or(0);
-
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .context("cloning PTY reader")?;
-    let writer = pair.master.take_writer().context("taking PTY writer")?;
-    let master = Arc::new(Mutex::new(pair.master));
-    let stdin = Arc::new(Mutex::new(writer));
-
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
-
-    // Per-agent outbox + forwarder.
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<OutputChunk>();
-    let control = ForwarderControl::new();
-
-    // Forwarder: outbox -> current sink (with reconnect-aware looping).
-    {
-        let control = control.clone();
-        tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
-    }
-
-    // Reader thread: raw PTY -> outbox.
-    let outbox_for_reader = outbox_tx.clone();
-    let control_for_reader = control.clone();
-    std::thread::spawn(move || {
-        run_reader_thread(
-            agent_id,
-            reader,
-            child,
-            outbox_for_reader,
-            control_for_reader,
-            cancel_rx,
-            exit_tx,
-        );
-    });
-
-    let handle = AgentHandle {
-        agent_id,
-        session: Arc::new(Mutex::new(session.to_string())),
-        cancel_tx: Some(cancel_tx),
-        size: Arc::new(Mutex::new((cols, rows))),
-        outbox_tx,
-        control,
-        backend: HandleBackend::Tmux { stdin, master },
-    };
-    Ok(Launched {
-        handle,
-        pid,
-        exit_rx,
-    })
-}
-
-fn run_reader_thread(
-    agent_id: Uuid,
-    mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    outbox: mpsc::UnboundedSender<OutputChunk>,
-    control: ForwarderControl,
-    mut cancel_rx: oneshot::Receiver<()>,
-    exit_tx: oneshot::Sender<ExitReason>,
-) {
-    let mut buf = [0u8; 8192];
-    loop {
-        // Cooperative cancel check (non-blocking).
-        if cancel_rx.try_recv().is_ok() {
-            tracing::debug!(%agent_id, "PTY reader cancelled");
-            break;
-        }
-
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                tracing::debug!(%agent_id, "PTY EOF");
-                break;
-            }
-            Ok(n) => {
-                let chunk = OutputChunk::classify(buf[..n].to_vec(), &control);
-                if outbox.send(chunk).is_err() {
-                    // Forwarder gone (registry dropped this agent). We can stop.
-                    tracing::debug!(%agent_id, "outbox closed; stopping reader");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(%agent_id, error = %e, "PTY read error");
-                break;
-            }
-        }
-    }
-
-    // Drain exit status.
-    let reason = match child.wait() {
-        Ok(status) => {
-            if status.success() {
-                ExitReason {
-                    exit_code: Some(0),
-                    signal: None,
-                }
-            } else {
-                ExitReason {
-                    exit_code: Some(status.exit_code() as i32),
-                    signal: None,
-                }
-            }
-        }
-        Err(_) => ExitReason {
-            exit_code: None,
-            signal: None,
-        },
-    };
-    let _ = exit_tx.send(reason);
-}
-
-/// Long-lived per-agent task: encode raw PTY bytes into binary frames and
-/// ship them to the current WS session's sink. Survives WS reconnects —
-/// when the sink is None, parks on `control.notify` until a new session
-/// installs one. Exits when `outbox_rx` returns None (i.e. all
-/// `outbox_tx` clones — including the AgentHandle and reader thread — are
-/// dropped).
+/// Long-lived per-agent task: route raw PTY bytes to bounded direct sinks,
+/// then best-effort mirror into the current bounded WS session. Missing/full
+/// mirrors are detached and dropped; worker replay is the catch-up source.
+/// Exits when every bounded-outbox sender is dropped.
 pub(crate) async fn run_forwarder(
     agent_id: Uuid,
-    mut outbox_rx: mpsc::UnboundedReceiver<OutputChunk>,
+    mut outbox_rx: mpsc::Receiver<OutputChunk>,
     control: ForwarderControl,
 ) {
-    let mut pending_mirror = VecDeque::new();
     let mut idle_timer: Option<IdleResolutionTimer> = None;
-    let mut outbox_open = true;
-
     loop {
-        // Keep content classification and eligibility at the source side of
-        // the queue. Drain a bounded batch before servicing the mirror so a
-        // missing/full server sink cannot defer producer decisions; the only
-        // delayed step is a generation-guarded, content-free idle timeout.
-        for _ in 0..64 {
-            match outbox_rx.try_recv() {
-                Ok(chunk) => {
-                    queue_output_chunk(
-                        agent_id,
-                        chunk,
-                        &control,
-                        &mut pending_mirror,
-                        &mut idle_timer,
-                    )
-                    .await;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    outbox_open = false;
-                    idle_timer = None;
-                    break;
-                }
-            }
-        }
-
-        if idle_timer
-            .as_ref()
-            .is_some_and(|timer| timer.sleep.is_elapsed())
-        {
-            resolve_idle_activity(agent_id, &control, &mut pending_mirror, &mut idle_timer);
-        }
-
-        if !outbox_open && pending_mirror.is_empty() {
-            break;
-        }
-
-        if pending_mirror.is_empty() {
-            tokio::select! {
-                chunk = outbox_rx.recv() => match chunk {
-                    Some(chunk) => {
-                        queue_output_chunk(
-                            agent_id,
-                            chunk,
-                            &control,
-                            &mut pending_mirror,
-                            &mut idle_timer,
-                        ).await;
+        tokio::select! {
+            chunk = outbox_rx.recv() => match chunk {
+                Some(chunk) => queue_output_chunk(
+                    agent_id,
+                    chunk,
+                    &control,
+                    &mut idle_timer,
+                ).await,
+                None => break,
+            },
+            generation = wait_for_idle(&mut idle_timer) => {
+                idle_timer = None;
+                if control.resolve_output_idle(generation) {
+                    if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+                        try_mirror(&control, activity).await;
                     }
-                    None => {
-                        outbox_open = false;
-                        idle_timer = None;
-                    }
-                },
-                generation = wait_for_idle(&mut idle_timer) => {
-                    resolve_idle_generation(
-                        agent_id,
-                        generation,
-                        &control,
-                        &mut pending_mirror,
-                        &mut idle_timer,
-                    );
-                }
-            }
-            continue;
-        }
-
-        let current = control.slot.lock().await.clone();
-        let Some(sink) = current else {
-            if outbox_open {
-                tokio::select! {
-                    chunk = outbox_rx.recv() => match chunk {
-                        Some(chunk) => {
-                            queue_output_chunk(
-                                agent_id,
-                                chunk,
-                                &control,
-                                &mut pending_mirror,
-                                &mut idle_timer,
-                            ).await;
-                        }
-                        None => {
-                            outbox_open = false;
-                            idle_timer = None;
-                        }
-                    },
-                    _ = control.notify.notified() => {},
-                    generation = wait_for_idle(&mut idle_timer) => {
-                        resolve_idle_generation(
-                            agent_id,
-                            generation,
-                            &control,
-                            &mut pending_mirror,
-                            &mut idle_timer,
-                        );
-                    },
-                }
-            } else {
-                control.notify.notified().await;
-            }
-            continue;
-        };
-
-        let message = pending_mirror.front().cloned().expect("checked non-empty");
-        let send_result = if outbox_open {
-            tokio::select! {
-                chunk = outbox_rx.recv() => {
-                    match chunk {
-                        Some(chunk) => {
-                            queue_output_chunk(
-                                agent_id,
-                                chunk,
-                                &control,
-                                &mut pending_mirror,
-                                &mut idle_timer,
-                            ).await;
-                        }
-                        None => {
-                            outbox_open = false;
-                            idle_timer = None;
-                        }
-                    }
-                    continue;
-                },
-                result = sink.send(message) => result,
-                generation = wait_for_idle(&mut idle_timer) => {
-                    resolve_idle_generation(
-                        agent_id,
-                        generation,
-                        &control,
-                        &mut pending_mirror,
-                        &mut idle_timer,
-                    );
-                    continue;
-                },
-            }
-        } else {
-            sink.send(message).await
-        };
-
-        match send_result {
-            Ok(()) => {
-                pending_mirror.pop_front();
-            }
-            Err(_) => {
-                // Keep the unsent frame at the front for the replacement sink.
-                let mut slot = control.slot.lock().await;
-                if slot.as_ref().is_some_and(|current| current.is_closed()) {
-                    *slot = None;
                 }
             }
         }
@@ -980,19 +895,41 @@ async fn queue_output_chunk(
     agent_id: Uuid,
     chunk: OutputChunk,
     control: &ForwarderControl,
-    pending_mirror: &mut VecDeque<WsOutbound>,
     idle_timer: &mut Option<IdleResolutionTimer>,
 ) {
     *idle_timer = chunk.idle_resolution.map(IdleResolutionTimer::new);
-    control.send_direct(&chunk.bytes).await;
-    pending_mirror.push_back(WsOutbound::Binary(frames::encode_pty_output(
-        agent_id,
-        &chunk.bytes,
-    )));
+    control.route_direct(&chunk.bytes, chunk.source_end).await;
+    if chunk.source_barrier {
+        return;
+    }
+    try_mirror(
+        control,
+        WsOutbound::Binary(frames::encode_pty_output(agent_id, &chunk.bytes)),
+    )
+    .await;
     if chunk.activity {
         if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
-            pending_mirror.push_back(activity);
+            try_mirror(control, activity).await;
         }
+    }
+}
+
+async fn try_mirror(control: &ForwarderControl, message: WsOutbound) {
+    let Some(sink) = control.slot.lock().await.clone() else {
+        return;
+    };
+    if sink.try_send(message).is_ok() {
+        return;
+    }
+    // A missing/slow legacy mirror never holds PTY plaintext hostage. Detach
+    // this sink; direct viewers continue, and reconnect catch-up comes from the
+    // worker's bounded replay log.
+    let mut slot = control.slot.lock().await;
+    if slot
+        .as_ref()
+        .is_some_and(|current| current.same_channel(&sink))
+    {
+        *slot = None;
     }
 }
 
@@ -1004,40 +941,189 @@ async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
     timer.generation
 }
 
-fn resolve_idle_activity(
-    agent_id: Uuid,
-    control: &ForwarderControl,
-    pending_mirror: &mut VecDeque<WsOutbound>,
-    idle_timer: &mut Option<IdleResolutionTimer>,
-) {
-    let generation = idle_timer
-        .as_ref()
-        .expect("checked elapsed idle timer")
-        .generation;
-    resolve_idle_generation(agent_id, generation, control, pending_mirror, idle_timer);
-}
-
-fn resolve_idle_generation(
-    agent_id: Uuid,
-    generation: u64,
-    control: &ForwarderControl,
-    pending_mirror: &mut VecDeque<WsOutbound>,
-    idle_timer: &mut Option<IdleResolutionTimer>,
-) {
-    *idle_timer = None;
-    if control.resolve_output_idle(generation) {
-        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
-            pending_mirror.push_back(activity);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
+    }
+
+    fn test_handle(
+        control: ForwarderControl,
+        cmd_tx: mpsc::Sender<WorkerCmd>,
+        alive: Arc<AtomicBool>,
+    ) -> AgentHandle {
+        let (outbox_tx, _outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
+        AgentHandle::new_worker(WorkerHandleParts {
+            agent_id: Uuid::new_v4(),
+            cmd_tx,
+            lifecycle: AgentLifecycle::new(
+                PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                Uuid::new_v4(),
+            ),
+            alive,
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control,
+        })
+    }
+
+    #[test]
+    fn rejected_commands_do_not_suppress_genuine_output_activity() {
+        let oversized_control = ForwarderControl::new();
+        let (oversized_tx, _oversized_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let oversized = test_handle(
+            oversized_control.clone(),
+            oversized_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(oversized
+            .write_stdin(&vec![b'x'; MAX_WORKER_INPUT_BYTES + 1])
+            .is_err());
+        assert!(source_output(&oversized_control, b"genuine oversized rejection output").activity);
+
+        let dead_control = ForwarderControl::new();
+        let (dead_tx, _dead_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let dead = test_handle(
+            dead_control.clone(),
+            dead_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(dead.write_stdin(b"rejected dead input").is_err());
+        assert!(source_output(&dead_control, b"genuine dead rejection output").activity);
+
+        for resize in [false, true] {
+            let control = ForwarderControl::new();
+            let (cmd_tx, _cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+            for index in 0..WORKER_COMMAND_QUEUE_DEPTH {
+                cmd_tx
+                    .try_send(WorkerCmd::Resize {
+                        cols: 80 + index as u16,
+                        rows: 24,
+                    })
+                    .unwrap();
+            }
+            let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+            if resize {
+                assert!(handle.resize(120, 40).is_err());
+            } else {
+                assert!(handle.write_stdin(b"rejected full input").is_err());
+            }
+            assert!(source_output(&control, b"genuine full queue rejection output").activity);
+        }
+    }
+
+    #[test]
+    fn admitted_input_and_resize_suppress_their_expected_echoes() {
+        let input_control = ForwarderControl::new();
+        let (input_tx, _input_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let input = test_handle(
+            input_control.clone(),
+            input_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        input.write_stdin(b"accepted input").unwrap();
+        assert!(!source_output(&input_control, b"accepted input echo").activity);
+
+        let resize_control = ForwarderControl::new();
+        let (resize_tx, _resize_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let resize = test_handle(
+            resize_control.clone(),
+            resize_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(resize.resize(120, 40).unwrap());
+        assert!(!source_output(&resize_control, b"resize repaint output").activity);
+    }
+
+    #[test]
+    fn queued_plaintext_wrappers_wipe_on_rejection_and_teardown() {
+        let observed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let direct_observed = Arc::clone(&observed);
+        let direct_probe: DirectWipeProbe = Arc::new(move |bytes| {
+            direct_observed.lock().unwrap().push(bytes.to_vec());
+        });
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(DirectPayload::with_wipe_probe(
+            b"queued direct plaintext".to_vec(),
+            Arc::clone(&direct_probe),
+        ))
+        .unwrap();
+        assert!(tx
+            .try_send(DirectPayload::with_wipe_probe(
+                b"rejected direct plaintext".to_vec(),
+                direct_probe,
+            ))
+            .is_err());
+        drop(rx);
+        drop(tx);
+
+        OUTBOUND_WIPE_PROBE.with(|slot| {
+            let outbound_observed = Arc::clone(&observed);
+            *slot.borrow_mut() = Some(Box::new(move |bytes| {
+                outbound_observed.lock().unwrap().push(bytes.to_vec());
+            }));
+        });
+        drop(WsOutbound::Binary(b"queued websocket plaintext".to_vec()));
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3);
+        assert!(observed
+            .iter()
+            .all(|bytes| bytes.iter().all(|byte| *byte == 0)));
+    }
+
+    #[tokio::test]
+    async fn verbose_output_with_absent_then_stalled_mirror_keeps_direct_viewer_healthy() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let direct = control.add_direct_sink("healthy".into()).await;
+        let mut direct_rx = direct.receiver;
+        let mut disconnected = direct.disconnected;
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
+        assert_eq!(outbox_tx.max_capacity(), WORKER_OUTPUT_QUEUE_DEPTH);
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_task = Arc::clone(&received);
+        let chunk = vec![b'x'; 8 * 1024];
+        let absent_chunks = 256usize;
+        let stalled_chunks = 256usize;
+        let expected_bytes = (absent_chunks + stalled_chunks) * chunk.len();
+        let direct_drain = tokio::spawn(async move {
+            while received_task.load(AtomicOrdering::Relaxed) < expected_bytes {
+                let chunk = direct_rx.recv().await.expect("healthy direct sink closed");
+                received_task.fetch_add(chunk.len(), AtomicOrdering::Relaxed);
+            }
+        });
+
+        for _ in 0..absent_chunks {
+            outbox_tx
+                .send(source_output(&control, &chunk))
+                .await
+                .unwrap();
+        }
+
+        let (stalled_tx, _stalled_rx) = mpsc::channel(1);
+        control.set_sink(stalled_tx).await;
+        for _ in 0..stalled_chunks {
+            outbox_tx
+                .send(source_output(&control, &chunk))
+                .await
+                .unwrap();
+        }
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+        direct_drain.await.unwrap();
+
+        assert!(!*disconnected.borrow_and_update());
+        assert_eq!(
+            received.load(AtomicOrdering::Relaxed),
+            (absent_chunks + stalled_chunks) * chunk.len()
+        );
+        assert!(control.slot.lock().await.is_none());
     }
 
     #[test]
@@ -1120,19 +1206,21 @@ mod tests {
         assert!(try_emit_activity(&tx, agent_id, ActivityKind::Output));
         assert!(try_emit_activity(&tx, agent_id, ActivityKind::Input));
 
-        let WsOutbound::Json(output_json) = rx.recv().await.unwrap() else {
+        let output = rx.recv().await.unwrap();
+        let WsOutbound::Json(output_json) = &output else {
             panic!("expected JSON output activity")
         };
-        let WsOutbound::Json(input_json) = rx.recv().await.unwrap() else {
+        let input = rx.recv().await.unwrap();
+        let WsOutbound::Json(input_json) = &input else {
             panic!("expected JSON input activity")
         };
         assert_eq!(
             output_json,
-            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
         );
         assert_eq!(
             input_json,
-            format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
         );
     }
 
@@ -1142,157 +1230,204 @@ mod tests {
         let control = ForwarderControl::new();
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
         outbox_tx
-            .send(source_output(&control, b"sensitive terminal output"))
+            .try_send(source_output(&control, b"sensitive terminal output"))
             .unwrap();
         drop(outbox_tx);
 
-        let WsOutbound::Binary(binary) = sink_rx.recv().await.unwrap() else {
+        let binary_message = sink_rx.recv().await.unwrap();
+        let WsOutbound::Binary(binary) = &binary_message else {
             panic!("expected binary PTY output")
         };
-        let (kind, decoded_id, payload) = frames::decode_binary(&binary).unwrap();
+        let (kind, decoded_id, payload) = frames::decode_binary(binary).unwrap();
         assert_eq!(kind, frames::KIND_PTY_OUTPUT);
         assert_eq!(decoded_id, agent_id);
         assert_eq!(payload, b"sensitive terminal output");
 
-        let WsOutbound::Json(activity_json) = sink_rx.recv().await.unwrap() else {
+        let activity_message = sink_rx.recv().await.unwrap();
+        let WsOutbound::Json(activity_json) = &activity_message else {
             panic!("expected JSON output activity")
         };
         assert_eq!(
             activity_json,
-            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
         );
         assert!(!activity_json.contains("sensitive terminal output"));
         forwarder.await.unwrap();
     }
 
     #[tokio::test]
-    async fn forwarder_decides_activity_before_mirror_backpressure_and_suppression() {
+    async fn stalled_mirror_is_detached_while_direct_output_continues() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
-        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
-        control.add_direct_sink("test".into(), direct_tx).await;
+        let mut direct = control.add_direct_sink("test".into()).await;
 
         // Capacity one deliberately blocks the mirror after its first binary
         // frame. Subsequent direct receipts prove classification has still
         // consumed those chunks in source order.
         let (sink_tx, mut sink_rx) = mpsc::channel(1);
         control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
-        outbox_tx.send(source_output(&control, b"ok")).unwrap();
-        assert_eq!(direct_rx.recv().await.unwrap(), b"ok");
+        outbox_tx.try_send(source_output(&control, b"ok")).unwrap();
+        assert_eq!(direct.receiver.recv().await.unwrap(), b"ok");
 
         outbox_tx
-            .send(source_output(&control, b"before suppression"))
+            .try_send(source_output(&control, b"before suppression"))
             .unwrap();
-        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+        assert_eq!(direct.receiver.recv().await.unwrap(), b"before suppression");
 
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
         outbox_tx
-            .send(source_output(&control, b"during suppression"))
+            .try_send(source_output(&control, b"during suppression"))
             .unwrap();
-        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+        assert_eq!(direct.receiver.recv().await.unwrap(), b"during suppression");
 
-        // Simulate reconnect after the suppression window. The stored decision
-        // for earlier output remains, while suppressed output cannot appear as
-        // a delayed activity event.
-        control.activity.lock().unwrap().suppress_output_until = None;
         drop(outbox_tx);
-
-        let first = sink_rx.recv().await.unwrap();
-        let second = sink_rx.recv().await.unwrap();
-        let third = sink_rx.recv().await.unwrap();
-        let fourth = sink_rx.recv().await.unwrap();
         forwarder.await.unwrap();
-
-        let frames = [first, second, third, fourth];
-        let mut binary_payloads = Vec::new();
-        let mut activity_frames = Vec::new();
-        for frame in frames {
-            match frame {
-                WsOutbound::Binary(binary) => {
-                    let (_, _, payload) = frames::decode_binary(&binary).unwrap();
-                    binary_payloads.push(payload.to_vec());
-                }
-                WsOutbound::Json(json) => activity_frames.push(json),
-            }
-        }
-        assert_eq!(
-            binary_payloads,
-            vec![
-                b"ok".to_vec(),
-                b"before suppression".to_vec(),
-                b"during suppression".to_vec()
-            ]
-        );
-        assert_eq!(
-            activity_frames,
-            vec![format!(
-                r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#
-            )]
-        );
+        let first = sink_rx.recv().await.unwrap();
+        let WsOutbound::Binary(binary) = &first else {
+            panic!("first bounded mirror frame was not PTY output");
+        };
+        let (_, _, payload) = frames::decode_binary(binary).unwrap();
+        assert_eq!(payload, b"ok");
         assert!(sink_rx.try_recv().is_err());
+        assert!(control.slot.lock().await.is_none());
     }
 
     #[tokio::test]
     async fn forwarder_does_not_reclassify_suppressed_output_when_sink_reconnects() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
-        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
-        control.add_direct_sink("test".into(), direct_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let mut direct = control.add_direct_sink("test".into()).await;
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
         // There is intentionally no server sink while both chunks are
         // classified. A later suppression cannot erase the first decision.
         outbox_tx
-            .send(source_output(&control, b"before suppression"))
+            .try_send(source_output(&control, b"before suppression"))
             .unwrap();
-        assert_eq!(direct_rx.recv().await.unwrap(), b"before suppression");
+        assert_eq!(direct.receiver.recv().await.unwrap(), b"before suppression");
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
         outbox_tx
-            .send(source_output(&control, b"during suppression"))
+            .try_send(source_output(&control, b"during suppression"))
             .unwrap();
-        assert_eq!(direct_rx.recv().await.unwrap(), b"during suppression");
+        assert_eq!(direct.receiver.recv().await.unwrap(), b"during suppression");
         control.activity.lock().unwrap().suppress_output_until = None;
 
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
         drop(outbox_tx);
 
-        let first = sink_rx.recv().await.unwrap();
-        let second = sink_rx.recv().await.unwrap();
-        let third = sink_rx.recv().await.unwrap();
         forwarder.await.unwrap();
-
-        assert!(matches!(first, WsOutbound::Binary(_)));
-        let WsOutbound::Json(activity) = second else {
-            panic!("pre-suppression output decision was lost")
-        };
-        assert_eq!(
-            activity,
-            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
-        );
-        assert!(matches!(third, WsOutbound::Binary(_)));
+        // Output observed while the legacy sink was absent is not retained in
+        // spawnd. A reconnect uses worker replay instead.
         assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_sink_anchor_tracks_exact_source_bytes_across_capture_boundary() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (mirror_tx, mut mirror_rx) = mpsc::channel(64);
+        control.set_sink(mirror_tx).await;
+        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        // Adoption establishes a durable worker coordinate before this viewer
+        // exists; those historical bytes must not count in spawn.pty offsets.
+        outbox_tx
+            .try_send(OutputChunk::source_barrier(10_000))
+            .unwrap();
+        control.wait_source_offset(10_000).await;
+        let mut direct = control.add_direct_sink("viewer".into()).await;
+
+        let before = b"before:\xf0\x9f\x98\x80";
+        let during = b"\x1b[31mduring\x1b[0m";
+        let boundary = 10_000 + before.len() as u64 + during.len() as u64;
+        outbox_tx
+            .try_send(OutputChunk::classify_at_source(
+                before.to_vec(),
+                10_000 + before.len() as u64,
+                &control,
+            ))
+            .unwrap();
+        outbox_tx
+            .try_send(OutputChunk::classify_at_source(
+                during.to_vec(),
+                boundary,
+                &control,
+            ))
+            .unwrap();
+        outbox_tx
+            .try_send(OutputChunk::source_barrier(boundary))
+            .unwrap();
+        control.wait_source_offset(boundary).await;
+
+        assert_eq!(direct.receiver.recv().await.unwrap(), before);
+        assert_eq!(direct.receiver.recv().await.unwrap(), during);
+        assert_eq!(
+            control.direct_sink_anchor("viewer", boundary).await,
+            Some((before.len() + during.len()) as u64)
+        );
+
+        let after = b"after\r\n";
+        outbox_tx
+            .try_send(OutputChunk::classify_at_source(
+                after.to_vec(),
+                boundary + after.len() as u64,
+                &control,
+            ))
+            .unwrap();
+        assert_eq!(direct.receiver.recv().await.unwrap(), after);
+
+        drop(outbox_tx);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_direct_sink_is_bounded_and_disconnected_for_replay_catchup() {
+        let agent_id = Uuid::new_v4();
+        let control = ForwarderControl::new();
+        let (mirror_tx, mut mirror_rx) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH * 4);
+        control.set_sink(mirror_tx).await;
+        tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
+        let mut direct = control.add_direct_sink("stalled".into()).await;
+        let (outbox_tx, outbox_rx) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH + 1);
+        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+
+        for _ in 0..=DIRECT_SINK_QUEUE_DEPTH {
+            outbox_tx.send(source_output(&control, b"x")).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), direct.disconnected.changed())
+            .await
+            .expect("stalled viewer was not disconnected")
+            .expect("disconnect watch closed");
+        assert!(*direct.disconnected.borrow());
+        assert!(direct.receiver.len() <= DIRECT_SINK_QUEUE_DEPTH);
+        assert_eq!(control.direct_sink_offset("stalled").await, None);
+
+        drop(outbox_tx);
+        forwarder.await.unwrap();
     }
 
     #[tokio::test]
     async fn producer_decision_precedes_enqueue_and_later_suppression() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
 
         // The producer classifies and enqueues before the forwarder exists.
         // A later control event cannot mutate the queued decision.
         let chunk = source_output(&control, b"queued before suppression");
         assert!(chunk.activity);
-        outbox_tx.send(chunk).unwrap();
+        outbox_tx.try_send(chunk).unwrap();
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
 
         let (sink_tx, mut sink_rx) = mpsc::channel(2);
@@ -1312,12 +1447,12 @@ mod tests {
     async fn suppression_preceding_producer_decision_stays_with_queued_output() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
 
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
         let chunk = source_output(&control, b"queued during suppression");
         assert!(!chunk.activity);
-        outbox_tx.send(chunk).unwrap();
+        outbox_tx.try_send(chunk).unwrap();
         // Expiry/reconnect before forwarding must not cause reclassification.
         control.activity.lock().unwrap().suppress_output_until = None;
 
@@ -1331,162 +1466,6 @@ mod tests {
             WsOutbound::Binary(_)
         ));
         forwarder.await.unwrap();
-        assert!(sink_rx.try_recv().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn short_ambiguous_output_emits_after_bounded_idle_without_blocking_bytes() {
-        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
-            let agent_id = Uuid::new_v4();
-            let control = ForwarderControl::new();
-            let (sink_tx, mut sink_rx) = mpsc::channel(4);
-            control.set_sink(sink_tx).await;
-            let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-            let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-            let chunk = source_output(&control, payload);
-            assert!(!chunk.activity);
-            assert!(chunk.idle_resolution.is_some());
-            outbox_tx.send(chunk).unwrap();
-
-            // Terminal bytes are never held behind the classification debounce.
-            assert!(matches!(
-                sink_rx.recv().await.unwrap(),
-                WsOutbound::Binary(_)
-            ));
-            assert!(sink_rx.try_recv().is_err());
-
-            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
-            tokio::task::yield_now().await;
-            assert!(sink_rx.try_recv().is_err());
-
-            tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY).await;
-            tokio::task::yield_now().await;
-            let WsOutbound::Json(json) = sink_rx.try_recv().expect("idle activity") else {
-                panic!("expected idle activity JSON")
-            };
-            assert_eq!(
-                json,
-                format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
-            );
-
-            drop(outbox_tx);
-            forwarder.await.unwrap();
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delayed_decision_preserves_receipt_time_suppression_ordering() {
-        // Suppression after receipt cannot erase eligible candidate text.
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        control.suppress_activity(Duration::from_secs(60));
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
-        assert!(matches!(sink_rx.try_recv().unwrap(), WsOutbound::Json(_)));
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-
-        // Suppression at receipt remains immutable even if it is cleared before
-        // the candidate resolves.
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        control.suppress_activity(Duration::from_secs(60));
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-        outbox_tx
-            .send(source_output(&control, b" \"quoted real output\""))
-            .unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        control.activity.lock().unwrap().suppress_output_until = None;
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
-        assert!(sink_rx.try_recv().is_err());
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn complete_tmux_status_stays_suppressed_at_every_split_with_idle_debounce() {
-        for payload in [
-            b"[spawn-oem] \"bash\" 12:34 15-Jul-26".as_slice(),
-            b"           \"project\" 04:49 08-May-26".as_slice(),
-            b"12:34 15-Jul-26".as_slice(),
-        ] {
-            for split in 0..=payload.len() {
-                let agent_id = Uuid::new_v4();
-                let control = ForwarderControl::new();
-                let (sink_tx, mut sink_rx) = mpsc::channel(4);
-                control.set_sink(sink_tx).await;
-                let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-                let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-                // Let the first half reach the forwarder and arm its timer,
-                // then complete the status before the debounce expires.
-                outbox_tx
-                    .send(source_output(&control, &payload[..split]))
-                    .unwrap();
-                assert!(matches!(
-                    sink_rx.recv().await.unwrap(),
-                    WsOutbound::Binary(_)
-                ));
-                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY / 2).await;
-                tokio::task::yield_now().await;
-                assert!(sink_rx.try_recv().is_err());
-
-                outbox_tx
-                    .send(source_output(&control, &payload[split..]))
-                    .unwrap();
-                assert!(matches!(
-                    sink_rx.recv().await.unwrap(),
-                    WsOutbound::Binary(_)
-                ));
-                tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-                tokio::task::yield_now().await;
-                assert!(
-                    sink_rx.try_recv().is_err(),
-                    "status emitted activity at split {split} for {payload:?}"
-                );
-
-                drop(outbox_tx);
-                forwarder.await.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_idle_timer_is_cancelled_when_agent_outbox_closes() {
-        let agent_id = Uuid::new_v4();
-        let control = ForwarderControl::new();
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
-
-        outbox_tx.send(source_output(&control, b"12:34")).unwrap();
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        drop(outbox_tx);
-        forwarder.await.unwrap();
-
-        tokio::time::advance(activity::OUTPUT_IDLE_RESOLUTION_DELAY * 2).await;
-        tokio::task::yield_now().await;
         assert!(sink_rx.try_recv().is_err());
     }
 }

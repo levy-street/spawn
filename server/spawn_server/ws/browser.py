@@ -51,9 +51,8 @@ DAEMON_SNAPSHOT_LINES = 10_000
 # overlay. Capturing 10k styled lines here made switching to long-running
 # agents take multiple seconds.
 INITIAL_SNAPSHOT_LINES = 400
-# Worker replays answer in milliseconds and tmux captures in hundreds of ms;
-# this only bites when the path is degraded — and the transcript fallback it
-# triggers is strictly worse than waiting (legacy formatting, no geometry).
+# Worker replay normally answers in milliseconds; allow a bounded degraded-path
+# window before falling back to the legacy transcript.
 INITIAL_SNAPSHOT_TIMEOUT = 3.0
 # Fallback when no daemon snapshot is available: ship only the transcript
 # tail. Long-running agents accumulate up to 64 MB of transcript.
@@ -91,10 +90,8 @@ def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
 
 
 def _prefer_transcript_history(argv: list[str]) -> bool:
-    # Raw PTY transcripts are chronological, but replaying full-screen TUIs
-    # can preserve alternate-screen repaint noise. Keep using tmux's rendered
-    # pane snapshot until we have a proper terminal recording renderer that can
-    # materialize clean scrollback independently.
+    # Raw PTY transcripts are chronological, but replaying full-screen TUIs can
+    # preserve alternate-screen repaint noise. Prefer the worker checkpoint.
     return False
 
 
@@ -219,11 +216,6 @@ async def _send_initial_history(
                         "rows": initial_rows,
                     }
                 )
-                # tmux rewraps asynchronously after the PTY resize; give it a
-                # beat so the connect-time capture reflects the new width
-                # instead of racing the reflow (lines wrapped at the stale
-                # width otherwise persist in scrollback until overwritten).
-                await asyncio.sleep(0.15)
             snapshot = await broker.request_snapshot(
                 agent_id, daemon, lines=INITIAL_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
             )
@@ -231,7 +223,7 @@ async def _send_initial_history(
                 await conn.send_text({"type": "history", "bytes_b64": snapshot["bytes_b64"]})
                 return
         except Exception as e:
-            log.warning("tmux snapshot request failed: %s", e)
+            log.warning("worker snapshot request failed: %s", e)
 
     history = await transcript.read(agent_id, max_bytes=TRANSCRIPT_FALLBACK_MAX_BYTES)
     await conn.send_text(
@@ -316,7 +308,11 @@ async def browser_ws(
     conn = BrowserConn(user_id=user.id, agent_id=agent_id, websocket=websocket)
     initial_cols = _clamp_initial_size(cols, 20, 400)
     initial_rows = _clamp_initial_size(rows, 5, 200)
-    display_state = await broker.attach_browser(conn, cols=initial_cols, rows=initial_rows)
+    display_state = (
+        BrowserDisplayState(owner=False, cols=None, rows=None, viewers=0)
+        if v2
+        else await broker.attach_browser(conn, cols=initial_cols, rows=initial_rows)
+    )
     log.info(
         "browser attached agent=%s user=%s owner=%s viewers=%s",
         agent_id,
@@ -329,17 +325,19 @@ async def browser_ws(
     # history. Followers must adopt the controller geometry instead of fitting
     # their own viewport and racing the shared PTY size.
     try:
-        await _broadcast_display_control(agent_id)
+        if not v2:
+            await _broadcast_display_control(agent_id)
         await conn.send_text(_rtc_config_payload(user.id, binding_nonce_required=v2))
-        await _send_initial_history(
-            conn,
-            agent_id=agent_id,
-            host_id=host_id,
-            agent_argv=agent_argv,
-            initial_cols=display_state.cols if display_state.cols is not None else initial_cols,
-            initial_rows=display_state.rows if display_state.rows is not None else initial_rows,
-            resize_before_snapshot=display_state.owner,
-        )
+        if not v2:
+            await _send_initial_history(
+                conn,
+                agent_id=agent_id,
+                host_id=host_id,
+                agent_argv=agent_argv,
+                initial_cols=display_state.cols if display_state.cols is not None else initial_cols,
+                initial_rows=display_state.rows if display_state.rows is not None else initial_rows,
+                resize_before_snapshot=display_state.owner,
+            )
         await conn.send_text({"type": "agent.status", "status": agent_status})
     except Exception as e:
         log.warning("history send failed: %s", e)
@@ -493,12 +491,6 @@ async def browser_ws(
         except TimeoutError:
             pass
 
-    # The history payload is a rendered tmux snapshot, not a live terminal
-    # attach state. Once the browser is subscribed to live bytes, force tmux
-    # to repaint the current screen so xterm's current viewport is real tmux
-    # output at the browser's measured size.
-    await _request_agent_redraw(agent_id, host_id)
-
     try:
         while True:
             msg = await websocket.receive()
@@ -539,6 +531,23 @@ async def browser_ws(
                 except json.JSONDecodeError:
                     continue
                 ftype = obj.get("type")
+                if v2 and ftype in {
+                    "resize",
+                    "take_control",
+                    "scroll",
+                    "redraw",
+                    "snapshot",
+                }:
+                    log.warning(
+                        "server-visible terminal control from spawn.v2 browser agent=%s user=%s; closing",
+                        agent_id,
+                        user.id,
+                    )
+                    await websocket.close(
+                        code=WS_CLOSE_BINARY_ON_V2,
+                        reason="terminal control belongs on spawn.ctl",
+                    )
+                    break
                 if ftype == "resize":
                     cols = _clamp_message_size(obj, "cols", 80, 20, 400)
                     rows = _clamp_message_size(obj, "rows", 24, 5, 200)
@@ -590,7 +599,6 @@ async def browser_ws(
                         except Exception as e:
                             log.warning("take control resize forward failed: %s", e)
                     await _broadcast_display_control(agent_id)
-                    await _request_agent_redraw(agent_id, host_id)
                 elif ftype == "scroll":
                     raw_lines = int(obj.get("lines") or 0)
                     lines = max(-200, min(200, raw_lines))
@@ -611,10 +619,9 @@ async def browser_ws(
                         except Exception as e:
                             log.warning("scroll forward failed: %s", e)
                 elif ftype == "redraw":
-                    # Browser asks tmux to repaint the current screen — used
-                    # after closing the scrollback overlay so the live
-                    # terminal reflects the authoritative pane state.
-                    await _request_agent_redraw(agent_id, host_id)
+                    # Compatibility no-op: worker checkpoints replace
+                    # daemon-induced repaints.
+                    continue
                 elif ftype == "snapshot":
                     raw_lines = int(obj.get("lines") or DAEMON_SNAPSHOT_LINES)
                     lines = max(100, min(DAEMON_SNAPSHOT_LINES, raw_lines))
@@ -957,8 +964,9 @@ async def browser_ws(
                     "binding_generation": binding.daemon_generation,
                 },
             )
-        await broker.detach_browser(conn)
-        await _broadcast_display_control(agent_id)
+        if not v2:
+            await broker.detach_browser(conn)
+            await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)
 
 
@@ -980,15 +988,3 @@ def _clamp_message_size(
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
-
-
-async def _request_agent_redraw(agent_id: str, host_id: str) -> None:
-    daemon = get_broker().get_daemon_for_agent(agent_id) or get_broker().get_daemon_for_host(
-        host_id
-    )
-    if daemon is None:
-        return
-    try:
-        await daemon.send_text({"type": "agent.redraw", "agent_id": agent_id})
-    except Exception as e:
-        log.warning("redraw forward failed: %s", e)

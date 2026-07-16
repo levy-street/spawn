@@ -4,8 +4,15 @@
 //! any moment, it can serialize the *current screen state* as an ANSI byte
 //! stream that reconstructs it in the browser's xterm.js. Checkpoints built
 //! this way replace the SIGWINCH-jiggle repaint hack: log rotation becomes
-//! invisible to the agent process, and a replay always opens with a exact,
+//! invisible to the agent process, and a replay always opens with an exact,
 //! synthesized repaint instead of hoping the app redrew recently.
+//!
+//! This means the worker deliberately retains plaintext semantic state for
+//! the current primary and alternate screen for its lifetime. The state is
+//! bounded by the active terminal geometry and has no scrolling history; it is
+//! not a second user-facing renderer and it never rewrites the live byte path.
+//! Serialized checkpoints are transient plaintext and are encrypted before
+//! being written to the scrollback segment files.
 //!
 //! Fidelity contract (enforced by the unit tests and, eventually, the
 //! term-conformance corpus): `feed(bytes)` then `serialize()` then feeding the

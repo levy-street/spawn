@@ -134,7 +134,6 @@ export type HostToolPolicy = z.infer<typeof HostToolPolicySchema>;
 export const AgentSchema = z.object({
   id: z.string().uuid(),
   name: z.string().nullable().default(null),
-  tmux_session: z.string().nullable().default(null),
   host_id: z.string().uuid(),
   host_name: z.string().nullable().default(null),
   preset_id: z.string().uuid().nullable(),

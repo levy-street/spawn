@@ -2,6 +2,19 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  AGENT_CTL_MAX_PENDING_PTY_BYTES,
+  type AgentCtlOperation,
+  AgentCtlRequestTracker,
+  type AgentCtlTrackedResult,
+  AgentGenerationInputQueue,
+  decodeAgentCtlChunk,
+  makeAgentCtlRequest,
+  newAgentCtlRequestId,
+  OrderedAsyncQueue,
+  parseAgentCtlText,
+  slicePtyChunkAfterAnchor,
+} from "@/lib/agent-ctl";
+import {
   base64ToBytes,
   buildAgentWsUrl,
   type DisplayControlState,
@@ -50,9 +63,15 @@ export interface ConnInfo {
 const EMPTY_CONN_INFO: ConnInfo = { kind: null, rttMs: null, protocol: null };
 
 type RtcState = {
+  agentId: string | null;
+  agentGeneration: number;
+  rtcGeneration: number;
   pc: RTCPeerConnection | null;
-  dc: RTCDataChannel | null;
+  ptyDc: RTCDataChannel | null;
+  ctlDc: RTCDataChannel | null;
   sessionId: string | null;
+  ptyOpen: boolean;
+  ctlOpen: boolean;
   bindingNonce: string | null;
   bindingGeneration: number | null;
   open: boolean;
@@ -80,14 +99,26 @@ function newRtcSessionId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
 }
 
-function newRtcBindingNonce(): string {
-  if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+type FillRandomBytes = (bytes: Uint8Array) => void;
+
+/** Generate an authority-binding identity, or fail closed without a CSPRNG. */
+export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): string | null {
+  const fill =
+    fillRandomBytes === undefined
+      ? typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function"
+        ? (bytes: Uint8Array) => {
+            crypto.getRandomValues(bytes);
+          }
+        : null
+      : fillRandomBytes;
+  if (!fill) return null;
+  const bytes = new Uint8Array(16);
+  try {
+    fill(bytes);
+  } catch {
+    return null;
   }
-  return Array.from({ length: 4 }, () => Math.random().toString(16).slice(2).padEnd(8, "0"))
-    .join("")
-    .slice(0, 32);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
 export function useAgentSocket({
@@ -112,20 +143,32 @@ export function useAgentSocket({
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
   const wsRef = useRef<WebSocket | null>(null);
   const wsV2Ref = useRef(false);
-  const pendingInputRef = useRef<Uint8Array[]>([]);
-  const pendingInputBytesRef = useRef(0);
+  const activeAgentIdRef = useRef<string | null>(null);
+  const agentGenerationRef = useRef(0);
+  const rtcGenerationRef = useRef(0);
+  const pendingInputRef = useRef(new AgentGenerationInputQueue(MAX_PENDING_INPUT_BYTES));
   const rtcRef = useRef<RtcState>({
+    agentId: null,
+    agentGeneration: 0,
+    rtcGeneration: 0,
     pc: null,
-    dc: null,
+    ptyDc: null,
+    ctlDc: null,
     sessionId: null,
+    ptyOpen: false,
+    ctlOpen: false,
     bindingNonce: null,
     bindingGeneration: null,
     open: false,
     bytesReceived: 0,
   });
+  const sendControlRef = useRef<
+    (operation: AgentCtlOperation, parameters?: Record<string, unknown>) => boolean
+  >(() => false);
   const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
+    agentId,
     onData,
     onHistory,
     onDisplayControl,
@@ -137,6 +180,7 @@ export function useAgentSocket({
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
+    agentId,
     onData,
     onHistory,
     onDisplayControl,
@@ -148,6 +192,14 @@ export function useAgentSocket({
   };
 
   useEffect(() => {
+    const agentGeneration = agentGenerationRef.current + 1;
+    agentGenerationRef.current = agentGeneration;
+    pendingInputRef.current.clear();
+    wsV2Ref.current = false;
+    sendControlRef.current = () => false;
+    activeAgentIdRef.current = enabled && agentId ? agentId : null;
+    setV2(false);
+    setDcOpen(false);
     if (!enabled || !agentId) return;
     let cancelled = false;
     let attempt = 0;
@@ -156,13 +208,22 @@ export function useAgentSocket({
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRelayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcRelayFallbackGeneration: number | null = null;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
     let lastRtcDataAt = 0;
     const pendingRelayChunks: Uint8Array[] = [];
 
+    const isCurrentAgentGeneration = () => agentGenerationRef.current === agentGeneration;
+    const isActiveAgentGeneration = () => !cancelled && isCurrentAgentGeneration();
+    const currentHandlers = () =>
+      isActiveAgentGeneration() && handlersRef.current.agentId === agentId
+        ? handlersRef.current
+        : null;
+
     const sendJsonOverWs = (msg: unknown) => {
+      if (!isCurrentAgentGeneration()) return false;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
       ws.send(JSON.stringify(msg));
@@ -182,11 +243,19 @@ export function useAgentSocket({
     const clearRelayFallback = () => {
       if (rtcRelayFallbackTimer) clearTimeout(rtcRelayFallbackTimer);
       rtcRelayFallbackTimer = null;
+      rtcRelayFallbackGeneration = null;
       pendingRelayChunks.splice(0);
     };
 
-    const cleanupRtc = (signal = true, retry = false) => {
+    const cleanupRtc = (signal = true, retry = false, expectedRtcGeneration?: number) => {
       const rtc = rtcRef.current;
+      if (
+        rtc.agentId !== agentId ||
+        rtc.agentGeneration !== agentGeneration ||
+        (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
+      ) {
+        return;
+      }
       const sessionId = rtc.sessionId;
       const bindingNonce = rtc.bindingNonce;
       clearRtcConnectTimer();
@@ -195,8 +264,24 @@ export function useAgentSocket({
       if (signal && sessionId && bindingNonce) {
         sendJsonOverWs({ type: "rtc.close", session_id: sessionId, binding_nonce: bindingNonce });
       }
+      rtcRef.current = {
+        agentId: null,
+        agentGeneration: 0,
+        rtcGeneration: 0,
+        pc: null,
+        ptyDc: null,
+        ctlDc: null,
+        sessionId: null,
+        ptyOpen: false,
+        ctlOpen: false,
+        bindingNonce: null,
+        bindingGeneration: null,
+        open: false,
+        bytesReceived: 0,
+      };
       try {
-        rtc.dc?.close();
+        rtc.ptyDc?.close();
+        rtc.ctlDc?.close();
       } catch {
         // ignore
       }
@@ -205,26 +290,18 @@ export function useAgentSocket({
       } catch {
         // ignore
       }
-      rtcRef.current = {
-        pc: null,
-        dc: null,
-        sessionId: null,
-        bindingNonce: null,
-        bindingGeneration: null,
-        open: false,
-        bytesReceived: 0,
-      };
+      sendControlRef.current = () => false;
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
-      setDcOpen(false);
+      if (isCurrentAgentGeneration()) setDcOpen(false);
       if (retry) scheduleRtcRetry();
     };
 
     // A transient WebRTC failure (network switch, slow ICE) must not strand
     // the session on the relay path until the next WS reconnect.
     const scheduleRtcRetry = () => {
-      if (cancelled || rtcRetryTimer || !lastRtcIceServers) return;
+      if (!isActiveAgentGeneration() || rtcRetryTimer || !lastRtcIceServers) return;
       const delay = Math.min(
         RTC_RETRY_MAX_DELAY_MS,
         RTC_RETRY_BASE_DELAY_MS * 2 ** rtcRetryAttempts,
@@ -232,7 +309,7 @@ export function useAgentSocket({
       rtcRetryAttempts += 1;
       rtcRetryTimer = setTimeout(() => {
         rtcRetryTimer = null;
-        if (cancelled || rtcRef.current.pc) return;
+        if (!isActiveAgentGeneration() || rtcRef.current.pc) return;
         if (wsRef.current?.readyState !== WebSocket.OPEN) return;
         if (lastRtcIceServers) void startRtc(lastRtcIceServers);
       }, delay);
@@ -241,22 +318,49 @@ export function useAgentSocket({
     const scheduleRelayFallback = (bytes: Uint8Array) => {
       pendingRelayChunks.push(bytes);
       if (rtcRelayFallbackTimer) return;
+      rtcRelayFallbackGeneration = rtcRef.current.rtcGeneration;
       rtcRelayFallbackTimer = setTimeout(() => {
         rtcRelayFallbackTimer = null;
+        const expectedGeneration = rtcRelayFallbackGeneration;
+        rtcRelayFallbackGeneration = null;
         const chunks = pendingRelayChunks.splice(0);
-        cleanupRtc(true, true);
+        if (
+          expectedGeneration === null ||
+          rtcRef.current.rtcGeneration !== expectedGeneration ||
+          !currentHandlers()
+        ) {
+          return;
+        }
+        cleanupRtc(true, true, expectedGeneration);
+        const handlers = currentHandlers();
+        if (!handlers) return;
         for (const chunk of chunks) {
-          handlersRef.current.onData(chunk);
+          handlers.onData(chunk);
         }
       }, RTC_RELAY_FALLBACK_DELAY_MS);
     };
 
     const startRtc = async (iceServers: RTCIceServer[]) => {
-      if (cancelled || rtcStartInFlight || rtcRef.current.pc) return;
+      if (!isActiveAgentGeneration() || rtcStartInFlight || rtcRef.current.pc) return;
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
+      const rtcGeneration = rtcGenerationRef.current + 1;
+      rtcGenerationRef.current = rtcGeneration;
       const sessionId = newRtcSessionId();
       const bindingNonce = newRtcBindingNonce();
+      if (!bindingNonce) {
+        rtcStartInFlight = false;
+        lastRtcIceServers = null;
+        // Legacy v1 can remain on its server relay. V2 has no content relay,
+        // so terminate signaling before an unbound RTC offer can be emitted.
+        if (wsV2Ref.current) {
+          const ws = wsRef.current;
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.close(1002, "Secure RTC binding identity is unavailable");
+          }
+        }
+        return;
+      }
       // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
       // survive networks where no direct path exists (docs/TRUST.md Phase 1).
       const forceRelay =
@@ -266,22 +370,179 @@ export function useAgentSocket({
         iceServers,
         iceTransportPolicy: forceRelay ? "relay" : "all",
       });
-      const dc = pc.createDataChannel("spawn.pty", { ordered: true });
+      const ptyDc = pc.createDataChannel("spawn.pty", { ordered: true });
+      const useControlChannel = wsV2Ref.current;
+      const ctlDc = useControlChannel ? pc.createDataChannel("spawn.ctl", { ordered: true }) : null;
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+      const pendingControlTexts: string[] = [];
+      const requests = new AgentCtlRequestTracker();
+      const pendingBootstrapPty: Array<{ bytes: Uint8Array; offsetAfter: number }> = [];
+      const pendingSnapshots: Array<{
+        bytes: Uint8Array;
+        plain: boolean;
+        ptyOffset: number;
+      }> = [];
+      let pendingBootstrapPtyBytes = 0;
+      let bootstrapDone = !useControlChannel;
+      let bootstrapPtyAnchor: number | null = null;
+      let initialHistoryRequestId: string | null = null;
       let offerSent = false;
-      dc.binaryType = "arraybuffer";
+      const isCurrentRtcGeneration = () => {
+        const current = rtcRef.current;
+        return (
+          isActiveAgentGeneration() &&
+          current.agentId === agentId &&
+          current.agentGeneration === agentGeneration &&
+          current.rtcGeneration === rtcGeneration &&
+          current.sessionId === sessionId
+        );
+      };
+      ptyDc.binaryType = "arraybuffer";
+      if (ctlDc) ctlDc.binaryType = "arraybuffer";
       rtcRef.current = {
+        agentId,
+        agentGeneration,
+        rtcGeneration,
         pc,
-        dc,
+        ptyDc,
+        ctlDc,
         sessionId,
+        ptyOpen: false,
+        ctlOpen: !useControlChannel,
         bindingNonce,
         bindingGeneration: null,
         open: false,
         bytesReceived: 0,
       };
+
+      const flushPendingInput = () => {
+        const queued = pendingInputRef.current.drain(agentGeneration);
+        for (const chunk of queued) {
+          try {
+            ptyDc.send(
+              chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength,
+              ) as ArrayBuffer,
+            );
+          } catch {
+            break;
+          }
+        }
+      };
+
+      const markReady = () => {
+        const current = rtcRef.current;
+        if (
+          !isCurrentRtcGeneration() ||
+          current.open ||
+          !current.ptyOpen ||
+          !current.ctlOpen ||
+          !bootstrapDone
+        ) {
+          return;
+        }
+        rtcRef.current = { ...current, open: true };
+        clearRtcConnectTimer();
+        rtcRetryAttempts = 0;
+        lastRtcDataAt = Date.now();
+        if (isCurrentAgentGeneration()) setDcOpen(true);
+        flushPendingInput();
+      };
+
+      const deliverAnchoredPtyChunk = (bytes: Uint8Array, offsetAfter: number) => {
+        if (!isCurrentRtcGeneration()) return;
+        const sliced = slicePtyChunkAfterAnchor(bytes, offsetAfter, bootstrapPtyAnchor);
+        bootstrapPtyAnchor = sliced.anchor;
+        const handlers = currentHandlers();
+        if (sliced.bytes && handlers) handlers.onData(sliced.bytes, offsetAfter);
+      };
+
+      const flushPendingSnapshots = () => {
+        if (!isCurrentRtcGeneration()) return;
+        const received = rtcRef.current.bytesReceived;
+        while (pendingSnapshots.length > 0 && pendingSnapshots[0].ptyOffset <= received) {
+          const snapshot = pendingSnapshots.shift();
+          if (!snapshot) break;
+          currentHandlers()?.onSnapshot?.(snapshot.bytes, snapshot.plain, snapshot.ptyOffset);
+        }
+      };
+
+      const finishBootstrap = (bytes: Uint8Array, ptyOffset: number | null | undefined) => {
+        if (bootstrapDone || !isCurrentRtcGeneration()) return;
+        const anchor = typeof ptyOffset === "number" && ptyOffset >= 0 ? ptyOffset : 0;
+        const handlers = currentHandlers();
+        if (!handlers) return;
+        if (handlers.onHistory) handlers.onHistory(bytes);
+        else handlers.onData(bytes);
+        bootstrapPtyAnchor = anchor;
+        for (const chunk of pendingBootstrapPty.splice(0)) {
+          deliverAnchoredPtyChunk(chunk.bytes, chunk.offsetAfter);
+        }
+        pendingBootstrapPtyBytes = 0;
+        bootstrapDone = true;
+        flushPendingSnapshots();
+        markReady();
+      };
+
+      const acceptTrackedResult = (result: AgentCtlTrackedResult | null) => {
+        if (!result || !isCurrentRtcGeneration()) return;
+        const requestId = result.response.request_id;
+        if (result.kind === "response") {
+          if (!result.response.ok && requestId === initialHistoryRequestId) {
+            finishBootstrap(new Uint8Array(), 0);
+          }
+          return;
+        }
+        if (requestId === initialHistoryRequestId || result.response.operation === "history") {
+          finishBootstrap(result.bytes, result.response.pty_offset);
+        } else if (result.response.operation === "snapshot") {
+          const ptyOffset =
+            typeof result.response.pty_offset === "number" ? result.response.pty_offset : null;
+          if (ptyOffset !== null && ptyOffset > rtcRef.current.bytesReceived) {
+            if (pendingSnapshots.length < 8) {
+              pendingSnapshots.push({
+                bytes: result.bytes,
+                plain: Boolean(result.response.plain),
+                ptyOffset,
+              });
+            }
+          } else {
+            currentHandlers()?.onSnapshot?.(
+              result.bytes,
+              Boolean(result.response.plain),
+              ptyOffset,
+            );
+          }
+        }
+      };
+
+      const sendControl = (
+        operation: AgentCtlOperation,
+        parameters: Record<string, unknown> = {},
+      ): boolean => {
+        if (!ctlDc || !isCurrentRtcGeneration()) return false;
+        const requestId = newAgentCtlRequestId();
+        const text = makeAgentCtlRequest(requestId, operation, parameters);
+        if (!text) return false;
+        if (ctlDc.readyState !== "open" && pendingControlTexts.length >= 128) return false;
+        if (!requests.register(requestId, operation)) return false;
+        try {
+          if (ctlDc.readyState === "open") {
+            ctlDc.send(text);
+          } else {
+            pendingControlTexts.push(text);
+          }
+        } catch {
+          requests.cancel(requestId);
+          return false;
+        }
+        return true;
+      };
+      sendControlRef.current = useControlChannel ? sendControl : () => false;
       rtcConnectTimer = setTimeout(() => {
-        if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
-          cleanupRtc(true, true);
+        if (isCurrentRtcGeneration() && !rtcRef.current.open) {
+          cleanupRtc(true, true, rtcGeneration);
         }
       }, RTC_CONNECT_TIMEOUT_MS);
 
@@ -294,15 +555,13 @@ export function useAgentSocket({
         });
 
       pc.onicecandidate = (event) => {
-        if (!event.candidate || cancelled) return;
+        if (!event.candidate || !isCurrentRtcGeneration()) return;
         const candidate = event.candidate.toJSON();
-        if (offerSent) {
-          sendRtcCandidate(candidate);
-        } else {
-          pendingLocalCandidates.push(candidate);
-        }
+        if (offerSent) sendRtcCandidate(candidate);
+        else pendingLocalCandidates.push(candidate);
       };
       pc.onconnectionstatechange = () => {
+        if (!isCurrentRtcGeneration()) return;
         if (pc.connectionState === "connected") {
           clearRtcDisconnectedTimer();
           return;
@@ -311,82 +570,146 @@ export function useAgentSocket({
           if (!rtcDisconnectedTimer) {
             rtcDisconnectedTimer = setTimeout(() => {
               if (rtcRef.current.sessionId === sessionId && pc.connectionState === "disconnected") {
-                cleanupRtc(true, true);
+                cleanupRtc(true, true, rtcGeneration);
               }
             }, RTC_DISCONNECTED_GRACE_MS);
           }
           return;
         }
         if (["failed", "closed"].includes(pc.connectionState)) {
-          cleanupRtc(pc.connectionState !== "closed", rtcRef.current.sessionId === sessionId);
+          cleanupRtc(pc.connectionState !== "closed", true, rtcGeneration);
         }
       };
-      dc.onopen = () => {
+
+      ptyDc.onopen = () => {
         const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          rtcRef.current = { ...current, open: true };
-          clearRtcConnectTimer();
-          rtcRetryAttempts = 0;
-          // The daemon starts mirroring PTY bytes onto this channel from its
-          // side of the open handshake; treat relay copies that race the
-          // first DataChannel byte as duplicates from the start.
-          lastRtcDataAt = Date.now();
-          setDcOpen(true);
-          // Flush keystrokes typed before the channel came up (v2 has no
-          // relay to carry them). Order is preserved: this runs before any
-          // subsequent sendBinary can see the channel as open.
-          const queued = pendingInputRef.current.splice(0);
-          pendingInputBytesRef.current = 0;
-          for (const chunk of queued) {
-            try {
-              dc.send(
-                chunk.buffer.slice(
-                  chunk.byteOffset,
-                  chunk.byteOffset + chunk.byteLength,
-                ) as ArrayBuffer,
-              );
-            } catch {
-              break;
-            }
+        if (!isCurrentRtcGeneration()) return;
+        rtcRef.current = { ...current, ptyOpen: true };
+        markReady();
+      };
+      ptyDc.onclose = () => {
+        if (!isCurrentRtcGeneration()) return;
+        cleanupRtc(true, true, rtcGeneration);
+      };
+      ptyDc.onerror = () => cleanupRtc(true, true, rtcGeneration);
+      const deliverPtyChunk = (bytes: Uint8Array) => {
+        const current = rtcRef.current;
+        if (!isCurrentRtcGeneration()) return;
+        current.bytesReceived += bytes.byteLength;
+        if (!bootstrapDone) {
+          if (pendingBootstrapPtyBytes + bytes.byteLength > AGENT_CTL_MAX_PENDING_PTY_BYTES) {
+            cleanupRtc(true, true, rtcGeneration);
+            return;
           }
+          pendingBootstrapPty.push({ bytes, offsetAfter: current.bytesReceived });
+          pendingBootstrapPtyBytes += bytes.byteLength;
+          return;
         }
+        deliverAnchoredPtyChunk(bytes, current.bytesReceived);
+        flushPendingSnapshots();
       };
-      dc.onclose = () => {
-        const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          rtcRef.current = { ...current, open: false };
-          setDcOpen(false);
-        }
-      };
-      dc.onerror = () => {
-        cleanupRtc(true, true);
-      };
-      const deliverDcChunk = (bytes: Uint8Array) => {
-        const h = handlersRef.current;
-        const current = rtcRef.current;
-        if (current.sessionId === sessionId) {
-          current.bytesReceived += bytes.length;
-          h.onData(bytes, current.bytesReceived);
-        } else {
-          h.onData(bytes);
-        }
-      };
-      dc.onmessage = (event) => {
+      const ptyMessages = new OrderedAsyncQueue();
+      ptyDc.onmessage = (event) => {
+        if (!isCurrentRtcGeneration()) return;
         lastRtcDataAt = Date.now();
         clearRelayFallback();
-        if (event.data instanceof ArrayBuffer) {
-          deliverDcChunk(new Uint8Array(event.data));
-        } else if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((buf) => {
-            if (!cancelled) deliverDcChunk(new Uint8Array(buf));
-          });
-        }
+        const data = event.data;
+        if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
+        void ptyMessages.enqueue(
+          async () => new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data),
+          (bytes) => {
+            if (isCurrentRtcGeneration()) deliverPtyChunk(bytes);
+          },
+        );
       };
+
+      if (ctlDc) {
+        ctlDc.onopen = () => {
+          if (!isCurrentRtcGeneration()) return;
+          const current = rtcRef.current;
+          rtcRef.current = { ...current, ctlOpen: true };
+          initialHistoryRequestId = newAgentCtlRequestId();
+          const size = initialSizeRef.current;
+          const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
+            lines: 400,
+            plain: false,
+            ...(size ? { cols: size.cols, rows: size.rows } : {}),
+          });
+          if (!historyText || !requests.register(initialHistoryRequestId, "history")) {
+            finishBootstrap(new Uint8Array(), 0);
+          } else {
+            try {
+              ctlDc.send(historyText);
+            } catch {
+              requests.cancel(initialHistoryRequestId);
+              cleanupRtc(true, true, rtcGeneration);
+              return;
+            }
+          }
+          try {
+            for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
+          } catch {
+            cleanupRtc(true, true, rtcGeneration);
+            return;
+          }
+          markReady();
+        };
+        ctlDc.onclose = () => {
+          if (!isCurrentRtcGeneration()) return;
+          cleanupRtc(true, true, rtcGeneration);
+        };
+        ctlDc.onerror = () => cleanupRtc(true, true, rtcGeneration);
+        const deliverControlBinary = (bytes: Uint8Array) => {
+          if (!isCurrentRtcGeneration()) return;
+          const chunk = decodeAgentCtlChunk(bytes);
+          if (!chunk) return;
+          acceptTrackedResult(requests.acceptChunk(chunk));
+        };
+        const controlMessages = new OrderedAsyncQueue();
+        ctlDc.onmessage = (event) => {
+          if (!isCurrentRtcGeneration()) return;
+          const data = event.data;
+          if (
+            typeof data !== "string" &&
+            !(data instanceof ArrayBuffer) &&
+            !(data instanceof Blob)
+          ) {
+            return;
+          }
+          void controlMessages.enqueue(
+            async () =>
+              data instanceof Blob
+                ? new Uint8Array(await data.arrayBuffer())
+                : data instanceof ArrayBuffer
+                  ? new Uint8Array(data)
+                  : data,
+            (decoded) => {
+              if (!isCurrentRtcGeneration()) return;
+              if (typeof decoded !== "string") {
+                deliverControlBinary(decoded);
+                return;
+              }
+              const message = parseAgentCtlText(decoded);
+              if (!message) return;
+              if (message.kind === "event") {
+                currentHandlers()?.onDisplayControl?.({
+                  owner: message.owner,
+                  cols: message.cols,
+                  rows: message.rows,
+                  viewers: message.viewers,
+                });
+                return;
+              }
+              acceptTrackedResult(requests.acceptResponse(message));
+            },
+          );
+        };
+      }
 
       try {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        if (cancelled || rtcRef.current.sessionId !== sessionId) return;
+        if (!isCurrentRtcGeneration()) return;
         if (
           !sendJsonOverWs({
             type: "rtc.offer",
@@ -395,26 +718,32 @@ export function useAgentSocket({
             sdp: offer.sdp,
           })
         ) {
-          cleanupRtc(false);
+          cleanupRtc(false, false, rtcGeneration);
           return;
         }
         offerSent = true;
-        for (const candidate of pendingLocalCandidates.splice(0)) {
-          sendRtcCandidate(candidate);
-        }
+        for (const candidate of pendingLocalCandidates.splice(0)) sendRtcCandidate(candidate);
       } catch {
-        cleanupRtc();
+        cleanupRtc(true, false, rtcGeneration);
       } finally {
-        rtcStartInFlight = false;
+        if (isCurrentRtcGeneration()) rtcStartInFlight = false;
       }
     };
 
     const connect = () => {
-      if (cancelled) return;
+      if (!isActiveAgentGeneration()) return;
       setState("connecting");
       let ws: WebSocket;
       try {
-        ws = new WebSocket(buildAgentWsUrl(agentId, initialSizeRef.current), spawnWsSubprotocols());
+        const forceV1 =
+          typeof window !== "undefined" &&
+          (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 === true;
+        // Geometry is protected viewport content. Only an explicitly forced
+        // legacy-v1 test/client sends it in the server-visible URL.
+        ws = new WebSocket(
+          buildAgentWsUrl(agentId, forceV1 ? initialSizeRef.current : null),
+          spawnWsSubprotocols(),
+        );
       } catch {
         setState("error");
         scheduleReconnect();
@@ -422,8 +751,10 @@ export function useAgentSocket({
       }
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
+      const isCurrentWs = () => isActiveAgentGeneration() && wsRef.current === ws;
 
       ws.onopen = () => {
+        if (!isCurrentWs()) return;
         attempt = 0;
         // The selected subprotocol decides the data plane: v2 servers never
         // relay PTY bytes, so the DataChannel is the only live path.
@@ -432,15 +763,19 @@ export function useAgentSocket({
         setState("open");
       };
       ws.onmessage = (ev) => {
-        const h = handlersRef.current;
+        if (!isCurrentWs()) return;
+        const h = currentHandlers();
+        if (!h) return;
         if (typeof ev.data === "string") {
           const msg = parseInbound(ev.data);
           if (!msg) return;
           if (msg.type === "history") {
+            if (wsV2Ref.current) return;
             const bytes = base64ToBytes(msg.bytes_b64);
             if (h.onHistory) h.onHistory(bytes);
             else h.onData(bytes);
           } else if (msg.type === "display.control") {
+            if (wsV2Ref.current) return;
             h.onDisplayControl?.({
               owner: msg.owner,
               cols: msg.cols,
@@ -448,6 +783,7 @@ export function useAgentSocket({
               viewers: msg.viewers,
             });
           } else if (msg.type === "snapshot") {
+            if (wsV2Ref.current) return;
             const current = rtcRef.current;
             const dcOffset =
               current.open &&
@@ -501,10 +837,15 @@ export function useAgentSocket({
                 bindingNonce: current.bindingNonce,
                 bindingGeneration: current.bindingGeneration,
               };
+              const acceptedRtcGeneration = current.rtcGeneration;
               void pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
                 const latest = rtcRef.current;
                 if (
+                  !isCurrentWs() ||
                   latest.pc !== pc ||
+                  latest.agentId !== agentId ||
+                  latest.agentGeneration !== agentGeneration ||
+                  latest.rtcGeneration !== acceptedRtcGeneration ||
                   latest.sessionId !== acceptedBinding.sessionId ||
                   latest.bindingNonce !== acceptedBinding.bindingNonce ||
                   latest.bindingGeneration !== acceptedBinding.bindingGeneration
@@ -577,7 +918,7 @@ export function useAgentSocket({
             if (
               msg.session_id &&
               (exactPrebindFailure || exactBoundStatus) &&
-              ["failed", "disabled", "unavailable"].includes(msg.status)
+              ["failed", "disabled", "unavailable", "collision"].includes(msg.status)
             ) {
               cleanupRtc(false, msg.status !== "disabled");
             }
@@ -594,9 +935,11 @@ export function useAgentSocket({
         }
       };
       ws.onerror = () => {
+        if (!isCurrentWs()) return;
         setState("error");
       };
       ws.onclose = () => {
+        if (!isCurrentAgentGeneration() || wsRef.current !== ws) return;
         cleanupRtc(false);
         wsRef.current = null;
         setState("closed");
@@ -605,7 +948,7 @@ export function useAgentSocket({
     };
 
     const scheduleReconnect = () => {
-      if (cancelled) return;
+      if (!isActiveAgentGeneration()) return;
       attempt += 1;
       const delay = Math.min(10_000, 500 * attempt);
       reconnectTimer = setTimeout(connect, delay);
@@ -617,15 +960,22 @@ export function useAgentSocket({
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-      if (wsRef.current) {
+      if (isCurrentAgentGeneration() && wsRef.current) {
+        const ws = wsRef.current;
         try {
           cleanupRtc(true);
-          wsRef.current.close(1000, "unmount");
+          wsRef.current = null;
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close(1000, "unmount");
         } catch {
           // ignore
         }
-        wsRef.current = null;
       }
+      pendingInputRef.current.clear();
+      if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
     };
   }, [agentId, enabled]);
 
@@ -639,12 +989,21 @@ export function useAgentSocket({
     }
     let cancelled = false;
     const poll = async () => {
-      const pc = rtcRef.current.pc;
+      const observed = rtcRef.current;
+      const pc = observed.pc;
       if (!pc) return;
       let stats: RTCStatsReport;
       try {
         stats = await pc.getStats();
       } catch {
+        return;
+      }
+      if (
+        rtcRef.current.pc !== pc ||
+        rtcRef.current.agentId !== observed.agentId ||
+        rtcRef.current.agentGeneration !== observed.agentGeneration ||
+        rtcRef.current.rtcGeneration !== observed.rtcGeneration
+      ) {
         return;
       }
       interface PairStats {
@@ -701,18 +1060,18 @@ export function useAgentSocket({
   }, [dcOpen]);
 
   const sendBinary = (bytes: Uint8Array | string) => {
+    if (activeAgentIdRef.current !== agentId) return false;
     const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     const rtc = rtcRef.current;
-    if (rtc.open && rtc.dc?.readyState === "open") {
-      rtc.dc.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+    if (rtc.open && rtc.ptyDc?.readyState === "open") {
+      rtc.ptyDc.send(
+        buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer,
+      );
       return true;
     }
     if (wsV2Ref.current) {
       // No relay on v2: hold input until the DataChannel (re)opens.
-      if (pendingInputBytesRef.current + buf.byteLength > MAX_PENDING_INPUT_BYTES) return false;
-      pendingInputRef.current.push(buf.slice());
-      pendingInputBytesRef.current += buf.byteLength;
-      return true;
+      return pendingInputRef.current.enqueue(agentGenerationRef.current, buf);
     }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -722,20 +1081,24 @@ export function useAgentSocket({
   };
 
   const sendJson = (msg: unknown) => {
+    if (activeAgentIdRef.current !== agentId) return false;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    // Stamp snapshot requests with the live RTC session so the daemon can
-    // return the DataChannel stream offset at capture time.
-    const rtc = rtcRef.current;
-    const payload =
-      typeof msg === "object" &&
-      msg !== null &&
-      (msg as { type?: string }).type === "snapshot" &&
-      rtc.open &&
-      rtc.sessionId
-        ? { ...(msg as Record<string, unknown>), rtc_session_id: rtc.sessionId }
-        : msg;
-    ws.send(JSON.stringify(payload));
+    if (wsV2Ref.current && typeof msg === "object" && msg !== null) {
+      const payload = msg as Record<string, unknown>;
+      const type = payload.type;
+      const operation =
+        type === "take_control"
+          ? "take_control"
+          : type === "resize" || type === "scroll" || type === "redraw" || type === "snapshot"
+            ? type
+            : null;
+      if (operation) {
+        const { type: _type, rtc_session_id: _rtcSessionId, ...parameters } = payload;
+        return sendControlRef.current(operation, parameters);
+      }
+    }
+    ws.send(JSON.stringify(msg));
     return true;
   };
 

@@ -11,9 +11,9 @@ cargo build --release
 # -> target/release/spawnd
 ```
 
-A `tmux` binary on `$PATH` is required at runtime — the daemon launches each
-agent inside its own detached tmux session so the agent survives `spawnd`
-restarts.
+The build produces both `spawnd` and `spawn-worker`. Keep the two binaries
+beside each other (or set `SPAWND_WORKER_BIN`). Each agent runs in its own
+purpose-built worker and survives supervisor reconnects/restarts.
 
 ## Login
 
@@ -44,8 +44,7 @@ input/output also flows over a direct `spawn.pty` DataChannel while the
 websocket remains the control plane and transcript/fallback path. On disconnect
 it reconnects with exponential backoff
 (1s, 2s, 4s, … capped at 60s) and re-registers with `existing_agents = […]`
-so the server resyncs its routing map without disturbing the running tmux
-sessions.
+so the server resyncs its routing map without disturbing running workers.
 
 ## Other commands
 
@@ -75,11 +74,16 @@ bytes`, with `0x01` for output (daemon→server) and `0x02` for input
 
 ## Process model
 
-Each agent runs in a tmux session named `spawn-<agent_id>`. The daemon
-attaches a PTY to the session via `tmux attach` and reads/writes that PTY.
-On `Ctrl-C`, `spawnd` closes the WS but does **not** kill any tmux session —
-that's the whole point of using tmux. Restart `spawnd run` and it will
-resume streaming.
+Each agent runs in a `spawn-worker` process which owns the PTY, encrypted
+resource-budgeted replay log, and plaintext headless checkpoint emulator
+(current screen grids only, no deep history). `spawnd` communicates with it
+over a mode-600 Unix socket. On `Ctrl-C`, `spawnd` closes the WS but does not stop
+workers; the next supervisor discovers and adopts their sockets.
+
+There is one mandatory backend and no environment or per-agent escape hatch.
+An old session created by a pre-cutover daemon is not adopted. Operators must
+drain it before upgrading, then restart the daemon and create a fresh worker
+session; see `docs/TRUST_PHASE2_PROGRESS.md`.
 
 ## Dev
 

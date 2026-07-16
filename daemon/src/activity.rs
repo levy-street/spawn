@@ -2,10 +2,9 @@
 //! byte in source order and emits only content-free activity metadata.
 //!
 //! Terminal sequences and UTF-8 code points can be split across arbitrary PTY
-//! reads, so classification is deliberately stateful per agent. Carry is
-//! bounded: CSI/OSC parsing uses constant state and plausible tmux status text
-//! is capped or resolved after a short idle debounce before being flushed
-//! through ordinary content classification.
+//! reads, so classification is deliberately stateful per agent. CSI/OSC
+//! parsing uses constant state; there is no intermediate terminal status bar
+//! whose repaint needs content-specific filtering.
 
 use std::time::Duration;
 
@@ -17,13 +16,11 @@ pub const INPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(1);
 pub const INPUT_ECHO_SUPPRESS_WINDOW: Duration = Duration::from_millis(750);
 /// After an injected resize/redraw, suppress the resulting repaint.
 pub const REDRAW_SUPPRESS_WINDOW: Duration = Duration::from_millis(1500);
-/// Resolve a short status-like fragment as real output after this much PTY
-/// inactivity. Tmux writes a complete status line as one burst, while a real
-/// command may legitimately stop at text such as `12:34`.
+/// Legacy debounce interval retained by the forwarder scheduler. Worker output
+/// no longer creates ambiguous daemon-side status repaint candidates.
 pub const OUTPUT_IDLE_RESOLUTION_DELAY: Duration = Duration::from_millis(250);
 
 const MIN_MEANINGFUL_OUTPUT_CHARS: u8 = 3;
-const MAX_STATUS_CARRY_CHARS: usize = 512;
 
 #[derive(Clone, Copy, Debug)]
 struct ObservedChar {
@@ -44,27 +41,6 @@ enum TerminalState {
     Charset,
 }
 
-#[derive(Debug, Default)]
-enum TextState {
-    #[default]
-    Normal,
-    Candidate(Vec<ObservedChar>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CandidateState {
-    Possible,
-    CompleteNoise,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClockState {
-    Prefix,
-    Complete,
-    Invalid,
-}
-
 /// Per-agent streaming classifier. `observe` must be called for every PTY
 /// chunk, including chunks received while output activity is throttled or
 /// suppressed. `eligible` controls whether visible characters from this chunk
@@ -72,22 +48,16 @@ enum ClockState {
 #[derive(Debug)]
 pub struct OutputClassifier {
     terminal: TerminalState,
-    text: TextState,
     utf8: Vec<(u8, bool)>,
     meaningful_chars: u8,
-    segment_has_visible: bool,
-    segment_has_leading_whitespace: bool,
 }
 
 impl Default for OutputClassifier {
     fn default() -> Self {
         Self {
             terminal: TerminalState::Ground,
-            text: TextState::Normal,
             utf8: Vec::new(),
             meaningful_chars: 0,
-            segment_has_visible: false,
-            segment_has_leading_whitespace: false,
         }
     }
 }
@@ -107,33 +77,20 @@ impl OutputClassifier {
         meaningful
     }
 
-    /// Whether visible text is waiting for enough context to distinguish a
-    /// tmux status repaint from real output.
+    /// Worker output has no daemon-generated status repaint ambiguity.
     pub fn needs_idle_resolution(&self) -> bool {
-        matches!(self.text, TextState::Candidate(_))
+        false
     }
 
-    /// Resolve status-like text after the producer has been idle for the
-    /// bounded debounce interval. Eligibility was captured on receipt, so a
-    /// later suppression event cannot change this decision.
+    /// No delayed content decision remains in the worker-only pipeline.
     pub fn resolve_idle(&mut self) -> bool {
-        let mut meaningful = false;
-        self.finish_text_segment(&mut meaningful);
-        if meaningful {
-            self.discard_meaningful_carry();
-        }
-        meaningful
+        false
     }
 
     /// Do not let sub-threshold text observed during a closed throttle window
     /// turn into a delayed activity event after that window expires.
     pub fn discard_meaningful_carry(&mut self) {
         self.meaningful_chars = 0;
-        if let TextState::Candidate(carry) = &mut self.text {
-            for observed in carry {
-                observed.eligible = false;
-            }
-        }
     }
 
     fn consume_terminal_byte(&mut self, byte: u8, eligible: bool, meaningful: &mut bool) {
@@ -191,13 +148,9 @@ impl OutputClassifier {
             self.utf8.clear();
             match byte {
                 0x1b => {
-                    // A cursor/control sequence is a visible-text boundary.
-                    // Flush anything merely status-like so an incomplete
-                    // fragment cannot swallow subsequent TUI output.
-                    self.finish_text_segment(meaningful);
                     self.terminal = TerminalState::Escape;
                 }
-                b'\r' | b'\n' => self.finish_text_segment(meaningful),
+                b'\r' | b'\n' => {}
                 0x00..=0x08 | 0x0b..=0x1f | 0x7f => {}
                 _ => self.consume_visible_char(
                     ObservedChar {
@@ -259,80 +212,7 @@ impl OutputClassifier {
     }
 
     fn consume_visible_char(&mut self, observed: ObservedChar, meaningful: &mut bool) {
-        match std::mem::take(&mut self.text) {
-            TextState::Normal => {
-                if observed.value.is_whitespace() {
-                    if !self.segment_has_visible {
-                        self.segment_has_leading_whitespace = true;
-                    }
-                    return;
-                }
-                let can_start_status = !self.segment_has_visible
-                    && (observed.value == '['
-                        || observed.value.is_ascii_digit()
-                        || (observed.value == '"' && self.segment_has_leading_whitespace));
-                self.segment_has_visible = true;
-                if can_start_status {
-                    self.text = TextState::Candidate(vec![observed]);
-                    self.evaluate_candidate(meaningful);
-                } else {
-                    self.record_char(observed, meaningful);
-                }
-            }
-            TextState::Candidate(mut carry) => {
-                carry.push(observed);
-                if carry.len() > MAX_STATUS_CARRY_CHARS {
-                    // Ambiguity is bounded, not content: once the cap is hit,
-                    // flush as real output and resume ordinary classification.
-                    self.text = TextState::Normal;
-                    for observed in carry {
-                        self.record_char(observed, meaningful);
-                    }
-                } else {
-                    self.text = TextState::Candidate(carry);
-                    self.evaluate_candidate(meaningful);
-                }
-            }
-        }
-    }
-
-    fn evaluate_candidate(&mut self, meaningful: &mut bool) {
-        let TextState::Candidate(carry) = &self.text else {
-            return;
-        };
-        let text: String = carry.iter().map(|item| item.value).collect();
-        match candidate_state(&text) {
-            CandidateState::Possible => {}
-            CandidateState::CompleteNoise => {
-                self.text = TextState::Normal;
-                self.segment_has_visible = false;
-                self.segment_has_leading_whitespace = false;
-            }
-            CandidateState::Invalid => {
-                let TextState::Candidate(carry) = std::mem::take(&mut self.text) else {
-                    unreachable!()
-                };
-                for observed in carry {
-                    self.record_char(observed, meaningful);
-                }
-            }
-        }
-    }
-
-    fn finish_text_segment(&mut self, meaningful: &mut bool) {
-        match std::mem::take(&mut self.text) {
-            TextState::Candidate(carry) => {
-                // A complete status is discarded as soon as its final digit is
-                // observed. Anything still merely plausible at EOL is real
-                // visible text and must be classified.
-                for observed in carry {
-                    self.record_char(observed, meaningful);
-                }
-            }
-            TextState::Normal => {}
-        }
-        self.segment_has_visible = false;
-        self.segment_has_leading_whitespace = false;
+        self.record_char(observed, meaningful);
     }
 
     fn record_char(&mut self, observed: ObservedChar, meaningful: &mut bool) {
@@ -348,104 +228,7 @@ impl OutputClassifier {
 
     #[cfg(test)]
     fn buffered_len(&self) -> usize {
-        let text = match &self.text {
-            TextState::Candidate(carry) => carry.len(),
-            TextState::Normal => 0,
-        };
-        self.utf8.len() + text + usize::from(self.meaningful_chars)
-    }
-}
-
-fn candidate_state(text: &str) -> CandidateState {
-    const SPAWN_PREFIX: &str = "[spawn-";
-    if SPAWN_PREFIX.starts_with(text) {
-        return CandidateState::Possible;
-    }
-    if text.starts_with(SPAWN_PREFIX) {
-        // A `[spawn-` prefix alone is only ambiguous. Discard it only after a
-        // complete status clock is present; CSI/EOL/carry-cap boundaries flush
-        // incomplete fragments as real content.
-        for (index, value) in text.char_indices() {
-            if value.is_ascii_digit() && clock_state(&text[index..]) == ClockState::Complete {
-                return CandidateState::CompleteNoise;
-            }
-        }
-        return CandidateState::Possible;
-    }
-    if let Some(rest) = text.strip_prefix('"') {
-        let Some(closing_quote) = rest.find('"') else {
-            return CandidateState::Possible;
-        };
-        let after_title = &rest[closing_quote + 1..];
-        if after_title.is_empty() {
-            return CandidateState::Possible;
-        }
-        if !after_title.starts_with(char::is_whitespace) {
-            return CandidateState::Invalid;
-        }
-        let clock = after_title.trim_start_matches(char::is_whitespace);
-        if clock.is_empty() {
-            return CandidateState::Possible;
-        }
-        return match clock_state(clock) {
-            ClockState::Prefix => CandidateState::Possible,
-            ClockState::Complete => CandidateState::CompleteNoise,
-            ClockState::Invalid => CandidateState::Invalid,
-        };
-    }
-    if text.starts_with(|value: char| value.is_ascii_digit()) {
-        return match clock_state(text) {
-            ClockState::Prefix => CandidateState::Possible,
-            ClockState::Complete => CandidateState::CompleteNoise,
-            ClockState::Invalid => CandidateState::Invalid,
-        };
-    }
-    CandidateState::Invalid
-}
-
-fn clock_state(text: &str) -> ClockState {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-
-    macro_rules! expect_byte {
-        ($predicate:expr) => {
-            if index == bytes.len() {
-                return ClockState::Prefix;
-            }
-            if !$predicate(bytes[index]) {
-                return ClockState::Invalid;
-            }
-            index += 1;
-        };
-    }
-
-    for _ in 0..2 {
-        expect_byte!(|byte: u8| byte.is_ascii_digit());
-    }
-    expect_byte!(|byte| byte == b':');
-    for _ in 0..2 {
-        expect_byte!(|byte: u8| byte.is_ascii_digit());
-    }
-    expect_byte!(|byte: u8| byte.is_ascii_whitespace());
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    for _ in 0..2 {
-        expect_byte!(|byte: u8| byte.is_ascii_digit());
-    }
-    expect_byte!(|byte| byte == b'-');
-    for _ in 0..3 {
-        expect_byte!(|byte: u8| byte.is_ascii_alphabetic());
-    }
-    expect_byte!(|byte| byte == b'-');
-    for _ in 0..2 {
-        expect_byte!(|byte: u8| byte.is_ascii_digit());
-    }
-
-    if index == bytes.len() {
-        ClockState::Complete
-    } else {
-        ClockState::Invalid
+        self.utf8.len() + usize::from(self.meaningful_chars)
     }
 }
 
@@ -503,19 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn tmux_noise_carries_across_every_boundary() {
-        assert_every_split(b"[spawn-oem] \"bash\" 12:34 15-Jul-26", false);
-        assert_every_split(b"           \"project\" 04:49 08-May-26", false);
-        assert_every_split(b"12:34 15-Jul-26", false);
-    }
-
-    #[test]
-    fn status_fragments_recover_at_csi_before_real_output_at_every_boundary() {
-        assert_every_split(b"[spawn-oem] \"bash\" 12:34 15-Jul-26\x1b[10;1Habc", true);
-        assert_every_split(b"[spawn-incomplete\x1b[10;1Habc", true);
-    }
-
-    #[test]
     fn quoted_real_output_without_newline_is_not_held_as_status() {
         assert_every_split(b"\"quoted real output\"", true);
     }
@@ -529,65 +299,12 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_control_and_ambiguous_status_carry_is_bounded() {
+    fn unterminated_control_carry_is_bounded() {
         let mut osc = OutputClassifier::default();
         assert!(!osc.observe(b"\x1b]0;", true));
         for _ in 0..10_000 {
             assert!(!osc.observe(b"secret title content", true));
-            assert!(osc.buffered_len() <= MAX_STATUS_CARRY_CHARS);
+            assert!(osc.buffered_len() <= 4);
         }
-
-        let mut fragment = OutputClassifier::default();
-        assert!(!fragment.observe(b"[spawn-", true));
-        let mut fragment_flushed = false;
-        for _ in 0..10_000 {
-            fragment_flushed |= fragment.observe(b"x", true);
-            assert!(fragment.buffered_len() <= MAX_STATUS_CARRY_CHARS);
-        }
-        assert!(
-            fragment_flushed,
-            "overlong spawn-like text was never classified"
-        );
-
-        let mut quote = OutputClassifier::default();
-        // Leading whitespace makes this plausibly the tmux title+clock suffix.
-        assert!(!quote.observe(b" \"", true));
-        let mut quote_flushed = false;
-        for _ in 0..10_000 {
-            quote_flushed |= quote.observe(b"unterminated", true);
-            assert!(quote.buffered_len() <= MAX_STATUS_CARRY_CHARS);
-        }
-        assert!(quote_flushed, "overlong quoted text was never classified");
-    }
-
-    #[test]
-    fn overlong_ambiguous_status_then_cursor_and_real_output_recovers() {
-        let mut classifier = OutputClassifier::default();
-        let mut meaningful = classifier.observe(b" \"", true);
-        for _ in 0..(MAX_STATUS_CARRY_CHARS + 10) {
-            meaningful |= classifier.observe(b"x", true);
-            assert!(classifier.buffered_len() <= MAX_STATUS_CARRY_CHARS);
-        }
-        meaningful |= classifier.observe(b"\x1b[20;1Hreal output", true);
-        assert!(meaningful);
-    }
-
-    #[test]
-    fn idle_resolution_flushes_short_ambiguous_output_but_not_complete_status() {
-        for payload in [b"12:34".as_slice(), b" \"quoted real output\"".as_slice()] {
-            let mut classifier = OutputClassifier::default();
-            assert!(!classifier.observe(payload, true));
-            assert!(classifier.needs_idle_resolution());
-            assert!(
-                classifier.resolve_idle(),
-                "idle payload was lost: {payload:?}"
-            );
-            assert!(!classifier.needs_idle_resolution());
-        }
-
-        let mut classifier = OutputClassifier::default();
-        assert!(!classifier.observe(b"[spawn-oem] \"bash\" 12:34 15-Jul-26", true));
-        assert!(!classifier.needs_idle_resolution());
-        assert!(!classifier.resolve_idle());
     }
 }

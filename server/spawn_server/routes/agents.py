@@ -20,7 +20,6 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 log = logging.getLogger("spawn.routes.agents")
 ACTIVE_OUTPUT_WINDOW = timedelta(seconds=3)
 WAITING_OUTPUT_WINDOW = timedelta(seconds=8)
-TMUX_LABEL_MAX_LENGTH = 48
 
 
 def _utcnow() -> datetime:
@@ -36,39 +35,6 @@ def _last_cwd_dir(cwd: str) -> str:
 
 def _default_agent_name(host_name: str, cwd: str) -> str:
     return f"{host_name} - {_last_cwd_dir(cwd)}"[:128]
-
-
-def _tmux_safe_label(label: str | None) -> str:
-    raw = (label or "agent").strip()
-    out: list[str] = []
-    last_was_sep = False
-    for ch in raw:
-        if ch.isascii() and ch.isalnum():
-            next_ch = ch.lower()
-        elif ch in "._-":
-            next_ch = ch
-        elif ch.isspace() or ch in "/\\:;,":
-            next_ch = "-"
-        else:
-            continue
-
-        if next_ch == "-":
-            if last_was_sep or not out:
-                continue
-            last_was_sep = True
-        else:
-            last_was_sep = False
-        out.append(next_ch)
-        if len(out) >= TMUX_LABEL_MAX_LENGTH:
-            break
-
-    while out and out[-1] in "-._":
-        out.pop()
-    return "".join(out) or "agent"
-
-
-def tmux_session_name(agent: Agent) -> str:
-    return f"spawn-{_tmux_safe_label(agent.name)}--{agent.id}"
 
 
 def _aware(dt: datetime | None) -> datetime | None:
@@ -120,7 +86,6 @@ def _activity(agent: Agent, now: datetime | None = None) -> tuple[str, str]:
 def _to_out(agent: Agent, host_name: str | None = None) -> schemas.AgentOut:
     out = schemas.AgentOut.model_validate(agent)
     out.host_name = host_name
-    out.tmux_session = tmux_session_name(agent)
     out.last_activity_at = _last_activity_at(agent)
     out.activity_state, out.activity_label = _activity(agent)
     return out
@@ -201,7 +166,6 @@ async def _dispatch_agent_launch(
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
                 "skills": skills or [],
-                "tmux_session": tmux_session_name(agent),
                 "cols": cols,
                 "rows": rows,
                 "create_cwd": create_cwd,
@@ -222,8 +186,7 @@ async def patch_agent(
     if a is None or a.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="agent not found")
 
-    name_changed = "name" in body.model_fields_set
-    if name_changed:
+    if "name" in body.model_fields_set:
         next_name = body.name.strip() if body.name is not None else ""
         a.name = next_name or None
     if body.pinned is not None:
@@ -234,21 +197,6 @@ async def patch_agent(
     await session.commit()
     await session.refresh(a)
     host = await session.get(Host, a.host_id)
-    if name_changed:
-        daemon = get_broker().get_daemon_for_agent(a.id) or get_broker().get_daemon_for_host(
-            a.host_id
-        )
-        if daemon is not None:
-            try:
-                await daemon.send_text(
-                    {
-                        "type": "agent.rename",
-                        "agent_id": a.id,
-                        "tmux_session": tmux_session_name(a),
-                    }
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("agent.rename dispatch failed: %s", e)
     return _to_out(a, host.name if host is not None else None)
 
 

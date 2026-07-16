@@ -18,6 +18,10 @@ if [[ -n "$non_executable_scripts" ]]; then
   exit 1
 fi
 
+printf '%s\n' "== worker-only daemon guard =="
+scripts/check-worker-only-daemon.sh --self-test
+scripts/check-worker-only-daemon.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 
@@ -88,7 +92,13 @@ else
 fi
 
 printf '%s\n' "== web lint + browser tests + build =="
-(cd web && bun run lint && bun run test:e2e && bun run build)
+(
+  cd web
+  bun run lint
+  bun run test:unit
+  bun run test:e2e
+  SPAWN_API_PROXY_TARGET="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}" bun run build
+)
 
 printf '%s\n' "== diff hygiene =="
 git diff --check

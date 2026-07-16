@@ -1,12 +1,11 @@
 # sessiond — replacing tmux with purpose-built session workers
 
-**Status: implemented behind a flag.** The worker backend ships in `daemon/`
-(`spawn-worker` binary + `spawnd` supervision) and is enabled per host with
-`SPAWND_SESSION_BACKEND=worker` or per agent with the same key in the agent's
-`env`. **tmux remains the default backend**; nothing in this design runs
-unless opted in. This document and the code are meant to agree — where they
-drift, the code under `daemon/src/sessiond/` and `daemon/src/worker_backend.rs`
-is the source of truth and this file has a bug.
+**Status: implemented as the mandatory backend; cutover review pending.**
+`spawn-worker` plus `spawnd` supervision is the only production session path.
+There is no backend selector, per-agent escape hatch, or fallback. The accepted
+cutover boundary and old-session drain procedure are in
+[TMUX_REMOVAL.md](TMUX_REMOVAL.md). Where this document and code drift,
+`daemon/src/sessiond/` and `daemon/src/worker_backend.rs` are authoritative.
 
 Governing trust document: [TRUST.md](TRUST.md). Every design choice below is
 tied back to it; the short version is that tmux was the last piece of
@@ -37,36 +36,43 @@ everything else.
 
 ## 2. Design principles
 
-1. **The server never sees content** (TRUST.md, the principle). Nothing here
-   touches the control plane: the worker protocol runs on a unix socket in a
-   `0700` directory on the user's own host; live PTY bytes leave the host
-   only over WebRTC DataChannels (DTLS peer-to-peer; TURN relays ciphertext).
-2. **Terminal emulation for rendering lives in the browser.** xterm.js in
-   `web/` is the only emulator whose grid a human ever sees. The worker holds
-   a *headless checkpoint emulator* (`sessiond/emulator.rs`, alacritty's
-   `Term` core plus an owned ANSI serializer) fed from the PTY read path —
-   used exclusively to synthesize segment checkpoints and never in the live
-   byte path. This is a deliberate revision of the original "workers are byte
-   pipes" rule: the byte-pipe design needed a SIGWINCH jiggle to provoke
-   checkpoint repaints from the app, which disturbed the agent, stacked
-   duplicate frames into scrollback on every rotation, and made checkpoint
-   quality depend on each app's WINCH behavior. The emulator's fidelity is a
-   tested contract (`feed → serialize → re-feed ⇒ identical state`), not an
-   assumption.
+1. **The server-never-sees-content model is the target, not this checkpoint's
+   current claim** (TRUST.md). The new worker protocol itself stays on a unix
+   socket in a `0700` directory, and the browser's low-latency copy travels over
+   WebRTC DataChannels. Until P2-AGENT-02, however, spawnd also mirrors every
+   normally connected agent's output over daemon WS `0x01`; the control plane
+   can relay and persist that plaintext even when the browser negotiated v2.
+2. **User-facing terminal rendering lives in the browser.** xterm.js in
+   `web/` owns the grid a human sees. The worker also holds a *headless
+   checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
+   an owned ANSI serializer) fed from the PTY read path. Its current primary
+   and alternate-screen grids are plaintext state resident for the worker's
+   lifetime, bounded by the active terminal geometry; it keeps no deep
+   scrollback. It is used to synthesize encrypted segment checkpoints and
+   never transforms the live forwarded bytes. This is a deliberate revision
+   of the original "workers are byte pipes" rule: the byte-pipe design needed
+   a SIGWINCH jiggle to provoke checkpoint repaints from the app, which
+   disturbed the agent, stacked duplicate frames into scrollback on every
+   rotation, and made checkpoint quality depend on each app's WINCH behavior.
+   The emulator's fidelity is a tested contract (`feed → serialize → re-feed
+   ⇒ identical state`), not an assumption.
 3. **Raw PTY bytes in the live path, end-to-end.** Live output is forwarded
    byte-for-byte, unparsed. Scrollback is the raw output stream plus typed
-   CHECKPOINT/RESIZE records; replay is "feed the same bytes to the same
-   emulator, opening from a serialized screen at a known geometry."
+   CHECKPOINT records containing geometry and serialized screen state; replay
+   is "feed the same bytes to the same emulator, opening from a serialized
+   screen at a known geometry."
 4. **One process per agent.** Crash isolation, per-agent keys, per-agent
    lifecycle, no shared mux server.
-5. **Honest crypto claims.** Encrypted-at-rest scrollback minimizes plaintext
-   *residency*; it does not and cannot mean "encrypted before DRAM" (§6.3).
+5. **Honest crypto claims.** Encrypted-at-rest scrollback protects the segment
+   files. It does not mean "encrypted before DRAM": the PTY path, checkpoint
+   grid, checkpoint serialization, replay, and forwarding all require
+   plaintext in host memory (§6.3).
 
 ## 3. Process model
 
 ```
 spawnd (host supervisor, one per host)
- ├── ws/rtc: control plane WS (signaling only) + WebRTC peer connections
+ ├── ws/rtc: signaling/control + legacy PTY mirror; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
@@ -74,18 +80,19 @@ spawnd (host supervisor, one per host)
  │    ├── agent process (session leader on the PTY slave)
  │    ├── headless checkpoint emulator (grid state only, no scrollback)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
- │    └── unix listener: $WORKER_DIR/<agent-id>.sock
+ │    ├── lifetime flock: $WORKER_DIR/<agent-id>.lock
+ │    ├── supervisor listener: $WORKER_DIR/<agent-id>.sock
+ │    └── lifecycle datagram: $WORKER_DIR/<agent-id>.lifecycle.sock
  └── spawn-worker --agent-id B …
 ```
 
 - **spawnd stays the host supervisor.** It owns the control-plane connection,
-  WebRTC, agent registry, and the decision of which backend an agent uses.
-  It launches workers, adopts orphaned ones, routes input/output, and reaps
-  exits.
+  WebRTC, and agent registry. It launches workers, adopts orphaned ones, routes
+  input/output, and reaps exits.
 - **`spawn-worker`** (`daemon/src/bin/spawn-worker.rs`, logic in
   `daemon/src/sessiond/worker.rs`) is one process per agent. It binds its
   socket, waits for `Start`, spawns the agent argv on a PTY it owns
-  (portable-pty, same crate the tmux backend uses for its attach PTY),
+  with portable-pty,
   and from then on: streams output, accepts input/resize, maintains the
   scrollback log, serves replay.
 - The worker is spawned with `process_group(0)`: its fate is tied to the
@@ -93,9 +100,10 @@ spawnd (host supervisor, one per host)
   upgraded, or being restarted leaves workers and their agents running.
   Deployment note: under systemd, spawnd's unit needs `KillMode=process`
   or workers get killed with the cgroup on `systemctl restart`.
-- Worker runtime cost is small by construction (a tokio runtime pinned to 2
-  threads, two blocking PTY I/O threads, no grid state), so "a fleet of
-  workers" scales with agent count the way `cat` would.
+- Worker runtime cost is scoped per agent: a tokio runtime pinned to 2 threads,
+  two blocking PTY I/O threads, and headless primary/alternate screen grids
+  whose size follows the current terminal geometry. It does not retain a
+  session-length plaintext grid history.
 
 ### Filesystem layout
 
@@ -104,9 +112,21 @@ spawnd (host supervisor, one per host)
 
 ```
 workers/
-  <agent-id>.sock          # unix listener, unlinked by the worker on exit
+  <agent-id>.lock          # lifetime exclusive reservation (0600)
+  <agent-id>.sock          # ordinary supervisor listener
+  <agent-id>.lifecycle.sock # atomic fixed-size TERM/KILL datagrams
   <agent-id>.scrollback/   # 0700; seg-00000001.log … (ciphertext only, 0600)
 ```
+
+The directory is ownership-checked and forced to `0700`; failure is fatal.
+Both sockets and the reservation are ownership-checked and forced to `0600`.
+`spawnd` acquires the per-agent flock before it spawns a worker and exposes the
+locked fd only in that post-fork child. The worker holds it for its lifetime.
+Duplicate creates therefore fail before a second worker is spawned. A lock
+released by a crash authorizes stale-socket recovery; no code unlinks an
+endpoint while the lock says a worker may still own it. Each endpoint cleanup
+also compares the socket's recorded device/inode identity, so a delayed old
+cleanup cannot unlink a replacement at the same pathname.
 
 Preferring `XDG_RUNTIME_DIR` puts sockets and ciphertext on tmpfs where
 available: gone on reboot, never on spinning rust. That is a feature — the
@@ -125,35 +145,57 @@ scrollback key is process-ephemeral anyway (§7).
 
 `len` counts the payload only; `MAX_FRAME_LEN` = 32 MiB (replay dominates and
 is capped far below this by the scrollback budget). Structured payloads are
-JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 1`, checked at
+JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 4`, checked at
 adoption time from `Hello.version` — a version-skewed worker is refused, not
 guessed at.
 
 | Type | Dir | Payload | Purpose |
 |---|---|---|---|
-| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, state, pid?, cols, rows}` | first frame on **every** accepted connection; enables stateless adoption |
+| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows}` | first frame on **every** accepted connection; enables stateless adoption and binds lifecycle to this exact worker instance |
 | `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the agent. Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
-| `T_OUTPUT` 0x04 | w→d | raw bytes | live PTY output |
+| `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
 | `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); forces a log checkpoint at the new geometry |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
-| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = total output bytes logged at capture |
+| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = cumulative lifetime output bytes logged at capture, including output no longer retained |
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
-| `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?}` | signal the agent's process group (TERM/KILL/INT/HUP/QUIT) |
+| `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?: TERM\|KILL}` | compatibility command; current spawnd lifecycle delivery uses the independent endpoint below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
 
-Connection semantics: the worker serves **one live connection**; a newly
-accepted connection displaces the previous one (frames from displaced
-connections are dropped by generation tag). That is exactly the semantics
-adoption needs — a restarted spawnd connects and simply wins. Unknown frame
-types are ignored (forward compatibility); oversized frames are a hard error.
+Connection semantics: the worker serves **one live supervisor connection**.
+It validates the candidate peer's effective UID and sends that candidate its
+`Hello`; only then does it close the old writer, abort and await the old reader,
+and install one new reader. Thus only one task/fd can feed the bounded command
+queue. Generation tags also discard anything the old peer queued immediately
+before cancellation. A restarted spawnd connects and wins without leaving a
+stale reader able to flood the worker. `spawnd` verifies that
+`Hello.agent_id` matches the agent implied by the socket path before trusting
+the instance token. Unknown frame types are rejected. The five-byte header is
+parsed before allocation and a strict per-type cap is applied (`T_INPUT` is at
+most 64 KiB; fixed commands require their exact size); a command never inherits
+the generic 32 MiB replay ceiling.
 
 Lifecycle timers: a worker that never receives `Start` exits after 120 s; a
 worker whose agent exited lingers 60 s to deliver `T_EXIT` to a reconnecting
 spawnd, then cleans up regardless. On exit the worker deletes its scrollback
 (the key dies with it anyway), unlinks its socket, and terminates.
+
+The lifecycle socket is a separate adoptable **Unix datagram** IPC path, not
+another command in the ordinary frame queue. A request is one atomic datagram
+of exactly 17 bytes: the 16-byte random `Hello.instance_id` plus a one-byte
+`TERM`/`KILL` enum. The worker replies with one content-free status-byte
+datagram only after the signal syscall. It rejects stale instance IDs, unknown
+codes, and non-exact datagrams. There are no accepted stream fds or per-request
+tasks for partial peers to retain: one task, one fixed 18-byte receive buffer,
+and the bounded kernel datagram queue are the complete server-side resource
+surface. The client retries idempotent delivery within one absolute two-second
+deadline, so a datagram flood cannot reserve all lifecycle capacity. The worker retains the
+unreaped portable-pty `Child` handle behind the same lock used by its exit
+monitor; while holding that stable ownership it validates the child and calls
+`killpg` only. `ESRCH` means safely gone. There is deliberately no fallback to
+`kill(pid)`, so PID reuse can never redirect a delayed request.
 
 ## 5. Data path — where bytes flow, who can read them
 
@@ -164,26 +206,32 @@ agent process
 spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
   ▼ T_OUTPUT (unix socket, 0700 dir, same host)
-spawnd: per-agent outbox → forwarder ──→ DataChannel direct sinks (per viewer)
-                                    └──→ WS sink (legacy v1 relay only)
+spawnd: bounded per-agent outbox → forwarder ──→ DataChannel direct sinks
+                                            └──→ bounded daemon WS mirror
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
-browser: xterm.js — the only terminal emulator in the system
+browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
-The worker backend reuses the **existing** outbox → forwarder → sinks
-plumbing from the tmux backend (`pty::run_forwarder`, `ForwarderControl`), so
-the Phase-1 DataChannel PTY path (`rtc.rs`) needed zero changes: a
-worker-backed agent's `AgentHandle` exposes the same `write_stdin` / `resize`
-/ `control` surface, dispatching to `WorkerCmd`s over the socket instead of a
-locally-held PTY (`HandleBackend::{Tmux,Worker}` in `daemon/src/pty.rs`).
+`pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
+routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
+`replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
+short-lived `0600` datagram endpoint in the same private directory and sends to
+the separate worker-owned lifecycle socket with the instance ID captured from
+the same `Hello`; one absolute deadline covers validation, fixed-size delivery,
+retries, and acknowledgement. It therefore cannot sit behind queued or
+partially written PTY input. Registry delivery also revalidates the immutable
+generation+lifecycle pair while holding the generation-transition lock.
+Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
+does not hold a local agent PTY, a child process handle, or a backend
+discriminator.
 
-Control-plane exposure of this path: **nothing**. The unix socket never
-crosses a machine boundary. Live bytes cross machines only inside DTLS.
-Snapshot/replay responses currently ride the browser WS as `agent.snapshot`
-JSON (base64) — the same Phase-1 status quo as the tmux backend, and the
-same Phase-2 work item (move history/snapshot onto a DataChannel stream)
-regardless of backend. The worker design makes that move trivial: the replay
-payload is already raw bytes with a stream-position watermark.
+The unix-socket hop adds no control-plane exposure, but the complete live path
+still does: until P2-AGENT-02, spawnd sends daemon WS `0x01` output for the
+legacy relay/transcript path for v1 and v2 browser sessions alike. Legacy
+snapshot responses can also ride browser WS as `agent.snapshot` JSON (base64).
+P2-AGENT-01 adds `spawn.ctl` replay with a stream-position watermark; it does
+not cut either legacy content leg. P2-AGENT-02 must remove them before Phase 2
+is true.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -206,21 +254,43 @@ u32 LE ciphertext_len | u8 kind | u64 LE seq | ciphertext (AEAD, 16-byte tag)
   spliced between kinds without detection. Any authentication or sequence
   failure **fails the whole replay closed** (and zeroizes the partial
   plaintext) rather than returning a best-effort screen.
-- **Kinds**: `OUTPUT` (raw PTY bytes) and `CHECKPOINT` (empty marker record
-  opening every segment; §8.1).
+- **Kinds**: `OUTPUT` (raw PTY bytes) and `CHECKPOINT` (geometry plus an
+  emulator-serialized ANSI repaint opening every segment; §8.1). The
+  checkpoint payload is encrypted like output and its disk/replay footprint is
+  charged to the same total resource budget.
 
 ### 6.2 Encrypt-on-read, bounded growth
 
-Output is encrypted **the moment it leaves the PTY read path** — the worker's
-main loop logs the chunk first, then forwards it live, then zeroizes the
-buffer. Plaintext is never written to disk (unit-tested by grepping segment
-files for a marker; `plaintext_never_hits_disk`).
+Each output chunk is fed into the checkpoint emulator and then encrypted before
+any scrollback write. The worker subsequently forwards the same plaintext
+chunk live and wipes its owned buffer. This is an encrypt-before-disk property,
+not encryption at the PTY/DRAM boundary. Plaintext is never written to segment
+files (unit-tested by grepping them for a marker;
+`plaintext_never_hits_disk`).
 
-Growth is bounded by two knobs (`--segment-bytes`, default 256 KiB plaintext
-per segment; `--max-log-bytes`, default 8 MiB total): when the budget is
-exceeded, whole oldest segments are unlinked — never partial records, never
-the newest segment. Replay cost is therefore O(budget), not O(session
-lifetime).
+Growth is controlled by two knobs. `--segment-bytes` defaults to 256 KiB of
+additional charged record bytes beyond the segment checkpoint before rotation
+is due. `--max-log-bytes` defaults to an 8 MiB conservative total scrollback
+resource budget. Operators/tests may lower that value; values above the
+compiled 8 MiB upper bound are rejected. The charge includes exact retained
+ciphertext and record framing, twice each segment's replay representation (one
+returned buffer plus one decryption/framing scratch allowance), and the log's
+retained `Vec`/path bookkeeping, actual allocated file/directory blocks with
+safe floors, and conservative inode/directory-entry overhead. A hard 128-file
+cap plus ring-reused filenames bounds live inodes and directory growth under
+one-byte-output/resize adversaries. Before admitting a record the log removes
+whole oldest segments; it never returns a partial segment. A checkpoint that
+fails conservative preflight is rejected before its file is created. If an
+append or checkpoint cannot preserve those invariants, the worker destroys and
+disables its replay log but continues live output; subsequent replay is
+unavailable rather than partial or over-budget.
+
+The 8 MiB value is therefore neither "8 MiB of plaintext output" nor an exact
+measurement of process RSS. It is a hard ceiling on this deliberately
+conservative charge model, including checkpoint/grid serialization in replay
+form and bounded transient replay plaintext. The live emulator grid is a
+separate, geometry-bounded resident allocation (§6.3). The `spawn.ctl` layer
+also retains its independent 12 MiB response rejection ceiling.
 
 ### 6.3 Memory hygiene — what is and isn't guaranteed
 
@@ -232,26 +302,43 @@ lifetime).
   **zeroized on drop**. mlock failure (e.g. `RLIMIT_MEMLOCK=0` containers) is
   logged, not fatal: the at-rest encryption stands; only the key's
   swap-residency guarantee weakens.
-- Plaintext PTY buffers are zeroized after each hop: the worker's read chunks
-  after log+forward, the PTY reader/writer thread scratch buffers, stdin
-  chunks after write, replay buffers (worker side) after send.
+- Owned plaintext is explicitly wiped on drop across the implemented handoff:
+  worker PTY read chunks and reader/writer scratch, queued input and worker
+  frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
+  replay result owns a self-wiping payload even while parked in a oneshot; its
+  source bytes wipe on receiver cancellation and normal consumption. Legacy
+  WS input owns and wipes the complete inbound binary frame after copying its
+  payload into the self-wiping worker-input wrapper. `OutputChunk`, WS/control
+  output, and direct-viewer payloads likewise wipe on drop; their queues are
+  bounded.
 
 **Not covered — stated plainly, per TRUST.md's "honest inventory" ethos:**
 - Plaintext **must** transit worker memory: kernel PTY buffers → userspace
   read buffer → AEAD input. There is no such thing as "encrypted before
   DRAM" on this path, and we do not claim it.
+- The headless emulator retains semantic plaintext for the current primary and
+  alternate screen, cursor, modes, and auxiliary terminal state for the
+  worker's lifetime. That state scales with terminal geometry and has no deep
+  history, but it is not transient. A serialized checkpoint and decrypted
+  replay are additional transient plaintext buffers. The scrollback admission
+  charge accounts conservatively for retained disk records, the returned
+  replay, and decryption/framing scratch within its 8 MiB default; the
+  control-channel response ceiling is an independent outer bound.
 - Kernel-side copies (PTY line discipline, unix socket buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
-- spawnd itself handles plaintext in flight (outbox → DataChannel). Those
-  buffers are not currently zeroized; they are transient. Phase-2 hardening
-  can extend `wipe` discipline into the forwarder if it proves worth the
-  churn.
-- The guarantee is **minimal plaintext residency on the user's own host** —
-  the same host where the agent itself runs in plaintext by definition. The
-  threat this addresses is *disk* residue (backups, stolen disks, forensic
-  carving, swap, core dumps), not a live root-level attacker on the host,
-  which TRUST.md places out of scope (a compromised host sees everything
-  regardless).
+- spawnd still handles plaintext in flight (worker socket → bounded outbox →
+  WS mirror/DataChannel). The outbox, worker-command channel, direct-viewer
+  queues, control responses, and WS session sink are bounded; a missing/full
+  legacy mirror is detached and discarded while direct viewers continue, and
+  reconnect catch-up comes from worker replay. Owned queued payloads wipe on
+  drop. Copies inside kernel unix/WebRTC/DTLS stacks are not owned or wiped by
+  this code, so this is not a claim of complete system-wide zeroization.
+- The guarantee here is **ciphertext-only scrollback segment files on the
+  user's own host**, with best-effort wiping of transient buffers — not the
+  absence of plaintext host memory. The threat this addresses is *disk*
+  residue (backups, stolen disks, forensic carving, swap, core dumps), not a
+  live root-level attacker on the host, which TRUST.md places out of scope (a
+  compromised host sees everything regardless).
 
 ## 7. Key management for scrollback-at-rest
 
@@ -288,18 +375,19 @@ geometry** (replacing the active segment in place when it holds no output
 yet, so resize storms rewrite one small file instead of growing the log);
 every segment is therefore single-geometry and self-contained.
 
-Replay returns the newest run of whole segments fitting the caller's budget
-as a **self-describing stream of geometry-tagged chunks**: each included
-segment contributes `CSI 8 ; rows ; cols t` + its checkpoint repaint + its
+Replay selects the newest run of whole segments whose complete replay
+representation fits the caller's `max_bytes`. If the newest complete segment
+does not fit, replay fails instead of returning a partial segment. The result
+is a **self-describing stream of geometry-tagged chunks**: each included
+segment contributes `CSI 8 ; rows ; cols t`, its checkpoint repaint, and its
 output. Checkpoint repaints are idempotent (leading `?1049l`, full-row
-painting, no ED), so mid-stream chunks converge rather than duplicate, and
-the final chunk alone reconstructs the current screen at the current
-geometry. The browser exploits both properties (`parseExactReplay` in
-`Terminal.tsx`): the **live terminal is seeded from the final chunk with
-zero resize calls** — it is fit-sized and must never be geometry-walked —
-while the display-only scrollback overlay renders every chunk at its own
-geometry via sequenced `term.resize()` (xterm.js parses but does not
-implement CSI 8 t itself).
+painting, no ED), so mid-stream chunks converge rather than duplicate, and the
+final chunk alone reconstructs the current screen at the current geometry. The
+browser exploits both properties (`parseExactReplay` in `Terminal.tsx`): the
+**live terminal is seeded from the final chunk with zero resize calls** — it is
+fit-sized and must never be geometry-walked — while the display-only scrollback
+overlay renders every chunk at its own geometry via sequenced `term.resize()`
+(xterm.js parses but does not implement CSI 8 t itself).
 
 The original design used checkpoint *markers* plus a SIGWINCH jiggle to
 provoke repaints from the app. That was retired: it duplicated full frames in
@@ -332,20 +420,24 @@ provoke.
 ### 8.3 Replay and viewer seeding
 
 `T_REPLAY_REQ(max_bytes)` → `T_REPLAY(watermark ‖ bytes)`. The watermark is
-the cumulative count of output bytes logged at capture time. spawnd's
+the cumulative lifetime count of output bytes logged at capture time; it is a
+monotonic source coordinate, not the size of the retained replay tail. spawnd's
 snapshot handler (`handle_agent_snapshot`, worker branch) samples the
 requesting viewer's DataChannel byte offset *before* issuing the replay;
 because the worker logs before forwarding, everything counted at that offset
 is guaranteed to be covered by the replay, and the browser can drop already
-seen live bytes deterministically (the existing `dc_offset` mechanism the
-tmux backend introduced for snapshot ordering — reused unchanged).
+seen live bytes deterministically using `dc_offset`.
+
+`spawn.ctl` history/snapshot exposes this as styled terminal replay only:
+clients send `plain:false`. A `plain:true` request fails closed with
+`plain_replay_unsupported`; ANSI checkpoint/output bytes are never mislabeled
+as plain text.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
 `daemon/tests/worker_e2e.rs` against a real `/bin/sh` on a real PTY, and
 through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
-`worker_backend::tests::worker_launch_adopt_and_shutdown_roundtrip`. No tmux
-is involved in any of these tests.
+`worker_backend::tests::worker_launch_adopt_and_priority_shutdown_roundtrip`.
 
 ## 9. Resize, flow control, multi-viewer
 
@@ -359,65 +451,62 @@ content), so the worker correctly stays a single-size PTY and needs no
 multi-size machinery.
 
 **Multi-viewer.** Fan-out happens in spawnd's forwarder via per-viewer
-DataChannel direct sinks, same as the tmux backend: every viewer gets the
-same raw byte stream, input is accepted from whichever peer the client-side
-control model lets type. One improvement falls out for free: there is no
-copy-mode to cancel, so the per-keystroke copy-mode check is skipped entirely
-for worker-backed agents (`rtc.rs` guards on `registry.is_worker`).
-Client-side scrollback/selection in xterm.js replaces tmux copy-mode.
+DataChannel direct sinks: every viewer gets the same raw byte stream, and input
+is accepted from whichever peer the control model lets type. There is no
+daemon-side copy-mode or per-keystroke subprocess check. Client-side
+scrollback/selection lives in xterm.js.
 
-**Flow control / backpressure — current, honest status.** The worker→spawnd
-socket write applies natural backpressure to the worker's forwarding loop
-(logging is unaffected), but the spawnd-side outbox and DataChannel sink
-channels are unbounded, exactly as they are for the tmux backend today: a
-slow viewer buffers in daemon memory, bounded in practice by session volume.
-The scrollback budget bounds *replay*, not live buffering. Planned follow-up
-(applies to both backends, so it is deliberately not gated on this
-migration): bound the per-viewer sink, drop-oldest on overflow, and re-seed
-the lagging viewer with replay-from-watermark — the worker protocol already
-carries everything that recovery needs.
+**Flow control / backpressure — current, honest status.** The PTY reader's
+handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
+each. The worker logs and forwards each chunk it consumes. If the supervisor
+socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
+PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
+queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 ordinary
+worker commands; each input command is capped at 64 KiB before spawnd copies
+the caller's slice. The worker's separate lifecycle datagram endpoint accepts
+only one atomic fixed 17-byte request into one fixed buffer and is independent
+of the ordinary socket task, so TERM/KILL cannot be starved by the ordinary
+queue, partial stream peers, or a stalled worker socket. The forwarder serves
+bounded direct-viewer sinks first, then offers output without
+blocking to the bounded legacy-WS mirror. A full or absent legacy mirror is
+detached instead of accumulating plaintext, while a lagging direct viewer is
+disconnected. Either transport reconnects and re-seeds from the worker replay
+watermark. The replay log uses the conservative total resource budget
+described in §6.2, including checkpoint and framing charges.
 
 ## 10. Crash isolation, restart, upgrades
 
 | Event | Outcome |
 |---|---|
-| **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, unlinks its socket, exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit; spawnd additionally reaps via `socket_live` probes. |
-| **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`; the stale socket is cleaned up on next probe. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, and adopts from the `Hello` (state, pid, geometry) — no persistent supervisor state, no fd handoff. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
+| **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
+| **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
+| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, verifies `Hello.agent_id`, and adopts from the `Hello` (instance identity, state, pid, geometry), then derives the independent lifecycle socket — no persistent supervisor state. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; a mismatched worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak. Old workers drain away as their agents exit. |
 | **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
-| **Host reboot** | everything dies, as with tmux. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
+| **Host reboot** | workers and agents die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
 
-Why no fd/socket handoff: the classic reason to pass fds (the supervisor owns
-the PTY) doesn't apply — the **worker** owns the PTY and its listener, and
-survives on its own. Adoption-by-reconnect is strictly simpler and has no
-handoff window to get wrong.
+The only launch-time fd inheritance is the already-locked reservation, exposed
+to that one post-fork child and immediately restored to close-on-exec inside
+the worker. PTY and socket fds are never handed off: the **worker** owns them
+and survives on its own. Adoption-by-reconnect has no listener handoff window.
 
-## 11. Migration from tmux
+## 11. Worker-only cutover
 
-**Coexistence (now).** Backend is chosen per agent at `agent.create`:
-`SPAWND_SESSION_BACKEND` in the create env overrides the daemon-global env
-var, default tmux (`worker_backend::backend_for_create`). Both backends
-coexist on one host; restart/kill/rename/snapshot/redraw dispatch on
-`registry.is_worker`. Rename becomes a label update (nothing shells out);
-restart drives an escalating TERM→KILL shutdown through the worker before
-respawning. Startup discovery adopts workers first, then scans tmux sessions.
+P2-TMUX-01 is the hard cutover, not a default flip. The daemon module,
+subprocess calls, selector and escape hatch, creation/attach/discovery,
+capture/repaint/copy-mode behavior, session label, and exact replay buffer are
+removed. Agent restart performs escalating TERM→KILL through the worker before
+creating a replacement; startup discovery scans worker sockets only.
 
-**Cutover criteria** (flip the default to `worker`):
-1. `tools/term-conformance` green on the browser emulator (§12) — the worker
-   path has no server-side emulator to paper over client bugs.
-2. Worker backend soaked on real agents (claude/codex) on the dev instance ≥
-   a week: reattach-with-history, spawnd restart adoption, multi-viewer,
-   mobile.
-3. Backpressure follow-up from §9 landed or consciously deferred with data.
-4. Prod spawnd unit runs `KillMode=process` (verified, not assumed).
-5. An explicit escape hatch: per-agent `SPAWND_SESSION_BACKEND=tmux`
-   continues to work for one release cycle after the default flips.
+A live pre-cutover session cannot be adopted or transformed into a worker
+without unsafe content/state handling. Operators close ingress and drain it
+before installing/restarting the worker-only build. If one remains, the daemon
+fails it unavailable. This code change itself performs no deployment, signal,
+or purge. Rollback cannot restore the retired content path; remediation rolls
+forward with a corrected worker-only build. See [TMUX_REMOVAL.md](TMUX_REMOVAL.md).
 
-**Endgame.** tmux backend and the `tmux` module become dead code; delete
-them, drop the `TMUX_TMPDIR` machinery, and with them the last subprocess
-that ever touched terminal plaintext. (`agent.create`'s `tmux_session` field
-survives as the display label it already is for workers.)
+The server/API/web `tmux_session` field and `agent.rename` frame are removed in
+the same checkpoint. They are absent from daemon runtime structs as well.
 
 ## 12. Prior art
 
@@ -425,24 +514,26 @@ survives as the display label it already is for workers.)
 |---|---|---|---|---|
 | Language | Rust | Rust | Rust | Rust |
 | Model | one daemon, N named sessions | one mux server, own client protocol | one server per session group, plugin runtime | **one process per agent** |
-| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core); live path is raw bytes, rendering is xterm.js only** |
+| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core, plaintext current-screen grids); live path is raw bytes, user-facing rendering is xterm.js** |
 | Reattach story | replays restore buffer | grid sync | grid sync | encrypted geometry-tagged byte replay opening with an emulator-serialized checkpoint (the iTerm2 restoration model, encrypted at rest) |
-| Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key, zeroized buffers** |
+| Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key; transient owned replay buffers wiped, plaintext current grids disclosed above** |
 | Crash blast radius | all sessions in daemon | all clients of the mux | session group | one agent |
 | Remote transport | ssh | ssh/TLS, own protocol | ssh | WebRTC DataChannel (already existed; unchanged) |
 
 shpool is the closest relative — it also concluded that "session persistence
 without a multiplexer" is the right shape, and its restore-buffer replay is
 the plaintext cousin of our checkpoint replay. We diverge where the operator
-model demands it: per-agent process isolation, encryption at rest, and
-refusing to host any grid state outside the browser. wezterm/zellij solve a
-different problem (rich multiplexing UX) at the cost of being the second
-emulator in the pipe — exactly what §1 is eliminating.
+model demands it: per-agent process isolation, encryption at rest, and keeping
+the worker's plaintext grid state to the current checkpoint screens rather
+than a user-facing or deep-history multiplexer. wezterm/zellij solve a
+different problem (rich multiplexing UX) with a server-side renderer in the
+live path — exactly what §1 is eliminating.
 
 ## 13. Testability
 
-The browser is the only terminal emulator (§2), so terminal-correctness
-testing splits cleanly into two independently-testable layers:
+The browser is the only user-facing terminal renderer, while the worker has a
+headless checkpoint emulator (§2). Terminal-correctness testing therefore
+splits into two independently-testable layers:
 
 **Byte-transport correctness (this design).** The worker/backend guarantee is
 byte-exactness, tested without any emulator: wire framing round-trips and
@@ -451,8 +542,8 @@ disk, tamper fails closed, budget enforcement, replay coherence
 (`sessiond::scrollback` tests), memory hygiene (`sessiond::secret` tests),
 and end-to-end PTY-in/bytes-out/reattach-replay through a real shell
 (`daemon/tests/worker_e2e.rs`) and through the full spawnd plumbing
-(`worker_backend` roundtrip test). `cargo test` in `daemon/` runs all of it;
-no tmux, no network, no browser.
+(`worker_backend` roundtrip test). `cargo test` in `daemon/` runs all of it
+without network or browser dependencies.
 
 **Emulation correctness (harness).** `tools/term-conformance/` owns this:
 a raw-byte corpus is fed to the system-under-test emulator (`@xterm/headless`
@@ -486,18 +577,20 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 | TRUST.md phase | sessiond contribution |
 |---|---|
-| **Phase 1** (shipped) — DataChannel-only PTY | worker backend plugs into the same forwarder/direct-sink pipeline; no new server exposure. The unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server) from the path |
+| **Phase 1** (shipped) — DataChannel-only PTY | worker backend adds no exposure beyond the existing legacy mirror: its unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server). Normally connected output still mirrors through daemon WS until P2-AGENT-02 removes that leg |
 | **Phase 2** — daemon-owned data, server stores deleted | this is the enabling work: scrollback/history/snapshot become daemon-owned artifacts (encrypted, at that) with a watermarked raw-byte replay primitive ready to move from WS-JSON onto a DataChannel history stream; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc` on the way to E2E `agent.create` |
 | **Phase 3** — signed signaling | orthogonal to sessiond (signaling-layer); nothing here assumes server-trusted introductions |
 | **Phase 4 / Later** — open source; encrypted transcript backup | worker is self-contained and auditable (`daemon/src/sessiond/` has no control-plane deps); device-key-sealed backup slots in as a separate artifact per §7 |
 
 ## 15. Known gaps / future work
 
-- **Backpressure** (§9): bounded per-viewer sinks + replay-based catch-up.
-- **History over DataChannel** (Phase 2): move `agent.snapshot`'s base64-WS
-  leg onto a DataChannel stream; the replay watermark already supports it.
-- **spawnd-side plaintext hygiene**: extend zeroize discipline into the
-  outbox/forwarder if profiling shows the buffers are long-lived.
+- **Backpressure follow-up** (§9): Phase 2 uses bounded per-viewer sinks,
+  disconnect-on-stall and replay-based catch-up; future work may add adaptive
+  queue sizing and transport telemetry.
+- **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
+  worker-backed connect history and snapshots using request-bound chunks
+  and explicit PTY byte anchors; independent review and the later removal of
+  the legacy base64-WS leg remain before the cut is complete.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed
   streams via the harness.
 - **Worker resource limits**: per-worker RLIMIT/cgroup knobs if agents start

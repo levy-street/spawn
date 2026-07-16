@@ -156,7 +156,6 @@ mod tests {
             "cwd": "/tmp",
             "argv": ["claude"],
             "env": {"FOO": "bar"},
-            "tmux_session": "spawn-abc",
             "cols": 120,
             "rows": 32
         }"#;
@@ -179,7 +178,22 @@ mod tests {
             r#"{"type":"agent.kill","agent_id":"00000000-0000-0000-0000-000000000002","signal":"TERM"}"#,
         )
         .unwrap();
-        assert!(matches!(kill, Inbound::AgentKill { .. }));
+        assert!(matches!(
+            kill,
+            Inbound::AgentKill {
+                signal: Some(spawnd::sessiond::wire::LifecycleSignal::Term),
+                ..
+            }
+        ));
+
+        let private_unknown = "private-signal-content";
+        let error = serde_json::from_str::<Inbound>(&format!(
+            r#"{{"type":"agent.kill","agent_id":"00000000-0000-0000-0000-000000000002","signal":"{private_unknown}"}}"#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unsupported lifecycle signal"));
+        assert!(!error.contains(private_unknown));
 
         let resize: Inbound = serde_json::from_str(
             r#"{"type":"agent.resize","agent_id":"00000000-0000-0000-0000-000000000003","cols":80,"rows":24}"#,
@@ -192,51 +206,45 @@ mod tests {
             }
             _ => panic!("expected AgentResize"),
         }
-
-        let rename: Inbound = serde_json::from_str(
-            r#"{"type":"agent.rename","agent_id":"00000000-0000-0000-0000-000000000003","tmux_session":"spawn-palette--00000000-0000-0000-0000-000000000003"}"#,
-        )
-        .unwrap();
-        match rename {
-            Inbound::AgentRename { tmux_session, .. } => {
-                assert_eq!(
-                    tmux_session,
-                    "spawn-palette--00000000-0000-0000-0000-000000000003"
-                );
-            }
-            _ => panic!("expected AgentRename"),
-        }
     }
 
     #[test]
-    fn rtc_signaling_parses_legacy_agent_and_bound_host_shapes() {
+    fn rtc_signaling_parses_generation_bound_agent_and_strict_host_shapes() {
         use crate::proto::Inbound;
 
-        let legacy: Inbound = serde_json::from_str(
-            r#"{"type":"rtc.offer","session_id":"legacy","agent_id":"00000000-0000-4000-8000-000000000001","sdp":"v=0"}"#,
+        let agent: Inbound = serde_json::from_str(
+            r#"{"type":"rtc.offer","session_id":"agent","agent_id":"00000000-0000-4000-8000-000000000001","binding_nonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_generation":7,"sdp":"v=0"}"#,
         )
         .unwrap();
-        match legacy {
+        match agent {
             Inbound::RtcOffer {
                 agent_id,
+                binding_nonce,
+                binding_generation,
                 scope_type,
                 protocol,
                 ..
             } => {
                 assert!(agent_id.is_some());
+                assert_eq!(
+                    binding_nonce.as_deref(),
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+                assert_eq!(binding_generation, Some(7));
                 assert!(scope_type.is_none());
                 assert!(protocol.is_none());
             }
-            _ => panic!("expected legacy RTC offer"),
+            _ => panic!("expected agent RTC offer"),
         }
 
         let host: Inbound = serde_json::from_str(
-            r#"{"type":"rtc.offer","session_id":"host","scope_type":"host","scope_id":"00000000-0000-4000-8000-000000000002","protocol":"spawn.host.ctl","protocol_version":1,"sdp":"v=0","ice_transport_policy":"relay"}"#,
+            r#"{"type":"rtc.offer","session_id":"host","binding_nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","scope_type":"host","scope_id":"00000000-0000-4000-8000-000000000002","protocol":"spawn.host.ctl","protocol_version":1,"sdp":"v=0","ice_transport_policy":"relay"}"#,
         )
         .unwrap();
         match host {
             Inbound::RtcOffer {
                 agent_id,
+                binding_nonce,
                 scope_type,
                 scope_id,
                 protocol,
@@ -245,6 +253,10 @@ mod tests {
                 ..
             } => {
                 assert!(agent_id.is_none());
+                assert_eq!(
+                    binding_nonce.as_deref(),
+                    Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                );
                 assert_eq!(scope_type.as_deref(), Some("host"));
                 assert!(scope_id.is_some());
                 assert_eq!(protocol.as_deref(), Some("spawn.host.ctl"));

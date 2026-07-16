@@ -81,6 +81,8 @@ pub enum Outbound {
     RtcAnswer {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
@@ -98,6 +100,8 @@ pub enum Outbound {
     RtcCandidate {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
@@ -114,6 +118,8 @@ pub enum Outbound {
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,12 +178,7 @@ pub enum Inbound {
     AgentKill {
         agent_id: Uuid,
         #[serde(default)]
-        signal: Option<String>,
-    },
-    #[serde(rename = "agent.rename")]
-    AgentRename {
-        agent_id: Uuid,
-        tmux_session: String,
+        signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
     },
     #[serde(rename = "agent.resize")]
     AgentResize {
@@ -228,7 +229,11 @@ pub enum Inbound {
     RtcOffer {
         session_id: String,
         #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
         binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
         #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
@@ -249,7 +254,11 @@ pub enum Inbound {
     RtcCandidate {
         session_id: String,
         #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
         binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
         #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
@@ -266,7 +275,11 @@ pub enum Inbound {
     RtcClose {
         session_id: String,
         #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
         binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
         #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
@@ -305,7 +318,6 @@ pub struct AgentCreate {
     pub install: Option<String>,
     #[serde(default)]
     pub skills: Vec<AgentSkillConfig>,
-    pub tmux_session: String,
     pub cols: u16,
     pub rows: u16,
     #[serde(default)]

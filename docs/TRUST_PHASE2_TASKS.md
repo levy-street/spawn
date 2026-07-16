@@ -86,7 +86,8 @@ protocol is already reviewed and stable.
 
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
-| P2-AGENT-01 | ACTIVE | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/scroll/redraw/display ownership to it using the existing bounded tmux/worker replay sources | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; tmux capture respects the 10,000-line request cap and configured history limit; worker replay rotates whole segments at its 8 MiB default and becomes unavailable after worker exit; both backends replay after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; reviewer notes that `0x01` still remains |
+| P2-TMUX-01 | DONE | Worker-only cutover: remove daemon tmux execution/module/backend selector/session-name protocol state and all tmux create/attach/adopt/discover/capture/replay/resize/scroll/copy/repaint paths; remove tmux-only replay/status filtering plus server/web `tmux_session` and `agent.rename`; add fail-closed guard and cutover ADR (integrated through `1f66d2d`) | P2-AGENT-01 implementation, QUAL-01 | Strict daemon/server/web gates pass; source inventory proves no production tmux execution, escape hatch, API/schema/UI field, or rename frame; real worker launch/adopt/replay/resize/input/shutdown remains covered; operator drain/restart and old-session unavailability are explicit; mergeability review passes |
+| P2-AGENT-01 | DONE | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/display ownership to the mandatory worker replay source (integrated through `1f66d2d`) | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; worker replay retains whole segments under its 8 MiB conservative total charge (ciphertext/framing + twice replay + bookkeeping), becomes unavailable after worker exit, and replays after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; reviewer notes that `0x01` still remains |
 | P2-AGENT-02 | PLANNED | Retire `spawn.v1`, daemon `0x01` output and `0x02` input, server transcript writes/history forwarding/pubsub relay | P2-AGENT-01 | Mandatory DataChannel behavior and old-client failure mode tested; server cannot receive live PTY bytes; offline-history regression documented |
 | P2-HOST-01 | DONE | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent (`88e4b67` plus reviewed hardening through `a808fb3`) | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
 | P2-HOST-02 | ACTIVE | Implementation complete on its isolated review branch: move host list/stat/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to the host channel; browser mediates bounded cross-host streaming. Independent review and merge are still pending. | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; streaming is bounded and hash/length checked; two-host authorization tests pass |
@@ -97,7 +98,7 @@ protocol is already reviewed and stable.
 | P2-DATA-01 | PLANNED | Approve endpoint-local versus opaque client-encrypted durable store for launch manifests, preset operational values/tool targets, and skill bodies | P2-HOST-01 | Threat model covers keys/recovery, multi-device, offline restart, rollback, migration, and ciphertext identifier/size/version/access leakage; server never has decryption keys |
 | P2-DATA-02 | BLOCKED | Move `cwd`, `argv`, `env`, preset default-command/install/environment values, tool targets, and skill bodies over `spawn.host.ctl`; store daemon restart manifest locally; stop cwd-derived names | P2-DATA-01 | Create/restart/preset/skill/tool flows work after plaintext reads are disabled; neutral default name used; legacy derived names scrubbed/reclassified; only disclosed metadata or opaque ciphertext remains |
 | P2-ERROR-01 | BLOCKED | Replace free-form daemon error/status/exit details with stable server-visible codes and E2E agent/host/pre-launch detail; remove server forwarding/logging | P2-AGENT-01, P2-HOST-01, P2-DATA-02 | Injected cwd/file/tool errors reach browser E2E, while server frames/logs/telemetry contain only codes and disclosed lifecycle metadata |
-| P2-PURGE-01 | BLOCKED | Inventory, migrate, close/drain ingress, restart processes, and purge transcripts, DB/derived names, Redis, memory/queues/swap/core, logs/observability, WAL/AOF, backups, replicas, raw blocks, and snapshots | P2-AGENT-02, P2-HOST-02, P2-HOST-03B, P2-TERM-01, P2-TERM-02, P2-DATA-02, P2-ERROR-01 | Two-operator evidence follows the eight-step runbook; process/observability and oldest-backup checks find no recoverable plaintext; no content rollback path remains |
+| P2-PURGE-01 | BLOCKED | Inventory, migrate, close/drain ingress, restart processes, and purge transcripts, DB/derived names, Redis, memory/queues/swap/core, logs/observability, WAL/AOF, backups, replicas, raw blocks, and snapshots | P2-TMUX-01, P2-AGENT-02, P2-HOST-02, P2-HOST-03B, P2-TERM-01, P2-TERM-02, P2-DATA-02, P2-ERROR-01 | Two-operator evidence follows the eight-step runbook; process/observability and oldest-backup checks find no recoverable plaintext; no content rollback path remains |
 | P2-AUDIT-01 | BLOCKED | Final adversarial server audit and Phase 2 claim gate | P2-PURGE-01 | Code/route/frame/schema inventory; server memory/queue/swap/core/disk/DB/Redis/log/observability scans; backup evidence; TURN-only tests; ciphertext and retained-metadata disclosure all pass |
 
 `P2-HOST-03B`, `P2-DATA-02`, `P2-ERROR-01`, `P2-PURGE-01`, and `P2-AUDIT-01`
@@ -118,6 +119,7 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 
 | Review finding | Scheduled resolution |
 |----------------|----------------------|
+| Dual session backends kept a plaintext multiplexer path, runtime escape hatch, content-derived display field, and non-migratable replay semantics | P2-TMUX-01, P2-PURGE-01 |
 | Phase 2 omitted host list/read/write/transfer and had no agent-independent transport | P2-HOST-01, P2-HOST-02 |
 | Tool installer output decision was unresolved and unattended errors persisted content | P2-HOST-03A, P2-HOST-03B |
 | REST terminal input/snapshot remained server content surfaces | P2-TERM-02 |
@@ -150,8 +152,8 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 
 1. **Wave 0 (complete):** DOC-01, GATE-01–05, and QUAL-01–05 passed
    independent review and are integrated on `master` through `640a2e0`.
-2. **Wave 1 (partially complete):** P2-HOST-01 is reviewed and integrated
-   through `a808fb3`; P2-AGENT-01 remains on its independent track.
+2. **Wave 1 (complete):** P2-HOST-01, P2-AGENT-01, and the P2-TMUX-01
+   worker-only cutover are reviewed and integrated through `1f66d2d`.
 3. **Wave 2 (active):** P2-HOST-02 has an implementation ready for independent
    review. P2-AGENT-02/P2-TERM-01/P2-TERM-02 continue on the agent protocol while
    P2-HOST-03A implements separate host-channel operations
