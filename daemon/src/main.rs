@@ -17,6 +17,7 @@ mod cli;
 mod config;
 mod creds;
 mod host_control;
+mod host_direct;
 mod host_files;
 mod login;
 mod proto;

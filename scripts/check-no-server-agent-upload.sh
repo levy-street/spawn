@@ -81,9 +81,9 @@ allowed_daemon_endpoint_bytes() {
   local match_line="${remainder%%:*}"
   local content="${remainder#*:}"
   [[ "$match_line" =~ ^[0-9]+$ ]] || return 1
-  [[ "$file" == "daemon/src/host_control.rs" ]] || return 1
-  [[ "$content" == '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' || \
-    "$content" == '            object.get("bytes_b64").and_then(Value::as_str),' ]]
+  [[ "$file" == "daemon/src/host_direct.rs" ]] || return 1
+  [[ "$content" == '                "bytes_b64": STANDARD.encode(bytes),' || \
+    "$content" == '    let encoded = object.get("bytes_b64")?.as_str()?;' ]]
 }
 
 allowed_web_endpoint_bytes() {
@@ -136,10 +136,10 @@ required_line_between() {
 }
 
 check_privileged_endpoint_structure() {
-  local daemon_file="daemon/src/host_control.rs"
+  local daemon_file="daemon/src/host_direct.rs"
   local web_file="web/src/lib/hostControl.ts"
-  local daemon_encode='                    "bytes_b64": STANDARD.encode(&buffer[..read]),'
-  local daemon_decode='            object.get("bytes_b64").and_then(Value::as_str),'
+  local daemon_encode='                "bytes_b64": STANDARD.encode(bytes),'
+  local daemon_decode='    let encoded = object.get("bytes_b64")?.as_str()?;'
   local web_encode='            bytes_b64: bytesToBase64(chunk),'
   local web_type='      bytes_b64?: string;'
   local web_late='            message.bytes_b64,'
@@ -151,9 +151,111 @@ check_privileged_endpoint_structure() {
     required_exact_line_once "$daemon_file" "$line" || return 1
   done
   required_line_between "$daemon_file" "$daemon_encode" \
-    'async fn send_read(' 'async fn handle_late_write_chunk(' || return 1
+    'async fn publish_read_chunk(' 'pub(crate) fn decode_write_chunk(' || return 1
   required_line_between "$daemon_file" "$daemon_decode" \
-    'async fn handle_stream_chunk(' 'async fn handle_stream_end(' || return 1
+    'pub(crate) fn decode_write_chunk(' 'Some(HostWriteChunk {' || return 1
+
+  python3 - "$repo_root" <<'PY'
+import hashlib
+import os
+import re
+import sys
+
+root = sys.argv[1]
+direct_path = os.path.join(root, "daemon/src/host_direct.rs")
+control_path = os.path.join(root, "daemon/src/host_control.rs")
+rtc_path = os.path.join(root, "daemon/src/rtc.rs")
+
+with open(direct_path, "rb") as source:
+    direct_bytes = source.read()
+direct = direct_bytes.decode()
+with open(control_path, encoding="utf-8") as source:
+    control = source.read()
+with open(rtc_path, encoding="utf-8") as source:
+    rtc = source.read()
+
+expected_direct_hash = "f4dbb1951394b94d6327dfb31b62f308e66d636385e077539180ef51024ad32b"
+if hashlib.sha256(direct_bytes).hexdigest() != expected_direct_hash:
+    raise SystemExit(
+        "no-server-agent-upload: protected host direct module changed; review its complete capability inventory"
+    )
+
+if "crate::" in direct:
+    raise SystemExit("no-server-agent-upload: protected host direct module gained a crate-local dependency")
+direct_api = re.findall(r"pub\(crate\)\s+(?:async\s+)?fn\s+(\w+)", direct)
+if direct_api != ["new", "transport", "publish", "publish_read_chunk", "decode_write_chunk"]:
+    raise SystemExit(
+        "no-server-agent-upload: protected host direct API changed: " + ", ".join(direct_api)
+    )
+if direct.count("dc: Arc<RTCDataChannel>") != 2 or direct.count("self.dc.send_text(") != 1:
+    raise SystemExit("no-server-agent-upload: protected host direct transport ownership changed")
+
+expected_control_imports = """use crate::host_direct::{decode_write_chunk, HostDirectChannel};
+use crate::host_files::{
+    HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
+    STREAM_CHUNK_BYTES,
+};
+use crate::rtc::HostConnectedSignal;"""
+if control.count(expected_control_imports) != 1:
+    raise SystemExit("no-server-agent-upload: protected host-control dependency list changed")
+if set(re.findall(r"crate::(\w+)", control)) != {"host_direct", "host_files", "rtc"}:
+    raise SystemExit("no-server-agent-upload: protected host-control gained an unreviewed crate dependency")
+if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
+    raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
+sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
+if sender_types != {"ReadSignal", "WriteCleanup"}:
+    raise SystemExit(
+        "no-server-agent-upload: protected host-control sender inventory changed: "
+        + ", ".join(sorted(sender_types))
+    )
+expected_control_export = """pub(crate) fn install(
+    dc: Arc<RTCDataChannel>,
+    connected_signal: HostConnectedSignal,
+    files_override: Option<Arc<HostFileService>>,
+) {"""
+control_exports = list(re.finditer(r"(?m)^pub(?:\([^\n)]*\))?\s+", control))
+if len(control_exports) != 1 or not control.startswith(
+    expected_control_export, control_exports[0].start()
+):
+    raise SystemExit(
+        "no-server-agent-upload: protected host-control exported surface changed"
+    )
+if control.count("connected_signal: HostConnectedSignal") != 1:
+    raise SystemExit("no-server-agent-upload: narrow connected signal capability changed")
+if control.count("connected_signal.publish()") != 1:
+    raise SystemExit("no-server-agent-upload: connected signal publication topology changed")
+
+capability = re.search(
+    r"#\[derive\(Clone\)\]\npub\(crate\) struct HostConnectedSignal \{.*?\n\}\n\n"
+    r"impl HostConnectedSignal \{.*?\n\}\n",
+    rtc,
+    re.DOTALL,
+)
+if capability is None:
+    raise SystemExit("no-server-agent-upload: narrow connected signal capability is missing")
+expected_capability = """#[derive(Clone)]
+pub(crate) struct HostConnectedSignal {
+    out_tx: mpsc::Sender<WsOutbound>,
+    session_id: String,
+    binding: HostRtcBinding,
+}
+
+impl HostConnectedSignal {
+    pub(crate) fn publish(&self) -> bool {
+        try_send_host_status(
+            &self.out_tx,
+            self.session_id.clone(),
+            &self.binding,
+            "connected",
+        )
+    }
+}
+"""
+if capability.group(0) != expected_capability:
+    raise SystemExit("no-server-agent-upload: narrow connected signal acquired arbitrary payload power")
+if len(re.findall(r"HostConnectedSignal\s*\{\s*out_tx,", rtc)) != 1:
+    raise SystemExit("no-server-agent-upload: connected signal construction escaped the RTC boundary")
+PY
 
   for line in "$web_encode" "$web_type" "$web_late" "$web_check" "$web_decode"; do
     required_exact_line_once "$web_file" "$line" || return 1
@@ -170,14 +272,6 @@ check_privileged_endpoint_structure() {
   expected_receivers=$'      2 channel.send(\n      1 this.channel.send(\n      1 ws.send('
   if [[ "$receivers" != "$expected_receivers" ]]; then
     printf 'no-server-agent-upload: web host-control send topology changed; review direct vs signaling channels:\n%s\n' \
-      "$receivers" >&2
-    return 1
-  fi
-  receivers="$(rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$daemon_file" | sort | uniq -c)"
-  expected_receivers=$'      1 publication_context.send(\n      5 self.send('
-  if [[ "$receivers" != "$expected_receivers" ]] || rg -n --color never \
-    'send_?to_?server|server[^[:space:]]*\.send|websocket|crate::ws' "$daemon_file" >/dev/null; then
-    printf 'no-server-agent-upload: daemon host-control send topology gained a server-capable relay:\n%s\n' \
       "$receivers" >&2
     return 1
   fi
@@ -436,7 +530,7 @@ run_guard() {
 }
 
 self_test() {
-  local fixture
+  local fixture source_root="$repo_root"
   fixture="$(mktemp -d)"
   trap 'rm -rf "$fixture"' RETURN
   mkdir -p \
@@ -460,32 +554,9 @@ self_test() {
     '    reason="agent upload errors belong on spawn.ctl"' \
     >"$fixture/server/spawn_server/ws/daemon.py"
   printf '%s\n' 'fn main() {}' >"$fixture/daemon/src/main.rs"
-  printf '%s\n' \
-    'fn production_rtc() {}' \
-    '#[cfg(test)]' \
-    'mod tests {' \
-    '    const DIRECT_ENDPOINT_FIELD: &str = concat!("bytes", "_b64");' \
-    '}' \
-    >"$fixture/daemon/src/rtc.rs"
-  printf '%s\n' \
-    'async fn send_read() {' \
-    '  self.send(json!({' \
-    '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' \
-    '  })).await;' \
-    '}' \
-    'async fn handle_late_write_chunk() {}' \
-    'async fn handle_stream_chunk(object: Object) {' \
-    '            object.get("bytes_b64").and_then(Value::as_str),' \
-    '}' \
-    'async fn handle_stream_end() {}' \
-    'fn direct_topology() {' \
-    '  self.send(one);' \
-    '  self.send(two);' \
-    '  self.send(three);' \
-    '  self.send(four);' \
-    '  publication_context.send(hello);' \
-    '}' \
-    >"$fixture/daemon/src/host_control.rs"
+  cp "$source_root/daemon/src/rtc.rs" "$fixture/daemon/src/rtc.rs"
+  cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
+  cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
   printf '%s\n' \
     'async writeStream() {' \
@@ -583,16 +654,72 @@ self_test() {
 
   printf '%s\n' \
     "$host_control_original" \
-    'fn disguised_daemon_relay(buffer: &[u8], read: usize) {' \
+    'pub(crate) fn export_protected_value(value: Value) -> Value { value }' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: protected host-control value export passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local host_direct_original
+  host_direct_original="$(<"$fixture/daemon/src/host_direct.rs")"
+  printf '%s\n' \
+    "$host_direct_original" \
+    'fn disguised_daemon_relay(bytes: &[u8]) {' \
     '  let envelope = json!({' \
-    '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' \
+    '                "bytes_b64": STANDARD.encode(bytes),' \
     '  });' \
     '  send_to_server(envelope);' \
+    '}' \
+    >"$fixture/daemon/src/host_direct.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: reused daemon endpoint allowance passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_direct_original" >"$fixture/daemon/src/host_direct.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$host_control_original" \
+    'struct RawProtectedUplink {' \
+    '  uplink: mpsc::Sender<crate::pty::WsOutbound>,' \
+    '}' \
+    'impl RawProtectedUplink {' \
+    '  async fn publish(&self, protected: Value) {' \
+    '    if let Ok(permit) = self.uplink.reserve().await {' \
+    '      permit.send(crate::pty::WsOutbound::json(protected.to_string()));' \
+    '    }' \
+    '  }' \
     '}' \
     >"$fixture/daemon/src/host_control.rs"
   if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
     printf '%s\n' \
-      "no-server-agent-upload self-test: reused daemon endpoint allowance passed" >&2
+      "no-server-agent-upload self-test: raw protected server uplink passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$host_control_original" \
+    'use crate::pty::WsOutbound as OpaqueFrame;' \
+    'use tokio::sync::mpsc::Sender as OpaqueRoute;' \
+    'struct RenamedProtectedUplink(OpaqueRoute<OpaqueFrame>);' \
+    'impl RenamedProtectedUplink {' \
+    '  async fn publish(&self, protected: Value) {' \
+    '    if let Ok(permit) = self.0.reserve().await {' \
+    '      permit.send(OpaqueFrame::json(protected.to_string()));' \
+    '    }' \
+    '  }' \
+    '}' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: aliased protected server uplink passed" >&2
     return 1
   fi
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"

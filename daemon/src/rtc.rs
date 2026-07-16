@@ -222,6 +222,27 @@ pub(crate) struct HostRtcBinding {
     pub(crate) protocol_version: u16,
 }
 
+/// The only server-signaling capability exposed to the protected host-control
+/// module. Its private sender and fixed operation prevent that module from
+/// forwarding arbitrary values or host-file content to the server uplink.
+#[derive(Clone)]
+pub(crate) struct HostConnectedSignal {
+    out_tx: mpsc::Sender<WsOutbound>,
+    session_id: String,
+    binding: HostRtcBinding,
+}
+
+impl HostConnectedSignal {
+    pub(crate) fn publish(&self) -> bool {
+        try_send_host_status(
+            &self.out_tx,
+            self.session_id.clone(),
+            &self.binding,
+            "connected",
+        )
+    }
+}
+
 /// Immutable host-scope identity supplied on offer/candidate/close frames.
 #[derive(Clone)]
 pub struct HostRtcSignal {
@@ -3093,7 +3114,12 @@ fn install_host_control_channel(
     out_tx: mpsc::Sender<WsOutbound>,
     files_override: Option<Arc<HostFileService>>,
 ) {
-    crate::host_control::install(dc, session_id, binding, out_tx, files_override);
+    let connected_signal = HostConnectedSignal {
+        out_tx,
+        session_id: session_id.clone(),
+        binding: binding.clone(),
+    };
+    crate::host_control::install(dc, connected_signal, files_override);
 }
 
 pub(crate) async fn send_host_status(
@@ -7607,7 +7633,7 @@ mod tests {
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
-        let (out_tx, _out_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
         let file_root = tempfile::tempdir().unwrap();
         tokio::fs::write(file_root.path().join("source.txt"), b"source body")
             .await
@@ -7662,6 +7688,18 @@ mod tests {
                 .await
                 .is_err()
         );
+        let server_frame = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("host connected signal was not published")
+            .expect("host server uplink closed before connected signal");
+        let server_frame: Value = serde_json::from_str(server_frame.as_str()).unwrap();
+        assert_eq!(server_frame["type"], "rtc.status");
+        assert_eq!(server_frame["session_id"], "host-e2e");
+        assert_eq!(server_frame["scope_type"], "host");
+        assert_eq!(server_frame["scope_id"], host_id.to_string());
+        assert_eq!(server_frame["protocol"], HOST_CONTROL_LABEL);
+        assert_eq!(server_frame["protocol_version"], RTC_PROTOCOL_VERSION);
+        assert_eq!(server_frame["status"], "connected");
 
         let accepted_channel = if accepted_index == 0 {
             &channel
@@ -8113,6 +8151,10 @@ mod tests {
         )
         .await;
         assert_eq!(closing["ok"], true);
+        assert!(
+            out_rx.try_recv().is_err(),
+            "host filesystem traffic escaped through the server uplink"
+        );
 
         tokio::time::timeout(Duration::from_secs(2), browser_pc.close())
             .await
