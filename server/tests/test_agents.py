@@ -304,8 +304,8 @@ async def test_agent_restart_dispatches_existing_agent(client):
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "agent.restart"
     assert sent["agent_id"] == agent_id
-    assert sent["cols"] == 100
-    assert sent["rows"] == 40
+    assert "cols" not in sent
+    assert "rows" not in sent
     assert sent["cwd"] == "/repo"
     assert sent["argv"] == ["codex", "--yolo"]
 
@@ -324,7 +324,6 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     from spawn_server.db import get_sessionmaker
     from spawn_server.models import Agent, Host, User
     from spawn_server.ws.broker import DaemonConn, get_broker
-    from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 
     sm = get_sessionmaker()
     async with sm() as session:
@@ -355,84 +354,21 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
-    r = await client.post(
-        f"/api/agents/{agent_id}/input",
-        json={"text": "hello\n"},
-        headers=auth,
+    for path, body in (
+        ("input", {"text": "hello\n"}),
+        ("resize", {"cols": 100, "rows": 40}),
+        ("scroll", {"lines": -20}),
+        ("redraw", None),
+        ("snapshot", {"lines": 123, "plain": True}),
+    ):
+        r = await client.post(f"/api/agents/{agent_id}/{path}", json=body, headers=auth)
+        assert r.status_code == 404
+    assert fake_ws.sent_bytes == []
+    assert all(
+        json.loads(frame).get("type")
+        not in {"agent.resize", "agent.scroll", "agent.redraw", "agent.snapshot"}
+        for frame in fake_ws.sent_text
     )
-    assert r.status_code == 200, r.text
-    frame = decode_binary_frame(fake_ws.sent_bytes[-1])
-    assert frame.kind == KIND_INPUT
-    assert frame.agent_id == agent_id
-    assert frame.payload == b"hello\n"
-    async with sm() as session:
-        persisted_agent = await session.get(Agent, agent_id)
-        assert persisted_agent is not None
-        assert persisted_agent.last_input_at is not None
-
-    r = await client.post(
-        f"/api/agents/{agent_id}/resize",
-        json={"cols": 100, "rows": 40},
-        headers=auth,
-    )
-    assert r.status_code == 200, r.text
-    assert json.loads(fake_ws.sent_text[-1]) == {
-        "type": "agent.resize",
-        "agent_id": agent_id,
-        "cols": 100,
-        "rows": 40,
-    }
-
-    r = await client.post(
-        f"/api/agents/{agent_id}/scroll",
-        json={"lines": -20},
-        headers=auth,
-    )
-    assert r.status_code == 200, r.text
-    assert json.loads(fake_ws.sent_text[-1]) == {
-        "type": "agent.scroll",
-        "agent_id": agent_id,
-        "lines": -20,
-    }
-
-    r = await client.post(f"/api/agents/{agent_id}/redraw", headers=auth)
-    assert r.status_code == 200, r.text
-    assert json.loads(fake_ws.sent_text[-1]) == {"type": "agent.redraw", "agent_id": agent_id}
-
-    snapshot_task = asyncio.create_task(
-        client.post(
-            f"/api/agents/{agent_id}/snapshot",
-            json={"lines": 123, "plain": True},
-            headers=auth,
-        )
-    )
-    sent_count = len(fake_ws.sent_text)
-    for _ in range(100):
-        if len(fake_ws.sent_text) >= sent_count:
-            sent = json.loads(fake_ws.sent_text[-1])
-            if sent["type"] == "agent.snapshot":
-                break
-        await asyncio.sleep(0.01)
-    sent = json.loads(fake_ws.sent_text[-1])
-    assert sent == {
-        "type": "agent.snapshot",
-        "request_id": sent["request_id"],
-        "agent_id": agent_id,
-        "lines": 123,
-        "plain": True,
-    }
-    assert await broker.resolve_snapshot(
-        agent_id,
-        {
-            "request_id": sent["request_id"],
-            "bytes_b64": base64.b64encode(b"screen").decode("ascii"),
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await snapshot_task
-    assert r.status_code == 200, r.text
-    assert base64.b64decode(r.json()["bytes_b64"]) == b"screen"
 
     upload_task = asyncio.create_task(
         client.post(
@@ -449,9 +385,10 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
         )
     )
     for _ in range(100):
-        sent = json.loads(fake_ws.sent_text[-1])
-        if sent["type"] == "agent.upload":
-            break
+        if fake_ws.sent_text:
+            sent = json.loads(fake_ws.sent_text[-1])
+            if sent["type"] == "agent.upload":
+                break
         await asyncio.sleep(0.01)
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "agent.upload"

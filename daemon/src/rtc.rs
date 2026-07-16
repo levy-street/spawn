@@ -1,9 +1,7 @@
 //! WebRTC direct terminal transport.
 //!
-//! The central websocket remains the authenticated control/signaling plane.
-//! Once a browser and daemon establish a DataChannel, raw PTY input/output can
-//! bypass the server relay path while the daemon still mirrors output to the
-//! server websocket for transcripts and fallback viewers.
+//! The central websocket remains the authenticated, content-free control and
+//! signaling plane. Raw PTY input/output and replay are endpoint-only.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -39,6 +37,7 @@ use crate::pty::{ForwarderControl, WsOutbound};
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
+const AGENT_RTC_PROTOCOL_VERSION: u16 = 2;
 const HOST_CONTROL_LABEL: &str = "spawn.host.ctl";
 const RTC_PROTOCOL_VERSION: u16 = 1;
 const HOST_CONTROL_MAX_FRAME_BYTES: usize = 16 * 1024;
@@ -58,6 +57,7 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a connected peer that reports `Disconnected` (transient
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+const REQUIRED_AGENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
@@ -147,7 +147,6 @@ pub struct RtcSessionBinding {
     binding_nonce: String,
     generation: String,
     agent_id: Uuid,
-    legacy_signal: bool,
 }
 
 impl RtcSessionBinding {
@@ -155,24 +154,10 @@ impl RtcSessionBinding {
     pub fn new(session_id: String, generation: String, agent_id: Uuid) -> Self {
         Self {
             session_id,
-            binding_nonce: generation.clone(),
+            binding_nonce: "a".repeat(32),
             generation,
             agent_id,
-            legacy_signal: true,
         }
-    }
-
-    pub fn from_legacy(session_id: String, generation: String, agent_id: Uuid) -> Option<Self> {
-        if !valid_binding_nonce(&generation) {
-            return None;
-        }
-        Some(Self {
-            session_id,
-            binding_nonce: generation.clone(),
-            generation,
-            agent_id,
-            legacy_signal: true,
-        })
     }
 
     /// Bind an agent RTC attempt to both the browser nonce and the durable
@@ -196,7 +181,6 @@ impl RtcSessionBinding {
             generation: format!("{binding_generation}:{binding_nonce}"),
             binding_nonce,
             agent_id,
-            legacy_signal: false,
         })
     }
 
@@ -223,6 +207,74 @@ struct BoundRtcSession {
 struct RtcCallbackGuard {
     active: Arc<AtomicBool>,
     fence: Arc<tokio::sync::RwLock<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum AgentChannel {
+    Pty,
+    Control,
+}
+
+#[derive(Default)]
+struct AgentChannelState {
+    pty_seen: bool,
+    control_seen: bool,
+    pty_open: bool,
+    control_open: bool,
+    failed: bool,
+}
+
+#[derive(Default)]
+struct RequiredAgentChannels {
+    state: Mutex<AgentChannelState>,
+    changed: Notify,
+}
+
+impl RequiredAgentChannels {
+    async fn register(&self, channel: AgentChannel) -> bool {
+        let mut state = self.state.lock().await;
+        let seen = match channel {
+            AgentChannel::Pty => &mut state.pty_seen,
+            AgentChannel::Control => &mut state.control_seen,
+        };
+        if *seen {
+            state.failed = true;
+            self.changed.notify_waiters();
+            return false;
+        }
+        *seen = true;
+        true
+    }
+
+    async fn mark_open(&self, channel: AgentChannel) {
+        let mut state = self.state.lock().await;
+        match channel {
+            AgentChannel::Pty => state.pty_open = true,
+            AgentChannel::Control => state.control_open = true,
+        }
+        self.changed.notify_waiters();
+    }
+
+    async fn fail(&self) {
+        self.state.lock().await.failed = true;
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_ready(&self) -> bool {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let state = self.state.lock().await;
+                if state.failed {
+                    return false;
+                }
+                if state.pty_open && state.control_open {
+                    return true;
+                }
+            }
+            changed.await;
+        }
+    }
 }
 
 fn viewer_id(session_id: &str, generation: &str) -> String {
@@ -257,7 +309,6 @@ impl RtcSessions {
                 binding.session_id,
                 binding.binding_nonce,
                 binding.agent_id,
-                binding.legacy_signal,
                 "failed",
                 Some("agent is not running on this daemon"),
             )
@@ -270,7 +321,6 @@ impl RtcSessions {
                 binding.session_id,
                 binding.binding_nonce,
                 binding.agent_id,
-                binding.legacy_signal,
                 "failed",
                 Some("agent backend was replaced while binding RTC"),
             )
@@ -298,7 +348,6 @@ impl RtcSessions {
                 bound.signaling.session_id,
                 bound.signaling.binding_nonce,
                 bound.signaling.agent_id,
-                bound.signaling.legacy_signal,
                 "failed",
                 Some(&format!("{e:#}")),
             )
@@ -435,23 +484,16 @@ impl RtcSessions {
             }
         };
 
-        let signal_generation = binding
-            .signaling
-            .legacy_signal
-            .then(|| binding.signaling.binding_nonce.clone());
-        let binding_nonce =
-            (!binding.signaling.legacy_signal).then(|| binding.signaling.binding_nonce.clone());
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
                 session_id: binding.signaling.session_id,
-                generation: signal_generation,
-                binding_nonce,
+                binding_nonce: Some(binding.signaling.binding_nonce),
                 agent_id: Some(binding.signaling.agent_id),
-                scope_type: None,
-                scope_id: None,
-                protocol: None,
-                protocol_version: None,
+                scope_type: Some("agent".to_string()),
+                scope_id: Some(binding.signaling.agent_id),
+                protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
+                protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
                 sdp: local_sdp,
             },
         )
@@ -568,7 +610,6 @@ impl RtcSessions {
             &out_tx,
             Outbound::RtcAnswer {
                 session_id,
-                generation: None,
                 binding_nonce: Some(binding.binding_nonce),
                 agent_id: None,
                 scope_type: Some("host".to_string()),
@@ -966,22 +1007,16 @@ fn install_ice_handler(
             };
             match serde_json::to_value(candidate) {
                 Ok(candidate) => {
-                    let signal_generation = binding
-                        .legacy_signal
-                        .then(|| binding.binding_nonce.clone());
-                    let binding_nonce =
-                        (!binding.legacy_signal).then(|| binding.binding_nonce.clone());
                     send_json(
                         &out_tx,
                         Outbound::RtcCandidate {
                             session_id: binding.session_id,
-                            generation: signal_generation,
-                            binding_nonce,
+                            binding_nonce: Some(binding.binding_nonce),
                             agent_id: Some(binding.agent_id),
-                            scope_type: None,
-                            scope_id: None,
-                            protocol: None,
-                            protocol_version: None,
+                            scope_type: Some("agent".to_string()),
+                            scope_id: Some(binding.agent_id),
+                            protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
+                            protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
                             candidate,
                         },
                     )
@@ -1004,6 +1039,34 @@ fn install_data_channel_handler(
     #[cfg(test)] pty_send_gate: Option<Arc<tokio::sync::Notify>>,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
+    let channels = Arc::new(RequiredAgentChannels::default());
+    {
+        let channels = Arc::clone(&channels);
+        let pc = Arc::clone(pc);
+        let out_tx = out_tx.clone();
+        let session_id = binding.signaling.session_id.clone();
+        let binding_nonce = binding.signaling.binding_nonce.clone();
+        let agent_id = binding.signaling.agent_id;
+        tokio::spawn(async move {
+            if !matches!(
+                tokio::time::timeout(REQUIRED_AGENT_CHANNEL_TIMEOUT, channels.wait_ready()).await,
+                Ok(true)
+            ) {
+                channels.fail().await;
+                send_status(
+                    &out_tx,
+                    session_id,
+                    binding_nonce,
+                    agent_id,
+                    "failed",
+                    Some("spawn.pty and spawn.ctl are both required"),
+                )
+                .await;
+                let _ = pc.close().await;
+            }
+        });
+    }
+    let handler_pc = Arc::clone(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let binding = binding.clone();
         let registry = registry.clone();
@@ -1013,12 +1076,18 @@ fn install_data_channel_handler(
         #[cfg(test)]
         let pty_send_gate = pty_send_gate.clone();
         let out_tx = out_tx.clone();
+        let channels = Arc::clone(&channels);
+        let pc = Arc::clone(&handler_pc);
         Box::pin(async move {
             let viewer_id = viewer_id(
                 &binding.signaling.session_id,
                 &binding.signaling.generation,
             );
             if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
+                if !channels.register(AgentChannel::Control).await {
+                    let _ = pc.close().await;
+                    return;
+                }
                 install_control_data_channel(
                     dc,
                     viewer_id,
@@ -1027,11 +1096,19 @@ fn install_data_channel_handler(
                     controls,
                     active,
                     fence,
+                    channels,
+                    pc,
                 );
                 return;
             }
             if dc.label() != PTY_DATA_CHANNEL_LABEL {
-                tracing::debug!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "ignoring unknown rtc data channel");
+                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unknown rtc data channel");
+                channels.fail().await;
+                let _ = pc.close().await;
+                return;
+            }
+            if !channels.register(AgentChannel::Pty).await {
+                let _ = pc.close().await;
                 return;
             }
 
@@ -1070,28 +1147,35 @@ fn install_data_channel_handler(
             let open_registry = registry.clone();
             let open_session_id = binding.signaling.session_id.clone();
             let open_binding_nonce = binding.signaling.binding_nonce.clone();
-            let open_legacy_signal = binding.signaling.legacy_signal;
             let open_viewer_id = viewer_id.clone();
             let open_out_tx = out_tx.clone();
             let open_dc = Arc::clone(&dc);
             let open_active = Arc::clone(&active);
             let open_fence = Arc::clone(&fence);
             let open_control = binding.control.clone();
+            let open_channels = Arc::clone(&channels);
+            let open_pc = Arc::clone(&pc);
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
                 let session_id = open_session_id.clone();
                 let binding_nonce = open_binding_nonce.clone();
-                let legacy_signal = open_legacy_signal;
                 let viewer_id = open_viewer_id.clone();
                 let out_tx = open_out_tx.clone();
                 let dc = Arc::clone(&open_dc);
                 let active = Arc::clone(&open_active);
                 let fence = Arc::clone(&open_fence);
                 let control = open_control.clone();
+                let channels = Arc::clone(&open_channels);
+                let pc = Arc::clone(&open_pc);
                 Box::pin(async move {
                     let _callback = fence.read().await;
                     if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                         let _ = dc.close().await;
+                        return;
+                    }
+                    channels.mark_open(AgentChannel::Pty).await;
+                    if !channels.wait_ready().await {
+                        let _ = pc.close().await;
                         return;
                     }
                     let mut replay_rx = None;
@@ -1104,7 +1188,6 @@ fn install_data_channel_handler(
                             session_id,
                             binding_nonce,
                             agent_id,
-                            legacy_signal,
                             "failed",
                             Some("worker replay is unavailable"),
                         )
@@ -1119,7 +1202,6 @@ fn install_data_channel_handler(
                             session_id,
                             binding_nonce,
                             agent_id,
-                            legacy_signal,
                             "failed",
                             Some("worker replay barrier failed"),
                         )
@@ -1143,7 +1225,6 @@ fn install_data_channel_handler(
                             session_id,
                             binding_nonce,
                             agent_id,
-                            legacy_signal,
                             "failed",
                             Some("worker live-stream barrier timed out"),
                         )
@@ -1166,7 +1247,6 @@ fn install_data_channel_handler(
                         session_id.clone(),
                         binding_nonce,
                         agent_id,
-                        legacy_signal,
                         "connected",
                         None,
                     )
@@ -1226,17 +1306,24 @@ fn install_data_channel_handler(
 
             let close_control = binding.control;
             let close_viewer_id = viewer_id;
+            let close_channels = Arc::clone(&channels);
+            let close_pc = Arc::clone(&pc);
             dc.on_close(Box::new(move || {
                 let control = close_control.clone();
                 let viewer_id = close_viewer_id.clone();
+                let channels = Arc::clone(&close_channels);
+                let pc = Arc::clone(&close_pc);
                 Box::pin(async move {
                     control.remove_direct_sink(&viewer_id).await;
+                    channels.fail().await;
+                    let _ = pc.close().await;
                 })
             }));
         })
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_control_data_channel(
     dc: Arc<RTCDataChannel>,
     session_id: String,
@@ -1245,6 +1332,8 @@ fn install_control_data_channel(
     controls: AgentControlHub,
     active: Arc<AtomicBool>,
     fence: Arc<tokio::sync::RwLock<()>>,
+    channels: Arc<RequiredAgentChannels>,
+    pc: Arc<RTCPeerConnection>,
 ) {
     let agent_id = agent.agent_id();
     let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
@@ -1394,6 +1483,8 @@ fn install_control_data_channel(
     let open_active = Arc::clone(&active);
     let open_registry = registry;
     let open_fence = fence;
+    let open_channels = Arc::clone(&channels);
+    let open_pc = Arc::clone(&pc);
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
         let session_id = open_session_id.clone();
@@ -1402,9 +1493,16 @@ fn install_control_data_channel(
         let active = Arc::clone(&open_active);
         let registry = open_registry.clone();
         let fence = Arc::clone(&open_fence);
+        let channels = Arc::clone(&open_channels);
+        let pc = Arc::clone(&open_pc);
         Box::pin(async move {
             let _callback = fence.read().await;
             if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                return;
+            }
+            channels.mark_open(AgentChannel::Control).await;
+            if !channels.wait_ready().await {
+                let _ = pc.close().await;
                 return;
             }
             controls
@@ -1420,11 +1518,15 @@ fn install_control_data_channel(
         let controls = controls.clone();
         let session_id = session_id.clone();
         let close_tx = close_tx.clone();
+        let channels = Arc::clone(&channels);
+        let pc = Arc::clone(&pc);
         Box::pin(async move {
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
             controls.unregister(agent_id, &session_id).await;
+            channels.fail().await;
+            let _ = pc.close().await;
         })
     }));
 }
@@ -1805,7 +1907,6 @@ fn install_host_ice_handler(
                 &out_tx,
                 Outbound::RtcCandidate {
                     session_id,
-                    generation: None,
                     binding_nonce: Some(binding.binding_nonce),
                     agent_id: None,
                     scope_type: Some("host".to_string()),
@@ -1956,7 +2057,6 @@ async fn send_host_status(
         out_tx,
         Outbound::RtcStatus {
             session_id,
-            generation: None,
             binding_nonce: Some(binding.binding_nonce.clone()),
             agent_id: None,
             scope_type: Some("host".to_string()),
@@ -1975,23 +2075,19 @@ async fn send_status(
     session_id: String,
     binding_nonce: String,
     agent_id: Uuid,
-    legacy_signal: bool,
     status: &str,
     message: Option<&str>,
 ) {
-    let signal_generation = legacy_signal.then(|| binding_nonce.clone());
-    let bound_nonce = (!legacy_signal).then_some(binding_nonce);
     send_json(
         out_tx,
         Outbound::RtcStatus {
             session_id,
-            generation: signal_generation,
-            binding_nonce: bound_nonce,
+            binding_nonce: Some(binding_nonce),
             agent_id: Some(agent_id),
-            scope_type: None,
-            scope_id: None,
-            protocol: None,
-            protocol_version: None,
+            scope_type: Some("agent".to_string()),
+            scope_id: Some(agent_id),
+            protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
+            protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
             status: status.to_string(),
             message: message.map(str::to_string),
         },
@@ -2001,7 +2097,7 @@ async fn send_status(
 
 async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
     if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::Json(s)).await;
+        let _ = out_tx.send(WsOutbound::json(s)).await;
     }
 }
 
@@ -2142,9 +2238,7 @@ mod tests {
                 },
                 outbound = out_rx.recv() => {
                     let outbound = outbound.expect("RTC signaling closed");
-                    let WsOutbound::Json(json) = &outbound else {
-                        continue;
-                    };
+                    let json = outbound.as_str();
                     let value: serde_json::Value = serde_json::from_str(json).unwrap();
                     match value["type"].as_str() {
                         Some("rtc.answer") => {
@@ -2786,9 +2880,7 @@ mod tests {
             )
             .await;
         let status_message = status_rx.recv().await.expect("post-exit status");
-        let WsOutbound::Json(status) = &status_message else {
-            panic!("unexpected binary post-exit status");
-        };
+        let status = status_message.as_str();
         let status: serde_json::Value = serde_json::from_str(status).unwrap();
         assert_eq!(status["type"], "rtc.status");
         assert_eq!(status["status"], "failed");
@@ -2913,9 +3005,7 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let message = out_rx.recv().await.expect("status channel closed");
-                let WsOutbound::Json(json) = &message else {
-                    continue;
-                };
+                let json = message.as_str();
                 let value: serde_json::Value = serde_json::from_str(json).unwrap();
                 if value["type"] == "rtc.status" {
                     break value;
@@ -2925,7 +3015,10 @@ mod tests {
         .await
         .expect("failed status timed out");
         assert_eq!(status["session_id"], "racing-offer");
-        assert_eq!(status["generation"], "offer-generation");
+        assert_eq!(status["binding_nonce"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(status["scope_type"], "agent");
+        assert_eq!(status["protocol"], "spawn.pty");
+        assert_eq!(status["protocol_version"], 2);
         assert_eq!(status["status"], "failed");
         assert_eq!(sessions.resident_session_count().await, 0);
         offer_pc.close().await.unwrap();
@@ -3111,9 +3204,7 @@ mod tests {
             vec![b"first secret".to_vec(), b"second secret".to_vec()]
         );
         let activity_message = out_rx.try_recv().unwrap();
-        let WsOutbound::Json(json) = &activity_message else {
-            panic!("expected content-free input activity JSON")
-        };
+        let json = activity_message.as_str();
         assert_eq!(
             json,
             &format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
@@ -3206,15 +3297,7 @@ mod tests {
             RtcSessionBinding::from_server("session".to_string(), nonce.clone(), 2, agent_id)
                 .unwrap();
         assert_eq!(first.binding_nonce, nonce);
-        assert!(!first.legacy_signal);
         assert_ne!(first.generation, second.generation);
-        let legacy =
-            RtcSessionBinding::from_legacy("legacy".to_string(), "f".repeat(32), agent_id).unwrap();
-        assert!(legacy.legacy_signal);
-        assert!(
-            RtcSessionBinding::from_legacy("legacy".to_string(), "weak".to_string(), agent_id,)
-                .is_none()
-        );
         assert!(RtcSessionBinding::from_server(
             "session".to_string(),
             "not-a-nonce".to_string(),

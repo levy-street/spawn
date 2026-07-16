@@ -47,8 +47,6 @@ export function NewAgentForm({
   const [presetId, setPresetId] = useState("");
   const [cwd, setCwd] = useState("");
   const [argv, setArgv] = useState("");
-  const [cols, setCols] = useState("120");
-  const [rows, setRows] = useState("32");
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -144,16 +142,6 @@ export function NewAgentForm({
       setError("Choose an agent or provide a custom command.");
       return;
     }
-    const parsedCols = Number.parseInt(cols, 10);
-    const parsedRows = Number.parseInt(rows, 10);
-    if (!Number.isInteger(parsedCols) || parsedCols < 20 || parsedCols > 400) {
-      setError("Columns must be between 20 and 400.");
-      return;
-    }
-    if (!Number.isInteger(parsedRows) || parsedRows < 5 || parsedRows > 200) {
-      setError("Rows must be between 5 and 200.");
-      return;
-    }
     m.mutate({
       name: normalizeCommandText(name).trim() || undefined,
       host_id: hostId,
@@ -161,8 +149,6 @@ export function NewAgentForm({
       cwd: normalizeCwdForHost(cwd, selectedHostHomeDir),
       argv: argvArr,
       skill_ids: skillIds,
-      cols: parsedCols,
-      rows: parsedRows,
       create_cwd: true,
     });
   };
@@ -351,30 +337,6 @@ export function NewAgentForm({
               <p className="text-xs text-muted-foreground">
                 Overrides the preset command when set.
               </p>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="agent-cols">Initial columns</Label>
-              <Input
-                id="agent-cols"
-                type="number"
-                min={20}
-                max={400}
-                value={cols}
-                onChange={(e) => setCols(e.target.value)}
-                disabled={disabled}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="agent-rows">Initial rows</Label>
-              <Input
-                id="agent-rows"
-                type="number"
-                min={5}
-                max={200}
-                value={rows}
-                onChange={(e) => setRows(e.target.value)}
-                disabled={disabled}
-              />
             </div>
           </div>
         )}

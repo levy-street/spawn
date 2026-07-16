@@ -11,9 +11,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Agent, User
-from .ws.activity import should_record_agent_input, utcnow
 from .ws.broker import get_broker
-from .ws.frames import KIND_INPUT, encode_binary_frame
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_UPLOAD_NAME_LENGTH = 255
@@ -79,23 +77,6 @@ def decode_upload(
     return clean_name, clean_mime, base64.b64encode(data).decode("ascii"), destination
 
 
-def decode_input_payload(*, text: str | None = None, bytes_b64: str | None = None) -> bytes:
-    if text is not None and bytes_b64 is not None:
-        raise HTTPException(status_code=400, detail="provide either text or bytes_b64, not both")
-    if text is None and bytes_b64 is None:
-        raise HTTPException(status_code=400, detail="provide text or bytes_b64")
-    if text is not None:
-        return text.encode("utf-8")
-    assert bytes_b64 is not None
-    try:
-        payload = base64.b64decode(bytes_b64, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise HTTPException(status_code=400, detail="bytes_b64 is not valid base64") from e
-    if not payload:
-        raise HTTPException(status_code=400, detail="input payload is empty")
-    return payload
-
-
 def daemon_for_agent(agent: Agent):
     daemon = get_broker().get_daemon_for_agent(agent.id) or get_broker().get_daemon_for_host(
         agent.host_id
@@ -103,87 +84,6 @@ def daemon_for_agent(agent: Agent):
     if daemon is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="host daemon is offline")
     return daemon
-
-
-async def send_agent_input(
-    *,
-    session: AsyncSession,
-    user: User,
-    agent_id: str,
-    text: str | None = None,
-    bytes_b64: str | None = None,
-) -> dict[str, Any]:
-    agent = await get_owned_agent(session, agent_id, user)
-    daemon = daemon_for_agent(agent)
-    payload = decode_input_payload(text=text, bytes_b64=bytes_b64)
-    await daemon.send_bytes(encode_binary_frame(KIND_INPUT, agent.id, payload))
-    now = utcnow()
-    if should_record_agent_input(agent.id, now):
-        agent.last_input_at = now
-        await session.commit()
-    return {"agent_id": agent.id, "bytes": len(payload)}
-
-
-async def resize_agent(
-    *,
-    session: AsyncSession,
-    user: User,
-    agent_id: str,
-    cols: int,
-    rows: int,
-) -> dict[str, Any]:
-    agent = await get_owned_agent(session, agent_id, user)
-    daemon = daemon_for_agent(agent)
-    cols = max(20, min(400, int(cols)))
-    rows = max(5, min(200, int(rows)))
-    await daemon.send_text({"type": "agent.resize", "agent_id": agent.id, "cols": cols, "rows": rows})
-    return {"agent_id": agent.id, "cols": cols, "rows": rows}
-
-
-async def scroll_agent(
-    *,
-    session: AsyncSession,
-    user: User,
-    agent_id: str,
-    lines: int,
-) -> dict[str, Any]:
-    agent = await get_owned_agent(session, agent_id, user)
-    daemon = daemon_for_agent(agent)
-    lines = max(-200, min(200, int(lines)))
-    if lines:
-        await daemon.send_text({"type": "agent.scroll", "agent_id": agent.id, "lines": lines})
-    return {"agent_id": agent.id, "lines": lines}
-
-
-async def redraw_agent(*, session: AsyncSession, user: User, agent_id: str) -> dict[str, Any]:
-    agent = await get_owned_agent(session, agent_id, user)
-    daemon = daemon_for_agent(agent)
-    await daemon.send_text({"type": "agent.redraw", "agent_id": agent.id})
-    return {"agent_id": agent.id, "redraw": True}
-
-
-async def snapshot_agent(
-    *,
-    session: AsyncSession,
-    user: User,
-    agent_id: str,
-    lines: int = 5000,
-    plain: bool = False,
-    timeout: float = 2.0,
-) -> dict[str, Any]:
-    agent = await get_owned_agent(session, agent_id, user)
-    daemon = daemon_for_agent(agent)
-    lines = max(100, min(10000, int(lines)))
-    snapshot = await get_broker().request_snapshot(
-        agent.id,
-        daemon,
-        lines=lines,
-        plain=plain,
-        timeout=timeout,
-    )
-    if snapshot is None or not snapshot.get("bytes_b64"):
-        raise HTTPException(status_code=504, detail="agent snapshot timed out")
-    return {"agent_id": agent.id, "bytes_b64": snapshot["bytes_b64"], "plain": plain, "lines": lines}
 
 
 async def upload_agent_file(

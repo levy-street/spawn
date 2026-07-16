@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import uuid
@@ -11,7 +10,6 @@ import uuid
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from .. import auth as auth_mod
-from .. import transcript
 from ..agent_control import (
     MAX_UPLOAD_CLIENT_ID_LENGTH,
     UploadValidationError,
@@ -23,9 +21,7 @@ from ..db import get_sessionmaker
 from ..models import Agent, User
 from ..redis import agent_event_channel, get_backend
 from ..turn import ice_servers_for_session
-from .activity import should_record_agent_input, utcnow
-from .broker import BrowserConn, BrowserDisplayState, RtcSessionBinding, get_broker
-from .frames import KIND_INPUT, encode_binary_frame
+from .broker import BrowserConn, RtcSessionBinding, get_broker
 from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HostPresenceOwner,
@@ -38,41 +34,17 @@ from .host_signal import (
     host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
-    new_rtc_binding_nonce,
     valid_rtc_binding_nonce,
 )
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
-TERMINAL_SCROLLBACK_LINES = 100_000
-DAEMON_SNAPSHOT_LINES = 10_000
-# The connect-time history only needs to paint the current screen plus a few
-# pages of context; deep history loads on demand through the scrollback
-# overlay. Capturing 10k styled lines here made switching to long-running
-# agents take multiple seconds.
-INITIAL_SNAPSHOT_LINES = 400
-# Worker replay normally answers in milliseconds; allow a bounded degraded-path
-# window before falling back to the legacy transcript.
-INITIAL_SNAPSHOT_TIMEOUT = 3.0
-# Fallback when no daemon snapshot is available: ship only the transcript
-# tail. Long-running agents accumulate up to 64 MB of transcript.
-TRANSCRIPT_FALLBACK_MAX_BYTES = 512 * 1024
 AGENT_RTC_PROTOCOL = "spawn.pty"
-AGENT_RTC_PROTOCOL_VERSION = 1
+AGENT_RTC_PROTOCOL_VERSION = 2
 BROWSER_UPLOAD_TIMEOUT_SECONDS = 30.0
-
-
-async def _touch_agent_input(agent_id: str) -> None:
-    now = utcnow()
-    if not should_record_agent_input(agent_id, now):
-        return
-    sm = get_sessionmaker()
-    async with sm() as session:
-        agent = await session.get(Agent, agent_id)
-        if agent is None:
-            return
-        agent.last_input_at = now
-        await session.commit()
+BROWSER_WS_PROTOCOL = "spawn.v2"
+WS_CLOSE_PROTOCOL_REQUIRED = 4003
+WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
 
 def _decode_upload(obj: dict) -> tuple[str, str, str, str | None]:
@@ -87,22 +59,6 @@ def _decode_upload(obj: dict) -> tuple[str, str, str, str | None]:
 def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
     name, mime_type, bytes_b64, _destination = _decode_upload(obj)
     return name, mime_type, bytes_b64
-
-
-def _prefer_transcript_history(argv: list[str]) -> bool:
-    # Raw PTY transcripts are chronological, but replaying full-screen TUIs can
-    # preserve alternate-screen repaint noise. Prefer the worker checkpoint.
-    return False
-
-
-def _display_control_payload(state: BrowserDisplayState) -> dict[str, object]:
-    return {
-        "type": "display.control",
-        "owner": state.owner,
-        "cols": state.cols,
-        "rows": state.rows,
-        "viewers": state.viewers,
-    }
 
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
@@ -168,69 +124,6 @@ async def _publish_agent_rtc_signal(
     )
 
 
-async def _broadcast_display_control(agent_id: str) -> None:
-    broker = get_broker()
-    failed: list[BrowserConn] = []
-    for conn, state in await broker.display_states_for_agent(agent_id):
-        try:
-            await conn.send_text(_display_control_payload(state))
-        except Exception as e:
-            log.warning("display control broadcast failed: %s", e)
-            failed.append(conn)
-    if not failed:
-        return
-
-    failed_ids = {conn.id for conn in failed}
-    for conn in failed:
-        await broker.detach_browser(conn)
-
-    for conn, state in await broker.display_states_for_agent(agent_id):
-        if conn.id in failed_ids:
-            continue
-        try:
-            await conn.send_text(_display_control_payload(state))
-        except Exception as e:
-            log.warning("display control rebroadcast failed: %s", e)
-
-
-async def _send_initial_history(
-    conn: BrowserConn,
-    *,
-    agent_id: str,
-    host_id: str,
-    agent_argv: list[str],
-    initial_cols: int | None,
-    initial_rows: int | None,
-    resize_before_snapshot: bool,
-) -> None:
-    broker = get_broker()
-    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(host_id)
-    if daemon is not None and not _prefer_transcript_history(agent_argv):
-        try:
-            if resize_before_snapshot and initial_cols is not None and initial_rows is not None:
-                await daemon.send_text(
-                    {
-                        "type": "agent.resize",
-                        "agent_id": agent_id,
-                        "cols": initial_cols,
-                        "rows": initial_rows,
-                    }
-                )
-            snapshot = await broker.request_snapshot(
-                agent_id, daemon, lines=INITIAL_SNAPSHOT_LINES, timeout=INITIAL_SNAPSHOT_TIMEOUT
-            )
-            if snapshot and snapshot.get("bytes_b64"):
-                await conn.send_text({"type": "history", "bytes_b64": snapshot["bytes_b64"]})
-                return
-        except Exception as e:
-            log.warning("worker snapshot request failed: %s", e)
-
-    history = await transcript.read(agent_id, max_bytes=TRANSCRIPT_FALLBACK_MAX_BYTES)
-    await conn.send_text(
-        {"type": "history", "bytes_b64": base64.b64encode(history).decode("ascii")}
-    )
-
-
 async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User | None:
     raw: str | None = None
     auth_h = websocket.headers.get("authorization")
@@ -267,28 +160,21 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
     return user
 
 
-# App-specific close code: a spawn.v2 browser sent a binary frame. Live PTY
-# bytes are DataChannel-only on v2 (docs/TRUST.md Phase 1).
-WS_CLOSE_BINARY_ON_V2 = 4002
-
-
 @router.websocket("/ws/browser")
 async def browser_ws(
     websocket: WebSocket,
     agent_id: str = Query(...),
     token: str | None = Query(default=None),
-    cols: int | None = Query(default=None),
-    rows: int | None = Query(default=None),
 ) -> None:
-    # spawn.v2 removes the plaintext PTY relay: the server never sends binary
-    # frames to the browser and rejects binary input; live terminal bytes flow
-    # peer-to-peer over the WebRTC DataChannel. v1 keeps the legacy relay for
-    # older clients during rollout, and is also what we fall back to when
-    # WebRTC is administratively disabled (a v2 accept would leave the client
-    # with no live path at all).
     offered = websocket.scope.get("subprotocols") or []
-    v2 = get_settings().webrtc_enabled and "spawn.v2" in offered
-    await websocket.accept(subprotocol="spawn.v2" if v2 else "spawn.v1")
+    if BROWSER_WS_PROTOCOL not in offered:
+        await websocket.accept()
+        await websocket.send_json(
+            {"type": "protocol.required", "protocol": BROWSER_WS_PROTOCOL, "version": 2}
+        )
+        await websocket.close(code=WS_CLOSE_PROTOCOL_REQUIRED, reason="protocol upgrade required")
+        return
+    await websocket.accept(subprotocol=BROWSER_WS_PROTOCOL)
     user = await _resolve_user(websocket, token)
     if user is None:
         return
@@ -306,66 +192,20 @@ async def browser_ws(
 
     broker = get_broker()
     conn = BrowserConn(user_id=user.id, agent_id=agent_id, websocket=websocket)
-    initial_cols = _clamp_initial_size(cols, 20, 400)
-    initial_rows = _clamp_initial_size(rows, 5, 200)
-    display_state = (
-        BrowserDisplayState(owner=False, cols=None, rows=None, viewers=0)
-        if v2
-        else await broker.attach_browser(conn, cols=initial_cols, rows=initial_rows)
-    )
-    log.info(
-        "browser attached agent=%s user=%s owner=%s viewers=%s",
-        agent_id,
-        user.id,
-        display_state.owner,
-        display_state.viewers,
-    )
+    log.info("browser signaling attached agent=%s user=%s", agent_id, user.id)
 
-    # Tell the browser which terminal geometry it should render before replaying
-    # history. Followers must adopt the controller geometry instead of fitting
-    # their own viewport and racing the shared PTY size.
+    # Only content-free signaling/lifecycle metadata is sent on this socket.
     try:
-        if not v2:
-            await _broadcast_display_control(agent_id)
-        await conn.send_text(_rtc_config_payload(user.id, binding_nonce_required=v2))
-        if not v2:
-            await _send_initial_history(
-                conn,
-                agent_id=agent_id,
-                host_id=host_id,
-                agent_argv=agent_argv,
-                initial_cols=display_state.cols if display_state.cols is not None else initial_cols,
-                initial_rows=display_state.rows if display_state.rows is not None else initial_rows,
-                resize_before_snapshot=display_state.owner,
-            )
+        await conn.send_text(_rtc_config_payload(user.id, binding_nonce_required=True))
         await conn.send_text({"type": "agent.status", "status": agent_status})
     except Exception as e:
-        log.warning("history send failed: %s", e)
+        log.warning("initial signaling state send failed: %s", e)
 
-    # Background task: pubsub subscribe → live PTY bytes → this browser.
-    # This is how cross-worker delivery works (the daemon WS publishes to
-    # Redis, regardless of which worker the browser landed on). It also
-    # carries the local-worker case so we don't double-deliver.
-    pump_ready = asyncio.Event()
+    # Redis remains only for cross-worker lifecycle and RTC signaling events.
     event_ready = asyncio.Event()
     rtc_ready = asyncio.Event()
     rtc_response_channel = browser_signal_channel(conn.id)
     rtc_routes: dict[str, RedisBrowserConn] = {}
-
-    async def _pump_pubsub() -> None:
-        try:
-            async with get_backend().subscribe(agent_id) as stream:
-                pump_ready.set()
-                async for chunk in stream:
-                    try:
-                        await conn.send_bytes(chunk)
-                    except Exception as e:
-                        log.warning("pubsub forward to browser failed: %s", e)
-                        return
-        except Exception as e:  # noqa: BLE001
-            log.warning("pubsub subscribe loop crashed: %s", e)
-        finally:
-            pump_ready.set()
 
     async def _pump_events() -> None:
         try:
@@ -474,7 +314,6 @@ async def browser_ws(
         finally:
             rtc_ready.set()
 
-    pump_task: asyncio.Task[None] | None = None
     event_task = asyncio.create_task(_pump_events())
     rtc_task = asyncio.create_task(_pump_rtc_signals())
     try:
@@ -484,12 +323,6 @@ async def browser_ws(
         )
     except TimeoutError:
         pass
-    if not v2:
-        pump_task = asyncio.create_task(_pump_pubsub())
-        try:
-            await asyncio.wait_for(pump_ready.wait(), timeout=1.0)
-        except TimeoutError:
-            pass
 
     try:
         while True:
@@ -500,30 +333,12 @@ async def browser_ws(
             data_bytes = msg.get("bytes")
 
             if data_bytes is not None:
-                if v2:
-                    log.warning(
-                        "binary frame from spawn.v2 browser agent=%s user=%s; closing",
-                        agent_id,
-                        user.id,
-                    )
-                    await websocket.close(
-                        code=WS_CLOSE_BINARY_ON_V2,
-                        reason="binary frames are not allowed on spawn.v2",
-                    )
-                    break
-                # v1 legacy relay: wrap in 0x02 + agent_id, forward to daemon.
-                daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                    host_id
+                log.warning("content-bearing binary frame on signaling socket; closing")
+                await websocket.close(
+                    code=WS_CLOSE_CONTENT_FORBIDDEN,
+                    reason="terminal bytes require spawn.pty",
                 )
-                if daemon is None:
-                    log.warning("no daemon for agent=%s host=%s", agent_id, host_id)
-                    continue
-                try:
-                    frame = encode_binary_frame(KIND_INPUT, agent_id, data_bytes)
-                    await daemon.send_bytes(frame)
-                    await _touch_agent_input(agent_id)
-                except Exception as e:
-                    log.warning("forward to daemon failed: %s", e)
+                break
 
             elif data_text is not None:
                 try:
@@ -531,7 +346,7 @@ async def browser_ws(
                 except json.JSONDecodeError:
                     continue
                 ftype = obj.get("type")
-                if v2 and ftype in {
+                if ftype in {
                     "resize",
                     "take_control",
                     "scroll",
@@ -539,122 +354,14 @@ async def browser_ws(
                     "snapshot",
                 }:
                     log.warning(
-                        "server-visible terminal control from spawn.v2 browser agent=%s user=%s; closing",
-                        agent_id,
-                        user.id,
+                        "server-visible terminal control on signaling socket; closing",
                     )
                     await websocket.close(
-                        code=WS_CLOSE_BINARY_ON_V2,
+                        code=WS_CLOSE_CONTENT_FORBIDDEN,
                         reason="terminal control belongs on spawn.ctl",
                     )
                     break
-                if ftype == "resize":
-                    cols = _clamp_message_size(obj, "cols", 80, 20, 400)
-                    rows = _clamp_message_size(obj, "rows", 24, 5, 200)
-                    display_state = await broker.update_display_size(
-                        conn,
-                        cols=cols,
-                        rows=rows,
-                    )
-                    if display_state is None:
-                        continue
-                    if display_state.changed:
-                        daemon = broker.get_daemon_for_agent(
-                            agent_id
-                        ) or broker.get_daemon_for_host(host_id)
-                        if daemon is not None:
-                            try:
-                                await daemon.send_text(
-                                    {
-                                        "type": "agent.resize",
-                                        "agent_id": agent_id,
-                                        "cols": cols,
-                                        "rows": rows,
-                                    }
-                                )
-                            except Exception as e:
-                                log.warning("resize forward failed: %s", e)
-                        await _broadcast_display_control(agent_id)
-                elif ftype == "take_control":
-                    cols = _clamp_message_size(obj, "cols", 80, 20, 400)
-                    rows = _clamp_message_size(obj, "rows", 24, 5, 200)
-                    display_state = await broker.take_display_control(
-                        conn,
-                        cols=cols,
-                        rows=rows,
-                    )
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.resize",
-                                    "agent_id": agent_id,
-                                    "cols": display_state.cols,
-                                    "rows": display_state.rows,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("take control resize forward failed: %s", e)
-                    await _broadcast_display_control(agent_id)
-                elif ftype == "scroll":
-                    raw_lines = int(obj.get("lines") or 0)
-                    lines = max(-200, min(200, raw_lines))
-                    if lines == 0:
-                        continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is not None:
-                        try:
-                            await daemon.send_text(
-                                {
-                                    "type": "agent.scroll",
-                                    "agent_id": agent_id,
-                                    "lines": lines,
-                                }
-                            )
-                        except Exception as e:
-                            log.warning("scroll forward failed: %s", e)
-                elif ftype == "redraw":
-                    # Compatibility no-op: worker checkpoints replace
-                    # daemon-induced repaints.
-                    continue
-                elif ftype == "snapshot":
-                    raw_lines = int(obj.get("lines") or DAEMON_SNAPSHOT_LINES)
-                    lines = max(100, min(DAEMON_SNAPSHOT_LINES, raw_lines))
-                    plain = bool(obj.get("plain", False))
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
-                    if daemon is None:
-                        continue
-                    rtc_session_id = _valid_rtc_session_id(obj.get("rtc_session_id"))
-                    try:
-                        snapshot = await broker.request_snapshot(
-                            agent_id,
-                            daemon,
-                            lines=lines,
-                            plain=plain,
-                            timeout=2.0,
-                            rtc_session_id=rtc_session_id,
-                        )
-                        if snapshot and snapshot.get("bytes_b64"):
-                            reply: dict[str, object] = {
-                                "type": "snapshot",
-                                "bytes_b64": snapshot["bytes_b64"],
-                                "plain": plain,
-                            }
-                            if snapshot.get("dc_offset") is not None:
-                                reply["dc_offset"] = snapshot["dc_offset"]
-                            if snapshot.get("rtc_session_id"):
-                                reply["rtc_session_id"] = snapshot["rtc_session_id"]
-                            await conn.send_text(reply)
-                    except Exception as e:
-                        log.warning("snapshot forward failed: %s", e)
-                elif ftype == "upload":
+                if ftype == "upload":
                     try:
                         name, mime_type, bytes_b64, destination = _decode_upload(obj)
                     except UploadValidationError as e:
@@ -754,7 +461,7 @@ async def browser_ws(
                     if (
                         session_id is None
                         or sdp is None
-                        or (v2 and not valid_rtc_binding_nonce(proposed_nonce))
+                        or not valid_rtc_binding_nonce(proposed_nonce)
                     ):
                         continue
                     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
@@ -783,11 +490,7 @@ async def browser_ws(
                             unavailable["binding_nonce"] = proposed_nonce
                         await conn.send_text(unavailable)
                         continue
-                    binding_nonce = (
-                        proposed_nonce
-                        if valid_rtc_binding_nonce(proposed_nonce)
-                        else new_rtc_binding_nonce()
-                    )
+                    binding_nonce = proposed_nonce
                     route = RedisBrowserConn(
                         user_id=user.id,
                         host_id=host_id,
@@ -829,6 +532,10 @@ async def browser_ws(
                                 "agent_id": agent_id,
                                 "binding_nonce": binding.nonce,
                                 "binding_generation": binding.daemon_generation,
+                                "scope_type": binding.scope_type,
+                                "scope_id": binding.scope_id,
+                                "protocol": binding.protocol,
+                                "protocol_version": binding.protocol_version,
                                 "status": "negotiating",
                             }
                         )
@@ -842,6 +549,10 @@ async def browser_ws(
                             "agent_id": agent_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
+                            "scope_type": binding.scope_type,
+                            "scope_id": binding.scope_id,
+                            "protocol": binding.protocol,
+                            "protocol_version": binding.protocol_version,
                             "sdp": sdp,
                             "ice_servers": ice_servers_for_session(
                                 get_settings(), label=user.id
@@ -876,11 +587,7 @@ async def browser_ws(
                         or binding.scope_id != agent_id
                         or binding.protocol != AGENT_RTC_PROTOCOL
                         or binding.protocol_version != AGENT_RTC_PROTOCOL_VERSION
-                        or (v2 and obj.get("binding_nonce") != binding.nonce)
-                        or (
-                            obj.get("binding_nonce") is not None
-                            and obj.get("binding_nonce") != binding.nonce
-                        )
+                        or obj.get("binding_nonce") != binding.nonce
                     ):
                         continue
                     await _publish_agent_rtc_signal(
@@ -893,6 +600,10 @@ async def browser_ws(
                             "agent_id": agent_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
+                            "scope_type": binding.scope_type,
+                            "scope_id": binding.scope_id,
+                            "protocol": binding.protocol,
+                            "protocol_version": binding.protocol_version,
                             "candidate": candidate,
                         },
                     )
@@ -905,11 +616,7 @@ async def browser_ws(
                     if route is None or binding is None or binding.browser is not route:
                         continue
                     if (
-                        (v2 and obj.get("binding_nonce") != binding.nonce)
-                        or (
-                            obj.get("binding_nonce") is not None
-                            and obj.get("binding_nonce") != binding.nonce
-                        )
+                        obj.get("binding_nonce") != binding.nonce
                     ):
                         continue
                     rtc_routes.pop(session_id, None)
@@ -924,6 +631,10 @@ async def browser_ws(
                             "agent_id": agent_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
+                            "scope_type": binding.scope_type,
+                            "scope_id": binding.scope_id,
+                            "protocol": binding.protocol,
+                            "protocol_version": binding.protocol_version,
                         },
                     )
     except WebSocketDisconnect:
@@ -941,12 +652,6 @@ async def browser_ws(
             await event_task
         except (asyncio.CancelledError, Exception):
             pass
-        if pump_task is not None:
-            pump_task.cancel()
-            try:
-                await pump_task
-            except (asyncio.CancelledError, Exception):
-                pass
         bindings: list[RtcSessionBinding] = []
         for route in list(rtc_routes.values()):
             bindings.extend(await broker.unregister_rtc_sessions_for(route))
@@ -962,29 +667,10 @@ async def browser_ws(
                     "agent_id": agent_id,
                     "binding_nonce": binding.nonce,
                     "binding_generation": binding.daemon_generation,
+                    "scope_type": binding.scope_type,
+                    "scope_id": binding.scope_id,
+                    "protocol": binding.protocol,
+                    "protocol_version": binding.protocol_version,
                 },
             )
-        if not v2:
-            await broker.detach_browser(conn)
-            await _broadcast_display_control(agent_id)
         log.info("browser detached agent=%s user=%s", agent_id, user.id)
-
-
-def _clamp_initial_size(value: int | None, minimum: int, maximum: int) -> int | None:
-    if value is None:
-        return None
-    return max(minimum, min(maximum, int(value)))
-
-
-def _clamp_message_size(
-    obj: dict,
-    key: str,
-    default: int,
-    minimum: int,
-    maximum: int,
-) -> int:
-    try:
-        value = int(obj.get(key) or default)
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))

@@ -11,7 +11,6 @@ from spawn_server.ws.browser import (
     UploadValidationError,
     _decode_image_upload,
     _decode_upload,
-    _prefer_transcript_history,
 )
 
 
@@ -70,19 +69,3 @@ def test_decode_image_upload_rejects_bad_payloads(payload, message):
 )
 def test_upload_paste_prefix(argv, prefix):
     assert upload_paste_prefix(argv) == prefix
-
-
-@pytest.mark.parametrize(
-    ("argv", "prefer_transcript"),
-    [
-        (["codex", "--yolo"], False),
-        (["/usr/local/bin/claude"], False),
-        (["claude-code"], False),
-        (["opencode"], False),
-        (["aider", "--model", "sonnet"], False),
-        (["bash", "-l"], False),
-        ([], False),
-    ],
-)
-def test_prefer_transcript_history(argv, prefer_transcript):
-    assert _prefer_transcript_history(argv) is prefer_transcript

@@ -16,7 +16,6 @@ mod agents;
 mod cli;
 mod config;
 mod creds;
-mod frames;
 mod login;
 mod proto;
 mod pty;

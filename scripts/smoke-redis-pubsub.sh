@@ -17,15 +17,10 @@ need uv
 tmp_dir="$(mktemp -d)"
 redis_pid=""
 redis_container=""
-subscriber_pid=""
 host_worker_pid=""
 
 cleanup() {
   local status=$?
-  if [[ -n "$subscriber_pid" ]]; then
-    kill "$subscriber_pid" >/dev/null 2>&1 || true
-    wait "$subscriber_pid" 2>/dev/null || true
-  fi
   if [[ -n "$host_worker_pid" ]]; then
     kill "$host_worker_pid" >/dev/null 2>&1 || true
     wait "$host_worker_pid" 2>/dev/null || true
@@ -37,7 +32,7 @@ cleanup() {
     wait "$redis_pid" 2>/dev/null || true
   fi
   if [[ "$status" != "0" ]]; then
-    for log in "$tmp_dir"/redis.log "$tmp_dir"/subscriber.log "$tmp_dir"/publisher.log "$tmp_dir"/host-worker.log "$tmp_dir"/host-claim.log; do
+    for log in "$tmp_dir"/redis.log "$tmp_dir"/publisher.log "$tmp_dir"/host-worker.log "$tmp_dir"/host-claim.log; do
       if [[ -f "$log" ]]; then
         printf '%s\n' "---- $(basename "$log") ----" >&2
         tail -200 "$log" >&2 || true
@@ -67,8 +62,6 @@ import uuid
 print(uuid.uuid4())
 PY
 )"
-ready_file="$tmp_dir/subscriber.ready"
-received_file="$tmp_dir/received.bin"
 
 start_redis() {
   if command -v redis-server >/dev/null 2>&1; then
@@ -135,62 +128,7 @@ PY
 start_redis
 wait_for_redis
 
-printf '%s\n' "smoke-redis-pubsub: subscribing from one process"
-(
-  cd server
-  SPAWN_REDIS_URL="$redis_url" \
-    SPAWN_USE_INPROCESS_PUBSUB=0 \
-    SPAWN_REDIS_SMOKE_AGENT_ID="$agent_id" \
-    SPAWN_REDIS_SMOKE_READY="$ready_file" \
-    SPAWN_REDIS_SMOKE_RECEIVED="$received_file" \
-    uv run python - <<'PY'
-import asyncio
-import os
-from pathlib import Path
-
-from spawn_server.config import get_settings
-from spawn_server.redis import get_backend
-
-agent_id = os.environ["SPAWN_REDIS_SMOKE_AGENT_ID"]
-ready_file = Path(os.environ["SPAWN_REDIS_SMOKE_READY"])
-received_file = Path(os.environ["SPAWN_REDIS_SMOKE_RECEIVED"])
-
-
-async def main() -> None:
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    backend = get_backend()
-    await backend.startup()
-    try:
-        async with backend.subscribe(agent_id) as stream:
-            ready_file.write_text("ready\n", encoding="utf-8")
-            chunks: list[bytes] = []
-            async for chunk in stream:
-                chunks.append(chunk)
-                body = b"".join(chunks)
-                if body == b"hello redis pubsub":
-                    received_file.write_bytes(body)
-                    return
-    finally:
-        await backend.shutdown()
-
-
-asyncio.run(main())
-PY
-) >"$tmp_dir/subscriber.log" 2>&1 &
-subscriber_pid=$!
-
-for _ in {1..80}; do
-  if [[ -f "$ready_file" ]]; then
-    break
-  fi
-  sleep 0.1
-done
-if [[ ! -f "$ready_file" ]]; then
-  printf '%s\n' "smoke-redis-pubsub: subscriber did not become ready" >&2
-  exit 1
-fi
-
-printf '%s\n' "smoke-redis-pubsub: publishing from a second process"
+printf '%s\n' "smoke-redis-pubsub: checking real Redis owner fencing"
 (
   cd server
   SPAWN_REDIS_URL="$redis_url" \
@@ -329,9 +267,6 @@ async def main() -> None:
         assert not await backend.delete_ephemeral_if(owner_key, b"old")
         assert await backend.delete_ephemeral_if(owner_key, b"new")
         assert await backend.get_ephemeral(owner_key) is None
-        await backend.publish(agent_id, b"hello ")
-        await backend.publish(agent_id, b"redis ")
-        await backend.publish(agent_id, b"pubsub")
     finally:
         await backend.shutdown()
 
@@ -339,20 +274,6 @@ async def main() -> None:
 asyncio.run(main())
 PY
 ) >"$tmp_dir/publisher.log" 2>&1
-
-for _ in {1..80}; do
-  if [[ -f "$received_file" ]]; then
-    break
-  fi
-  sleep 0.1
-done
-if [[ "$(cat "$received_file" 2>/dev/null || true)" != "hello redis pubsub" ]]; then
-  printf '%s\n' "smoke-redis-pubsub: subscriber did not receive published payload" >&2
-  exit 1
-fi
-
-wait "$subscriber_pid"
-subscriber_pid=""
 
 host_ready_file="$tmp_dir/host-worker.ready"
 host_established_file="$tmp_dir/host-worker.established"

@@ -80,9 +80,11 @@ from pathlib import Path
 
 
 def report(name: str, ok: bool) -> None:
+    results[name] = ok
     print(f"fake-codex-{name}:{'ok' if ok else 'bad'}", flush=True)
 
 
+results: dict[str, bool] = {}
 required = [
     "SPAWN_AGENT_CONFIG_DIR",
     "SPAWN_SKILLS_FILE",
@@ -108,6 +110,10 @@ report("skills-json", skill_names == ["spawn-smoke-skill"])
 report("skill-file", (skills_dir / "spawn-smoke-skill" / "SKILL.md").is_file())
 report("codex-config-skill", "[[skills.config]]" in config)
 report("codex-config-project", 'trust_level = "trusted"' in config)
+(Path.cwd() / ".spawn-smoke-capabilities.json").write_text(
+    json.dumps({"skills": skill_names, "checks": results}),
+    encoding="utf-8",
+)
 PY
 
 while IFS= read -r line; do
@@ -124,7 +130,6 @@ start_server() {
       SPAWN_USE_INPROCESS_PUBSUB=1 \
       SPAWN_JWT_SECRET=smoke-test-secret-with-enough-length \
       SPAWN_PUBLIC_URL="$base_url" \
-      SPAWN_TRANSCRIPT_DIR="$tmp_dir/transcripts" \
       uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port" \
         >>"$server_log" 2>&1
   ) &
@@ -195,96 +200,46 @@ raise SystemExit("daemon did not come online")
 PY
 }
 
-agent_snapshot_contains() {
-  local expected="$1"
-  python3 - "$base_url" "$smoke_token" "$smoke_agent_id" "$expected" <<'PY'
-import base64
+wait_agent_running() {
+  local agent_id="$1"
+  python3 - "$base_url" "$smoke_token" "$agent_id" <<'PY'
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-base_url, token, agent_id, expected = sys.argv[1:]
-
-
-def snapshot() -> str | None:
+base_url, token, agent_id = sys.argv[1:]
+last = None
+for _ in range(120):
     req = urllib.request.Request(
-        f"{base_url}/api/agents/{agent_id}/snapshot",
-        data=json.dumps({"lines": 200, "plain": True}).encode(),
-        method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        f"{base_url}/api/agents/{agent_id}",
+        headers={"Authorization": f"Bearer {token}"},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
-            body = json.loads(response.read().decode())
+            last = json.loads(response.read().decode())
     except (urllib.error.HTTPError, urllib.error.URLError):
-        return None
-    return base64.b64decode(body["bytes_b64"]).decode(errors="replace")
-
-
-last = None
-for _ in range(100):
-    last = snapshot()
-    if last is not None and expected in last:
+        time.sleep(0.1)
+        continue
+    if last.get("status") == "running":
         raise SystemExit(0)
     time.sleep(0.1)
-raise SystemExit(f"snapshot did not contain {expected!r}; last snapshot: {last!r}")
+raise SystemExit(f"agent did not reach running state; last={last!r}")
 PY
 }
 
-agent_send_and_expect_echo() {
-  local text="$1"
-  local expected="echo:$text"
-  python3 - "$base_url" "$smoke_token" "$smoke_agent_id" "$text" "$expected" <<'PY'
-import base64
-import json
-import sys
-import time
-import urllib.error
-import urllib.request
-
-base_url, token, agent_id, text, expected = sys.argv[1:]
-
-
-def request(method: str, path: str, payload: dict | None = None) -> dict | None:
-    data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(
-        base_url + path,
-        data=data,
-        method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            body = response.read()
-            return json.loads(body.decode() or "{}")
-    except (urllib.error.HTTPError, urllib.error.URLError):
-        return None
-
-
-def snapshot() -> str | None:
-    body = request(
-        "POST",
-        f"/api/agents/{agent_id}/snapshot",
-        {"lines": 200, "plain": True},
-    )
-    if body is None:
-        return None
-    return base64.b64decode(body["bytes_b64"]).decode(errors="replace")
-
-
-sent = False
-last = None
-for _ in range(120):
-    if not sent:
-        sent = request("POST", f"/api/agents/{agent_id}/input", {"text": text + "\n"}) is not None
-    last = snapshot()
-    if last is not None and expected in last:
-        raise SystemExit(0)
-    time.sleep(0.1)
-raise SystemExit(f"agent did not echo {text!r}; sent={sent}; last snapshot: {last!r}")
-PY
+wait_file_contains() {
+  local path="$1"
+  local expected="$2"
+  for _ in {1..120}; do
+    if [[ -f "$path" ]] && grep -F "$expected" "$path" >/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf 'smoke-local-daemon: %s did not contain %s\n' "$path" "$expected" >&2
+  return 1
 }
 
 printf '%s\n' "smoke-local-daemon: building spawnd"
@@ -425,10 +380,8 @@ PY
 
 agent="$(
   python3 - "$base_url" "$smoke_token" "$smoke_host_id" "$agent_cwd" <<'PY'
-import base64
 import json
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -459,58 +412,33 @@ created = request(
         "name": "fake-codex-capabilities",
         "cwd": cwd,
         "argv": ["codex", "--yolo"],
-        "cols": 100,
-        "rows": 30,
     },
 )
-agent_id = created["id"]
-
-
-def snapshot() -> str:
-    body = request(
-        "POST",
-        f"/api/agents/{agent_id}/snapshot",
-        {"lines": 200, "plain": True},
-    )
-    return base64.b64decode(body["bytes_b64"]).decode(errors="replace")
-
-
-required_markers = [
-    "fake-codex-ready",
-    "fake-codex-env:ok",
-    "fake-codex-skills:spawn-smoke-skill",
-    "fake-codex-config-dir:ok",
-    "fake-codex-skills-json:ok",
-    "fake-codex-skill-file:ok",
-    "fake-codex-codex-config-skill:ok",
-    "fake-codex-codex-config-project:ok",
-]
-
-last = ""
-for _ in range(120):
-    last = snapshot()
-    if all(marker in last for marker in required_markers):
-        print(json.dumps({"agent_id": agent_id}))
-        raise SystemExit(0)
-    time.sleep(0.1)
-
-missing = [marker for marker in required_markers if marker not in last]
-raise SystemExit(f"fake codex did not observe capabilities; missing={missing}; last snapshot: {last!r}")
+print(json.dumps({"agent_id": created["id"]}))
 PY
 )"
 smoke_agent_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_id"])' <<<"$agent")"
+wait_agent_running "$smoke_agent_id"
+capability_report="$agent_cwd/.spawn-smoke-capabilities.json"
+wait_file_contains "$capability_report" '"skills": ["spawn-smoke-skill"]'
+python3 - "$capability_report" <<'PY'
+import json
+import sys
+
+report = json.loads(open(sys.argv[1], encoding="utf-8").read())
+if not report["checks"] or not all(report["checks"].values()):
+    raise SystemExit(f"fake codex capability checks failed: {report!r}")
+PY
 curl -fsS -X DELETE \
   -H "Authorization: Bearer $smoke_token" \
   "$base_url/api/agents/$smoke_agent_id" >/dev/null
 smoke_agent_id=""
 
-printf '%s\n' "smoke-local-daemon: creating and interacting with shell agent"
+printf '%s\n' "smoke-local-daemon: creating persistent shell agent"
 agent="$(
   python3 - "$base_url" "$smoke_token" "$smoke_host_id" "$agent_cwd" <<'PY'
-import base64
 import json
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -542,50 +470,22 @@ created = request(
         "argv": [
             "sh",
             "-lc",
-            "printf 'spawn-smoke-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+            "printf 'spawn-smoke-ready\\n' > .spawn-smoke-ready; printf 'spawn-smoke-ready\\n'; while :; do sleep 1; done",
         ],
-        "cols": 100,
-        "rows": 30,
     },
 )
-agent_id = created["id"]
-
-
-def snapshot() -> str:
-    body = request(
-        "POST",
-        f"/api/agents/{agent_id}/snapshot",
-        {"lines": 200, "plain": True},
-    )
-    return base64.b64decode(body["bytes_b64"]).decode(errors="replace")
-
-
-for _ in range(100):
-    text = snapshot()
-    if "spawn-smoke-ready" in text:
-        break
-    time.sleep(0.1)
-else:
-    raise SystemExit(f"agent did not print readiness marker; last snapshot: {text!r}")
-
-request("POST", f"/api/agents/{agent_id}/input", {"text": "hello from smoke\n"})
-
-for _ in range(100):
-    text = snapshot()
-    if "echo:hello from smoke" in text:
-        print(json.dumps({"agent_id": agent_id}))
-        raise SystemExit(0)
-    time.sleep(0.1)
-raise SystemExit(f"agent did not echo input; last snapshot: {text!r}")
+print(json.dumps({"agent_id": created["id"]}))
 PY
 )"
 smoke_agent_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_id"])' <<<"$agent")"
+wait_agent_running "$smoke_agent_id"
+wait_file_contains "$agent_cwd/.spawn-smoke-ready" "spawn-smoke-ready"
 
-printf '%s\n' "smoke-local-daemon: verifying concurrent shell agents stay isolated"
+printf '%s\n' "smoke-local-daemon: verifying concurrent worker lifecycles stay isolated"
 python3 - "$base_url" "$smoke_token" "$smoke_host_id" "$agent_cwd" <<'PY'
-import base64
 import concurrent.futures
 import json
+from pathlib import Path
 import sys
 import time
 import urllib.error
@@ -611,63 +511,47 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
         raise RuntimeError(f"{method} {path} failed: {error.code} {error.read().decode()}") from error
 
 
-def snapshot(agent_id: str) -> str:
-    body = request(
-        "POST",
-        f"/api/agents/{agent_id}/snapshot",
-        {"lines": 200, "plain": True},
-    )
-    return base64.b64decode(body["bytes_b64"]).decode(errors="replace")
-
-
-def wait_for(agent_id: str, marker: str) -> str:
-    last = ""
+def wait_for(agent_id: str, path: Path, marker: str) -> None:
+    last = None
     for _ in range(120):
-        last = snapshot(agent_id)
-        if marker in last:
-            return last
+        agent = request("GET", f"/api/agents/{agent_id}")
+        last = agent
+        if agent.get("status") == "running" and path.is_file() and path.read_text() == marker:
+            return
         time.sleep(0.1)
-    raise RuntimeError(f"agent {agent_id} did not show {marker!r}; last snapshot: {last!r}")
+    raise RuntimeError(f"agent {agent_id} did not become isolated and ready; last={last!r}")
 
 
-def exercise(index: int) -> tuple[str, str]:
+def exercise(index: int) -> str:
     ready = f"concurrent-{index}-ready"
-    echo = f"concurrent-{index}:payload-{index}"
+    cwd = Path(root_cwd) / f"concurrent-{index}"
     created = request(
         "POST",
         "/api/agents",
         {
             "host_id": host_id,
             "name": f"concurrent-{index}",
-            "cwd": f"{root_cwd}/concurrent-{index}",
+            "cwd": str(cwd),
             "argv": [
                 "sh",
                 "-lc",
-                f"printf '{ready}\\n'; while IFS= read -r line; do printf 'concurrent-{index}:%s\\n' \"$line\"; done",
+                f"printf '{ready}' > .spawn-worker-ready; while :; do sleep 1; done",
             ],
-            "cols": 100,
-            "rows": 30,
             "create_cwd": True,
         },
     )
     agent_id = created["id"]
     agent_ids.append(agent_id)
-    wait_for(agent_id, ready)
-    request("POST", f"/api/agents/{agent_id}/input", {"text": f"payload-{index}\n"})
-    final = wait_for(agent_id, echo)
-    return agent_id, final
+    wait_for(agent_id, cwd / ".spawn-worker-ready", ready)
+    return agent_id
 
 
 try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(exercise, range(4)))
-    for index, (agent_id, text) in enumerate(results):
-        for other in range(4):
-            marker = f"concurrent-{other}:payload-{other}"
-            if other == index and marker not in text:
-                raise RuntimeError(f"agent {agent_id} missing own marker {marker!r}")
-            if other != index and marker in text:
-                raise RuntimeError(f"agent {agent_id} leaked marker {marker!r}: {text!r}")
+        list(pool.map(exercise, range(4)))
+    ready_files = sorted(Path(root_cwd).glob("concurrent-*/.spawn-worker-ready"))
+    if len(ready_files) != 4 or len({path.read_text() for path in ready_files}) != 4:
+        raise RuntimeError(f"concurrent worker markers were not isolated: {ready_files!r}")
 finally:
     for agent_id in list(agent_ids):
         try:
@@ -680,15 +564,15 @@ printf '%s\n' "smoke-local-daemon: verifying agent survives daemon restart"
 stop_daemon
 start_daemon
 wait_host_online
-agent_snapshot_contains "spawn-smoke-ready"
-agent_send_and_expect_echo "after daemon restart"
+wait_agent_running "$smoke_agent_id"
+wait_file_contains "$agent_cwd/.spawn-smoke-ready" "spawn-smoke-ready"
 
 printf '%s\n' "smoke-local-daemon: verifying daemon reconnects after server restart"
 stop_server
 start_server
 wait_host_online
-agent_snapshot_contains "echo:after daemon restart"
-agent_send_and_expect_echo "after server restart"
+wait_agent_running "$smoke_agent_id"
+wait_file_contains "$agent_cwd/.spawn-smoke-ready" "spawn-smoke-ready"
 
 curl -fsS -X DELETE \
   -H "Authorization: Bearer $smoke_token" \

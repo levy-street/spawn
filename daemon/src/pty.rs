@@ -23,47 +23,33 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::activity;
-use crate::frames;
 use crate::proto::Outbound;
 
-#[cfg(test)]
-type OutboundWipeProbe = Box<dyn Fn(&[u8])>;
-
-#[cfg(test)]
-thread_local! {
-    static OUTBOUND_WIPE_PROBE: std::cell::RefCell<Option<OutboundWipeProbe>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 #[derive(Clone, Debug)]
-pub enum WsOutbound {
-    /// A serialized JSON frame.
-    Json(String),
-    /// A binary frame already encoded (`kind|agent_id|payload`).
-    Binary(Vec<u8>),
-}
+pub struct WsOutbound(String);
 
 impl WsOutbound {
+    pub(crate) fn json(text: String) -> Self {
+        Self(text)
+    }
+
+    pub(crate) fn into_text(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     pub(crate) fn wipe(&mut self) {
-        match self {
-            Self::Json(text) => text.zeroize(),
-            Self::Binary(bytes) => bytes.zeroize(),
-        }
+        self.0.zeroize();
     }
 }
 
 impl Drop for WsOutbound {
     fn drop(&mut self) {
         self.wipe();
-        #[cfg(test)]
-        OUTBOUND_WIPE_PROBE.with(|slot| {
-            if let Some(probe) = slot.borrow_mut().take() {
-                match self {
-                    Self::Json(text) => probe(text.as_bytes()),
-                    Self::Binary(bytes) => probe(bytes),
-                }
-            }
-        });
     }
 }
 
@@ -255,11 +241,11 @@ fn activity_message(agent_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> {
         ActivityKind::Output => Outbound::AgentActivity { agent_id },
         ActivityKind::Input => Outbound::AgentInputActivity { agent_id },
     };
-    serde_json::to_string(&event).ok().map(WsOutbound::Json)
+    serde_json::to_string(&event).ok().map(WsOutbound::json)
 }
 
-/// Best-effort emission used by the WebRTC input callback. Output activity is
-/// queued in order beside its mirrored binary frame by `run_forwarder`.
+/// Best-effort emission used by the WebRTC input callback. The sink accepts
+/// serialized control-plane JSON only; it has no terminal-byte variant.
 pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
     let Some(message) = activity_message(agent_id, kind) else {
         return false;
@@ -486,6 +472,7 @@ impl ForwarderControl {
 
     /// Cumulative bytes queued to the given direct sink, or None if the sink
     /// is not registered.
+    #[cfg(test)]
     pub async fn direct_sink_offset(&self, id: &str) -> Option<u64> {
         self.direct_sinks
             .lock()
@@ -857,9 +844,9 @@ pub struct ExitReason {
     pub signal: Option<String>,
 }
 
-/// Long-lived per-agent task: route raw PTY bytes to bounded direct sinks,
-/// then best-effort mirror into the current bounded WS session. Missing/full
-/// mirrors are detached and dropped; worker replay is the catch-up source.
+/// Long-lived per-agent task: route raw PTY bytes only to bounded direct
+/// DataChannel sinks and emit content-free activity metadata to the current
+/// control-plane session. Worker replay is the only catch-up source.
 /// Exits when every bounded-outbox sender is dropped.
 pub(crate) async fn run_forwarder(
     agent_id: Uuid,
@@ -902,11 +889,6 @@ async fn queue_output_chunk(
     if chunk.source_barrier {
         return;
     }
-    try_mirror(
-        control,
-        WsOutbound::Binary(frames::encode_pty_output(agent_id, &chunk.bytes)),
-    )
-    .await;
     if chunk.activity {
         if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
             try_mirror(control, activity).await;
@@ -1040,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_plaintext_wrappers_wipe_on_rejection_and_teardown() {
+    fn queued_direct_plaintext_wipes_on_rejection_and_teardown() {
         let observed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let direct_observed = Arc::clone(&observed);
         let direct_probe: DirectWipeProbe = Arc::new(move |bytes| {
@@ -1061,16 +1043,8 @@ mod tests {
         drop(rx);
         drop(tx);
 
-        OUTBOUND_WIPE_PROBE.with(|slot| {
-            let outbound_observed = Arc::clone(&observed);
-            *slot.borrow_mut() = Some(Box::new(move |bytes| {
-                outbound_observed.lock().unwrap().push(bytes.to_vec());
-            }));
-        });
-        drop(WsOutbound::Binary(b"queued websocket plaintext".to_vec()));
-
         let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 3);
+        assert_eq!(observed.len(), 2);
         assert!(observed
             .iter()
             .all(|bytes| bytes.iter().all(|byte| *byte == 0)));
@@ -1108,11 +1082,15 @@ mod tests {
 
         let (stalled_tx, _stalled_rx) = mpsc::channel(1);
         control.set_sink(stalled_tx).await;
-        for _ in 0..stalled_chunks {
-            outbox_tx
-                .send(source_output(&control, &chunk))
-                .await
-                .unwrap();
+        for index in 0..stalled_chunks {
+            let mut output = source_output(&control, &chunk);
+            // Model the next activity interval without sleeping: a full
+            // content-free server queue must detach while direct PTY delivery
+            // continues unaffected.
+            if index <= 1 {
+                output.activity = true;
+            }
+            outbox_tx.send(output).await.unwrap();
         }
         drop(outbox_tx);
         forwarder.await.unwrap();
@@ -1207,13 +1185,9 @@ mod tests {
         assert!(try_emit_activity(&tx, agent_id, ActivityKind::Input));
 
         let output = rx.recv().await.unwrap();
-        let WsOutbound::Json(output_json) = &output else {
-            panic!("expected JSON output activity")
-        };
+        let output_json = output.as_str();
         let input = rx.recv().await.unwrap();
-        let WsOutbound::Json(input_json) = &input else {
-            panic!("expected JSON input activity")
-        };
+        let input_json = input.as_str();
         assert_eq!(
             output_json,
             &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
@@ -1225,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_emits_binary_output_then_content_free_activity() {
+    async fn forwarder_keeps_output_off_server_and_emits_content_free_activity() {
         let agent_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
@@ -1238,24 +1212,14 @@ mod tests {
             .unwrap();
         drop(outbox_tx);
 
-        let binary_message = sink_rx.recv().await.unwrap();
-        let WsOutbound::Binary(binary) = &binary_message else {
-            panic!("expected binary PTY output")
-        };
-        let (kind, decoded_id, payload) = frames::decode_binary(binary).unwrap();
-        assert_eq!(kind, frames::KIND_PTY_OUTPUT);
-        assert_eq!(decoded_id, agent_id);
-        assert_eq!(payload, b"sensitive terminal output");
-
         let activity_message = sink_rx.recv().await.unwrap();
-        let WsOutbound::Json(activity_json) = &activity_message else {
-            panic!("expected JSON output activity")
-        };
+        let activity_json = activity_message.as_str();
         assert_eq!(
             activity_json,
             &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
         );
         assert!(!activity_json.contains("sensitive terminal output"));
+        assert!(sink_rx.try_recv().is_err());
         forwarder.await.unwrap();
     }
 
@@ -1265,20 +1229,23 @@ mod tests {
         let control = ForwarderControl::new();
         let mut direct = control.add_direct_sink("test".into()).await;
 
-        // Capacity one deliberately blocks the mirror after its first binary
-        // frame. Subsequent direct receipts prove classification has still
-        // consumed those chunks in source order.
+        // Capacity one deliberately blocks activity metadata after its first
+        // ping. Direct receipts prove terminal bytes never use that queue.
         let (sink_tx, mut sink_rx) = mpsc::channel(1);
         control.set_sink(sink_tx).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
 
-        outbox_tx.try_send(source_output(&control, b"ok")).unwrap();
+        let mut first_activity = source_output(&control, b"ok");
+        first_activity.activity = true;
+        outbox_tx.try_send(first_activity).unwrap();
         assert_eq!(direct.receiver.recv().await.unwrap(), b"ok");
 
-        outbox_tx
-            .try_send(source_output(&control, b"before suppression"))
-            .unwrap();
+        let mut next_activity = source_output(&control, b"before suppression");
+        // Model the next activity interval without sleeping. No terminal
+        // content is ever placed in the full server queue.
+        next_activity.activity = true;
+        outbox_tx.try_send(next_activity).unwrap();
         assert_eq!(direct.receiver.recv().await.unwrap(), b"before suppression");
 
         control.suppress_activity_at(Instant::now(), Duration::from_secs(60));
@@ -1290,11 +1257,10 @@ mod tests {
         drop(outbox_tx);
         forwarder.await.unwrap();
         let first = sink_rx.recv().await.unwrap();
-        let WsOutbound::Binary(binary) = &first else {
-            panic!("first bounded mirror frame was not PTY output");
-        };
-        let (_, _, payload) = frames::decode_binary(binary).unwrap();
-        assert_eq!(payload, b"ok");
+        assert_eq!(
+            first.as_str(),
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
         assert!(sink_rx.try_recv().is_err());
         assert!(control.slot.lock().await.is_none());
     }
@@ -1435,11 +1401,11 @@ mod tests {
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
         drop(outbox_tx);
 
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
-        assert!(matches!(sink_rx.recv().await.unwrap(), WsOutbound::Json(_)));
+        assert_eq!(
+            sink_rx.recv().await.unwrap().as_str(),
+            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+        );
+        assert!(sink_rx.try_recv().is_err());
         forwarder.await.unwrap();
     }
 
@@ -1461,10 +1427,6 @@ mod tests {
         let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
         drop(outbox_tx);
 
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            WsOutbound::Binary(_)
-        ));
         forwarder.await.unwrap();
         assert!(sink_rx.try_recv().is_err());
     }

@@ -55,10 +55,10 @@ test("new agent form posts with the authenticated session context", async ({ pag
       host_id: host.id,
       preset_id: PRESET_ID,
       cwd: "/Users/tester",
-      cols: 120,
-      rows: 32,
       create_cwd: true,
     });
+  expect(createdBody).not.toHaveProperty("cols");
+  expect(createdBody).not.toHaveProperty("rows");
 });
 
 test("agent create permission errors are rendered as controlled form errors", async ({ page }) => {

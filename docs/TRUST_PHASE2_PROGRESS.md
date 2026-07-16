@@ -6,10 +6,11 @@ schedule: `docs/TRUST_PHASE2_TASKS.md`. Read all three first.
 
 ## What we're doing and why
 
-A security audit found the server currently **sees protected content**: even
-for v2 (DataChannel) clients the daemon mirrors PTY output to the server as
-plaintext (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot
-frames still transit the server. Host paths/files/transfers, installer output,
+A security audit found that the server **saw protected content**: even for v2
+(DataChannel) clients the daemon mirrored PTY output to the server as plaintext
+(`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
+transited the server. The P2-AGENT-02 implementation checkpoint removes that
+agent-terminal path; its independent review and merge are still pending. Host paths/files/transfers, installer output,
 REST terminal surfaces, launch values, preset environment templates, and skill
 bodies also have server-readable paths or stores. Signaling is unsigned (server
 can MITM the DataChannel). Goal of this work ("Tier 2"):
@@ -82,10 +83,9 @@ Wave 0 is complete on `master` through `640a2e0`: the expanded trust design,
 Redis smoke repair, all activity correctness gates, hermetic server baseline,
 and repository-wide format/Ruff/Clippy cleanup passed independent review.
 
-Increment 1's output-activity path is **shipped to the dev stack**. The `0x01`
-output leg still exists (it persists the transcript and feeds the v1 pubsub
-relay), so the server still receives all PTY output. The server no longer needs
-those bytes for activity, which is the precondition for cutting the mirror.
+Increment 1's output-activity path is **shipped to the dev stack**. It made the
+later mirror cut possible by removing the server's need to inspect terminal
+bytes for activity.
 
 Wave 1 is now active in parallel worktrees: P2-AGENT-01 is implementing the
 per-agent `spawn.ctl` root and P2-HOST-01 the independent host-scoped
@@ -111,9 +111,22 @@ restore the retired content path. The server/API/web `tmux_session` display
 field and `agent.rename` frame are removed in this checkpoint because their
 derived labels were not guaranteed content-free.
 
-P2-AGENT-02 remains planned: daemon WebSocket `0x01` output mirroring and
-`0x02` input still exist, so this checkpoint alone does not stop the server
-seeing terminal content and does not satisfy Phase 2.
+**P2-AGENT-02/P2-TERM-02 checkpoint (implemented, review pending):** daemon
+WebSocket `spawn.control.v2` is JSON-only; browser WebSocket `spawn.v2` is
+mandatory; the `0x01` output and `0x02` input frames, `spawn.v1`, transcripts,
+agent-content Redis pubsub, server snapshots/history/display state, browser
+binary fallback, and REST input/resize/scroll/redraw/snapshot routes are gone.
+Both `spawn.pty` and `spawn.ctl` are required for an agent RTC peer. Old
+clients and daemons receive only `protocol.required` then close. Strict binding
+tuples and `scripts/check-no-server-terminal-content.sh` fail closed against a
+content path returning.
+
+This is still a source checkpoint: it is not merged or deployed, does not purge
+historical copies, and does not complete Phase 2. Offline history is now an
+explicit non-feature: replay is available only from a live endpoint worker;
+when the host is offline or the worker exits, the server has no transcript to
+show. Historical transcript files, Redis/AOF/WAL, logs, memory, swap, cores,
+backups, replicas and snapshots remain in P2-PURGE-01 scope.
 
 ## Remaining sequence
 
@@ -121,8 +134,9 @@ seeing terminal content and does not satisfy Phase 2.
    worker cutover, while the separate host-scoped `spawn.host.ctl` proceeds.
    Per-agent RTC is not sufficient for file/tool operations on a host with no
    agent.
-2. Retire `spawn.v1` plus `0x01`/`0x02`; then migrate agent uploads and remove
-   REST/WS terminal content and viewport-control surfaces.
+2. Independently review and merge the `spawn.v1`/`0x01`/`0x02` cut and removed
+   terminal/viewport surfaces; then migrate agent uploads, which still use a
+   server-visible route.
 3. Move host listings/read/write/transfer onto the host channel and ship a
    parallel E2E path for interactive installer detail. Cross-host bytes stream
    through the trusted browser, not the server. Keep the legacy tool route until
@@ -157,19 +171,19 @@ seeing terminal content and does not satisfy Phase 2.
   (0.0.0.0:8330). Repo at `~/projects/spawn`; web build needs
   `SPAWN_API_PROXY_TARGET=http://127.0.0.1:18330`.
 
-**Deploy the daemon (dev):** do not deploy this cutover as an ordinary hot
-restart. Follow `docs/TMUX_REMOVAL.md`: close ingress, inventory and drain old
-sessions without capture, build/install both `spawnd` and `spawn-worker`, then
-restart and verify worker adoption/replay. Compatible workers survive a
-supervisor restart; old sessions are unavailable. A binary rollback must not
-restore the retired content path, so remediation is a corrected worker-only
-roll-forward rather than re-enabling the old backend.
+**Deploy the daemon (dev):** do not deploy this cutover as an ordinary hot or
+mixed-version restart. Follow `docs/TMUX_REMOVAL.md`: close ingress, inventory
+and drain old sessions without capture, build/install both `spawnd` and
+`spawn-worker`, deploy the matching server and web assets in the same change
+window, then restart and verify worker adoption/replay. `spawn.v1` components
+are intentionally incompatible and must fail closed. Compatible workers
+survive a supervisor restart; old sessions are unavailable. Remediation is a
+corrected content-free roll-forward, never re-enabling tmux or a WS relay.
 
 **Deploy the server (dev):** `git push origin master` → `ssh minivac 'cd
 ~/projects/spawn && git pull --ff-only && systemctl --user restart
-spawn-dev-server.service'`. **Deploy order for a daemon+server increment: daemon
-first** (new frame is backward-compatible; old server logs `unknown frame` but
-still works), then server.
+spawn-dev-server.service'`. For P2-AGENT-02 there is no backward-compatible
+rolling order: use the coordinated drain/restart above.
 
 **Validate live:** mint a dev session token server-side
 (`auth.issue_session_token(user_id)` on the dev box — details + the user/host

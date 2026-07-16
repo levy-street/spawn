@@ -67,6 +67,8 @@ and therefore was not safe compatibility metadata. No new writes or derived
 values are allowed. P2-PURGE-01 still covers historical logs, caches, backups,
 and other recoverable copies outside the live schema.
 
-This cutover does **not** complete P2-AGENT-02. The legacy `spawn.v1` WebSocket
-binary `0x01` output mirror and `0x02` input leg still exist until that task
-makes DataChannels mandatory and removes server transcript/history relay.
+The follow-on P2-AGENT-02 checkpoint removes the legacy `spawn.v1` WebSocket,
+binary `0x01` output mirror, `0x02` input leg, and server transcript/history
+relay. It does not weaken this ADR: tmux remains retired and must not be
+reintroduced as a compatibility, replay, fallback, or incident-recovery path.
+The only accepted direction is worker-only, mandatory-DataChannel roll-forward.

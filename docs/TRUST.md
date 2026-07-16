@@ -61,11 +61,13 @@ not come for free:
    control plane could substitute fingerprints and man-in-the-middle a
    session. Fixing this requires endpoint identity keys that sign the
    SDP (Phase 3).
-2. **The legacy relay and mirror.** `spawn.v1` can still relay terminal data as
-   plaintext binary frames on `/ws/browser` ↔ `/ws/daemon`. Independently, the
-   daemon mirrors every output chunk to the server, which persists it as a
-   transcript even for v2 viewers. Those paths are the largest current
-   violation of the principle and are removed in Phase 2.
+2. **Historical relay data and the remaining content surfaces.** The
+   P2-AGENT-02 implementation checkpoint removes `spawn.v1`, daemon WS PTY
+   binary frames, transcripts, content pubsub, snapshots/history, and viewport
+   routes; review, merge, coordinated deployment, and historical purge remain.
+   Uploads, host file/tool operations, launch manifests, skill bodies, and
+   detailed errors still have server-readable paths tracked in the Phase 2
+   ledger.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.
@@ -103,7 +105,7 @@ host), traffic analysis (the control plane and TURN necessarily learn
 who talked to which host and when), and availability (the operator can
 always refuse service).
 
-## What the server still sees (and must stop seeing)
+## What the server keeps or historically held
 
 Honest inventory, from the current wire protocol:
 
@@ -120,17 +122,17 @@ contain no terminal bytes and are throttled, but their timing is behavioral
 metadata and can reveal when a person or agent is active. Self-hosting is the
 answer for users for whom this metadata is itself sensitive.
 
-**Content the server sees today and must stop seeing:**
+**Protected-content migration inventory:**
 
-| Today | Where it leaks | Target |
-|-------|----------------|--------|
-| PTY bytes (fallback relay) | binary frames on `/ws/browser`, `/ws/daemon` | DataChannel only; relay path deleted |
-| Transcripts (~64 MB/agent on server disk) | `transcript.py`; historical Redis ring keys may remain | replaced by bounded backend replay fetched over DataChannel; no new archive; historical copies purged |
-| History replay | `{"type":"history"}` on `/ws/browser` | DataChannel history stream |
+| Content class | Current or historical path | Migration state |
+|---------------|----------------------------|-----------------|
+| PTY bytes (retired live relay) | former binary frames on `/ws/browser`, `/ws/daemon` | removed in P2-AGENT-02 implementation; mandatory DataChannels; review/deploy pending |
+| Transcripts (~64 MB/agent historically on server disk) | retired `transcript.py`; historical files/Redis/backups may remain | code path deleted; bounded endpoint replay; historical copies still require P2-PURGE-01 |
+| History replay | former `{"type":"history"}` on `/ws/browser` | removed from server; `spawn.ctl` endpoint stream |
 | Agent file uploads | `upload` frames, `bytes_b64` through both WS legs and REST | per-agent DataChannel file stream |
-| Terminal snapshots / card previews | `agent.snapshot` frames | rendered from DataChannel output |
-| REST terminal input and snapshots | `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
-| Terminal geometry and viewport actions | REST plus `/ws/browser` resize/scroll/redraw/display-control paths; `agent.resize`/`scroll`/`redraw` | per-agent `spawn.ctl`; server sees neither dimensions, deltas, nor event timing |
+| Terminal snapshots / card previews | retired `agent.snapshot` frames | removed from server; rendered from endpoint replay/output |
+| REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
+| Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-agent `spawn.ctl` only |
 | Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-readably |
 | Preset environment templates | `presets.env_template`, merged into agent `env` | endpoint-owned or client-encrypted; values sent E2E at spawn time |
 | Launch paths/arguments and preset commands | `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | endpoint-owned or client-encrypted; launch manifest sent E2E |
@@ -204,11 +206,11 @@ What moves where, and the regressions we accept:
   fetches the available tail over the DataChannel at attach. A `spawnd` restart
   can adopt a surviving worker and recover only that retained history; once the
   worker and its history are gone, replay is unavailable. Server
-  `transcript.py` and the content pubsub path are deleted; any historical Redis
-  ring keys are purged.
-- **Offline history** → **accepted regression.** Today the server can
-  replay a transcript while the host is asleep; in the operator model,
-  daemon offline = history unavailable. Mitigation later: optional
+  `transcript.py` and the content pubsub path are deleted; historical Redis,
+  files and backups remain subject to the purge runbook.
+- **Offline history** → **accepted regression.** The retired server path could
+  replay a transcript while the host was asleep; after this cut, daemon
+  offline = history unavailable. Mitigation later: optional
   client-side-encrypted transcript backup (browser holds keys, server
   stores ciphertext blobs it cannot read).
 - **Live card previews** → rendered client-side from per-host
@@ -330,19 +332,19 @@ Each phase ships independently; the product works throughout.
 
 ### Phase 1 — TURN + WebRTC as the only terminal path
 
-*Delivers: v2 browsers do not send or receive live PTY through the server
-(policy claim; the daemon mirror and transcripts remain server-side).*
+*Delivered originally as a browser-side policy claim; the P2-AGENT-02
+implementation now also removes the daemon mirror and transcripts, pending
+review/merge/deploy/purge.*
 
 *Status 2026-07-10: shipped for spawn.v2 clients.* coturn (already on the
 prod box) now runs `use-auth-secret`; the server mints ephemeral HMAC
 credentials per session (`turn.py`) instead of shipping a static TURN
 password to every browser. The browser WS negotiates `spawn.v2`: the
 server never sends binary PTY frames to v2 browsers (no pubsub pump) and
-closes with code 4002 if one arrives; the web client is DataChannel-only
-for live PTY, queueing input until the channel opens. `spawn.v1` (and the
-daemon-bound `0x02` input path only it uses) remains for rollout compat —
-retiring it, plus the daemon→server `0x01` output leg that still feeds
-server-side transcripts, is Phase 2 work.
+closes with code 4002 if one arrives; the web client is DataChannel-only for
+live PTY. At the P2-AGENT-02 implementation checkpoint, `spawn.v1`, daemon
+`0x01`/`0x02`, and server transcripts are removed; both `spawn.pty` and
+`spawn.ctl` are mandatory and old protocols fail closed.
 
 - Stand up coturn; control plane mints ephemeral HMAC TURN credentials
   per session (time-limited, per RFC 5766 REST-API convention) and
@@ -352,12 +354,11 @@ server-side transcripts, is Phase 2 work.
   remove browser-bound binary PTY frames from `/ws/browser` and
   daemon-bound `0x02` input frames from `/ws/daemon`.
 - Keep `/ws/*` as control + signaling only. Bump subprotocol to
-  `spawn.v2`; support v1 during rollout per proto/README versioning.
+  browser `spawn.v2` and daemon `spawn.control.v2`; no content-compatible v1
+  rollout window remains.
 - Acceptance: no v2 browser uses a plaintext server relay in either direction
   (assert browser binary input is a protocol error and no v2 pubsub pump is
   started); sessions survive on TURN-only networks (test with UDP blocked).
-  This does not assert that the server cannot see output: daemon `0x01` remains
-  until Phase 2.
 
 ### Phase 2 — endpoint-owned data, server data stores deleted
 
@@ -366,9 +367,9 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 3.*
 
 - Add per-agent `spawn.ctl` beside `spawn.pty` for history, snapshots, viewport
-  controls/display ownership, agent uploads, and detailed agent errors. Moving
-  history/snapshots does **not** complete the cut while the
-  daemon still mirrors every output chunk on the server-bound `0x01` leg.
+  controls/display ownership, agent uploads, and detailed agent errors. The
+  P2-AGENT-02 checkpoint completes the terminal mirror/history/viewport cut;
+  uploads and detailed errors remain later tasks.
 - Add a separate host-scoped WebRTC session and `spawn.host.ctl` DataChannel
   for directory listings, host file read/write/transfer, tool installer output,
   and launch manifests. A per-agent channel is insufficient because these

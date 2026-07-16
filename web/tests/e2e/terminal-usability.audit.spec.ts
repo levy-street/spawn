@@ -8,6 +8,7 @@ import {
   test,
   type WebSocketRoute,
 } from "@playwright/test";
+import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
 import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 
 type WireMessage = string | Buffer;
@@ -35,10 +36,6 @@ type Box = {
   height: number;
 };
 
-function b64(value: string) {
-  return Buffer.from(value, "utf8").toString("base64");
-}
-
 function longHistory(lines: number) {
   return `${Array.from({ length: lines }, (_, i) => {
     return `audit-history-${String(i).padStart(3, "0")}`;
@@ -57,7 +54,10 @@ function jsonMessages(messages: WireMessage[]) {
     .filter((message): message is string => typeof message === "string")
     .map((message) => {
       try {
-        return JSON.parse(message);
+        const parsed = JSON.parse(message);
+        return parsed?.kind === "request" && typeof parsed.operation === "string"
+          ? { ...parsed, ...parsed.parameters, type: parsed.operation }
+          : parsed;
       } catch {
         return null;
       }
@@ -228,21 +228,84 @@ async function openAuditedTerminal(
     reconnectHistory?: string;
   } = {},
 ) {
-  // Trust Phase 1 (spawn.v2) holds keystrokes until a WebRTC DataChannel
-  // opens, which never happens against the mocked WebSocket. Pin the client
-  // to the spawn.v1 relay like terminal.spec.ts does (Playwright's WS mock
-  // always selects the first offered subprotocol).
-  await page.addInitScript(() => {
-    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
-  });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
   const messages: WireMessage[] = [];
   const sockets: WebSocketRoute[] = [];
   const socketEvents: SocketEvent[] = [];
   const restUploads: Array<Record<string, unknown>> = [];
+  let commandBuffer = "";
 
-  // Uploads travel over REST (not WebSocket frames); mirror the API and echo
-  // the daemon's usual terminal acknowledgement into the live socket.
+  const write = async (value: string) => sendPty(page, value);
+  const emitPrompt = async () => write("\r\n$ ");
+  const submitCommand = async () => {
+    const command = commandBuffer;
+    commandBuffer = "";
+    socketEvents.push({ type: "command", command });
+    if (command.trim()) {
+      await write(`\r\naudit:${command.replaceAll("\t", "<TAB>")}\r\n$ `);
+    } else {
+      await emitPrompt();
+    }
+  };
+  const handleInput = async (bytes: Buffer) => {
+    const text = bytes.toString("utf8");
+    socketEvents.push({
+      type: "binary",
+      bytes: Buffer.byteLength(text),
+      textPreview: text.slice(0, 80),
+    });
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+      if (char === "\x1b") {
+        const sequence = text.slice(i, i + 3);
+        if (sequence === "\x1b[A") {
+          socketEvents.push({ type: "control", name: "ArrowUp" });
+          await write("\r\nhistory:previous-command\r\n$ ");
+          i += 2;
+          continue;
+        }
+        if (["\x1b[B", "\x1b[C", "\x1b[D"].includes(sequence)) {
+          socketEvents.push({ type: "control", name: `Arrow${sequence.at(2) ?? ""}` });
+          i += 2;
+          continue;
+        }
+        socketEvents.push({ type: "control", name: "Escape" });
+        continue;
+      }
+      if (char === "\x03") {
+        socketEvents.push({ type: "control", name: "Ctrl-C" });
+        commandBuffer = "";
+        await write("\r\n^C\r\n$ ");
+        continue;
+      }
+      if (char === "\r" || char === "\n") {
+        await submitCommand();
+        continue;
+      }
+      if (char === "\t") {
+        socketEvents.push({ type: "control", name: "Tab" });
+        commandBuffer += "\t";
+        await write("\t");
+        continue;
+      }
+      commandBuffer += char;
+      await write(char);
+    }
+  };
+  let inputChain = Promise.resolve();
+  await installAgentRtcMock(page, messages, {
+    history: options.history ?? "audit-ready\n$ ",
+    secondHistory: options.reconnectHistory ?? "audit-reconnected\n$ ",
+    control: options.control ?? { owner: true, cols: 120, rows: 36, viewers: 1 },
+    autoSnapshot: true,
+    onPtyInput: (bytes) => {
+      inputChain = inputChain.then(() => handleInput(bytes));
+      return inputChain;
+    },
+  });
+  await mockAuthenticatedApi(page, { agents: [agent()] });
+
+  // Uploads travel over REST; mirror the endpoint and let the fake worker
+  // emit its acknowledgement over the mandatory spawn.pty DataChannel.
   await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
     const body = route.request().postDataJSON() as Record<string, unknown>;
     restUploads.push(body);
@@ -256,112 +319,30 @@ async function openAuditedTerminal(
         pasted: false,
       },
     });
-    sockets.at(-1)?.send(Buffer.from(`\r\nuploaded:${String(body.name ?? "")}\r\n$ `));
+    await write(`\r\nuploaded:${String(body.name ?? "")}\r\n$ `);
   });
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     sockets.push(ws);
-    let commandBuffer = "";
-    const index = sockets.length;
-
-    const write = (value: string) => ws.send(Buffer.from(value));
-    const emitPrompt = () => write("\r\n$ ");
-    const sendDisplayControl = (
-      control = options.control ?? { owner: true, cols: 120, rows: 36, viewers: 1 },
-    ) => {
-      ws.send(JSON.stringify({ type: "display.control", ...control }));
-    };
-
-    const submitCommand = () => {
-      const command = commandBuffer;
-      commandBuffer = "";
-      socketEvents.push({ type: "command", command });
-      if (command.trim()) {
-        write(`\r\naudit:${command.replaceAll("\t", "<TAB>")}\r\n$ `);
-      } else {
-        emitPrompt();
-      }
-    };
-
-    const handleInput = (text: string) => {
-      socketEvents.push({
-        type: "binary",
-        bytes: Buffer.byteLength(text),
-        textPreview: text.slice(0, 80),
-      });
-      for (let i = 0; i < text.length; i += 1) {
-        const char = text[i];
-        if (char === "\x1b") {
-          const sequence = text.slice(i, i + 3);
-          if (sequence === "\x1b[A") {
-            socketEvents.push({ type: "control", name: "ArrowUp" });
-            write("\r\nhistory:previous-command\r\n$ ");
-            i += 2;
-            continue;
-          }
-          if (["\x1b[B", "\x1b[C", "\x1b[D"].includes(sequence)) {
-            socketEvents.push({ type: "control", name: `Arrow${sequence.at(2) ?? ""}` });
-            i += 2;
-            continue;
-          }
-          socketEvents.push({ type: "control", name: "Escape" });
-          continue;
-        }
-        if (char === "\x03") {
-          socketEvents.push({ type: "control", name: "Ctrl-C" });
-          commandBuffer = "";
-          write("\r\n^C\r\n$ ");
-          continue;
-        }
-        if (char === "\r" || char === "\n") {
-          submitCommand();
-          continue;
-        }
-        if (char === "\t") {
-          socketEvents.push({ type: "control", name: "Tab" });
-          commandBuffer += "\t";
-          write("\t");
-          continue;
-        }
-        commandBuffer += char;
-        write(char);
-      }
-    };
-
     ws.onMessage((message) => {
       messages.push(message);
       if (typeof message === "string") {
-        const parsed = JSON.parse(message);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(message);
+        } catch {
+          return;
+        }
         socketEvents.push({ type: "json", message: parsed });
-        if (parsed.type === "upload") {
-          write(`\r\nuploaded:${parsed.name}\r\n$ `);
-        }
-        if (parsed.type === "snapshot") {
-          ws.send(
-            JSON.stringify({
-              type: "snapshot",
-              bytes_b64: b64(`${longHistory(220)}snapshot-tail\n$ `),
-              plain: false,
-            }),
-          );
-        }
-        if (parsed.type === "take_control") {
-          sendDisplayControl({ owner: true, cols: parsed.cols, rows: parsed.rows, viewers: 2 });
-        }
-        return;
       }
-      handleInput(message.toString("utf8"));
+      handleAgentRtcSignal(ws, message);
     });
-
-    sendDisplayControl();
     ws.send(
       JSON.stringify({
-        type: "history",
-        bytes_b64: b64(
-          index === 1
-            ? (options.history ?? "audit-ready\n$ ")
-            : (options.reconnectHistory ?? "audit-reconnected\n$ "),
-        ),
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        binding_nonce_required: true,
       }),
     );
     ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
@@ -443,7 +424,7 @@ test.describe("terminal usability audit", () => {
     const overlay = page.getByTestId("terminal-scrollback-overlay");
     await expect(overlay).toBeVisible();
     await expect(overlay.locator(".xterm-rows")).toContainText("audit-history-");
-    sockets[0]?.send(Buffer.from("\x1b[2A\rLIVE-AUDIT-WHILE-SCROLLED"));
+    await sendPty(page, "\x1b[2A\rLIVE-AUDIT-WHILE-SCROLLED");
     observations.push(await observeTerminal(page, "scrollback opened"));
 
     await page.mouse.wheel(0, 5000);
@@ -529,7 +510,7 @@ test.describe("terminal usability audit", () => {
     }, testInfo) => {
       const health = await watchPageHealth(page);
       const observations: Observation[] = [];
-      const { messages, sockets, socketEvents } = await openAuditedTerminal(page, {
+      const { messages, socketEvents } = await openAuditedTerminal(page, {
         history: `${longHistory(240)}mobile-ready\n$ `,
       });
 
@@ -541,7 +522,7 @@ test.describe("terminal usability audit", () => {
       const overlay = page.getByTestId("terminal-scrollback-overlay");
       await expect(overlay).toBeVisible();
       await expect(overlay.locator(".xterm-rows")).toContainText("audit-history-");
-      sockets[0]?.send(Buffer.from("\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED"));
+      await sendPty(page, "\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED");
       observations.push(await observeTerminal(page, "mobile scrollback"));
 
       await dragTouchInTerminal(page, 0.62, 0.35);

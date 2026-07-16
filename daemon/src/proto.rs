@@ -52,22 +52,6 @@ pub enum Outbound {
         #[serde(default)]
         client_id: Option<String>,
     },
-    #[serde(rename = "agent.snapshot")]
-    AgentSnapshot {
-        agent_id: Uuid,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<String>,
-        bytes_b64: String,
-        /// Cumulative bytes queued to the requesting browser's direct
-        /// DataChannel sink at capture time; lets the client order the
-        /// snapshot against live DataChannel bytes.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        dc_offset: Option<u64>,
-        /// Echo of the requester's RTC session id so a browser can ignore
-        /// offsets stamped for a stale session.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        rtc_session_id: Option<String>,
-    },
     #[serde(rename = "host.fs.list_result")]
     HostFsListResult {
         request_id: String,
@@ -116,8 +100,6 @@ pub enum Outbound {
     RtcAnswer {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        generation: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
@@ -135,8 +117,6 @@ pub enum Outbound {
     RtcCandidate {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        generation: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
@@ -153,8 +133,6 @@ pub enum Outbound {
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        generation: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,33 +234,6 @@ pub enum Inbound {
         #[serde(default)]
         signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
     },
-    #[serde(rename = "agent.resize")]
-    AgentResize {
-        agent_id: Uuid,
-        cols: u16,
-        rows: u16,
-    },
-    #[serde(rename = "agent.scroll")]
-    AgentScroll {
-        agent_id: Uuid,
-        lines: i16,
-    },
-    #[serde(rename = "agent.snapshot")]
-    AgentSnapshot {
-        agent_id: Uuid,
-        #[serde(default)]
-        request_id: Option<String>,
-        #[serde(default)]
-        lines: Option<u16>,
-        #[serde(default)]
-        plain: Option<bool>,
-        #[serde(default)]
-        rtc_session_id: Option<String>,
-    },
-    #[serde(rename = "agent.redraw")]
-    AgentRedraw {
-        agent_id: Uuid,
-    },
     #[serde(rename = "agent.upload")]
     AgentUpload {
         agent_id: Uuid,
@@ -304,8 +255,6 @@ pub enum Inbound {
     #[serde(rename = "rtc.offer")]
     RtcOffer {
         session_id: String,
-        #[serde(default)]
-        generation: Option<String>,
         #[serde(default)]
         binding_nonce: Option<String>,
         #[serde(default)]
@@ -330,8 +279,6 @@ pub enum Inbound {
     RtcCandidate {
         session_id: String,
         #[serde(default)]
-        generation: Option<String>,
-        #[serde(default)]
         binding_nonce: Option<String>,
         #[serde(default)]
         binding_generation: Option<u64>,
@@ -350,8 +297,6 @@ pub enum Inbound {
     #[serde(rename = "rtc.close")]
     RtcClose {
         session_id: String,
-        #[serde(default)]
-        generation: Option<String>,
         #[serde(default)]
         binding_nonce: Option<String>,
         #[serde(default)]
@@ -388,14 +333,11 @@ pub struct AgentCreate {
     pub env: std::collections::BTreeMap<String, String>,
     /// Optional shell command. If `argv[0]` isn't on the daemon's PATH at
     /// agent.create time, the daemon runs this via `bash -c` and streams
-    /// stdout+stderr into the agent's PTY ring buffer. Then it retries the
-    /// PATH lookup before launching.
+    /// no server-visible output. Then it retries the PATH lookup before launch.
     #[serde(default)]
     pub install: Option<String>,
     #[serde(default)]
     pub skills: Vec<AgentSkillConfig>,
-    pub cols: u16,
-    pub rows: u16,
     #[serde(default)]
     pub create_cwd: bool,
 }

@@ -38,29 +38,26 @@ import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
-// Defer the deep (10k-line) scrollback warm so connecting to an agent paints
-// the small connect-time history first instead of competing with a multi-MB
-// capture transfer and offscreen render.
+// Defer the deep (10k-line) endpoint replay warm so connecting can paint the
+// small endpoint-provided seed first.
 const SCROLLBACK_WARM_DELAY_MS = 1_200;
-// Server-side captures can time out without a reply; clear the in-flight
+// Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
 // The cache refresh debounces on output, but a continuously-streaming agent
 // would postpone it forever — bound how stale the cache is allowed to get.
 const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
-// Without a DataChannel, snapshots share the relay WebSocket with keystroke
-// echoes: a multi-hundred-KB capture every couple of seconds head-of-line
-// blocks typing on slow links. Refresh far less often and capture fewer
-// lines; opening scrollback still fetches the full depth once.
-const SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS = 5_000;
-const SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS = 20_000;
-const SCROLLBACK_RELAY_CACHE_LINES = 2_000;
+// Before an offset-anchored PTY stream is active, refresh less aggressively;
+// opening scrollback still asks the endpoint for the full depth once.
+const SCROLLBACK_UNANCHORED_REFRESH_DEBOUNCE_MS = 5_000;
+const SCROLLBACK_UNANCHORED_REFRESH_MAX_WAIT_MS = 20_000;
+const SCROLLBACK_UNANCHORED_CACHE_LINES = 2_000;
 // Never re-render the overlay underneath an actively-scrolling user: the
 // reset+rewrite collapses the scroll range mid-gesture and yanks the view.
 const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // Recent live DataChannel chunks kept for replay on top of offset-anchored
-// snapshots. Snapshots travel the slow relay path while live bytes ride the
-// DataChannel, so a fresh capture can lag chunks already rendered locally;
+// snapshots. Replay responses and live bytes use separate mandatory endpoint
+// DataChannels, so a fresh capture can lag chunks already rendered locally;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -310,7 +307,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
   // Whether the live buffer's current seed came from an exact worker stream
-  // (vs the legacy transcript fallback on a degraded connect).
+  // (vs a plain endpoint replay without geometry markers).
   const liveSeedWasExactRef = useRef(false);
   // Last trustworthy reader position (buffer line of the viewport top),
   // recorded only while no rewrite is collapsing the buffer. Rebuilt content
@@ -962,8 +959,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           if (evicted) recentDcChunksSizeRef.current -= evicted.bytes.length;
         }
       } else if (dcActiveRef.current) {
-        // Transport fell back to the relay; DataChannel offsets no longer
-        // describe this stream.
+        // An unanchored endpoint replay cannot be ordered by PTY offset.
         dcActiveRef.current = false;
         recentDcChunksRef.current = [];
         recentDcChunksSizeRef.current = 0;
@@ -1003,9 +999,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!term) return;
       const exactChunks = parseExactReplay(decodeUtf8(bytes));
       if (exactChunks) exactStreamRef.current = true;
-      // Remember what kind of seed the live buffer got: a degraded connect
-      // can fall back to the server transcript (legacy formatting) even for
-      // worker agents, and a later exact snapshot should heal that.
+      // Remember whether the endpoint seed included exact geometry markers;
+      // a later exact replay can heal a plain seed.
       liveSeedWasExactRef.current = exactChunks !== null;
       const lastChunk = exactChunks?.[exactChunks.length - 1];
       if (lastChunk) {
@@ -1047,9 +1042,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (snapshotIsExact) {
         exactStreamRef.current = true;
         if (!liveSeedWasExactRef.current) {
-          // The connect-time seed fell back to the legacy transcript (slow
-          // or degraded path) but the stream is provably exact: heal the
-          // live buffer from a proper checkpoint capture.
+          // The connect-time seed was plain, but the endpoint stream is now
+          // provably exact: heal from a proper checkpoint capture.
           historyReseedPendingRef.current = true;
         }
       }
@@ -1067,8 +1061,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
         scrollbackCacheDirtyRef.current = false;
       } else {
-        // Snapshots and live PTY bytes travel over different transports (ws
-        // vs WebRTC DataChannel), so arrival order is not capture order. If
+        // Replay and live PTY bytes travel over separate DataChannels, so
+        // arrival order is not capture order. If
         // live bytes arrived since this snapshot was requested, the capture
         // may not contain them — keep the cache dirty and converge with a
         // follow-up refresh rather than risk rolling the live terminal back.
@@ -1078,10 +1072,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheDirtyRef.current = dirty;
         if (dirty) scheduleScrollbackCacheRefreshRef.current();
       }
-      // Reseeds prefer an anchored capture, but a relay-only session (no
-      // DataChannel) can never produce one — accept an unanchored capture
-      // there; syncLive's cache-clean gate guarantees the stream was quiet
-      // around it, so nothing can roll back.
+      // Reseeds prefer an anchored capture. A plain endpoint replay can be
+      // accepted only through the cache-clean gate while the stream is quiet.
       const anchorOk = typeof dcOffset === "number" || !dcActiveRef.current;
       if (historyReseedPendingRef.current && anchorOk && !scrollbackVisibleRef.current) {
         // A width change left seeded history wrapped at the old width;
@@ -1165,11 +1157,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       type: "snapshot",
       lines:
         purpose === "cache" && !dcActiveRef.current
-          ? SCROLLBACK_RELAY_CACHE_LINES
+          ? SCROLLBACK_UNANCHORED_CACHE_LINES
           : purpose === "overlay" && exactStreamRef.current
             ? // Worker replays: reach the full retained log. A TUI's redraw
-              // churn is hundreds of bytes per "line", so the legacy
-              // lines→bytes sizing leaves older transcript out of reach and
+              // churn is hundreds of bytes per "line", so basic
+              // lines-to-bytes sizing leaves older replay out of reach and
               // scrollback dead-ends ("can't scroll") on busy sessions.
               TERMINAL_SNAPSHOT_LINES * 4
             : TERMINAL_SNAPSHOT_LINES,
@@ -1195,10 +1187,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // Debounce on output, but bound the postponement: an agent that streams
       // faster than the debounce window would otherwise starve the refresh
       // forever, leaving the scrollback cache minutes stale.
-      const relayMode = !dcActiveRef.current;
-      const debounce = delayMs ?? (relayMode ? SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS : 350);
-      const maxWait = relayMode
-        ? SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS
+      const unanchoredMode = !dcActiveRef.current;
+      const debounce =
+        delayMs ?? (unanchoredMode ? SCROLLBACK_UNANCHORED_REFRESH_DEBOUNCE_MS : 350);
+      const maxWait = unanchoredMode
+        ? SCROLLBACK_UNANCHORED_REFRESH_MAX_WAIT_MS
         : SCROLLBACK_REFRESH_MAX_WAIT_MS;
       const now = Date.now();
       if (scrollbackCacheRefreshDeadlineRef.current === null) {
@@ -1374,8 +1367,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      // Keep a large local buffer for transcript replay and non-wheel access.
-      // Wheel/touch scrollback is rendered from fresh daemon snapshots so it
+      // Keep a large local buffer for endpoint replay and non-wheel access.
+      // Wheel/touch scrollback is rendered from fresh worker snapshots so it
       // reflects the current worker checkpoint rather than browser replay artifacts.
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
@@ -2589,8 +2582,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         } else {
           // At the live edge: drive a fresh authoritative reseed to
           // convergence. The reseed only applies a snapshot that lands "clean"
-          // (no live bytes since it was requested), so on the relay path — no
-          // DataChannel offset to anchor a replay — a single 5s-debounced
+          // (no live bytes since it was requested), so without a PTY offset
+          // anchor a single 5s-debounced
           // request almost never lands inside the window, and the panel looks
           // unrefreshed until a manual scroll. Keep requesting promptly until
           // one converges (or we give up); only clean snapshots apply, so this
@@ -2877,7 +2870,7 @@ type ReplayChunk = { cols: number; rows: number; data: string };
  * Worker-backed agents ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
- * or null when the payload is a legacy transcript rather than worker replay.
+ * or null when the endpoint returned a plain replay without geometry markers.
  * xterm.js does not implement CSI 8 t itself, so the
  * consumer applies each chunk's geometry via term.resize() between writes.
  */
@@ -2933,8 +2926,8 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
 }
 
 /** Sequenced ops for the scrollback overlay (a display-only terminal that is
- *  safe to resize): exact worker replays get per-chunk geometry, legacy
- *  transcripts get the fallback reformat, and both end at `finalSize`. */
+ *  safe to resize): exact worker replays get per-chunk geometry, plain
+ *  endpoint replays get a fallback reformat, and both end at `finalSize`. */
 function overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
@@ -2958,7 +2951,7 @@ function overlayWriteOps(
  *  never be geometry-walked (resizing it reflows the buffer and desyncs it
  *  from its container). Exact worker replays end with a self-contained chunk
  *  — a full idempotent repaint at the current PTY geometry — so the final
- *  chunk alone seeds the screen. Legacy transcript fallback is reformatted. */
+ *  chunk alone seeds the screen. Plain endpoint replay is reformatted. */
 function liveSeedWriteOps(text: string): SequencedWrite[] {
   const exact = parseExactReplay(text);
   if (!exact) {
@@ -2969,7 +2962,7 @@ function liveSeedWriteOps(text: string): SequencedWrite[] {
 
 function formatSnapshotForXterm(input: string): string {
   const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
-  // Legacy snapshots can terminate the final row with a newline; writing it would
+  // Plain snapshots can terminate the final row with a newline; writing it would
   // scroll the terminal one row past the content and desync subsequent
   // app-relative drawing by one row (e.g. input echo landing on the status
   // bar row). Leave the cursor on the last content row instead.
@@ -2990,7 +2983,7 @@ function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // back to the agent after transcript replay can echo fragments like "0;276;0c".
+  // back to the agent after replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

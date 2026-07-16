@@ -180,39 +180,6 @@ export const AgentSchema = z.object({
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
-export const AgentInputResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  bytes: z.number().int(),
-});
-export type AgentInputResult = z.infer<typeof AgentInputResultSchema>;
-
-export const AgentResizeResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  cols: z.number().int(),
-  rows: z.number().int(),
-});
-export type AgentResizeResult = z.infer<typeof AgentResizeResultSchema>;
-
-export const AgentScrollResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  lines: z.number().int(),
-});
-export type AgentScrollResult = z.infer<typeof AgentScrollResultSchema>;
-
-export const AgentRedrawResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  redraw: z.boolean(),
-});
-export type AgentRedrawResult = z.infer<typeof AgentRedrawResultSchema>;
-
-export const AgentSnapshotSchema = z.object({
-  agent_id: z.string().uuid(),
-  bytes_b64: z.string(),
-  plain: z.boolean(),
-  lines: z.number().int(),
-});
-export type AgentSnapshot = z.infer<typeof AgentSnapshotSchema>;
-
 export const AgentUploadResultSchema = z.object({
   agent_id: z.string().uuid(),
   path: z.string(),
@@ -519,8 +486,6 @@ export const agents = {
     argv?: string[];
     env?: Record<string, string>;
     skill_ids?: string[];
-    cols?: number;
-    rows?: number;
     create_cwd?: boolean;
   }) =>
     api("/api/agents", {
@@ -534,40 +499,11 @@ export const agents = {
       body: JSON.stringify(body),
       schema: AgentSchema,
     }),
-  restart: (id: string, body?: { cols?: number; rows?: number; create_cwd?: boolean }) =>
+  restart: (id: string, body?: { create_cwd?: boolean }) =>
     api(`/api/agents/${id}/restart`, {
       method: "POST",
       body: JSON.stringify(body ?? {}),
       schema: AgentSchema,
-    }),
-  input: (id: string, body: { text?: string; bytes_b64?: string }) =>
-    api(`/api/agents/${id}/input`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentInputResultSchema,
-    }),
-  resize: (id: string, body: { cols: number; rows: number }) =>
-    api(`/api/agents/${id}/resize`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentResizeResultSchema,
-    }),
-  scroll: (id: string, body: { lines: number }) =>
-    api(`/api/agents/${id}/scroll`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentScrollResultSchema,
-    }),
-  redraw: (id: string) =>
-    api(`/api/agents/${id}/redraw`, {
-      method: "POST",
-      schema: AgentRedrawResultSchema,
-    }),
-  snapshot: (id: string, body?: { lines?: number; plain?: boolean }) =>
-    api(`/api/agents/${id}/snapshot`, {
-      method: "POST",
-      body: JSON.stringify(body ?? {}),
-      schema: AgentSnapshotSchema,
     }),
   upload: (
     id: string,

@@ -21,7 +21,7 @@ export const TERMINAL_FONT_FAMILY =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
 
 /** Scrollback depths. The live terminal keeps a deep local buffer for replay;
- * the history overlay renders daemon snapshots capped at snapshot depth. */
+ * the history overlay renders endpoint worker snapshots capped at this depth. */
 export const TERMINAL_SCROLLBACK_LINES = 100_000;
 export const TERMINAL_SNAPSHOT_LINES = 10_000;
 

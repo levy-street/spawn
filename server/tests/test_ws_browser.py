@@ -8,15 +8,14 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from spawn_server import auth, transcript
+from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
 from spawn_server.redis import get_backend
 from spawn_server.ws.broker import DaemonConn, get_broker
-from spawn_server.ws.browser import INITIAL_SNAPSHOT_LINES, browser_ws
+from spawn_server.ws.browser import browser_ws
 from spawn_server.ws.daemon import _pump_host_rtc_signals
-from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
 from spawn_server.ws.host_signal import (
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
     HostPresenceOwner,
@@ -38,7 +37,7 @@ class FakeBrowserWebSocket:
         if authorization is not None:
             self.headers["authorization"] = authorization
         self.cookies = cookies or {}
-        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v1"]}
+        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v2"]}
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -56,6 +55,9 @@ class FakeBrowserWebSocket:
 
     async def send_text(self, value: str) -> None:
         self.sent_text.append(value)
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self.sent_text.append(json.dumps(value))
 
     async def send_bytes(self, value: bytes) -> None:
         self.sent_bytes.append(value)
@@ -188,7 +190,7 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(clien
 
     missing = FakeBrowserWebSocket()
     await browser_ws(missing, agent_id=agent_id, token=None)  # type: ignore[arg-type]
-    assert missing.accepted_subprotocol == "spawn.v1"
+    assert missing.accepted_subprotocol == "spawn.v2"
     assert missing.closed == (1008, "not authenticated")
 
     daemon_token = auth.issue_daemon_token("00000000-0000-4000-8000-000000000001", user_a)
@@ -202,279 +204,19 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(clien
 
     via_query = FakeBrowserWebSocket()
     via_query.queue_disconnect()
-    await browser_ws(via_query, agent_id=agent_id, token=token_a, cols=None, rows=None)  # type: ignore[arg-type]
+    await browser_ws(via_query, agent_id=agent_id, token=token_a)  # type: ignore[arg-type]
     assert via_query.closed is None
 
-
-async def test_browser_ws_replays_transcript_history_and_status(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("SPAWN_TRANSCRIPT_DIR", str(tmp_path / "transcripts"))
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    user_id, token = await _signup(client, "ws-browser-history@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_id, status="quiet")
-    await transcript.append(agent_id, b"historical output\n")
-
-    ws = FakeBrowserWebSocket(cookies={"spawn_session": token})
-    ws.queue_disconnect()
-
-    await browser_ws(ws, agent_id=agent_id, cols=120, rows=32)  # type: ignore[arg-type]
-
-    display = _messages_of_type(ws, "display.control")
-    assert display[0] == {
-        "type": "display.control",
-        "owner": True,
-        "cols": 120,
-        "rows": 32,
-        "viewers": 1,
-    }
-    history = _messages_of_type(ws, "history")
-    assert base64.b64decode(history[0]["bytes_b64"]) == b"historical output\n"
-    assert _messages_of_type(ws, "agent.status")[-1] == {
-        "type": "agent.status",
-        "status": "quiet",
-    }
-
-
-async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client):
-    user_id, token = await _signup(client, "ws-browser-daemon-history@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
-
-    daemon_ws = FakeDaemonWebSocket()
-    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
-    broker = get_broker()
-    await broker.register_daemon(daemon)
-    await _accept_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
-
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
-    task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None, cols=120, rows=32)  # type: ignore[arg-type]
+    old = FakeBrowserWebSocket(
+        authorization=f"Bearer {token_a}", subprotocols=["spawn.v1"]
     )
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "agent.snapshot" for item in daemon_ws.sent_text)
-    )
+    await browser_ws(old, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+    assert old.accepted_subprotocol is None
+    assert _messages_of_type(old, "protocol.required") == [
+        {"type": "protocol.required", "protocol": "spawn.v2", "version": 2}
+    ]
+    assert old.closed == (4003, "protocol upgrade required")
 
-    snapshot_request = [
-        json.loads(item)
-        for item in daemon_ws.sent_text
-        if json.loads(item).get("type") == "agent.snapshot"
-    ][-1]
-    assert snapshot_request == {
-        "type": "agent.snapshot",
-        "agent_id": agent_id,
-        "lines": INITIAL_SNAPSHOT_LINES,
-        "request_id": snapshot_request["request_id"],
-    }
-
-    assert await broker.resolve_snapshot(
-        agent_id,
-        {
-            "request_id": snapshot_request["request_id"],
-            "bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii"),
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    await _wait_until(lambda: len(_messages_of_type(ws, "history")) >= 1)
-    history = _messages_of_type(ws, "history")[-1]
-    assert base64.b64decode(history["bytes_b64"]) == b"daemon history\n"
-
-    ws.queue_disconnect()
-    await asyncio.wait_for(task, timeout=1)
-    await broker.unregister_daemon(daemon)
-
-
-async def test_browser_ws_display_control_tracks_owner_and_viewer_takeover(client):
-    user_id, token = await _signup(client, "ws-browser-display@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_id)
-
-    first = FakeBrowserWebSocket(authorization=f"Bearer {token}")
-    second = FakeBrowserWebSocket(authorization=f"Bearer {token}")
-    first_task = asyncio.create_task(
-        browser_ws(first, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
-    )
-    second_task = asyncio.create_task(
-        browser_ws(second, agent_id=agent_id, token=None, cols=80, rows=24)  # type: ignore[arg-type]
-    )
-
-    await _wait_until(lambda: len(_messages_of_type(second, "display.control")) >= 1)
-    assert _messages_of_type(first, "display.control")[-1]["owner"] is True
-    assert _messages_of_type(first, "display.control")[-1]["viewers"] == 2
-    assert _messages_of_type(second, "display.control")[-1] == {
-        "type": "display.control",
-        "owner": False,
-        "cols": 100,
-        "rows": 30,
-        "viewers": 2,
-    }
-
-    second.queue_text({"type": "take_control", "cols": 132, "rows": 40})
-    await _wait_until(lambda: _messages_of_type(second, "display.control")[-1]["owner"] is True)
-    assert _messages_of_type(second, "display.control")[-1]["cols"] == 132
-    assert _messages_of_type(second, "display.control")[-1]["rows"] == 40
-    assert _messages_of_type(first, "display.control")[-1]["owner"] is False
-
-    first.queue_disconnect()
-    second.queue_disconnect()
-    await asyncio.wait_for(first_task, timeout=1)
-    await asyncio.wait_for(second_task, timeout=1)
-
-
-async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_daemon(
-    client, monkeypatch
-):
-    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    user_id, token = await _signup(client, "ws-browser-forward@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
-
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
-    task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
-    )
-    await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
-
-    daemon_ws = FakeDaemonWebSocket()
-    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
-    broker = get_broker()
-    await broker.register_daemon(daemon)
-    await _accept_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
-    signal_ready = asyncio.Event()
-    expiry_tasks: set[asyncio.Task[None]] = set()
-    signal_task = asyncio.create_task(
-        _pump_host_rtc_signals(daemon, signal_ready, expiry_tasks)
-    )
-    await wait_for_signal_pump(signal_task, signal_ready)
-
-    ws.queue_bytes(b"hello")
-    await _wait_until(lambda: len(daemon_ws.sent_bytes) >= 1)
-    frame = decode_binary_frame(daemon_ws.sent_bytes[-1])
-    assert frame.kind == KIND_INPUT
-    assert frame.agent_id == agent_id
-    assert frame.payload == b"hello"
-
-    ws.queue_text({"type": "resize", "cols": 111, "rows": 33})
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "agent.resize" for item in daemon_ws.sent_text)
-    )
-    resize = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.resize"][-1]
-    assert resize == {"type": "agent.resize", "agent_id": agent_id, "cols": 111, "rows": 33}
-
-    # Legacy spawn.v1 input still stamps activity on the server because its
-    # bytes traverse this websocket path.
-    sm = get_sessionmaker()
-    async with sm() as session:
-        agent = await session.get(Agent, agent_id)
-        assert agent is not None
-        assert agent.last_input_at is not None
-
-    ws.queue_text({"type": "scroll", "lines": 999})
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "agent.scroll" for item in daemon_ws.sent_text)
-    )
-    scroll = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.scroll"][-1]
-    assert scroll == {"type": "agent.scroll", "agent_id": agent_id, "lines": 200}
-
-    upload_body = base64.b64encode(b"file body").decode("ascii")
-    ws.queue_text(
-        {
-            "type": "upload",
-            "name": "note.txt",
-            "mime_type": "text/plain",
-            "bytes_b64": upload_body,
-            "destination": "cwd",
-            "paste": False,
-            "client_id": "client-1",
-        }
-    )
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "agent.upload" for item in daemon_ws.sent_text)
-    )
-    upload = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.upload"][-1]
-    request_id = upload.pop("request_id")
-    assert isinstance(request_id, str)
-    assert request_id != "client-1"
-    assert upload == {
-        "type": "agent.upload",
-        "agent_id": agent_id,
-        "cwd": "/repo",
-        "name": "note.txt",
-        "mime_type": "text/plain",
-        "bytes_b64": upload_body,
-        "paste_prefix": "",
-        "paste": False,
-        "destination": "cwd",
-        "client_id": "client-1",
-    }
-    result = {
-        "type": "agent.uploaded",
-        "agent_id": agent_id,
-        "request_id": request_id,
-        "client_id": "client-1",
-        "path": "/repo/note.txt",
-    }
-    assert await broker.resolve_upload(
-        agent_id,
-        request_id,
-        result,
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    await _wait_until(lambda: bool(_messages_of_type(ws, "upload.saved")))
-    assert _messages_of_type(ws, "upload.saved")[-1] == {
-        "type": "upload.saved",
-        "client_id": "client-1",
-        "path": "/repo/note.txt",
-    }
-
-    ws.queue_text({"type": "redraw"})
-    ws.queue_text({"type": "rtc.offer", "session_id": "rtc-browser-1", "sdp": "v=0\r\n"})
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "rtc.offer" for item in daemon_ws.sent_text)
-    )
-    offer = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "rtc.offer"][-1]
-    assert not any(
-        json.loads(item).get("type") == "agent.redraw" for item in daemon_ws.sent_text
-    )
-    binding_nonce = offer["binding_nonce"]
-    assert isinstance(binding_nonce, str) and len(binding_nonce) == 32
-    assert offer == {
-        "type": "rtc.offer",
-        "session_id": "rtc-browser-1",
-        "agent_id": agent_id,
-        "binding_nonce": binding_nonce,
-        "binding_generation": daemon.host_generation,
-        "sdp": "v=0\r\n",
-        "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
-    }
-
-    candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
-    ws.queue_text({"type": "rtc.candidate", "session_id": "rtc-browser-1", "candidate": candidate})
-    await _wait_until(
-        lambda: any(json.loads(item).get("type") == "rtc.candidate" for item in daemon_ws.sent_text)
-    )
-    rtc_candidate = [
-        json.loads(item)
-        for item in daemon_ws.sent_text
-        if json.loads(item).get("type") == "rtc.candidate"
-    ][-1]
-    assert rtc_candidate == {
-        "type": "rtc.candidate",
-        "session_id": "rtc-browser-1",
-        "agent_id": agent_id,
-        "binding_nonce": binding_nonce,
-        "binding_generation": daemon.host_generation,
-        "candidate": candidate,
-    }
-
-    ws.queue_disconnect()
-    await asyncio.wait_for(task, timeout=1)
-    signal_task.cancel()
-    await asyncio.gather(signal_task, return_exceptions=True)
-    for expiry_task in expiry_tasks:
-        expiry_task.cancel()
-    await asyncio.gather(*expiry_tasks, return_exceptions=True)
-    await broker.unregister_daemon(daemon)
 
 
 async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, monkeypatch):
@@ -483,7 +225,7 @@ async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, mon
     host_id, agent_id = await _create_host_and_agent(user_id)
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None, cols=80, rows=24)  # type: ignore[arg-type]
+        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
     )
     await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
 
@@ -565,73 +307,9 @@ async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, mon
     await asyncio.wait_for(task, timeout=1)
 
 
-async def test_browser_ws_fans_out_live_bytes_and_isolates_agents(client):
-    from spawn_server.redis import get_backend
-
-    user_id, token = await _signup(client, "ws-browser-fanout@example.com")
-    _host_id, agent_ids = await _create_host_with_agents(user_id, 2)
-    first_agent, second_agent = agent_ids
-
-    first_agent_sockets = [
-        FakeBrowserWebSocket(authorization=f"Bearer {token}"),
-        FakeBrowserWebSocket(authorization=f"Bearer {token}"),
-        FakeBrowserWebSocket(authorization=f"Bearer {token}"),
-    ]
-    second_agent_sockets = [
-        FakeBrowserWebSocket(authorization=f"Bearer {token}"),
-        FakeBrowserWebSocket(authorization=f"Bearer {token}"),
-    ]
-    tasks = [
-        asyncio.create_task(browser_ws(ws, agent_id=first_agent, token=None, cols=100, rows=30))  # type: ignore[arg-type]
-        for ws in first_agent_sockets
-    ] + [
-        asyncio.create_task(browser_ws(ws, agent_id=second_agent, token=None, cols=90, rows=25))  # type: ignore[arg-type]
-        for ws in second_agent_sockets
-    ]
-
-    try:
-        all_sockets = first_agent_sockets + second_agent_sockets
-        await _wait_until(
-            lambda: all(len(_messages_of_type(ws, "agent.status")) >= 1 for ws in all_sockets)
-        )
-        backend = get_backend()
-        assert backend.inproc is not None
-        await _wait_until(
-            lambda: len(backend.inproc._subs.get(f"spawn:agent:{first_agent}", ())) == 3
-            and len(backend.inproc._subs.get(f"spawn:agent:{second_agent}", ())) == 2
-        )
-
-        await backend.publish(first_agent, b"first-agent-output\n")
-        await backend.publish(second_agent, b"second-agent-output\n")
-
-        await _wait_until(
-            lambda: all(b"first-agent-output" in b"".join(ws.sent_bytes) for ws in first_agent_sockets)
-            and all(
-                b"second-agent-output" in b"".join(ws.sent_bytes) for ws in second_agent_sockets
-            )
-        )
-        assert all(b"second-agent-output" not in b"".join(ws.sent_bytes) for ws in first_agent_sockets)
-        assert all(b"first-agent-output" not in b"".join(ws.sent_bytes) for ws in second_agent_sockets)
-
-        first_agent_display = [
-            _messages_of_type(ws, "display.control")[-1] for ws in first_agent_sockets
-        ]
-        second_agent_display = [
-            _messages_of_type(ws, "display.control")[-1] for ws in second_agent_sockets
-        ]
-        assert {message["viewers"] for message in first_agent_display} == {3}
-        assert {message["viewers"] for message in second_agent_display} == {2}
-        assert sum(1 for message in first_agent_display if message["owner"]) == 1
-        assert sum(1 for message in second_agent_display if message["owner"]) == 1
-    finally:
-        for ws in first_agent_sockets + second_agent_sockets:
-            ws.queue_disconnect()
-        await asyncio.gather(*(asyncio.wait_for(task, timeout=1) for task in tasks))
-
 
 async def test_browser_ws_v2_never_relays_pty_bytes(client):
-    """spawn.v2 (docs/TRUST.md Phase 1): no binary in either direction."""
-    from spawn_server.redis import get_backend
+    """spawn.v2 never exposes a server-side PTY byte path."""
 
     user_id, token = await _signup(client, "ws-browser-v2@example.com")
     host_id, agent_id = await _create_host_and_agent(user_id)
@@ -641,10 +319,8 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
     await broker.register_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
-    ws = FakeBrowserWebSocket(
-        authorization=f"Bearer {token}", subprotocols=["spawn.v2", "spawn.v1"]
-    )
-    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30))  # type: ignore[arg-type]
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None))  # type: ignore[arg-type]
 
     try:
         await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
@@ -663,12 +339,10 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
             for frame in daemon_frames
         )
 
-        # v2 browsers are never subscribed to the PTY pubsub feed.
+        # There is no terminal-content pubsub channel or binary send path.
         backend = get_backend()
         assert backend.inproc is not None
-        assert len(backend.inproc._subs.get(f"spawn:agent:{agent_id}", ())) == 0
-        await backend.publish(agent_id, b"live-output\n")
-        await asyncio.sleep(0.05)
+        assert f"spawn:agent:{agent_id}" not in backend.inproc._subs
         assert ws.sent_bytes == []
     finally:
         ws.queue_disconnect()
@@ -692,7 +366,7 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         authorization=f"Bearer {token}", subprotocols=["spawn.v2"]
     )
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
+        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
     )
     session_id = "reused-v2-session"
     nonce_a = "a" * 32
@@ -730,6 +404,10 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         first_offer = _daemon_messages_of_type(daemon_ws, "rtc.offer")[-1]
         assert first_offer["binding_nonce"] == nonce_a
         assert first_offer["binding_generation"] == daemon.host_generation
+        assert first_offer["scope_type"] == "agent"
+        assert first_offer["scope_id"] == agent_id
+        assert first_offer["protocol"] == "spawn.pty"
+        assert first_offer["protocol_version"] == 2
 
         ws.queue_text(
             {"type": "rtc.close", "session_id": session_id, "binding_nonce": nonce_a}
@@ -841,7 +519,7 @@ async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
     _host_id, agent_id = await _create_host_and_agent(user_id)
 
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
-    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30))  # type: ignore[arg-type]
+    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None))  # type: ignore[arg-type]
 
     await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
     ws.queue_bytes(b"stdin over the relay")
@@ -857,7 +535,7 @@ async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
 
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None, cols=None, rows=None)  # type: ignore[arg-type]
+        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
     )
 
     await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
@@ -865,24 +543,3 @@ async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
     await asyncio.wait_for(task, timeout=1)
 
     assert ws.closed == (4002, "terminal control belongs on spawn.ctl")
-
-
-async def test_browser_ws_v2_falls_back_to_v1_when_webrtc_disabled(client, monkeypatch):
-    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "false")
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-    try:
-        user_id, token = await _signup(client, "ws-browser-v2-nortc@example.com")
-        _host_id, agent_id = await _create_host_and_agent(user_id)
-
-        ws = FakeBrowserWebSocket(
-            authorization=f"Bearer {token}", subprotocols=["spawn.v2", "spawn.v1"]
-        )
-        ws.queue_disconnect()
-        await browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
-
-        # A v2 accept with WebRTC off would leave the client with no live
-        # path at all; the server keeps such clients on the v1 relay.
-        assert ws.accepted_subprotocol == "spawn.v1"
-    finally:
-        monkeypatch.delenv("SPAWN_WEBRTC_ENABLED", raising=False)
-        get_settings.cache_clear()  # type: ignore[attr-defined]

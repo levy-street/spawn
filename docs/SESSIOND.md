@@ -36,12 +36,11 @@ everything else.
 
 ## 2. Design principles
 
-1. **The server-never-sees-content model is the target, not this checkpoint's
-   current claim** (TRUST.md). The new worker protocol itself stays on a unix
+1. **The agent terminal path is endpoint-owned at the P2-AGENT-02
+   implementation checkpoint** (review pending; TRUST.md). The worker protocol stays on a Unix
    socket in a `0700` directory, and the browser's low-latency copy travels over
-   WebRTC DataChannels. Until P2-AGENT-02, however, spawnd also mirrors every
-   normally connected agent's output over daemon WS `0x01`; the control plane
-   can relay and persist that plaintext even when the browser negotiated v2.
+   mandatory WebRTC DataChannels. `spawnd` sends only content-free activity and
+   signaling/lifecycle JSON over its server control socket.
 2. **User-facing terminal rendering lives in the browser.** xterm.js in
    `web/` owns the grid a human sees. The worker also holds a *headless
    checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
@@ -225,13 +224,12 @@ Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
 does not hold a local agent PTY, a child process handle, or a backend
 discriminator.
 
-The unix-socket hop adds no control-plane exposure, but the complete live path
-still does: until P2-AGENT-02, spawnd sends daemon WS `0x01` output for the
-legacy relay/transcript path for v1 and v2 browser sessions alike. Legacy
-snapshot responses can also ride browser WS as `agent.snapshot` JSON (base64).
-P2-AGENT-01 adds `spawn.ctl` replay with a stream-position watermark; it does
-not cut either legacy content leg. P2-AGENT-02 must remove them before Phase 2
-is true.
+The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removes daemon
+WS terminal binary frames, browser relay/history/snapshot frames, transcripts,
+and content pubsub. `spawn.ctl` replay carries a stream-position watermark
+directly to the browser. This agent cut does not make all of Phase 2 true:
+uploads, host operations, launch manifests, error detail, historical purge,
+and the final audit remain separate tracked tasks.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -577,8 +575,8 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 | TRUST.md phase | sessiond contribution |
 |---|---|
-| **Phase 1** (shipped) — DataChannel-only PTY | worker backend adds no exposure beyond the existing legacy mirror: its unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server). Normally connected output still mirrors through daemon WS until P2-AGENT-02 removes that leg |
-| **Phase 2** — daemon-owned data, server stores deleted | this is the enabling work: scrollback/history/snapshot become daemon-owned artifacts (encrypted, at that) with a watermarked raw-byte replay primitive ready to move from WS-JSON onto a DataChannel history stream; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc` on the way to E2E `agent.create` |
+| **Phase 1** (shipped) — DataChannel-only PTY | worker backend removed tmux as a plaintext holder; P2-AGENT-02 now removes the legacy server mirror at its review-pending implementation checkpoint |
+| **Phase 2** — endpoint-owned data, server stores deleted | scrollback/history/snapshot are worker-owned encrypted artifacts with watermarked replay over `spawn.ctl`; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc`, while later tasks must still make launch and host paths E2E and purge historical copies |
 | **Phase 3** — signed signaling | orthogonal to sessiond (signaling-layer); nothing here assumes server-trusted introductions |
 | **Phase 4 / Later** — open source; encrypted transcript backup | worker is self-contained and auditable (`daemon/src/sessiond/` has no control-plane deps); device-key-sealed backup slots in as a separate artifact per §7 |
 
@@ -587,10 +585,10 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 - **Backpressure follow-up** (§9): Phase 2 uses bounded per-viewer sinks,
   disconnect-on-stall and replay-based catch-up; future work may add adaptive
   queue sizing and transport telemetry.
-- **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
+- **History over DataChannel review** (Phase 2): `spawn.ctl` carries
   worker-backed connect history and snapshots using request-bound chunks
-  and explicit PTY byte anchors; independent review and the later removal of
-  the legacy base64-WS leg remain before the cut is complete.
+  and explicit PTY byte anchors; the legacy base64-WS leg is removed in the
+  P2-AGENT-02 implementation and independent review remains.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed
   streams via the harness.
 - **Worker resource limits**: per-worker RLIMIT/cgroup knobs if agents start
