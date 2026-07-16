@@ -19,6 +19,121 @@ need python3
 need ps
 need readlink
 need tr
+need uname
+
+linux_process_primitives_available() {
+  local system_name="$1"
+  local proc_root="$2"
+  local self_comm
+
+  [[ "$system_name" == "Linux" ]] || return 1
+  [[ -r "$proc_root/self/stat" && -r "$proc_root/self/cmdline" \
+    && -L "$proc_root/self/exe" && -r "$proc_root/self/comm" ]] || return 1
+  self_comm="$(<"$proc_root/self/comm")"
+  [[ -n "$self_comm" ]] || return 1
+  ps -C "$self_comm" -o pid= >/dev/null 2>&1
+}
+
+linux_process_identity_at() {
+  local proc_root="$1"
+  local pid="$2"
+  python3 - "$proc_root" "$pid" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+proc = Path(sys.argv[1]) / sys.argv[2]
+try:
+    stat_tail = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+    starttime = stat_tail[19]
+    executable = os.readlink(proc / "exe")
+    cmdline = (proc / "cmdline").read_bytes()
+except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
+    raise SystemExit(1)
+if not starttime.isdecimal() or not executable or not cmdline:
+    raise SystemExit(1)
+fingerprint = hashlib.sha256(os.fsencode(executable) + b"\0" + cmdline).hexdigest()
+print(f"{starttime}:{fingerprint}")
+PY
+}
+
+owned_process_identity_matches() {
+  local proc_root="$1"
+  local pid="$2"
+  local expected="$3"
+  local observed
+
+  [[ -n "$expected" ]] || return 1
+  observed="$(linux_process_identity_at "$proc_root" "$pid")" || return 1
+  [[ "$observed" == "$expected" ]]
+}
+
+capture_owned_process_identity() {
+  local label="$1"
+  local pid="$2"
+  local expected_exe="$3"
+  shift 3
+  local identity=""
+
+  for _ in {1..100}; do
+    identity="$(python3 - "/proc" "$pid" "$expected_exe" "$@" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+proc = Path(sys.argv[1]) / sys.argv[2]
+expected_exe = os.path.realpath(sys.argv[3])
+expected_argv = sys.argv[4:]
+try:
+    stat_tail = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+    starttime = stat_tail[19]
+    executable = os.readlink(proc / "exe")
+    cmdline = (proc / "cmdline").read_bytes()
+except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
+    raise SystemExit(1)
+argv = [part.decode(errors="surrogateescape") for part in cmdline.split(b"\0") if part]
+if os.path.realpath(executable) != expected_exe or argv != expected_argv:
+    raise SystemExit(1)
+fingerprint = hashlib.sha256(os.fsencode(executable) + b"\0" + cmdline).hexdigest()
+print(f"{starttime}:{fingerprint}")
+PY
+)" && [[ -n "$identity" ]] && {
+      printf '%s\n' "$identity"
+      return 0
+    }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  printf 'smoke-local-daemon: %s launch identity did not stabilize for pid %s\n' \
+    "$label" "$pid" >&2
+  return 1
+}
+
+validate_worker_socket_paths() {
+  local dir="$1"
+  python3 - "$dir" <<'PY'
+import os
+import sys
+
+directory = sys.argv[1]
+uuid = "f" * 8 + "-" + "f" * 4 + "-" + "4" + "f" * 3 + "-" + "8" + "f" * 3 + "-" + "f" * 12
+names = (
+    f"{uuid}.sock",
+    f"{uuid}.lifecycle.sock",
+    f".lifecycle-client-4294967295-{uuid}.sock",
+)
+limit = 107  # Linux sockaddr_un.sun_path bytes excluding the trailing NUL.
+too_long = [(name, len(os.fsencode(os.path.join(directory, name)))) for name in names]
+too_long = [(name, length) for name, length in too_long if length > limit]
+if too_long:
+    detail = ", ".join(f"{name}={length}" for name, length in too_long)
+    raise SystemExit(
+        f"smoke-local-daemon: worker socket path exceeds Linux {limit}-byte limit: {detail}"
+    )
+PY
+}
 
 owned_group_live_pids() {
   local pgid="$1"
@@ -59,8 +174,9 @@ stop_owned_process_group() {
   local label="$1"
   local pid="$2"
   local pgid="$3"
-  local term_attempts="${4:-100}"
-  local kill_attempts="${5:-100}"
+  local identity="$4"
+  local term_attempts="${5:-100}"
+  local kill_attempts="${6:-100}"
   local observed_pgid=""
 
   if [[ ! "$pid" =~ ^[1-9][0-9]*$ || "$pgid" != "$pid" ]]; then
@@ -75,8 +191,12 @@ stop_owned_process_group() {
       "$label" "$pid" "$pgid" "$observed_pgid" >&2
     return 1
   fi
-
   if owned_group_is_live "$pgid"; then
+    if ! owned_process_identity_matches /proc "$pid" "$identity"; then
+      printf 'smoke-local-daemon: refusing %s TERM after launch identity changed; pid=%s pgid=%s\n' \
+        "$label" "$pid" "$pgid" >&2
+      return 1
+    fi
     kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
     for ((attempt = 0; attempt < term_attempts; attempt++)); do
       owned_group_is_live "$pgid" || break
@@ -87,6 +207,11 @@ stop_owned_process_group() {
   if owned_group_is_live "$pgid"; then
     printf 'smoke-local-daemon: %s did not stop after TERM; escalating owned process group %s\n' \
       "$label" "$pgid" >&2
+    if ! owned_process_identity_matches /proc "$pid" "$identity"; then
+      printf 'smoke-local-daemon: refusing %s KILL after launch identity changed; pid=%s pgid=%s\n' \
+        "$label" "$pid" "$pgid" >&2
+      return 1
+    fi
     kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
     for ((attempt = 0; attempt < kill_attempts; attempt++)); do
       owned_group_is_live "$pgid" || break
@@ -144,8 +269,16 @@ scoped_worker_pids() {
 }
 
 active_scoped_worker_pids() {
-  local worker_exe proc pid
-  worker_exe="$(readlink -f daemon/target/debug/spawn-worker 2>/dev/null)" || return 0
+  local candidate_stat worker_exe proc pid
+  if ! linux_process_primitives_available "$(uname -s)" /proc; then
+    printf '%s\n' "smoke-local-daemon: worker audit lost required Linux process identity" >&2
+    return 1
+  fi
+  if ! worker_exe="$(readlink -f daemon/target/debug/spawn-worker 2>/dev/null)" \
+    || [[ ! -x "$worker_exe" ]]; then
+    printf '%s\n' "smoke-local-daemon: cannot establish exact spawn-worker identity" >&2
+    return 1
+  fi
 
   # Ask procps for the small set of kernel comm-name candidates, then apply
   # the exact executable and private --socket identity checks. This keeps
@@ -154,6 +287,24 @@ active_scoped_worker_pids() {
     pid="${pid//[[:space:]]/}"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
     proc="/proc/$pid"
+    [[ -d "$proc" ]] || continue
+    candidate_stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$candidate_stat" == Z* ]]; then
+      continue
+    fi
+    if [[ -z "$candidate_stat" ]]; then
+      [[ -d "$proc" ]] || continue
+      printf 'smoke-local-daemon: cannot read spawn-worker candidate state for pid %s\n' \
+        "$pid" >&2
+      return 1
+    fi
+    if [[ ! -r "$proc/cmdline" || ! -L "$proc/exe" ]] \
+      || ! readlink "$proc/exe" >/dev/null 2>&1; then
+      [[ -d "$proc" ]] || continue
+      printf 'smoke-local-daemon: cannot validate spawn-worker candidate pid %s\n' \
+        "$pid" >&2
+      return 1
+    fi
     if scoped_worker_pid_matches "$proc" "$worker_exe" "$worker_dir"; then
       printf '%s\n' "$pid"
     fi
@@ -190,8 +341,74 @@ self_test_scoped_worker_pids() {
   printf '%s\n' "smoke-local-daemon: scoped worker matcher self-test passed"
 }
 
+self_test_launch_identity() {
+  local fixture expected identity
+  fixture="$(mktemp -d)"
+  expected="$fixture/owned"
+  : >"$expected"
+  mkdir -p "$fixture/proc/201"
+  ln -s "$expected" "$fixture/proc/201/exe"
+  python3 - "$fixture/proc/201" "$fixture" <<'PY'
+import sys
+from pathlib import Path
+
+proc = Path(sys.argv[1])
+cwd = sys.argv[2]
+fields = ["S", *("0" for _ in range(18)), "12345"]
+(proc / "stat").write_text(f"201 (owned) {' '.join(fields)}\n", encoding="utf-8")
+(proc / "cmdline").write_bytes(b"owned\0--cwd\0" + cwd.encode() + b"\0")
+PY
+  identity="$(linux_process_identity_at "$fixture/proc" 201)"
+  owned_process_identity_matches "$fixture/proc" 201 "$identity"
+
+  # Same executable and directory, but an unrelated command line, must not
+  # inherit the recorded launch identity.
+  printf 'unrelated\0--cwd\0%s\0' "$fixture" >"$fixture/proc/201/cmdline"
+  if owned_process_identity_matches "$fixture/proc" 201 "$identity"; then
+    printf '%s\n' "smoke-local-daemon: unrelated launch identity was accepted" >&2
+    rm -rf "$fixture"
+    return 1
+  fi
+
+  # Restoring argv cannot hide PID reuse: /proc starttime remains part of the
+  # identity and changing it must also fail closed.
+  printf 'owned\0--cwd\0%s\0' "$fixture" >"$fixture/proc/201/cmdline"
+  python3 - "$fixture/proc/201/stat" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+fields = path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+fields[19] = "12346"
+path.write_text(f"201 (owned) {' '.join(fields)}\n", encoding="utf-8")
+PY
+  if owned_process_identity_matches "$fixture/proc" 201 "$identity"; then
+    printf '%s\n' "smoke-local-daemon: changed process starttime was accepted" >&2
+    rm -rf "$fixture"
+    return 1
+  fi
+  rm -rf "$fixture"
+  printf '%s\n' "smoke-local-daemon: launch identity self-test passed"
+}
+
+self_test_platform_and_socket_guards() {
+  local long_dir
+  if linux_process_primitives_available Darwin /proc \
+    || linux_process_primitives_available Linux /nonexistent; then
+    printf '%s\n' "smoke-local-daemon: unsupported process platform was accepted" >&2
+    return 1
+  fi
+  validate_worker_socket_paths /tmp/smoke/workers
+  printf -v long_dir '/tmp/%090d/workers' 0
+  if validate_worker_socket_paths "$long_dir" >/dev/null 2>&1; then
+    printf '%s\n' "smoke-local-daemon: oversized worker socket path was accepted" >&2
+    return 1
+  fi
+  printf '%s\n' "smoke-local-daemon: platform and socket guard self-test passed"
+}
+
 self_test_owned_process_group() {
-  local fixture pid
+  local fixture identity pid python_exe
 
   fixture="$(mktemp -d)"
   python3 - "$fixture/ready" <<'PY' &
@@ -218,11 +435,35 @@ PY
   done
   if [[ ! -f "$fixture/ready" ]]; then
     printf '%s\n' "smoke-local-daemon: owned process group self-test did not become ready" >&2
-    stop_owned_process_group "self-test process" "$pid" "$pid" 20 20 || true
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
     rm -rf "$fixture"
     return 1
   fi
-  stop_owned_process_group "self-test process" "$pid" "$pid" 20 20
+  python_exe="$(readlink -f "$(command -v python3)")"
+  if ! identity="$(capture_owned_process_identity \
+    "self-test process" "$pid" "$python_exe" python3 - "$fixture/ready")"; then
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$fixture"
+    return 1
+  fi
+  if stop_owned_process_group \
+    "self-test mismatched process" "$pid" "$pid" "0:$identity" 2 2 \
+    >/dev/null 2>&1; then
+    printf '%s\n' "smoke-local-daemon: mismatched launch identity was stopped" >&2
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$fixture"
+    return 1
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "smoke-local-daemon: identity mismatch signalled the owned process" >&2
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$fixture"
+    return 1
+  fi
+  stop_owned_process_group "self-test process" "$pid" "$pid" "$identity" 20 20
   rm -rf "$fixture"
   if owned_group_is_live "$pid"; then
     printf 'smoke-local-daemon: owned process group self-test leaked pgid %s\n' \
@@ -234,16 +475,32 @@ PY
 
 if [[ "${1:-}" == "--self-test" ]]; then
   self_test_scoped_worker_pids
+  self_test_launch_identity
+  self_test_platform_and_socket_guards
+  if ! linux_process_primitives_available "$(uname -s)" /proc; then
+    printf '%s\n' \
+      "smoke-local-daemon: self-test requires Linux /proc identity and procps -C" >&2
+    exit 1
+  fi
   self_test_owned_process_group
   exit 0
 fi
 
-tmp_template="${SPAWN_SMOKE_TMP_TEMPLATE:-${TMPDIR:-/tmp}/spawn-smoke.XXXXXX}"
+if ! linux_process_primitives_available "$(uname -s)" /proc; then
+  printf '%s\n' \
+    "smoke-local-daemon: Linux /proc identity and procps -C support are required" >&2
+  exit 1
+fi
+
+tmp_template="${SPAWN_SMOKE_TMP_TEMPLATE:-/tmp/spawn-smoke.XXXXXX}"
 tmp_dir="$(mktemp -d "$tmp_template")"
 server_pid=""
 server_pgid=""
+server_identity=""
 daemon_pid=""
 daemon_pgid=""
+daemon_identity=""
+worker_audit_required=0
 
 cleanup() {
   local status=$?
@@ -290,26 +547,36 @@ cleanup() {
       status=1
     fi
   fi
-  if declare -F wait_for_smoke_worker_teardown >/dev/null; then
+  if [[ "${worker_audit_required:-0}" == "1" ]] \
+    && declare -F wait_for_smoke_worker_teardown >/dev/null; then
     if ! wait_for_smoke_worker_teardown 200; then
       cleanup_safe=0
       status=1
     fi
   fi
-  if ! stop_daemon; then
-    cleanup_safe=0
-    status=1
+  if declare -F stop_daemon >/dev/null; then
+    if ! stop_daemon; then
+      cleanup_safe=0
+      status=1
+    fi
   fi
-  if ! stop_server; then
-    cleanup_safe=0
-    status=1
+  if declare -F stop_server >/dev/null; then
+    if ! stop_server; then
+      cleanup_safe=0
+      status=1
+    fi
   fi
 
-  if declare -F active_scoped_worker_pids >/dev/null \
-    && [[ -n "$(active_scoped_worker_pids)" ]]; then
-    printf '%s\n' "smoke-local-daemon: scoped worker audit found live workers after cleanup" >&2
-    cleanup_safe=0
-    status=1
+  if [[ "${worker_audit_required:-0}" == "1" ]]; then
+    local scoped_workers=""
+    if ! scoped_workers="$(active_scoped_worker_pids)"; then
+      cleanup_safe=0
+      status=1
+    elif [[ -n "$scoped_workers" ]]; then
+      printf '%s\n' "smoke-local-daemon: scoped worker audit found live workers after cleanup" >&2
+      cleanup_safe=0
+      status=1
+    fi
   fi
   if [[ -d "${worker_dir:-}" ]] \
     && [[ -n "$(find "$worker_dir" -maxdepth 1 -type s -print -quit 2>/dev/null)" ]]; then
@@ -347,6 +614,7 @@ agent_cwd="$tmp_dir/agent-cwd"
 fake_bin="$tmp_dir/fake-bin"
 worker_dir="$tmp_dir/workers"
 mkdir -p "$daemon_home" "$agent_cwd" "$fake_bin" "$worker_dir"
+validate_worker_socket_paths "$worker_dir"
 
 cat >"$fake_bin/codex" <<'SH'
 #!/usr/bin/env sh
@@ -403,6 +671,7 @@ SH
 chmod 755 "$fake_bin/codex"
 
 start_server() {
+  local identity uv_exe
   if [[ -n "$server_pid" || -n "$server_pgid" ]]; then
     printf 'smoke-local-daemon: refusing to start a second server; pid=%s pgid=%s\n' \
       "${server_pid:-unset}" "${server_pgid:-unset}" >&2
@@ -424,6 +693,11 @@ start_server() {
     return 1
   fi
   server_pgid="$server_pid"
+  uv_exe="$(readlink -f "$(command -v uv)")"
+  identity="$(capture_owned_process_identity \
+    "server" "$server_pid" "$uv_exe" \
+    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port")" || return 1
+  server_identity="$identity"
 
   for _ in {1..80}; do
     if curl -fsS "$base_url/healthz" >/dev/null 2>&1; then
@@ -436,21 +710,25 @@ start_server() {
 
 stop_server() {
   if [[ -n "$server_pid" ]]; then
-    if ! stop_owned_process_group "server" "$server_pid" "$server_pgid"; then
+    if ! stop_owned_process_group \
+      "server" "$server_pid" "$server_pgid" "$server_identity"; then
       return 1
     fi
     server_pid=""
     server_pgid=""
+    server_identity=""
   fi
 }
 
 start_daemon() {
+  local daemon_exe identity
   if [[ -n "$daemon_pid" || -n "$daemon_pgid" ]]; then
     printf 'smoke-local-daemon: refusing to start a second daemon; pid=%s pgid=%s\n' \
       "${daemon_pid:-unset}" "${daemon_pgid:-unset}" >&2
     return 1
   fi
   printf '%s\n' "smoke-local-daemon: starting spawnd for host $smoke_host_id"
+  worker_audit_required=1
   HOME="$daemon_home" \
     SPAWN_DISABLE_KEYRING=1 \
     SPAWN_CONFIG_DIR="$daemon_home/.config/spawn" \
@@ -465,15 +743,22 @@ start_daemon() {
     return 1
   fi
   daemon_pgid="$daemon_pid"
+  daemon_exe="$(readlink -f daemon/target/debug/spawnd)"
+  identity="$(capture_owned_process_identity \
+    "daemon" "$daemon_pid" "$daemon_exe" \
+    daemon/target/debug/spawnd --server "$base_url" run)" || return 1
+  daemon_identity="$identity"
 }
 
 stop_daemon() {
   if [[ -n "$daemon_pid" ]]; then
-    if ! stop_owned_process_group "daemon" "$daemon_pid" "$daemon_pgid"; then
+    if ! stop_owned_process_group \
+      "daemon" "$daemon_pid" "$daemon_pgid" "$daemon_identity"; then
       return 1
     fi
     daemon_pid=""
     daemon_pgid=""
+    daemon_identity=""
   fi
 }
 
@@ -507,7 +792,6 @@ PY
 
 wait_daemon_ready() {
   python3 - "$base_url" "$smoke_token" "$smoke_host_id" <<'PY'
-import json
 import sys
 import time
 import urllib.error
@@ -519,15 +803,16 @@ last = "no readiness attempt"
 
 while time.monotonic() < deadline:
     req = urllib.request.Request(
-        f"{base_url}/api/hosts/{host_id}/tools",
+        f"{base_url}/api/hosts/{host_id}/control/ping",
         headers={"Authorization": f"Bearer {token}"},
+        method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=3) as response:
-            payload = json.loads(response.read().decode())
-        if isinstance(payload.get("tools"), list):
+            body = response.read()
+        if response.status == 204 and body == b"":
             raise SystemExit(0)
-        last = f"malformed tool readiness response: {payload!r}"
+        last = f"malformed control ping response: status={response.status} body={body!r}"
     except urllib.error.HTTPError as error:
         last = f"HTTP {error.code}: {error.read().decode()}"
     except (TimeoutError, urllib.error.URLError) as error:
@@ -578,14 +863,18 @@ wait_for_smoke_worker_teardown() {
   local attempts="${1:-200}"
   local pids sockets
   for ((attempt = 0; attempt < attempts; attempt++)); do
-    pids="$(active_scoped_worker_pids)"
+    if ! pids="$(active_scoped_worker_pids)"; then
+      return 1
+    fi
     sockets="$(find "$worker_dir" -maxdepth 1 -type s -print -quit 2>/dev/null)"
     if [[ -z "$pids" && -z "$sockets" ]]; then
       return 0
     fi
     sleep 0.05
   done
-  pids="$(active_scoped_worker_pids)"
+  if ! pids="$(active_scoped_worker_pids)"; then
+    return 1
+  fi
   sockets="$(find "$worker_dir" -maxdepth 1 -type s -print 2>/dev/null)"
   printf 'smoke-local-daemon: scoped worker teardown timed out; pids=%s sockets=%s\n' \
     "${pids:-none}" "${sockets:-none}" >&2

@@ -260,6 +260,11 @@ async fn dispatch_loop(
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");
                 }
+                Inbound::HostPing { request_id } => {
+                    if let Ok(frame) = serde_json::to_string(&Outbound::HostPong { request_id }) {
+                        let _ = out_tx.send(WsOutbound::json(frame)).await;
+                    }
+                }
                 Inbound::HostFsList {
                     request_id,
                     path,

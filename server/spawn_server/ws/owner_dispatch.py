@@ -22,6 +22,7 @@ OWNER_RESULT_KINDS = frozenset(
         "agent.uploaded",
         "host.fs.list_result",
         "host.fs.result",
+        "host.pong",
         "host.tools.check_result",
         "host.tools.install_result",
     }

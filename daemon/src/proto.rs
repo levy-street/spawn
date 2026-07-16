@@ -25,6 +25,8 @@ pub enum Outbound {
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
+    #[serde(rename = "host.pong")]
+    HostPong { request_id: String },
     #[serde(rename = "agent.exit")]
     AgentExit {
         agent_id: Uuid,
@@ -172,6 +174,10 @@ pub enum Inbound {
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
+    #[serde(rename = "host.ping")]
+    HostPing {
+        request_id: String,
+    },
     #[serde(rename = "host.fs.list")]
     HostFsList {
         request_id: String,
