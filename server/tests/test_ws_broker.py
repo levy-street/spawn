@@ -8,7 +8,14 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from spawn_server.ws.broker import Broker, BrowserConn, DaemonConn, HostBrowserConn, get_broker
+from spawn_server.ws.broker import (
+    Broker,
+    BrowserConn,
+    DaemonConn,
+    HostBrowserConn,
+    UploadResolution,
+    get_broker,
+)
 from spawn_server.ws.frames import (
     KIND_INPUT,
     KIND_OUTPUT,
@@ -471,9 +478,7 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
     old = encode_host_presence_owner(HostPresenceOwner("a" * 32, 1))
     new = encode_host_presence_owner(HostPresenceOwner("b" * 32, 2))
     await backend.set_ephemeral(key, old, ttl_seconds=60)
-    claimed, previous = await backend.set_ephemeral_if_newer(
-        key, new, generation=2, ttl_seconds=60
-    )
+    claimed, previous = await backend.set_ephemeral_if_newer(key, new, generation=2, ttl_seconds=60)
     assert claimed
     assert previous == old
 
@@ -481,9 +486,7 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
     assert await backend.get_ephemeral(key) == new
     assert await backend.refresh_ephemeral_if(key, new, ttl_seconds=60)
 
-    claimed, previous = await backend.set_ephemeral_if_newer(
-        key, old, generation=1, ttl_seconds=60
-    )
+    claimed, previous = await backend.set_ephemeral_if_newer(key, old, generation=1, ttl_seconds=60)
     assert not claimed
     assert previous == new
     assert await backend.get_ephemeral(key) == new
@@ -505,14 +508,12 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
         assert previous == corrupt
         assert await backend.get_ephemeral(key) == corrupt
     assert decode_host_presence_owner(b"not-a-generation:invalid") is None
-    assert decode_host_presence_owner(
-        f"{MAX_SAFE_FENCING_GENERATION + 1}:{'d' * 32}".encode()
-    ) is None
+    assert (
+        decode_host_presence_owner(f"{MAX_SAFE_FENCING_GENERATION + 1}:{'d' * 32}".encode()) is None
+    )
 
     await backend.delete_ephemeral_if(key, b"3:invalid-owner")
-    maximum = encode_host_presence_owner(
-        HostPresenceOwner("d" * 32, MAX_SAFE_FENCING_GENERATION)
-    )
+    maximum = encode_host_presence_owner(HostPresenceOwner("d" * 32, MAX_SAFE_FENCING_GENERATION))
     claimed, _ = await backend.set_ephemeral_if_newer(
         key,
         maximum,
@@ -527,6 +528,44 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
             generation=MAX_SAFE_FENCING_GENERATION + 1,
             ttl_seconds=60,
         )
+
+
+@pytest.mark.asyncio
+async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner():
+    broker = Broker()
+    current = DaemonConn(
+        host_id="host-upload-resolution",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    assert await broker.accept_daemon_owner(current, 1)
+    assert (
+        await broker.resolve_upload(
+            "agent-1",
+            None,
+            {},
+            daemon=current,
+            expected_host_generation=1,
+        )
+        is UploadResolution.NO_WAITER
+    )
+    stale = DaemonConn(
+        host_id=current.host_id,
+        user_id=current.user_id,
+        websocket=FakeWS(),  # type: ignore[arg-type]
+        host_generation=0,
+    )
+    assert (
+        await broker.resolve_upload(
+            "agent-1",
+            "timed-out-client",
+            {},
+            daemon=stale,
+            expected_host_generation=0,
+        )
+        is UploadResolution.STALE_OWNER
+    )
 
 
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
@@ -547,9 +586,12 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
         signal={"type": "rtc.close"},
     )
     assert decode_host_signal(encode_host_signal(valid)) == valid
-    assert decode_host_signal(
-        encode_host_signal(valid).replace(b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', b'"invalid"')
-    ) is None
+    assert (
+        decode_host_signal(
+            encode_host_signal(valid).replace(b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', b'"invalid"')
+        )
+        is None
+    )
     revocation = HostOwnerRevocation("a" * 32, "d" * 32)
     assert decode_host_owner_revocation(encode_host_owner_revocation(revocation)) == revocation
     assert decode_host_owner_revocation(b"null") is None

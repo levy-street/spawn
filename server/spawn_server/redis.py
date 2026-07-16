@@ -20,6 +20,11 @@ from .config import get_settings
 from .limits import MAX_SAFE_FENCING_GENERATION
 
 
+def agent_event_channel(agent_id: str) -> str:
+    """Cross-worker JSON control events for browsers attached to an agent."""
+    return f"spawn:agent:{agent_id}:events"
+
+
 def _lease_generation(value: bytes) -> int | None:
     try:
         generation_raw, owner_raw = value.split(b":", 1)
@@ -48,6 +53,14 @@ class _InProcPubSub:
     async def publish(self, channel: str, data: bytes) -> None:
         for q in list(self._subs.get(channel, ())):
             await q.put(data)
+
+    async def publish_if_ephemeral(
+        self, key: str, expected: bytes, channel: str, data: bytes
+    ) -> bool:
+        if self.get_ephemeral(key) != expected:
+            return False
+        await self.publish(channel, data)
+        return True
 
     def subscribe(self, channel: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -187,6 +200,24 @@ class RedisBackend:
         assert self._client is not None
         await self._client.publish(channel, payload)
 
+    async def publish_if_ephemeral(
+        self, key: str, expected: bytes, channel: str, payload: bytes
+    ) -> bool:
+        """Publish only while an exact generation-bearing lease is active."""
+        if self._inproc is not None:
+            return await self._inproc.publish_if_ephemeral(key, expected, channel, payload)
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "redis.call('publish', ARGV[2], ARGV[3]); return 1",
+            1,
+            key,
+            expected,
+            channel,
+            payload,
+        )
+        return bool(result)
+
     @asynccontextmanager
     async def subscribe(self, agent_id: str) -> AsyncIterator[AsyncIterator[bytes]]:
         """Subscribe to PTY bytes for an agent.
@@ -257,9 +288,7 @@ class RedisBackend:
         assert self._client is not None
         await self._client.set(key, value, ex=ttl_seconds)
 
-    async def swap_ephemeral(
-        self, key: str, value: bytes, *, ttl_seconds: int
-    ) -> bytes | None:
+    async def swap_ephemeral(self, key: str, value: bytes, *, ttl_seconds: int) -> bytes | None:
         """Atomically replace a leased value and return its previous owner."""
         if self._inproc is not None:
             return self._inproc.swap_ephemeral(key, value, ttl_seconds)
@@ -351,9 +380,7 @@ class RedisBackend:
         )
         return bool(deleted)
 
-    async def refresh_ephemeral_if(
-        self, key: str, value: bytes, *, ttl_seconds: int
-    ) -> bool:
+    async def refresh_ephemeral_if(self, key: str, value: bytes, *, ttl_seconds: int) -> bool:
         if self._inproc is not None:
             return self._inproc.refresh_ephemeral_if(key, value, ttl_seconds)
         assert self._client is not None

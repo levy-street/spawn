@@ -20,7 +20,7 @@ from ..agent_control import (
 from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Agent, User
-from ..redis import get_backend
+from ..redis import agent_event_channel, get_backend
 from ..turn import ice_servers_for_session
 from .activity import should_record_agent_input, utcnow
 from .broker import BrowserConn, BrowserDisplayState, get_broker
@@ -304,6 +304,7 @@ async def browser_ws(
     # Redis, regardless of which worker the browser landed on). It also
     # carries the local-worker case so we don't double-deliver.
     pump_ready = asyncio.Event()
+    event_ready = asyncio.Event()
 
     async def _pump_pubsub() -> None:
         try:
@@ -320,7 +321,38 @@ async def browser_ws(
         finally:
             pump_ready.set()
 
+    async def _pump_events() -> None:
+        try:
+            async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as stream:
+                event_ready.set()
+                async for raw_event in stream:
+                    try:
+                        event = json.loads(raw_event)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict) or event.get("type") not in {
+                        "agent.status",
+                        "agent.exit",
+                        "upload.saved",
+                        "upload.error",
+                    }:
+                        continue
+                    try:
+                        await conn.send_text(event)
+                    except Exception as e:
+                        log.warning("agent event forward to browser failed: %s", e)
+                        return
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent event subscribe loop crashed: %s", e)
+        finally:
+            event_ready.set()
+
     pump_task: asyncio.Task[None] | None = None
+    event_task = asyncio.create_task(_pump_events())
+    try:
+        await asyncio.wait_for(event_ready.wait(), timeout=1.0)
+    except TimeoutError:
+        pass
     if not v2:
         pump_task = asyncio.create_task(_pump_pubsub())
         try:
@@ -643,6 +675,11 @@ async def browser_ws(
     except Exception as e:  # noqa: BLE001
         log.exception("browser ws crashed: %s", e)
     finally:
+        event_task.cancel()
+        try:
+            await event_task
+        except (asyncio.CancelledError, Exception):
+            pass
         if pump_task is not None:
             pump_task.cancel()
             try:

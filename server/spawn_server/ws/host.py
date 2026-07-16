@@ -23,11 +23,14 @@ from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
     MAX_HOST_RTC_SESSIONS_PER_BROWSER,
+    HostPresenceOwner,
     HostSignalEnvelope,
     browser_signal_channel,
     decode_host_presence_owner,
+    encode_host_presence_owner,
+    encode_host_signal,
     host_presence_key,
-    publish_host_signal,
+    host_signal_channel,
     receive_with_signal_pump,
     wait_for_signal_pump,
 )
@@ -68,7 +71,9 @@ def _metadata_matches(obj: dict, host_id: str) -> bool:
     )
 
 
-def _signal_payload(kind: str, session_id: str, host_id: str, **values: object) -> dict[str, object]:
+def _signal_payload(
+    kind: str, session_id: str, host_id: str, **values: object
+) -> dict[str, object]:
     return {
         "type": kind,
         "session_id": session_id,
@@ -182,13 +187,22 @@ async def _publish_signal(
     response_channel: str,
     binding: BrowserRtcSession,
     signal: dict[str, object],
-) -> None:
-    await publish_host_signal(
-        host_id,
-        HostSignalEnvelope(
-            daemon_connection_id=binding.daemon_connection_id,
-            browser_channel=response_channel,
-            signal=signal,
+) -> bool:
+    return await get_backend().publish_if_ephemeral(
+        host_presence_key(host_id),
+        encode_host_presence_owner(
+            HostPresenceOwner(
+                binding.daemon_connection_id,
+                binding.daemon_generation,
+            )
+        ),
+        host_signal_channel(host_id),
+        encode_host_signal(
+            HostSignalEnvelope(
+                daemon_connection_id=binding.daemon_connection_id,
+                browser_channel=response_channel,
+                signal=signal,
+            )
         ),
     )
 
@@ -289,10 +303,7 @@ async def host_ws(
                 now = time.monotonic()
                 async with sessions_lock:
                     _prune_sessions(sessions, now)
-                    if (
-                        session_id in sessions
-                        or len(sessions) >= MAX_HOST_RTC_SESSIONS_PER_BROWSER
-                    ):
+                    if session_id in sessions or len(sessions) >= MAX_HOST_RTC_SESSIONS_PER_BROWSER:
                         binding = None
                     else:
                         binding = BrowserRtcSession(
@@ -310,7 +321,7 @@ async def host_ws(
                         sessions.pop(session_id, None)
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
-                await _publish_signal(
+                published = await _publish_signal(
                     host_id,
                     response_channel,
                     binding,
@@ -323,6 +334,10 @@ async def host_ws(
                         ice_transport_policy=transport_policy,
                     ),
                 )
+                if not published:
+                    async with sessions_lock:
+                        sessions.pop(session_id, None)
+                    await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.candidate":
                 candidate = _valid_rtc_candidate(obj.get("candidate"))
@@ -336,14 +351,16 @@ async def host_ws(
                         sessions.pop(session_id, None)
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
-                await _publish_signal(
+                published = await _publish_signal(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload(
-                        "rtc.candidate", session_id, host_id, candidate=candidate
-                    ),
+                    _signal_payload("rtc.candidate", session_id, host_id, candidate=candidate),
                 )
+                if not published:
+                    async with sessions_lock:
+                        sessions.pop(session_id, None)
+                    await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.close":
                 async with sessions_lock:

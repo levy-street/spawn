@@ -15,6 +15,7 @@ import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -100,6 +101,12 @@ class DaemonOwnerAcceptance:
 
     def __bool__(self) -> bool:
         return self.accepted
+
+
+class UploadResolution(Enum):
+    RESOLVED = "resolved"
+    NO_WAITER = "no_waiter"
+    STALE_OWNER = "stale_owner"
 
 
 @dataclass
@@ -586,9 +593,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             waiters = list(self._snapshot_waiters.pop(agent_id, ()))
@@ -636,9 +641,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             fut = self._dir_list_waiters.pop(request_id, None)
@@ -732,9 +735,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             fut = self._fs_waiters.pop(request_id, None)
@@ -781,9 +782,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             fut = self._tool_check_waiters.pop(request_id, None)
@@ -830,9 +829,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             fut = self._tool_install_waiters.pop(request_id, None)
@@ -872,25 +869,23 @@ class Broker:
         *,
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
-    ) -> bool:
+    ) -> UploadResolution:
         if not client_id:
-            return False
+            return UploadResolution.NO_WAITER
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
-                return False
+                return UploadResolution.STALE_OWNER
             waiter = self._upload_waiters.pop(client_id, None)
         if waiter is None:
-            return False
+            return UploadResolution.NO_WAITER
         waiter_agent_id, fut = waiter
         if waiter_agent_id != agent_id or fut.done():
-            return False
+            return UploadResolution.NO_WAITER
         fut.set_result(payload)
-        return True
+        return UploadResolution.RESOLVED
 
     async def reject_uploads_for_agent(
         self,
@@ -903,9 +898,7 @@ class Broker:
         async with self._lock:
             if daemon is not None and (
                 expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
-                    daemon, expected_host_generation
-                )
+                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
             ):
                 return False
             rejected = [

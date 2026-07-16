@@ -292,9 +292,7 @@ async def test_stalled_generation_reservation_keeps_active_owner_and_routes(clie
 
     accepted = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     accepted_task = asyncio.create_task(daemon_ws(accepted, token=None))  # type: ignore[arg-type]
-    accepted.queue_text(
-        {"type": "register", "version": "accepted", "existing_agents": [agent_id]}
-    )
+    accepted.queue_text({"type": "register", "version": "accepted", "existing_agents": [agent_id]})
     await _wait_until(
         lambda: any(item.get("type") == "registered" for item in _sent_json(accepted))
     )
@@ -416,9 +414,7 @@ async def test_activation_commit_failure_cas_restores_accepted_owner(client, mon
 
     accepted = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     accepted_task = asyncio.create_task(daemon_ws(accepted, token=None))  # type: ignore[arg-type]
-    accepted.queue_text(
-        {"type": "register", "version": "accepted", "existing_agents": [agent_id]}
-    )
+    accepted.queue_text({"type": "register", "version": "accepted", "existing_agents": [agent_id]})
     await _wait_until(
         lambda: any(item.get("type") == "registered" for item in _sent_json(accepted))
     )
@@ -471,6 +467,143 @@ async def test_activation_commit_failure_cas_restores_accepted_owner(client, mon
     )
     accepted.queue_disconnect()
     await asyncio.wait_for(accepted_task, timeout=1)
+
+
+async def test_activation_lost_ack_after_commit_reconciles_new_owner(client, monkeypatch):
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-activation-lost-ack@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "version": "old"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+
+    original_attempt = daemon_mod._attempt_host_activation
+
+    async def commit_then_lose_ack(*args, **kwargs):
+        await original_attempt(*args, **kwargs)
+        raise RuntimeError("injected lost activation acknowledgement")
+
+    monkeypatch.setattr(daemon_mod, "_attempt_host_activation", commit_then_lose_ack)
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text({"type": "register", "version": "new"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(new)))
+
+    new_conn = get_broker().get_daemon_for_host(host_id)
+    assert new_conn is not None
+    assert new_conn.host_generation == 2
+    owner = decode_host_presence_owner(
+        await get_backend().get_ephemeral(host_presence_key(host_id))
+    )
+    assert owner == HostPresenceOwner(new_conn.id, 2)
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == new_conn.id
+        assert host.daemon_generation == 2
+
+    await asyncio.wait_for(old_task, timeout=1)
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+
+
+async def test_activation_cancellation_awaits_cleanup_and_restores_predecessor(client, monkeypatch):
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-activation-cancel@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "version": "old"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+    old_conn = get_broker().get_daemon_for_host(host_id)
+    assert old_conn is not None
+    old_value = encode_host_presence_owner(HostPresenceOwner(old_conn.id, old_conn.host_generation))
+
+    attempt_started = asyncio.Event()
+    attempt_cleaned = asyncio.Event()
+
+    async def hang_activation(*args, **kwargs):
+        attempt_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            attempt_cleaned.set()
+
+    monkeypatch.setattr(daemon_mod, "_attempt_host_activation", hang_activation)
+    pending = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    pending_task = asyncio.create_task(daemon_ws(pending, token=None))  # type: ignore[arg-type]
+    pending.queue_text({"type": "register", "version": "cancelled"})
+    await asyncio.wait_for(attempt_started.wait(), timeout=1)
+
+    pending_task.cancel()
+    result = await asyncio.gather(pending_task, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert attempt_cleaned.is_set()
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == old_value
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is None
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == old_conn.id
+        assert host.daemon_generation == old_conn.host_generation
+        assert host.daemon_pending_connection_id is None
+        assert host.daemon_pending_generation is None
+
+    old.queue_disconnect()
+    await asyncio.wait_for(old_task, timeout=1)
+
+
+async def test_activation_deadline_cancels_attempt_and_restores_predecessor(client, monkeypatch):
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-activation-deadline@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register", "version": "old"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+    old_conn = get_broker().get_daemon_for_host(host_id)
+    assert old_conn is not None
+    old_value = encode_host_presence_owner(HostPresenceOwner(old_conn.id, old_conn.host_generation))
+
+    attempt_cleaned = asyncio.Event()
+
+    async def hang_activation(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            attempt_cleaned.set()
+
+    monkeypatch.setattr(daemon_mod, "_attempt_host_activation", hang_activation)
+    monkeypatch.setattr(daemon_mod, "HOST_ACTIVATION_DEADLINE_SECONDS", 0.01)
+    pending = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    pending_task = asyncio.create_task(daemon_ws(pending, token=None))  # type: ignore[arg-type]
+    pending.queue_text({"type": "register", "version": "timed-out"})
+    await asyncio.wait_for(pending_task, timeout=1)
+
+    assert attempt_cleaned.is_set()
+    assert pending.close_calls == [(4000, "superseded")]
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == old_value
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is None
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == old_conn.id
+        assert host.daemon_generation == old_conn.host_generation
+        assert host.daemon_pending_connection_id is None
+        assert host.daemon_pending_generation is None
+
+    old.queue_disconnect()
+    await asyncio.wait_for(old_task, timeout=1)
 
 
 async def test_generation_max_rejects_pending_owner_without_evicting_accepted_routes(client):
@@ -611,9 +744,7 @@ async def test_redis_loss_cannot_make_an_older_durable_generation_current(client
     await backend.shutdown()
     await backend.startup()
     old.queue_text({"type": "host.heartbeat"})
-    await _wait_until(
-        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(old))
-    )
+    await _wait_until(lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(old)))
 
     new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
