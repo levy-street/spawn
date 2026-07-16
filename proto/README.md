@@ -492,9 +492,18 @@ generation, and the fixed endpoint limits:
 {"version":1,"kind":"response","request_id":"upload-uuid","operation":"upload_complete","ok":true,"state":"complete","path":"/endpoint/path/notes.txt","total_bytes":90000,"sha256":"64-lowercase-hex-digest"}
 ```
 
-The browser hashes before sending, applies SCTP buffered-amount backpressure,
-and retries only the pre-effect `upload_start` exchange with a stable upload
-UUID a bounded number of times. It never retries after dispatching the final
+The browser first reserves one of eight agent-scoped reconciliation slots in
+`sessionStorage`, before sending `upload_start`. The ledger never evicts an
+unresolved record. Full capacity or unavailable durability fails closed before
+any endpoint frame. A same-tab memory/history fallback preserves the identity
+and visible lock across component/navigation remounts when the storage write
+itself fails; no later upload is admitted until storage recovers and an
+explicit checked dismissal is successfully persisted. The browser then hashes
+before sending, applies SCTP buffered-amount backpressure, and retries only the
+pre-effect `upload_start` exchange with a stable upload UUID a bounded number
+of times. Immediately before the final chunk it durably promotes the reserved
+record to `outcome_unknown`; a failed promotion prevents final dispatch and
+cancels the unpublished upload. It never retries after dispatching the final
 chunk. A timeout, abort, or disconnect after that dispatch is stable
 `outcome_unknown`; best-effort cancellation cannot downgrade it, and the user
 must reconcile the destination before retrying. The daemon admits
@@ -543,16 +552,17 @@ effect. Definite pre-publication validation, hash, write, or sync failures keep
 their request-bound stable error code.
 
 Removing an in-progress browser attachment aborts its upload generation. If no
-final chunk was dispatched this is a definite silent cancellation. If the
-final chunk was dispatched, removal still removes the local preview and ignores
-late success, but it must preserve the visible `outcome_unknown` reconciliation
-warning; endpoint publication may already have occurred. The browser persists
-an agent/upload-scoped reconciliation record synchronously when it dispatches
-the final frame, before waiting for an acknowledgement. Acknowledged completion
-clears it; otherwise it survives the transient status timeout, Remove,
-unmount/navigation/remount, and unrelated later statuses. Its only actions are
-to focus the terminal for an endpoint check and to dismiss after that check;
-there is deliberately no retry action.
+final chunk was dispatched this is a definite silent cancellation and a
+successful ledger write clears its reservation. If the final chunk was
+dispatched, removal still removes the local preview and ignores late success,
+but it must preserve the visible `outcome_unknown` reconciliation warning;
+endpoint publication may already have occurred. Acknowledged completion clears
+the record only after that removal is persisted; a failed write retains the
+record and locks new effects. Otherwise the warning survives the transient
+status timeout, Remove, unmount/navigation/remount, overlapping terminal
+instances, and unrelated later statuses. Its only actions are to focus the
+terminal for an endpoint check and to dismiss after that check; there is
+deliberately no retry action.
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.

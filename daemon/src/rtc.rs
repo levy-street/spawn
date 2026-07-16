@@ -83,6 +83,8 @@ const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
 #[cfg(test)]
 type TestEffectGateMap = HashMap<(String, TestEffectPoint), Arc<TestEffectGate>>;
+#[cfg(test)]
+type TestSenderCloseGateMap = HashMap<(String, AgentChannel), Arc<TestSenderCloseGate>>;
 
 #[derive(Clone, Default)]
 pub struct RtcSessions {
@@ -102,6 +104,8 @@ pub struct RtcSessions {
     pty_send_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     #[cfg(test)]
     effect_gates: Arc<Mutex<TestEffectGateMap>>,
+    #[cfg(test)]
+    sender_close_gates: Arc<Mutex<TestSenderCloseGateMap>>,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,41 @@ enum TestEffectPoint {
 struct TestEffectGate {
     entered: Notify,
     release: Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestSenderCloseGate {
+    exit: Notify,
+    entered: Notify,
+    release: Notify,
+    failure_at: OnceLock<tokio::time::Instant>,
+    deadline: OnceLock<tokio::time::Instant>,
+}
+
+#[cfg(test)]
+async fn wait_test_sender_exit(gate: &Option<Arc<TestSenderCloseGate>>) {
+    match gate {
+        Some(gate) => {
+            gate.exit.notified().await;
+            let _ = gate.failure_at.set(tokio::time::Instant::now());
+        }
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+async fn pause_test_sender_close(
+    gate: &Option<Arc<TestSenderCloseGate>>,
+    close: &PeerCloseCoordinator,
+) {
+    if let Some(gate) = gate {
+        gate.deadline
+            .set(close.initiated_deadline().expect("sender close deadline"))
+            .expect("sender close deadline only recorded once");
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
 }
 
 #[derive(Clone)]
@@ -305,7 +344,7 @@ struct RtcCallbackGuard {
     fence: Arc<tokio::sync::RwLock<()>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum AgentChannel {
     Pty,
     Control,
@@ -462,6 +501,20 @@ impl RtcSessions {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
+    }
+
+    #[cfg(test)]
+    async fn stall_sender_close(
+        &self,
+        session_id: &str,
+        channel: AgentChannel,
+    ) -> Arc<TestSenderCloseGate> {
+        let gate = Arc::new(TestSenderCloseGate::default());
+        self.sender_close_gates
+            .lock()
+            .await
+            .insert((session_id.to_string(), channel), Arc::clone(&gate));
+        gate
     }
 
     pub async fn bind_registered_host_id(&self, host_id: Uuid) -> bool {
@@ -643,6 +696,24 @@ impl RtcSessions {
         drop(_admission);
 
         install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
+        #[cfg(test)]
+        let pty_send_gate = self
+            .pty_send_gates
+            .lock()
+            .await
+            .remove(&binding.signaling.session_id);
+        #[cfg(test)]
+        let pty_sender_close_gate = self
+            .sender_close_gates
+            .lock()
+            .await
+            .remove(&(binding.signaling.session_id.clone(), AgentChannel::Pty));
+        #[cfg(test)]
+        let control_sender_close_gate = self
+            .sender_close_gates
+            .lock()
+            .await
+            .remove(&(binding.signaling.session_id.clone(), AgentChannel::Control));
         install_data_channel_handler(
             &pc,
             self.clone(),
@@ -656,10 +727,11 @@ impl RtcSessions {
             channels,
             Arc::clone(&close),
             #[cfg(test)]
-            self.pty_send_gates
-                .lock()
-                .await
-                .remove(&binding.signaling.session_id),
+            pty_send_gate,
+            #[cfg(test)]
+            pty_sender_close_gate,
+            #[cfg(test)]
+            control_sender_close_gate,
             out_tx.clone(),
         );
         self.install_reaper(&pc, binding.signaling.clone(), close);
@@ -1541,6 +1613,8 @@ fn install_data_channel_handler(
     channels: Arc<RequiredAgentChannels>,
     close: Arc<PeerCloseCoordinator>,
     #[cfg(test)] pty_send_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)] pty_sender_close_gate: Option<Arc<TestSenderCloseGate>>,
+    #[cfg(test)] control_sender_close_gate: Option<Arc<TestSenderCloseGate>>,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     {
@@ -1590,6 +1664,10 @@ fn install_data_channel_handler(
         let fence = Arc::clone(&guard.fence);
         #[cfg(test)]
         let pty_send_gate = pty_send_gate.clone();
+        #[cfg(test)]
+        let pty_sender_close_gate = pty_sender_close_gate.clone();
+        #[cfg(test)]
+        let control_sender_close_gate = control_sender_close_gate.clone();
         let out_tx = out_tx.clone();
         let channels = Arc::clone(&channels);
         let close = Arc::clone(&close);
@@ -1642,6 +1720,8 @@ fn install_data_channel_handler(
                     sessions,
                     Arc::clone(&close),
                     binding.signaling.generation.clone(),
+                    #[cfg(test)]
+                    control_sender_close_gate,
                 );
                 return;
             }
@@ -1939,6 +2019,11 @@ fn install_data_channel_handler(
                     tokio::spawn(async move {
                         #[cfg(test)]
                         let mut pty_send_gate = pty_send_gate;
+                        #[cfg(test)]
+                        let sender_exit = wait_test_sender_exit(&pty_sender_close_gate);
+                        #[cfg(not(test))]
+                        let sender_exit = std::future::pending::<()>();
+                        tokio::pin!(sender_exit);
                         loop {
                             let chunk = tokio::select! {
                                 changed = direct.disconnected.changed() => {
@@ -1946,6 +2031,7 @@ fn install_data_channel_handler(
                                     None
                                 }
                                 chunk = direct.receiver.recv() => chunk,
+                                _ = &mut sender_exit => None,
                             };
                             let Some(chunk) = chunk else { break };
                             #[cfg(test)]
@@ -1981,13 +2067,15 @@ fn install_data_channel_handler(
                         }
                         output_channels.stop();
                         output_active.store(false, Ordering::Release);
-                        let _ = dc.close().await;
                         output_sessions.schedule_close_if_same(
                             &output_session_id,
                             &output_generation,
                             &output_pc,
                             &output_close,
                         );
+                        #[cfg(test)]
+                        pause_test_sender_close(&pty_sender_close_gate, &output_close).await;
+                        let _ = dc.close().await;
                     });
                 })
             }));
@@ -2034,6 +2122,7 @@ fn install_control_data_channel(
     sessions: RtcSessions,
     close: Arc<PeerCloseCoordinator>,
     generation: String,
+    #[cfg(test)] sender_close_gate: Option<Arc<TestSenderCloseGate>>,
 ) {
     let agent_id = agent.agent_id();
     let upload_capability = Uuid::new_v4();
@@ -2053,6 +2142,11 @@ fn install_control_data_channel(
     let send_close = Arc::clone(&close);
     let send_generation = generation.clone();
     tokio::spawn(async move {
+        #[cfg(test)]
+        let sender_exit = wait_test_sender_exit(&sender_close_gate);
+        #[cfg(not(test))]
+        let sender_exit = std::future::pending::<()>();
+        tokio::pin!(sender_exit);
         loop {
             let message = tokio::select! {
                 message = receiver.recv() => message,
@@ -2067,6 +2161,7 @@ fn install_control_data_channel(
                     }
                 },
                 _ = &mut close_rx => None,
+                _ = &mut sender_exit => None,
             };
             let Some(mut message) = message else {
                 break;
@@ -2103,13 +2198,15 @@ fn install_control_data_channel(
         }
         send_channels.stop();
         send_active.store(false, Ordering::Release);
-        let _ = send_dc.close().await;
         send_sessions.schedule_close_if_same(
             &send_session_id,
             &send_generation,
             &send_pc,
             &send_close,
         );
+        #[cfg(test)]
+        pause_test_sender_close(&sender_close_gate, &send_close).await;
+        let _ = send_dc.close().await;
     });
 
     // webrtc-rs may invoke multiple message callbacks concurrently. Serialize
@@ -4443,6 +4540,108 @@ mod tests {
         assert_eq!(sessions.peer_cleanup_task_count().await, 0);
         assert!(sessions.closing_peers.lock().await.is_empty());
         assert_eq!(sessions.peer_admission.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn real_sender_exit_starts_one_deadline_before_stalled_data_channel_close() {
+        for channel in [AgentChannel::Pty, AgentChannel::Control] {
+            let registry = AgentRegistry::new();
+            let agent_id = Uuid::new_v4();
+            let (agent, mut commands) = insert_test_worker(&registry, agent_id);
+            let control = registry.control_for_binding(agent).unwrap();
+            let worker_control = control.clone();
+            let worker = tokio::spawn(async move {
+                while let Some(command) = commands.recv().await {
+                    if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                            worker_control.source_offset(),
+                            Vec::new(),
+                        )));
+                    }
+                }
+            });
+            let sessions = RtcSessions::new();
+            let session_id = format!("real-sender-close-{channel:?}-{}", Uuid::new_v4());
+            let generation = "generation";
+            let viewer = viewer_id(&session_id, generation);
+            let gate = sessions.stall_sender_close(&session_id, channel).await;
+            let client =
+                connect_rtc_session(&sessions, &registry, agent_id, &session_id, generation).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while control.direct_sink_offset(&viewer).await.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("PTY output sender was not installed");
+            let fence = {
+                let peers = sessions.peers.lock().await;
+                Arc::clone(&peers.get(&session_id).expect("active real peer").fence)
+            };
+            let blocked_effect = fence.read_owned().await;
+
+            gate.exit.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+                .await
+                .expect("actual sender did not reach stalled DataChannel close");
+            let sender_failed_at = *gate
+                .failure_at
+                .get()
+                .expect("actual sender failure instant");
+            let first_deadline = *gate.deadline.get().expect("actual sender deadline");
+            assert!(
+                first_deadline <= sender_failed_at + Duration::from_millis(105),
+                "actual sender received more than the one teardown budget"
+            );
+
+            tokio::time::sleep_until(first_deadline - Duration::from_millis(40)).await;
+            let duplicate_sessions = sessions.clone();
+            let duplicate_session_id = session_id.clone();
+            let duplicate = tokio::spawn(async move {
+                duplicate_sessions
+                    .close(&duplicate_session_id, generation, agent_id)
+                    .await;
+            });
+            let remote_pc = Arc::clone(&client.pc);
+            let remote_close = tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_millis(200), remote_pc.close()).await;
+            });
+
+            tokio::time::timeout_at(first_deadline + Duration::from_millis(100), duplicate)
+                .await
+                .expect("duplicate close received a fresh sender teardown budget")
+                .expect("duplicate close task");
+            assert_eq!(
+                gate.deadline.get().copied(),
+                Some(first_deadline),
+                "peer state/on-close or duplicate close replaced the sender deadline"
+            );
+            assert!(
+                !sessions.peers.lock().await.contains_key(&session_id),
+                "peer map outlived the sender deadline"
+            );
+
+            gate.release.notify_one();
+            drop(blocked_effect);
+            remote_close.await.expect("remote close task");
+            wait_peer_cleanup(&sessions, &control, agent_id, &viewer).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if sessions.closing_peers.lock().await.is_empty()
+                        && sessions.peer_cleanup_task_count().await == 0
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("tracked sender cleanup did not settle");
+            assert!(sessions.closing_peers.lock().await.is_empty());
+            assert_eq!(sessions.peer_cleanup_task_count().await, 0);
+            assert_eq!(sessions.peer_admission.charged(), 0);
+            worker.abort();
+        }
     }
 
     #[tokio::test(start_paused = true)]

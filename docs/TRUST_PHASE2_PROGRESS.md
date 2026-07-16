@@ -244,12 +244,18 @@ unmount, and RTC-generation replacement abort browser uploads, send best-effort
 `upload_cancel`, and cannot resurrect UI state from late completion. A Remove
 before final dispatch stays a silent definite cancellation; after final
 dispatch the thumbnail still disappears but the reconciliation warning remains
-visible. Final-frame dispatch persists an agent/upload-scoped reconciliation
-record before waiting for acknowledgement; it is independent of the transient
-three-second status and attachment/component lifetime, survives navigation and
-remount, and offers check-then-dismiss actions but never retry. Acknowledged
-success clears it. Control-channel teardown publishes cancellation and viewer
-removal immediately. Every callback for that peer shares an immutable
+visible. Before `upload_start`, the browser durably reserves one of eight
+agent-scoped reconciliation slots without eviction. Full capacity or a storage
+fault refuses the upload with zero endpoint effect. Immediately before the
+final frame it durably promotes that reservation to `outcome_unknown`; a failed
+promotion cancels before publication. Same-tab memory and history-state
+fallbacks preserve a failed-write identity, warning, and global upload lock
+across component/navigation remounts. A successful acknowledged completion or
+explicit checked dismissal frees a slot only after the removal persists. The
+record is independent of the transient three-second status and attachment
+lifetime, and no warning offers retry. Control-channel teardown publishes
+cancellation and viewer removal immediately. Every callback for that peer
+shares an immutable
 first-close deadline, including delayed sender, state, duplicate, invalid, and
 replacement paths. The tracked cleanup owns the RTC admission token until
 transport, fence, registries, and uploads actually settle, so map removal does
@@ -265,7 +271,11 @@ session/generation retry, zero temp/FD/operation residue, and idempotent
 publication. Deterministic paused-time RTC tests prove delayed duplicate,
 sender, and state closes cannot gain a new deadline, and a stalled cleanup
 retains its admission slot across peer-map removal and replacement churn until
-zero residue. The real-peer gate rejects unordered,
+zero residue. A real paired-WebRTC regression drives the actual PTY and control
+sender loops to failure, stalls their DataChannel-close path, then proves a
+delayed duplicate and peer-state close reuse the sender's original deadline;
+both labels settle with no peer, closing-registry, sink, task, or admission
+residue. The real-peer gate rejects unordered,
 packet-lifetime-limited, and retransmit-limited `spawn.pty` and `spawn.ctl`
 channels without resident state. TypeScript and the browser protocol unit suite
 pass; focused browser tests cover declared reliability, large multi-chunk
@@ -273,16 +283,21 @@ transfer, non-immediate `bufferedAmount` drain, Remove-driven cancellation, and
 lost final acknowledgement without retry. Browser coverage also advances more
 than three seconds under a fake clock, applies later ordinary status, removes
 the attachment, and unmounts/navigates/remounts the terminal while the durable
-reconciliation record remains until explicit post-check dismissal. Paired real WebRTC tests cover
+reconciliation record remains until explicit post-check dismissal. Browser
+storage-fault coverage proves reservation failure has zero endpoint effect,
+pre-final promotion failure cancels without publication, post-final failure
+retains exactly one ambiguity without retry, eight unresolved records refuse a
+ninth before `upload_start`, and recovered-storage dismissal frees capacity.
+Paired real WebRTC tests cover
 verified multi-chunk publication, a stalled-cleanup control close within one
 deadline with replacement isolation and eventual zero residue, and a lost
 final acknowledgement that reconciles the same stable ID on a replacement
 channel without a duplicate destination. The broad production-source upload
 guard and its adversarial self-test pass. Strict daemon format and all-target
-Clippy pass; all 60 library, 121 daemon, and 8 worker-E2E tests pass; server Ruff
-and all 134 server tests pass; web lint, all 55 unit tests, 75 Playwright tests
+Clippy pass; all 60 library, 122 daemon, and 8 worker-E2E tests pass; server Ruff
+and all 134 server tests pass; web lint, all 55 unit tests, 79 Playwright tests
 (3 opt-in audits skipped), and the production build pass.
-`SPAWN_E2E_PORT=45275 scripts/test-all.sh` passes the full repeatable matrix,
+`SPAWN_E2E_PORT=45325 scripts/test-all.sh` passes the full repeatable matrix,
 including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
 daemon lifecycle, live-browser, and service-manager smokes. Current-master
 mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base

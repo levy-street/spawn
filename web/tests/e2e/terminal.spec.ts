@@ -98,6 +98,40 @@ function jsonMessages(messages: Array<string | Buffer>) {
     .filter(Boolean);
 }
 
+async function failReconciliationStorageAfter(page: Page, successfulWrites: number) {
+  await page.addInitScript(
+    ({ prefix, successfulWrites }) => {
+      const originalSetItem = Storage.prototype.setItem;
+      const originalRemoveItem = Storage.prototype.removeItem;
+      let writes = 0;
+      const shouldFail = (key: string) => key.startsWith(prefix) && writes++ >= successfulWrites;
+      Storage.prototype.setItem = function (key: string, value: string) {
+        if (shouldFail(key)) throw new DOMException("test storage failure", "QuotaExceededError");
+        return originalSetItem.call(this, key, value);
+      };
+      Storage.prototype.removeItem = function (key: string) {
+        if (shouldFail(key)) throw new DOMException("test storage failure", "QuotaExceededError");
+        return originalRemoveItem.call(this, key);
+      };
+      (
+        window as unknown as { __spawnRestoreReconciliationStorage: () => void }
+      ).__spawnRestoreReconciliationStorage = () => {
+        Storage.prototype.setItem = originalSetItem;
+        Storage.prototype.removeItem = originalRemoveItem;
+      };
+    },
+    { prefix: "spawn.upload-reconciliation.v1:", successfulWrites },
+  );
+}
+
+async function restoreReconciliationStorage(page: Page) {
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRestoreReconciliationStorage: () => void }
+    ).__spawnRestoreReconciliationStorage();
+  });
+}
+
 function liveTerminal(page: Page) {
   return page.getByTestId("terminal-live-host").locator(".xterm");
 }
@@ -326,6 +360,190 @@ test("lost final upload acknowledgement is outcome_unknown and is never retried"
     1,
   );
   expect(uploads).toHaveLength(1);
+});
+
+test("reconciliation capacity refuses the ninth upload before any endpoint effect", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    ({ agentId }) => {
+      sessionStorage.setItem(
+        `spawn.upload-reconciliation.v1:${agentId}`,
+        JSON.stringify(
+          Array.from({ length: 8 }, (_, index) => ({
+            uploadId: `retained-${index}`,
+            fileName: `retained-${index}.txt`,
+            message: "Reconcile before retrying.",
+            recordedAt: index + 1,
+            phase: "outcome_unknown",
+          })),
+        ),
+      );
+    },
+    { agentId: AGENT_ID },
+  );
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await expect(page.getByTestId("upload-reconciliation").locator("strong")).toHaveCount(8);
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "refused.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("must not reach endpoint"),
+  });
+  await expect(page.getByText(/reconciliation capacity is full/i)).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(
+    jsonMessages(messages).filter((message) => message?.type === "upload_cancel"),
+  ).toHaveLength(0);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation").locator("strong")).toHaveCount(8);
+
+  await page.getByRole("button", { name: "Dismiss retained-0.txt after checking" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "accepted.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("accepted"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("reservation storage failure survives SPA remount and locks endpoint effects", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 0);
+  const { messages, uploads } = await openTerminalWithMockSocket(page, { fromAgents: true });
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "blocked-before.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("blocked"),
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("blocked-before.txt");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await page.goForward();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("blocked-before.txt");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "also-blocked.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("blocked again"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+
+  await restoreReconciliationStorage(page);
+  await page.getByRole("button", { name: "Dismiss blocked-before.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "after-recovery.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("allowed"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("pre-final storage failure cancels before publication and keeps the upload locked", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 1);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "blocked-final.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("must not publish"),
+  });
+
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "final frame was not dispatched",
+  );
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_cancel"))
+    .toHaveLength(1);
+  expect(uploads).toHaveLength(0);
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "locked-too.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("still locked"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(0);
+});
+
+test("post-final storage failure preserves one ambiguity and blocks retry across remount", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 2);
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+    fromAgents: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "published-once.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("published once"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("published-once.txt");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await page.goForward();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "must-not-retry.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("no retry"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await restoreReconciliationStorage(page);
+  await page.getByRole("button", { name: "Dismiss published-once.txt after checking" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "new-after-check.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("new effect"),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(2);
 });
 
 test("multi-chunk upload waits for real bufferedAmount drain", async ({ page }) => {
