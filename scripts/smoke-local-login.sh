@@ -38,7 +38,7 @@ cleanup() {
   if [[ "$status" != "0" ]]; then
     for log in "${server_log:-}" "${login_out:-}" "${login_err:-}" "${status_out:-}" "${status_err:-}"; do
       if [[ -n "$log" && -f "$log" ]]; then
-        printf '---- %s ----\n' "$(basename "$log")" >&2
+        printf '%s\n' "---- $(basename "$log") ----" >&2
         tail -200 "$log" >&2 || true
       fi
     done
@@ -141,7 +141,14 @@ PY
 )"
 
 printf '%s\n' "smoke-local-login: running spawnd login"
-HOME="$home" \
+env \
+  -u SPAWN_ACCESS_TOKEN \
+  -u SPAWN_DAEMON_TOKEN \
+  -u SPAWN_HOST_ID \
+  -u SPAWN_SERVER_URL \
+  -u XDG_CONFIG_HOME \
+  HOME="$home" \
+  SPAWN_CONFIG_DIR="$home/.config/spawn" \
   SPAWN_DISABLE_KEYRING=1 \
   daemon/target/debug/spawnd --server "$base_url" login --host-name cli-login-smoke --no-run \
   >"$login_out" 2>"$login_err" &
@@ -216,7 +223,14 @@ grep -F "enter code:" "$login_out" >/dev/null
 grep -F "logged in. host_id =" "$login_out" >/dev/null
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
-HOME="$home" \
+env \
+  -u SPAWN_ACCESS_TOKEN \
+  -u SPAWN_DAEMON_TOKEN \
+  -u SPAWN_HOST_ID \
+  -u SPAWN_SERVER_URL \
+  -u XDG_CONFIG_HOME \
+  HOME="$home" \
+  SPAWN_CONFIG_DIR="$home/.config/spawn" \
   SPAWN_DISABLE_KEYRING=1 \
   daemon/target/debug/spawnd --server "$base_url" status \
   >"$status_out" 2>"$status_err"
