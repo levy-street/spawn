@@ -6821,10 +6821,49 @@ mod tests {
         .await;
         assert_eq!(closing["ok"], true);
 
+        let tools = crate::host_tools::HostToolService::shared();
+        tools.arm_pipe_drain_pause();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-tool-close",
+                    "operation": "tool.check",
+                    "payload": {
+                        "targets": [{"target_id": "closing-shell", "tool": "shell"}]
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tools.wait_for_pipe_drain_pause())
+            .await
+            .expect("tool child did not reach the owned pipe-drain gate");
+        assert_eq!(tools.active_operations(), 1);
+
+        let close_started = std::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(2), browser_pc.close())
             .await
-            .expect("peer close must not wait behind a read sender")
+            .expect("peer close must not wait behind file or tool cleanup")
             .unwrap();
+        assert!(close_started.elapsed() < Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            tools.active_operations(),
+            1,
+            "session teardown abandoned its independently owned tool cleanup"
+        );
+        tools.release_pipe_drain_pause();
+        assert!(
+            tools
+                .wait_for_operations_idle_until(
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await,
+            "tool cleanup did not finish after the session close deadline"
+        );
         daemon_pc.close().await.unwrap();
     }
 }

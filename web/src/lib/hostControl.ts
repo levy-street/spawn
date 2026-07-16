@@ -27,18 +27,19 @@ const MAX_TOOL_TARGETS = 8;
 const MAX_TOOL_OUTPUT_BYTES = 4 * 1024;
 const TOOL_CHECK_TIMEOUT_MS = 30_000;
 const TOOL_INSTALL_TIMEOUT_MS = 195_000;
+const TOOL_CANCEL_RESPONSE_TIMEOUT_MS = 5_000;
 const TOOL_COMMANDS = {
   "claude-code": "claude",
   codex: "codex",
   opencode: "opencode",
-  "aider-sonnet": "aider",
+  aider: "aider",
   shell: "bash",
 } as const;
 const TOOL_INSTALL_ARGV = {
   "claude-code": ["npm", "install", "--global", "@anthropic-ai/claude-code"],
   codex: ["npm", "install", "--global", "@openai/codex"],
   opencode: ["npm", "install", "--global", "opencode-ai"],
-  "aider-sonnet": ["python3", "-m", "pip", "install", "--user", "--upgrade", "aider-chat"],
+  aider: ["python3", "-m", "pip", "install", "--user", "--upgrade", "aider-chat"],
 } as const;
 export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
@@ -127,6 +128,7 @@ interface PendingRequest {
   mutation: boolean;
   operation: string;
   dispatched: boolean;
+  cancelRequested?: boolean;
   removeAbort?: () => void;
 }
 
@@ -325,6 +327,32 @@ export class HostControlClient {
       };
       if (options.signal) {
         const onAbort = () => {
+          const pendingInstall = this.pending.get(requestId);
+          if (
+            pendingInstall?.operation === "tool.install" &&
+            pendingInstall.dispatched &&
+            !pendingInstall.cancelRequested
+          ) {
+            pendingInstall.cancelRequested = true;
+            pendingInstall.removeAbort?.();
+            pendingInstall.removeAbort = undefined;
+            clearTimeout(pendingInstall.timer);
+            this.sendCancel(requestId);
+            pendingInstall.timer = setTimeout(
+              () => {
+                const current = this.finishPending(requestId);
+                if (!current) return;
+                current.reject(
+                  this.requestAcknowledgementLost(
+                    current,
+                    new DOMException("Host tool install cancellation timed out", "AbortError"),
+                  ),
+                );
+              },
+              Math.min(timeoutMs, TOOL_CANCEL_RESPONSE_TIMEOUT_MS),
+            );
+            return;
+          }
           const current = this.finishPending(requestId);
           if (!current) return;
           this.sendCancel(requestId);

@@ -197,25 +197,43 @@ kill the process group. Once installation starts, any non-success, teardown,
 failed reconciliation, or lost acknowledgement is `outcome_unknown`, is never
 retried automatically, and must be reconciled with `tool.check`.
 
+Tool subprocesses and their stdout/stderr drain tasks are owned independently
+of request and DataChannel tasks. Process, session-long-task, and same-tool
+install permits remain held until the child is actually waited/reaped and both
+pipes have finished or been aborted and joined. Session close still obeys its
+one absolute deadline while late cleanup remains tracked; multi-target failure
+cancels and drains every started sibling. The browser exposes an explicit
+cancel action, preserves structured endpoint error codes/data, treats a lost
+post-spawn cancellation acknowledgement or late success as
+`outcome_unknown`, ignores protected late output, and directs the user to
+check status before any manual retry. Built-in policy is keyed by canonical
+disclosed `agent_kind`; in particular, preset `aider-sonnet` maps to `aider`
+at both endpoint and browser boundaries and unknown kinds fail closed.
+
 The old REST `/tools` and `/install` endpoints, server `host.tools.*` frames,
 plaintext durable preset install/default-command target, and unattended update
 path remain deliberately retained for P2-HOST-03B. Therefore this parallel
-interactive path does not complete the tool migration or Phase 2. A source
-inventory guard rejects server use of the new E2E operation names, UI use of
-the legacy interactive helpers, and shell evaluation in the endpoint tool
-implementation; it runs from `scripts/test-all.sh`.
+interactive path does not complete the tool migration or Phase 2. A
+tracked-plus-unignored production source inventory guard rejects server use of
+the new E2E operation names, metadata helper/route/schema expansion, UI use or
+aliasing of the legacy interactive helpers, browser/endpoint shell fallbacks,
+moved operation names, protected logging, and canonical-policy drift. Its exact
+HOST-03B allowlist, required lifecycle/UI sentinels, tool-failure handling, and
+adversarial `--self-test` run from `scripts/test-all.sh`.
 
 **Current P2-HOST-03A candidate validation:** daemon format and strict
-all-target Clippy pass; all 181 daemon tests pass (60 library, 113 supervisor,
+all-target Clippy pass; all 183 daemon tests pass (60 library, 115 supervisor,
 8 worker E2E). Server Ruff and all 150 server tests pass. Web lint, typecheck,
-all 58 unit tests, a retry-free Playwright run with 69 passing tests and 3
+all 60 unit tests, a retry-free Playwright run with 71 passing tests and 3
 opt-in audits skipped, and the production build pass. The focused endpoint
-tool suite has 12 adversarial tests, the browser host-control suite has 35,
-and the metadata-only server regression passes. `SPAWN_E2E_PORT=43975
-scripts/test-all.sh` passes the complete repeatable matrix, including the new
-boundary inventory plus prebuilt install, HTTP, Redis, PostgreSQL owner
-recovery, login, daemon lifecycle, live-browser, and service-manager smokes.
-No review pass or merge is claimed by this validation.
+tool suite has 14 adversarial tests, the browser host-control suite has 37,
+the paired zero-agent host channel covers bounded close with independently
+owned late tool cleanup, and the metadata-only server regression passes.
+`SPAWN_E2E_PORT=43985 scripts/test-all.sh` passes the complete repeatable
+matrix, including the adversarial boundary self-test plus prebuilt install,
+HTTP, Redis, PostgreSQL owner recovery, login, daemon lifecycle, live-browser,
+and service-manager smokes. No review pass or merge is claimed by this
+validation.
 
 **P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the

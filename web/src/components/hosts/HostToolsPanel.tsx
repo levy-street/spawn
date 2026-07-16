@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, Download, RefreshCw, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -24,6 +24,9 @@ interface VisibleResult {
   name: string;
   result?: HostToolInstallResult;
   error?: string;
+  code?: string;
+  outcomeUnknown?: boolean;
+  cancelled?: boolean;
 }
 
 const TOOL_CHECK_BATCH_SIZE = 8;
@@ -32,6 +35,22 @@ export function HostToolsPanel({ host }: { host: Host }) {
   const qc = useQueryClient();
   const { client, state } = useHostControl(host.id, host.status === "online");
   const [lastResult, setLastResult] = useState<VisibleResult | null>(null);
+  const installAbortRef = useRef<{
+    controller: AbortController;
+    client: typeof client;
+    hostId: string;
+    tool: ToolRow;
+  } | null>(null);
+  useEffect(() => {
+    const hostId = host.id;
+    return () => {
+      const active = installAbortRef.current;
+      if (active?.client === client && active.hostId === hostId) {
+        active.controller.abort();
+        installAbortRef.current = null;
+      }
+    };
+  }, [client, host.id]);
   const toolsQ = useQuery({
     queryKey: ["host-tools", host.id],
     queryFn: async (): Promise<{ tools: ToolRow[] }> => {
@@ -62,26 +81,46 @@ export function HostToolsPanel({ host }: { host: Host }) {
     refetchInterval: 60_000,
   });
   const installM = useMutation({
-    mutationFn: async (tool: ToolRow) => {
+    mutationFn: async ({ tool, controller }: { tool: ToolRow; controller: AbortController }) => {
       if (!client || !isInteractiveToolKind(tool.agent_kind)) {
         throw new HostControlError(
           "unsupported_tool",
           "Tool is not supported by the endpoint policy",
         );
       }
-      return client.installTool({ target_id: tool.preset_id, tool: tool.agent_kind });
+      return client.installTool(
+        { target_id: tool.preset_id, tool: tool.agent_kind },
+        { signal: controller.signal },
+      );
     },
-    onSuccess: (result, tool) => {
+    onSuccess: (result, { tool, controller }) => {
+      if (controller.signal.aborted) {
+        setLastResult({
+          name: tool.preset_name,
+          code: "outcome_unknown",
+          outcomeUnknown: true,
+          error: "Cancellation raced completion. Check the tool status before retrying.",
+        });
+        return;
+      }
       setLastResult({ name: tool.preset_name, result });
       qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
     },
-    onError: (err, tool) => {
+    onError: (err, { tool }) => {
       const uncertain = err instanceof HostControlError ? err.data : undefined;
+      const code = err instanceof HostControlError ? err.code : undefined;
       setLastResult({
         name: tool.preset_name,
         result: isInstallResult(uncertain) ? uncertain : undefined,
         error: err instanceof Error ? err.message : String(err),
+        code,
+        outcomeUnknown: code === "outcome_unknown",
+        cancelled:
+          code === "cancelled" || (err instanceof DOMException && err.name === "AbortError"),
       });
+    },
+    onSettled: (_result, _error, { controller }) => {
+      if (installAbortRef.current?.controller === controller) installAbortRef.current = null;
     },
   });
   const policyM = useMutation({
@@ -106,7 +145,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
     );
   }
 
-  const installingId = installM.variables?.preset_id;
+  const installingId = installM.variables?.tool.preset_id;
   const tools = toolsQ.data?.tools ?? [];
 
   return (
@@ -195,7 +234,10 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 onClick={() => {
                   if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
                     setLastResult(null);
-                    installM.mutate(tool);
+                    const controller = new AbortController();
+                    installAbortRef.current?.controller.abort();
+                    installAbortRef.current = { controller, client, hostId: host.id, tool };
+                    installM.mutate({ tool, controller });
                   }
                 }}
               >
@@ -206,6 +248,25 @@ export function HostToolsPanel({ host }: { host: Host }) {
                     ? "Update"
                     : "Install"}
               </Button>
+              {installingId === tool.preset_id && installM.isPending && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => {
+                    const active = installAbortRef.current;
+                    if (!active || active.tool.preset_id !== tool.preset_id) return;
+                    active.controller.abort();
+                    setLastResult({
+                      name: tool.preset_name,
+                      code: "cancelling",
+                      error: "Cancellation requested; waiting for the endpoint outcome.",
+                    });
+                  }}
+                >
+                  Cancel
+                </Button>
+              )}
             </li>
           ))}
         </ul>
@@ -214,16 +275,23 @@ export function HostToolsPanel({ host }: { host: Host }) {
       {lastResult && (
         <div className="border-t border-border px-4 py-3">
           <div
-            className={`mb-2 text-sm ${lastResult.result?.success ? "text-emerald-400" : "text-destructive"}`}
+            className={`mb-2 text-sm ${lastResult.result?.success ? "text-emerald-400" : lastResult.outcomeUnknown ? "text-amber-400" : "text-destructive"}`}
           >
             {lastResult.name}:{" "}
             {lastResult.result?.success
               ? "completed"
-              : lastResult.result
+              : lastResult.outcomeUnknown || lastResult.result
                 ? "outcome unknown"
-                : "failed"}
+                : lastResult.cancelled
+                  ? "cancelled"
+                  : "failed"}
             {lastResult.error ? ` · ${lastResult.error}` : ""}
           </div>
+          {lastResult.outcomeUnknown && (
+            <div className="mb-2 text-xs text-amber-300">
+              Check the tool status before retrying. This install is never retried automatically.
+            </div>
+          )}
           {(lastResult.result?.stdout || lastResult.result?.stderr) && (
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs">
               {lastResult.result.stdout}

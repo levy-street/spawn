@@ -20,7 +20,7 @@ use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
 };
-use crate::host_tools::HostToolService;
+use crate::host_tools::{HostToolOperations, HostToolService};
 use crate::pty::WsOutbound;
 use crate::rtc::{try_send_host_status, HostRtcBinding};
 
@@ -251,6 +251,7 @@ struct Context {
     dc: Arc<RTCDataChannel>,
     files: Arc<HostFileService>,
     tools: Arc<HostToolService>,
+    tool_operations: Arc<HostToolOperations>,
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
@@ -641,10 +642,15 @@ impl Context {
         let request_id = request_id.to_string();
         let cleanup_request_id = request_id.clone();
         let task = async move {
-            let _permit = permit;
             let result = context
                 .tools
-                .check(targets, cancelled, context.shutdown.child_token())
+                .check(
+                    targets,
+                    cancelled,
+                    context.shutdown.child_token(),
+                    Arc::clone(&context.tool_operations),
+                    permit,
+                )
                 .await;
             context.state.lock().await.tool_requests.remove(&request_id);
             let sent = match result {
@@ -714,10 +720,15 @@ impl Context {
         let request_id = request_id.to_string();
         let cleanup_request_id = request_id.clone();
         let task = async move {
-            let _permit = permit;
             let result = context
                 .tools
-                .install(target, cancelled, context.shutdown.child_token())
+                .install(
+                    target,
+                    cancelled,
+                    context.shutdown.child_token(),
+                    Arc::clone(&context.tool_operations),
+                    permit,
+                )
                 .await;
             context.state.lock().await.tool_requests.remove(&request_id);
             let sent = match result {
@@ -1618,6 +1629,13 @@ impl Context {
                         Ok(None) => return,
                         Err(_) => {
                             tasks.abort_all();
+                            // Account every cancellation that is already
+                            // observable without extending the one session
+                            // deadline. Dropping the JoinSet aborts any final
+                            // straggler; tool children are not owned by these
+                            // request tasks and remain tracked by
+                            // `tool_operations` until reap and pipe drain.
+                            while tasks.try_join_next().is_some() {}
                             return;
                         }
                     }
@@ -1625,8 +1643,14 @@ impl Context {
             }
         };
         let drain_operations = self.file_operations.wait_for_idle_until(deadline);
+        let drain_tool_operations = self.tool_operations.wait_for_idle_until(deadline);
         let drain_publications = self.publications.wait_for_idle_until(deadline);
-        let _ = tokio::join!(drain_tasks, drain_operations, drain_publications);
+        let _ = tokio::join!(
+            drain_tasks,
+            drain_operations,
+            drain_tool_operations,
+            drain_publications
+        );
         #[cfg(test)]
         self.files
             .write_lifecycle_test_hooks()
@@ -1774,6 +1798,7 @@ pub(crate) fn install(
                 dc: Arc::clone(&dc),
                 files,
                 tools: HostToolService::shared(),
+                tool_operations: HostToolOperations::new(),
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),

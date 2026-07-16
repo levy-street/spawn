@@ -1,7 +1,7 @@
 // @ts-nocheck -- focused browser API fakes; production code remains fully type-checked.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { HOST_CONTROL_PROTOCOL, HostControlClient } from "./hostControl";
+import { HOST_CONTROL_PROTOCOL, HostControlClient, isInteractiveToolKind } from "./hostControl";
 
 class FakeDataChannel {
   label: string;
@@ -1451,6 +1451,103 @@ describe("HostControlClient", () => {
       endpoint.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
     ).toHaveLength(1);
     endpoint.client.close();
+  });
+
+  test("install cancellation waits for the endpoint to distinguish pre-spawn from unknown", async () => {
+    const definitive = await readyClient();
+    const definitiveAbort = new AbortController();
+    const cancelled = definitive.client
+      .installTool(
+        { target_id: "preset-1", tool: "codex" },
+        { signal: definitiveAbort.signal, timeoutMs: 50 },
+      )
+      .catch((error) => error);
+    const definitiveRequest = JSON.parse(definitive.pc.channel.sent.at(-1));
+    definitiveAbort.abort();
+    expect(JSON.parse(definitive.pc.channel.sent.at(-1))).toMatchObject({
+      type: "cancel",
+      request_id: definitiveRequest.request_id,
+    });
+    let settled = false;
+    void cancelled.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    definitive.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: definitiveRequest.request_id,
+        ok: false,
+        error: { code: "cancelled", detail: "install cancelled before execution" },
+      }),
+    );
+    await expect(cancelled).resolves.toMatchObject({ code: "cancelled" });
+    definitive.client.close();
+
+    const postSpawn = await readyClient();
+    const postSpawnAbort = new AbortController();
+    const unknown = postSpawn.client
+      .installTool(
+        { target_id: "preset-1", tool: "codex" },
+        { signal: postSpawnAbort.signal, timeoutMs: 50 },
+      )
+      .catch((error) => error);
+    const postSpawnRequest = JSON.parse(postSpawn.pc.channel.sent.at(-1));
+    postSpawnAbort.abort();
+    postSpawn.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: postSpawnRequest.request_id,
+        ok: true,
+        result: {
+          target_id: "preset-1",
+          tool: "codex",
+          command: ["codex"],
+          install_argv: ["npm", "install", "--global", "@openai/codex"],
+          outcome: "unknown",
+          success: false,
+          stdout: "partial output",
+          stderr: "",
+          output_truncated: false,
+          error: "install was cancelled after execution started",
+        },
+      }),
+    );
+    await expect(unknown).resolves.toMatchObject({
+      code: "outcome_unknown",
+      data: { stdout: "partial output" },
+    });
+    expect(
+      postSpawn.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
+    ).toHaveLength(1);
+    postSpawn.client.close();
+
+    const lost = await readyClient();
+    const lostAbort = new AbortController();
+    const lostOutcome = lost.client
+      .installTool(
+        { target_id: "preset-1", tool: "codex" },
+        { signal: lostAbort.signal, timeoutMs: 5 },
+      )
+      .catch((error) => error);
+    lostAbort.abort();
+    await Bun.sleep(10);
+    await expect(lostOutcome).resolves.toMatchObject({ code: "outcome_unknown" });
+    expect(
+      lost.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
+    ).toHaveLength(1);
+    lost.client.close();
+  });
+
+  test("uses canonical agent kinds for every built-in tool policy", () => {
+    for (const kind of ["claude-code", "codex", "opencode", "aider", "shell"]) {
+      expect(isInteractiveToolKind(kind)).toBe(true);
+    }
+    expect(isInteractiveToolKind("aider-sonnet")).toBe(false);
+    expect(isInteractiveToolKind("custom")).toBe(false);
   });
 
   test("reconnects after a lost install acknowledgement without retrying the mutation", async () => {

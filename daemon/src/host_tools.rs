@@ -5,8 +5,12 @@
 //! from the fixed policy below and is resolved against the endpoint's PATH.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -14,7 +18,7 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_TARGETS: usize = 8;
@@ -26,7 +30,7 @@ const MAX_DETAIL_BYTES: usize = 512;
 pub(crate) const OUTPUT_TAIL_BYTES: usize = 4 * 1024;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SPAWN_BUSY_RETRIES: usize = 3;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 pub(crate) const MAX_PROCESSES: usize = 4;
@@ -146,7 +150,10 @@ const POLICIES: &[ToolPolicy] = &[
         install: Some(InstallPolicy::Npm("opencode-ai")),
     },
     ToolPolicy {
-        tool: "aider-sonnet",
+        // Tool policy is keyed by the disclosed preset `agent_kind`, not by a
+        // particular built-in preset name. The built-in Aider preset is named
+        // `aider-sonnet` but canonically discloses `agent_kind = "aider"`.
+        tool: "aider",
         executable: "aider",
         version_args: &["--version"],
         latest: Some(LatestPolicy::Pip("aider-chat")),
@@ -168,6 +175,113 @@ fn policy_for(tool: &str) -> Option<ToolPolicy> {
 pub(crate) struct HostToolService {
     processes: Arc<Semaphore>,
     installing: StdMutex<HashSet<&'static str>>,
+    operations: Arc<HostToolOperations>,
+    lifecycle_hooks: Arc<HostToolLifecycleHooks>,
+}
+
+#[derive(Default)]
+struct HostToolLifecycleHooks {
+    #[cfg(test)]
+    after_kill: AsyncPause,
+    #[cfg(test)]
+    pipe_drain: AsyncPause,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AsyncPause {
+    armed: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl AsyncPause {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl HostToolLifecycleHooks {
+    async fn pause_after_kill(&self) {
+        #[cfg(test)]
+        if self.after_kill.armed.swap(false, Ordering::AcqRel) {
+            self.after_kill.entered.notify_one();
+            self.after_kill.release.notified().await;
+        }
+    }
+
+    async fn pause_pipe_drain(&self) {
+        #[cfg(test)]
+        if self.pipe_drain.armed.swap(false, Ordering::AcqRel) {
+            self.pipe_drain.entered.notify_one();
+            self.pipe_drain.release.notified().await;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HostToolOperations {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+struct HostToolOperationPermit {
+    operations: Arc<HostToolOperations>,
+}
+
+struct CancelOperationOnDrop(CancellationToken);
+
+impl HostToolOperations {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn admit(self: &Arc<Self>) -> HostToolOperationPermit {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        HostToolOperationPermit {
+            operations: Arc::clone(self),
+        }
+    }
+
+    pub(crate) async fn wait_for_idle_until(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.active.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HostToolOperationPermit {
+    fn drop(&mut self) {
+        if self.operations.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.operations.idle.notify_waiters();
+        }
+    }
+}
+
+impl Drop for CancelOperationOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl HostToolService {
@@ -175,12 +289,42 @@ impl HostToolService {
         Arc::new(Self {
             processes: Arc::new(Semaphore::new(MAX_PROCESSES)),
             installing: StdMutex::new(HashSet::new()),
+            operations: HostToolOperations::new(),
+            lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
         })
     }
 
     pub(crate) fn shared() -> Arc<Self> {
         static SERVICE: OnceLock<Arc<HostToolService>> = OnceLock::new();
         Arc::clone(SERVICE.get_or_init(Self::new))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_pipe_drain_pause(&self) {
+        self.lifecycle_hooks.pipe_drain.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_pipe_drain_pause(&self) {
+        self.lifecycle_hooks.pipe_drain.wait_until_entered().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_pipe_drain_pause(&self) {
+        self.lifecycle_hooks.pipe_drain.release();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_operations(&self) -> usize {
+        self.operations.active()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_operations_idle_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        self.operations.wait_for_idle_until(deadline).await
     }
 
     pub(crate) fn parse_check(payload: &serde_json::Value) -> Result<Vec<ToolTarget>, ToolError> {
@@ -217,8 +361,27 @@ impl HostToolService {
         targets: Vec<ToolTarget>,
         cancelled: CancellationToken,
         shutdown: CancellationToken,
+        session_operations: Arc<HostToolOperations>,
+        session_permit: OwnedSemaphorePermit,
     ) -> Result<Vec<ToolStatus>, ToolError> {
-        let env = Arc::new(crate::run::resolved_command_env().await);
+        let service = Arc::clone(self);
+        let operation_cancelled = cancelled.clone();
+        self.run_owned(session_operations, session_permit, cancelled, async move {
+            let env = Arc::new(crate::run::resolved_command_env().await);
+            service
+                .check_inner(targets, env, operation_cancelled, shutdown)
+                .await
+        })
+        .await
+    }
+
+    async fn check_inner(
+        self: &Arc<Self>,
+        targets: Vec<ToolTarget>,
+        env: Arc<BTreeMap<String, String>>,
+        cancelled: CancellationToken,
+        shutdown: CancellationToken,
+    ) -> Result<Vec<ToolStatus>, ToolError> {
         let operation_cancelled = cancelled.child_token();
         let mut checks = FuturesUnordered::new();
         for (index, target) in targets.into_iter().enumerate() {
@@ -262,10 +425,45 @@ impl HostToolService {
         target: ToolTarget,
         cancelled: CancellationToken,
         shutdown: CancellationToken,
+        session_operations: Arc<HostToolOperations>,
+        session_permit: OwnedSemaphorePermit,
     ) -> Result<ToolInstallResult, ToolError> {
-        let env = crate::run::resolved_command_env().await;
-        self.install_with_env(target, &env, cancelled, shutdown)
-            .await
+        let service = Arc::clone(self);
+        let operation_cancelled = cancelled.clone();
+        self.run_owned(session_operations, session_permit, cancelled, async move {
+            let env = crate::run::resolved_command_env().await;
+            service
+                .install_with_env(target, &env, operation_cancelled, shutdown)
+                .await
+        })
+        .await
+    }
+
+    async fn run_owned<T, F>(
+        self: &Arc<Self>,
+        session_operations: Arc<HostToolOperations>,
+        session_permit: OwnedSemaphorePermit,
+        cancelled: CancellationToken,
+        operation: F,
+    ) -> Result<T, ToolError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ToolError>> + Send + 'static,
+    {
+        let service_permit = self.operations.admit();
+        let session_operation_permit = session_operations.admit();
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ownership = (service_permit, session_operation_permit, session_permit);
+            let _ = result_tx.send(operation.await);
+        });
+        let _cancel_if_abandoned = CancelOperationOnDrop(cancelled);
+        result_rx.await.map_err(|_| {
+            ToolError::new(
+                "closed",
+                "endpoint tool operation owner stopped before reporting a result",
+            )
+        })?
     }
 
     async fn install_with_env(
@@ -294,12 +492,15 @@ impl HostToolService {
         })?;
         let capture = run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.lifecycle_hooks),
             &resolved,
             &args,
             env,
             INSTALL_TIMEOUT,
-            &cancelled,
-            &shutdown,
+            ProgramCancellation {
+                request: &cancelled,
+                shutdown: &shutdown,
+            },
         )
         .await?;
         let install_argv = std::iter::once(program.to_string())
@@ -391,12 +592,15 @@ impl HostToolService {
         };
         let capture = run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.lifecycle_hooks),
             &path,
             policy.version_args,
             env,
             CHECK_TIMEOUT,
-            cancelled,
-            shutdown,
+            ProgramCancellation {
+                request: cancelled,
+                shutdown,
+            },
         )
         .await?;
         let version = first_meaningful_line(&capture.stdout.text)
@@ -452,12 +656,15 @@ impl HostToolService {
         let path = resolve_executable(program, env)?;
         let capture = run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.lifecycle_hooks),
             &path,
             &args,
             env,
             CHECK_TIMEOUT,
-            cancelled,
-            shutdown,
+            ProgramCancellation {
+                request: cancelled,
+                shutdown,
+            },
         )
         .await
         .ok()?;
@@ -573,15 +780,25 @@ struct ProgramCapture {
     failure: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ProgramCancellation<'a> {
+    request: &'a CancellationToken,
+    shutdown: &'a CancellationToken,
+}
+
 async fn run_program_capture(
     processes: Arc<Semaphore>,
+    lifecycle_hooks: Arc<HostToolLifecycleHooks>,
     program: &Path,
     args: &[&str],
     env: &BTreeMap<String, String>,
     timeout: Duration,
-    cancelled: &CancellationToken,
-    shutdown: &CancellationToken,
+    cancellation: ProgramCancellation<'_>,
 ) -> Result<ProgramCapture, ToolError> {
+    let ProgramCancellation {
+        request: cancelled,
+        shutdown,
+    } = cancellation;
     let _permit = acquire_process_permit(processes, cancelled, shutdown).await?;
     if cancelled.is_cancelled() || shutdown.is_cancelled() {
         return Err(ToolError::new("cancelled", "tool operation was cancelled"));
@@ -627,10 +844,7 @@ async fn run_program_capture(
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
         kill_process_group(pid);
         let _ = child.start_kill();
-        let status = tokio::time::timeout(PROCESS_REAP_TIMEOUT, child.wait())
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let status = child.wait().await.ok();
         process_group.disarm();
         return Ok(ProgramCapture {
             status,
@@ -639,46 +853,74 @@ async fn run_program_capture(
             failure: Some("tool output capture was unavailable after execution started".into()),
         });
     };
-    let stdout_task = tokio::spawn(read_tail(stdout));
-    let stderr_task = tokio::spawn(read_tail(stderr));
-    let mut wait = Box::pin(child.wait());
+    let stdout_hooks = Arc::clone(&lifecycle_hooks);
+    let stderr_hooks = Arc::clone(&lifecycle_hooks);
+    let stdout_task = tokio::spawn(async move {
+        let capture = read_tail(stdout).await;
+        stdout_hooks.pause_pipe_drain().await;
+        capture
+    });
+    let stderr_task = tokio::spawn(async move {
+        let capture = read_tail(stderr).await;
+        stderr_hooks.pause_pipe_drain().await;
+        capture
+    });
     let mut failure = None;
-    let status = tokio::select! {
-        result = &mut wait => match result {
-            Ok(status) => Some(status),
-            Err(error) => {
-                failure = Some(format!("endpoint could not observe tool process completion: {error}"));
-                kill_process_group(pid);
-                None
-            }
-        },
+    enum Completion {
+        Exited(std::io::Result<ExitStatus>),
+        Cancelled(&'static str),
+        TimedOut,
+    }
+    let completion = tokio::select! {
+        result = child.wait() => Completion::Exited(result),
         _ = cancelled.cancelled() => {
-            failure = Some("tool operation was cancelled after execution started".into());
-            kill_process_group(pid);
-            tokio::time::timeout(PROCESS_REAP_TIMEOUT, &mut wait).await.ok().and_then(Result::ok)
+            Completion::Cancelled("tool operation was cancelled after execution started")
         }
         _ = shutdown.cancelled() => {
-            failure = Some("host session closed after execution started".into());
-            kill_process_group(pid);
-            tokio::time::timeout(PROCESS_REAP_TIMEOUT, &mut wait).await.ok().and_then(Result::ok)
+            Completion::Cancelled("host session closed after execution started")
         }
         _ = tokio::time::sleep(timeout) => {
-            failure = Some(format!("tool operation timed out after {} seconds", timeout.as_secs()));
-            kill_process_group(pid);
-            tokio::time::timeout(PROCESS_REAP_TIMEOUT, &mut wait).await.ok().and_then(Result::ok)
+            Completion::TimedOut
         }
     };
-    drop(wait);
-    if failure.is_some() {
-        let _ = child.start_kill();
-        process_group.disarm();
-    }
+    let status = match completion {
+        Completion::Exited(Ok(status)) => Some(status),
+        Completion::Exited(Err(error)) => {
+            failure = Some(format!(
+                "endpoint could not observe tool process completion: {error}"
+            ));
+            kill_process_group(pid);
+            let _ = child.start_kill();
+            child.wait().await.ok()
+        }
+        Completion::Cancelled(detail) => {
+            failure = Some(detail.into());
+            kill_process_group(pid);
+            let _ = child.start_kill();
+            lifecycle_hooks.pause_after_kill().await;
+            // The service-owned operation deliberately waits without a second
+            // timeout. Session close may stop waiting at its one absolute
+            // deadline, but this task retains the process permit and install
+            // claim until the child has actually been reaped.
+            child.wait().await.ok()
+        }
+        Completion::TimedOut => {
+            failure = Some(format!(
+                "tool operation timed out after {} seconds",
+                timeout.as_secs()
+            ));
+            kill_process_group(pid);
+            let _ = child.start_kill();
+            lifecycle_hooks.pause_after_kill().await;
+            child.wait().await.ok()
+        }
+    };
+    process_group.disarm();
     let (stdout, stderr) = tokio::join!(finish_tail(stdout_task), finish_tail(stderr_task));
     if stdout.1 || stderr.1 {
         kill_process_group(pid);
         failure.get_or_insert_with(|| "tool output pipes did not close before deadline".into());
     }
-    process_group.disarm();
     Ok(ProgramCapture {
         status,
         stdout: stdout.0,
@@ -707,11 +949,12 @@ impl Drop for ProcessGroupGuard {
 }
 
 async fn finish_tail(mut task: tokio::task::JoinHandle<TailCapture>) -> (TailCapture, bool) {
-    match tokio::time::timeout(PROCESS_REAP_TIMEOUT, &mut task).await {
+    match tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut task).await {
         Ok(Ok(capture)) => (capture, false),
         Ok(Err(_)) => (empty_tail(), false),
         Err(_) => {
             task.abort();
+            let _ = task.await;
             (empty_tail(), true)
         }
     }
@@ -906,6 +1149,18 @@ mod tests {
         assert!(POLICIES
             .iter()
             .all(|policy| !policy.executable.contains(' ')));
+        assert_eq!(
+            POLICIES
+                .iter()
+                .map(|policy| policy.tool)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["claude-code", "codex", "opencode", "aider", "shell"])
+        );
+        assert_eq!(
+            policy_for("aider").map(|policy| policy.executable),
+            Some("aider")
+        );
+        assert!(policy_for("aider-sonnet").is_none());
         assert!(Arc::ptr_eq(
             &HostToolService::shared(),
             &HostToolService::shared()
@@ -941,12 +1196,15 @@ mod tests {
         let env = test_env(dir.path());
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[&malicious],
             &env,
             Duration::from_secs(1),
-            &CancellationToken::new(),
-            &CancellationToken::new(),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
         )
         .await
         .expect("capture");
@@ -956,12 +1214,15 @@ mod tests {
         let oversized = "x".repeat(OUTPUT_TAIL_BYTES + 511);
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[&oversized],
             &env,
             Duration::from_secs(1),
-            &CancellationToken::new(),
-            &CancellationToken::new(),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
         )
         .await
         .expect("capture");
@@ -984,12 +1245,15 @@ mod tests {
         let started = std::time::Instant::now();
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[],
             &env,
             Duration::from_secs(5),
-            &cancelled,
-            &CancellationToken::new(),
+            ProgramCancellation {
+                request: &cancelled,
+                shutdown: &CancellationToken::new(),
+            },
         )
         .await
         .expect("capture");
@@ -1002,43 +1266,231 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn aborting_capture_future_kills_the_descendant_process_group() {
+    async fn aborted_request_keeps_process_claims_until_owned_reap_finishes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ready = dir.path().join("child-ready");
-        let survived = dir.path().join("child-survived");
-        let script = executable(
+        let pid_file = dir.path().join("installer-pid");
+        executable(
             dir.path(),
-            "abortable",
+            "npm",
             &format!(
-                "(sleep 0.1; touch '{}') & printf ready > '{}'; while :; do :; done",
-                survived.display(),
-                ready.display()
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
             ),
         );
+        executable(dir.path(), "codex", "printf 'codex 1.0.0'");
         let env = test_env(dir.path());
-        let task = tokio::spawn(async move {
-            run_program_capture(
-                Arc::new(Semaphore::new(1)),
-                &script,
-                &[],
-                &env,
-                Duration::from_secs(5),
-                &CancellationToken::new(),
-                &CancellationToken::new(),
+        let service = HostToolService::new();
+        service.lifecycle_hooks.after_kill.arm();
+        let session_operations = HostToolOperations::new();
+        let long_tasks = Arc::new(Semaphore::new(1));
+        let long_permit = Arc::clone(&long_tasks)
+            .acquire_owned()
+            .await
+            .expect("long task permit");
+        let cancelled = CancellationToken::new();
+        let request = {
+            let owner = Arc::clone(&service);
+            let operation_service = Arc::clone(&service);
+            let operation_cancelled = cancelled.clone();
+            let session_operations = Arc::clone(&session_operations);
+            tokio::spawn(async move {
+                owner
+                    .run_owned(session_operations, long_permit, cancelled, async move {
+                        operation_service
+                            .install_with_env(
+                                ToolTarget {
+                                    target_id: "preset-1".into(),
+                                    tool: "codex".into(),
+                                },
+                                &env,
+                                operation_cancelled,
+                                CancellationToken::new(),
+                            )
+                            .await
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(&pid_file)
+                .ok()
+                .is_none_or(|pid| pid.trim().is_empty())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("installer did not start");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("read installer pid")
+            .parse()
+            .expect("installer pid");
+
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.lifecycle_hooks.after_kill.wait_until_entered(),
+        )
+        .await
+        .expect("owned cleanup did not reach reap gate");
+        assert_eq!(service.operations.active(), 1);
+        assert_eq!(session_operations.active(), 1);
+        assert_eq!(service.processes.available_permits(), MAX_PROCESSES - 1);
+        assert_eq!(long_tasks.available_permits(), 0);
+        assert!(service
+            .installing
+            .lock()
+            .expect("install claims")
+            .contains("codex"));
+        assert!(Path::new("/proc").join(pid.to_string()).exists());
+        assert!(
+            !session_operations
+                .wait_for_idle_until(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await,
+            "session operation escaped its close deadline accounting"
+        );
+        let busy = service
+            .install_with_env(
+                ToolTarget {
+                    target_id: "preset-2".into(),
+                    tool: "codex".into(),
+                },
+                &test_env(dir.path()),
+                CancellationToken::new(),
+                CancellationToken::new(),
             )
             .await
-        });
-        for _ in 0..100 {
-            if ready.exists() {
-                break;
+            .expect_err("same-tool claim released before reap");
+        assert_eq!(busy.code, "tool_busy");
+
+        service.lifecycle_hooks.after_kill.release();
+        assert!(
+            session_operations
+                .wait_for_idle_until(tokio::time::Instant::now() + Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(service.operations.active(), 0);
+        assert_eq!(service.processes.available_permits(), MAX_PROCESSES);
+        assert_eq!(long_tasks.available_permits(), 1);
+        assert!(service
+            .installing
+            .lock()
+            .expect("install claims")
+            .is_empty());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Path::new("/proc").join(pid.to_string()).exists() {
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+        })
+        .await
+        .expect("installer remained as a child or zombie after owned reap");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_permit_is_held_until_owned_pipe_drains_finish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = executable(dir.path(), "pipe-drain", "printf output; printf error >&2");
+        let processes = Arc::new(Semaphore::new(1));
+        let hooks = Arc::new(HostToolLifecycleHooks::default());
+        hooks.pipe_drain.arm();
+        let task = {
+            let processes = Arc::clone(&processes);
+            let hooks = Arc::clone(&hooks);
+            let env = test_env(dir.path());
+            tokio::spawn(async move {
+                run_program_capture(
+                    processes,
+                    hooks,
+                    &script,
+                    &[],
+                    &env,
+                    Duration::from_secs(1),
+                    ProgramCancellation {
+                        request: &CancellationToken::new(),
+                        shutdown: &CancellationToken::new(),
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.pipe_drain.wait_until_entered(),
+        )
+        .await
+        .expect("pipe drain did not reach ownership gate");
+        assert_eq!(processes.available_permits(), 0);
+        hooks.pipe_drain.release();
+        let capture = task.await.expect("capture task").expect("capture result");
+        assert_eq!(capture.stdout.text, "output");
+        assert_eq!(capture.stderr.text, "error");
+        assert_eq!(processes.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_target_failure_cancels_and_drains_started_siblings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("check-pid");
+        executable(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
+            ),
+        );
+        let service = HostToolService::new();
+        service.lifecycle_hooks.after_kill.arm();
+        let check = {
+            let service = Arc::clone(&service);
+            let env = Arc::new(test_env(dir.path()));
+            tokio::spawn(async move {
+                service
+                    .check_inner(
+                        vec![
+                            ToolTarget {
+                                target_id: "started".into(),
+                                tool: "codex".into(),
+                            },
+                            ToolTarget {
+                                target_id: "failing".into(),
+                                tool: "unknown".into(),
+                            },
+                        ],
+                        env,
+                        CancellationToken::new(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.lifecycle_hooks.after_kill.wait_until_entered(),
+        )
+        .await
+        .expect("started sibling was not cancelled");
+        assert!(!check.is_finished(), "check returned before sibling reap");
+        assert_eq!(service.processes.available_permits(), MAX_PROCESSES - 1);
+        service.lifecycle_hooks.after_kill.release();
+        let error = check
+            .await
+            .expect("check task")
+            .expect_err("unsupported sibling must fail the batch");
+        assert_eq!(error.code, "unsupported_tool");
+        assert_eq!(service.processes.available_permits(), MAX_PROCESSES);
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let pid = pid.trim();
+            if !pid.is_empty() {
+                assert!(
+                    !Path::new("/proc").join(pid).exists(),
+                    "cancelled sibling remained as a process or zombie"
+                );
+            }
         }
-        assert!(ready.exists(), "child process never started");
-        task.abort();
-        let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!survived.exists(), "descendant survived task abortion");
     }
 
     #[cfg(unix)]
@@ -1050,12 +1502,15 @@ mod tests {
         let started = std::time::Instant::now();
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[],
             &env,
             Duration::from_millis(20),
-            &CancellationToken::new(),
-            &CancellationToken::new(),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
         )
         .await
         .expect("capture");

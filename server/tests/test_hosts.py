@@ -172,6 +172,16 @@ async def test_interactive_tool_metadata_route_never_loads_or_forwards_detail(
     }
     assert protected not in response.text
     assert protected not in caplog.text
+    from spawn_server.presets import BUILTIN_PRESETS
+
+    expected_builtin_kinds = {spec["name"]: spec["agent_kind"] for spec in BUILTIN_PRESETS}
+    returned_builtin_kinds = {
+        tool["preset_name"]: tool["agent_kind"]
+        for tool in response.json()["tools"]
+        if tool["preset_name"] in expected_builtin_kinds
+    }
+    assert returned_builtin_kinds == expected_builtin_kinds
+    assert returned_builtin_kinds["aider-sonnet"] == "aider"
 
 
 async def test_host_tool_check_roundtrip(client):
