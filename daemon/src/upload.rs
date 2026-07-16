@@ -35,10 +35,12 @@ const UPLOAD_COMMITTING: u8 = 2;
 const UPLOAD_COMPLETE: u8 = 3;
 
 /// Cap for explorer fs.read / fs.write payloads (raw bytes, pre-base64).
+#[cfg(test)]
 pub const MAX_FS_BYTES: usize = 32 * 1024 * 1024;
 
 /// Save raw bytes into `dir` under a sanitized `name`. When `overwrite` is
 /// false a free `name-N.ext` variant is chosen instead of clobbering.
+#[cfg(test)]
 pub async fn save_file_in_dir(
     dir: &Path,
     name: &str,
@@ -827,6 +829,7 @@ fn sanitized_file_name(
     safe
 }
 
+#[cfg(test)]
 async fn available_upload_path(dir: &Path, file_name: &str) -> Result<PathBuf> {
     let path = dir.join(file_name);
     if !fs::try_exists(&path)

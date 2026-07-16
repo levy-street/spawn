@@ -1,10 +1,10 @@
 # Interaction Surface Matrix
 
-Spawn exposes the same host and agent controls through the browser UI, REST API,
-typed web helpers, and the daemon wire protocol. REST is the source of truth for
-user-facing semantics; browser flows call into the same route or shared control
-helpers where possible. (The MCP tool surface and `/mcp` endpoint were removed
-entirely — see docs/TRUST.md.)
+Spawn exposes controls through the browser UI, REST API, typed web helpers, and
+daemon protocols. REST is the source of truth for server-visible semantics;
+content-confidential host controls instead use authenticated end-to-end
+DataChannels. (The MCP tool surface and `/mcp` endpoint were removed entirely —
+see docs/TRUST.md.)
 
 | Capability | Browser UI | REST | Web helper | Daemon frame |
 | --- | --- | --- | --- | --- |
@@ -12,7 +12,7 @@ entirely — see docs/TRUST.md.)
 | Device approval | device page | `/api/auth/device/*` | `auth.approveDevice` | `device.start`, poll/login CLI |
 | List/get hosts | hosts page, agent form | `GET /api/hosts`, `GET /api/hosts/{id}` | `hosts.list/get` | register/heartbeat updates |
 | Rename/delete host | hosts page | `PATCH/DELETE /api/hosts/{id}` | `hosts.rename/remove` | delete closes connected daemon |
-| List host directories | new-agent picker | `GET /api/hosts/{id}/dirs` | `hosts.dirs` | `host.dirs` request/result |
+| List/manage host files | file explorer, new-agent picker | none | `HostControlClient` | capability-rooted E2E `spawn.host.ctl` `fs.*`; explicit bounded pages and streams |
 | Check/install host tools | hosts page, agent update badge | `/tools`, `/install`, `/policy` | `hosts.tools/installTool/updateToolPolicy` | `host.tools.check`, `host.tools.install` |
 | List/create/update/delete presets | settings | `/api/presets` | `presets.*` | used at agent launch |
 | Manage skills | settings, new-agent access picker | `/api/skills` | `skills.*` | included in `agent.create` |
@@ -27,6 +27,10 @@ entirely — see docs/TRUST.md.)
 
 Intentional differences:
 
+- Host home, paths, directory metadata, file bytes, and detailed filesystem
+  errors never use REST or the server daemon WebSocket. The browser talks to
+  the selected host on its independently bound `spawn.host.ctl` DataChannel;
+  cross-host copies are browser-mediated between two such sessions.
 - Browser display ownership, terminal input, viewport control, replay, and
   agent upload are
   endpoint-owned DataChannel features. REST and server WebSockets deliberately

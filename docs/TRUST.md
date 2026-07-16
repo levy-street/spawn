@@ -62,12 +62,12 @@ not come for free:
    session. Fixing this requires endpoint identity keys that sign the
    SDP (Phase 3).
 2. **Historical relay data and the remaining content surfaces.** The
-   P2-AGENT-02 implementation checkpoint removes `spawn.v1`, daemon WS PTY
-   binary frames, transcripts, content pubsub, snapshots/history, and viewport
-   routes; review, merge, coordinated deployment, and historical purge remain.
-   Uploads, host file/tool operations, launch manifests, skill bodies, and
-   detailed errors still have server-readable paths tracked in the Phase 2
-   ledger.
+   The reviewed P2-AGENT-02 cut removes `spawn.v1`, daemon WS PTY binary frames,
+   transcripts, content pubsub, snapshots/history, and viewport routes. The
+   reviewed P2-HOST-02 cut removes host filesystem operations. The current
+   P2-TERM-01 review candidate removes agent uploads. Tool operations, launch
+   manifests, skill bodies, detailed errors, coordinated deployment, and
+   historical purge remain tracked in the Phase 2 ledger.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.

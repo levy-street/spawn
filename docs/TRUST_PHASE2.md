@@ -28,19 +28,18 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   socket requires `spawn.v2`. Both are text/JSON-only signaling and disclosed
   lifecycle. Binary terminal frames,
   `spawn.v1`, the `0x01`/`0x02` relay, transcripts, agent-content Redis pubsub,
-  and server history/snapshot/display relay are removed in the current
-  P2-AGENT-02 source candidate. Browser RTC offer/candidate/close frames bind
+  and server history/snapshot/display relay are removed in the reviewed
+  P2-AGENT-02 cut. Browser RTC offer/candidate/close frames bind
   the exact agent/scope/protocol/version/nonce tuple.
 - A reviewed host-scoped `spawn.host.ctl` transport root is integrated and
-  works independently of any agent. It currently provides bounded host-bound
-  control primitives; moving all host filesystem/tool payloads remains later
-  work.
-- Host directory/file routes in `server/spawn_server/routes/hosts.py` proxy
-  `host.fs.*` through the server. Downloads and uploads put complete file bytes
-  in server memory; cross-host transfer reads into the server before writing to
-  the destination. The daemon's registration frame also exposes `home_dir`.
-  These operations may be used with no agent running, so `spawn.ctl` on an
-  agent connection cannot replace them.
+  works independently of any agent. The merged P2-HOST-02 implementation moves
+  host list/stat/read/write/mkdir/rename/remove, browser download/upload, and
+  browser-mediated cross-host transfer onto bounded capability-rooted streams
+  on that channel.
+- Host directory/file REST routes, server broker waiters/result schemas,
+  daemon `host.fs.*` frames, and registration `home_dir` are removed in the
+  merged source. Host paths, entry metadata, file bytes, hashes, and
+  detailed filesystem errors therefore remain endpoint-to-endpoint.
 - Tool checks and installs also use server↔daemon control frames. Installer
   `output` and `error` can contain arbitrary commands, paths, and secrets;
   `HostToolPolicy.last_auto_update_error` persists a detailed error derived
@@ -139,18 +138,16 @@ queues and catch up through replay on reconnect. This transport root passed
 independent review and was integrated through `1f66d2d`; it does not by itself
 make the Phase 2 claim.
 
-### 3 — retire the WS terminal relay and server content stores (implemented, review pending)
+### 3 — retire the WS terminal relay and server content stores ✅ reviewed and merged
 
-The current P2-AGENT-02 source candidate removes the daemon binary output/input
+The reviewed P2-AGENT-02 cut removes the daemon binary output/input
 sink, server transcript writes and forwarding, agent-content pubsub, browser
 binary fallback, `spawn.v1`, and the old REST/WS terminal viewport surfaces.
 The daemon and server require their exact v2 subprotocols, every browser RTC
 signal carries the full agent tuple, and invalid mandatory DataChannel shapes
 remove the peer, viewer, and direct sink. The accepted regression is that an
 offline or exited worker has no history replay; there is no server transcript
-to show. Historical copies still require Increment 8 purge evidence, and this
-increment remains review pending until the branch is independently accepted
-and merged.
+to show. Historical copies still require Increment 8 purge evidence.
 
 ### 4 — host-scoped E2E control transport (`spawn.host.ctl`) ✅ reviewed and merged
 
@@ -203,6 +200,9 @@ is restricted to stable content-free values.
 
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
+The filesystem portion is **REVIEWED AND MERGED** in P2-HOST-02 at `4e7c89b`.
+The interactive tool portion remains planned separately as P2-HOST-03A.
+
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
   errors remain E2E. Remove `home_dir` from daemon registration and fetch the
@@ -210,7 +210,17 @@ is restricted to stable content-free values.
 - Browser downloads and uploads stream directly. Cross-host transfer uses two
   authorized host sessions and streams source daemon → browser → destination
   daemon; the server never buffers the file. Preserve bounded memory and
-  destination overwrite semantics.
+  destination overwrite semantics. Filesystem calls are capability-rooted and
+  no-follow for every component, no-clobber commits use a single atomic rename,
+  directory pages have daemon and browser retention ceilings, and ACK/cancel
+  dispatch cannot wait behind a long sender or file write. A short per-session
+  arrival arbiter assigns ordinals and publishes bounded, expiring cancel
+  cutoffs before fast/normal queue routing: only frames that preceded a cancel
+  may drain, while every later chunk/end fails closed even if the fast consumer
+  is delayed. Fast write cancellation signals the active I/O token and hands
+  disk cleanup to the single tracked session maintenance task. Cancelled read
+  IDs remain tombstoned and cannot be redeclared. The first source/destination
+  timeout, error, cancellation, or peer loss aborts and cleans up both streams.
 - Add a parallel E2E request/response path for interactive tool checks/installs,
   including commands, paths, installed/latest versions, stdout/stderr, and
   detailed errors. This increment proves and ships the endpoint transport, but
@@ -244,12 +254,12 @@ content-free server acknowledgement because the server has no upload leg at
 all. Old workers without the cwd capability and old REST/WS upload clients fail
 closed instead of activating a compatibility relay.
 
-The current P2-TERM-02/P2-AGENT-02 candidate removes REST
+The reviewed P2-TERM-02/P2-AGENT-02 cut removes REST
 input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`
 viewport/display-control handlers, and their schemas/broker/server↔daemon
 frames. Browser input uses `spawn.pty`; snapshot/history and viewport control
 use `spawn.ctl`. Smoke/integration tooling uses an RTC endpoint harness instead
-of a server content proxy. This portion remains independent-review pending.
+of a server content proxy.
 
 P2-ERROR-01 must replace agent-scoped free-form daemon error messages with stable server-visible
 codes and E2E detail on `spawn.ctl`. Remove server forwarding/logging of error

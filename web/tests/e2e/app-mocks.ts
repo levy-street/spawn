@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
 
 export const USER_ID = "00000000-0000-4000-8000-000000000001";
@@ -135,10 +136,10 @@ export async function mockAuthenticatedApi(
     updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     deleteSkill?: (id: string, route: Route) => Promise<void> | void;
     files?: (hostId: string, path: string | null) => unknown;
+    fileRead?: (hostId: string, path: string) => string | Uint8Array;
     fileUpload?: (hostId: string, route: Route) => Promise<void> | void;
     fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
-    fileTransfer?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   } = {},
 ) {
@@ -146,6 +147,377 @@ export async function mockAuthenticatedApi(
   const hostList = options.hosts ?? [host];
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
+
+  const invokeFileHandler = async (
+    handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
+    hostId: string,
+    body: Record<string, unknown>,
+    fallback: Record<string, unknown>,
+  ) => {
+    if (!handler) return fallback;
+    let result: Record<string, unknown> | undefined;
+    const route = {
+      request: () => ({
+        postData: () => `name="dir"\r\n\r\n${String(body.dir ?? "")}\r\n`,
+        postDataJSON: async () => body,
+      }),
+      fulfill: async (response: { json?: Record<string, unknown> }) => {
+        result = response.json;
+      },
+    } as unknown as Route;
+    await handler(hostId, body, route);
+    return result ?? fallback;
+  };
+
+  await page.exposeFunction(
+    "__spawnHostControlRequest",
+    async (hostId: string, operation: string, payload: Record<string, unknown>) => {
+      const selected = (hostList as Array<{ id?: string; home_dir?: string }>).find(
+        (item) => item.id === hostId,
+      );
+      const homeDir = selected?.home_dir ?? "/Users/tester";
+      if (operation === "fs.home") return { home_dir: homeDir };
+      if (operation === "fs.list") {
+        return (
+          options.files?.(hostId, String(payload.path ?? "~")) ?? fileListing({ path: homeDir })
+        );
+      }
+      if (operation === "fs.mkdir") {
+        return invokeFileHandler(
+          options.fileMkdir,
+          hostId,
+          { path: payload.path },
+          { path: payload.path },
+        );
+      }
+      if (operation === "fs.rename") {
+        return invokeFileHandler(
+          options.fileRename,
+          hostId,
+          { path: payload.path, name: payload.name, overwrite: payload.overwrite ?? false },
+          { path: payload.path },
+        );
+      }
+      if (operation === "fs.remove") {
+        return invokeFileHandler(
+          options.fileDelete,
+          hostId,
+          { path: payload.path, recursive: payload.recursive ?? false },
+          { path: payload.path },
+        );
+      }
+      if (operation === "fs.read") {
+        const bytes = Buffer.from(options.fileRead?.(hostId, String(payload.path)) ?? "hi");
+        return {
+          path: payload.path,
+          name:
+            String(payload.path ?? "file")
+              .split("/")
+              .at(-1) ?? "file",
+          length: bytes.length,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          bytes_b64: bytes.toString("base64"),
+        };
+      }
+      if (operation === "fs.write.commit") {
+        if (options.fileUpload) {
+          let result: Record<string, unknown> | undefined;
+          const route = {
+            request: () => ({
+              postData: () => `name="dir"\r\n\r\n${String(payload.dir ?? "")}\r\n`,
+            }),
+            fulfill: async (response: { json?: Record<string, unknown> }) => {
+              result = response.json;
+            },
+          } as unknown as Route;
+          await options.fileUpload(hostId, route);
+          return result ?? { path: `${String(payload.dir)}/${String(payload.name)}` };
+        }
+        return { path: `${String(payload.dir)}/${String(payload.name)}` };
+      }
+      throw new Error(`unsupported mock host control operation: ${operation}`);
+    },
+  );
+
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: undefined,
+    });
+
+    type HostInvoke = (
+      hostId: string,
+      operation: string,
+      payload: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>;
+    const invoke = () =>
+      (
+        globalThis as typeof globalThis & {
+          __spawnHostControlRequest: HostInvoke;
+        }
+      ).__spawnHostControlRequest;
+
+    class MockHostDataChannel {
+      readonly label = "spawn.host.ctl";
+      readonly bufferedAmount = 0;
+      readyState: RTCDataChannelState = "connecting";
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      private readonly writes = new Map<
+        string,
+        { declaration: Record<string, unknown>; chunks: string[] }
+      >();
+
+      constructor(private readonly hostId: string) {}
+
+      open() {
+        this.readyState = "open";
+        this.onopen?.(new Event("open"));
+        this.emit({
+          version: 1,
+          type: "hello",
+          protocol: "spawn.host.ctl",
+          capabilities: [
+            "ping",
+            "fs.home",
+            "fs.list",
+            "fs.stat",
+            "fs.read",
+            "fs.write.begin",
+            "fs.mkdir",
+            "fs.rename",
+            "fs.remove",
+          ],
+        });
+      }
+
+      close() {
+        if (this.readyState === "closed") return;
+        this.readyState = "closed";
+        this.onclose?.(new Event("close"));
+      }
+
+      send(encoded: string) {
+        const frame = JSON.parse(encoded) as Record<string, unknown>;
+        void this.handle(frame);
+      }
+
+      private emit(frame: Record<string, unknown>) {
+        setTimeout(
+          () => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(frame) })),
+          0,
+        );
+      }
+
+      private async handle(frame: Record<string, unknown>) {
+        const type = frame.type;
+        if (type === "request") {
+          const requestId = String(frame.request_id);
+          const operation = String(frame.operation);
+          const payload = (frame.payload ?? {}) as Record<string, unknown>;
+          if (operation === "ping") {
+            this.emit({
+              version: 1,
+              type: "response",
+              request_id: requestId,
+              ok: true,
+              result: { pong: true },
+            });
+            return;
+          }
+          if (operation === "fs.write.begin") {
+            const streamId = crypto.randomUUID();
+            this.writes.set(streamId, { declaration: payload, chunks: [] });
+            this.emit({
+              version: 1,
+              type: "response",
+              request_id: requestId,
+              ok: true,
+              result: { stream_id: streamId },
+            });
+            return;
+          }
+          try {
+            const result = await invoke()(this.hostId, operation, payload);
+            if (operation === "fs.read") {
+              const streamId = crypto.randomUUID();
+              const bytes = String(result.bytes_b64 ?? "");
+              const { bytes_b64: _, ...declaration } = result;
+              this.emit({
+                version: 1,
+                type: "response",
+                request_id: requestId,
+                ok: true,
+                result: { ...declaration, stream_id: streamId },
+              });
+              if (bytes)
+                this.emit({
+                  version: 1,
+                  type: "stream.chunk",
+                  stream_id: streamId,
+                  sequence: 0,
+                  bytes_b64: bytes,
+                });
+              this.emit({
+                version: 1,
+                type: "stream.end",
+                stream_id: streamId,
+                length: result.length,
+                sha256: result.sha256,
+              });
+              return;
+            }
+            this.emit({ version: 1, type: "response", request_id: requestId, ok: true, result });
+          } catch (error) {
+            this.emit({
+              version: 1,
+              type: "response",
+              request_id: requestId,
+              ok: false,
+              error: { code: "mock_failed", detail: String(error) },
+            });
+          }
+          return;
+        }
+        const streamId = String(frame.stream_id ?? "");
+        if (type === "stream.chunk") {
+          this.writes.get(streamId)?.chunks.push(String(frame.bytes_b64 ?? ""));
+          return;
+        }
+        if (type === "stream.cancel") {
+          this.writes.delete(streamId);
+          return;
+        }
+        if (type === "stream.end") {
+          const write = this.writes.get(streamId);
+          if (!write) return;
+          this.writes.delete(streamId);
+          const result = await invoke()(this.hostId, "fs.write.commit", write.declaration);
+          this.emit({
+            version: 1,
+            type: "stream.committed",
+            stream_id: streamId,
+            path: result.path,
+          });
+        }
+      }
+    }
+
+    class MockHostPeerConnection {
+      connectionState: RTCPeerConnectionState = "new";
+      remoteDescription: RTCSessionDescription | null = null;
+      localDescription: RTCSessionDescription | null = null;
+      onicecandidate: ((event: RTCPeerConnectionIceEvent) => void) | null = null;
+      onconnectionstatechange: ((event: Event) => void) | null = null;
+      private channel: MockHostDataChannel | null = null;
+      constructor(private readonly hostId = "") {}
+      createDataChannel() {
+        this.channel = new MockHostDataChannel(this.hostId);
+        return this.channel as unknown as RTCDataChannel;
+      }
+      async createOffer() {
+        return { type: "offer" as const, sdp: "mock-offer" };
+      }
+      async setLocalDescription(description: RTCSessionDescriptionInit) {
+        this.localDescription = description as RTCSessionDescription;
+      }
+      async setRemoteDescription(description: RTCSessionDescriptionInit) {
+        this.remoteDescription = description as RTCSessionDescription;
+        this.connectionState = "connected";
+        this.channel?.open();
+      }
+      async addIceCandidate() {}
+      close() {
+        this.connectionState = "closed";
+        this.channel?.close();
+      }
+    }
+
+    let constructingHostPeerId: string | null = null;
+
+    class MockHostWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = MockHostWebSocket.CONNECTING;
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      readonly hostId: string;
+      constructor(url: string | URL) {
+        this.hostId = new URL(String(url), location.href).searchParams.get("host_id") ?? "";
+        setTimeout(() => {
+          this.readyState = MockHostWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.emit({ type: "rtc.config", enabled: true, ice_servers: [] });
+        }, 0);
+      }
+      send(encoded: string) {
+        const message = JSON.parse(encoded) as Record<string, unknown>;
+        if (message.type === "rtc.offer") {
+          this.emit({ type: "rtc.answer", session_id: message.session_id, sdp: "mock-answer" });
+        }
+      }
+      close() {
+        if (this.readyState === MockHostWebSocket.CLOSED) return;
+        this.readyState = MockHostWebSocket.CLOSED;
+        this.onclose?.(new CloseEvent("close"));
+      }
+      private emit(values: Record<string, unknown>) {
+        setTimeout(() => {
+          constructingHostPeerId = this.hostId;
+          try {
+            this.onmessage?.(
+              new MessageEvent("message", {
+                data: JSON.stringify({
+                  ...values,
+                  scope_type: "host",
+                  scope_id: this.hostId,
+                  protocol: "spawn.host.ctl",
+                  protocol_version: 1,
+                }),
+              }),
+            );
+          } finally {
+            constructingHostPeerId = null;
+          }
+        }, 0);
+      }
+    }
+
+    const OriginalWebSocket = globalThis.WebSocket;
+    const HostAwareWebSocket = function (
+      this: WebSocket,
+      url: string | URL,
+      protocols?: string | string[],
+    ) {
+      if (new URL(String(url), location.href).pathname === "/ws/host") {
+        return new MockHostWebSocket(url);
+      }
+      return new OriginalWebSocket(url, protocols);
+    } as unknown as typeof WebSocket;
+    Object.assign(HostAwareWebSocket, {
+      CONNECTING: WebSocket.CONNECTING,
+      OPEN: WebSocket.OPEN,
+      CLOSING: WebSocket.CLOSING,
+      CLOSED: WebSocket.CLOSED,
+    });
+    globalThis.WebSocket = HostAwareWebSocket;
+    const OriginalPeerConnection = globalThis.RTCPeerConnection;
+    globalThis.RTCPeerConnection = function (
+      this: RTCPeerConnection,
+      configuration?: RTCConfiguration,
+    ) {
+      const hostId = constructingHostPeerId;
+      return hostId
+        ? new MockHostPeerConnection(hostId)
+        : new OriginalPeerConnection(configuration);
+    } as unknown as typeof RTCPeerConnection;
+  });
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -159,60 +531,6 @@ export async function mockAuthenticatedApi(
     if (path === "/api/hosts") {
       await route.fulfill({ status: 200, contentType: "application/json", json: hostList });
       return;
-    }
-    const filesMatch = path.match(/^\/api\/hosts\/([^/]+)\/files(?:\/([a-z]+))?$/);
-    if (filesMatch) {
-      const [, hostId, op] = filesMatch;
-      if (!op && method === "GET") {
-        const listing = options.files?.(hostId, url.searchParams.get("path")) ?? fileListing();
-        await route.fulfill({ status: 200, contentType: "application/json", json: listing });
-        return;
-      }
-      if (op === "download" && method === "GET") {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/octet-stream",
-          headers: { "Content-Disposition": 'attachment; filename="notes.txt"' },
-          body: Buffer.from("hi"),
-        });
-        return;
-      }
-      if (op === "upload" && method === "POST") {
-        if (options.fileUpload) {
-          await options.fileUpload(hostId, route);
-          return;
-        }
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          json: { path: "/Users/tester/upload.txt" },
-        });
-        return;
-      }
-      if (
-        (op === "mkdir" || op === "delete" || op === "transfer" || op === "rename") &&
-        method === "POST"
-      ) {
-        const body = await request.postDataJSON();
-        const handler =
-          op === "mkdir"
-            ? options.fileMkdir
-            : op === "delete"
-              ? options.fileDelete
-              : op === "rename"
-                ? options.fileRename
-                : options.fileTransfer;
-        if (handler) {
-          await handler(hostId, body, route);
-          return;
-        }
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          json: { path: (body as { path?: string }).path ?? null },
-        });
-        return;
-      }
     }
     if (path.match(/^\/api\/hosts\/[^/]+$/) && method === "GET") {
       const id = path.split("/").at(-1) ?? "";

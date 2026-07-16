@@ -236,7 +236,6 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
             "os": "linux",
             "arch": "x86_64",
             "version": "0.2.0",
-            "home_dir": "/home/tester",
             "existing_agents": [agent_id, other_agent_id, "00000000-0000-4000-8000-999999999999"],
         }
     )
@@ -244,7 +243,6 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
     daemon = get_broker().get_daemon_for_host(host_id)
     assert daemon is not None
-    assert daemon.home_dir == "/home/tester"
     assert get_broker().get_daemon_for_agent(agent_id) is daemon
     assert get_broker().get_daemon_for_agent(other_agent_id) is None
 

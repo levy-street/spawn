@@ -223,7 +223,7 @@ function HostDetail() {
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-xl border border-border p-4 text-sm @md/shell:grid-cols-4">
             <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
             <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
-            <Fact label="Home" value={host.home_dir ?? "—"} mono />
+            <Fact label="Files" value="end-to-end encrypted" />
             <Fact
               label="Connection"
               value={

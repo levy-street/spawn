@@ -1111,9 +1111,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await _fence_superseded_daemon(conn)
                         break
                     existing = obj.get("existing_agents") or []
-                    home_dir = obj.get("home_dir")
-                    if isinstance(home_dir, str) and home_dir:
-                        conn.home_dir = home_dir
                     valid_existing: list[str] = []
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
@@ -1168,30 +1165,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
                         await _fence_superseded_daemon(conn)
                         break
-
-                elif ftype == "host.fs.list_result":
-                    request_id = obj.get("request_id")
-                    if isinstance(request_id, str):
-                        if not await broker.resolve_dir_list(
-                            request_id,
-                            obj,
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
-
-                elif ftype in ("host.fs.read_result", "host.fs.op_result"):
-                    request_id = obj.get("request_id")
-                    if isinstance(request_id, str):
-                        if not await broker.resolve_fs_result(
-                            request_id,
-                            obj,
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
 
                 elif ftype == "host.tools.check_result":
                     request_id = obj.get("request_id")

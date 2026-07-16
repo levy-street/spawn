@@ -20,7 +20,6 @@ pub enum Outbound {
         os: String,
         arch: String,
         version: String,
-        home_dir: Option<String>,
         existing_agents: Vec<Uuid>,
     },
     #[serde(rename = "host.heartbeat")]
@@ -45,40 +44,6 @@ pub enum Outbound {
     /// is the only metadata it needs to maintain `last_input_at` for v2.
     #[serde(rename = "agent.input_activity")]
     AgentInputActivity { agent_id: Uuid },
-    #[serde(rename = "host.fs.list_result")]
-    HostFsListResult {
-        request_id: String,
-        path: String,
-        #[serde(default)]
-        home_dir: Option<String>,
-        #[serde(default)]
-        parent: Option<String>,
-        #[serde(default)]
-        entries: Vec<HostDirEntry>,
-        #[serde(default)]
-        error: Option<String>,
-    },
-    #[serde(rename = "host.fs.read_result")]
-    HostFsReadResult {
-        request_id: String,
-        path: String,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        size: Option<u64>,
-        #[serde(default)]
-        bytes_b64: Option<String>,
-        #[serde(default)]
-        error: Option<String>,
-    },
-    #[serde(rename = "host.fs.op_result")]
-    HostFsOpResult {
-        request_id: String,
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        error: Option<String>,
-    },
     #[serde(rename = "host.tools.check_result")]
     HostToolsCheckResult {
         request_id: String,
@@ -168,47 +133,6 @@ pub enum Inbound {
     #[serde(rename = "host.ping")]
     HostPing {
         request_id: String,
-    },
-    #[serde(rename = "host.fs.list")]
-    HostFsList {
-        request_id: String,
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        include_files: bool,
-    },
-    #[serde(rename = "host.fs.read")]
-    HostFsRead {
-        request_id: String,
-        path: String,
-    },
-    #[serde(rename = "host.fs.write")]
-    HostFsWrite {
-        request_id: String,
-        dir: String,
-        name: String,
-        bytes_b64: String,
-        #[serde(default)]
-        overwrite: bool,
-    },
-    #[serde(rename = "host.fs.mkdir")]
-    HostFsMkdir {
-        request_id: String,
-        path: String,
-    },
-    #[serde(rename = "host.fs.rename")]
-    HostFsRename {
-        request_id: String,
-        path: String,
-        /// New name within the same directory (not a path).
-        name: String,
-    },
-    #[serde(rename = "host.fs.remove")]
-    HostFsRemove {
-        request_id: String,
-        path: String,
-        #[serde(default)]
-        recursive: bool,
     },
     #[serde(rename = "host.tools.check")]
     HostToolsCheck {
@@ -327,19 +251,6 @@ pub struct AgentSkillConfig {
     pub name: String,
     pub description: String,
     pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostDirEntry {
-    pub name: String,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_dir: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    /// Unix epoch seconds of last modification.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modified_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

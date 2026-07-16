@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -32,6 +34,7 @@ use crate::agent_ctl::{
     ProtocolError,
 };
 use crate::agents::{AgentBinding, AgentRegistry};
+use crate::host_files::HostFileService;
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
 use crate::upload::{
@@ -43,9 +46,10 @@ const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
 const AGENT_RTC_PROTOCOL_VERSION: u16 = 2;
 const HOST_CONTROL_LABEL: &str = "spawn.host.ctl";
 const RTC_PROTOCOL_VERSION: u16 = 1;
+#[cfg(test)]
 const HOST_CONTROL_MAX_FRAME_BYTES: usize = 16 * 1024;
+#[cfg(test)]
 const HOST_CONTROL_MAX_REQUEST_ID_BYTES: usize = 128;
-const HOST_CONTROL_MAX_IN_FLIGHT: usize = 32;
 const MAX_RTC_PEERS: usize = 128;
 const MAX_HOST_RTC_PEERS: usize = 64;
 const MAX_SAFE_SIGNAL_GENERATION: u64 = 9_007_199_254_740_991;
@@ -111,11 +115,11 @@ struct HostRtcPeer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HostRtcBinding {
-    host_id: Uuid,
-    binding_nonce: String,
-    protocol: String,
-    protocol_version: u16,
+pub(crate) struct HostRtcBinding {
+    pub(crate) host_id: Uuid,
+    pub(crate) binding_nonce: String,
+    pub(crate) protocol: String,
+    pub(crate) protocol_version: u16,
 }
 
 /// Immutable host-scope identity supplied on offer/candidate/close frames.
@@ -711,7 +715,13 @@ impl RtcSessions {
         drop(_admission);
 
         install_host_ice_handler(&pc, session_id.clone(), binding.clone(), out_tx.clone());
-        install_host_data_channel_handler(&pc, session_id.clone(), binding.clone(), out_tx.clone());
+        install_host_data_channel_handler(
+            &pc,
+            session_id.clone(),
+            binding.clone(),
+            out_tx.clone(),
+            None,
+        );
         self.install_host_reaper(&pc, session_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
@@ -2555,28 +2565,42 @@ fn install_host_data_channel_handler(
     session_id: String,
     binding: HostRtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
+    files_override: Option<Arc<HostFileService>>,
 ) {
     let accepted = Arc::new(AtomicBool::new(false));
+    let handler_pc = Arc::clone(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let accepted = Arc::clone(&accepted);
+        let pc = Arc::clone(&handler_pc);
         let session_id = session_id.clone();
         let binding = binding.clone();
         let out_tx = out_tx.clone();
+        let files = files_override.clone();
         Box::pin(async move {
-            if dc.label() != HOST_CONTROL_LABEL || accepted.swap(true, Ordering::AcqRel) {
+            let reliable = dc.ordered()
+                && dc.max_packet_lifetime().is_none()
+                && dc.max_retransmits().is_none();
+            if dc.label() != HOST_CONTROL_LABEL || !reliable {
+                let _ = dc.close().await;
+                let _ = pc.close().await;
+                return;
+            }
+            if accepted.swap(true, Ordering::AcqRel) {
                 let _ = dc.close().await;
                 return;
             }
-            install_host_control_channel(dc, session_id, binding, out_tx);
+            install_host_control_channel(dc, session_id, binding, out_tx, files);
         })
     }));
 }
 
+#[cfg(test)]
 enum HostControlAction {
     Reply(String),
     Close,
 }
 
+#[cfg(test)]
 fn host_control_response(data: &[u8], is_string: bool) -> HostControlAction {
     if !is_string || data.is_empty() || data.len() > HOST_CONTROL_MAX_FRAME_BYTES {
         return HostControlAction::Close;
@@ -2630,53 +2654,12 @@ fn install_host_control_channel(
     session_id: String,
     binding: HostRtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
+    files_override: Option<Arc<HostFileService>>,
 ) {
-    let message_dc = Arc::clone(&dc);
-    let in_flight = Arc::new(Semaphore::new(HOST_CONTROL_MAX_IN_FLIGHT));
-    dc.on_message(Box::new(move |message: DataChannelMessage| {
-        let dc = Arc::clone(&message_dc);
-        let in_flight = Arc::clone(&in_flight);
-        Box::pin(async move {
-            let Ok(_permit) = in_flight.try_acquire_owned() else {
-                let _ = dc.close().await;
-                return;
-            };
-            match host_control_response(&message.data, message.is_string) {
-                HostControlAction::Reply(response) => {
-                    if dc.send_text(response).await.is_err() {
-                        let _ = dc.close().await;
-                    }
-                }
-                HostControlAction::Close => {
-                    let _ = dc.close().await;
-                }
-            }
-        })
-    }));
-
-    let open_dc = Arc::clone(&dc);
-    dc.on_open(Box::new(move || {
-        let dc = Arc::clone(&open_dc);
-        let out_tx = out_tx.clone();
-        let session_id = session_id.clone();
-        let binding = binding.clone();
-        Box::pin(async move {
-            let hello = json!({
-                "version": RTC_PROTOCOL_VERSION,
-                "type": "hello",
-                "protocol": HOST_CONTROL_LABEL,
-                "capabilities": ["ping"]
-            });
-            if dc.send_text(hello.to_string()).await.is_ok() {
-                send_host_status(&out_tx, session_id, &binding, "connected").await;
-            } else {
-                let _ = dc.close().await;
-            }
-        })
-    }));
+    crate::host_control::install(dc, session_id, binding, out_tx, files_override);
 }
 
-async fn send_host_status(
+pub(crate) async fn send_host_status(
     out_tx: &mpsc::Sender<WsOutbound>,
     session_id: String,
     binding: &HostRtcBinding,
@@ -2697,6 +2680,29 @@ async fn send_host_status(
         },
     )
     .await;
+}
+
+pub(crate) fn try_send_host_status(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    session_id: String,
+    binding: &HostRtcBinding,
+    status: &str,
+) -> bool {
+    let frame = Outbound::RtcStatus {
+        session_id,
+        binding_nonce: Some(binding.binding_nonce.clone()),
+        agent_id: None,
+        scope_type: Some("host".to_string()),
+        scope_id: Some(binding.host_id),
+        protocol: Some(binding.protocol.clone()),
+        protocol_version: Some(binding.protocol_version),
+        status: status.to_string(),
+        message: None,
+    };
+    let Ok(text) = serde_json::to_string(&frame) else {
+        return false;
+    };
+    out_tx.try_send(WsOutbound::json(text)).is_ok()
 }
 
 fn try_send_status(
@@ -2758,6 +2764,152 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_files::{HostOperationKind, STREAM_CHUNK_BYTES};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    async fn receive_host_control(
+        messages: &mut mpsc::Receiver<(usize, String)>,
+    ) -> (usize, Value) {
+        let (index, encoded) = tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("host control response timed out")
+            .expect("host control channel closed before response");
+        (index, serde_json::from_str(&encoded).unwrap())
+    }
+
+    async fn request_host_control(
+        channel: &RTCDataChannel,
+        messages: &mut mpsc::Receiver<(usize, String)>,
+        request_id: &str,
+        operation: &str,
+        payload: Value,
+    ) -> Value {
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": request_id,
+                    "operation": operation,
+                    "payload": payload,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        receive_host_control(messages).await.1
+    }
+
+    async fn start_paired_host_endpoint_with_init(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+        init: Option<webrtc::data_channel::data_channel_init::RTCDataChannelInit>,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+        mpsc::Receiver<WsOutbound>,
+    ) {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let browser_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let daemon_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let channel = browser_pc
+            .create_data_channel(HOST_CONTROL_LABEL, init)
+            .await
+            .unwrap();
+        let (messages_tx, messages_rx) = mpsc::channel::<(usize, String)>(64);
+        channel.on_message(Box::new(move |message: DataChannelMessage| {
+            let messages_tx = messages_tx.clone();
+            Box::pin(async move {
+                let _ = messages_tx
+                    .send((0, String::from_utf8_lossy(&message.data).into_owned()))
+                    .await;
+            })
+        }));
+        let (out_tx, out_rx) = mpsc::channel(4);
+        install_host_data_channel_handler(
+            &daemon_pc,
+            session_id.to_string(),
+            binding,
+            out_tx,
+            Some(files),
+        );
+
+        let offer = browser_pc.create_offer(None).await.unwrap();
+        let mut offer_gathered = browser_pc.gathering_complete_promise().await;
+        browser_pc.set_local_description(offer).await.unwrap();
+        let _ = offer_gathered.recv().await;
+        daemon_pc
+            .set_remote_description(browser_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+        let answer = daemon_pc.create_answer(None).await.unwrap();
+        let mut answer_gathered = daemon_pc.gathering_complete_promise().await;
+        daemon_pc.set_local_description(answer).await.unwrap();
+        let _ = answer_gathered.recv().await;
+        browser_pc
+            .set_remote_description(daemon_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+        (browser_pc, daemon_pc, channel, messages_rx, out_rx)
+    }
+
+    async fn start_paired_host_endpoint(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+        mpsc::Receiver<WsOutbound>,
+    ) {
+        start_paired_host_endpoint_with_init(files, binding, session_id, None).await
+    }
+
+    async fn paired_host_endpoint(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+    ) {
+        let (browser_pc, daemon_pc, channel, mut messages_rx, _out_rx) =
+            start_paired_host_endpoint(files, binding, session_id).await;
+        let (_, hello) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(hello["type"], "hello");
+        (browser_pc, daemon_pc, channel, messages_rx)
+    }
+
+    async fn wait_for_host_channel_close(channel: &RTCDataChannel) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while channel.ready_state()
+                != webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host control channel did not fail closed");
+    }
 
     fn insert_test_worker(
         registry: &AgentRegistry,
@@ -5130,7 +5282,1180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_agent_host_control_channel_exchanges_hello_and_ping() {
+    async fn two_real_host_channels_keep_source_and_destination_capabilities_isolated() {
+        let source_root = tempfile::tempdir().unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        let source_bytes = (0..(STREAM_CHUNK_BYTES * 3 + 17))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        tokio::fs::write(source_root.path().join("source.bin"), &source_bytes)
+            .await
+            .unwrap();
+        let source_files = Arc::new(
+            HostFileService::rooted_at(source_root.path())
+                .await
+                .unwrap(),
+        );
+        let destination_files = Arc::new(
+            HostFileService::rooted_at(destination_root.path())
+                .await
+                .unwrap(),
+        );
+        let source_host_id = Uuid::new_v4();
+        let destination_host_id = Uuid::new_v4();
+        let source_binding = HostRtcBinding {
+            host_id: source_host_id,
+            binding_nonce: "a".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let destination_binding = HostRtcBinding {
+            host_id: destination_host_id,
+            binding_nonce: "b".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        assert_ne!(source_binding.host_id, destination_binding.host_id);
+        assert_ne!(
+            source_binding.binding_nonce,
+            destination_binding.binding_nonce
+        );
+
+        let (source_browser, source_daemon, source_channel, mut source_messages) =
+            paired_host_endpoint(
+                Arc::clone(&source_files),
+                source_binding,
+                "source-generation-1",
+            )
+            .await;
+        let (
+            destination_browser,
+            destination_daemon,
+            destination_channel,
+            mut destination_messages,
+        ) = paired_host_endpoint(
+            Arc::clone(&destination_files),
+            destination_binding,
+            "destination-generation-7",
+        )
+        .await;
+        assert!(!Arc::ptr_eq(&source_channel, &destination_channel));
+
+        let source = request_host_control(
+            &source_channel,
+            &mut source_messages,
+            "two-host-read",
+            "fs.read",
+            json!({"path": "source.bin"}),
+        )
+        .await;
+        let source_stream_id = source["result"]["stream_id"].as_str().unwrap();
+        let source_hash = source["result"]["sha256"].as_str().unwrap().to_string();
+        let mut transferred = Vec::new();
+        loop {
+            let (_, message) = receive_host_control(&mut source_messages).await;
+            if message["type"] == "stream.end" {
+                break;
+            }
+            assert_eq!(message["stream_id"], source_stream_id);
+            transferred.extend(
+                STANDARD
+                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            source_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": source_stream_id,
+                        "sequence": message["sequence"].as_u64().unwrap() + 1,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(transferred, source_bytes);
+        assert!(!source_root.path().join("destination.bin").exists());
+
+        let destination = request_host_control(
+            &destination_channel,
+            &mut destination_messages,
+            "two-host-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "destination.bin",
+                "length": transferred.len(),
+                "sha256": source_hash,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let destination_stream_id = destination["result"]["stream_id"].as_str().unwrap();
+        for (sequence, chunk) in transferred.chunks(STREAM_CHUNK_BYTES).enumerate() {
+            destination_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": destination_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode(chunk),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        destination_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": destination_stream_id,
+                    "length": transferred.len(),
+                    "sha256": source_hash,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, committed) = receive_host_control(&mut destination_messages).await;
+        assert_eq!(committed["type"], "stream.committed");
+        assert_eq!(
+            tokio::fs::read(destination_root.path().join("destination.bin"))
+                .await
+                .unwrap(),
+            source_bytes
+        );
+        assert!(source_root.path().join("source.bin").exists());
+
+        destination_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.ack",
+                    "stream_id": source_stream_id,
+                    "sequence": 1,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while destination_channel.ready_state()
+                != webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a source-host stream id must be rejected on the destination channel");
+        assert_eq!(
+            source_channel.ready_state(),
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        );
+
+        source_browser.close().await.unwrap();
+        source_daemon.close().await.unwrap();
+        destination_browser.close().await.unwrap();
+        destination_daemon.close().await.unwrap();
+    }
+
+    fn assert_no_upload_temporaries(root: &Path) {
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".spawn-upload-"))
+                .count(),
+            0,
+            "session shutdown leaked a write temporary",
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_after_host_context_publication_suppresses_hello_and_connected_status() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_after_context();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "d".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-after-host-context").await;
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_open_after_context())
+            .await
+            .expect("host open did not pause after context publication");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host close exceeded its absolute deadline");
+        close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(messages.try_recv().is_err(), "hello published after close");
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn closing_between_hello_and_connected_suppresses_connected_status() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_before_connected();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "e".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-before-connected").await;
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_open_before_connected())
+            .await
+            .expect("host open did not pause before connected publication");
+        let (_, hello) = receive_host_control(&mut messages).await;
+        assert_eq!(hello.get("type").and_then(Value::as_str), Some("hello"));
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host close exceeded its absolute deadline");
+        close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_presend_hello_claim_before_shutdown_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_after_publication_claim();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "9".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-after-hello-claim").await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_open_after_publication_claim(),
+        )
+        .await
+        .expect("hello did not claim publication");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("close did not cancel the hello claim");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("claimed hello send survived the close deadline");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_publication_send_finished(),
+        )
+        .await
+        .expect("cancelled hello claim did not drain");
+        close.await.unwrap().unwrap();
+        hooks.release_open_after_publication_claim();
+        tokio::task::yield_now().await;
+        assert!(
+            messages.try_recv().is_err(),
+            "hello published after shutdown returned"
+        );
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status claimed publication after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn host_control_rejects_unordered_and_partially_reliable_channels() {
+        let cases = [
+            (
+                "unordered",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    ordered: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "packet-lifetime",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    max_packet_life_time: Some(1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "retransmits",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    max_retransmits: Some(1),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, init) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "4".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+                start_paired_host_endpoint_with_init(
+                    files,
+                    binding,
+                    &format!("invalid-host-channel-{label}"),
+                    Some(init),
+                )
+                .await;
+            wait_for_host_channel_close(&channel).await;
+            assert!(messages.try_recv().is_err(), "{label} received a hello");
+            assert!(
+                statuses.try_recv().is_err(),
+                "{label} published connected status"
+            );
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_host_channel_during_write_begin_cleans_unpublished_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "e".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "close-during-write-begin").await;
+
+        hooks.arm_begin_after_create();
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "close-begin",
+                    "operation": "fs.write.begin",
+                    "payload": {
+                        "dir": "~",
+                        "name": "must-not-exist.bin",
+                        "length": 0,
+                        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "overwrite": false,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_begin_after_create())
+            .await
+            .expect("write begin did not pause after temporary creation");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("host write shutdown did not start");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host write shutdown did not terminate");
+        assert!(!root.path().join("must-not-exist.bin").exists());
+        assert_no_upload_temporaries(root.path());
+
+        hooks.release_begin_after_create();
+        close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(!root.path().join("must-not-exist.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "write begin published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn closing_host_channel_before_write_commit_aborts_finish_and_cleans_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "f".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "close-before-write-commit").await;
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "close-finish",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "must-not-commit.bin",
+                "length": 0,
+                "sha256": sha256,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+        hooks.arm_blocking(HostOperationKind::WriteCommit);
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_entered(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write finish did not pause before commit");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("host write shutdown did not start");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host write shutdown did not terminate");
+        assert!(!root.path().join("must-not-commit.bin").exists());
+        assert_no_upload_temporaries(root.path());
+
+        hooks.release_blocking(HostOperationKind::WriteCommit);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_finished(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write commit operation did not finish");
+        close.await.unwrap().unwrap();
+
+        assert!(!root.path().join("must-not-commit.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "write commit published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_temporary_unlink_cannot_extend_close_or_resurrect_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "0".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "stalled-temp-cleanup").await;
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-cleanup",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "must-stay-uncommitted.bin",
+                "length": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        assert!(write["result"]["stream_id"].is_string());
+
+        hooks.arm_temporary_cleanup();
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_temporary_cleanup_entered(),
+        )
+        .await
+        .expect("temporary cleanup did not enter its blocking unlink");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("stalled temporary unlink extended the close deadline");
+        close.await.unwrap().unwrap();
+
+        assert!(!root.path().join("must-stay-uncommitted.bin").exists());
+        assert!(root.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spawn-upload-")));
+
+        hooks.release_temporary_cleanup();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_temporary_cleanup_finished(),
+        )
+        .await
+        .expect("late temporary cleanup did not finish");
+        assert!(!root.path().join("must-stay-uncommitted.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "stalled cleanup published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_blocking_host_operations_cannot_outlive_close_with_effects() {
+        let cases = [
+            (
+                HostOperationKind::List,
+                "list",
+                "stalled-list",
+                "fs.list",
+                json!({"path": "~", "cursor": 0}),
+            ),
+            (
+                HostOperationKind::Read,
+                "read",
+                "stalled-read",
+                "fs.read",
+                json!({"path": "read.txt"}),
+            ),
+            (
+                HostOperationKind::Mkdir,
+                "mkdir",
+                "stalled-mkdir",
+                "fs.mkdir",
+                json!({"path": "new-dir"}),
+            ),
+            (
+                HostOperationKind::Rename,
+                "rename",
+                "stalled-rename",
+                "fs.rename",
+                json!({"path": "source.txt", "name": "renamed.txt", "overwrite": false}),
+            ),
+            (
+                HostOperationKind::Remove,
+                "remove",
+                "stalled-remove",
+                "fs.remove",
+                json!({"path": "victim.txt", "recursive": false}),
+            ),
+            (
+                HostOperationKind::WriteBegin,
+                "write",
+                "stalled-write",
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": "blocked-write.bin",
+                    "length": 0,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "overwrite": false,
+                }),
+            ),
+        ];
+
+        for (kind, label, request_id, operation, payload) in cases {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("read.txt"), b"read")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("source.txt"), b"source")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("victim.txt"), b"victim")
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let hooks = files.write_lifecycle_test_hooks();
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "1".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("blocking-close-{label}")).await;
+
+            hooks.arm_blocking(kind);
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "request",
+                        "request_id": request_id,
+                        "operation": operation,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_entered(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} did not enter its blocking operation"));
+
+            let closing_channel = Arc::clone(&channel);
+            let close = tokio::spawn(async move { closing_channel.close().await });
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+                .await
+                .unwrap_or_else(|_| panic!("{label} shutdown did not start"));
+            tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+                .await
+                .unwrap_or_else(|_| panic!("{label} shutdown exceeded its absolute deadline"));
+
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            assert!(!root.path().join("blocked-write.bin").exists(), "{label}");
+            assert_no_upload_temporaries(root.path());
+
+            hooks.release_blocking(kind);
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_finished(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} blocking operation did not finish"));
+            close.await.unwrap().unwrap();
+            assert!(
+                messages.try_recv().is_err(),
+                "{label} published after close"
+            );
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            assert!(!root.path().join("blocked-write.bin").exists(), "{label}");
+            assert_no_upload_temporaries(root.path());
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn linearized_mutations_may_finish_after_bounded_close_without_publication() {
+        let cases = [
+            (
+                HostOperationKind::Mkdir,
+                "mkdir",
+                "linearized-mkdir",
+                "fs.mkdir",
+                json!({"path": "new-dir"}),
+            ),
+            (
+                HostOperationKind::Rename,
+                "rename",
+                "linearized-rename",
+                "fs.rename",
+                json!({"path": "source.txt", "name": "renamed.txt", "overwrite": false}),
+            ),
+            (
+                HostOperationKind::Remove,
+                "remove",
+                "linearized-remove",
+                "fs.remove",
+                json!({"path": "victim.txt", "recursive": false}),
+            ),
+        ];
+
+        for (kind, label, request_id, operation, payload) in cases {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("source.txt"), b"source")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("victim.txt"), b"victim")
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let hooks = files.write_lifecycle_test_hooks();
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "2".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("effect-close-{label}")).await;
+
+            hooks.arm_effect_boundary(kind);
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "request",
+                        "request_id": request_id,
+                        "operation": operation,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                hooks.wait_effect_boundary_entered(kind),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not reach the effect linearization boundary"));
+
+            let closing_channel = Arc::clone(&channel);
+            let close = tokio::spawn(async move { closing_channel.close().await });
+            tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+                .await
+                .unwrap_or_else(|_| panic!("{label} close exceeded its absolute deadline"));
+
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            hooks.release_effect_boundary(kind);
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_finished(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} authorized effect did not finish"));
+            close.await.unwrap().unwrap();
+
+            assert!(
+                messages.try_recv().is_err(),
+                "{label} published after close"
+            );
+            match label {
+                "mkdir" => assert!(root.path().join("new-dir").is_dir()),
+                "rename" => {
+                    assert!(!root.path().join("source.txt").exists());
+                    assert_eq!(
+                        tokio::fs::read(root.path().join("renamed.txt"))
+                            .await
+                            .unwrap(),
+                        b"source"
+                    );
+                }
+                "remove" => assert!(!root.path().join("victim.txt").exists()),
+                _ => unreachable!(),
+            }
+            assert_no_upload_temporaries(root.path());
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn linearized_write_commit_finishes_after_bounded_close_without_publication_or_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "3".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "linearized-write-close").await;
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "linearized-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "committed.bin",
+                "length": 0,
+                "sha256": sha256,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+        hooks.arm_effect_boundary(HostOperationKind::WriteCommit);
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_effect_boundary_entered(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write did not reach the commit linearization boundary");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("linearized write close exceeded its absolute deadline");
+        assert!(!root.path().join("committed.bin").exists());
+        hooks.release_effect_boundary(HostOperationKind::WriteCommit);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_finished(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("authorized write commit did not finish");
+        close.await.unwrap().unwrap();
+
+        assert_eq!(
+            tokio::fs::read(root.path().join("committed.bin"))
+                .await
+                .unwrap(),
+            b""
+        );
+        assert!(messages.try_recv().is_err(), "write published after close");
+        assert_no_upload_temporaries(root.path());
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn published_write_cancel_wins_while_the_fast_consumer_is_delayed() {
+        for terminal in ["chunk", "end"] {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("empty.bin"), [])
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "c".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("cancel-race-{terminal}")).await;
+
+            let read = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("finished-read-{terminal}"),
+                "fs.read",
+                json!({"path": "empty.bin"}),
+            )
+            .await;
+            let finished_read_id = read["result"]["stream_id"].as_str().unwrap();
+            let (_, read_end) = receive_host_control(&mut messages).await;
+            assert_eq!(read_end["type"], "stream.end");
+
+            let (name, length, sha256) = if terminal == "chunk" {
+                (
+                    "late-chunk.bin",
+                    1,
+                    "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                )
+            } else {
+                (
+                    "late-end.bin",
+                    0,
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+            };
+            let write = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("cancelled-write-{terminal}"),
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": name,
+                    "length": length,
+                    "sha256": sha256,
+                    "overwrite": false,
+                }),
+            )
+            .await;
+            let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": finished_read_id,
+                        "sequence": 0,
+                        "test_delay_ms": 250,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.cancel",
+                        "stream_id": stream_id,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let terminal_frame = if terminal == "chunk" {
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": stream_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"x"),
+                })
+            } else {
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+            };
+            channel.send_text(terminal_frame.to_string()).await.unwrap();
+
+            wait_for_host_channel_close(&channel).await;
+            assert!(!root.path().join(name).exists());
+            assert_eq!(
+                std::fs::read_dir(root.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".spawn-upload-"))
+                    .count(),
+                0,
+                "cancelled write temporary was not removed",
+            );
+            browser_pc.close().await.unwrap();
+            daemon_pc.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_write_cancel_does_not_block_read_ack_or_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let source_bytes = vec![b'r'; STREAM_CHUNK_BYTES * 9];
+        tokio::fs::write(root.path().join("ack.bin"), &source_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("cancel.bin"), &source_bytes)
+            .await
+            .unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "d".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "stalled-write-control-paths").await;
+
+        let ack_read = request_host_control(
+            &channel,
+            &mut messages,
+            "concurrent-ack-read",
+            "fs.read",
+            json!({"path": "ack.bin"}),
+        )
+        .await;
+        let ack_stream_id = ack_read["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages).await;
+            assert_eq!(chunk["stream_id"], ack_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+
+        let cancel_read = request_host_control(
+            &channel,
+            &mut messages,
+            "concurrent-cancel-read",
+            "fs.read",
+            json!({"path": "cancel.bin"}),
+        )
+        .await;
+        let cancel_stream_id = cancel_read["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages).await;
+            assert_eq!(chunk["stream_id"], cancel_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "stalled-write.bin",
+                "length": 1,
+                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let write_stream_id = write["result"]["stream_id"].as_str().unwrap();
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": write_stream_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"x"),
+                    "test_delay_ms": 1_000,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for frame in [
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.cancel",
+                "stream_id": write_stream_id,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.ack",
+                "stream_id": ack_stream_id,
+                "sequence": 8,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.cancel",
+                "stream_id": cancel_stream_id,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "request",
+                "request_id": "after-stalled-write-cancel",
+                "operation": "ping",
+                "payload": {},
+            }),
+        ] {
+            channel.send_text(frame.to_string()).await.unwrap();
+        }
+
+        let mut saw_final_ack_chunk = false;
+        let mut saw_ack_end = false;
+        let mut saw_ping = false;
+        tokio::time::timeout(Duration::from_millis(750), async {
+            while !(saw_final_ack_chunk && saw_ack_end && saw_ping) {
+                let (_, message) = receive_host_control(&mut messages).await;
+                if message["request_id"] == "after-stalled-write-cancel" {
+                    assert_eq!(message["result"]["pong"], true);
+                    saw_ping = true;
+                } else if message["stream_id"] == ack_stream_id && message["type"] == "stream.chunk"
+                {
+                    assert_eq!(message["sequence"], 8);
+                    saw_final_ack_chunk = true;
+                } else if message["stream_id"] == ack_stream_id && message["type"] == "stream.end" {
+                    saw_ack_end = true;
+                } else {
+                    panic!("unexpected host-control message: {message}");
+                }
+            }
+        })
+        .await
+        .expect("write cancellation blocked an unrelated fast control path");
+        assert_eq!(
+            channel.ready_state(),
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        );
+        tokio::time::timeout(Duration::from_millis(750), async {
+            while std::fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".spawn-upload-")
+                })
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled write cleanup did not drain promptly");
+        assert!(!root.path().join("stalled-write.bin").exists());
+
+        browser_pc.close().await.unwrap();
+        daemon_pc.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_agent_host_files_round_trip_over_paired_data_channel() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -5152,7 +6477,7 @@ mod tests {
             .create_data_channel(HOST_CONTROL_LABEL, None)
             .await
             .unwrap();
-        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(4);
+        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(32);
         for (index, data_channel) in [(0, &channel), (1, &extra_channel)] {
             let messages_tx = messages_tx.clone();
             data_channel.on_message(Box::new(move |message: DataChannelMessage| {
@@ -5173,7 +6498,24 @@ mod tests {
             protocol_version: RTC_PROTOCOL_VERSION,
         };
         let (out_tx, _out_rx) = mpsc::channel(4);
-        install_host_data_channel_handler(&daemon_pc, "host-e2e".to_string(), binding, out_tx);
+        let file_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(file_root.path().join("source.txt"), b"source body")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            file_root.path().join("hash-cancel.bin"),
+            vec![b'h'; 16 * 1024 * 1024],
+        )
+        .await
+        .unwrap();
+        let files = Arc::new(HostFileService::rooted_at(file_root.path()).await.unwrap());
+        install_host_data_channel_handler(
+            &daemon_pc,
+            "host-e2e".to_string(),
+            binding,
+            out_tx,
+            Some(Arc::clone(&files)),
+        );
 
         let offer = browser_pc.create_offer(None).await.unwrap();
         let mut offer_gathered = browser_pc.gathering_complete_promise().await;
@@ -5200,6 +6542,11 @@ mod tests {
         let hello: Value = serde_json::from_str(&hello).unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["protocol"], HOST_CONTROL_LABEL);
+        assert_eq!(hello["limits"]["normal_queue"], 64);
+        assert_eq!(hello["limits"]["fast_queue"], 64);
+        assert_eq!(hello["limits"]["long_tasks"], 8);
+        assert_eq!(hello["limits"]["write_reapers"], 1);
+        assert_eq!(hello["limits"]["directory_entries"], 1024);
         assert!(
             tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
                 .await
@@ -5231,7 +6578,436 @@ mod tests {
         assert_eq!(response["request_id"], "e2e-ping");
         assert_eq!(response["result"]["pong"], true);
 
-        browser_pc.close().await.unwrap();
+        let listing = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-list",
+            "fs.list",
+            json!({"path": "~", "cursor": 0}),
+        )
+        .await;
+        assert_eq!(listing["result"]["home_dir"], files.home_dir());
+        assert!(listing["result"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "source.txt"));
+
+        let upload = (0..(STREAM_CHUNK_BYTES * 20 + 73))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let upload_hash = format!("{:x}", Sha256::digest(&upload));
+        let write_started = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "uploaded.txt",
+                "length": upload.len(),
+                "sha256": upload_hash,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let write_stream_id = write_started["result"]["stream_id"].as_str().unwrap();
+        for (sequence, chunk) in upload.chunks(STREAM_CHUNK_BYTES).enumerate() {
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": write_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode(chunk),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": write_stream_id,
+                    "length": upload.len(),
+                    "sha256": upload_hash,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, committed) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(committed["type"], "stream.committed");
+        assert_eq!(
+            tokio::fs::read(file_root.path().join("uploaded.txt"))
+                .await
+                .unwrap(),
+            upload,
+        );
+
+        let cancelled_write = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-active-write-cancel",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "cancelled-write.bin",
+                "length": 2,
+                "sha256": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let cancelled_write_id = cancelled_write["result"]["stream_id"].as_str().unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": cancelled_write_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"a"),
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": cancelled_write_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let after_active_cancel = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-after-active-write-cancel",
+            "ping",
+            json!({}),
+        )
+        .await;
+        assert_eq!(after_active_cancel["result"]["pong"], true);
+        assert!(!file_root.path().join("cancelled-write.bin").exists());
+
+        let backlog_bytes = vec![b'z'; 24];
+        let backlog_hash = format!("{:x}", Sha256::digest(&backlog_bytes));
+        let backlog_write = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-backlog-write-cancel",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "backlog-write.bin",
+                "length": backlog_bytes.len(),
+                "sha256": backlog_hash,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let backlog_stream_id = backlog_write["result"]["stream_id"].as_str().unwrap();
+        for (sequence, byte) in backlog_bytes.iter().enumerate() {
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": backlog_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode([*byte]),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": backlog_stream_id,
+                    "length": backlog_bytes.len(),
+                    "sha256": backlog_hash,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": backlog_stream_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut after_backlog_cancel = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-after-backlog-cancel",
+            "ping",
+            json!({}),
+        )
+        .await;
+        while after_backlog_cancel["request_id"] != "e2e-after-backlog-cancel" {
+            after_backlog_cancel = receive_host_control(&mut messages_rx).await.1;
+        }
+        assert_eq!(after_backlog_cancel["result"]["pong"], true);
+
+        let read_started = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-read",
+            "fs.read",
+            json!({"path": "uploaded.txt"}),
+        )
+        .await;
+        assert_eq!(read_started["result"]["length"], upload.len());
+        assert_eq!(read_started["result"]["sha256"], upload_hash);
+        let read_stream_id = read_started["result"]["stream_id"].as_str().unwrap();
+        let mut downloaded = Vec::new();
+        let ended = loop {
+            let (_, message) = receive_host_control(&mut messages_rx).await;
+            if message["type"] == "stream.end" {
+                break message;
+            }
+            assert_eq!(message["type"], "stream.chunk");
+            assert_eq!(message["stream_id"], read_stream_id);
+            downloaded.extend(
+                STANDARD
+                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": read_stream_id,
+                        "sequence": message["sequence"].as_u64().unwrap() + 1,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        };
+        assert_eq!(downloaded, upload);
+        assert_eq!(ended["type"], "stream.end");
+        assert_eq!(ended["length"], upload.len());
+        assert_eq!(ended["sha256"], upload_hash);
+
+        let stalled = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-stalled-read",
+            "fs.read",
+            json!({"path": "uploaded.txt"}),
+        )
+        .await;
+        let stalled_stream_id = stalled["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages_rx).await;
+            assert_eq!(chunk["type"], "stream.chunk");
+            assert_eq!(chunk["stream_id"], stalled_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+        let (_, timeout_error) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(timeout_error["type"], "stream.error");
+        assert_eq!(timeout_error["stream_id"], stalled_stream_id);
+        assert_eq!(timeout_error["error"]["code"], "stream_timeout");
+
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-hash-cancel",
+                    "operation": "fs.read",
+                    "payload": {"path": "hash-cancel.bin"},
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "cancel",
+                    "request_id": "e2e-hash-cancel",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, cancelled_hash) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(cancelled_hash["type"], "response");
+        assert_eq!(cancelled_hash["request_id"], "e2e-hash-cancel");
+        assert_eq!(cancelled_hash["ok"], false);
+        assert_eq!(cancelled_hash["error"]["code"], "cancelled");
+
+        let cancelled = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-send-cancel",
+            "fs.read",
+            json!({"path": "uploaded.txt"}),
+        )
+        .await;
+        let cancelled_stream_id = cancelled["result"]["stream_id"].as_str().unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": cancelled_stream_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut queued_after_cancel = 0;
+        while let Ok(Some((_, encoded))) =
+            tokio::time::timeout(Duration::from_millis(100), messages_rx.recv()).await
+        {
+            let message: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(message["type"], "stream.chunk");
+            assert_eq!(message["stream_id"], cancelled_stream_id);
+            queued_after_cancel += 1;
+        }
+        assert!(queued_after_cancel <= 8);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), messages_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let made = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-mkdir",
+            "fs.mkdir",
+            json!({"path": "folder"}),
+        )
+        .await;
+        assert_eq!(made["ok"], true);
+        let renamed = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-rename",
+            "fs.rename",
+            json!({"path": "uploaded.txt", "name": "renamed.txt"}),
+        )
+        .await;
+        assert!(renamed["result"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("renamed.txt"));
+        let stat = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-stat",
+            "fs.stat",
+            json!({"path": "renamed.txt"}),
+        )
+        .await;
+        assert_eq!(stat["result"]["kind"], "file");
+        assert_eq!(stat["result"]["size"], upload.len());
+        for (request_id, path) in [
+            ("e2e-remove-file", "renamed.txt"),
+            ("e2e-remove-directory", "folder"),
+        ] {
+            let removed = request_host_control(
+                accepted_channel,
+                &mut messages_rx,
+                request_id,
+                "fs.remove",
+                json!({"path": path, "recursive": false}),
+            )
+            .await;
+            assert_eq!(removed["ok"], true);
+        }
+        assert!(!file_root.path().join("renamed.txt").exists());
+        assert!(!file_root.path().join("folder").exists());
+
+        let empty_hash = format!("{:x}", Sha256::digest([]));
+        for index in 0..64 {
+            let request_id = format!("e2e-write-churn-{index}");
+            let name = format!("write-churn-{index}.bin");
+            let started = request_host_control(
+                accepted_channel,
+                &mut messages_rx,
+                &request_id,
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": name,
+                    "length": 0,
+                    "sha256": empty_hash,
+                    "overwrite": false,
+                }),
+            )
+            .await;
+            let stream_id = started["result"]["stream_id"].as_str().unwrap();
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.end",
+                        "stream_id": stream_id,
+                        "length": 0,
+                        "sha256": empty_hash,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let (_, committed) = receive_host_control(&mut messages_rx).await;
+            assert_eq!(committed["type"], "stream.committed");
+            assert_eq!(committed["stream_id"], stream_id);
+        }
+        assert_eq!(
+            std::fs::read_dir(file_root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".spawn-upload-"))
+                .count(),
+            0,
+            "rapid write churn must not retain upload temporaries",
+        );
+
+        let closing = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-peer-close",
+            "fs.read",
+            json!({"path": "hash-cancel.bin"}),
+        )
+        .await;
+        assert_eq!(closing["ok"], true);
+
+        tokio::time::timeout(Duration::from_secs(2), browser_pc.close())
+            .await
+            .expect("peer close must not wait behind a read sender")
+            .unwrap();
         daemon_pc.close().await.unwrap();
     }
 }

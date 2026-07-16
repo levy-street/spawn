@@ -32,7 +32,6 @@ also accepts `Bearer` for API testing).
 |--------|-----------------------|------------------------------------------|
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
-| GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
 | POST   | `/api/hosts/{id}/control/ping` | owner-authorized, content-free current daemon-generation readiness check (204) |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
@@ -50,8 +49,7 @@ Host shape:
   "version": "0.1.0",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
-  "agent_count": 2,
-  "home_dir": "/home/me|null"
+  "agent_count": 2
 }
 ```
 
@@ -173,7 +171,6 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
  "os": "linux",
  "arch": "x86_64",
  "version": "0.1.0",
- "home_dir": "/home/me",
  "existing_agents": ["uuid", ...]}
 
 {"type": "host.heartbeat"}
@@ -240,31 +237,6 @@ Host `rtc.candidate` and `rtc.status` frames carry the identical tuple and
 binding nonce. Host status values are content-free codes; endpoint error
 detail is not placed on the signaling websocket.
 
-{"type": "host.fs.list_result",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "home_dir": "/home/me",
- "parent": "/home/me",
- "entries": [{"name": "foo",
-              "path": "/home/me/projects/foo",
-              "is_dir": true,
-              "size": null,
-              "modified_at": 1750000000}],
- "error": null}
-
-{"type": "host.fs.read_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "a.txt",
- "size": 2,
- "bytes_b64": "aGk=",
- "error": null}
-
-{"type": "host.fs.op_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "error": null}
-
 {"type": "host.tools.check_result",
  "request_id": "uuid",
  "tools": [{
@@ -308,36 +280,6 @@ detail is not placed on the signaling websocket.
 {"type": "host.heartbeat"}
 
 {"type": "host.ping", "request_id": "uuid"}
-
-{"type": "host.fs.list",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "include_files": false}
-
-{"type": "host.fs.read",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt"}
-
-{"type": "host.fs.write",
- "request_id": "uuid",
- "dir": "/home/me/projects",
- "name": "a.txt",
- "bytes_b64": "aGk=",
- "overwrite": false}
-
-{"type": "host.fs.mkdir",
- "request_id": "uuid",
- "path": "/home/me/projects/new-dir"}
-
-{"type": "host.fs.rename",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "b.txt"}
-
-{"type": "host.fs.remove",
- "request_id": "uuid",
- "path": "/home/me/projects/old",
- "recursive": false}
 
 {"type": "host.tools.check",
  "request_id": "uuid",
@@ -623,7 +565,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping"]}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -633,9 +575,120 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Filesystem/tool/launch operations and their bounded
-chunk streams are added by later trust Phase 2 tasks; the transport root
-currently advertises only `ping`.
+outstanding request ID. Request IDs may not be reused within a host session;
+the daemon closes rather than evicting its bounded replay set.
+
+`spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
+channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
+before the host-control handler is installed. The normal/fast queue arrival
+ordinal, cancellation cutoffs, and tombstones rely on that transport contract.
+
+Every daemon DataChannel send registers a bounded, cancellable publication
+permit before starting its asynchronous channel write. Close atomically rejects
+new permits, cancels every registered send, and waits for permit drain only to
+the same absolute session-close deadline. A callback that was not scheduled by
+that deadline can retain an already-cancelled permit, but on its next poll a
+biased cancellation branch wins before `send_text`, so it cannot advance or
+publish. The server-visible content-free `connected` status uses a separate
+short fence with a nonblocking queue insertion, so it likewise cannot publish
+after close.
+
+Host filesystem paths and detailed errors exist only in this DataChannel.
+`fs.home`, `fs.stat`, `fs.mkdir`, `fs.rename`, and `fs.remove` use ordinary
+request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns one
+unsorted page of at most 96 entries plus `next_cursor`; the browser fetches a
+page only after an explicit **Load more** action. A daemon request never scans
+more than the fixed 1024-entry directory ceiling, and the final page sets
+`truncated:true` when additional entries exist. The browser retains at most 32
+pages/3072 entries for an active directory and evicts collapsed directory
+pages. Entries contain `name`, `path`, `kind`, `is_dir`, optional `size`, and
+optional `modified_at`.
+
+The daemon acquires the canonical home directory once as a filesystem
+capability. Every component is then opened relative to held directory handles
+with no-follow semantics; request-time operations never resolve an ambient
+path. Final read/write/list/mkdir/remove/rename/temp operations are anchored to
+those handles, reject symlink components, and refuse to rename/remove the root.
+`overwrite` defaults false. A no-clobber rename/commit uses the platform atomic
+`RENAME_NOREPLACE`/`RENAME_EXCL` operation and fails closed where that primitive
+is unavailable; it never uses a check-then-rename sequence.
+
+Mutating operations have an explicit acknowledgement boundary. For
+`fs.mkdir`, `fs.rename`, and `fs.remove`, the daemon acquires its session effect
+fence and observes the session as open immediately before invoking the
+filesystem mutation. A close or cancellation that wins before that point
+prevents the effect. Once the operation passes that point it is authorized and
+may finish even if the channel closes before its response is delivered. The
+same rule applies to a write commit after the browser has dispatched
+`stream.end`; disconnect or cancellation is not rollback.
+
+Every upload temporary is registered with the session before creation. A
+per-temporary state claim decides close versus commit without waiting behind an
+unrelated filesystem mutation: cleanup that claims a pending temporary unlinks
+it and prevents commit, while a commit that has already claimed its temporary
+may finish under the acknowledgement rule above. Unlink jobs run as accounted
+blocking work. Session close waits only to its one absolute deadline; if an
+underlying unlink itself stalls, close returns on time and the still-accounted
+cleanup finishes later, without permitting destination publication or
+resurrection.
+
+An acknowledged success is definitive. An explicit daemon error other than
+`outcome_unknown` is also definitive and reports that no user-visible mutation
+occurred. Once the effect fence has been crossed, however, a syscall can apply
+partially or completely before a later operation such as directory sync fails;
+the daemon therefore maps every post-boundary mutation failure to stable code
+`outcome_unknown`. The browser uses the same code if a dispatched mutation
+loses its acknowledgement to timeout, local cancellation, or session loss. It
+never automatically retries that operation and must be conservative even when
+a cancellation frame may have won. Reconcile before any manual retry:
+list/stat the mkdir target; inspect both source and destination for rename;
+stat/list the removal target; and stat/read the write destination, verifying
+its expected length and SHA-256 where applicable. These details and the error
+remain inside the encrypted host DataChannel.
+
+Reads start with:
+
+```json
+{"version":1,"type":"request","request_id":"r","operation":"fs.read","payload":{"path":"~/a.txt"}}
+{"version":1,"type":"response","request_id":"r","ok":true,"result":{"stream_id":"s","path":"/home/me/a.txt","name":"a.txt","length":2,"sha256":"...64 hex..."}}
+{"version":1,"type":"stream.chunk","stream_id":"s","sequence":0,"bytes_b64":"aGk="}
+{"version":1,"type":"stream.ack","stream_id":"s","sequence":1}
+{"version":1,"type":"stream.end","stream_id":"s","length":2,"sha256":"...64 hex..."}
+```
+
+The daemon permits at most eight unacknowledged 8 KiB chunks. DataChannel
+callbacks only validate and enqueue bounded frames: ACK/cancel frames use a
+separate 64-frame fast queue and per-read signal channel, while ordered normal
+frames use their own 64-frame queue. Hash/send jobs run outside the callback
+under an eight-task semaphore, so a sender waiting for its window cannot block
+its own ACK or cancellation. It hashes before and during the read; a mutation
+produces `stream.error` rather than a valid end.
+
+Every received frame is stamped with a session-local arrival ordinal before it
+enters either queue. A fast cancellation records that cutoff, so an earlier
+ordered chunk/end already waiting in the normal queue is validated and drained
+without resurrecting the cancelled write; a later, duplicate, unknown, or
+cross-session frame still fails closed. The browser applies the equivalent
+bounded tombstone to at most the eight already-authorized read chunks and their
+terminal frame. Tombstones expire and have fixed session-local cardinality
+limits. Completed/cancelled writes are maintained by one session-owned reaper,
+not one sleeper task per stream; it is tracked and drained on channel close.
+Writes start with `fs.write.begin` payload
+`{dir,name,length,sha256,overwrite?}`, then the browser sends the same chunk and
+end shapes. The daemon rejects wrong sequence/length/hash, writes a unique temp
+file, flushes and fsyncs it, atomically renames it, and fsyncs the parent before
+`stream.committed`. Timeout, cancellation, peer loss, or integrity failure
+removes the temp file. Files are capped at 512 MiB.
+
+For cross-host transfer, the browser opens two independently authorized host
+sessions and pumps the source read stream into the destination write stream;
+it neither buffers the whole file nor sends any path, metadata, error, or byte
+through the signaling server. Source/destination errors, timeouts, cancellation,
+or either peer closing race the pump; the first terminal outcome cancels both
+streams and awaits cleanup before returning. The former REST
+`/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
+Browser downloads stream to a native file destination when supported; the
+object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 
 ## Versioning
 

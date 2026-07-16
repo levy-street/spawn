@@ -7,7 +7,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -18,12 +17,10 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, StoredCreds};
 use crate::proto::{
-    AgentCreate, HostDirEntry, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound,
-    Outbound,
+    AgentCreate, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound, Outbound,
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcSessions};
-use crate::upload;
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 
@@ -151,7 +148,6 @@ async fn serve_one_connection(
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        home_dir: daemon_home_dir().map(|p| p.to_string_lossy().into_owned()),
         existing_agents: registry.ids(),
     };
     let register_json = serde_json::to_string(&register)?;
@@ -264,49 +260,6 @@ async fn dispatch_loop(
                     if let Ok(frame) = serde_json::to_string(&Outbound::HostPong { request_id }) {
                         let _ = out_tx.send(WsOutbound::json(frame)).await;
                     }
-                }
-                Inbound::HostFsList {
-                    request_id,
-                    path,
-                    include_files,
-                } => {
-                    handle_host_fs_list(request_id, path, include_files, out_tx).await;
-                }
-                Inbound::HostFsRead { request_id, path } => {
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        handle_host_fs_read(request_id, path, &out_tx).await;
-                    });
-                }
-                Inbound::HostFsWrite {
-                    request_id,
-                    dir,
-                    name,
-                    bytes_b64,
-                    overwrite,
-                } => {
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        handle_host_fs_write(request_id, dir, name, bytes_b64, overwrite, &out_tx)
-                            .await;
-                    });
-                }
-                Inbound::HostFsMkdir { request_id, path } => {
-                    handle_host_fs_mkdir(request_id, path, out_tx).await;
-                }
-                Inbound::HostFsRemove {
-                    request_id,
-                    path,
-                    recursive,
-                } => {
-                    handle_host_fs_remove(request_id, path, recursive, out_tx).await;
-                }
-                Inbound::HostFsRename {
-                    request_id,
-                    path,
-                    name,
-                } => {
-                    handle_host_fs_rename(request_id, path, name, out_tx).await;
                 }
                 Inbound::HostToolsCheck {
                     request_id,
@@ -551,280 +504,6 @@ async fn dispatch_loop(
         }
     }
     Ok(())
-}
-
-async fn handle_host_fs_list(
-    request_id: String,
-    path: Option<String>,
-    include_files: bool,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let home_dir = daemon_home_dir().map(|p| p.to_string_lossy().into_owned());
-    let target = expand_host_path(path.as_deref().unwrap_or(""));
-    let path_string = target.to_string_lossy().into_owned();
-    let parent = target.parent().map(|p| p.to_string_lossy().into_owned());
-
-    let mut entries = Vec::new();
-    let mut error = None;
-    match tokio::fs::read_dir(&target).await {
-        Ok(mut dir) => loop {
-            match dir.next_entry().await {
-                Ok(Some(entry)) => {
-                    let file_type = match entry.file_type().await {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let is_dir = file_type.is_dir();
-                    if !is_dir && !include_files {
-                        continue;
-                    }
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name == "." || name == ".." {
-                        continue;
-                    }
-                    let metadata = entry.metadata().await.ok();
-                    entries.push(HostDirEntry {
-                        path: entry.path().to_string_lossy().into_owned(),
-                        name,
-                        is_dir: Some(is_dir),
-                        size: metadata.as_ref().filter(|_| !is_dir).map(|m| m.len()),
-                        modified_at: metadata
-                            .as_ref()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64),
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
-                }
-            }
-        },
-        Err(e) => {
-            error = Some(e.to_string());
-        }
-    }
-
-    entries.sort_by(|a, b| {
-        let a_dir = a.is_dir.unwrap_or(false);
-        let b_dir = b.is_dir.unwrap_or(false);
-        b_dir
-            .cmp(&a_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-
-    let frame = Outbound::HostFsListResult {
-        request_id,
-        path: path_string,
-        home_dir,
-        parent,
-        entries,
-        error,
-    };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
-    }
-}
-
-async fn send_fs_op_result(
-    request_id: String,
-    path: Option<String>,
-    error: Option<String>,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let frame = Outbound::HostFsOpResult {
-        request_id,
-        path,
-        error,
-    };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
-    }
-}
-
-async fn handle_host_fs_read(request_id: String, path: String, out_tx: &mpsc::Sender<WsOutbound>) {
-    let target = expand_host_path(&path);
-    let path_string = target.to_string_lossy().into_owned();
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
-
-    let read = async {
-        let metadata = tokio::fs::metadata(&target)
-            .await
-            .with_context(|| format!("reading metadata for {}", target.display()))?;
-        if !metadata.is_file() {
-            anyhow::bail!("not a regular file");
-        }
-        if metadata.len() as usize > upload::MAX_FS_BYTES {
-            anyhow::bail!("file exceeds 32 MB download limit");
-        }
-        let bytes = tokio::fs::read(&target)
-            .await
-            .with_context(|| format!("reading {}", target.display()))?;
-        Ok::<_, anyhow::Error>((metadata.len(), STANDARD.encode(&bytes)))
-    }
-    .await;
-
-    let frame = match read {
-        Ok((size, bytes_b64)) => Outbound::HostFsReadResult {
-            request_id,
-            path: path_string,
-            name,
-            size: Some(size),
-            bytes_b64: Some(bytes_b64),
-            error: None,
-        },
-        Err(e) => Outbound::HostFsReadResult {
-            request_id,
-            path: path_string,
-            name,
-            size: None,
-            bytes_b64: None,
-            error: Some(e.to_string()),
-        },
-    };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
-    }
-}
-
-async fn handle_host_fs_write(
-    request_id: String,
-    dir: String,
-    name: String,
-    bytes_b64: String,
-    overwrite: bool,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let target_dir = expand_host_path(&dir);
-    let write = async {
-        let bytes = STANDARD
-            .decode(bytes_b64.as_bytes())
-            .context("decoding file payload")?;
-        upload::save_file_in_dir(&target_dir, &name, &bytes, overwrite).await
-    }
-    .await;
-
-    match write {
-        Ok(path) => {
-            send_fs_op_result(
-                request_id,
-                Some(path.to_string_lossy().into_owned()),
-                None,
-                out_tx,
-            )
-            .await;
-        }
-        Err(e) => {
-            send_fs_op_result(request_id, None, Some(e.to_string()), out_tx).await;
-        }
-    }
-}
-
-async fn handle_host_fs_mkdir(request_id: String, path: String, out_tx: &mpsc::Sender<WsOutbound>) {
-    let target = expand_host_path(&path);
-    let path_string = target.to_string_lossy().into_owned();
-    match tokio::fs::create_dir_all(&target).await {
-        Ok(()) => send_fs_op_result(request_id, Some(path_string), None, out_tx).await,
-        Err(e) => {
-            send_fs_op_result(request_id, Some(path_string), Some(e.to_string()), out_tx).await
-        }
-    }
-}
-
-async fn handle_host_fs_remove(
-    request_id: String,
-    path: String,
-    recursive: bool,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let target = expand_host_path(&path);
-    let path_string = target.to_string_lossy().into_owned();
-
-    let remove = async {
-        if target == Path::new("/") || Some(&target) == daemon_home_dir().as_ref() {
-            anyhow::bail!("refusing to remove {}", target.display());
-        }
-        let metadata = tokio::fs::symlink_metadata(&target)
-            .await
-            .with_context(|| format!("reading metadata for {}", target.display()))?;
-        if metadata.is_dir() {
-            if recursive {
-                tokio::fs::remove_dir_all(&target).await
-            } else {
-                tokio::fs::remove_dir(&target).await
-            }
-            .with_context(|| format!("removing directory {}", target.display()))?;
-        } else {
-            tokio::fs::remove_file(&target)
-                .await
-                .with_context(|| format!("removing {}", target.display()))?;
-        }
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-
-    match remove {
-        Ok(()) => send_fs_op_result(request_id, Some(path_string), None, out_tx).await,
-        Err(e) => {
-            send_fs_op_result(request_id, Some(path_string), Some(e.to_string()), out_tx).await
-        }
-    }
-}
-
-async fn handle_host_fs_rename(
-    request_id: String,
-    path: String,
-    name: String,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let source = expand_host_path(&path);
-
-    let rename = async {
-        let name = name.trim();
-        if name.is_empty() || name.len() > 255 || name == "." || name == ".." {
-            anyhow::bail!("invalid name");
-        }
-        if name.contains(['/', '\\']) || name.chars().any(char::is_control) {
-            anyhow::bail!("name cannot contain path separators");
-        }
-        if source == Path::new("/") || Some(&source) == daemon_home_dir().as_ref() {
-            anyhow::bail!("refusing to rename {}", source.display());
-        }
-        let parent = source
-            .parent()
-            .ok_or_else(|| anyhow!("cannot rename {}", source.display()))?;
-        let target = parent.join(name);
-        if target == source {
-            return Ok(target);
-        }
-        if tokio::fs::try_exists(&target)
-            .await
-            .with_context(|| format!("checking {}", target.display()))?
-        {
-            anyhow::bail!("{name} already exists");
-        }
-        tokio::fs::rename(&source, &target)
-            .await
-            .with_context(|| format!("renaming {}", source.display()))?;
-        Ok::<_, anyhow::Error>(target)
-    }
-    .await;
-
-    match rename {
-        Ok(target) => {
-            send_fs_op_result(
-                request_id,
-                Some(target.to_string_lossy().into_owned()),
-                None,
-                out_tx,
-            )
-            .await;
-        }
-        Err(e) => send_fs_op_result(request_id, None, Some(e.to_string()), out_tx).await,
-    }
 }
 
 async fn handle_host_tools_check(

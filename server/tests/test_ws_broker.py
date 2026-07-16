@@ -85,46 +85,6 @@ async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassocia
 
 
 @pytest.mark.asyncio
-async def test_broker_directory_request_roundtrip(app):
-    broker = get_broker()
-
-    host_id = "host-dirs"
-    user_id = "user-1"
-    daemon_ws = FakeWS()
-    daemon = DaemonConn(
-        host_id=host_id,
-        user_id=user_id,
-        websocket=daemon_ws,  # type: ignore[arg-type]
-        home_dir="/home/me",
-    )
-    await _accept_owner(broker, daemon)
-
-    task = asyncio.create_task(broker.request_dir_list(daemon, path="/home/me", timeout=1))
-    await asyncio.sleep(0)
-
-    sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent["type"] == "host.fs.list"
-    assert sent["path"] == "/home/me"
-    request_id = sent["request_id"]
-
-    payload = {
-        "type": "host.fs.list_result",
-        "request_id": request_id,
-        "path": "/home/me",
-        "home_dir": "/home/me",
-        "parent": "/home",
-        "entries": [{"name": "src", "path": "/home/me/src"}],
-        "error": None,
-    }
-    await broker.resolve_dir_list(
-        request_id, payload, daemon=daemon, expected_host_generation=1
-    )
-    assert await task == payload
-
-    await broker.unregister_daemon(daemon)
-
-
-@pytest.mark.asyncio
 async def test_broker_tool_install_request_roundtrip(app):
     broker = get_broker()
 

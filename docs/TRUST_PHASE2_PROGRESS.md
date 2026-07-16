@@ -9,12 +9,13 @@ schedule: `docs/TRUST_PHASE2_TASKS.md`. Read all three first.
 A security audit found that the server **saw protected content**: even for v2
 (DataChannel) clients the daemon mirrored PTY output to the server as plaintext
 (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
-transited the server. The P2-AGENT-02 implementation checkpoint removes that
-agent-terminal path; its independent review and merge are still pending. Host
-paths/files/transfers, installer output,
-REST terminal surfaces, launch values, preset environment templates, and skill
-bodies also have server-readable paths or stores. Signaling is unsigned (server
-can MITM the DataChannel). Goal of this work ("Tier 2"):
+transited the server. The reviewed P2-AGENT-02/P2-TERM-02 cut now removes that
+agent-terminal path. The reviewed P2-HOST-02 cut removes host paths/files/
+transfers from the server. The current P2-TERM-01 review candidate also removes
+agent uploads, while installer output, launch values, preset environment
+templates, and skill bodies still have server-readable paths or stores.
+Signaling is unsigned (server can MITM the DataChannel). Goal of this work
+("Tier 2"):
 
 - **Phase 2** — server has no plaintext protected-content path or recoverable
   plaintext store. Acceptance includes runtime path tests plus primary and
@@ -40,6 +41,9 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 | `1bb9fe9`, `775b7d0` | QUAL-02, QUAL-04 | Independently reviewed repository-wide daemon format cleanup and strict Clippy fixes. |
 | `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
 | `1f66d2d` | P2-AGENT-01, P2-TMUX-01, P2-HOST-01 | Integrated the independently reviewed per-agent control root, worker-only/tmux-removal cutover, and host-scoped control root plus their hardening series on `master`. |
+| `5722288` | P2-AGENT-02, P2-TERM-02 | Integrated the independently reviewed server-terminal relay removal, mandatory two-channel agent RTC gate, strict v2 signaling, and bounded lifecycle teardown series on `master`. |
+| `22c1f0c` | QUAL-FLAKE-01 | Integrated the independently reviewed task-lifecycle and smoke stability corrections. |
+| `4e7c89b` | P2-HOST-02 | Integrated the independently reviewed capability-rooted host filesystem channel, bounded streaming/cancellation, conservative `outcome_unknown`, shutdown/publication, and temp-cleanup hardening series on `master`. |
 
 ### Increment 1 detail (the keystone)
 
@@ -92,8 +96,89 @@ bytes for activity.
 Wave 1 is complete on `master` through `1f66d2d`: P2-AGENT-01,
 P2-TMUX-01, and P2-HOST-01 passed independent review and were integrated. The
 per-agent `spawn.ctl`, mandatory worker-only backend, and independent
-host-scoped `spawn.host.ctl` roots are therefore established. The detailed
-status/dependencies are in `TRUST_PHASE2_TASKS.md`.
+host-scoped `spawn.host.ctl` roots are therefore established.
+
+The reviewed P2-AGENT-02/P2-TERM-02 terminal-relay cut is integrated on
+`master` through `5722288`. The application server no longer has live terminal,
+replay, snapshot, or viewport content paths; both agent DataChannels and strict
+v2 signaling tuples are mandatory.
+
+The QUAL-FLAKE-01 stability correction passed independent review and is merged
+at `22c1f0c`. Server auto-update tasks are centrally owned and drained,
+local-daemon cleanup is bounded and tied to stable process identities, and the
+persistent-agent smoke waits on an owner-authorized, content-free
+current-generation `host.ping`/`host.pong` exchange.
+
+P2-HOST-02 passed independent review and is integrated on `master` at
+`4e7c89b`: host home/list/stat/read/write/mkdir/rename/remove, browser
+download/upload, and browser-mediated cross-host transfer use bounded,
+hash-and-length-checked DataChannel streams. Registration `home_dir`, filesystem
+REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
+are removed.
+
+The first P2-HOST-02 review rejected the candidate for path-resolution races,
+serial DataChannel read deadlock, check-then-rename clobbering, incomplete
+bilateral transfer aborts, unbounded directory aggregation, and inadequate
+two-host isolation coverage. The revised candidate uses a held capability root
+and no-follow directory handles, atomic no-replace rename, separate bounded
+ACK/cancel dispatch, explicit bounded directory pages/UI retention, bilateral
+abort cleanup, and real distinct-host paired-channel coverage.
+
+The next review found three cancel/lifecycle races: active-write cancel fell
+through to channel close, split fast/normal queues could reorder cancellation
+ahead of earlier frames on both endpoints, and per-write cleanup sleepers were
+untracked. Corrections return handled cancellation, stamp frames before queue
+routing, use bounded expiring cutoff tombstones on daemon and browser, and own
+one tracked session reaper that drains at close.
+
+The following review found that stamping alone was insufficient: the fast
+consumer still published the write-cancel cutoff too late, cancellation could
+wait on an active file-write lock and its disk cleanup, and the browser could
+accept a new read declaration that reused a cancelled stream ID. The current
+candidate synchronously assigns each arrival ordinal and publishes stream
+cancel cutoffs in one short per-session arbiter critical section before queue
+routing. Any later write chunk/end fails closed even while the fast consumer is
+backlogged. Active writes have cancellation tokens; fast cancel removes and
+tombstones the stream, signals its token, and enqueues bounded cleanup without
+waiting for file I/O. One tracked session maintenance task owns cleanup and
+idle reaping, and cancelled temporary files are dropped and unlinked without a
+pointless flush. Browser read declarations reject active and tombstoned IDs.
+Forced fast-delay cancel-then-chunk/end, stalled-write ACK/cancel survival,
+prompt cleanup, browser declaration replay, paired-channel backlog/reuse,
+rapid write-churn shutdown, and distinct-host isolation regressions cover these
+findings.
+
+The latest review made the close/effect boundary explicit. A mutation that
+passes the session effect fence may finish after peer close, so lost
+acknowledgements for dispatched mkdir/rename/remove operations and writes after
+`stream.end` now surface as stable `outcome_unknown`, never as proof of
+rollback; the browser does not retry and must reconcile endpoint state first.
+Deterministic tests pause both before and after effect authorization, prove the
+single close deadline, cancel and drain every claimed DataChannel send before
+that deadline, make any late-polled callback take cancellation before
+`send_text`, suppress new sends after close, and verify write-temp cleanup.
+Host control also rejects
+unordered or partially reliable
+DataChannels, suppresses hello/connected publication when close wins the open
+race, and bounds the deliberately external close invoker with a tested hard
+deadline. A session-owned temporary registry now exists before upload-temp
+creation. Its per-temp claim lets close remove unpublished and pre-commit temps
+without waiting behind unrelated linearized mutations; already-linearized
+commits retain the conservative `outcome_unknown` rule. Cleanup syscalls run in
+accounted blocking closures and cannot extend the single close deadline, even
+when an unlink itself stalls.
+
+**Accepted P2-HOST-02 review validation:** daemon format and
+strict all-target Clippy pass; all 169 daemon tests pass; server Ruff and all
+149 server tests pass; web lint, typecheck, all 54 unit tests, 68 Playwright
+tests with retries disabled (3 opt-in audits skipped), and the production build
+pass. `SPAWN_E2E_PORT=43957 scripts/test-all.sh` also passes the full repeatable
+matrix, including prebuilt install, HTTP, Redis, PostgreSQL owner recovery,
+login, daemon lifecycle, live-browser, and service-manager smokes. No
+P2-HOST-02 worker process remains afterward.
+
+The merged P2-HOST-02 implementation includes the reviewed worker-only and
+agent-relay checkpoints and retains both source guards.
 
 **P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
@@ -112,7 +197,7 @@ restore the retired content path. The server/API/web `tmux_session` display
 field and `agent.rename` frame are removed in this checkpoint because their
 derived labels were not guaranteed content-free.
 
-**P2-AGENT-02/P2-TERM-02 checkpoint (implemented, review pending):** daemon
+**P2-AGENT-02/P2-TERM-02 checkpoint (reviewed and merged):** daemon
 WebSocket `spawn.control.v2` is JSON-only; browser WebSocket `spawn.v2` is
 mandatory; the `0x01` output and `0x02` input frames, `spawn.v1`, transcripts,
 agent-content Redis pubsub, server snapshots/history/display state, browser
@@ -125,7 +210,7 @@ with a `spawn.ctl` v1 `ready` event; browsers keep PTY input and control
 requests in bounded generation-scoped queues until that event, then fail the
 RTC attempt on the existing 10-second connection/bootstrap deadline.
 
-**Current P2-AGENT-02 review-candidate validation:** strict daemon format and
+**Accepted P2-AGENT-02 review validation:** strict daemon format and
 Clippy pass; all 140 daemon tests pass; server Ruff and all 146 server tests
 pass; web lint, all 30 unit tests, 68 browser tests (3 opt-in audits skipped),
 and the production build pass. `SPAWN_E2E_PORT=3791 scripts/test-all.sh` passes
@@ -147,15 +232,19 @@ or old peers fail closed. Server routes, schemas, broker waiters, browser and
 daemon upload frames, and web API helpers are removed. Legacy frames close
 without logging names, paths, errors, or payloads.
 
-**Current P2-TERM-01 candidate validation:** strict daemon format and Clippy
-pass; all daemon all-target tests pass (60 library, 85 daemon, 8 worker E2E);
-full server Ruff and all 137 server tests pass; web lint, TypeScript, all 31
-unit tests, 68 browser tests (3 opt-in audits skipped), the direct chunked
-upload browser test, and the production build pass. With
-`SPAWN_E2E_PORT=3792`, `scripts/test-all.sh` also passes all repeatable checks
-plus installer, HTTP, real-Redis, PostgreSQL/Redis owner-recovery, login, daemon,
-live-browser direct upload, and service-manager smokes. Concurrent-current-
-master mergeability remains to be recorded before independent review.
+**Current integrated P2-TERM-01 candidate validation:** strict daemon format
+and all-target Clippy pass; all daemon all-target tests pass (60 library, 107
+daemon, 8 worker E2E); full server Ruff and all 134 server tests pass; web lint,
+TypeScript, all 55 unit tests, 68 retry-free browser tests (3 opt-in audits
+skipped), the direct chunked-upload browser test, and the production build
+pass. With `SPAWN_E2E_PORT=44192`, `scripts/test-all.sh` also passes all
+repeatable checks plus installer, HTTP, real-Redis, PostgreSQL/Redis
+owner-recovery, login, daemon, live-browser direct upload, and service-manager
+smokes. Semantic integration includes current `master` at P2-HOST-02
+`4e7c89b`; its accepted host-control/filesystem implementation remains
+byte-identical, the combined host/upload adversarial suites pass, and only the
+required shared source/docs deletions differ. Independent review is still
+required before acceptance or merge.
 
 This is still a source checkpoint: it is not merged or deployed, does not purge
 historical copies, and does not complete Phase 2. Offline history is now an
@@ -167,12 +256,11 @@ backups, replicas and snapshots remain in P2-PURGE-01 scope.
 ## Remaining sequence
 
 1. Independently review and merge the P2-TERM-01 direct agent-upload candidate,
-   including current-master/concurrent-host merge simulation; do not restore a
+   including current-master integrated-host coexistence; do not restore a
    REST/WS compatibility upload path for old peers.
-2. Move host listings/read/write/transfer onto the host channel and ship a
-   parallel E2E path for interactive installer detail. Cross-host bytes stream
-   through the trusted browser, not the server. Keep the legacy tool route until
-   its endpoint-owned durable targets exist; this wave is not the final tool cut.
+2. Ship the parallel E2E path for interactive installer detail. Keep the
+   legacy tool route until its endpoint-owned durable targets exist; this wave
+   is not the final tool cut.
 3. Move full launch manifests, `Agent.env`, preset environment/install/tool
    targets, and skill bodies to the approved endpoint-owned/encrypted store.
    Stop cwd-derived default names, then make the interactive E2E tool path

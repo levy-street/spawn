@@ -36,8 +36,11 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { ApiError, type HostDirEntry, hosts } from "@/lib/api";
+import { useHostControl } from "@/hooks/useHostControl";
+import { ApiError, hosts } from "@/lib/api";
+import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
 import { cn } from "@/lib/utils";
+import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
 /**
  * VS Code-style lazy file tree for a spawn host. Flat-rendered rows with
@@ -46,10 +49,31 @@ import { cn } from "@/lib/utils";
 
 const INDENT_PX = 12;
 
-interface Row {
+interface EntryRow {
+  kind: "entry";
   entry: HostDirEntry;
   depth: number;
   parentDir: string;
+}
+
+interface PageRow {
+  kind: "page";
+  depth: number;
+  dir: string;
+  nextCursor: number | null;
+  loading: boolean;
+  error: unknown;
+  limitReached: boolean;
+}
+
+type Row = EntryRow | PageRow;
+
+interface DirectoryListing {
+  entries: HostDirEntry[];
+  nextCursor: number | null;
+  loading: boolean;
+  error: unknown;
+  limitReached: boolean;
 }
 
 interface MenuState {
@@ -112,46 +136,137 @@ export function FileExplorer({
   const [status, setStatus] = useState<string | null>(null);
   const [uploadingCount, setUploadingCount] = useState(0);
   const [dropDir, setDropDir] = useState<string | null>(null);
+  const [pageCursors, setPageCursors] = useState<Record<string, number[]>>({});
   const uploadDirRef = useRef<string | null>(null);
   const initialAppliedRef = useRef(false);
+  const { client: hostControl, state: hostControlState } = useHostControl(hostId);
+  const controlReady = hostControlState === "ready" && hostControl !== null;
 
   const rootQ = useQuery({
     queryKey: ["host-files", hostId, rootPath ?? ""],
-    queryFn: () => hosts.files(hostId, rootPath),
+    queryFn: () => hostControl!.listPage(rootPath),
+    enabled: controlReady,
+    gcTime: 0,
   });
   const resolvedRoot = rootQ.data?.path ?? rootPath ?? null;
 
   const childQs = useQueries({
     queries: expanded.map((path) => ({
       queryKey: ["host-files", hostId, path],
-      queryFn: () => hosts.files(hostId, path),
+      queryFn: () => hostControl!.listPage(path),
+      enabled: controlReady,
+      gcTime: 0,
     })),
   });
-  const listings = useMemo(() => {
-    const map = new Map<string, { entries: HostDirEntry[]; loading: boolean }>();
-    expanded.forEach((path, i) => {
-      const q = childQs[i];
-      map.set(path, { entries: q?.data?.entries ?? [], loading: Boolean(q?.isLoading) });
+  const pageRequests = useMemo(
+    () =>
+      Object.entries(pageCursors).flatMap(([path, cursors]) =>
+        cursors.map((cursor) => ({ path, cursor })),
+      ),
+    [pageCursors],
+  );
+  const pageQs = useQueries({
+    queries: pageRequests.map(({ path, cursor }) => ({
+      queryKey: ["host-files", hostId, path, "page", cursor],
+      queryFn: () => hostControl!.listPage(path, cursor),
+      enabled: controlReady,
+      gcTime: 0,
+    })),
+  });
+  const { rootListing, listings } = useMemo(() => {
+    const extra = new Map<string, (typeof pageQs)[number]>();
+    pageRequests.forEach(({ path, cursor }, index) => {
+      const query = pageQs[index];
+      if (query) extra.set(`${path}\0${cursor}`, query);
     });
-    return map;
-  }, [expanded, childQs]);
+    const build = (
+      path: string,
+      firstPage: HostDirList | undefined,
+      firstLoading: boolean,
+      firstError: unknown,
+    ): DirectoryListing => {
+      const pages = firstPage ? [firstPage] : [];
+      let loading = firstLoading;
+      let error = firstError;
+      for (const cursor of pageCursors[path] ?? []) {
+        const query = extra.get(`${path}\0${cursor}`);
+        if (query?.data) pages.push(query.data);
+        else {
+          loading ||= Boolean(query?.isLoading || query?.isFetching);
+          error ??= query?.error;
+          break;
+        }
+      }
+      const retained = retainDirectoryPages(pages);
+      return { ...retained, loading, error };
+    };
+    const map = new Map<string, DirectoryListing>();
+    expanded.forEach((path, index) => {
+      const query = childQs[index];
+      map.set(
+        path,
+        build(
+          path,
+          query?.data,
+          Boolean(!query?.data && (query?.isLoading || query?.isFetching)),
+          query?.error,
+        ),
+      );
+    });
+    return {
+      rootListing: resolvedRoot
+        ? build(
+            resolvedRoot,
+            rootQ.data,
+            Boolean(!rootQ.data && (rootQ.isLoading || rootQ.isFetching)),
+            rootQ.error,
+          )
+        : null,
+      listings: map,
+    };
+  }, [childQs, expanded, pageCursors, pageQs, pageRequests, resolvedRoot, rootQ]);
+  const retainedPageCount = 1 + expanded.length + pageRequests.length;
 
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
   const otherHosts = (hostsQ.data ?? []).filter((h) => h.id !== hostId);
 
+  // Props identify a distinct host tree, so local paging state must not leak.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset on tree identity changes
+  useEffect(() => {
+    setPageCursors({});
+    setExpanded([]);
+    initialAppliedRef.current = false;
+  }, [hostId, rootPath]);
+
   const rows = useMemo(() => {
     const out: Row[] = [];
-    const walk = (entries: HostDirEntry[], depth: number, parentDir: string) => {
-      for (const entry of entries) {
-        out.push({ entry, depth, parentDir });
+    const walk = (listing: DirectoryListing, depth: number, parentDir: string) => {
+      for (const entry of listing.entries) {
+        out.push({ kind: "entry", entry, depth, parentDir });
         if (entry.is_dir && expanded.includes(entry.path)) {
-          walk(listings.get(entry.path)?.entries ?? [], depth + 1, entry.path);
+          const child = listings.get(entry.path);
+          if (child) walk(child, depth + 1, entry.path);
         }
       }
+      if (listing.loading || listing.error || listing.nextCursor !== null || listing.limitReached) {
+        out.push({
+          kind: "page",
+          depth,
+          dir: parentDir,
+          nextCursor: listing.nextCursor,
+          loading: listing.loading,
+          error: listing.error,
+          limitReached: listing.limitReached,
+        });
+      }
     };
-    if (rootQ.data && resolvedRoot) walk(rootQ.data.entries, 0, resolvedRoot);
+    if (rootListing && resolvedRoot) walk(rootListing, 0, resolvedRoot);
     return out;
-  }, [rootQ.data, resolvedRoot, expanded, listings]);
+  }, [resolvedRoot, expanded, listings, rootListing]);
+  const entryRows = useMemo(
+    () => rows.filter((row): row is EntryRow => row.kind === "entry"),
+    [rows],
+  );
 
   // Deep link: expand every ancestor between the root and initialPath.
   useEffect(() => {
@@ -167,13 +282,23 @@ export function FileExplorer({
       acc = `${acc}/${part}`;
       ancestors.push(acc);
     }
-    setExpanded((current) => [...new Set([...current, ...ancestors])]);
+    const available = Math.max(0, FILE_EXPLORER_RETAINED_PAGE_LIMIT - 1);
+    setExpanded((current) => [...new Set([...current, ...ancestors])].slice(0, available));
+    if (ancestors.length > available) {
+      setStatus("File view limit reached before the full deep link could be expanded");
+    }
     setSelected(initialPath);
     initialAppliedRef.current = true;
   }, [initialPath, resolvedRoot]);
 
   const refreshDir = useCallback(
     (dir: string | null) => {
+      setPageCursors((current) => {
+        const next = { ...current };
+        if (dir) delete next[dir];
+        else if (resolvedRoot) delete next[resolvedRoot];
+        return next;
+      });
       if (dir === null || dir === resolvedRoot) {
         qc.invalidateQueries({ queryKey: ["host-files", hostId, rootPath ?? ""] });
         if (resolvedRoot) qc.invalidateQueries({ queryKey: ["host-files", hostId, resolvedRoot] });
@@ -185,16 +310,47 @@ export function FileExplorer({
   );
 
   const refreshAll = useCallback(() => {
+    setPageCursors({});
     qc.invalidateQueries({ queryKey: ["host-files", hostId] });
   }, [hostId, qc]);
 
-  const toggleDir = useCallback((path: string) => {
-    setExpanded((current) =>
-      current.includes(path)
-        ? current.filter((p) => p !== path && !p.startsWith(`${path}/`))
-        : [...current, path],
-    );
-  }, []);
+  const toggleDir = useCallback(
+    (path: string) => {
+      if (expanded.includes(path)) {
+        setExpanded((current) =>
+          current.filter((entryPath) => entryPath !== path && !entryPath.startsWith(`${path}/`)),
+        );
+        setPageCursors((pages) =>
+          Object.fromEntries(
+            Object.entries(pages).filter(
+              ([pagePath]) => pagePath !== path && !pagePath.startsWith(`${path}/`),
+            ),
+          ),
+        );
+        return;
+      }
+      if (retainedPageCount >= FILE_EXPLORER_RETAINED_PAGE_LIMIT) {
+        setStatus("File view limit reached; collapse a directory before expanding another");
+        return;
+      }
+      setExpanded((current) => [...current, path]);
+    },
+    [expanded, retainedPageCount],
+  );
+
+  const loadNextPage = useCallback(
+    (path: string, cursor: number) => {
+      if (retainedPageCount >= FILE_EXPLORER_RETAINED_PAGE_LIMIT) {
+        setStatus("File view limit reached; collapse a directory before loading more entries");
+        return;
+      }
+      setPageCursors((current) => {
+        const cursors = current[path] ?? [];
+        return cursors.includes(cursor) ? current : { ...current, [path]: [...cursors, cursor] };
+      });
+    },
+    [retainedPageCount],
+  );
 
   const uploadFiles = useCallback(
     async (dir: string, files: globalThis.File[]) => {
@@ -203,7 +359,8 @@ export function FileExplorer({
       setUploadingCount((n) => n + files.length);
       for (const file of files) {
         try {
-          const result = await hosts.uploadFile(hostId, file, { dir });
+          if (!hostControl) throw new Error("Host control channel is not ready");
+          const result = await hostControl.uploadFile(file, { dir });
           setStatus(`Uploaded ${result.path ?? file.name}`);
         } catch (err) {
           setStatus(`${file.name || "File"}: ${errorMessage(err)}`);
@@ -213,12 +370,12 @@ export function FileExplorer({
       }
       refreshDir(dir);
     },
-    [hostId, refreshDir],
+    [hostControl, refreshDir],
   );
 
   const mkdirM = useMutation({
     mutationFn: ({ dir, name }: { dir: string; name: string }) =>
-      hosts.mkdir(hostId, `${dir}/${name}`),
+      hostControl?.mkdir(`${dir}/${name}`) ?? Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { dir }) => {
       setCreatingIn(null);
       setFolderDraft("");
@@ -230,7 +387,7 @@ export function FileExplorer({
 
   const renameM = useMutation({
     mutationFn: ({ entry, name }: { entry: HostDirEntry; name: string; parentDir: string }) =>
-      hosts.renameFile(hostId, { path: entry.path, name }),
+      hostControl?.rename(entry.path, name) ?? Promise.reject(new Error("Host is not connected")),
     onSuccess: (result, { entry, parentDir }) => {
       setRenaming(null);
       if (result.path) {
@@ -246,6 +403,18 @@ export function FileExplorer({
                   : p,
             ),
           );
+          setPageCursors((current) =>
+            Object.fromEntries(
+              Object.entries(current).map(([path, cursors]) => [
+                path === entry.path
+                  ? (result.path as string)
+                  : path.startsWith(oldPrefix)
+                    ? `${result.path}${path.slice(entry.path.length)}`
+                    : path,
+                cursors,
+              ]),
+            ),
+          );
         }
       }
       refreshDir(parentDir);
@@ -256,10 +425,18 @@ export function FileExplorer({
 
   const deleteM = useMutation({
     mutationFn: ({ entry }: { entry: HostDirEntry; parentDir: string }) =>
-      hosts.deleteFile(hostId, { path: entry.path, recursive: entry.is_dir === true }),
+      hostControl?.remove(entry.path, entry.is_dir === true) ??
+      Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { entry, parentDir }) => {
       setStatus(`Deleted ${entry.name}`);
       setExpanded((cur) => cur.filter((p) => p !== entry.path && !p.startsWith(`${entry.path}/`)));
+      setPageCursors((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([path]) => path !== entry.path && !path.startsWith(`${entry.path}/`),
+          ),
+        ),
+      );
       if (selected === entry.path) setSelected(null);
       refreshDir(parentDir);
     },
@@ -275,12 +452,23 @@ export function FileExplorer({
       entry: HostDirEntry;
       destHostId: string;
       destDir: string;
-    }) =>
-      hosts.transferFile(hostId, {
-        path: entry.path,
-        dest_host_id: destHostId,
-        dest_dir: destDir,
-      }),
+    }) => {
+      if (!hostControl) throw new Error("Source host is not connected");
+      return (async () => {
+        const destination = new HostControlClient(destHostId);
+        try {
+          await destination.waitUntilReady();
+          const home = await destination.home();
+          return await hostControl.transferFileTo(
+            destination,
+            entry.path,
+            destDir === "~" ? home.home_dir : destDir,
+          );
+        } finally {
+          destination.close();
+        }
+      })();
+    },
     onSuccess: (result) => setStatus(`Sent to ${result.path ?? "destination host"}`),
     onError: (err) => setStatus(errorMessage(err)),
   });
@@ -289,19 +477,14 @@ export function FileExplorer({
     async (entry: HostDirEntry) => {
       setStatus(`Downloading ${entry.name}...`);
       try {
-        const blob = await hosts.downloadFile(hostId, entry.path);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = entry.name;
-        a.click();
-        URL.revokeObjectURL(url);
+        if (!hostControl) throw new Error("Host control channel is not ready");
+        await hostControl.saveFileToBrowser(entry.path, entry.name);
         setStatus(null);
       } catch (err) {
         setStatus(`${entry.name}: ${errorMessage(err)}`);
       }
     },
-    [hostId],
+    [hostControl],
   );
 
   const relativePath = useCallback(
@@ -365,15 +548,15 @@ export function FileExplorer({
 
   const onRowKeyDown = (event: ReactKeyboardEvent) => {
     if (renaming || creatingIn !== null) return;
-    const index = rows.findIndex((r) => r.entry.path === selected);
-    const row = index >= 0 ? rows[index] : null;
+    const index = entryRows.findIndex((r) => r.entry.path === selected);
+    const row = index >= 0 ? entryRows[index] : null;
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      const next = rows[Math.min(rows.length - 1, index + 1)] ?? rows[0];
+      const next = entryRows[Math.min(entryRows.length - 1, index + 1)] ?? entryRows[0];
       if (next) setSelected(next.entry.path);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      const prev = rows[Math.max(0, index - 1)] ?? rows[0];
+      const prev = entryRows[Math.max(0, index - 1)] ?? entryRows[0];
       if (prev) setSelected(prev.entry.path);
     } else if (event.key === "ArrowRight" && row?.entry.is_dir) {
       event.preventDefault();
@@ -458,7 +641,7 @@ export function FileExplorer({
                 transferM.mutate({
                   entry,
                   destHostId: other.id,
-                  destDir: other.home_dir ?? "~",
+                  destDir: "~",
                 })
               }
             >
@@ -529,7 +712,14 @@ export function FileExplorer({
           size="icon"
           className="size-6"
           aria-label="Collapse all"
-          onClick={() => setExpanded([])}
+          onClick={() => {
+            setExpanded([]);
+            setPageCursors((current) =>
+              resolvedRoot && current[resolvedRoot]
+                ? { [resolvedRoot]: current[resolvedRoot] }
+                : {},
+            );
+          }}
         >
           <ChevronsDownUp className="size-3.5" />
         </Button>
@@ -571,12 +761,7 @@ export function FileExplorer({
             {errorMessage(rootQ.error)}
           </p>
         )}
-        {rootQ.data?.error && (
-          <p className="px-3 py-2 text-xs text-destructive" role="alert">
-            {rootQ.data.error}
-          </p>
-        )}
-        {!rootBusy && rows.length === 0 && creatingIn === null && !rootQ.error && (
+        {!rootBusy && entryRows.length === 0 && creatingIn === null && !rootQ.error && (
           <p className="px-3 py-4 text-center text-xs text-muted-foreground">
             Empty directory. Drop files here to upload.
           </p>
@@ -593,7 +778,34 @@ export function FileExplorer({
           />
         )}
 
-        {rows.map(({ entry, depth, parentDir }) => {
+        {rows.map((row) => {
+          if (row.kind === "page") {
+            const atCapacity = retainedPageCount >= FILE_EXPLORER_RETAINED_PAGE_LIMIT;
+            const label = row.loading
+              ? "Loading more entries..."
+              : row.error
+                ? "Retry directory"
+                : row.limitReached || atCapacity
+                  ? "Entry limit reached"
+                  : "Load more";
+            return (
+              <button
+                key={`page:${row.dir}:${row.nextCursor ?? "terminal"}`}
+                type="button"
+                className="flex h-7 w-full items-center gap-2 text-left text-xs text-muted-foreground hover:bg-accent/40 disabled:cursor-default disabled:hover:bg-transparent"
+                style={{ paddingLeft: 20 + row.depth * INDENT_PX }}
+                disabled={row.loading || row.limitReached || (atCapacity && !row.error)}
+                onClick={() => {
+                  if (row.error) refreshDir(row.dir);
+                  else if (row.nextCursor !== null) loadNextPage(row.dir, row.nextCursor);
+                }}
+              >
+                {row.loading && <Loader2 className="size-3 animate-spin" aria-hidden />}
+                {label}
+              </button>
+            );
+          }
+          const { entry, depth, parentDir } = row;
           const isDir = entry.is_dir === true;
           const isExpanded = isDir && expanded.includes(entry.path);
           const isSelected = selected === entry.path;

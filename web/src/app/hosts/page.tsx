@@ -131,7 +131,6 @@ function HostRow({ host }: { host: Host }) {
           </span>
           <span className="mt-0.5 block truncate text-xs text-muted-foreground">
             {host.os ?? "unknown"}/{host.arch ?? "unknown"} · spawnd {host.version ?? "?"}
-            {host.home_dir ? ` · ${host.home_dir}` : ""}
           </span>
         </span>
         <span className="shrink-0 text-right">

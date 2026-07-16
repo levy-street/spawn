@@ -66,22 +66,23 @@ integrated, leaving a clean quality baseline for the transport work.
 | QUAL-03 | DONE | Fix the Ruff import-order failure in `server/spawn_server/routes/hosts.py` (`ec1f86e`) | Completed baseline cleanup | `uv run ruff check spawn_server tests` passes |
 | QUAL-04 | DONE | Fix the two Clippy warnings: `type_complexity` at `pty.rs` worker replay and `nonminimal_bool` in `upload.rs` (`775b7d0`; merged with the parallel format cleanup by `640a2e0`) | Completed baseline cleanup | `cargo clippy --all-targets --all-features -- -D warnings` passes |
 | QUAL-05 | DONE | Make the full server test baseline hermetic by isolating auth-provider environment and migration connection state (`aa524d9`) | Completed test-harness cleanup | Full server suite passes without relying on ambient environment or prior engine state |
-| QUAL-FLAKE-01 | ACTIVE — REVIEW PENDING | Remove three observed baseline races without weakening assertions: centrally own, observe, drain, and cancel every background auto-update task; make local-daemon teardown bounded and scoped to stable launch plus worker identities before filesystem cleanup; gate persistent-agent create on an owner-authorized, content-free current-generation daemon ping after the intentionally failing agent is deleted | Blocks accepting a flaky all-checks baseline | Focused server repeats, cleanup/reconnect self-tests, repeated local-daemon smoke, trust guards, exact gates, and current-master mergeability pass with bounded fail-closed diagnostics |
+| QUAL-FLAKE-01 | DONE — REVIEWED, MERGED (`22c1f0c`) | Remove three observed baseline races without weakening assertions: centrally own, observe, drain, and cancel every background auto-update task; make local-daemon teardown bounded and scoped to stable launch plus worker identities before filesystem cleanup; gate persistent-agent create on an owner-authorized, content-free current-generation daemon ping after the intentionally failing agent is deleted | Completed baseline stability correction | Focused server repeats, cleanup/reconnect self-tests, repeated local-daemon smoke, trust guards, exact gates, and current-master mergeability passed with bounded fail-closed diagnostics |
 
-QUAL-FLAKE-01 keeps all three independently reproduced failures visible until
-review accepts the correction:
+QUAL-FLAKE-01 keeps all three independently reproduced failures visible with
+their reviewed corrections, integrated at `22c1f0c`:
 
-1. **ACTIVE — REVIEW PENDING:** the server auto-update assertion could outrun
-   the detached result-persistence task despite a one-second polling allowance.
-2. **ACTIVE — REVIEW PENDING:** local-daemon cleanup could remove its private
-   filesystem while a worker was still tearing down or writing late state.
-3. **ACTIVE — REVIEW PENDING:** persistent-shell creation could race the
-   daemon control connection recovering after deletion of the capability-test
-   agent.
+1. **DONE — REVIEWED, MERGED:** the server centrally owns, observes, drains,
+   and cancels auto-update result-persistence tasks.
+2. **DONE — REVIEWED, MERGED:** local-daemon cleanup is bounded and scoped to
+   stable daemon and worker identities before private filesystem removal.
+3. **DONE — REVIEWED, MERGED:** persistent-shell creation waits for an
+   owner-authorized, content-free current-generation daemon ping after deletion
+   of the capability-test agent.
 
-The first candidate failed independent review. Its replacement must rerun all
-acceptance evidence after adding production task ownership, stable process
-identity, content-free readiness, and fail-closed platform/socket-path guards.
+The first candidate failed independent review. Its replacement added production
+task ownership, stable process identity, content-free readiness, and fail-closed
+platform/socket-path guards, reran the acceptance evidence, passed independent
+review, and merged at `22c1f0c`.
 
 ### Integrated validation at `640a2e0`
 
@@ -98,16 +99,19 @@ The reviewed Wave 0 commits were validated together on `master` at `640a2e0`:
 
 The two transport roots, P2-AGENT-01 and P2-HOST-01, and the P2-TMUX-01
 worker-only cutover are reviewed and integrated on `master` through `1f66d2d`.
+The P2-AGENT-02/P2-TERM-02 server-terminal cut is reviewed and integrated
+through `5722288`; QUAL-FLAKE-01 is integrated through `22c1f0c`; and the
+P2-HOST-02 filesystem cut is reviewed and integrated through `4e7c89b`.
 Work beneath a root may parallelize only where its protocol is reviewed and
 stable.
 
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
 | P2-TMUX-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Worker-only cutover: remove daemon tmux execution/module/backend selector/session-name protocol state and all tmux create/attach/adopt/discover/capture/replay/resize/scroll/copy/repaint paths; remove tmux-only replay/status filtering plus server/web `tmux_session` and `agent.rename`; add fail-closed guard and cutover ADR | P2-AGENT-01 implementation, QUAL-01 | Strict daemon/server/web gates pass; source inventory proves no production tmux execution, escape hatch, API/schema/UI field, or rename frame; real worker launch/adopt/replay/resize/input/shutdown remains covered; operator drain/restart and old-session unavailability are explicit; mergeability review passes |
-| P2-AGENT-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/display ownership to the mandatory worker replay source | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; worker replay retains whole segments under its 8 MiB conservative total charge (ciphertext/framing + twice replay + bookkeeping), becomes unavailable after worker exit, and replays after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; the remaining `0x01` mirror is assigned to P2-AGENT-02 |
+| P2-AGENT-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/display ownership to the mandatory worker replay source | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; worker replay retains whole segments under its 8 MiB conservative total charge (ciphertext/framing + twice replay + bookkeeping), becomes unavailable after worker exit, and replays after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing |
 | P2-AGENT-02 | DONE — REVIEWED, MERGED (`5722288`) | Retire `spawn.v1`, daemon `0x01` output and `0x02` input, server transcript writes/history forwarding/pubsub relay; require both agent DataChannels and strict v2 signaling tuples | P2-AGENT-01 | All-target daemon compile, server/web suites, mandatory-channel and old-protocol failure tests, no-content guard, offline-history/cutover documentation, and mergeability review pass |
 | P2-HOST-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
-| P2-HOST-02 | PLANNED | Move host list/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to host channel; browser mediates cross-host streaming | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; streaming is bounded and hash/length checked; two-host authorization tests pass |
+| P2-HOST-02 | DONE — REVIEWED, MERGED (`4e7c89b`) | Move host list/stat/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to capability-rooted host channels; browser mediates bounded, bilaterally cancelled cross-host streaming; preserve pre-routing cancel publication, prompt token-based write cancellation, tracked cleanup, read-stream replay rejection, conservative `outcome_unknown`, and bounded close/publication semantics | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; no-follow/atomic-race tests, bounded dispatcher/page/stream/tombstone/reaper tests, forced fast/normal cancel-order and stalled-I/O control-path tests, browser redeclaration tests, distinct two-host authorization/abort tests, strict/full gates, and mergeability review pass |
 | P2-HOST-03A | PLANNED | Add the parallel interactive tool path on `spawn.host.ctl`: commands, paths, installed/latest versions, detailed errors, and stdout/stderr remain E2E while the legacy route is temporarily retained | P2-HOST-01, QUAL-03 | Interactive check/install works with bounded/cancellable requests and no new server content; compatibility route retention is explicit and Phase 2 remains incomplete |
 | P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
 | P2-TERM-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Move agent uploads to capability/generation-bound, hash-checked, bounded/chunked/cancellable `spawn.ctl`; remove REST/WS/broker `bytes_b64`, saved/error, and daemon upload legs; retain the worker's canonical cwd as a no-follow descriptor-rooted destination capability | P2-AGENT-01, QUAL-04 | Large-file/chunk framing, resume/idempotency, cancellation/disconnect/replacement cleanup, checksum/length, capability/generation, symlink/escape/no-clobber, concurrent destination, path-ack confidentiality, old-peer failure, bounded-memory/cache/backpressure/retry tests, full gates, independent review, and current-master mergeability pass |
@@ -180,11 +184,11 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
    P2-HOST-01 passed independent review and are integrated on `master` through
    `1f66d2d`.
 3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 are reviewed and integrated
-   through `5722288`; QUAL-FLAKE-01 remains active with review pending.
-   P2-TERM-01 and P2-HOST-02 are implemented on separate review-pending
-   candidates; P2-HOST-03A may implement separate host-channel operations
-   (rebasing/serializing shared route edits before merge). P2-DATA-01 design
-   review may run alongside them once P2-HOST-01 fixes the transport boundary.
+   through `5722288`; QUAL-FLAKE-01 is reviewed and integrated through
+   `22c1f0c`, and P2-HOST-02 is reviewed and integrated through `4e7c89b`.
+   P2-TERM-01 is implemented on the integrated agent/host protocol and awaits
+   independent review; P2-HOST-03A and P2-DATA-01 design may proceed alongside
+   it where their scopes do not overlap.
 4. **Wave 3:** P2-DATA-02 after its design pass, then P2-HOST-03B and
    P2-ERROR-01 in parallel once durable preset/tool targets exist.
 5. **Wave 4 (serial change window):** P2-PURGE-01, then P2-AUDIT-01. Historical
