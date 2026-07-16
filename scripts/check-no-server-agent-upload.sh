@@ -101,6 +101,257 @@ allowed_web_endpoint_bytes() {
     "$content" == '          bytes = base64ToBytes(message.bytes_b64);' ]]
 }
 
+allowed_web_test_bytes() {
+  local match="$1"
+  [[ "${match%%:*}" == "web/src/lib/hostControl.test.ts" ]]
+}
+
+required_exact_line_once() {
+  local file="$1"
+  local expected="$2"
+  local count
+  count="$(awk -v expected="$expected" '$0 == expected { count += 1 } END { print count + 0 }' "$file")"
+  if [[ "$count" != "1" ]]; then
+    printf 'no-server-agent-upload: required privileged endpoint line missing or duplicated in %s: %s\n' \
+      "$file" "$expected" >&2
+    return 1
+  fi
+}
+
+required_line_between() {
+  local file="$1"
+  local expected="$2"
+  local start="$3"
+  local end="$4"
+  awk -v expected="$expected" -v start="$start" -v end="$end" '
+    index($0, start) { inside = 1; next }
+    inside && index($0, end) { inside = 0 }
+    inside && $0 == expected { count += 1 }
+    END { exit count == 1 ? 0 : 1 }
+  ' "$file" || {
+    printf 'no-server-agent-upload: privileged endpoint line escaped its reviewed function in %s: %s\n' \
+      "$file" "$expected" >&2
+    return 1
+  }
+}
+
+check_privileged_endpoint_structure() {
+  local daemon_file="daemon/src/host_control.rs"
+  local web_file="web/src/lib/hostControl.ts"
+  local daemon_encode='                    "bytes_b64": STANDARD.encode(&buffer[..read]),'
+  local daemon_decode='            object.get("bytes_b64").and_then(Value::as_str),'
+  local web_encode='            bytes_b64: bytesToBase64(chunk),'
+  local web_type='      bytes_b64?: string;'
+  local web_late='            message.bytes_b64,'
+  local web_check='        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {'
+  local web_decode='          bytes = base64ToBytes(message.bytes_b64);'
+  local line
+
+  for line in "$daemon_encode" "$daemon_decode"; do
+    required_exact_line_once "$daemon_file" "$line" || return 1
+  done
+  required_line_between "$daemon_file" "$daemon_encode" \
+    'async fn send_read(' 'async fn handle_late_write_chunk(' || return 1
+  required_line_between "$daemon_file" "$daemon_decode" \
+    'async fn handle_stream_chunk(' 'async fn handle_stream_end(' || return 1
+
+  for line in "$web_encode" "$web_type" "$web_late" "$web_check" "$web_decode"; do
+    required_exact_line_once "$web_file" "$line" || return 1
+  done
+  required_line_between "$web_file" "$web_encode" \
+    'async writeStream(' 'async transferFileTo(' || return 1
+  for line in "$web_type" "$web_late" "$web_check" "$web_decode"; do
+    required_line_between "$web_file" "$line" \
+      'private handleControlMessage(' 'private sendSignal(' || return 1
+  done
+
+  local receivers expected_receivers
+  receivers="$(rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$web_file" | sort | uniq -c)"
+  expected_receivers=$'      2 channel.send(\n      1 this.channel.send(\n      1 ws.send('
+  if [[ "$receivers" != "$expected_receivers" ]]; then
+    printf 'no-server-agent-upload: web host-control send topology changed; review direct vs signaling channels:\n%s\n' \
+      "$receivers" >&2
+    return 1
+  fi
+  receivers="$(rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$daemon_file" | sort | uniq -c)"
+  expected_receivers=$'      1 publication_context.send(\n      5 self.send('
+  if [[ "$receivers" != "$expected_receivers" ]] || rg -n --color never \
+    'send_?to_?server|server[^[:space:]]*\.send|websocket|crate::ws' "$daemon_file" >/dev/null; then
+    printf 'no-server-agent-upload: daemon host-control send topology gained a server-capable relay:\n%s\n' \
+      "$receivers" >&2
+    return 1
+  fi
+}
+
+check_production_test_imports() {
+  python3 - "$repo_root" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+patterns = (
+    re.compile(r'''(?:import|export)\s+(?:type\s+)?[\w*$,\s{}]+?\s+from\s*["']([^"']+)["']'''),
+    re.compile(r'''import\s*["']([^"']+)["']'''),
+    re.compile(r'''(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)'''),
+)
+bad = []
+source_root = os.path.join(root, "web/src")
+for directory, names, files in os.walk(source_root):
+    names[:] = [name for name in names if name not in {"node_modules", "__pycache__"}]
+    for name in files:
+        if not name.endswith((".ts", ".tsx")) or re.search(r"\.(?:test|spec)\.(?:ts|tsx)$", name):
+            continue
+        path = os.path.join(directory, name)
+        with open(path, encoding="utf-8") as source:
+            text = source.read()
+        for pattern in patterns:
+            if any(re.search(r"\.(?:test|spec)(?:[./]|$)", spec) for spec in pattern.findall(text)):
+                bad.append(os.path.relpath(path, root))
+                break
+if bad:
+    raise SystemExit(
+        "no-server-agent-upload: production web source imports an exempt test module:\n"
+        + "\n".join(sorted(bad))
+    )
+PY
+}
+
+check_assembled_aliases() {
+  python3 - "$repo_root" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+forbidden = (
+    "bytesb64",
+    "agentupload",
+    "agentuploaded",
+    "uploadfailed",
+    "uploadsaved",
+    "uploaderror",
+    "requestupload",
+    "resolveupload",
+)
+string_re = re.compile(r'''["']([^"'\\]*(?:\\.[^"'\\]*)*)["']''')
+
+
+def has_forbidden_literals(text: str) -> bool:
+    values = string_re.findall(text)
+    if len(values) < 2:
+        return False
+    joined = "".join(re.sub(r"[^a-z0-9]", "", value.lower()) for value in values)
+    return any(token in joined for token in forbidden)
+
+
+def matching_delimiter(text: str, start: int, opening: str, closing: str) -> int | None:
+    depth = 0
+    index = start
+    quote = None
+    block_comment = 0
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if block_comment:
+            if char == "/" and following == "*":
+                block_comment += 1
+                index += 2
+                continue
+            if char == "*" and following == "/":
+                block_comment -= 1
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "/" and following == "/":
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if char == "/" and following == "*":
+            block_comment = 1
+            index += 2
+            continue
+        if char == '"':
+            quote = char
+            index += 1
+            continue
+        if char == "'" and (
+            (index + 2 < len(text) and text[index + 2] == "'")
+            or (index + 3 < len(text) and following == "\\" and text[index + 3] == "'")
+        ):
+            quote = char
+            index += 1
+            continue
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def strip_rust_test_modules(text: str) -> str:
+    pattern = re.compile(
+        r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{'
+    )
+    masked = list(text)
+    for match in list(pattern.finditer(text)):
+        opening = text.find("{", match.start(), match.end())
+        closing = matching_delimiter(text, opening, "{", "}")
+        if closing is None:
+            raise SystemExit("no-server-agent-upload: unbalanced #[cfg(test)] module")
+        for index in range(match.start(), closing + 1):
+            if masked[index] != "\n":
+                masked[index] = " "
+    return "".join(masked)
+
+
+def scan(path: str, text: str) -> None:
+    if path.endswith(".rs"):
+        text = strip_rust_test_modules(text)
+    for match in re.finditer(r"concat!\s*\(", text):
+        opening = text.find("(", match.start(), match.end())
+        closing = matching_delimiter(text, opening, "(", ")")
+        if closing is not None and has_forbidden_literals(text[match.start() : closing + 1]):
+            raise SystemExit(f"no-server-agent-upload: assembled privileged alias in {path}")
+    for match in re.finditer(r"\.join\s*\(", text):
+        snippet = text[max(0, match.start() - 180) : min(len(text), match.end() + 220)]
+        if has_forbidden_literals(snippet):
+            raise SystemExit(f"no-server-agent-upload: joined privileged alias in {path}")
+    for match in re.finditer(r'''["'][^"']+["']\s*\+\s*["'][^"']+["']''', text):
+        if has_forbidden_literals(match.group(0)):
+            raise SystemExit(f"no-server-agent-upload: concatenated privileged alias in {path}")
+    for match in re.finditer(r"`[^`]{0,500}`", text):
+        if has_forbidden_literals(match.group(0)):
+            raise SystemExit(f"no-server-agent-upload: template privileged alias in {path}")
+
+
+for relative_root in ("server/spawn_server", "daemon/src", "web/src"):
+    absolute_root = os.path.join(root, relative_root)
+    for directory, names, files in os.walk(absolute_root):
+        names[:] = [name for name in names if name not in {"node_modules", "target", "__pycache__"}]
+        for name in files:
+            if not name.endswith((".py", ".rs", ".ts", ".tsx")):
+                continue
+            if re.search(r"\.(?:test|spec)\.(?:ts|tsx)$", name):
+                continue
+            path = os.path.join(directory, name)
+            with open(path, encoding="utf-8") as source:
+                scan(os.path.relpath(path, root), source.read())
+PY
+}
+
 run_guard() {
   local inventory=()
   mapfile -d '' inventory < <(inventory_files)
@@ -157,10 +408,8 @@ run_guard() {
   rejected=""
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
-    case "${match%%:*}" in
-      *.test.ts | *.test.tsx) ;;
-      *) allowed_web_endpoint_bytes "$match" || rejected+="$match"$'\n' ;;
-    esac
+    allowed_web_endpoint_bytes "$match" || allowed_web_test_bytes "$match" || \
+      rejected+="$match"$'\n'
   done <<<"$matches"
   if [[ -n "$rejected" ]]; then
     printf 'no-server-agent-upload: web server API/schema/ack/error leg returned:\n%s' \
@@ -181,6 +430,9 @@ run_guard() {
   required_once server/spawn_server/ws/daemon.py 'if obj.get("code") == "upload_failed":'
   required_once server/spawn_server/ws/daemon.py \
     'reason="agent upload errors belong on spawn.ctl"'
+  check_privileged_endpoint_structure
+  check_production_test_imports
+  check_assembled_aliases
 }
 
 self_test() {
@@ -216,21 +468,45 @@ self_test() {
     '}' \
     >"$fixture/daemon/src/rtc.rs"
   printf '%s\n' \
-    'fn direct_read() {' \
+    'async fn send_read() {' \
+    '  self.send(json!({' \
     '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' \
+    '  })).await;' \
     '}' \
-    'fn direct_write(object: Object) {' \
+    'async fn handle_late_write_chunk() {}' \
+    'async fn handle_stream_chunk(object: Object) {' \
     '            object.get("bytes_b64").and_then(Value::as_str),' \
+    '}' \
+    'async fn handle_stream_end() {}' \
+    'fn direct_topology() {' \
+    '  self.send(one);' \
+    '  self.send(two);' \
+    '  self.send(three);' \
+    '  self.send(four);' \
+    '  publication_context.send(hello);' \
     '}' \
     >"$fixture/daemon/src/host_control.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
   printf '%s\n' \
-    'export function directHostChannel() {' \
+    'async writeStream() {' \
+    '  this.sendStreamFrame("stream.chunk", streamId, {' \
     '            bytes_b64: bytesToBase64(chunk),' \
+    '  });' \
+    '}' \
+    'async transferFileTo() {}' \
+    'private handleControlMessage() {' \
     '      bytes_b64?: string;' \
     '            message.bytes_b64,' \
     '        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {' \
     '          bytes = base64ToBytes(message.bytes_b64);' \
+    '}' \
+    'private sendSignal() {' \
+    '  ws.send(frame);' \
+    '}' \
+    'function directTopology() {' \
+    '  channel.send(one);' \
+    '  channel.send(two);' \
+    '  this.channel.send(three);' \
     '}' \
     >"$fixture/web/src/lib/hostControl.ts"
   printf '%s\n' 'const directTest = { bytes_b64: btoa("x") };' \
@@ -248,7 +524,11 @@ self_test() {
     'server/spawn_server/error_moved.py|kind = "upload.error"'
     'daemon/src/moved.rs|const LEGACY: &str = "agent.uploaded";'
     'daemon/src/rtc_helper.rs|fn legacy_agent_upload(bytes_b64: &str) { send_to_server(bytes_b64); }'
+    'daemon/src/assembled.rs|const FIELD: &str = concat!("bytes", "_b64");'
     'web/src/lib/moved.ts|export const route = "/agents/${id}/upload";'
+    'web/src/lib/assembled.ts|export const FIELD = ["bytes", "b64"].join("_");'
+    'web/src/lib/importTest.ts|import { directTest } from "./hostControl.test";'
+    'server/spawn_server/assembled.py|FIELD = "".join(("bytes", "_b64"))'
   )
   local case path body
   for case in "${cases[@]}"; do
@@ -301,6 +581,23 @@ self_test() {
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
+  printf '%s\n' \
+    "$host_control_original" \
+    'fn disguised_daemon_relay(buffer: &[u8], read: usize) {' \
+    '  let envelope = json!({' \
+    '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' \
+    '  });' \
+    '  send_to_server(envelope);' \
+    '}' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: reused daemon endpoint allowance passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
   local web_host_control_original
   web_host_control_original="$(<"$fixture/web/src/lib/hostControl.ts")"
   printf '%s\n' \
@@ -310,6 +607,23 @@ self_test() {
   if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
     printf '%s\n' \
       "no-server-agent-upload self-test: privileged web host-control relay passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$web_host_control_original" >"$fixture/web/src/lib/hostControl.ts"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$web_host_control_original" \
+    'export function disguisedWebRelay(chunk: Uint8Array) {' \
+    '  const envelope = {' \
+    '            bytes_b64: bytesToBase64(chunk),' \
+    '  };' \
+    '  serverWebSocket.send(JSON.stringify(envelope));' \
+    '}' \
+    >"$fixture/web/src/lib/hostControl.ts"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: reused web endpoint allowance passed" >&2
     return 1
   fi
   printf '%s\n' "$web_host_control_original" >"$fixture/web/src/lib/hostControl.ts"

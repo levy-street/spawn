@@ -277,6 +277,8 @@ struct UploadLifecycleHooks {
     #[cfg(test)]
     prepare_count: AtomicUsize,
     #[cfg(test)]
+    ready_return: BlockingPause,
+    #[cfg(test)]
     write_sync: BlockingPause,
     #[cfg(test)]
     commit: BlockingPause,
@@ -334,6 +336,11 @@ impl UploadLifecycleHooks {
             self.prepare_count.fetch_add(1, Ordering::AcqRel);
             self.prepare.pause_if_armed();
         }
+    }
+
+    fn pause_ready_return(&self) {
+        #[cfg(test)]
+        self.ready_return.pause_if_armed();
     }
 
     fn pause_write_sync(&self) {
@@ -551,7 +558,14 @@ impl UploadHub {
             )
             .map_err(UploadError::failed);
             match prepared {
-                Ok(upload)
+                Ok(upload) => {
+                    *slot = Some(upload);
+                    // Make the prepared slot observable before publishing the
+                    // ACTIVE lifecycle. A same-owner start may use try_lock as
+                    // soon as it observes ACTIVE, so publishing in the reverse
+                    // order creates a transient false "operation in progress"
+                    // result even though preparation has completed.
+                    drop(slot);
                     if operation_entry
                         .lifecycle
                         .compare_exchange(
@@ -560,21 +574,18 @@ impl UploadHub {
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
-                        .is_ok() =>
-                {
-                    *slot = Some(upload);
+                        .is_err()
+                    {
+                        operation_entry.changed.notify_waiters();
+                        hub.schedule_cleanup(operation_key, Arc::clone(&operation_entry));
+                        return Err(UploadError::cancelled());
+                    }
                     operation_entry.changed.notify_waiters();
+                    hub.inner.hooks.pause_ready_return();
                     Ok(UploadStartOutcome::Ready {
                         next_sequence: 0,
                         received_bytes: 0,
                     })
-                }
-                Ok(upload) => {
-                    *slot = Some(upload);
-                    drop(slot);
-                    operation_entry.changed.notify_waiters();
-                    hub.schedule_cleanup(operation_key, Arc::clone(&operation_entry));
-                    Err(UploadError::cancelled())
                 }
                 Err(error) => {
                     operation_entry
@@ -1822,6 +1833,7 @@ mod tests {
         let hooks = hub.lifecycle_hooks();
         hooks.arm_admit_barrier(2);
         hooks.prepare.arm();
+        hooks.ready_return.arm();
         let agent = AgentBinding::new(Uuid::new_v4(), 81);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
@@ -1864,6 +1876,19 @@ mod tests {
         assert_eq!(hub.retained_counts().await.0, 1);
 
         hooks.prepare.release();
+        hooks.ready_return.wait_until_entered().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if first.is_finished() || second.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-owner retry observes the prepared slot while the inserter is paused");
+        assert_ne!(first.is_finished(), second.is_finished());
+        hooks.ready_return.release();
         let (first, second) = tokio::join!(first, second);
         for outcome in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
             assert!(matches!(
@@ -1893,6 +1918,71 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains("spawn-upload")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_same_owner_start_never_exposes_active_before_the_prepared_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = UploadHub::default();
+        let agent = AgentBinding::new(Uuid::new_v4(), 83);
+        let capability = Uuid::new_v4();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        for iteration in 0..512 {
+            let upload_id = Uuid::new_v4();
+            let upload_manifest = manifest(
+                b"stress",
+                &format!("stress-{iteration}.bin"),
+                UploadDestination::Cwd,
+            );
+            let first_hub = hub.clone();
+            let first_cwd = cwd.clone();
+            let first_manifest = upload_manifest.clone();
+            let first = tokio::spawn(async move {
+                first_hub
+                    .start(
+                        agent,
+                        "viewer",
+                        capability,
+                        upload_id,
+                        &first_cwd,
+                        first_manifest,
+                    )
+                    .await
+            });
+            let second_hub = hub.clone();
+            let second_cwd = cwd.clone();
+            let second_manifest = upload_manifest;
+            let second = tokio::spawn(async move {
+                second_hub
+                    .start(
+                        agent,
+                        "viewer",
+                        capability,
+                        upload_id,
+                        &second_cwd,
+                        second_manifest,
+                    )
+                    .await
+            });
+            let (first, second) = tokio::join!(first, second);
+            for outcome in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
+                assert!(matches!(
+                    outcome,
+                    UploadStartOutcome::Ready {
+                        next_sequence: 0,
+                        received_bytes: 0
+                    }
+                ));
+            }
+            assert!(hub
+                .cancel(agent, "viewer", capability, upload_id)
+                .await
+                .unwrap());
+        }
+
+        wait_for_upload_drain(&hub).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
