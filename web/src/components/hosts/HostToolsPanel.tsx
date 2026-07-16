@@ -6,56 +6,93 @@ import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useHostControl } from "@/hooks/useHostControl";
+import { ApiError, type Host, type HostToolMetadata, hosts } from "@/lib/api";
 import {
-  ApiError,
-  type Host,
+  HostControlError,
   type HostToolInstallResult,
   type HostToolStatus,
-  hosts,
-} from "@/lib/api";
+  isInteractiveToolKind,
+} from "@/lib/hostControl";
+
+interface ToolRow extends HostToolMetadata {
+  status: HostToolStatus | null;
+  supported: boolean;
+}
+
+interface VisibleResult {
+  name: string;
+  result?: HostToolInstallResult;
+  error?: string;
+}
+
+const TOOL_CHECK_BATCH_SIZE = 8;
 
 export function HostToolsPanel({ host }: { host: Host }) {
   const qc = useQueryClient();
-  const [lastResult, setLastResult] = useState<HostToolInstallResult | null>(null);
+  const { client, state } = useHostControl(host.id, host.status === "online");
+  const [lastResult, setLastResult] = useState<VisibleResult | null>(null);
   const toolsQ = useQuery({
     queryKey: ["host-tools", host.id],
-    queryFn: () => hosts.tools(host.id),
-    enabled: host.status === "online",
+    queryFn: async (): Promise<{ tools: ToolRow[] }> => {
+      if (!client) throw new HostControlError("connection_closed", "Host control is unavailable");
+      const metadata = await hosts.toolTargets(host.id);
+      const targets = metadata.tools.flatMap((tool) =>
+        isInteractiveToolKind(tool.agent_kind)
+          ? [{ target_id: tool.preset_id, tool: tool.agent_kind }]
+          : [],
+      );
+      const checked: HostToolStatus[] = [];
+      for (let offset = 0; offset < targets.length; offset += TOOL_CHECK_BATCH_SIZE) {
+        checked.push(
+          ...(await client.checkTools(targets.slice(offset, offset + TOOL_CHECK_BATCH_SIZE))),
+        );
+      }
+      const statuses = new Map(checked.map((tool) => [tool.target_id, tool]));
+      return {
+        tools: metadata.tools.map((tool) => ({
+          ...tool,
+          status: statuses.get(tool.preset_id) ?? null,
+          supported: isInteractiveToolKind(tool.agent_kind),
+        })),
+      };
+    },
+    enabled: host.status === "online" && state === "ready",
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
   const installM = useMutation({
-    mutationFn: (tool: HostToolStatus) => hosts.installTool(host.id, tool.preset_id),
-    onSuccess: (result) => {
-      setLastResult(result);
+    mutationFn: async (tool: ToolRow) => {
+      if (!client || !isInteractiveToolKind(tool.agent_kind)) {
+        throw new HostControlError(
+          "unsupported_tool",
+          "Tool is not supported by the endpoint policy",
+        );
+      }
+      return client.installTool({ target_id: tool.preset_id, tool: tool.agent_kind });
+    },
+    onSuccess: (result, tool) => {
+      setLastResult({ name: tool.preset_name, result });
       qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
     },
-    onError: (err) => {
+    onError: (err, tool) => {
+      const uncertain = err instanceof HostControlError ? err.data : undefined;
       setLastResult({
-        preset_id: "",
-        preset_name: "Install",
-        agent_kind: "",
-        command: "",
-        success: false,
-        output: "",
-        error: err instanceof ApiError ? err.message : String(err),
+        name: tool.preset_name,
+        result: isInstallResult(uncertain) ? uncertain : undefined,
+        error: err instanceof Error ? err.message : String(err),
       });
     },
   });
   const policyM = useMutation({
-    mutationFn: ({ tool, autoUpdate }: { tool: HostToolStatus; autoUpdate: boolean }) =>
+    mutationFn: ({ tool, autoUpdate }: { tool: ToolRow; autoUpdate: boolean }) =>
       hosts.updateToolPolicy(host.id, tool.preset_id, { auto_update: autoUpdate }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
     },
     onError: (err) => {
       setLastResult({
-        preset_id: "",
-        preset_name: "Policy",
-        agent_kind: "",
-        command: "",
-        success: false,
-        output: "",
+        name: "Policy",
         error: err instanceof ApiError ? err.message : String(err),
       });
     },
@@ -83,13 +120,13 @@ export function HostToolsPanel({ host }: { host: Host }) {
           aria-label={`Refresh tools for ${host.name}`}
           title="Refresh"
           onClick={() => toolsQ.refetch()}
-          disabled={toolsQ.isFetching}
+          disabled={state !== "ready" || toolsQ.isFetching}
         >
           <RefreshCw className={`size-3.5 ${toolsQ.isFetching ? "animate-spin" : ""}`} />
         </Button>
       </div>
 
-      {toolsQ.isLoading && (
+      {(state !== "ready" || toolsQ.isLoading) && (
         <div className="space-y-3 p-4">
           <Skeleton className="h-5 w-2/3" />
           <Skeleton className="h-5 w-1/2" />
@@ -100,7 +137,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
           {toolsQ.error instanceof ApiError ? toolsQ.error.message : String(toolsQ.error)}
         </div>
       )}
-      {!toolsQ.isLoading && !toolsQ.error && tools.length === 0 && (
+      {state === "ready" && !toolsQ.isLoading && !toolsQ.error && tools.length === 0 && (
         <div className="px-4 py-3 text-sm text-muted-foreground">No preset targets.</div>
       )}
 
@@ -112,27 +149,28 @@ export function HostToolsPanel({ host }: { host: Host }) {
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-sm font-medium">{tool.preset_name}</span>
-                  {tool.installed && tool.version && (
+                  {tool.status?.installed && tool.status.version && (
                     <span className="truncate font-mono text-[11px] text-muted-foreground">
-                      {tool.version}
+                      {tool.status.version}
                     </span>
                   )}
-                  {tool.update_available && (
+                  {tool.status?.update_available && (
                     <Badge variant="warning">
-                      update{tool.latest_version ? ` ${tool.latest_version}` : ""}
+                      update{tool.status.latest_version ? ` ${tool.status.latest_version}` : ""}
                     </Badge>
                   )}
-                  {!tool.installed && <Badge variant="outline">not installed</Badge>}
+                  {!tool.supported && <Badge variant="outline">unsupported policy</Badge>}
+                  {tool.supported && !tool.status?.installed && (
+                    <Badge variant="outline">not installed</Badge>
+                  )}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                  {tool.error ? (
-                    <span className="text-destructive">{tool.error}</span>
-                  ) : tool.last_auto_update_error ? (
-                    <span className="text-destructive">
-                      auto update failed: {tool.last_auto_update_error}
-                    </span>
+                  {tool.status?.error ? (
+                    <span className="text-destructive">{tool.status.error}</span>
+                  ) : !tool.supported ? (
+                    "This custom target is not in the endpoint execution policy."
                   ) : (
-                    (tool.path ?? tool.install ?? tool.command)
+                    (tool.status?.path ?? tool.status?.command.join(" ") ?? tool.agent_kind)
                   )}
                 </div>
               </div>
@@ -140,18 +178,20 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 <input
                   type="checkbox"
                   checked={tool.auto_update}
-                  disabled={!tool.install || policyM.isPending}
+                  disabled={!tool.supported || tool.agent_kind === "shell" || policyM.isPending}
                   onChange={(event) =>
                     policyM.mutate({ tool, autoUpdate: event.currentTarget.checked })
                   }
                 />
-                Auto update
+                Auto update (legacy)
               </label>
               <Button
-                variant={tool.installed && !tool.update_available ? "outline" : "secondary"}
+                variant={
+                  tool.status?.installed && !tool.status.update_available ? "outline" : "secondary"
+                }
                 size="sm"
                 className="shrink-0"
-                disabled={!tool.install || installM.isPending}
+                disabled={!tool.supported || tool.agent_kind === "shell" || installM.isPending}
                 onClick={() => {
                   if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
                     setLastResult(null);
@@ -162,7 +202,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 <Download className="size-3.5" />
                 {installingId === tool.preset_id
                   ? "Running..."
-                  : tool.installed
+                  : tool.status?.installed
                     ? "Update"
                     : "Install"}
               </Button>
@@ -174,14 +214,22 @@ export function HostToolsPanel({ host }: { host: Host }) {
       {lastResult && (
         <div className="border-t border-border px-4 py-3">
           <div
-            className={`mb-2 text-sm ${lastResult.success ? "text-emerald-400" : "text-destructive"}`}
+            className={`mb-2 text-sm ${lastResult.result?.success ? "text-emerald-400" : "text-destructive"}`}
           >
-            {lastResult.preset_name}: {lastResult.success ? "completed" : "failed"}
+            {lastResult.name}:{" "}
+            {lastResult.result?.success
+              ? "completed"
+              : lastResult.result
+                ? "outcome unknown"
+                : "failed"}
             {lastResult.error ? ` · ${lastResult.error}` : ""}
           </div>
-          {lastResult.output && (
+          {(lastResult.result?.stdout || lastResult.result?.stderr) && (
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs">
-              {lastResult.output}
+              {lastResult.result.stdout}
+              {lastResult.result.stdout && lastResult.result.stderr ? "\n" : ""}
+              {lastResult.result.stderr}
+              {lastResult.result.output_truncated ? "\n[output truncated by endpoint]" : ""}
             </pre>
           )}
         </div>
@@ -190,12 +238,22 @@ export function HostToolsPanel({ host }: { host: Host }) {
   );
 }
 
-function ToolStatusIcon({ tool }: { tool: HostToolStatus }) {
-  if (tool.error) {
+function ToolStatusIcon({ tool }: { tool: ToolRow }) {
+  if (!tool.supported || tool.status?.error) {
     return <AlertCircle className="size-4 shrink-0 text-amber-400" aria-label="Target warning" />;
   }
-  if (tool.installed) {
+  if (tool.status?.installed) {
     return <CheckCircle2 className="size-4 shrink-0 text-emerald-400" aria-label="Installed" />;
   }
   return <X className="size-4 shrink-0 text-muted-foreground" aria-label="Missing" />;
+}
+
+function isInstallResult(value: unknown): value is HostToolInstallResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "outcome" in value &&
+    ((value as { outcome?: unknown }).outcome === "succeeded" ||
+      (value as { outcome?: unknown }).outcome === "unknown")
+  );
 }

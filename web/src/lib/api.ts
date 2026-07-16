@@ -108,6 +108,21 @@ export const HostToolListSchema = z.object({
 });
 export type HostToolList = z.infer<typeof HostToolListSchema>;
 
+export const HostToolMetadataSchema = z.object({
+  preset_id: z.string(),
+  preset_name: z.string(),
+  agent_kind: z.string(),
+  auto_update: z.boolean().default(false),
+  last_checked_at: z.string().nullable().optional(),
+  last_auto_update_at: z.string().nullable().optional(),
+});
+export type HostToolMetadata = z.infer<typeof HostToolMetadataSchema>;
+
+export const HostToolMetadataListSchema = z.object({
+  tools: z.array(HostToolMetadataSchema).default([]),
+});
+export type HostToolMetadataList = z.infer<typeof HostToolMetadataListSchema>;
+
 export const HostToolInstallResultSchema = z.object({
   preset_id: z.string(),
   preset_name: z.string(),
@@ -325,6 +340,11 @@ export const hosts = {
     api(`/api/hosts/${id}/tools`, {
       method: "GET",
       schema: HostToolListSchema,
+    }),
+  toolTargets: (id: string) =>
+    api(`/api/hosts/${id}/tool-targets`, {
+      method: "GET",
+      schema: HostToolMetadataListSchema,
     }),
   installTool: (id: string, presetId: string) =>
     api(`/api/hosts/${id}/tools/${presetId}/install`, {

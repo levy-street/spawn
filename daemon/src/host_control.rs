@@ -20,6 +20,7 @@ use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
 };
+use crate::host_tools::HostToolService;
 use crate::pty::WsOutbound;
 use crate::rtc::{try_send_host_status, HostRtcBinding};
 
@@ -144,6 +145,7 @@ struct State {
     reads: HashMap<String, mpsc::Sender<ReadSignal>>,
     finished_read_ids: HashMap<String, Instant>,
     read_requests: HashMap<String, Arc<AtomicBool>>,
+    tool_requests: HashMap<String, CancellationToken>,
     cancelled_request_ids: HashSet<String>,
     seen_request_ids: HashSet<String>,
 }
@@ -248,6 +250,7 @@ impl Drop for PublicationPermit {
 struct Context {
     dc: Arc<RTCDataChannel>,
     files: Arc<HostFileService>,
+    tools: Arc<HostToolService>,
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
@@ -581,6 +584,8 @@ impl Context {
             }
             "fs.read" => self.begin_read(request_id, payload).await,
             "fs.write.begin" => self.begin_write(request_id, payload).await,
+            "tool.check" => self.begin_tool_check(request_id, payload).await,
+            "tool.install" => self.begin_tool_install(request_id, payload).await,
             _ => {
                 self.error(
                     request_id,
@@ -589,6 +594,152 @@ impl Context {
                 )
                 .await
             }
+        }
+    }
+
+    async fn begin_tool_check(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> bool {
+        let Some(payload) = payload else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "tool check payload is required",
+                )
+                .await;
+        };
+        let targets = match HostToolService::parse_check(&Value::Object(payload.clone())) {
+            Ok(targets) => targets,
+            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+        };
+        let Ok(permit) = Arc::clone(&self.long_tasks).try_acquire_owned() else {
+            return self
+                .error(
+                    request_id,
+                    "too_many_tasks",
+                    "too many long-running host operations",
+                )
+                .await;
+        };
+        let cancelled = CancellationToken::new();
+        {
+            let mut state = self.state.lock().await;
+            if state.cancelled_request_ids.remove(request_id) {
+                drop(state);
+                return self
+                    .error(request_id, "cancelled", "tool check was cancelled")
+                    .await;
+            }
+            state
+                .tool_requests
+                .insert(request_id.to_string(), cancelled.clone());
+        }
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let cleanup_request_id = request_id.clone();
+        let task = async move {
+            let _permit = permit;
+            let result = context
+                .tools
+                .check(targets, cancelled, context.shutdown.child_token())
+                .await;
+            context.state.lock().await.tool_requests.remove(&request_id);
+            let sent = match result {
+                Ok(tools) => match serde_json::to_value(tools) {
+                    Ok(tools) => context.response(&request_id, json!({"tools": tools})).await,
+                    Err(_) => false,
+                },
+                Err(error) => context.error(&request_id, error.code, &error.detail).await,
+            };
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(Arc::clone(&context.dc));
+            }
+        };
+        if self.spawn_session_task(task).await {
+            true
+        } else {
+            self.state
+                .lock()
+                .await
+                .tool_requests
+                .remove(&cleanup_request_id);
+            false
+        }
+    }
+
+    async fn begin_tool_install(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> bool {
+        let Some(payload) = payload else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "tool install payload is required",
+                )
+                .await;
+        };
+        let target = match HostToolService::parse_install(&Value::Object(payload.clone())) {
+            Ok(target) => target,
+            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+        };
+        let Ok(permit) = Arc::clone(&self.long_tasks).try_acquire_owned() else {
+            return self
+                .error(
+                    request_id,
+                    "too_many_tasks",
+                    "too many long-running host operations",
+                )
+                .await;
+        };
+        let cancelled = CancellationToken::new();
+        {
+            let mut state = self.state.lock().await;
+            if state.cancelled_request_ids.remove(request_id) {
+                drop(state);
+                return self
+                    .error(request_id, "cancelled", "tool install was cancelled")
+                    .await;
+            }
+            state
+                .tool_requests
+                .insert(request_id.to_string(), cancelled.clone());
+        }
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let cleanup_request_id = request_id.clone();
+        let task = async move {
+            let _permit = permit;
+            let result = context
+                .tools
+                .install(target, cancelled, context.shutdown.child_token())
+                .await;
+            context.state.lock().await.tool_requests.remove(&request_id);
+            let sent = match result {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => context.response(&request_id, result).await,
+                    Err(_) => false,
+                },
+                Err(error) => context.error(&request_id, error.code, &error.detail).await,
+            };
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(Arc::clone(&context.dc));
+            }
+        };
+        if self.spawn_session_task(task).await {
+            true
+        } else {
+            self.state
+                .lock()
+                .await
+                .tool_requests
+                .remove(&cleanup_request_id);
+            false
         }
     }
 
@@ -1356,20 +1507,21 @@ impl Context {
         let Some(request_id) = valid_id(object.get("request_id")) else {
             return false;
         };
-        let (read, write) = {
+        let (read, write, tool) = {
             let mut state = self.state.lock().await;
             let read = state.read_requests.get(request_id).cloned();
             let write = state
                 .write_requests
                 .remove(request_id)
                 .and_then(|stream_id| state.writes.remove(&stream_id));
-            if read.is_none() && write.is_none() {
+            let tool = state.tool_requests.get(request_id).cloned();
+            if read.is_none() && write.is_none() && tool.is_none() {
                 if state.cancelled_request_ids.len() >= MAX_SEEN_REQUESTS {
                     return false;
                 }
                 state.cancelled_request_ids.insert(request_id.to_string());
             }
-            (read, write)
+            (read, write, tool)
         };
         if let Some(read) = read {
             read.store(true, Ordering::Release);
@@ -1388,6 +1540,9 @@ impl Context {
                 return false;
             }
         }
+        if let Some(tool) = tool {
+            tool.cancel();
+        }
         true
     }
 
@@ -1399,31 +1554,40 @@ impl Context {
         self.files
             .write_lifecycle_test_hooks()
             .notify_shutdown_started();
-        let (reads, writes) = match tokio::time::timeout_at(deadline, self.state.lock()).await {
-            Ok(mut state) => {
-                let reads = state
-                    .reads
-                    .drain()
-                    .map(|(_, read)| read)
-                    .collect::<Vec<_>>();
-                for request in state.read_requests.drain().map(|(_, request)| request) {
-                    request.store(true, Ordering::Release);
+        let (reads, writes, tools) =
+            match tokio::time::timeout_at(deadline, self.state.lock()).await {
+                Ok(mut state) => {
+                    let reads = state
+                        .reads
+                        .drain()
+                        .map(|(_, read)| read)
+                        .collect::<Vec<_>>();
+                    for request in state.read_requests.drain().map(|(_, request)| request) {
+                        request.store(true, Ordering::Release);
+                    }
+                    state.write_requests.clear();
+                    let writes = state
+                        .writes
+                        .drain()
+                        .map(|(_, write)| write)
+                        .collect::<Vec<_>>();
+                    let tools = state
+                        .tool_requests
+                        .drain()
+                        .map(|(_, tool)| tool)
+                        .collect::<Vec<_>>();
+                    (reads, writes, tools)
                 }
-                state.write_requests.clear();
-                let writes = state
-                    .writes
-                    .drain()
-                    .map(|(_, write)| write)
-                    .collect::<Vec<_>>();
-                (reads, writes)
-            }
-            Err(_) => (Vec::new(), Vec::new()),
-        };
+                Err(_) => (Vec::new(), Vec::new(), Vec::new()),
+            };
         for read in reads {
             let _ = read.try_send(ReadSignal::Cancel);
         }
         for write in &writes {
             write.cancelled.cancel();
+        }
+        for tool in tools {
+            tool.cancel();
         }
         // The session registry owns cleanup capabilities independently of
         // PendingWrite futures and blocking commit closures. This removes
@@ -1609,6 +1773,7 @@ pub(crate) fn install(
             let context = Context {
                 dc: Arc::clone(&dc),
                 files,
+                tools: HostToolService::shared(),
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),
@@ -1703,7 +1868,8 @@ pub(crate) fn install(
                 "protocol": PROTOCOL,
                 "capabilities": [
                     "ping", "fs.home", "fs.list", "fs.stat", "fs.read",
-                    "fs.write.begin", "fs.mkdir", "fs.rename", "fs.remove"
+                    "fs.write.begin", "fs.mkdir", "fs.rename", "fs.remove",
+                    "tool.check", "tool.install"
                 ],
                 "limits": {
                     "frame_bytes": MAX_FRAME_BYTES,
@@ -1713,6 +1879,9 @@ pub(crate) fn install(
                     "normal_queue": MAX_NORMAL_QUEUE,
                     "fast_queue": MAX_FAST_QUEUE,
                     "long_tasks": MAX_LONG_TASKS,
+                    "tool_targets": crate::host_tools::MAX_TARGETS,
+                    "tool_processes": crate::host_tools::MAX_PROCESSES,
+                    "tool_output_bytes": crate::host_tools::OUTPUT_TAIL_BYTES,
                     "write_reapers": 1,
                 }
             });

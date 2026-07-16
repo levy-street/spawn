@@ -18,6 +18,7 @@ mod config;
 mod creds;
 mod host_control;
 mod host_files;
+mod host_tools;
 mod login;
 mod proto;
 mod pty;

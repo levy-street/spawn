@@ -13,7 +13,7 @@ see docs/TRUST.md.)
 | List/get hosts | hosts page, agent form | `GET /api/hosts`, `GET /api/hosts/{id}` | `hosts.list/get` | register/heartbeat updates |
 | Rename/delete host | hosts page | `PATCH/DELETE /api/hosts/{id}` | `hosts.rename/remove` | delete closes connected daemon |
 | List/manage host files | file explorer, new-agent picker | none | `HostControlClient` | capability-rooted E2E `spawn.host.ctl` `fs.*`; explicit bounded pages and streams |
-| Check/install host tools | hosts page, agent update badge | `/tools`, `/install`, `/policy` | `hosts.tools/installTool/updateToolPolicy` | `host.tools.check`, `host.tools.install` |
+| Check/install host tools | hosts page, agent update badge | disclosed target metadata at `/tool-targets`; policy at `/policy`; legacy `/tools` and `/install` temporarily retained | interactive `HostControlClient.checkTools/installTool`; `hosts.updateToolPolicy`; legacy REST helpers retained | interactive E2E `spawn.host.ctl` `tool.check`/`tool.install`; legacy/unattended `host.tools.*` retained |
 | List/create/update/delete presets | settings | `/api/presets` | `presets.*` | used at agent launch |
 | Manage skills | settings, new-agent access picker | `/api/skills` | `skills.*` | included in `agent.create` |
 | Grant agent skill access | new-agent access picker, agent detail summary | `/api/agents/{id}/access` | `agentAccess.*`; `agents.create` grant fields | materializes files/env and Codex projection |
@@ -31,6 +31,11 @@ Intentional differences:
   errors never use REST or the server daemon WebSocket. The browser talks to
   the selected host on its independently bound `spawn.host.ctl` DataChannel;
   cross-host copies are browser-mediated between two such sessions.
+- Interactive tool commands, executable paths, versions, installer argv,
+  stdout/stderr, and detailed errors use `spawn.host.ctl` directly. REST
+  discloses only target/policy metadata to that UI. The old REST and
+  server-daemon tool path remains solely for compatibility and unattended
+  updates until P2-HOST-03B; its presence keeps Phase 2 incomplete.
 - Browser display ownership, terminal input, viewport control, and replay are
   endpoint-owned DataChannel features. REST and server WebSockets deliberately
   expose none of those content-bearing operations.

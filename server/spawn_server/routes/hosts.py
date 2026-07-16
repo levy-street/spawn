@@ -14,7 +14,7 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
@@ -498,6 +498,61 @@ async def list_host_tools(
                 _merge_tool_policy(tool, policy)
     await session.commit()
     return checked
+
+
+@router.get("/{host_id}/tool-targets", response_model=schemas.HostToolMetadataList)
+async def list_host_tool_metadata(
+    host_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostToolMetadataList:
+    """Return disclosed target/policy metadata for the E2E interactive path.
+
+    Select columns explicitly: command, install, executable path, version,
+    output, and error detail must not enter this request handler.
+    """
+    await _get_owned_host(session, host_id, user)
+    rows = (
+        await session.execute(
+            select(
+                Preset.id,
+                Preset.name,
+                Preset.agent_kind,
+                HostToolPolicy.auto_update,
+                HostToolPolicy.last_checked_at,
+                HostToolPolicy.last_auto_update_at,
+            )
+            .outerjoin(
+                HostToolPolicy,
+                and_(
+                    HostToolPolicy.owner_user_id == user.id,
+                    HostToolPolicy.host_id == host_id,
+                    HostToolPolicy.preset_id == Preset.id,
+                ),
+            )
+            .where(or_(Preset.owner_user_id.is_(None), Preset.owner_user_id == user.id))
+        )
+    ).all()
+    return schemas.HostToolMetadataList(
+        tools=[
+            schemas.HostToolMetadata(
+                preset_id=preset_id,
+                preset_name=preset_name,
+                agent_kind=agent_kind,
+                auto_update=bool(auto_update),
+                last_checked_at=last_checked_at,
+                last_auto_update_at=last_auto_update_at,
+            )
+            for (
+                preset_id,
+                preset_name,
+                agent_kind,
+                auto_update,
+                last_checked_at,
+                last_auto_update_at,
+            ) in rows
+        ]
+    )
 
 
 @router.post("/{host_id}/control/ping", status_code=status.HTTP_204_NO_CONTENT)

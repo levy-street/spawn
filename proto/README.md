@@ -32,9 +32,10 @@ also accepts `Bearer` for API testing).
 |--------|-----------------------|------------------------------------------|
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
-| GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
+| GET    | `/api/hosts/{id}/tool-targets` | disclosed preset/policy metadata used to select E2E interactive tool targets; never returns command, install argv, path, version, output, or error detail |
+| GET    | `/api/hosts/{id}/tools` | **legacy, temporarily retained:** check preset executable targets through the server/daemon control leg |
 | POST   | `/api/hosts/{id}/control/ping` | owner-authorized, content-free current daemon-generation readiness check (204) |
-| POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
+| POST   | `/api/hosts/{id}/tools/{preset_id}/install` | **legacy, temporarily retained:** run that preset's server-stored install command through the server/daemon control leg |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
 | DELETE | `/api/hosts/{id}`     | revoke daemon token + drop the host      |
@@ -189,11 +190,13 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 {"type": "agent.activity", "agent_id": "uuid"}
 
 {"type": "agent.input_activity", "agent_id": "uuid"}
+```
 
 Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `agent.activity` records meaningful PTY output timing, while
 `agent.input_activity` records input timing for the direct WebRTC DataChannel.
 
+```json
 {"type": "agent.uploaded",
  "agent_id": "uuid",
  "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
@@ -223,6 +226,7 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "protocol": "spawn.pty", "protocol_version": 2,
  "status": "connected|failed",
  "message": "optional detail"}
+```
 
 Host-scoped signaling uses the same `rtc.*` types but replaces `agent_id` with
 an explicit, mandatory binding tuple on every frame:
@@ -242,6 +246,13 @@ Host `rtc.candidate` and `rtc.status` frames carry the identical tuple and
 binding nonce. Host status values are content-free codes; endpoint error
 detail is not placed on the signaling websocket.
 
+The following `host.tools.*` daemon-WebSocket frames are the temporarily
+retained legacy and unattended path. The interactive hosts-page path does not
+use them; its protected details use `spawn.host.ctl` below. They remain until
+P2-HOST-03B moves durable targets/unattended execution to the endpoint and
+removes this compatibility path.
+
+```json
 {"type": "host.tools.check_result",
  "request_id": "uuid",
  "tools": [{
@@ -561,7 +572,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove","tool.check","tool.install"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1,"tool_targets":8,"tool_processes":4,"tool_output_bytes":4096}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -685,6 +696,60 @@ streams and awaits cleanup before returning. The former REST
 `/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
+
+### Interactive host tools
+
+The hosts page obtains only disclosed target metadata from
+`GET /api/hosts/{id}/tool-targets`: preset ID/name, `agent_kind`, auto-update
+policy, and check/update timestamps. It then sends the selected preset ID and
+stable tool kind directly to the endpoint. Commands, installer argv,
+executable paths, installed/latest versions, stdout/stderr, truncation state,
+and detailed errors exist only in this encrypted DataChannel.
+
+```json
+{"version":1,"type":"request","request_id":"r","operation":"tool.check","payload":{"targets":[{"target_id":"preset-uuid","tool":"codex"}]}}
+{"version":1,"type":"response","request_id":"r","ok":true,"result":{"tools":[{"target_id":"preset-uuid","tool":"codex","command":["codex"],"installed":true,"path":"/home/me/.local/bin/codex","version":"codex 1.2.3","latest_version":"1.2.4","update_available":true}]}}
+
+{"version":1,"type":"request","request_id":"i","operation":"tool.install","payload":{"target":{"target_id":"preset-uuid","tool":"codex"}}}
+{"version":1,"type":"response","request_id":"i","ok":true,"result":{"target_id":"preset-uuid","tool":"codex","command":["codex"],"install_argv":["npm","install","--global","@openai/codex"],"outcome":"succeeded","success":true,"exit_code":0,"stdout":"...","stderr":"","output_truncated":false,"status":{"target_id":"preset-uuid","tool":"codex","command":["codex"],"installed":true,"path":"/home/me/.local/bin/codex","version":"codex 1.2.4","latest_version":"1.2.4","update_available":false}}}
+```
+
+Both payloads reject unknown fields. Target IDs are bounded opaque identifiers;
+the browser cannot supply an executable, path, shell text, version argument, or
+installer argument. The endpoint owns this fixed v1 policy:
+
+| Tool kind | Check argv | Install argv |
+| --- | --- | --- |
+| `claude-code` | `claude --version` | `npm install --global @anthropic-ai/claude-code` |
+| `codex` | `codex --version` | `npm install --global @openai/codex` |
+| `opencode` | `opencode --version` | `npm install --global opencode-ai` |
+| `aider-sonnet` | `aider --version` | `python3 -m pip install --user --upgrade aider-chat` |
+| `shell` | `bash --version` | unavailable |
+
+Every executable is resolved against the endpoint environment and executed as
+an exact argument vector. There is no shell interpolation or free-form install
+command on this path. Resolution rejects path separators and non-allowlisted
+tool kinds. At most eight targets are accepted per check, four child processes
+run concurrently, and a second install of the same tool fails with `tool_busy`.
+Checks use a five-second endpoint deadline; installs use 180 seconds. Stdout
+and stderr each retain only their final 4096 bytes and report
+`output_truncated` when earlier bytes were discarded.
+
+Cancellation, request timeout, channel close, and host-session replacement
+kill the child process group and drain it under the host session's single
+absolute teardown deadline. A cancellation that wins before process creation
+is a definitive no-effect error. Once the installer starts, nonzero exit,
+timeout, cancellation, shutdown, failed reconciliation, and any other partial
+effect return `outcome:"unknown"`; the browser never retries automatically.
+Loss of the install acknowledgement is also `outcome_unknown`. Reconcile with
+`tool.check` before a user retries. Successful installation is acknowledged
+only after an endpoint check resolves the expected executable. Reconnecting
+creates a fresh host session but never replays a mutation.
+
+The legacy REST `/tools` and `/install` routes, server `host.tools.*` frames,
+and server-stored unattended update target remain temporarily available for
+compatibility. Their presence means Phase 2 is incomplete. P2-HOST-03B removes
+them only after the durable target and unattended policy are endpoint-owned.
 
 ## Versioning
 

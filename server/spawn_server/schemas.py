@@ -128,6 +128,19 @@ class HostToolList(BaseModel):
     tools: list[HostToolStatus] = Field(default_factory=list)
 
 
+class HostToolMetadata(BaseModel):
+    preset_id: str
+    preset_name: str
+    agent_kind: str
+    auto_update: bool = False
+    last_checked_at: datetime | None = None
+    last_auto_update_at: datetime | None = None
+
+
+class HostToolMetadataList(BaseModel):
+    tools: list[HostToolMetadata] = Field(default_factory=list)
+
+
 class HostToolInstallResult(BaseModel):
     preset_id: str
     preset_name: str

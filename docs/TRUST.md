@@ -65,9 +65,11 @@ not come for free:
    P2-AGENT-02 implementation checkpoint removes `spawn.v1`, daemon WS PTY
    binary frames, transcripts, content pubsub, snapshots/history, and viewport
    routes; review, merge, coordinated deployment, and historical purge remain.
-   Uploads, host file/tool operations, launch manifests, skill bodies, and
-   detailed errors still have server-readable paths tracked in the Phase 2
-   ledger.
+   Uploads, launch manifests, skill bodies, and detailed errors still have
+   server-readable paths tracked in the Phase 2 ledger. Host files and
+   interactive tool detail now have separate E2E implementation candidates,
+   but both still require independent review/integration; the legacy and
+   unattended tool path also remains until P2-HOST-03B.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.
@@ -141,7 +143,7 @@ answer for users for whom this metadata is itself sensitive.
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | REST host-file routes plus `host.fs.*` server↔daemon frames | host-scoped `spawn.host.ctl` DataChannel |
 | Cross-host file transfer | server reads the source and forwards its bytes to the destination | browser streams source host → browser → destination host over two host channels |
-| Tool check/install commands, paths, installed/latest versions, output, and detailed errors | `host.tools.*`; policy errors can persist in Postgres | host-scoped DataChannel; unattended jobs return content-free status only |
+| Tool check/install commands, paths, installed/latest versions, output, and detailed errors | legacy/unattended `host.tools.*`; policy errors can persist in Postgres | interactive `spawn.host.ctl` candidate **IMPLEMENTED, REVIEW PENDING**; legacy route and unattended durable target remain until P2-HOST-03B |
 | Free-form daemon errors | `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | stable content-free server code; detail delivered over the appropriate E2E control channel |
 
 Preset names, skill names/descriptions, and explicitly chosen or neutral agent
@@ -237,6 +239,10 @@ What moves where, and the regressions we accept:
   report only preset/host identifiers, schedule timestamps, and content-free
   success/failure/exit-code metadata to the control plane; stdout/stderr and
   detailed errors remain daemon-local until an endpoint fetches them E2E.
+  P2-HOST-03A implements the parallel interactive route with endpoint-owned,
+  fixed argv policy and metadata-only REST target discovery. It deliberately
+  retains the old server route and unattended target until P2-HOST-03B, so
+  this candidate is not the final tool cut and does not complete Phase 2.
 - **Detailed operational errors** → the server receives only stable codes needed
   for lifecycle metadata. Human-readable spawn, snapshot, upload, filesystem,
   and tool errors travel on `spawn.ctl` or `spawn.host.ctl`; the server neither

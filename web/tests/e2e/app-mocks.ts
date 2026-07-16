@@ -141,6 +141,9 @@ export async function mockAuthenticatedApi(
     fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+    toolTargets?: unknown[];
+    toolCheck?: (hostId: string, payload: Record<string, unknown>) => unknown;
+    toolInstall?: (hostId: string, payload: Record<string, unknown>) => unknown;
   } = {},
 ) {
   const agents = options.agents ?? [];
@@ -235,6 +238,12 @@ export async function mockAuthenticatedApi(
         }
         return { path: `${String(payload.dir)}/${String(payload.name)}` };
       }
+      if (operation === "tool.check") {
+        return options.toolCheck?.(hostId, payload) ?? { tools: [] };
+      }
+      if (operation === "tool.install") {
+        return options.toolInstall?.(hostId, payload) ?? {};
+      }
       throw new Error(`unsupported mock host control operation: ${operation}`);
     },
   );
@@ -289,6 +298,8 @@ export async function mockAuthenticatedApi(
             "fs.mkdir",
             "fs.rename",
             "fs.remove",
+            "tool.check",
+            "tool.install",
           ],
         });
       }
@@ -542,11 +553,11 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
-    if (path === `/api/hosts/${HOST_ID}/tools`) {
+    if (path === `/api/hosts/${HOST_ID}/tool-targets`) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        json: { tools: [] },
+        json: { tools: options.toolTargets ?? [] },
       });
       return;
     }

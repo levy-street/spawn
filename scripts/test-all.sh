@@ -28,6 +28,9 @@ scripts/smoke-local-daemon.sh --self-test
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
 
+printf '%s\n' "== host tool E2E boundary guard =="
+scripts/check-host-tool-e2e-boundary.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

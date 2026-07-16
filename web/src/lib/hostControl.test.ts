@@ -659,6 +659,7 @@ describe("HostControlClient", () => {
       ["fs.mkdir", (client) => client.mkdir("/private/new")],
       ["fs.rename", (client) => client.rename("/private/old", "new")],
       ["fs.remove", (client) => client.remove("/private/old")],
+      ["tool.install", (client) => client.installTool({ target_id: "preset-1", tool: "codex" })],
     ];
     for (const [operation, mutate] of cases) {
       const { client, pc } = await readyClient({ reconnectBaseDelayMs: 1000 });
@@ -1297,5 +1298,179 @@ describe("HostControlClient", () => {
     expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
     source.client.close();
     destination.client.close();
+  });
+
+  test("checks endpoint tools with target metadata only and binds every protected result", async () => {
+    const { client, pc } = await readyClient();
+    const target = { target_id: "preset-1", tool: "codex" };
+    const checking = client.checkTools([target]);
+    const request = JSON.parse(pc.channel.sent.at(-1));
+    expect(request).toMatchObject({ operation: "tool.check", payload: { targets: [target] } });
+    expect(JSON.stringify(request)).not.toContain("--version");
+    expect(JSON.stringify(request)).not.toContain("npm install");
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          tools: [
+            {
+              target_id: "preset-1",
+              tool: "codex",
+              command: ["codex"],
+              installed: true,
+              path: "/private/bin/codex",
+              version: "codex 1.2.3",
+              latest_version: "1.2.4",
+              update_available: true,
+              error: "endpoint-only detail",
+            },
+          ],
+        },
+      }),
+    );
+    await expect(checking).resolves.toEqual([
+      expect.objectContaining({ path: "/private/bin/codex", version: "codex 1.2.3" }),
+    ]);
+    client.close();
+  });
+
+  test("rejects malicious tool argv, path, version, error, and oversized output replies", async () => {
+    for (const malicious of [
+      { command: ["sh", "-c", "leak"] },
+      { path: "../../server" },
+      { version: "v".repeat(241) },
+      { error: "e".repeat(513) },
+      { unexpected_detail: "must fail closed" },
+    ]) {
+      const endpoint = await readyClient({ reconnectBaseDelayMs: 1000 });
+      const checking = endpoint.client
+        .checkTools([{ target_id: "preset-1", tool: "codex" }])
+        .catch((error) => error);
+      const request = JSON.parse(endpoint.pc.channel.sent.at(-1));
+      endpoint.pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: request.request_id,
+          ok: true,
+          result: {
+            tools: [
+              {
+                target_id: "preset-1",
+                tool: "codex",
+                command: ["codex"],
+                installed: true,
+                path: "/bin/codex",
+                version: "1.0",
+                ...malicious,
+              },
+            ],
+          },
+        }),
+      );
+      expect((await checking).code).toBe("invalid_response");
+      expect(endpoint.pc.channel.closed).toBe(true);
+      endpoint.client.close();
+    }
+
+    for (const malicious of [
+      { install_argv: ["sh", "-c", "leak"] },
+      { stdout: "x".repeat(4097) },
+      { unexpected_detail: "must fail closed" },
+    ]) {
+      const endpoint = await readyClient({ reconnectBaseDelayMs: 1000 });
+      const installing = endpoint.client
+        .installTool({ target_id: "preset-1", tool: "codex" })
+        .catch((error) => error);
+      const request = JSON.parse(endpoint.pc.channel.sent.at(-1));
+      endpoint.pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: request.request_id,
+          ok: true,
+          result: {
+            target_id: "preset-1",
+            tool: "codex",
+            command: ["codex"],
+            install_argv: ["npm", "install", "--global", "@openai/codex"],
+            outcome: "unknown",
+            success: false,
+            stdout: "bounded stdout",
+            stderr: "",
+            output_truncated: false,
+            error: "bounded failure",
+            ...malicious,
+          },
+        }),
+      );
+      expect((await installing).code).toBe("invalid_response");
+      expect(endpoint.pc.channel.closed).toBe(true);
+      endpoint.client.close();
+    }
+  });
+
+  test("surfaces protected install output and unknown outcomes without retrying", async () => {
+    const endpoint = await readyClient();
+    const installing = endpoint.client
+      .installTool({ target_id: "preset-1", tool: "codex" })
+      .catch((error) => error);
+    const request = JSON.parse(endpoint.pc.channel.sent.at(-1));
+    endpoint.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          target_id: "preset-1",
+          tool: "codex",
+          command: ["codex"],
+          install_argv: ["npm", "install", "--global", "@openai/codex"],
+          outcome: "unknown",
+          success: false,
+          exit_code: 1,
+          stdout: "endpoint stdout secret",
+          stderr: "endpoint stderr secret",
+          output_truncated: false,
+          error: "installer may have partially changed endpoint state",
+        },
+      }),
+    );
+    await expect(installing).resolves.toMatchObject({
+      code: "outcome_unknown",
+      data: {
+        stdout: "endpoint stdout secret",
+        stderr: "endpoint stderr secret",
+      },
+    });
+    expect(
+      endpoint.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
+    ).toHaveLength(1);
+    endpoint.client.close();
+  });
+
+  test("reconnects after a lost install acknowledgement without retrying the mutation", async () => {
+    const endpoint = await readyClient({ reconnectBaseDelayMs: 1 });
+    const installing = endpoint.client
+      .installTool({ target_id: "preset-1", tool: "codex" })
+      .catch((error) => error);
+    expect(
+      endpoint.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
+    ).toHaveLength(1);
+
+    endpoint.pc.channel.onclose?.();
+    await expect(installing).resolves.toMatchObject({ code: "outcome_unknown" });
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(
+      FakePeerConnection.instances
+        .flatMap((pc) => pc.channel?.sent ?? [])
+        .filter((frame) => JSON.parse(frame).operation === "tool.install"),
+    ).toHaveLength(1);
+    endpoint.client.close();
   });
 });

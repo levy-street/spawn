@@ -178,6 +178,45 @@ P2-HOST-02 worker process remains afterward.
 The P2-HOST-02 candidate includes the reviewed worker-only and agent relay
 checkpoints and must retain both source guards through review.
 
+P2-HOST-03A now has an implementation candidate on its isolated review branch.
+The hosts page fetches only disclosed preset ID/name, agent kind, policy, and
+timestamps from `GET /api/hosts/{id}/tool-targets`; it sends target ID/tool kind
+over `spawn.host.ctl`. The endpoint alone resolves the executable and runs
+fixed, versioned direct argv for checks/installs. Commands, resolved paths,
+versions, install argv, stdout/stderr, truncation, and detailed errors remain
+browser↔endpoint E2E. The implementation reuses the reviewed host capability
+and generation binding, ordered/reliable admission, bounded queues,
+request/cancel binding, publication fence, absolute close deadline, zero-agent
+operation, and reconnect behavior.
+
+This is **IMPLEMENTED, REVIEW PENDING**, not integrated or `DONE`. Execution is
+fail closed: unknown payload fields and arbitrary path/argv are rejected; no
+shell evaluates browser input; target/process/output/time limits are fixed;
+same-tool installs are mutually exclusive; cancellation, close, and timeout
+kill the process group. Once installation starts, any non-success, teardown,
+failed reconciliation, or lost acknowledgement is `outcome_unknown`, is never
+retried automatically, and must be reconciled with `tool.check`.
+
+The old REST `/tools` and `/install` endpoints, server `host.tools.*` frames,
+plaintext durable preset install/default-command target, and unattended update
+path remain deliberately retained for P2-HOST-03B. Therefore this parallel
+interactive path does not complete the tool migration or Phase 2. A source
+inventory guard rejects server use of the new E2E operation names, UI use of
+the legacy interactive helpers, and shell evaluation in the endpoint tool
+implementation; it runs from `scripts/test-all.sh`.
+
+**Current P2-HOST-03A candidate validation:** daemon format and strict
+all-target Clippy pass; all 181 daemon tests pass (60 library, 113 supervisor,
+8 worker E2E). Server Ruff and all 150 server tests pass. Web lint, typecheck,
+all 58 unit tests, a retry-free Playwright run with 69 passing tests and 3
+opt-in audits skipped, and the production build pass. The focused endpoint
+tool suite has 12 adversarial tests, the browser host-control suite has 35,
+and the metadata-only server regression passes. `SPAWN_E2E_PORT=43975
+scripts/test-all.sh` passes the complete repeatable matrix, including the new
+boundary inventory plus prebuilt install, HTTP, Redis, PostgreSQL owner
+recovery, login, daemon lifecycle, live-browser, and service-manager smokes.
+No review pass or merge is claimed by this validation.
+
 **P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
 tmux module, backend selector/env escape hatch, session-name protocol state,
@@ -185,6 +224,11 @@ tmux discovery/attach/capture/copy/repaint paths, exact tmux replay buffer, and
 tmux-status classifier/tests are deleted. `scripts/check-worker-only-daemon.sh`
 guards that boundary in `scripts/test-all.sh`. The decision and operator
 boundary are recorded in `docs/TMUX_REMOVAL.md`.
+
+This is a permanent architecture constraint, not a paused migration. Do not
+schedule tmux repair work or add tmux repair TODOs. Restate any affected
+user-visible behavior against `spawn-worker`; reversing the cutover requires a
+new ADR and trust-boundary review.
 
 This merged source checkpoint has not deployed, restarted a service,
 signalled a live process, or deleted an external session. Old sessions cannot
@@ -226,9 +270,9 @@ replicas and snapshots remain in P2-PURGE-01 scope.
 
 1. Independently review and merge the P2-HOST-02 filesystem migration, then
    migrate agent uploads, which still use a server-visible route.
-2. Ship the parallel E2E path for interactive installer detail. Keep the
-   legacy tool route until its endpoint-owned durable targets exist; this wave
-   is not the final tool cut.
+2. Independently review and merge the implemented parallel E2E path for
+   interactive installer detail. Keep the legacy tool route until its
+   endpoint-owned durable targets exist; this wave is not the final tool cut.
 3. Move full launch manifests, `Agent.env`, preset environment/install/tool
    targets, and skill bodies to the approved endpoint-owned/encrypted store.
    Stop cwd-derived default names, then make the interactive E2E tool path

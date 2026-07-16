@@ -112,6 +112,68 @@ async def test_host_scoping(client):
     assert r.status_code == 404
 
 
+async def test_interactive_tool_metadata_route_never_loads_or_forwards_detail(
+    client, monkeypatch, caplog
+):
+    token = await _signup(client, "host-tool-metadata@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, HostToolPolicy, Preset, User
+
+    protected = "PRIVATE_COMMAND_PATH_VERSION_OUTPUT_ERROR"
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "host-tool-metadata@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="metadata-box", status="online")
+        preset = Preset(
+            owner_user_id=user.id,
+            name="private tool",
+            agent_kind="codex",
+            default_argv=[f"/private/{protected}"],
+            env_template={},
+            install=f"do-not-forward-{protected}",
+        )
+        session.add_all([host, preset])
+        await session.flush()
+        session.add(
+            HostToolPolicy(
+                owner_user_id=user.id,
+                host_id=host.id,
+                preset_id=preset.id,
+                auto_update=True,
+                last_auto_update_error=protected,
+            )
+        )
+        await session.commit()
+        host_id = host.id
+        preset_id = preset.id
+
+    def broker_must_not_be_used():
+        raise AssertionError("metadata-only interactive route touched the legacy broker")
+
+    monkeypatch.setattr(hosts_routes, "get_broker", broker_must_not_be_used)
+    response = await client.get(f"/api/hosts/{host_id}/tool-targets", headers=auth)
+    assert response.status_code == 200, response.text
+    target = next(tool for tool in response.json()["tools"] if tool["preset_id"] == preset_id)
+    assert target == {
+        "preset_id": preset_id,
+        "preset_name": "private tool",
+        "agent_kind": "codex",
+        "auto_update": True,
+        "last_checked_at": None,
+        "last_auto_update_at": None,
+    }
+    assert protected not in response.text
+    assert protected not in caplog.text
+
+
 async def test_host_tool_check_roundtrip(client):
     token = await _signup(client, "host-tools@example.com")
     auth = {"Authorization": f"Bearer {token}"}

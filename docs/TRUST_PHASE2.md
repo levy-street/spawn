@@ -196,7 +196,9 @@ is restricted to stable content-free values.
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
 The filesystem portion is **IMPLEMENTED, REVIEW PENDING** in P2-HOST-02. The
-interactive tool portion remains planned separately as P2-HOST-03A.
+interactive tool portion is also **IMPLEMENTED, REVIEW PENDING** separately as
+P2-HOST-03A. Neither candidate is integrated or complete until independent
+review passes and it merges.
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
@@ -223,6 +225,19 @@ interactive tool portion remains planned separately as P2-HOST-03A.
   cannot be removed yet because their durable target still comes from plaintext
   `Preset.install` and `Preset.default_argv`; the final and unattended cut waits
   for Increment 7.
+- The P2-HOST-03A candidate exposes metadata-only target discovery over REST,
+  then sends only a bounded target ID and stable tool kind on `spawn.host.ctl`.
+  The endpoint maps that kind to a fixed executable/version/install argv,
+  resolves it locally, and executes it directly without a shell. Checks and
+  installs have endpoint deadlines, process/output/concurrency bounds,
+  cancellation kills the process group, and same-tool installs are mutually
+  exclusive. A post-spawn failure, timeout, cancellation, close, failed
+  reconciliation, or lost acknowledgement is `outcome_unknown`; the browser
+  never retries and uses a fresh `tool.check` to reconcile. Protected tool
+  results are validated against the requested target and fixed policy before
+  display. The existing capability/generation binding, ordered-reliable
+  admission, bounded queues, publication fence, one absolute close deadline,
+  zero-agent session, and reconnect behavior remain the transport root.
 - Delete the filesystem REST content proxies and server broker waiters only
   after the web client and daemon path is live. Tool route deletion remains
   deferred to Increment 7.

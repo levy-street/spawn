@@ -17,13 +17,36 @@ const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
 const MAX_STREAM_TOMBSTONES = 256;
 const STREAM_TOMBSTONE_TTL_MS = 120_000;
-const INDETERMINATE_REQUEST_OPERATIONS = new Set(["fs.mkdir", "fs.rename", "fs.remove"]);
+const INDETERMINATE_REQUEST_OPERATIONS = new Set([
+  "fs.mkdir",
+  "fs.rename",
+  "fs.remove",
+  "tool.install",
+]);
+const MAX_TOOL_TARGETS = 8;
+const MAX_TOOL_OUTPUT_BYTES = 4 * 1024;
+const TOOL_CHECK_TIMEOUT_MS = 30_000;
+const TOOL_INSTALL_TIMEOUT_MS = 195_000;
+const TOOL_COMMANDS = {
+  "claude-code": "claude",
+  codex: "codex",
+  opencode: "opencode",
+  "aider-sonnet": "aider",
+  shell: "bash",
+} as const;
+const TOOL_INSTALL_ARGV = {
+  "claude-code": ["npm", "install", "--global", "@anthropic-ai/claude-code"],
+  codex: ["npm", "install", "--global", "@openai/codex"],
+  opencode: ["npm", "install", "--global", "opencode-ai"],
+  "aider-sonnet": ["python3", "-m", "pip", "install", "--user", "--upgrade", "aider-chat"],
+} as const;
 export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
 export class HostControlError extends Error {
   constructor(
     public readonly code: string,
     public readonly detail?: string,
+    public readonly data?: unknown,
   ) {
     super(detail || code);
     this.name = "HostControlError";
@@ -52,6 +75,40 @@ export interface HostFileOp {
   path?: string | null;
 }
 
+export type InteractiveToolKind = keyof typeof TOOL_COMMANDS;
+
+export interface HostToolTargetRef {
+  target_id: string;
+  tool: InteractiveToolKind;
+}
+
+export interface HostToolStatus {
+  target_id: string;
+  tool: InteractiveToolKind;
+  command: string[];
+  installed: boolean;
+  path?: string | null;
+  version?: string | null;
+  latest_version?: string | null;
+  update_available?: boolean | null;
+  error?: string | null;
+}
+
+export interface HostToolInstallResult {
+  target_id: string;
+  tool: InteractiveToolKind;
+  command: string[];
+  install_argv: string[];
+  outcome: "succeeded" | "unknown";
+  success: boolean;
+  exit_code?: number | null;
+  stdout: string;
+  stderr: string;
+  output_truncated: boolean;
+  error?: string | null;
+  status?: HostToolStatus | null;
+}
+
 export interface HostReadStream {
   streamId: string;
   path: string;
@@ -68,6 +125,7 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   mutation: boolean;
+  operation: string;
   dispatched: boolean;
   removeAbort?: () => void;
 }
@@ -262,6 +320,7 @@ export class HostControlClient {
         reject,
         timer,
         mutation: INDETERMINATE_REQUEST_OPERATIONS.has(operation),
+        operation,
         dispatched: false,
       };
       if (options.signal) {
@@ -625,6 +684,70 @@ export class HostControlClient {
       await source.stream.cancel(error).catch(() => {});
       throw error;
     }
+  }
+
+  async checkTools(
+    targets: HostToolTargetRef[],
+    options?: HostControlRequestOptions,
+  ): Promise<HostToolStatus[]> {
+    validateToolTargets(targets);
+    const result = await this.request<unknown>(
+      "tool.check",
+      { targets },
+      {
+        ...options,
+        timeoutMs: options?.timeoutMs ?? TOOL_CHECK_TIMEOUT_MS,
+      },
+    );
+    if (
+      !isJsonObject(result) ||
+      !Array.isArray(result.tools) ||
+      result.tools.length !== targets.length
+    ) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid tool check result");
+    }
+    const statuses = result.tools.map((value, index) => parseToolStatus(value, targets[index]));
+    if (statuses.some((status) => status === null)) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid tool check result");
+    }
+    return statuses as HostToolStatus[];
+  }
+
+  async installTool(
+    target: HostToolTargetRef,
+    options?: HostControlRequestOptions,
+  ): Promise<HostToolInstallResult> {
+    validateToolTargets([target]);
+    if (target.tool === "shell") {
+      throw new HostControlError("install_unavailable", "The shell target has no install policy");
+    }
+    const value = await this.request<unknown>(
+      "tool.install",
+      { target },
+      {
+        ...options,
+        timeoutMs: options?.timeoutMs ?? TOOL_INSTALL_TIMEOUT_MS,
+      },
+    );
+    const result = parseToolInstallResult(value, target);
+    if (!result) {
+      this.failRtc();
+      throw new HostControlError(
+        "invalid_response",
+        "Host returned an invalid tool install result",
+      );
+    }
+    if (result.outcome === "unknown") {
+      throw new HostControlError(
+        "outcome_unknown",
+        result.error ||
+          "The install may have changed endpoint state; check the tool before retrying",
+        result,
+      );
+    }
+    return result;
   }
 
   private openWebSocket(): void {
@@ -1168,6 +1291,12 @@ export class HostControlClient {
 
   private requestAcknowledgementLost(pending: PendingRequest, fallback: Error): Error {
     if (!pending.mutation || !pending.dispatched) return fallback;
+    if (pending.operation === "tool.install") {
+      return new HostControlError(
+        "outcome_unknown",
+        "The install may have changed endpoint state; run a tool check before retrying",
+      );
+    }
     return new HostControlError(
       "outcome_unknown",
       "The host mutation may have completed; reconcile host state before retrying",
@@ -1298,6 +1427,155 @@ export class HostControlClient {
     this.state = state;
     for (const listener of this.listeners) listener(state);
   }
+}
+
+export function isInteractiveToolKind(value: string): value is InteractiveToolKind {
+  return Object.hasOwn(TOOL_COMMANDS, value);
+}
+
+function validateToolTargets(targets: HostToolTargetRef[]): void {
+  if (targets.length === 0 || targets.length > MAX_TOOL_TARGETS) {
+    throw new HostControlError("invalid_request", "Tool target count is outside the allowed range");
+  }
+  const ids = new Set<string>();
+  for (const target of targets) {
+    if (
+      !/^[A-Za-z0-9-]{1,128}$/.test(target.target_id) ||
+      !isInteractiveToolKind(target.tool) ||
+      ids.has(target.target_id)
+    ) {
+      throw new HostControlError("invalid_request", "Tool target metadata is invalid");
+    }
+    ids.add(target.target_id);
+  }
+}
+
+function parseToolStatus(value: unknown, expected: HostToolTargetRef): HostToolStatus | null {
+  if (!isJsonObject(value)) return null;
+  if (
+    !hasOnlyKeys(value, [
+      "target_id",
+      "tool",
+      "command",
+      "installed",
+      "path",
+      "version",
+      "latest_version",
+      "update_available",
+      "error",
+    ])
+  ) {
+    return null;
+  }
+  const command = value.command;
+  if (
+    value.target_id !== expected.target_id ||
+    value.tool !== expected.tool ||
+    !Array.isArray(command) ||
+    command.length !== 1 ||
+    command[0] !== TOOL_COMMANDS[expected.tool] ||
+    typeof value.installed !== "boolean" ||
+    !optionalBoundedString(value.path, 512) ||
+    !optionalBoundedString(value.version, 240) ||
+    !optionalBoundedString(value.latest_version, 240) ||
+    !optionalBoundedString(value.error, 512) ||
+    (value.update_available !== undefined &&
+      value.update_available !== null &&
+      typeof value.update_available !== "boolean")
+  ) {
+    return null;
+  }
+  if (
+    (typeof value.path === "string" && !value.path.startsWith("/")) ||
+    (value.installed && typeof value.path !== "string") ||
+    (!value.installed && (value.path != null || value.version != null))
+  ) {
+    return null;
+  }
+  return value as unknown as HostToolStatus;
+}
+
+function parseToolInstallResult(
+  value: unknown,
+  expected: HostToolTargetRef,
+): HostToolInstallResult | null {
+  if (!isJsonObject(value) || expected.tool === "shell") return null;
+  if (
+    !hasOnlyKeys(value, [
+      "target_id",
+      "tool",
+      "command",
+      "install_argv",
+      "outcome",
+      "success",
+      "exit_code",
+      "stdout",
+      "stderr",
+      "output_truncated",
+      "error",
+      "status",
+    ])
+  ) {
+    return null;
+  }
+  const expectedInstall = TOOL_INSTALL_ARGV[expected.tool];
+  if (
+    value.target_id !== expected.target_id ||
+    value.tool !== expected.tool ||
+    !stringArrayEquals(value.command, [TOOL_COMMANDS[expected.tool]]) ||
+    !stringArrayEquals(value.install_argv, expectedInstall) ||
+    (value.outcome !== "succeeded" && value.outcome !== "unknown") ||
+    typeof value.success !== "boolean" ||
+    typeof value.stdout !== "string" ||
+    typeof value.stderr !== "string" ||
+    encodedLength(value.stdout) > MAX_TOOL_OUTPUT_BYTES ||
+    encodedLength(value.stderr) > MAX_TOOL_OUTPUT_BYTES ||
+    typeof value.output_truncated !== "boolean" ||
+    !optionalBoundedString(value.error, 512) ||
+    (value.exit_code !== undefined &&
+      value.exit_code !== null &&
+      (!Number.isSafeInteger(value.exit_code) || Math.abs(value.exit_code as number) > 255))
+  ) {
+    return null;
+  }
+  const status =
+    value.status === undefined || value.status === null
+      ? null
+      : parseToolStatus(value.status, expected);
+  if (
+    (value.status !== undefined && value.status !== null && status === null) ||
+    (value.outcome === "succeeded" &&
+      (!value.success || !status?.installed || value.exit_code !== 0 || value.error != null)) ||
+    (value.outcome === "unknown" && (value.success || status?.installed === true))
+  ) {
+    return null;
+  }
+  return { ...(value as unknown as HostToolInstallResult), status };
+}
+
+function optionalBoundedString(value: unknown, maxBytes: number): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === "string" && encodedLength(value) <= maxBytes)
+  );
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedKeys = new Set(allowed);
+  return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function stringArrayEquals(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((part, index) => part === expected[index])
+  );
+}
+
+function encodedLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

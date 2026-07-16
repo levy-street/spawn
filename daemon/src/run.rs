@@ -1344,7 +1344,7 @@ async fn handle_agent_create(
     });
 }
 
-async fn resolved_command_env() -> BTreeMap<String, String> {
+pub(crate) async fn resolved_command_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     normalize_agent_env(&mut env).await;
     env

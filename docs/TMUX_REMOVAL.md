@@ -33,6 +33,10 @@ path is the worker-only implementation. Any proposal to reverse this decision
 requires a new ADR, an explicit trust-boundary review, and replacement of the
 worker-only source guard; incident response is not an exception.
 
+At issue/task intake and code review, a proposed "fix tmux" item is therefore a
+scope error, not backlog work. Rewrite it as a worker behavior requirement or
+reject it; do not schedule exploratory tmux repair work.
+
 ## Cutover boundary
 
 There is deliberately no transparent migration of a live tmux PTY into a

@@ -6336,6 +6336,14 @@ mod tests {
         assert_eq!(hello["limits"]["long_tasks"], 8);
         assert_eq!(hello["limits"]["write_reapers"], 1);
         assert_eq!(hello["limits"]["directory_entries"], 1024);
+        assert_eq!(hello["limits"]["tool_targets"], 8);
+        assert_eq!(hello["limits"]["tool_processes"], 4);
+        assert_eq!(hello["limits"]["tool_output_bytes"], 4096);
+        assert!(hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "tool.check"));
         assert!(
             tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
                 .await
@@ -6366,6 +6374,26 @@ mod tests {
         let response: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["request_id"], "e2e-ping");
         assert_eq!(response["result"]["pong"], true);
+
+        let tools = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-tool-check",
+            "tool.check",
+            json!({
+                "targets": [{"target_id": "shell-preset", "tool": "shell"}]
+            }),
+        )
+        .await;
+        let status = &tools["result"]["tools"][0];
+        assert_eq!(status["target_id"], "shell-preset");
+        assert_eq!(status["tool"], "shell");
+        assert_eq!(status["command"], json!(["bash"]));
+        assert_eq!(status["installed"], true);
+        assert!(status["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/bash")));
+        assert!(status["version"].as_str().is_some());
 
         let listing = request_host_control(
             accepted_channel,
