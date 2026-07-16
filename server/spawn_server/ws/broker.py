@@ -13,7 +13,6 @@ import json
 import time
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -34,6 +33,8 @@ class DaemonConn:
     home_dir: str | None = None
     agent_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    superseded_close_started: bool = False
+    rtc_revocation_started: bool = False
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
@@ -143,15 +144,24 @@ class Broker:
 
     # ---- daemon registration ----
 
+    @staticmethod
+    async def _close_superseded(conn: DaemonConn | None) -> None:
+        if conn is None or conn.superseded_close_started:
+            return
+        conn.superseded_close_started = True
+        try:
+            await asyncio.wait_for(
+                conn.websocket.close(code=4000, reason="superseded"), timeout=1.0
+            )
+        except Exception:
+            conn.superseded_close_started = False
+
     async def register_daemon(self, conn: DaemonConn) -> None:
+        superseded: DaemonConn | None = None
         async with self._lock:
             existing = self._daemons_by_host.get(conn.host_id)
             if existing is not None and existing is not conn:
-                # Drop the stale connection (best-effort).
-                try:
-                    await existing.websocket.close(code=4000, reason="superseded")
-                except Exception:
-                    pass
+                superseded = existing
                 for aid in list(existing.agent_ids):
                     self._daemon_by_agent.pop(aid, None)
                 existing.agent_ids.clear()
@@ -161,6 +171,7 @@ class Broker:
                 # of silently orphaning an established DataChannel.
                 self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
             self._daemons_by_host[conn.host_id] = conn
+        await self._close_superseded(superseded)
 
     async def unregister_daemon(self, conn: DaemonConn) -> None:
         async with self._lock:
@@ -195,6 +206,7 @@ class Broker:
         This transition is therefore also the one place where an accepted local
         predecessor may be superseded.
         """
+        superseded: DaemonConn | None = None
         async with self._lock:
             if conn.host_generation != generation:
                 return DaemonOwnerAcceptance(False)
@@ -207,11 +219,8 @@ class Broker:
             existing = self._daemons_by_host.get(conn.host_id)
             superseded_connection_id: str | None = None
             if existing is not None and existing is not conn:
+                superseded = existing
                 superseded_connection_id = existing.id
-                try:
-                    await existing.websocket.close(code=4000, reason="superseded")
-                except Exception:
-                    pass
                 for aid in list(existing.agent_ids):
                     if self._daemon_by_agent.get(aid) is existing:
                         self._daemon_by_agent.pop(aid, None)
@@ -220,7 +229,8 @@ class Broker:
 
             self._daemons_by_host[conn.host_id] = conn
             self._accepted_daemon_owners[conn.host_id] = (conn.id, generation)
-            return DaemonOwnerAcceptance(True, superseded_connection_id)
+        await self._close_superseded(superseded)
+        return DaemonOwnerAcceptance(True, superseded_connection_id)
 
     async def is_accepted_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
         async with self._lock:
@@ -232,12 +242,6 @@ class Broker:
             and conn.host_generation == generation
             and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
         )
-
-    @asynccontextmanager
-    async def accepted_daemon_guard(self, conn: DaemonConn, generation: int):
-        """Linearize a daemon side effect against local owner acceptance."""
-        async with self._lock:
-            yield self._is_accepted_daemon_owner_locked(conn, generation)
 
     async def attach_agent_to_daemon(
         self,

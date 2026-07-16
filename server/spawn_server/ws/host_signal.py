@@ -42,9 +42,7 @@ async def wait_for_signal_pump(pump: asyncio.Task[None], ready: asyncio.Event) -
     await ready_task
 
 
-async def receive_with_signal_pump(
-    websocket: Any, pump: asyncio.Task[None]
-) -> dict[str, Any]:
+async def receive_with_signal_pump(websocket: Any, pump: asyncio.Task[None]) -> dict[str, Any]:
     """Receive a websocket frame while treating a dead Redis pump as fatal."""
     receive_task = asyncio.create_task(websocket.receive())
     try:
@@ -115,6 +113,7 @@ def decode_host_presence_owner(value: bytes | None) -> HostPresenceOwner | None:
 @dataclass(frozen=True)
 class HostSignalEnvelope:
     daemon_connection_id: str
+    daemon_generation: int
     browser_channel: str
     signal: dict[str, Any]
 
@@ -166,6 +165,7 @@ def encode_host_signal(envelope: HostSignalEnvelope) -> bytes:
     payload = json.dumps(
         {
             "daemon_connection_id": envelope.daemon_connection_id,
+            "daemon_generation": envelope.daemon_generation,
             "browser_channel": envelope.browser_channel,
             "signal": envelope.signal,
         },
@@ -186,18 +186,28 @@ def decode_host_signal(payload: bytes) -> HostSignalEnvelope | None:
     if not isinstance(value, dict):
         return None
     daemon_connection_id = value.get("daemon_connection_id")
+    daemon_generation = value.get("daemon_generation")
     browser_channel = value.get("browser_channel")
     signal = value.get("signal")
     if (
         not isinstance(daemon_connection_id, str)
         or not valid_daemon_connection_id(daemon_connection_id)
+        or not isinstance(daemon_generation, int)
+        or isinstance(daemon_generation, bool)
+        or daemon_generation < 1
+        or daemon_generation > MAX_SAFE_FENCING_GENERATION
         or not isinstance(browser_channel, str)
         or not browser_channel.startswith("spawn:rtc:browser:")
         or not valid_daemon_connection_id(browser_channel.removeprefix("spawn:rtc:browser:"))
         or not isinstance(signal, dict)
     ):
         return None
-    return HostSignalEnvelope(daemon_connection_id, browser_channel, signal)
+    return HostSignalEnvelope(
+        daemon_connection_id,
+        daemon_generation,
+        browser_channel,
+        signal,
+    )
 
 
 async def publish_host_signal(host_id: str, envelope: HostSignalEnvelope) -> None:
@@ -215,13 +225,38 @@ class RedisBrowserConn:
     user_id: str
     host_id: str
     channel: str
+    daemon_connection_id: str
+    daemon_generation: int
 
     @property
     def route_id(self) -> str:
         return self.channel
 
-    async def send_text(self, payload: dict) -> None:
-        await get_backend().publish_channel(
+    async def _send_text_as_owner(self, payload: dict, owner: HostPresenceOwner) -> None:
+        published = await get_backend().publish_if_ephemeral(
+            host_presence_key(self.host_id),
+            encode_host_presence_owner(owner),
             self.channel,
             json.dumps(payload, separators=(",", ":")).encode(),
         )
+        if not published:
+            raise StaleHostOwnerError("host RTC response owner is no longer current")
+
+    async def send_text(self, payload: dict) -> None:
+        await self._send_text_as_owner(
+            payload,
+            HostPresenceOwner(
+                self.daemon_connection_id,
+                self.daemon_generation,
+            ),
+        )
+
+    async def send_owner_revocation(self, payload: dict, replacement: HostPresenceOwner) -> None:
+        """Publish unavailable using the replacement's explicit owner token."""
+        if replacement.daemon_connection_id == self.daemon_connection_id:
+            raise StaleHostOwnerError("revocation requires a replacement owner")
+        await self._send_text_as_owner(payload, replacement)
+
+
+class StaleHostOwnerError(RuntimeError):
+    """An exact-owner RTC publication lost its Redis fencing token."""

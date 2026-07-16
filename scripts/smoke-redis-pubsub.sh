@@ -593,7 +593,7 @@ async def main() -> None:
     try:
         await publish_host_signal(
             host_id,
-            HostSignalEnvelope(old_owner, route, signal("redis-established-session")),
+            HostSignalEnvelope(old_owner, 1, route, signal("redis-established-session")),
         )
         for _ in range(200):
             if established_file.exists():
@@ -625,20 +625,20 @@ async def main() -> None:
             assert await _prepare_host_activation(
                 session, host_id, new_owner, generation, {"version": "replacement"}
             )
-            assert await backend.activate_ephemeral(
-                host_pending_presence_key(host_id),
-                replacement_lease,
-                host_presence_key(host_id),
-                old_lease,
-                replacement_lease,
-                ttl_seconds=60,
-            )
             await session.commit()
+        assert await backend.activate_ephemeral(
+            host_pending_presence_key(host_id),
+            replacement_lease,
+            host_presence_key(host_id),
+            old_lease,
+            replacement_lease,
+            ttl_seconds=60,
+        )
         # Deliberately publish the stale offer before the revocation event. The
         # old worker must fence on the current lease generation, not event order.
         await publish_host_signal(
             host_id,
-            HostSignalEnvelope(old_owner, route, signal("redis-stale-offer")),
+            HostSignalEnvelope(old_owner, 1, route, signal("redis-stale-offer")),
         )
         await publish_host_owner_revocation(
             host_id,

@@ -200,6 +200,7 @@ async def _publish_signal(
         encode_host_signal(
             HostSignalEnvelope(
                 daemon_connection_id=binding.daemon_connection_id,
+                daemon_generation=binding.daemon_generation,
                 browser_channel=response_channel,
                 signal=signal,
             )

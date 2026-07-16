@@ -568,6 +568,70 @@ async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner()
     )
 
 
+@pytest.mark.asyncio
+async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(app):
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import (
+        HostPresenceOwner,
+        RedisBrowserConn,
+        StaleHostOwnerError,
+        encode_host_presence_owner,
+        host_presence_key,
+    )
+
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-rtc-exact-publish",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    assert await broker.accept_daemon_owner(daemon, 1)
+    channel = f"spawn:rtc:browser:{'c' * 32}"
+    browser = RedisBrowserConn(
+        user_id=daemon.user_id,
+        host_id=daemon.host_id,
+        channel=channel,
+        daemon_connection_id=daemon.id,
+        daemon_generation=1,
+    )
+    assert await broker.register_rtc_session(
+        "rtc-exact-publish",
+        browser,
+        daemon=daemon,
+        scope_type="host",
+        scope_id=daemon.host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        ttl_seconds=60,
+    )
+    binding = await broker.rtc_session_for("rtc-exact-publish", daemon=daemon)
+    assert binding is not None
+
+    backend = get_backend()
+    replacement = HostPresenceOwner("d" * 32, 2)
+    await backend.set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(replacement),
+        ttl_seconds=60,
+    )
+    assert backend.inproc is not None
+    queue = backend.inproc.subscribe(channel)
+    try:
+        for payload in (
+            {"type": "rtc.answer", "sdp": "v=0\r\n"},
+            {"type": "rtc.status", "status": "connected"},
+        ):
+            with pytest.raises(StaleHostOwnerError):
+                await browser.send_text(payload)
+        assert queue.empty()
+    finally:
+        backend.inproc.unsubscribe(channel, queue)
+
+    assert await broker.rtc_session_for("rtc-exact-publish", daemon=daemon) is binding
+    assert binding.expires_at != float("inf")
+
+
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     from spawn_server.ws.host_signal import (
         MAX_HOST_SIGNAL_ENVELOPE_BYTES,
@@ -582,10 +646,15 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     response_channel = f"spawn:rtc:browser:{'b' * 32}"
     valid = HostSignalEnvelope(
         daemon_connection_id="a" * 32,
+        daemon_generation=1,
         browser_channel=response_channel,
         signal={"type": "rtc.close"},
     )
     assert decode_host_signal(encode_host_signal(valid)) == valid
+    bool_generation = encode_host_signal(valid).replace(
+        b'"daemon_generation":1', b'"daemon_generation":true'
+    )
+    assert decode_host_signal(bool_generation) is None
     assert (
         decode_host_signal(
             encode_host_signal(valid).replace(b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', b'"invalid"')
@@ -599,6 +668,7 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
         encode_host_signal(
             HostSignalEnvelope(
                 daemon_connection_id="a" * 32,
+                daemon_generation=1,
                 browser_channel=response_channel,
                 signal={"value": "x" * MAX_HOST_SIGNAL_ENVELOPE_BYTES},
             )

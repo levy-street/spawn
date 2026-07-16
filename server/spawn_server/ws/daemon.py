@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth as auth_mod
-from .. import transcript
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import Agent, Host
@@ -32,11 +34,11 @@ from .host_signal import (
     decode_host_owner_revocation,
     decode_host_presence_owner,
     decode_host_signal,
+    encode_host_owner_revocation,
     encode_host_presence_owner,
     host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
-    publish_host_owner_revocation,
     receive_with_signal_pump,
     wait_for_signal_pump,
 )
@@ -44,6 +46,8 @@ from .host_signal import (
 router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
 HOST_ACTIVATION_DEADLINE_SECONDS = 30
+HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS = 2.0
+HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS = 10.0
 
 
 def _utcnow() -> datetime:
@@ -79,12 +83,12 @@ async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) ->
     host_id = sub.split(":", 1)[1]
     user_id = payload.get("user_id")
 
-    sm = get_sessionmaker()
-    async with sm() as session:
+    async with _bounded_host_ownership_session() as session:
         host = await session.get(Host, host_id)
-        if host is None or host.owner_user_id != user_id:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="host gone")
-            return None
+        authorized = host is not None and host.owner_user_id == user_id
+    if not authorized:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="host gone")
+        return None
     return host
 
 
@@ -95,6 +99,7 @@ async def _allocate_host_generation(
     *,
     commit: bool = True,
 ) -> int | None:
+    await _configure_activation_timeouts(session)
     result = await session.execute(
         update(Host)
         .where(
@@ -117,6 +122,7 @@ async def _allocate_host_generation(
 async def _clear_host_generation_reservation(
     session: AsyncSession, host_id: str, connection_id: str, generation: int
 ) -> bool:
+    await _configure_activation_timeouts(session)
     result = await session.execute(
         update(Host)
         .where(
@@ -133,6 +139,7 @@ async def _clear_host_generation_reservation(
 async def _host_activation_predecessor(
     session: AsyncSession, host_id: str, connection_id: str, generation: int
 ) -> HostPresenceOwner | None | bool:
+    await _configure_activation_timeouts(session)
     row = (
         await session.execute(
             select(
@@ -157,6 +164,7 @@ async def _prepare_host_activation(
     generation: int,
     registration: dict[str, object],
 ) -> bool:
+    await _configure_activation_timeouts(session)
     values: dict[str, object] = {
         "daemon_connection_id": connection_id,
         "daemon_generation": generation,
@@ -184,8 +192,17 @@ async def _prepare_host_activation(
 async def _configure_activation_timeouts(session: AsyncSession) -> None:
     bind = session.get_bind()
     if bind.dialect.name == "postgresql":
-        await session.execute(text("SET LOCAL lock_timeout = '10s'"))
-        await session.execute(text("SET LOCAL statement_timeout = '20s'"))
+        await session.execute(text("SET LOCAL lock_timeout = '2s'"))
+        await session.execute(text("SET LOCAL statement_timeout = '5s'"))
+        await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
+
+
+@asynccontextmanager
+async def _bounded_host_ownership_session() -> AsyncIterator[AsyncSession]:
+    """Bound the complete DB-only ownership transaction, including cleanup."""
+    async with asyncio.timeout(HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS):
+        async with get_sessionmaker()() as session:
+            yield session
 
 
 async def _attempt_host_activation(
@@ -196,26 +213,26 @@ async def _attempt_host_activation(
     previous_value: bytes | None,
     value: bytes,
 ) -> None:
-    sm = get_sessionmaker()
-    async with sm() as session:
-        await _configure_activation_timeouts(session)
+    if await get_backend().get_ephemeral(host_presence_key(host_id)) != previous_value:
+        return
+    async with _bounded_host_ownership_session() as session:
         if not await _prepare_host_activation(
             session, host_id, connection_id, generation, registration
         ):
             await session.rollback()
             return
-        promoted = await get_backend().activate_ephemeral(
-            host_pending_presence_key(host_id),
-            value,
-            host_presence_key(host_id),
-            previous_value,
-            value,
-            ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
-        )
-        if not promoted:
-            await session.rollback()
-            return
         await session.commit()
+    # Redis is deliberately outside the Host row-lock transaction. The DB is
+    # authoritative during this short bridge; reconciliation repairs an
+    # acknowledged or ambiguous CAS from fresh durable state.
+    await get_backend().activate_ephemeral(
+        host_pending_presence_key(host_id),
+        value,
+        host_presence_key(host_id),
+        previous_value,
+        value,
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
 
 
 async def _reconcile_host_activation(
@@ -227,8 +244,7 @@ async def _reconcile_host_activation(
 ) -> bool:
     """Resolve an ambiguous promotion from fresh durable and cache state."""
     previous_value = None if previous_owner is None else encode_host_presence_owner(previous_owner)
-    sm = get_sessionmaker()
-    async with sm() as session:
+    async with _bounded_host_ownership_session() as session:
         await _configure_activation_timeouts(session)
         host = await session.get(Host, host_id)
         committed = host is not None and (
@@ -283,7 +299,7 @@ async def _reconcile_host_activation(
                 ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
             )
         await backend.delete_ephemeral_if(pending_key, value)
-        async with sm() as session:
+        async with _bounded_host_ownership_session() as session:
             await _clear_host_generation_reservation(session, host_id, connection_id, generation)
     else:
         await backend.delete_ephemeral_if(pending_key, value)
@@ -349,8 +365,8 @@ async def _activate_host_with_reconciliation(
 
 async def _is_durable_host_owner(host_id: str, connection_id: str, generation: int) -> bool:
     async def query() -> bool:
-        sm = get_sessionmaker()
-        async with sm() as session:
+        async with _bounded_host_ownership_session() as session:
+            await _configure_activation_timeouts(session)
             owner = await session.scalar(
                 select(Host.id).where(
                     Host.id == host_id,
@@ -374,8 +390,8 @@ async def _is_durable_host_owner(host_id: str, connection_id: str, generation: i
 async def _durable_pending_successor(
     host_id: str, connection_id: str, generation: int
 ) -> HostPresenceOwner | None | bool:
-    sm = get_sessionmaker()
-    async with sm() as session:
+    async with _bounded_host_ownership_session() as session:
+        await _configure_activation_timeouts(session)
         row = (
             await session.execute(
                 select(
@@ -398,6 +414,7 @@ async def _durable_pending_successor(
 async def _touch_host(
     session: AsyncSession, host_id: str, connection_id: str, generation: int
 ) -> bool:
+    await _configure_activation_timeouts(session)
     result = await session.execute(
         update(Host)
         .where(
@@ -417,6 +434,7 @@ async def _touch_host(
 async def _mark_host_offline_if_owner(
     session: AsyncSession, host_id: str, connection_id: str, generation: int
 ) -> bool:
+    await _configure_activation_timeouts(session)
     result = await session.execute(
         update(Host)
         .where(
@@ -615,28 +633,95 @@ async def _lock_durable_host_owner(session: AsyncSession, conn: DaemonConn) -> b
     return owner is not None
 
 
+async def _validate_durable_host_owner(conn: DaemonConn) -> bool:
+    """Perform the bounded owner transaction without external awaits."""
+    async with _bounded_host_ownership_session() as session:
+        valid = await _lock_durable_host_owner(session, conn)
+        await session.rollback()
+        return valid
+
+
+def _agent_owner_exists(conn: DaemonConn) -> Any:
+    generation = conn.host_generation
+    return (
+        select(Host.id)
+        .where(
+            Host.id == conn.host_id,
+            Host.daemon_connection_id == conn.id,
+            Host.daemon_generation == generation,
+        )
+        .exists()
+    )
+
+
+async def _redis_owner_is_current(conn: DaemonConn) -> bool:
+    expected = _host_presence_value(conn)
+    return expected is not None and (
+        await get_backend().get_ephemeral(host_presence_key(conn.host_id)) == expected
+    )
+
+
+async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
+    await asyncio.wait_for(target.send_text(payload), timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS)
+
+
+async def _route_rtc_payload_if_owner(
+    conn: DaemonConn,
+    binding: RtcSessionBinding,
+    payload: dict[str, object],
+) -> bool:
+    if not await _validate_durable_host_owner(conn):
+        return False
+    if not await _redis_owner_is_current(conn):
+        return False
+    try:
+        await _bounded_send_text(binding.browser, payload)
+    except Exception:
+        return False
+    return True
+
+
 async def _revoke_host_rtc_sessions(conn: DaemonConn) -> None:
     broker = get_broker()
-    for binding in await broker.rtc_sessions_for_daemon(conn):
+    bindings = await broker.rtc_sessions_for_daemon(conn)
+    try:
+        current = await asyncio.wait_for(
+            get_backend().get_ephemeral(host_presence_key(conn.host_id)),
+            timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS,
+        )
+        replacement = decode_host_presence_owner(current)
+    except Exception:
+        replacement = None
+    for binding in bindings:
         if binding.scope_type != "host":
             continue
+        unavailable = {
+            "type": "rtc.status",
+            "session_id": binding.session_id,
+            "scope_type": "host",
+            "scope_id": binding.scope_id,
+            "protocol": binding.protocol,
+            "protocol_version": binding.protocol_version,
+            "status": "unavailable",
+        }
         try:
-            await binding.browser.send_text(
-                {
-                    "type": "rtc.status",
-                    "session_id": binding.session_id,
-                    "scope_type": "host",
-                    "scope_id": binding.scope_id,
-                    "protocol": binding.protocol,
-                    "protocol_version": binding.protocol_version,
-                    "status": "unavailable",
-                }
-            )
+            if (
+                isinstance(binding.browser, RedisBrowserConn)
+                and replacement is not None
+                and replacement.daemon_connection_id != conn.id
+            ):
+                await asyncio.wait_for(
+                    binding.browser.send_owner_revocation(unavailable, replacement),
+                    timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS,
+                )
+            else:
+                await _bounded_send_text(binding.browser, unavailable)
         except Exception:
             pass
         await broker.unregister_rtc_session(binding.session_id, binding.browser)
         try:
-            await conn.send_text(
+            await _bounded_send_text(
+                conn,
                 {
                     "type": "rtc.close",
                     "session_id": binding.session_id,
@@ -644,18 +729,32 @@ async def _revoke_host_rtc_sessions(conn: DaemonConn) -> None:
                     "scope_id": binding.scope_id,
                     "protocol": binding.protocol,
                     "protocol_version": binding.protocol_version,
-                }
+                },
             )
         except Exception:
             pass
 
 
 async def _fence_superseded_daemon(conn: DaemonConn) -> None:
-    await _revoke_host_rtc_sessions(conn)
+    # Close first: RTC notifications are best-effort and may each consume
+    # their bounded dispatch timeout, but fencing the daemon socket must be
+    # prompt regardless of browser/Redis health.
+    if not conn.superseded_close_started:
+        conn.superseded_close_started = True
+        try:
+            await asyncio.wait_for(
+                conn.websocket.close(code=4000, reason="superseded"),
+                timeout=1.0,
+            )
+        except Exception:
+            conn.superseded_close_started = False
+    if conn.rtc_revocation_started:
+        return
+    conn.rtc_revocation_started = True
     try:
-        await conn.websocket.close(code=4000, reason="superseded")
+        await _revoke_host_rtc_sessions(conn)
     except Exception:
-        pass
+        log.warning("failed to revoke superseded host RTC sessions")
 
 
 async def _expire_host_rtc_binding(
@@ -663,31 +762,25 @@ async def _expire_host_rtc_binding(
     daemon: DaemonConn,
 ) -> None:
     await asyncio.sleep(HOST_RTC_SESSION_TTL_SECONDS)
+    if not await _validate_durable_host_owner(daemon) or not await _redis_owner_is_current(daemon):
+        await _fence_superseded_daemon(daemon)
+        return
     if not await get_broker().expire_rtc_session(binding.session_id, binding):
         return
-    sm = get_sessionmaker()
-    async with sm() as owner_session:
-        if not await _lock_durable_host_owner(owner_session, daemon):
-            await _fence_superseded_daemon(daemon)
-            return
-        if owner_session.get_bind().dialect.name == "sqlite":
-            # SQLite's test-only FOR UPDATE is a no-op and the in-memory test
-            # engine shares one connection. Do not leave that emulated
-            # transaction open across the websocket send.
-            await owner_session.commit()
-        try:
-            await daemon.send_text(
-                {
-                    "type": "rtc.close",
-                    "session_id": binding.session_id,
-                    "scope_type": "host",
-                    "scope_id": binding.scope_id,
-                    "protocol": binding.protocol,
-                    "protocol_version": binding.protocol_version,
-                }
-            )
-        except Exception:
-            pass
+    try:
+        await _bounded_send_text(
+            daemon,
+            {
+                "type": "rtc.close",
+                "session_id": binding.session_id,
+                "scope_type": "host",
+                "scope_id": binding.scope_id,
+                "protocol": binding.protocol,
+                "protocol_version": binding.protocol_version,
+            },
+        )
+    except Exception:
+        pass
 
 
 async def _process_host_rtc_signal(
@@ -701,47 +794,42 @@ async def _process_host_rtc_signal(
     generation = conn.host_generation
     if generation is None or not await broker.is_accepted_daemon_owner(conn, generation):
         return True
-
-    sm = get_sessionmaker()
-    async with sm() as owner_session:
-        if not await _lock_durable_host_owner(owner_session, conn):
-            await _fence_superseded_daemon(conn)
-            return False
-        if owner_session.get_bind().dialect.name == "sqlite":
-            # Production PostgreSQL keeps the row lock through every effect;
-            # SQLite cannot provide that guarantee and is used only by the
-            # single-process unit suite.
-            await owner_session.commit()
-        if not await _owns_host_signal_presence(conn):
-            await _fence_superseded_daemon(conn)
-            return False
-        signal = envelope.signal
-        if not _host_rtc_metadata_matches(signal, conn.host_id):
+    if envelope.daemon_connection_id != conn.id or envelope.daemon_generation != generation:
+        return True
+    if not await _validate_durable_host_owner(conn) or not await _redis_owner_is_current(conn):
+        await _fence_superseded_daemon(conn)
+        return False
+    signal = envelope.signal
+    if not _host_rtc_metadata_matches(signal, conn.host_id):
+        return True
+    session_id = _valid_rtc_session_id(signal.get("session_id"))
+    if session_id is None:
+        return True
+    frame_type = signal.get("type")
+    if frame_type == "rtc.offer":
+        if _valid_rtc_sdp(signal.get("sdp")) is None:
             return True
-        session_id = _valid_rtc_session_id(signal.get("session_id"))
-        if session_id is None:
-            return True
-        frame_type = signal.get("type")
-        if frame_type == "rtc.offer":
-            if _valid_rtc_sdp(signal.get("sdp")) is None:
-                return True
-            remote_browser = RedisBrowserConn(
-                user_id=conn.user_id,
-                host_id=conn.host_id,
-                channel=envelope.browser_channel,
-            )
-            registered = await broker.register_rtc_session(
-                session_id,
-                remote_browser,
-                daemon=conn,
-                scope_type="host",
-                scope_id=conn.host_id,
-                protocol=HOST_CONTROL_PROTOCOL,
-                protocol_version=HOST_CONTROL_VERSION,
-                ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
-            )
-            if not registered:
-                await remote_browser.send_text(
+        remote_browser = RedisBrowserConn(
+            user_id=conn.user_id,
+            host_id=conn.host_id,
+            channel=envelope.browser_channel,
+            daemon_connection_id=conn.id,
+            daemon_generation=generation,
+        )
+        registered = await broker.register_rtc_session(
+            session_id,
+            remote_browser,
+            daemon=conn,
+            scope_type="host",
+            scope_id=conn.host_id,
+            protocol=HOST_CONTROL_PROTOCOL,
+            protocol_version=HOST_CONTROL_VERSION,
+            ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
+        )
+        if not registered:
+            try:
+                await _bounded_send_text(
+                    remote_browser,
                     {
                         "type": "rtc.status",
                         "session_id": session_id,
@@ -750,33 +838,43 @@ async def _process_host_rtc_signal(
                         "protocol": HOST_CONTROL_PROTOCOL,
                         "protocol_version": HOST_CONTROL_VERSION,
                         "status": "failed",
-                    }
+                    },
                 )
-                return True
-            binding = await broker.rtc_session_for(session_id, daemon=conn)
-            if binding is None:
-                return True
-            expiry_task = asyncio.create_task(_expire_host_rtc_binding(binding, conn))
-            expiry_tasks.add(expiry_task)
-            expiry_task.add_done_callback(expiry_tasks.discard)
-            await conn.send_text(signal)
+            except Exception:
+                await _fence_superseded_daemon(conn)
+                return False
             return True
-
         binding = await broker.rtc_session_for(session_id, daemon=conn)
-        if (
-            binding is None
-            or binding.scope_type != "host"
-            or binding.scope_id != conn.host_id
-            or binding.browser.route_id != envelope.browser_channel
-        ):
+        if binding is None:
             return True
-        if frame_type == "rtc.candidate":
-            if _valid_rtc_candidate(signal.get("candidate")) is not None:
-                await conn.send_text(signal)
-        elif frame_type == "rtc.close":
-            await broker.unregister_rtc_session(session_id, binding.browser)
-            await conn.send_text(signal)
+        expiry_task = asyncio.create_task(_expire_host_rtc_binding(binding, conn))
+        expiry_tasks.add(expiry_task)
+        expiry_task.add_done_callback(expiry_tasks.discard)
+        if not await _redis_owner_is_current(conn):
+            await broker.unregister_rtc_session(session_id, remote_browser)
+            await _fence_superseded_daemon(conn)
+            return False
+        await _bounded_send_text(conn, signal)
         return True
+
+    binding = await broker.rtc_session_for(session_id, daemon=conn)
+    if (
+        binding is None
+        or binding.scope_type != "host"
+        or binding.scope_id != conn.host_id
+        or binding.browser.route_id != envelope.browser_channel
+    ):
+        return True
+    if not await _redis_owner_is_current(conn):
+        await _fence_superseded_daemon(conn)
+        return False
+    if frame_type == "rtc.candidate":
+        if _valid_rtc_candidate(signal.get("candidate")) is not None:
+            await _bounded_send_text(conn, signal)
+    elif frame_type == "rtc.close":
+        await broker.unregister_rtc_session(session_id, binding.browser)
+        await _bounded_send_text(conn, signal)
+    return True
 
 
 async def _pump_host_rtc_signals(
@@ -809,9 +907,8 @@ async def _pump_host_rtc_signals(
             try:
                 keep_pumping = await asyncio.shield(processing)
             except asyncio.CancelledError:
-                # Do not interrupt a SELECT FOR UPDATE transaction halfway
-                # through its exact-owner side effect. Finish its bounded DB
-                # cleanup before allowing daemon shutdown to proceed.
+                # Finish the bounded DB decision and generation-token dispatch
+                # before allowing daemon shutdown to abandon this signal.
                 await processing
                 raise
             if not keep_pumping:
@@ -835,7 +932,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     expiry_tasks: set[asyncio.Task[None]] = set()
     signal_task = asyncio.create_task(_pump_host_rtc_signals(conn, signal_ready, expiry_tasks))
 
-    sm = get_sessionmaker()
     registered = False
 
     try:
@@ -864,46 +960,42 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 # Activity is no longer derived from these bytes — the daemon
                 # classifies output locally and emits a content-free
                 # `agent.activity` frame (trust Phase 2), handled below. This
-                # path stays only to persist/relay until the DataChannel owns
-                # history (Phase 2 step 3), at which point it is deleted.
+                # compatibility path stays only for exact-generation live
+                # relay until the DataChannel owns all output.
 
                 generation = conn.host_generation
                 if generation is None:
                     await _fence_superseded_daemon(conn)
                     break
-                stale = False
-                async with sm() as owner_session:
-                    if not await _lock_durable_host_owner(owner_session, conn):
-                        stale = True
-                    else:
+                durable_owner = False
+                agent_authorized = False
+                async with _bounded_host_ownership_session() as owner_session:
+                    durable_owner = await _lock_durable_host_owner(owner_session, conn)
+                    if durable_owner:
                         agent = await owner_session.get(Agent, frame.agent_id)
-                        if agent is None or agent.host_id != host.id:
-                            stale = True
-                        else:
-                            if (
-                                frame.agent_id not in conn.agent_ids
-                                and not await broker.attach_agent_to_daemon(
-                                    frame.agent_id,
-                                    conn,
-                                    expected_host_generation=generation,
-                                )
-                            ):
-                                stale = True
-                            else:
-                                # The row lock orders transcript persistence before
-                                # any replacement DB commit; Redis atomically checks
-                                # the same generation before external publication.
-                                await transcript.append(frame.agent_id, frame.payload)
-                                published = await get_backend().publish_if_ephemeral(
-                                    host_presence_key(host.id),
-                                    _host_presence_value(conn) or b"",
-                                    f"spawn:agent:{frame.agent_id}",
-                                    frame.payload,
-                                )
-                                if not published:
-                                    stale = True
+                        agent_authorized = agent is not None and agent.host_id == host.id
                     await owner_session.rollback()
-                if stale:
+                if not durable_owner:
+                    await _fence_superseded_daemon(conn)
+                    break
+                if not agent_authorized:
+                    log.warning("daemon stream for unknown agent=%s", frame.agent_id)
+                    continue
+                attached = frame.agent_id in conn.agent_ids or await broker.attach_agent_to_daemon(
+                    frame.agent_id,
+                    conn,
+                    expected_host_generation=generation,
+                )
+                # Live output is dispatched by an exact generation token and
+                # is no longer appended to the shared transcript path. A
+                # stalled filesystem write therefore cannot land after B wins.
+                published = attached and await get_backend().publish_if_ephemeral(
+                    host_presence_key(host.id),
+                    _host_presence_value(conn) or b"",
+                    f"spawn:agent:{frame.agent_id}",
+                    frame.payload,
+                )
+                if not published:
                     await _fence_superseded_daemon(conn)
                     break
 
@@ -937,7 +1029,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     # database or Redis owner. Only the later CAS promotion is
                     # visible to browsers and accepted daemon routing.
                     previous_owner: HostPresenceOwner | None = None
-                    async with sm() as session:
+                    async with _bounded_host_ownership_session() as session:
                         generation = await _allocate_host_generation(
                             session,
                             host.id,
@@ -949,7 +1041,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     conn.host_generation = generation
                     claimed, _ = await _claim_host_signal_presence(conn)
                     if not claimed:
-                        async with sm() as session:
+                        async with _bounded_host_ownership_session() as session:
                             await _clear_host_generation_reservation(
                                 session, host.id, conn.id, generation
                             )
@@ -958,7 +1050,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
 
                     value = _host_presence_value(conn)
                     assert value is not None
-                    async with sm() as session:
+                    async with _bounded_host_ownership_session() as session:
                         predecessor = await _host_activation_predecessor(
                             session, host.id, conn.id, generation
                         )
@@ -980,48 +1072,55 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     home_dir = obj.get("home_dir")
                     if isinstance(home_dir, str) and home_dir:
                         conn.home_dir = home_dir
-                    registration_accepted = False
-                    async with sm() as session:
-                        if await _lock_durable_host_owner(
-                            session, conn
-                        ) and await _is_current_host_owner(conn):
-                            acceptance = await broker.accept_daemon_owner(conn, generation)
-                            registration_accepted = bool(acceptance)
-                            # Resync only while the exact durable owner lock
-                            # prevents another worker from committing a
-                            # successor and invalidating these local routes.
-                            for aid in existing if registration_accepted else ():
+                    valid_existing: list[str] = []
+                    durable_owner = False
+                    async with _bounded_host_ownership_session() as session:
+                        durable_owner = await _lock_durable_host_owner(session, conn)
+                        if durable_owner:
+                            for aid in existing:
+                                if not isinstance(aid, str):
+                                    continue
                                 agent = await session.get(Agent, aid)
-                                if (
-                                    agent is not None
-                                    and agent.host_id == host.id
-                                    and not await broker.attach_agent_to_daemon(
-                                        aid,
-                                        conn,
-                                        expected_host_generation=generation,
-                                    )
-                                ):
-                                    registration_accepted = False
-                                    break
-                            if registration_accepted:
-                                registered = True
-                                if (
-                                    previous_owner is not None
-                                    and previous_owner.daemon_connection_id != conn.id
-                                ):
-                                    await publish_host_owner_revocation(
-                                        conn.host_id,
-                                        HostOwnerRevocation(
-                                            revoked_connection_id=(
-                                                previous_owner.daemon_connection_id
-                                            ),
-                                            replacement_connection_id=conn.id,
-                                        ),
-                                    )
-                                await conn.send_text({"type": "registered", "host_id": host.id})
+                                if agent is not None and agent.host_id == host.id:
+                                    valid_existing.append(aid)
                         await session.rollback()
+
+                    registration_accepted = False
+                    if durable_owner and await _redis_owner_is_current(conn):
+                        acceptance = await broker.accept_daemon_owner(conn, generation)
+                        registration_accepted = bool(acceptance)
+                        for aid in valid_existing if registration_accepted else ():
+                            if not await broker.attach_agent_to_daemon(
+                                aid,
+                                conn,
+                                expected_host_generation=generation,
+                            ):
+                                registration_accepted = False
+                                break
+                        registration_accepted = (
+                            registration_accepted and await _redis_owner_is_current(conn)
+                        )
+                    if registration_accepted and previous_owner is not None:
+                        revocation = HostOwnerRevocation(
+                            revoked_connection_id=previous_owner.daemon_connection_id,
+                            replacement_connection_id=conn.id,
+                        )
+                        registration_accepted = await get_backend().publish_if_ephemeral(
+                            host_presence_key(conn.host_id),
+                            value,
+                            host_signal_channel(conn.host_id),
+                            encode_host_owner_revocation(revocation),
+                        )
+                    if registration_accepted:
+                        # The exact Redis decision is the generation-bearing
+                        # dispatch point; the bounded socket send holds no DB
+                        # or broker lock.
+                        registration_accepted = await _redis_owner_is_current(conn)
+                    if registration_accepted:
+                        await _bounded_send_text(conn, {"type": "registered", "host_id": host.id})
+                        registered = True
                     if not registration_accepted:
-                        async with sm() as session:
+                        async with _bounded_host_ownership_session() as session:
                             await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
                         await _fence_superseded_daemon(conn)
                         break
@@ -1029,104 +1128,135 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "host.fs.list_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            await broker.resolve_dir_list(
-                                request_id,
-                                obj,
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            await session.rollback()
+                        if not await _validate_durable_host_owner(
+                            conn
+                        ) or not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await broker.resolve_dir_list(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype in ("host.fs.read_result", "host.fs.op_result"):
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            await broker.resolve_fs_result(
-                                request_id,
-                                obj,
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            await session.rollback()
+                        if not await _validate_durable_host_owner(
+                            conn
+                        ) or not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await broker.resolve_fs_result(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "host.tools.check_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            await broker.resolve_tool_check(
-                                request_id,
-                                obj,
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            await session.rollback()
+                        if not await _validate_durable_host_owner(
+                            conn
+                        ) or not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await broker.resolve_tool_check(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "host.tools.install_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            await broker.resolve_tool_install(
-                                request_id,
-                                obj,
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            await session.rollback()
+                        if not await _validate_durable_host_owner(
+                            conn
+                        ) or not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await broker.resolve_tool_install(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "host.heartbeat":
-                    if not await _refresh_host_signal_presence(conn):
-                        await _fence_superseded_daemon(conn)
-                        break
                     generation = conn.host_generation
                     if generation is None:
                         await _fence_superseded_daemon(conn)
                         break
-                    async with sm() as session:
-                        if not await _touch_host(session, host.id, conn.id, generation):
-                            await _fence_superseded_daemon(conn)
-                            break
-                    await conn.send_text({"type": "host.heartbeat"})
+                    async with _bounded_host_ownership_session() as session:
+                        touched = await _touch_host(session, host.id, conn.id, generation)
+                    if not touched or not await _refresh_host_signal_presence(conn):
+                        await _fence_superseded_daemon(conn)
+                        break
+                    await _bounded_send_text(conn, {"type": "host.heartbeat"})
 
                 elif ftype == "agent.started":
                     aid = obj.get("agent_id")
                     if aid:
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
+                        generation = conn.host_generation
+                        if generation is None:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        durable_owner = False
+                        started = False
+                        rejected_owner = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            agent = await session.get(Agent, aid) if durable_owner else None
                             if agent is not None and agent.host_id == host.id:
-                                generation = conn.host_generation
-                                if generation is None:
-                                    break
-                                if not await broker.attach_agent_to_daemon(
-                                    aid,
-                                    conn,
-                                    expected_host_generation=generation,
-                                ):
-                                    break
-                                async with broker.accepted_daemon_guard(
-                                    conn, generation
-                                ) as accepted:
-                                    if not accepted or not await _is_current_host_owner(conn):
-                                        break
-                                    agent.status = "running"
+                                result = await session.execute(
+                                    update(Agent)
+                                    .where(
+                                        Agent.id == aid,
+                                        Agent.host_id == host.id,
+                                        _agent_owner_exists(conn),
+                                    )
+                                    .values(status="running")
+                                    .execution_options(synchronize_session=False)
+                                )
+                                started = result.rowcount == 1
+                                rejected_owner = not started
+                                if started:
                                     await session.commit()
-                                    if not await _publish_agent_event_if_owner(
-                                        conn,
-                                        aid,
-                                        {"type": "agent.status", "status": "running"},
-                                    ):
-                                        await _fence_superseded_daemon(conn)
-                                        break
+                                else:
+                                    await session.rollback()
+                            else:
+                                await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if rejected_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if started:
+                            attached = await broker.attach_agent_to_daemon(
+                                aid,
+                                conn,
+                                expected_host_generation=generation,
+                            )
+                            published = attached and await _publish_agent_event_if_owner(
+                                conn,
+                                aid,
+                                {"type": "agent.status", "status": "running"},
+                            )
+                            if not published:
+                                await _fence_superseded_daemon(conn)
+                                break
 
                 elif ftype == "agent.activity":
                     # Content-free output-activity ping (trust Phase 2). The
@@ -1135,22 +1265,39 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     aid = obj.get("agent_id")
                     if aid:
                         now = _utcnow()
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
+                        durable_owner = False
+                        rejected_owner = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            agent = await session.get(Agent, aid) if durable_owner else None
                             if agent is not None and agent.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
-                                    break
-                                async with broker.accepted_daemon_guard(
-                                    conn, generation
-                                ) as accepted:
-                                    if not accepted or not await _is_current_host_owner(conn):
-                                        break
-                                    agent.last_output_at = now
-                                    if not await _touch_host(session, host.id, conn.id, generation):
-                                        break
+                                    await session.rollback()
+                                else:
+                                    result = await session.execute(
+                                        update(Agent)
+                                        .where(
+                                            Agent.id == aid,
+                                            Agent.host_id == host.id,
+                                            _agent_owner_exists(conn),
+                                        )
+                                        .values(last_output_at=now)
+                                        .execution_options(synchronize_session=False)
+                                    )
+                                    if result.rowcount == 1:
+                                        await _touch_host(session, host.id, conn.id, generation)
+                                    else:
+                                        rejected_owner = True
+                                        await session.rollback()
+                            else:
+                                await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if rejected_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "agent.input_activity":
                     # `spawn.pty` input bypasses the server on v2. The daemon
@@ -1159,118 +1306,175 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     aid = obj.get("agent_id")
                     if aid:
                         now = _utcnow()
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
+                        durable_owner = False
+                        rejected_owner = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            agent = await session.get(Agent, aid) if durable_owner else None
                             if agent is not None and agent.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
-                                    break
-                                async with broker.accepted_daemon_guard(
-                                    conn, generation
-                                ) as accepted:
-                                    if not accepted or not await _is_current_host_owner(conn):
-                                        break
-                                    agent.last_input_at = now
-                                    if not await _touch_host(session, host.id, conn.id, generation):
-                                        break
+                                    await session.rollback()
+                                else:
+                                    result = await session.execute(
+                                        update(Agent)
+                                        .where(
+                                            Agent.id == aid,
+                                            Agent.host_id == host.id,
+                                            _agent_owner_exists(conn),
+                                        )
+                                        .values(last_input_at=now)
+                                        .execution_options(synchronize_session=False)
+                                    )
+                                    if result.rowcount == 1:
+                                        await _touch_host(session, host.id, conn.id, generation)
+                                    else:
+                                        rejected_owner = True
+                                        await session.rollback()
+                            else:
+                                await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if rejected_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "agent.exit":
                     aid = obj.get("agent_id")
                     code = obj.get("exit_code")
                     sig = obj.get("signal")
                     if aid:
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
+                        durable_owner = False
+                        exited = False
+                        rejected_owner = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            agent = await session.get(Agent, aid) if durable_owner else None
                             if agent is not None and agent.host_id == host.id:
-                                generation = conn.host_generation
-                                if generation is None:
-                                    break
-                                async with broker.accepted_daemon_guard(
-                                    conn, generation
-                                ) as accepted:
-                                    if not accepted or not await _is_current_host_owner(conn):
-                                        break
-                                    agent.status = "killed" if sig else "exited"
-                                    agent.exit_code = code
-                                    agent.exited_at = _utcnow()
+                                result = await session.execute(
+                                    update(Agent)
+                                    .where(
+                                        Agent.id == aid,
+                                        Agent.host_id == host.id,
+                                        _agent_owner_exists(conn),
+                                    )
+                                    .values(
+                                        status="killed" if sig else "exited",
+                                        exit_code=code,
+                                        exited_at=_utcnow(),
+                                    )
+                                    .execution_options(synchronize_session=False)
+                                )
+                                exited = result.rowcount == 1
+                                rejected_owner = not exited
+                                if exited:
                                     await session.commit()
-                                    if not await _publish_agent_event_if_owner(
-                                        conn,
-                                        aid,
-                                        {
-                                            "type": "agent.exit",
-                                            "exit_code": code,
-                                            "signal": sig,
-                                        },
-                                    ):
-                                        await _fence_superseded_daemon(conn)
-                                        break
-                        await broker.detach_agent(
+                                else:
+                                    await session.rollback()
+                            else:
+                                await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if rejected_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        published = not exited or await _publish_agent_event_if_owner(
+                            conn,
+                            aid,
+                            {
+                                "type": "agent.exit",
+                                "exit_code": code,
+                                "signal": sig,
+                            },
+                        )
+                        detached = await broker.detach_agent(
                             aid,
                             expected_daemon=conn,
                             expected_host_generation=conn.host_generation,
                         )
+                        if exited and (not published or not detached):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "agent.uploaded":
                     aid = obj.get("agent_id")
                     path = obj.get("path")
                     client_id = obj.get("client_id")
                     if aid and isinstance(path, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
-                            if agent is None or agent.host_id != host.id:
-                                log.warning("upload ack for unknown agent=%s", aid)
-                                continue
-                            resolved = await broker.resolve_upload(
-                                aid,
-                                client_id if isinstance(client_id, str) else None,
-                                {"agent_id": aid, "path": path, "client_id": client_id},
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            if resolved is UploadResolution.STALE_OWNER:
-                                break
-                            if resolved is UploadResolution.NO_WAITER:
-                                continue
-                            payload: dict[str, object] = {
-                                "type": "upload.saved",
-                                "path": path,
-                            }
-                            if isinstance(client_id, str):
-                                payload["client_id"] = client_id
-                            if not await _publish_agent_event_if_owner(conn, aid, payload):
-                                await _fence_superseded_daemon(conn)
-                                break
+                        durable_owner = False
+                        agent_authorized = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            if durable_owner:
+                                agent = await session.get(Agent, aid)
+                                agent_authorized = agent is not None and agent.host_id == host.id
                             await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not agent_authorized:
+                            log.warning("upload ack for unknown agent=%s", aid)
+                            continue
+                        if not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        resolved = await broker.resolve_upload(
+                            aid,
+                            client_id if isinstance(client_id, str) else None,
+                            {"agent_id": aid, "path": path, "client_id": client_id},
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        )
+                        if resolved is UploadResolution.STALE_OWNER:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if resolved is UploadResolution.NO_WAITER:
+                            continue
+                        payload: dict[str, object] = {
+                            "type": "upload.saved",
+                            "path": path,
+                        }
+                        if isinstance(client_id, str):
+                            payload["client_id"] = client_id
+                        if not await _publish_agent_event_if_owner(conn, aid, payload):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "agent.snapshot":
                     aid = obj.get("agent_id")
                     bytes_b64 = obj.get("bytes_b64")
                     if aid and isinstance(bytes_b64, str):
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            agent = await session.get(Agent, aid)
-                            if agent is None or agent.host_id != host.id:
-                                log.warning("snapshot for unknown agent=%s", aid)
-                                continue
-                            await broker.resolve_snapshot(
-                                aid,
-                                {
-                                    "bytes_b64": bytes_b64,
-                                    "dc_offset": obj.get("dc_offset"),
-                                    "rtc_session_id": obj.get("rtc_session_id"),
-                                },
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
+                        durable_owner = False
+                        agent_authorized = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            if durable_owner:
+                                agent = await session.get(Agent, aid)
+                                agent_authorized = agent is not None and agent.host_id == host.id
                             await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not agent_authorized:
+                            log.warning("snapshot for unknown agent=%s", aid)
+                            continue
+                        if not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if not await broker.resolve_snapshot(
+                            aid,
+                            {
+                                "bytes_b64": bytes_b64,
+                                "dc_offset": obj.get("dc_offset"),
+                                "rtc_session_id": obj.get("rtc_session_id"),
+                            },
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "rtc.answer":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
@@ -1280,11 +1484,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc answer did not match its registered session")
                             continue
-                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                            conn
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
                         payload: dict[str, object] = {
                             "type": "rtc.answer",
                             "session_id": session_id,
@@ -1301,20 +1500,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     "protocol_version": binding.protocol_version,
                                 }
                             )
-                        try:
-                            if (
-                                binding.scope_type == "host"
-                                and not await _owns_host_signal_presence(conn)
-                            ):
-                                await _fence_superseded_daemon(conn)
-                                break
-                            async with sm() as owner_session:
-                                if not await _lock_durable_host_owner(owner_session, conn):
-                                    break
-                                await binding.browser.send_text(payload)
-                                await owner_session.rollback()
-                        except Exception as e:
-                            log.warning("rtc answer route failed: %s", e)
+                        if not await _route_rtc_payload_if_owner(conn, binding, payload):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "rtc.candidate":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
@@ -1324,11 +1512,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc candidate did not match its registered session")
                             continue
-                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                            conn
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
                         payload = {
                             "type": "rtc.candidate",
                             "session_id": session_id,
@@ -1345,20 +1528,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     "protocol_version": binding.protocol_version,
                                 }
                             )
-                        try:
-                            if (
-                                binding.scope_type == "host"
-                                and not await _owns_host_signal_presence(conn)
-                            ):
-                                await _fence_superseded_daemon(conn)
-                                break
-                            async with sm() as owner_session:
-                                if not await _lock_durable_host_owner(owner_session, conn):
-                                    break
-                                await binding.browser.send_text(payload)
-                                await owner_session.rollback()
-                        except Exception as e:
-                            log.warning("rtc candidate route failed: %s", e)
+                        if not await _route_rtc_payload_if_owner(conn, binding, payload):
+                            await _fence_superseded_daemon(conn)
+                            break
 
                 elif ftype == "rtc.status":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
@@ -1368,24 +1540,15 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc status did not match its registered session")
                             continue
-                        if binding.scope_type == "host" and not await _owns_host_signal_presence(
-                            conn
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if (
                             binding.scope_type == "host"
                             and status_value not in HOST_RTC_STATUS_ALLOWLIST
                         ):
                             log.warning("daemon sent non-allowlisted host rtc status")
                             continue
-                        if binding.scope_type == "host" and status_value == "connected":
-                            connected_binding = await broker.mark_rtc_session_connected(
-                                session_id, binding
-                            )
-                            if connected_binding is None:
-                                continue
-                            binding = connected_binding
+                        mark_connected = (
+                            binding.scope_type == "host" and status_value == "connected"
+                        )
                         payload = {
                             "type": "rtc.status",
                             "session_id": session_id,
@@ -1405,46 +1568,39 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     "protocol_version": binding.protocol_version,
                                 }
                             )
-                        try:
-                            if (
-                                binding.scope_type == "host"
-                                and not await _owns_host_signal_presence(conn)
-                            ):
-                                await _fence_superseded_daemon(conn)
-                                break
-                            async with sm() as owner_session:
-                                if not await _lock_durable_host_owner(owner_session, conn):
-                                    break
-                                await binding.browser.send_text(payload)
-                                await owner_session.rollback()
-                        except Exception as e:
-                            log.warning("rtc status route failed: %s", e)
+                        if not await _route_rtc_payload_if_owner(conn, binding, payload):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if (
+                            mark_connected
+                            and await broker.mark_rtc_session_connected(session_id, binding) is None
+                        ):
+                            continue
 
                 elif ftype == "error":
                     aid = obj.get("agent_id")
                     if obj.get("code") == "upload_failed" and aid:
-                        async with sm() as session:
-                            if not await _lock_durable_host_owner(session, conn):
-                                break
-                            rejected = await broker.reject_uploads_for_agent(
-                                aid,
-                                obj.get("message") or "Upload failed.",
-                                daemon=conn,
-                                expected_host_generation=conn.host_generation,
-                            )
-                            if not rejected:
-                                break
-                            if not await _publish_agent_event_if_owner(
-                                conn,
-                                aid,
-                                {
-                                    "type": "upload.error",
-                                    "message": obj.get("message") or "Image upload failed.",
-                                },
-                            ):
-                                await _fence_superseded_daemon(conn)
-                                break
-                            await session.rollback()
+                        if not await _validate_durable_host_owner(
+                            conn
+                        ) or not await _redis_owner_is_current(conn):
+                            await _fence_superseded_daemon(conn)
+                            break
+                        rejected = await broker.reject_uploads_for_agent(
+                            aid,
+                            obj.get("message") or "Upload failed.",
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        )
+                        if not rejected or not await _publish_agent_event_if_owner(
+                            conn,
+                            aid,
+                            {
+                                "type": "upload.error",
+                                "message": obj.get("message") or "Image upload failed.",
+                            },
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
                     log.warning(
                         "daemon error host=%s agent=%s code=%s msg=%s",
                         host.id,
@@ -1458,6 +1614,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
         pass
     except Exception as e:  # noqa: BLE001
         log.exception("daemon ws crashed: %s", e)
+        await _fence_superseded_daemon(conn)
     finally:
         await _revoke_host_rtc_sessions(conn)
         pending_expiry_tasks = list(expiry_tasks)
@@ -1481,10 +1638,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             log.warning("failed to release distributed host signaling ownership")
         await broker.unregister_daemon(conn)
         if conn.host_generation is not None:
-            async with sm() as session:
+            async with _bounded_host_ownership_session() as session:
                 await _clear_host_generation_reservation(
                     session, host.id, conn.id, conn.host_generation
                 )
-            async with sm() as session:
+            async with _bounded_host_ownership_session() as session:
                 await _mark_host_offline_if_owner(session, host.id, conn.id, conn.host_generation)
         log.info("daemon disconnected host=%s", host.id)

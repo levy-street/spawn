@@ -14,8 +14,12 @@ from spawn_server.db import get_sessionmaker
 from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
 from spawn_server.models import Agent, Host, User
 from spawn_server.redis import get_backend
-from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
-from spawn_server.ws.daemon import _allocate_host_generation, daemon_ws
+from spawn_server.ws.broker import BrowserConn, DaemonConn, HostBrowserConn, get_broker
+from spawn_server.ws.daemon import (
+    _allocate_host_generation,
+    _fence_superseded_daemon,
+    daemon_ws,
+)
 from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 from spawn_server.ws.host_signal import (
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
@@ -925,6 +929,154 @@ async def test_dequeued_stale_exit_cannot_mutate_or_detach_replacement(client, m
         assert agent.status == "running"
         assert agent.exit_code is None
     assert broker.get_daemon_for_agent(agent_id) is new_conn
+
+    new.queue_disconnect()
+    await asyncio.wait_for(new_task, timeout=1)
+
+
+async def test_started_publish_failure_fences_without_broker_deadlock(client, monkeypatch):
+    user_id, _ = await _signup(client, "ws-daemon-publish-fence@example.com")
+    host_id = await _create_host(user_id, name="publish-failure")
+    other_host_id = await _create_host(user_id, name="broker-stays-live")
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    other_token = auth.issue_daemon_token(other_host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
+
+    other = FakeDaemonWebSocket(authorization=f"Bearer {other_token}")
+    other_task = asyncio.create_task(daemon_ws(other, token=None))  # type: ignore[arg-type]
+    other.queue_text({"type": "register"})
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(other))
+    )
+    other_conn = get_broker().get_daemon_for_host(other_host_id)
+    assert other_conn is not None and other_conn.host_generation is not None
+
+    backend = get_backend()
+    original_publish = backend.publish_if_ephemeral
+
+    async def fail_agent_event(key, expected, channel, payload):
+        if channel == f"spawn:agent:{agent_id}:events":
+            return False
+        return await original_publish(key, expected, channel, payload)
+
+    monkeypatch.setattr(backend, "publish_if_ephemeral", fail_agent_event)
+    ws.queue_text({"type": "agent.started", "agent_id": agent_id})
+    await asyncio.wait_for(task, timeout=1)
+    assert ws.closed == (4000, "superseded")
+
+    assert await asyncio.wait_for(
+        get_broker().is_accepted_daemon_owner(
+            other_conn, other_conn.host_generation
+        ),
+        timeout=0.2,
+    )
+    other.queue_text({"type": "host.heartbeat"})
+    await _wait_until(
+        lambda: any(item.get("type") == "host.heartbeat" for item in _sent_json(other))
+    )
+    other.queue_disconnect()
+    await asyncio.wait_for(other_task, timeout=1)
+
+
+async def test_fence_closes_before_stalled_rtc_revocation_and_keeps_broker_usable(app):
+    class StalledBrowserWebSocket(FakeDaemonWebSocket):
+        async def send_text(self, value: str) -> None:
+            await asyncio.Event().wait()
+
+    broker = get_broker()
+    stale_ws = FakeDaemonWebSocket()
+    stale = DaemonConn(
+        host_id="stale-rtc-host",
+        user_id="owner",
+        websocket=stale_ws,  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    assert await broker.accept_daemon_owner(stale, 1)
+    browser = HostBrowserConn(
+        "owner",
+        stale.host_id,
+        StalledBrowserWebSocket(),  # type: ignore[arg-type]
+    )
+    assert await broker.register_rtc_session(
+        "stalled-revocation",
+        browser,
+        daemon=stale,
+        scope_type="host",
+        scope_id=stale.host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        ttl_seconds=60,
+    )
+
+    fence = asyncio.create_task(_fence_superseded_daemon(stale))
+    await _wait_until(lambda: stale_ws.closed == (4000, "superseded"), timeout=0.2)
+
+    other = DaemonConn(
+        host_id="healthy-host",
+        user_id="owner",
+        websocket=FakeDaemonWebSocket(),  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    assert await asyncio.wait_for(broker.accept_daemon_owner(other, 1), timeout=0.1)
+    assert await asyncio.wait_for(broker.is_accepted_daemon_owner(other, 1), timeout=0.1)
+
+    fence.cancel()
+    await asyncio.gather(fence, return_exceptions=True)
+    await broker.unregister_rtc_session("stalled-revocation", browser)
+    await broker.unregister_daemon(stale)
+    await broker.unregister_daemon(other)
+
+
+async def test_stalled_post_commit_publish_does_not_block_host_takeover(client, monkeypatch):
+    import spawn_server.ws.daemon as daemon_mod
+
+    user_id, _ = await _signup(client, "ws-daemon-stalled-publish@example.com")
+    host_id = await _create_host(user_id, name="stalled-publish")
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    old = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    old_task = asyncio.create_task(daemon_ws(old, token=None))  # type: ignore[arg-type]
+    old.queue_text({"type": "register"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(old)))
+
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+
+    async def stall_publish(conn, aid, payload):
+        assert aid == agent_id
+        publish_started.set()
+        await release_publish.wait()
+        return False
+
+    monkeypatch.setattr(daemon_mod, "_publish_agent_event_if_owner", stall_publish)
+    old.queue_text({"type": "agent.started", "agent_id": agent_id})
+    await asyncio.wait_for(publish_started.wait(), timeout=1)
+
+    # The lifecycle mutation committed before the external publish began. A
+    # replacement must still acquire the Host row and register immediately.
+    new = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    new_task = asyncio.create_task(daemon_ws(new, token=None))  # type: ignore[arg-type]
+    new.queue_text({"type": "register", "existing_agents": [agent_id]})
+    await asyncio.wait_for(
+        _wait_until(
+            lambda: any(item.get("type") == "registered" for item in _sent_json(new)),
+            timeout=1,
+        ),
+        timeout=1.1,
+    )
+    new_conn = get_broker().get_daemon_for_host(host_id)
+    assert new_conn is not None and new_conn.host_generation == 2
+
+    release_publish.set()
+    await asyncio.wait_for(old_task, timeout=1)
+    assert old.closed == (4000, "superseded")
+    assert get_broker().get_daemon_for_agent(agent_id) is new_conn
 
     new.queue_disconnect()
     await asyncio.wait_for(new_task, timeout=1)
