@@ -74,6 +74,21 @@ allowed_server_sentinel() {
   esac
 }
 
+allowed_rtc_test_only_bytes() {
+  local match="$1"
+  [[ "$match" == daemon/src/rtc.rs:*bytes_b64* ]] || return 1
+  local remainder="${match#daemon/src/rtc.rs:}"
+  local match_line="${remainder%%:*}"
+  [[ "$match_line" =~ ^[0-9]+$ ]] || return 1
+  local tests_line status
+  set +e
+  tests_line="$(rg -n --color never '^mod tests \{$' daemon/src/rtc.rs 2>/dev/null)"
+  status=$?
+  set -e
+  [[ $status == 0 && "$tests_line" =~ ^([0-9]+): ]] || return 1
+  ((match_line > BASH_REMATCH[1]))
+}
+
 run_guard() {
   local inventory=()
   mapfile -d '' inventory < <(inventory_files)
@@ -117,8 +132,8 @@ run_guard() {
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
     case "$match" in
-      daemon/src/host_control.rs:*bytes_b64* | daemon/src/rtc.rs:*bytes_b64*) ;;
-      *) rejected+="$match"$'\n' ;;
+      daemon/src/host_control.rs:*bytes_b64*) ;;
+      *) allowed_rtc_test_only_bytes "$match" || rejected+="$match"$'\n' ;;
     esac
   done <<<"$matches"
   if [[ -n "$rejected" ]]; then
@@ -184,6 +199,13 @@ self_test() {
     '    reason="agent upload errors belong on spawn.ctl"' \
     >"$fixture/server/spawn_server/ws/daemon.py"
   printf '%s\n' 'fn main() {}' >"$fixture/daemon/src/main.rs"
+  printf '%s\n' \
+    'fn production_rtc() {}' \
+    '#[cfg(test)]' \
+    'mod tests {' \
+    '    const DIRECT_ENDPOINT_FIELD: &str = "bytes_b64";' \
+    '}' \
+    >"$fixture/daemon/src/rtc.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
 
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
@@ -197,6 +219,7 @@ self_test() {
     'server/spawn_server/ack_moved.py|kind = "agent.uploaded"'
     'server/spawn_server/error_moved.py|kind = "upload.error"'
     'daemon/src/moved.rs|const LEGACY: &str = "agent.uploaded";'
+    'daemon/src/rtc_helper.rs|fn legacy_agent_upload(bytes_b64: &str) { send_to_server(bytes_b64); }'
     'web/src/lib/moved.ts|export const route = "/agents/${id}/upload";'
   )
   local case path body
@@ -210,6 +233,19 @@ self_test() {
     fi
     rm "$fixture/$path"
   done
+
+  local rtc_original
+  rtc_original="$(<"$fixture/daemon/src/rtc.rs")"
+  printf '%s\n' \
+    'fn legacy_agent_upload(bytes_b64: &str) { send_to_server(bytes_b64); }' \
+    "$rtc_original" >"$fixture/daemon/src/rtc.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: privileged rtc.rs relay passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$rtc_original" >"$fixture/daemon/src/rtc.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   sed -i '/agent uploads belong on spawn.ctl/d' "$fixture/server/spawn_server/ws/browser.py"
   if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then

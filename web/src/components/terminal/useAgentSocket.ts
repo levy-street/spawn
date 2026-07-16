@@ -65,6 +65,9 @@ export interface DirectAgentUploadOptions {
   destination?: "attachments" | "cwd";
   signal?: AbortSignal;
   uploadId?: string;
+  /** Re-check the caller's durable reservation before each upload_start
+   *  attempt. Throwing prevents the endpoint request. */
+  beforeUploadStart?: () => void;
   /** Called synchronously before the final frame is sent. Throwing prevents
    *  that frame from reaching the endpoint. */
   beforeFinalDispatch?: () => void;
@@ -583,6 +586,7 @@ export function useAgentSocket({
                 ? uploadSignal.reason
                 : new DOMException("Upload cancelled.", "AbortError");
             }
+            options.beforeUploadStart?.();
             ctlDc.send(startText);
             try {
               message = await waitUploadMessage(uploadId, 5000, uploadSignal);

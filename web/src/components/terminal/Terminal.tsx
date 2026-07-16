@@ -98,7 +98,7 @@ type UploadReconciliation = {
   fileName: string;
   message: string;
   recordedAt: number;
-  phase: "reserved" | "outcome_unknown";
+  phase: "reserved" | "blocked" | "outcome_unknown";
 };
 
 type UploadReconciliationState = {
@@ -911,10 +911,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [agentId],
   );
 
+  const assertUploadReconciliation = useCallback(
+    (uploadId: string) => assertUploadReconciliationActive(agentId, uploadId),
+    [agentId],
+  );
+
   const dismissUploadReconciliation = useCallback(
-    (uploadId: string) => {
+    (uploadId: string, recoverFault = false) => {
       try {
-        dismissUploadReconciliationSlot(agentId, uploadId);
+        dismissUploadReconciliationSlot(agentId, uploadId, recoverFault);
       } catch {
         // The store emitted a fault event and retained the record. A later
         // explicit dismissal after storage recovers is the only safe unlock.
@@ -922,14 +927,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [agentId],
   );
-
-  const retryUploadReconciliation = useCallback(() => {
-    try {
-      retryUploadReconciliationStorage(agentId);
-    } catch {
-      // The fault event keeps the lock and warning visible.
-    }
-  }, [agentId]);
 
   const updatePendingAttachments = useCallback(
     (updater: (attachments: PendingAttachment[]) => PendingAttachment[]) => {
@@ -2524,6 +2521,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             mimeType: mimeTypeForFile(file),
             destination: "attachments",
             signal: controller.signal,
+            beforeUploadStart: () => assertUploadReconciliation(clientId),
             beforeFinalDispatch: () =>
               promoteUploadReconciliation(
                 clientId,
@@ -2576,6 +2574,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [
       handleUploadSaved,
+      assertUploadReconciliation,
       dismissUploadReconciliation,
       promoteUploadReconciliation,
       reserveUploadReconciliation,
@@ -2605,6 +2604,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             destination: "cwd",
             name: file.name || "file",
             mimeType: mimeTypeForUpload(file),
+            beforeUploadStart: () => assertUploadReconciliation(uploadId),
             beforeFinalDispatch: () =>
               promoteUploadReconciliation(
                 uploadId,
@@ -2640,6 +2640,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [
       dismissUploadReconciliation,
+      assertUploadReconciliation,
       promoteUploadReconciliation,
       reserveUploadReconciliation,
       showUploadStatus,
@@ -2956,6 +2957,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             mimeType: mimeTypeForUpload(file),
             destination: options?.destination ?? "attachments",
             uploadId,
+            beforeUploadStart: () => assertUploadReconciliation(uploadId),
             beforeFinalDispatch: () =>
               promoteUploadReconciliation(
                 uploadId,
@@ -2992,6 +2994,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }),
     [
       appendAttachmentsForSubmit,
+      assertUploadReconciliation,
       dismissUploadReconciliation,
       hideScrollbackOverlay,
       pasteDataTransfer,
@@ -3113,15 +3116,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
                 : "."}
             </div>
           )}
-          {uploadReconciliationFault && uploadReconciliations.length === 0 && (
-            <button
-              type="button"
-              className="self-start rounded border border-border bg-card px-2 py-1 hover:bg-accent"
-              onClick={retryUploadReconciliation}
-            >
-              Retry safety storage
-            </button>
-          )}
           {uploadReconciliations.map((record) => (
             <div key={record.uploadId} className="flex flex-wrap items-center gap-x-2 gap-y-1">
               <span className="min-w-0 flex-1">
@@ -3149,7 +3143,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
                 className="rounded border border-border bg-card px-2 py-1 hover:bg-accent"
                 aria-label={`Dismiss ${record.fileName} after checking`}
                 title={record.message}
-                onClick={() => dismissUploadReconciliation(record.uploadId)}
+                onClick={() => dismissUploadReconciliation(record.uploadId, true)}
               >
                 I checked — dismiss
               </button>
@@ -3268,14 +3262,40 @@ function uploadReconciliationStorageFault(): string {
   return "Upload reconciliation storage is unavailable.";
 }
 
+function blockReservedUploadReconciliations(
+  records: UploadReconciliation[],
+): UploadReconciliation[] {
+  const recordedAt = Date.now();
+  return records.map((record) =>
+    record.phase === "reserved"
+      ? {
+          ...record,
+          message: "Upload durability failed before final dispatch.",
+          recordedAt,
+          phase: "blocked" as const,
+        }
+      : record,
+  );
+}
+
 function dispatchUploadReconciliationEvent(agentId: string): void {
-  window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { agentId } }));
+  try {
+    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { agentId } }));
+  } catch {
+    // The in-memory latch is authoritative for the current call even if a
+    // hostile/broken event target prevents another mounted instance syncing.
+  }
 }
 
 function readUploadReconciliationHistoryFallback(
   agentId: string,
 ): { records: UploadReconciliation[]; fault: string } | null {
-  const state: unknown = window.history.state;
+  let state: unknown;
+  try {
+    state = window.history.state;
+  } catch {
+    return null;
+  }
   if (typeof state !== "object" || state === null) return null;
   const fallbacks = (state as Record<string, unknown>).__spawnUploadReconciliationFallback;
   if (typeof fallbacks !== "object" || fallbacks === null) return null;
@@ -3291,22 +3311,27 @@ function writeUploadReconciliationHistoryFallback(
   agentId: string,
   fallback: UploadReconciliationState | null,
 ): void {
-  const current =
-    typeof window.history.state === "object" && window.history.state !== null
-      ? window.history.state
-      : {};
-  const existing =
-    typeof current.__spawnUploadReconciliationFallback === "object" &&
-    current.__spawnUploadReconciliationFallback !== null
-      ? current.__spawnUploadReconciliationFallback
-      : {};
-  const fallbacks = { ...existing };
-  if (fallback) fallbacks[agentId] = fallback;
-  else delete fallbacks[agentId];
-  window.history.replaceState(
-    { ...current, __spawnUploadReconciliationFallback: fallbacks },
-    document.title,
-  );
+  try {
+    const current =
+      typeof window.history.state === "object" && window.history.state !== null
+        ? window.history.state
+        : {};
+    const existing =
+      typeof current.__spawnUploadReconciliationFallback === "object" &&
+      current.__spawnUploadReconciliationFallback !== null
+        ? current.__spawnUploadReconciliationFallback
+        : {};
+    const fallbacks = { ...existing };
+    if (fallback) fallbacks[agentId] = fallback;
+    else delete fallbacks[agentId];
+    window.history.replaceState(
+      { ...current, __spawnUploadReconciliationFallback: fallbacks },
+      document.title,
+    );
+  } catch {
+    // sessionStorage or the in-memory latch still owns safety. This fallback
+    // must never replace the typed upload-blocking error with a DOM exception.
+  }
 }
 
 function loadUploadReconciliationState(agentId: string): UploadReconciliationState {
@@ -3334,6 +3359,7 @@ function loadUploadReconciliationState(agentId: string): UploadReconciliationSta
           typeof record.recordedAt !== "number" ||
           (record.phase !== undefined &&
             record.phase !== "reserved" &&
+            record.phase !== "blocked" &&
             record.phase !== "outcome_unknown")
         ) {
           throw new Error("invalid reconciliation record");
@@ -3357,8 +3383,12 @@ function loadUploadReconciliationState(agentId: string): UploadReconciliationSta
     runtime.memory.set(agentId, records);
     return { records, fault: runtime.faults.get(agentId) ?? null };
   } catch {
-    runtime.faults.set(agentId, uploadReconciliationStorageFault());
-    return { records: memory, fault: runtime.faults.get(agentId) ?? null };
+    const fault = uploadReconciliationStorageFault();
+    const blocked = blockReservedUploadReconciliations(memory);
+    runtime.memory.set(agentId, blocked);
+    runtime.faults.set(agentId, fault);
+    writeUploadReconciliationHistoryFallback(agentId, { records: blocked, fault });
+    return { records: blocked, fault };
   }
 }
 
@@ -3366,6 +3396,7 @@ function persistUploadReconciliations(
   agentId: string,
   records: UploadReconciliation[],
   recordsOnFailure: UploadReconciliation[],
+  clearFault = false,
 ): void {
   if (typeof window === "undefined") {
     throw new UploadReconciliationBlockedError(uploadReconciliationStorageFault());
@@ -3376,23 +3407,36 @@ function persistUploadReconciliations(
     );
   }
   const runtime = uploadReconciliationRuntime();
+  const existingFault = runtime.faults.get(agentId) ?? null;
   try {
     const key = uploadReconciliationStorageKey(agentId);
     if (records.length === 0) window.sessionStorage.removeItem(key);
     else window.sessionStorage.setItem(key, JSON.stringify(records));
     runtime.memory.set(agentId, records);
-    runtime.faults.delete(agentId);
-    writeUploadReconciliationHistoryFallback(agentId, null);
+    if (clearFault) {
+      runtime.faults.delete(agentId);
+      writeUploadReconciliationHistoryFallback(agentId, null);
+    } else if (existingFault) {
+      runtime.faults.set(agentId, existingFault);
+      writeUploadReconciliationHistoryFallback(agentId, {
+        records,
+        fault: existingFault,
+      });
+    } else {
+      writeUploadReconciliationHistoryFallback(agentId, null);
+    }
     dispatchUploadReconciliationEvent(agentId);
   } catch {
-    runtime.memory.set(agentId, recordsOnFailure);
-    runtime.faults.set(agentId, uploadReconciliationStorageFault());
+    const blocked = blockReservedUploadReconciliations(recordsOnFailure);
+    runtime.memory.set(agentId, blocked);
+    const fault = uploadReconciliationStorageFault();
+    runtime.faults.set(agentId, fault);
     writeUploadReconciliationHistoryFallback(agentId, {
-      records: recordsOnFailure,
-      fault: uploadReconciliationStorageFault(),
+      records: blocked,
+      fault,
     });
     dispatchUploadReconciliationEvent(agentId);
-    throw new UploadReconciliationBlockedError(uploadReconciliationStorageFault());
+    throw new UploadReconciliationBlockedError(fault);
   }
 }
 
@@ -3402,7 +3446,30 @@ function reserveUploadReconciliationSlot(
   fileName: string,
 ): void {
   const state = loadUploadReconciliationState(agentId);
-  if (state.fault) throw new UploadReconciliationBlockedError(state.fault);
+  if (state.fault) {
+    const blocked = blockReservedUploadReconciliations(state.records);
+    const existing = blocked.find((record) => record.uploadId === uploadId);
+    const records = existing
+      ? blocked
+      : blocked.length < MAX_UPLOAD_RECONCILIATIONS
+        ? [
+            ...blocked,
+            {
+              uploadId,
+              fileName,
+              message: "Upload durability is unavailable; no endpoint effect was admitted.",
+              recordedAt: Date.now(),
+              phase: "blocked" as const,
+            },
+          ]
+        : state.records;
+    const runtime = uploadReconciliationRuntime();
+    runtime.memory.set(agentId, records);
+    runtime.faults.set(agentId, state.fault);
+    writeUploadReconciliationHistoryFallback(agentId, { records, fault: state.fault });
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
   if (state.records.some((record) => record.uploadId === uploadId)) {
     throw new UploadReconciliationBlockedError("This upload already has a reconciliation record.");
   }
@@ -3435,9 +3502,18 @@ function promoteUploadReconciliationSlot(
 ): void {
   const state = loadUploadReconciliationState(agentId);
   const existing = state.records.find((record) => record.uploadId === uploadId);
+  if (state.fault) {
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
   if (!existing) {
     throw new UploadReconciliationBlockedError(
       "The upload safety reservation was lost; the final frame was not dispatched.",
+    );
+  }
+  if (existing.phase === "blocked") {
+    throw new UploadReconciliationBlockedError(
+      "This upload was blocked by a reconciliation storage fault; its final frame was not dispatched.",
     );
   }
   const next = state.records.map((record) =>
@@ -3456,15 +3532,28 @@ function promoteUploadReconciliationSlot(
   persistUploadReconciliations(agentId, next, state.records);
 }
 
-function dismissUploadReconciliationSlot(agentId: string, uploadId: string): void {
+function assertUploadReconciliationActive(agentId: string, uploadId: string): void {
   const state = loadUploadReconciliationState(agentId);
-  const next = state.records.filter((record) => record.uploadId !== uploadId);
-  persistUploadReconciliations(agentId, next, state.records);
+  const record = state.records.find((candidate) => candidate.uploadId === uploadId);
+  if (state.fault) {
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
+  if (!record || record.phase === "blocked") {
+    throw new UploadReconciliationBlockedError(
+      "This upload no longer has an active durable safety reservation.",
+    );
+  }
 }
 
-function retryUploadReconciliationStorage(agentId: string): void {
+function dismissUploadReconciliationSlot(
+  agentId: string,
+  uploadId: string,
+  recoverFault: boolean,
+): void {
   const state = loadUploadReconciliationState(agentId);
-  persistUploadReconciliations(agentId, state.records, state.records);
+  const next = state.records.filter((record) => record.uploadId !== uploadId);
+  persistUploadReconciliations(agentId, next, state.records, recoverFault);
 }
 
 function mergeUploadReconciliations(

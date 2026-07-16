@@ -132,6 +132,48 @@ async function restoreReconciliationStorage(page: Page) {
   });
 }
 
+async function failReconciliationHistoryFallback(page: Page) {
+  await page.addInitScript(() => {
+    const original = History.prototype.replaceState;
+    History.prototype.replaceState = function (data: unknown, unused: string, url?: string | URL) {
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        "__spawnUploadReconciliationFallback" in data
+      ) {
+        throw new DOMException("test history failure", "DataCloneError");
+      }
+      return original.call(this, data, unused, url);
+    };
+    (
+      window as unknown as { __spawnRestoreReconciliationHistory: () => void }
+    ).__spawnRestoreReconciliationHistory = () => {
+      History.prototype.replaceState = original;
+    };
+  });
+}
+
+async function stallFirstUploadHash(page: Page) {
+  await page.addInitScript(() => {
+    const original = Blob.prototype.arrayBuffer;
+    let first = true;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Blob.prototype.arrayBuffer = async function () {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return original.call(this);
+    };
+    (
+      window as unknown as { __spawnReleaseFirstUploadHash: () => void }
+    ).__spawnReleaseFirstUploadHash = release;
+  });
+}
+
 function liveTerminal(page: Page) {
   return page.getByTestId("terminal-live-host").locator(".xterm");
 }
@@ -447,6 +489,7 @@ test("reservation storage failure survives SPA remount and locks endpoint effect
 
   await restoreReconciliationStorage(page);
   await page.getByRole("button", { name: "Dismiss blocked-before.txt after checking" }).click();
+  await page.getByRole("button", { name: "Dismiss also-blocked.txt after checking" }).click();
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
   await page.locator('input[type="file"]').setInputFiles({
     name: "after-recovery.txt",
@@ -492,6 +535,131 @@ test("pre-final storage failure cancels before publication and keeps the upload 
     1,
   );
   expect(uploads).toHaveLength(0);
+});
+
+test("a concurrent storage fault permanently blocks every older stalled reservation", async ({
+  page,
+}) => {
+  await stallFirstUploadHash(page);
+  await failReconciliationStorageAfter(page, 2);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  const input = page.locator('input[type="file"]');
+
+  await input.setInputFiles({
+    name: "stalled-a.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("stalled A"),
+  });
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("stalled-a.txt");
+  await input.setInputFiles({
+    name: "faulting-b.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("faulting B"),
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("faulting-b.txt");
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  expect(uploads).toHaveLength(0);
+
+  await restoreReconciliationStorage(page);
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+
+  await input.setInputFiles({
+    name: "locked-c.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("locked C"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  await page.getByRole("button", { name: "Dismiss faulting-b.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toHaveCount(0);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnReleaseFirstUploadHash: () => void }
+    ).__spawnReleaseFirstUploadHash();
+  });
+  await page.waitForTimeout(150);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await input.setInputFiles({
+    name: "safe-d.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("safe D"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    2,
+  );
+});
+
+test("dual storage and history failure stays typed and updates overlapping consumers", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 0);
+  await failReconciliationHistoryFallback(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.evaluate((agentId) => {
+    const probe = document.createElement("div");
+    probe.dataset.testid = "upload-reconciliation-overlap-probe";
+    document.body.append(probe);
+    const sync = (event: Event) => {
+      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      const runtime = (
+        globalThis as typeof globalThis & {
+          __spawnUploadReconciliationRuntime?: {
+            memory: Map<string, Array<{ fileName: string }>>;
+            faults: Map<string, string>;
+          };
+        }
+      ).__spawnUploadReconciliationRuntime;
+      probe.textContent = `${runtime?.faults.get(agentId) ?? ""}|${
+        runtime?.memory
+          .get(agentId)
+          ?.map((record) => record.fileName)
+          .join(",") ?? ""
+      }`;
+    };
+    window.addEventListener("spawn:upload-reconciliation", sync);
+  }, AGENT_ID);
+
+  await page
+    .locator('input[type="file"]')
+    .first()
+    .setInputFiles({
+      name: "dual-failure.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("never dispatched"),
+    });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("dual-failure.txt");
+  await expect(page.getByTestId("upload-reconciliation-overlap-probe")).toContainText(
+    "Upload reconciliation storage is unavailable.|dual-failure.txt",
+  );
+  await expect(
+    page.getByText("Upload reconciliation storage is unavailable.").first(),
+  ).toBeVisible();
+  expect(await page.getByText(/DataCloneError|test history failure/).count()).toBe(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await restoreReconciliationStorage(page);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRestoreReconciliationHistory: () => void }
+    ).__spawnRestoreReconciliationHistory();
+  });
+  await page.getByRole("button", { name: "Dismiss dual-failure.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation-overlap-probe")).toHaveText("|");
 });
 
 test("post-final storage failure preserves one ambiguity and blocks retry across remount", async ({

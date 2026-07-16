@@ -250,7 +250,12 @@ fault refuses the upload with zero endpoint effect. Immediately before the
 final frame it durably promotes that reservation to `outcome_unknown`; a failed
 promotion cancels before publication. Same-tab memory and history-state
 fallbacks preserve a failed-write identity, warning, and global upload lock
-across component/navigation remounts. A successful acknowledged completion or
+across component/navigation remounts. The fault poisons every overlapping
+reservation; restored storage or another successful write cannot clear it or
+let a stalled upload dispatch. Even simultaneous `sessionStorage` and history
+fallback failures retain the in-memory lock, notify mounted consumers
+best-effort, and surface only the typed blocked result. A successful
+acknowledged completion or
 explicit checked dismissal frees a slot only after the removal persists. The
 record is independent of the transient three-second status and attachment
 lifetime, and no warning offers retry. Control-channel teardown publishes
@@ -287,7 +292,9 @@ reconciliation record remains until explicit post-check dismissal. Browser
 storage-fault coverage proves reservation failure has zero endpoint effect,
 pre-final promotion failure cancels without publication, post-final failure
 retains exactly one ambiguity without retry, eight unresolved records refuse a
-ninth before `upload_start`, and recovered-storage dismissal frees capacity.
+ninth before `upload_start`, a concurrent fault permanently blocks older
+stalled reservations, dual storage/history failure remains typed and visible to
+overlapping consumers, and checked dismissal after recovery frees capacity.
 Paired real WebRTC tests cover
 verified multi-chunk publication, a stalled-cleanup control close within one
 deadline with replacement isolation and eventual zero residue, and a lost
@@ -295,14 +302,22 @@ final acknowledgement that reconciles the same stable ID on a replacement
 channel without a duplicate destination. The broad production-source upload
 guard and its adversarial self-test pass. Strict daemon format and all-target
 Clippy pass; all 60 library, 122 daemon, and 8 worker-E2E tests pass; server Ruff
-and all 134 server tests pass; web lint, all 55 unit tests, 79 Playwright tests
+and all 134 server tests pass; web lint, all 55 unit tests, 81 Playwright tests
 (3 opt-in audits skipped), and the production build pass.
-`SPAWN_E2E_PORT=45325 scripts/test-all.sh` passes the full repeatable matrix,
+`SPAWN_E2E_PORT=45337 scripts/test-all.sh` passes the full repeatable matrix,
 including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
 daemon lifecycle, live-browser, and service-manager smokes. Current-master
 mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base
 and the simulated merge tree equals the candidate tree. Independent re-review
 is still required before acceptance or merge.
+
+The reconciliation ledger is intentionally tab-local: a new tab or browser
+restart is not covered by this Phase 2 safety state. P2-DATA-01/P2-DATA-02 must
+define the future durable endpoint-owned journal and cross-restart recovery
+boundary. Its hard eight-record cap is an explicit availability/DoS tradeoff:
+eight unresolved or durability-blocked records stop all new uploads until the
+user checks endpoint state and successfully persists explicit dismissals. No
+record is silently evicted to regain service.
 
 This is still a source checkpoint: it is not merged or deployed, does not purge
 historical copies, and does not complete Phase 2. Offline history is now an

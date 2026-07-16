@@ -498,10 +498,16 @@ unresolved record. Full capacity or unavailable durability fails closed before
 any endpoint frame. A same-tab memory/history fallback preserves the identity
 and visible lock across component/navigation remounts when the storage write
 itself fails; no later upload is admitted until storage recovers and an
-explicit checked dismissal is successfully persisted. The browser then hashes
-before sending, applies SCTP buffered-amount backpressure, and retries only the
-pre-effect `upload_start` exchange with a stable upload UUID a bounded number
-of times. Immediately before the final chunk it durably promotes the reserved
+explicit checked dismissal is successfully persisted. A durability fault
+poisons every already-reserved overlapping upload; restoration or an unrelated
+successful write cannot clear the fault or make those uploads dispatch. The
+in-memory fault and best-effort reconciliation event are still latched when
+both `sessionStorage` and history fallback writes fail, and native storage/
+history exceptions never replace the typed upload-blocked result. The browser
+then hashes before sending, applies SCTP buffered-amount backpressure, and
+retries only the pre-effect `upload_start` exchange with a stable upload UUID a
+bounded number of times. Immediately before the final chunk it durably promotes
+the reserved
 record to `outcome_unknown`; a failed promotion prevents final dispatch and
 cancels the unpublished upload. It never retries after dispatching the final
 chunk. A timeout, abort, or disconnect after that dispatch is stable
@@ -520,6 +526,14 @@ per-viewer/global admission charge remain held until descriptor/temp cleanup
 actually completes; timed-out cleanup stays tracked. A pre-publication
 cancellation cannot later publish, while an already-linearized final commit may
 finish only under the `outcome_unknown`/completed-cache rule below.
+
+This reconciliation ledger is deliberately tab-local. A new tab or browser
+restart is not protected by the Phase 2 browser ledger; the future durable
+endpoint-owned journal/recovery boundary belongs to P2-DATA-01/P2-DATA-02. The
+eight-record limit is also an intentional availability tradeoff: eight
+unresolved or durability-blocked records deny further uploads until the user
+checks endpoint state and successfully persists explicit dismissals. Records
+are never silently evicted to recover capacity.
 The deadline is created once by the peer's immutable coordinator at the first
 initiating channel/peer close, not separately for each cleanup stage. Delayed
 sender-close, connection-state, duplicate-close, invalid-channel, and backend
