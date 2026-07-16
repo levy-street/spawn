@@ -151,6 +151,7 @@ start_daemon() {
   printf '%s\n' "smoke-local-daemon: starting spawnd for host $smoke_host_id"
   HOME="$daemon_home" \
     SPAWN_DISABLE_KEYRING=1 \
+    SPAWN_CONFIG_DIR="$daemon_home/.config/spawn" \
     SPAWND_WORKER_DIR="$worker_dir" \
     PATH="$fake_bin:$PATH" \
     daemon/target/debug/spawnd --server "$base_url" run \
