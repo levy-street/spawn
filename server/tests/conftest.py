@@ -27,6 +27,7 @@ from spawn_server.db import Base  # noqa: E402
 from spawn_server.main import app as fastapi_app  # noqa: E402
 from spawn_server.presets import seed_builtin_presets  # noqa: E402
 from spawn_server.redis import get_backend  # noqa: E402
+from spawn_server.ws.broker import get_broker  # noqa: E402
 
 # Force the cached settings to re-read env on each session.
 get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -35,12 +36,19 @@ get_settings.cache_clear()  # type: ignore[attr-defined]
 @pytest_asyncio.fixture
 async def app():
     """Yield a freshly-initialized FastAPI app with empty in-memory DB."""
-    # Single shared in-memory SQLite connection — required so multiple sessions see same data.
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        future=True,
-    )
+    external_services = os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") == "1"
+    if external_services:
+        # The opt-in crash/race smoke runs these same tests against real
+        # PostgreSQL and Redis instead of silently exercising the fallbacks.
+        engine = create_async_engine(get_settings().database_url, future=True)
+    else:
+        # Single shared in-memory SQLite connection — required so multiple
+        # sessions see the same schema.
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
     sm = async_sessionmaker(engine, expire_on_commit=False)
 
     # Override the module-level globals.
@@ -48,6 +56,8 @@ async def app():
     db_mod._sessionmaker = sm
 
     async with engine.begin() as conn:
+        if external_services:
+            await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
     # Initialize in-process redis backend.
@@ -58,7 +68,11 @@ async def app():
 
     yield fastapi_app
 
+    await get_broker().shutdown()
     await get_backend().shutdown()
+    if external_services:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()
     db_mod._engine = None
     db_mod._sessionmaker = None

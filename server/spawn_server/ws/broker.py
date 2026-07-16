@@ -10,13 +10,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import TYPE_CHECKING
+
+from ..redis import get_backend
+from .owner_dispatch import (
+    OwnerResultEnvelope,
+    decode_owner_result,
+    owner_result_channel,
+    publish_owner_result,
+)
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
+
+    from .host_signal import RedisBrowserConn
 
 
 @dataclass(eq=False)
@@ -24,9 +36,13 @@ class DaemonConn:
     host_id: str
     user_id: str
     websocket: WebSocket
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    host_generation: int | None = None
     home_dir: str | None = None
     agent_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    superseded_close_started: bool = False
+    rtc_revocation_started: bool = False
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
@@ -53,14 +69,56 @@ class BrowserConn:
         async with self.send_lock:
             await self.websocket.send_bytes(payload)
 
+    @property
+    def route_id(self) -> str:
+        return self.id
+
+
+@dataclass(eq=False)
+class HostBrowserConn:
+    user_id: str
+    host_id: str
+    websocket: WebSocket
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def send_text(self, payload: dict) -> None:
+        async with self.send_lock:
+            await self.websocket.send_text(json.dumps(payload))
+
+    @property
+    def route_id(self) -> str:
+        return self.id
+
 
 @dataclass(frozen=True)
 class RtcSessionBinding:
     session_id: str
-    generation: str
-    agent_id: str
-    browser: BrowserConn
+    browser: BrowserConn | HostBrowserConn | RedisBrowserConn
     daemon: DaemonConn
+    scope_type: str
+    scope_id: str
+    protocol: str
+    protocol_version: int
+    daemon_connection_id: str
+    daemon_generation: int
+    nonce: str
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class DaemonOwnerAcceptance:
+    accepted: bool
+    superseded_connection_id: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
+class UploadResolution(Enum):
+    RESOLVED = "resolved"
+    NO_WAITER = "no_waiter"
+    STALE_OWNER = "stale_owner"
 
 
 @dataclass
@@ -82,87 +140,158 @@ class BrowserDisplayState:
 class Broker:
     def __init__(self) -> None:
         self._daemons_by_host: dict[str, DaemonConn] = {}
+        self._accepted_daemon_owners: dict[str, tuple[str, int]] = {}
         self._daemon_by_agent: dict[str, DaemonConn] = {}
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
         self._display_by_agent: dict[str, _DisplayState] = {}
-        self._snapshot_waiters: dict[str, set[asyncio.Future[dict]]] = defaultdict(set)
-        self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._fs_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
+        self._retired_rtc_bindings: dict[tuple[str, str, int, str], float] = {}
+        self._rtc_tombstone_cleanup_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
 
+    @staticmethod
+    async def _close_superseded(conn: DaemonConn | None) -> None:
+        if conn is None or conn.superseded_close_started:
+            return
+        conn.superseded_close_started = True
+        try:
+            await asyncio.wait_for(
+                conn.websocket.close(code=4000, reason="superseded"), timeout=1.0
+            )
+        except Exception:
+            conn.superseded_close_started = False
+
     async def register_daemon(self, conn: DaemonConn) -> None:
-        displaced_bindings: list[RtcSessionBinding] = []
+        superseded: DaemonConn | None = None
         async with self._lock:
             existing = self._daemons_by_host.get(conn.host_id)
             if existing is not None and existing is not conn:
-                # Drop the stale connection (best-effort).
-                try:
-                    await existing.websocket.close(code=4000, reason="superseded")
-                except Exception:
-                    pass
+                superseded = existing
                 for aid in list(existing.agent_ids):
                     self._daemon_by_agent.pop(aid, None)
                 existing.agent_ids.clear()
-                displaced_bindings = [
-                    binding
-                    for binding in self._rtc_sessions.values()
-                    if binding.daemon is existing
-                ]
-                for binding in displaced_bindings:
-                    self._rtc_sessions.pop(binding.session_id, None)
+                # Host sessions are actively revoked by the distributed owner
+                # event after the replacement daemon claims its Redis lease.
+                # Keep them long enough to send unavailable/rtc.close instead
+                # of silently orphaning an established DataChannel.
+                self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
             self._daemons_by_host[conn.host_id] = conn
-        await self._notify_rtc_bindings_unavailable(displaced_bindings)
+        await self._close_superseded(superseded)
 
     async def unregister_daemon(self, conn: DaemonConn) -> None:
-        displaced_bindings: list[RtcSessionBinding] = []
         async with self._lock:
             if self._daemons_by_host.get(conn.host_id) is conn:
                 self._daemons_by_host.pop(conn.host_id, None)
+            if conn.host_generation is not None and self._accepted_daemon_owners.get(
+                conn.host_id
+            ) == (conn.id, conn.host_generation):
+                self._accepted_daemon_owners.pop(conn.host_id, None)
             for aid in list(conn.agent_ids):
                 if self._daemon_by_agent.get(aid) is conn:
                     self._daemon_by_agent.pop(aid, None)
             conn.agent_ids.clear()
-            displaced_bindings = [
-                binding
-                for binding in self._rtc_sessions.values()
-                if binding.daemon is conn
-            ]
-            for binding in displaced_bindings:
-                self._rtc_sessions.pop(binding.session_id, None)
-        await self._notify_rtc_bindings_unavailable(displaced_bindings)
+            self._drop_rtc_sessions_for_daemon_locked(conn)
 
-    @staticmethod
-    async def _notify_rtc_bindings_unavailable(bindings: list[RtcSessionBinding]) -> None:
-        for binding in bindings:
-            try:
-                await binding.browser.send_text(
-                    {
-                        "type": "rtc.status",
-                        "session_id": binding.session_id,
-                        "agent_id": binding.agent_id,
-                        "status": "unavailable",
-                        "message": "Owning daemon disconnected.",
-                    }
-                )
-            except Exception:
-                pass
+    def _drop_rtc_sessions_for_daemon_locked(
+        self, conn: DaemonConn, *, include_host: bool = True
+    ) -> None:
+        stale = [
+            session_id
+            for session_id, binding in self._rtc_sessions.items()
+            if binding.daemon is conn and (include_host or binding.scope_type != "host")
+        ]
+        for session_id in stale:
+            binding = self._rtc_sessions.get(session_id)
+            if binding is not None and self._retire_rtc_binding_locked(binding):
+                self._rtc_sessions.pop(session_id, None)
 
-    async def attach_agent_to_daemon(self, agent_id: str, conn: DaemonConn) -> None:
+    async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> DaemonOwnerAcceptance:
+        """Atomically expose a fully claimed daemon to local routing.
+
+        Authenticated sockets remain absent from the broker until their durable
+        generation and distributed presence lease have both been established.
+        This transition is therefore also the one place where an accepted local
+        predecessor may be superseded.
+        """
+        superseded: DaemonConn | None = None
         async with self._lock:
+            if conn.host_generation != generation:
+                return DaemonOwnerAcceptance(False)
+            current = self._accepted_daemon_owners.get(conn.host_id)
+            if current is not None and (
+                current[1] > generation or (current[1] == generation and current[0] != conn.id)
+            ):
+                return DaemonOwnerAcceptance(False)
+
+            existing = self._daemons_by_host.get(conn.host_id)
+            superseded_connection_id: str | None = None
+            if existing is not None and existing is not conn:
+                superseded = existing
+                superseded_connection_id = existing.id
+                for aid in list(existing.agent_ids):
+                    if self._daemon_by_agent.get(aid) is existing:
+                        self._daemon_by_agent.pop(aid, None)
+                existing.agent_ids.clear()
+                self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
+
+            self._daemons_by_host[conn.host_id] = conn
+            self._accepted_daemon_owners[conn.host_id] = (conn.id, generation)
+        await self._close_superseded(superseded)
+        return DaemonOwnerAcceptance(True, superseded_connection_id)
+
+    async def is_accepted_daemon_owner(self, conn: DaemonConn, generation: int) -> bool:
+        async with self._lock:
+            return self._is_accepted_daemon_owner_locked(conn, generation)
+
+    def _is_accepted_daemon_owner_locked(self, conn: DaemonConn, generation: int) -> bool:
+        return (
+            self._daemons_by_host.get(conn.host_id) is conn
+            and conn.host_generation == generation
+            and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
+        )
+
+    async def attach_agent_to_daemon(
+        self,
+        agent_id: str,
+        conn: DaemonConn,
+        *,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        async with self._lock:
+            if expected_host_generation is not None and not (
+                self._daemons_by_host.get(conn.host_id) is conn
+                and conn.host_generation == expected_host_generation
+                and self._accepted_daemon_owners.get(conn.host_id)
+                == (conn.id, expected_host_generation)
+            ):
+                return False
             conn.agent_ids.add(agent_id)
             self._daemon_by_agent[agent_id] = conn
+            return True
 
-    async def detach_agent(self, agent_id: str) -> None:
+    async def detach_agent(
+        self,
+        agent_id: str,
+        *,
+        expected_daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
         async with self._lock:
+            conn = self._daemon_by_agent.get(agent_id)
+            if expected_daemon is not None and (
+                conn is not expected_daemon
+                or expected_host_generation is None
+                or not self._is_accepted_daemon_owner_locked(
+                    expected_daemon, expected_host_generation
+                )
+            ):
+                return False
             conn = self._daemon_by_agent.pop(agent_id, None)
             if conn is not None:
                 conn.agent_ids.discard(agent_id)
+            return conn is not None
 
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
@@ -216,100 +345,290 @@ class Broker:
     async def register_rtc_session(
         self,
         session_id: str,
-        conn: BrowserConn,
-        agent_id: str,
+        conn: BrowserConn | HostBrowserConn | RedisBrowserConn,
+        *,
         daemon: DaemonConn,
-    ) -> RtcSessionBinding | None:
+        scope_type: str,
+        scope_id: str,
+        protocol: str,
+        protocol_version: int,
+        binding_nonce: str | None = None,
+        ttl_seconds: int | None = None,
+        now: float | None = None,
+    ) -> bool:
         async with self._lock:
+            now = time.monotonic() if now is None else now
+            self._prune_expired_rtc_sessions_locked(now)
+            generation = daemon.host_generation if daemon.host_generation is not None else 0
+            from .host_signal import (
+                MAX_RTC_BINDING_IDENTITIES,
+                new_rtc_binding_nonce,
+                valid_rtc_binding_nonce,
+            )
+
+            nonce = binding_nonce or new_rtc_binding_nonce()
+            if not valid_rtc_binding_nonce(nonce):
+                return False
+            route_nonce = getattr(conn, "binding_nonce", nonce)
+            if route_nonce != nonce:
+                return False
+            identity = (session_id, daemon.id, generation, nonce)
+            # A retired identity is an immutable generation. Reinstalling it
+            # would make delayed frames indistinguishable from current ones,
+            # even if the entry existed only until the caller's follow-up
+            # lookup. Reject it before mutating the live-session map.
+            if identity in self._retired_rtc_bindings:
+                return False
+            if (
+                len(self._rtc_sessions) + len(self._retired_rtc_bindings)
+                >= MAX_RTC_BINDING_IDENTITIES
+            ):
+                return False
             if session_id in self._rtc_sessions:
-                return None
-            binding = RtcSessionBinding(
+                return False
+            if scope_type == "host":
+                from .host_signal import (
+                    MAX_HOST_RTC_SESSIONS_PER_BROWSER,
+                    MAX_HOST_RTC_SESSIONS_PER_DAEMON,
+                    MAX_HOST_RTC_SESSIONS_PER_HOST,
+                )
+
+                host_bindings = [
+                    binding
+                    for binding in self._rtc_sessions.values()
+                    if binding.scope_type == "host" and binding.scope_id == scope_id
+                ]
+                if len(host_bindings) >= MAX_HOST_RTC_SESSIONS_PER_HOST:
+                    return False
+                if (
+                    sum(binding.daemon is daemon for binding in host_bindings)
+                    >= MAX_HOST_RTC_SESSIONS_PER_DAEMON
+                ):
+                    return False
+                if (
+                    sum(binding.browser.route_id == conn.route_id for binding in host_bindings)
+                    >= MAX_HOST_RTC_SESSIONS_PER_BROWSER
+                ):
+                    return False
+            self._rtc_sessions[session_id] = RtcSessionBinding(
                 session_id=session_id,
-                generation=uuid.uuid4().hex,
-                agent_id=agent_id,
                 browser=conn,
                 daemon=daemon,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                protocol=protocol,
+                protocol_version=protocol_version,
+                daemon_connection_id=daemon.id,
+                daemon_generation=generation,
+                nonce=nonce,
+                expires_at=float("inf") if ttl_seconds is None else now + ttl_seconds,
             )
-            self._rtc_sessions[session_id] = binding
-            return binding
-
-    async def rtc_binding_for_browser(
-        self, session_id: str, conn: BrowserConn, agent_id: str
-    ) -> RtcSessionBinding | None:
-        async with self._lock:
-            binding = self._rtc_sessions.get(session_id)
-            if (
-                binding is not None
-                and binding.browser is conn
-                and binding.agent_id == agent_id
-            ):
-                return binding
-            return None
+            return True
 
     async def unregister_rtc_session(
-        self, session_id: str, conn: BrowserConn, agent_id: str
-    ) -> RtcSessionBinding | None:
+        self,
+        session_id: str,
+        conn: BrowserConn | HostBrowserConn | RedisBrowserConn | None = None,
+    ) -> None:
         async with self._lock:
-            binding = self._rtc_sessions.get(session_id)
-            if (
-                binding is not None
-                and binding.browser is conn
-                and binding.agent_id == agent_id
-            ):
-                self._rtc_sessions.pop(session_id, None)
-                return binding
-            return None
+            current = self._rtc_sessions.get(session_id)
+            if current is not None and (conn is None or current.browser is conn):
+                if self._retire_rtc_binding_locked(current):
+                    self._rtc_sessions.pop(session_id, None)
 
-    async def unregister_rtc_sessions_for(self, conn: BrowserConn) -> list[RtcSessionBinding]:
+    async def unregister_rtc_sessions_for(
+        self, conn: BrowserConn | HostBrowserConn | RedisBrowserConn
+    ) -> list[RtcSessionBinding]:
         async with self._lock:
-            bindings = [
-                binding for binding in self._rtc_sessions.values() if binding.browser is conn
+            sessions = [
+                (session_id, binding)
+                for session_id, binding in self._rtc_sessions.items()
+                if binding.browser is conn
             ]
-            for binding in bindings:
-                self._rtc_sessions.pop(binding.session_id, None)
-            return bindings
+            removed: list[RtcSessionBinding] = []
+            for session_id, binding in sessions:
+                if self._retire_rtc_binding_locked(binding):
+                    self._rtc_sessions.pop(session_id, None)
+                    removed.append(binding)
+            return removed
 
-    async def browser_for_rtc_signal(
+    async def rtc_session_for(
         self,
         session_id: str,
-        agent_id: str,
-        daemon: DaemonConn,
-        generation: str,
-    ) -> BrowserConn | None:
-        async with self._lock:
-            binding = self._rtc_sessions.get(session_id)
-            if (
-                binding is not None
-                and binding.agent_id == agent_id
-                and binding.daemon is daemon
-                and binding.generation == generation
-            ):
-                return binding.browser
-            return None
-
-    async def unregister_rtc_signal(
-        self,
-        session_id: str,
-        agent_id: str,
-        daemon: DaemonConn,
-        generation: str,
+        *,
+        browser: BrowserConn | HostBrowserConn | RedisBrowserConn | None = None,
+        daemon: DaemonConn | None = None,
+        now: float | None = None,
     ) -> RtcSessionBinding | None:
-        """Consume a terminal daemon status without touching a replacement binding."""
         async with self._lock:
+            self._prune_expired_rtc_sessions_locked(time.monotonic() if now is None else now)
             binding = self._rtc_sessions.get(session_id)
-            if (
-                binding is not None
-                and binding.agent_id == agent_id
-                and binding.daemon is daemon
-                and binding.generation == generation
-            ):
-                self._rtc_sessions.pop(session_id, None)
-                return binding
-            return None
+            if binding is None:
+                return None
+            if browser is not None and binding.browser is not browser:
+                return None
+            if daemon is not None and binding.daemon is not daemon:
+                return None
+            return binding
 
-    async def rtc_session_count(self) -> int:
+    def _prune_expired_rtc_sessions_locked(self, now: float) -> None:
+        self._prune_rtc_tombstones_locked(now)
+        expired = [
+            session_id
+            for session_id, binding in self._rtc_sessions.items()
+            if binding.expires_at <= now
+        ]
+        for session_id in expired:
+            binding = self._rtc_sessions.get(session_id)
+            if binding is not None and self._retire_rtc_binding_locked(binding, now=now):
+                self._rtc_sessions.pop(session_id, None)
+
+    @staticmethod
+    def _rtc_binding_identity(binding: RtcSessionBinding) -> tuple[str, str, int, str]:
+        return (
+            binding.session_id,
+            binding.daemon_connection_id,
+            binding.daemon_generation,
+            binding.nonce,
+        )
+
+    def _retire_rtc_binding_locked(
+        self, binding: RtcSessionBinding, *, now: float | None = None
+    ) -> bool:
+        from .host_signal import (
+            MAX_RTC_BINDING_IDENTITIES,
+            RTC_BINDING_TOMBSTONE_TTL_SECONDS,
+        )
+
+        timestamp = time.monotonic() if now is None else now
+        identity = self._rtc_binding_identity(binding)
+        if (
+            identity not in self._retired_rtc_bindings
+            and len(self._retired_rtc_bindings) >= MAX_RTC_BINDING_IDENTITIES
+        ):
+            return False
+        self._retired_rtc_bindings[identity] = (
+            timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
+        )
+        self._schedule_rtc_tombstone_cleanup_locked()
+        return True
+
+    def _prune_rtc_tombstones_locked(self, now: float) -> None:
+        for identity in [
+            identity
+            for identity, expires_at in self._retired_rtc_bindings.items()
+            if expires_at <= now
+        ]:
+            self._retired_rtc_bindings.pop(identity, None)
+
+    def _schedule_rtc_tombstone_cleanup_locked(self) -> None:
+        if (
+            self._rtc_tombstone_cleanup_task is None
+            or self._rtc_tombstone_cleanup_task.done()
+        ):
+            self._rtc_tombstone_cleanup_task = asyncio.create_task(
+                self._rtc_tombstone_cleanup_loop()
+            )
+
+    async def _rtc_tombstone_cleanup_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                async with self._lock:
+                    now = time.monotonic()
+                    self._prune_expired_rtc_sessions_locked(now)
+                    if not self._retired_rtc_bindings:
+                        return
+                    delay = max(
+                        0.0,
+                        min(self._retired_rtc_bindings.values()) - time.monotonic(),
+                    )
+                await asyncio.sleep(delay)
+        finally:
+            if self._rtc_tombstone_cleanup_task is current_task:
+                self._rtc_tombstone_cleanup_task = None
+
+    async def shutdown(self) -> None:
+        task = self._rtc_tombstone_cleanup_task
+        self._rtc_tombstone_cleanup_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         async with self._lock:
-            return len(self._rtc_sessions)
+            self._rtc_sessions.clear()
+            self._retired_rtc_bindings.clear()
+
+    def _rtc_binding_is_current_locked(self, binding: RtcSessionBinding) -> bool:
+        return (
+            self._rtc_sessions.get(binding.session_id) is binding
+            and self._rtc_binding_identity(binding) not in self._retired_rtc_bindings
+        )
+
+    async def rtc_session_is_current(self, binding: RtcSessionBinding) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            self._prune_expired_rtc_sessions_locked(now)
+            return self._rtc_binding_is_current_locked(binding)
+
+    async def rtc_binding_identity_is_retired(
+        self,
+        session_id: str,
+        daemon: DaemonConn,
+        binding_nonce: str,
+    ) -> bool:
+        """Recognize an exact retired binding for delayed teardown only."""
+        generation = daemon.host_generation
+        if generation is None:
+            return False
+        async with self._lock:
+            self._prune_rtc_tombstones_locked(time.monotonic())
+            return (
+                session_id,
+                daemon.id,
+                generation,
+                binding_nonce,
+            ) in self._retired_rtc_bindings
+
+    async def expire_rtc_session(self, session_id: str, expected: RtcSessionBinding) -> bool:
+        async with self._lock:
+            current = self._rtc_sessions.get(session_id)
+            if current is not expected:
+                return False
+            if not self._retire_rtc_binding_locked(current):
+                return False
+            self._rtc_sessions.pop(session_id, None)
+            return True
+
+    async def mark_rtc_session_connected(
+        self, session_id: str, expected: RtcSessionBinding
+    ) -> RtcSessionBinding | None:
+        """Extend a token-dispatched session without making it immortal."""
+        from .host_signal import RTC_CONNECTED_SESSION_TTL_SECONDS
+
+        async with self._lock:
+            current = self._rtc_sessions.get(session_id)
+            if current is not expected or not self._rtc_binding_is_current_locked(expected):
+                return None
+            connected = replace(
+                current,
+                expires_at=time.monotonic() + RTC_CONNECTED_SESSION_TTL_SECONDS,
+            )
+            self._rtc_sessions[session_id] = connected
+            return connected
+
+    async def rtc_sessions_for_daemon(self, daemon: DaemonConn) -> list[RtcSessionBinding]:
+        async with self._lock:
+            self._prune_expired_rtc_sessions_locked(time.monotonic())
+            return [binding for binding in self._rtc_sessions.values() if binding.daemon is daemon]
+
+    async def browser_for_rtc_session(
+        self, session_id: str
+    ) -> BrowserConn | HostBrowserConn | RedisBrowserConn | None:
+        binding = await self.rtc_session_for(session_id)
+        return binding.browser if binding is not None else None
 
     async def update_display_size(
         self,
@@ -402,38 +721,43 @@ class Broker:
         timeout: float = 2.0,
         rtc_session_id: str | None = None,
     ) -> dict | None:
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._snapshot_waiters[agent_id].add(fut)
-        try:
-            payload: dict[str, object] = {
-                "type": "agent.snapshot",
-                "agent_id": agent_id,
-                "lines": lines,
-            }
-            if plain:
-                payload["plain"] = True
-            if rtc_session_id:
-                payload["rtc_session_id"] = rtc_session_id
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                waiters = self._snapshot_waiters.get(agent_id)
-                if waiters is not None:
-                    waiters.discard(fut)
-                    if not waiters:
-                        self._snapshot_waiters.pop(agent_id, None)
+        request_id = str(uuid.uuid4())
+        payload: dict[str, object] = {
+            "type": "agent.snapshot",
+            "request_id": request_id,
+            "agent_id": agent_id,
+            "lines": lines,
+        }
+        if plain:
+            payload["plain"] = True
+        if rtc_session_id:
+            payload["rtc_session_id"] = rtc_session_id
+        return await self._request_owner_result(
+            daemon,
+            "agent.snapshot",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
-    async def resolve_snapshot(self, agent_id: str, payload: dict) -> None:
-        async with self._lock:
-            waiters = list(self._snapshot_waiters.pop(agent_id, ()))
-        for fut in waiters:
-            if not fut.done():
-                fut.set_result(payload)
+    async def resolve_snapshot(
+        self,
+        agent_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "agent.snapshot",
+            request_id,
+            payload,
+        )
 
     async def request_dir_list(
         self,
@@ -444,30 +768,36 @@ class Broker:
         timeout: float = 3.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._dir_list_waiters[request_id] = fut
-        try:
-            payload: dict[str, object] = {"type": "host.fs.list", "request_id": request_id}
-            if path is not None:
-                payload["path"] = path
-            if include_files:
-                payload["include_files"] = True
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._dir_list_waiters.get(request_id) is fut:
-                    self._dir_list_waiters.pop(request_id, None)
+        payload: dict[str, object] = {"type": "host.fs.list", "request_id": request_id}
+        if path is not None:
+            payload["path"] = path
+        if include_files:
+            payload["include_files"] = True
+        return await self._request_owner_result(
+            daemon,
+            "host.fs.list_result",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
-    async def resolve_dir_list(self, request_id: str, payload: dict) -> None:
-        async with self._lock:
-            fut = self._dir_list_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
+    async def resolve_dir_list(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.fs.list_result",
+            request_id,
+            payload,
+        )
 
     async def _request_fs(
         self,
@@ -478,19 +808,13 @@ class Broker:
     ) -> dict | None:
         request_id = str(uuid.uuid4())
         payload["request_id"] = request_id
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._fs_waiters[request_id] = fut
-        try:
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._fs_waiters.get(request_id) is fut:
-                    self._fs_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.fs.result",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
     async def request_fs_read(
         self, daemon: DaemonConn, *, path: str, timeout: float = 60.0
@@ -544,11 +868,23 @@ class Broker:
             timeout=timeout,
         )
 
-    async def resolve_fs_result(self, request_id: str, payload: dict) -> None:
-        async with self._lock:
-            fut = self._fs_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
+    async def resolve_fs_result(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.fs.result",
+            request_id,
+            payload,
+        )
 
     async def request_tool_check(
         self,
@@ -558,31 +894,35 @@ class Broker:
         timeout: float = 15.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._tool_check_waiters[request_id] = fut
-        try:
-            await daemon.send_text(
-                {
-                    "type": "host.tools.check",
-                    "request_id": request_id,
-                    "targets": targets,
-                }
-            )
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._tool_check_waiters.get(request_id) is fut:
-                    self._tool_check_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.tools.check_result",
+            request_id,
+            {
+                "type": "host.tools.check",
+                "request_id": request_id,
+                "targets": targets,
+            },
+            timeout=timeout,
+        )
 
-    async def resolve_tool_check(self, request_id: str, payload: dict) -> None:
-        async with self._lock:
-            fut = self._tool_check_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
+    async def resolve_tool_check(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.tools.check_result",
+            request_id,
+            payload,
+        )
 
     async def request_tool_install(
         self,
@@ -592,31 +932,35 @@ class Broker:
         timeout: float = 180.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._tool_install_waiters[request_id] = fut
-        try:
-            await daemon.send_text(
-                {
-                    "type": "host.tools.install",
-                    "request_id": request_id,
-                    "target": target,
-                }
-            )
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._tool_install_waiters.get(request_id) is fut:
-                    self._tool_install_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.tools.install_result",
+            request_id,
+            {
+                "type": "host.tools.install",
+                "request_id": request_id,
+                "target": target,
+            },
+            timeout=timeout,
+        )
 
-    async def resolve_tool_install(self, request_id: str, payload: dict) -> None:
-        async with self._lock:
-            fut = self._tool_install_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
+    async def resolve_tool_install(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.tools.install_result",
+            request_id,
+            payload,
+        )
 
     async def request_upload(
         self,
@@ -627,45 +971,97 @@ class Broker:
         client_id: str,
         timeout: float = 30.0,
     ) -> dict | None:
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._upload_waiters[client_id] = (agent_id, fut)
-        try:
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
+        request_id = str(uuid.uuid4())
+        payload["agent_id"] = agent_id
+        payload["client_id"] = client_id
+        payload["request_id"] = request_id
+        return await self._request_owner_result(
+            daemon,
+            "agent.uploaded",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
+
+    async def resolve_upload(
+        self,
+        agent_id: str,
+        request_id: str | None,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> UploadResolution:
+        if not request_id:
+            return UploadResolution.NO_WAITER
+        if daemon is None:
+            return UploadResolution.STALE_OWNER
+        published = await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "agent.uploaded",
+            request_id,
+            payload,
+        )
+        return UploadResolution.RESOLVED if published else UploadResolution.STALE_OWNER
+
+    async def _request_owner_result(
+        self,
+        daemon: DaemonConn,
+        kind: str,
+        request_id: str,
+        request: dict[str, object],
+        *,
+        timeout: float,
+    ) -> dict | None:
+        generation = daemon.host_generation
+        if generation is None:
             return None
-        finally:
-            async with self._lock:
-                current = self._upload_waiters.get(client_id)
-                if current is not None and current[1] is fut:
-                    self._upload_waiters.pop(client_id, None)
+        channel = owner_result_channel(daemon.host_id, kind, request_id)
+        async with get_backend().subscribe_channel(channel) as stream:
+            await daemon.send_text(request)
+            try:
+                async with asyncio.timeout(timeout):
+                    async for raw in stream:
+                        envelope = decode_owner_result(raw)
+                        if envelope is None or not (
+                            envelope.host_id == daemon.host_id
+                            and envelope.daemon_connection_id == daemon.id
+                            and envelope.daemon_generation == generation
+                            and envelope.kind == kind
+                            and envelope.request_id == request_id
+                        ):
+                            continue
+                        return envelope.payload
+            except TimeoutError:
+                return None
+        return None
 
-    async def resolve_upload(self, agent_id: str, client_id: str | None, payload: dict) -> None:
-        if not client_id:
-            return
-        async with self._lock:
-            waiter = self._upload_waiters.pop(client_id, None)
-        if waiter is None:
-            return
-        waiter_agent_id, fut = waiter
-        if waiter_agent_id != agent_id or fut.done():
-            return
-        fut.set_result(payload)
-
-    async def reject_uploads_for_agent(self, agent_id: str, message: str) -> None:
-        async with self._lock:
-            rejected = [
-                (client_id, fut)
-                for client_id, (waiter_agent_id, fut) in self._upload_waiters.items()
-                if waiter_agent_id == agent_id
-            ]
-            for client_id, _ in rejected:
-                self._upload_waiters.pop(client_id, None)
-        for _, fut in rejected:
-            if not fut.done():
-                fut.set_exception(RuntimeError(message))
+    @staticmethod
+    async def _publish_owner_result(
+        daemon: DaemonConn,
+        expected_host_generation: int | None,
+        kind: str,
+        request_id: str,
+        payload: dict,
+    ) -> bool:
+        generation = daemon.host_generation
+        if (
+            expected_host_generation is None
+            or generation != expected_host_generation
+            or generation < 1
+        ):
+            return False
+        return await publish_owner_result(
+            OwnerResultEnvelope(
+                host_id=daemon.host_id,
+                daemon_connection_id=daemon.id,
+                daemon_generation=generation,
+                kind=kind,
+                request_id=request_id,
+                payload=payload,
+            )
+        )
 
 
 _broker = Broker()

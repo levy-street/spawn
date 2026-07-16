@@ -164,6 +164,39 @@ authorizes operations to its own host identity; the browser binds every
 response to the requested host/session. Phase 3 adds signed signaling to both
 agent- and host-scoped peer connections.
 
+Implementation note: the transport root is intentionally separable from the
+content migrations in Increment 5. Its first reviewed cut uses a dedicated
+`/ws/host` signaling websocket, binds each RTC session to browser connection,
+daemon connection, host scope, protocol, and version, and exposes only a
+bounded `hello`/`ping` request-response primitive. This permits ownership,
+zero-agent, TURN-only, reconnect, cancellation, size, and cross-scope behavior
+to be tested before any protected filesystem/tool payload is moved. It does
+not make the Phase 2 claim and does not remove any legacy host content route.
+Host signaling is routed between websocket workers through ephemeral Redis
+pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
+does not depend on process-local broker affinity. A replacement claim actively
+revokes the previous worker. Authenticated daemon sockets remain absent from
+broker host and agent routing until registration has allocated a durable database
+`BigInteger` fence token and a matching, non-routable Redis pending reservation.
+Promotion uses an exact pending-and-predecessor CAS; the active lease is restored
+by exact token if the database activation commit fails. A reservation cannot alter
+the previous database owner, active Redis lease, browser target, or broker routes.
+During the bounded promotion-to-commit bridge B is still non-routable and A remains
+authorized; a browser requires the database and Redis active tokens to agree. The
+Redis cache accepts only a newer reservation token, and
+the authoritative database owner can reclaim
+a lost cache entry; heartbeat and offline transitions require the exact connection
+and generation. Every host signal also revalidates
+the current lease, so a stale worker cannot retain or create host sessions or
+overwrite its replacement's durable status during either claim or notification
+races. Browser, host, and daemon session
+counts are capped, pending offers expire, daemon peer connections have a hard
+ceiling, and only the first correctly labelled host DataChannel is accepted.
+The browser's negotiation deadline starts before offer creation and ends only
+after the versioned host-channel hello, so missing answers and half-open
+channels are cleaned up and reconnected. Host RTC status visible to the server
+is restricted to stable content-free values.
+
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the

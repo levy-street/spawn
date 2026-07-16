@@ -216,22 +216,40 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
  "agent_id": "uuid",
  "sdp": "v=0..."}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
  "agent_id": "uuid",
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.status",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
  "agent_id": "uuid",
  "status": "connected|failed",
  "message": "optional detail"}
+
+Host-scoped signaling uses the same `rtc.*` types but replaces `agent_id` with
+an explicit, mandatory binding tuple on every frame:
+
+```json
+{"type": "rtc.answer",
+ "session_id": "browser-generated-id",
+ "binding_nonce": "browser-generated-hex",
+ "scope_type": "host",
+ "scope_id": "host-uuid",
+ "protocol": "spawn.host.ctl",
+ "protocol_version": 1,
+ "sdp": "v=0..."}
+```
+
+Host `rtc.candidate` and `rtc.status` frames carry the identical tuple and
+binding nonce. Host status values are content-free codes; endpoint error
+detail is not placed on the signaling websocket.
 
 {"type": "host.fs.list_result",
  "request_id": "uuid",
@@ -397,22 +415,35 @@ means `TERM`. Other values are rejected before lifecycle dispatch.
 
 {"type": "rtc.offer",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
+ "binding_generation": 7,
  "agent_id": "uuid",
  "sdp": "v=0...",
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
+ "binding_generation": 7,
  "agent_id": "uuid",
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.close",
  "session_id": "browser-generated-id",
- "generation": "server-generated-hex",
+ "binding_nonce": "browser-or-server-generated-hex",
+ "binding_generation": 7,
  "agent_id": "uuid"}
 ```
+
+For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
+`agent_id` and carry a 32-character `binding_nonce`, `scope_type:"host"`,
+`scope_id`, `protocol:"spawn.host.ctl"`, and `protocol_version:1`. A host offer
+also carries `ice_transport_policy:"all|relay"`; when the server supplies only
+TURN URLs both endpoints use `relay` and do not gather direct/STUN candidates.
+Agent signaling additionally carries the selected daemon owner's monotonic
+`binding_generation`; the daemon combines it with the nonce so frames from an
+older daemon ownership generation cannot affect a replacement session. The
+legacy `generation` spelling is accepted only for rollout compatibility.
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
@@ -462,14 +493,15 @@ viewport state.
 When the server advertises WebRTC support, the browser may additionally send
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
 The server authorizes the browser against the agent, forwards signaling to the
-owning daemon over `/ws/daemon`, and keeps this websocket open as the control
-plane and fallback terminal relay.
+owning daemon over `/ws/daemon`, and keeps this websocket open as the
+signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
 
 ### Server → browser
 
 ```json
 {"type": "rtc.config",
  "enabled": true,
+ "binding_nonce_required": true,
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 {"type": "history", "bytes_b64": "..."}    // initial replay buffer
 {"type": "agent.exit", "exit_code": 0, "signal": null}
@@ -477,9 +509,9 @@ plane and fallback terminal relay.
 {"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
 {"type": "upload.error", "message": "..."}
-{"type": "rtc.answer", "session_id": "browser-generated-id", "agent_id": "uuid", "sdp": "v=0..."}
-{"type": "rtc.candidate", "session_id": "browser-generated-id", "agent_id": "uuid", "candidate": {"candidate": "..."}}
-{"type": "rtc.status", "session_id": "browser-generated-id", "agent_id": "uuid", "status": "connected|failed"}
+{"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "sdp": "v=0..."}
+{"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "candidate": {"candidate": "..."}}
+{"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "status": "connected|failed"}
 ```
 Plus raw binary stdout bytes.
 
@@ -585,15 +617,47 @@ Old pre-cutover sessions are not adopted; operators must drain them before
 installing/restarting the worker-only daemon. See `docs/TRUST_PHASE2_PROGRESS.md`.
 
 The signaling server binds each active RTC session ID to its browser
-connection, agent, daemon connection and a server-minted generation. Active ID
-collisions are rejected, and every candidate, close, answer and status must
-match that binding; stale generations cannot affect a replacement session.
-The daemon additionally binds every RTC callback to the concrete agent-backend
-generation and drains its callback fence before replacing or removing that
-backend.
+connection, scope, binding nonce, selected daemon connection and durable daemon
+ownership generation. Active ID collisions are rejected, and every candidate,
+close, answer and status must match that binding; retired nonces and stale
+owner generations cannot affect a replacement session. The daemon additionally
+binds every agent RTC callback to both that signaling identity and the concrete
+agent-backend generation, then drains its callback fence before replacing or
+removing that backend.
 Per-viewer live and response queues are bounded. A viewer that stalls SCTP
 beyond the send timeout is disconnected and obtains a new bounded replay when
 it reconnects; display-state updates are latest-value/coalesced.
+
+## Host control WebSocket and DataChannel
+
+`/ws/host?host_id=<uuid>` is a signaling-only browser websocket independent of
+any agent. It authenticates the browser session, verifies that the user owns
+the host, and selects subprotocol `spawn.host.v1`. The server sends a bound
+`rtc.config`; browser offers/candidates/closes and daemon
+answers/candidates/statuses must repeat the exact host binding tuple above.
+The signaling router binds each `session_id` to the initiating browser
+connection, selected daemon connection, host, protocol, and version. Session
+ID collisions and cross-browser, cross-daemon, cross-host, or cross-protocol
+frames are rejected.
+
+The browser creates an ordered `spawn.host.ctl` DataChannel. The daemon accepts
+that label only on a host-scoped peer connection for its server-registered host
+identity. The server never receives these messages. Version 1 starts with:
+
+```json
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping"]}
+{"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
+{"version":1,"type":"cancel","request_id":"unguessable-id"}
+```
+
+Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
+limited to 128 bytes, and malformed, binary, wrong-version, or oversized
+messages close the channel. The browser limits concurrent requests, applies a
+timeout, sends cancellation on timeout/abort, and binds responses to the
+outstanding request ID. Filesystem/tool/launch operations and their bounded
+chunk streams are added by later trust Phase 2 tasks; the transport root
+currently advertises only `ping`.
 
 ## Versioning
 
@@ -602,4 +666,7 @@ it reconnects; display-state updates are latest-value/coalesced.
   legacy relay fallback; the daemon WS remains `spawn.v1` until the
   daemon-owned-data migration (docs/TRUST.md Phase 2). Server SHOULD
   support both during a rollout window.
+- Host signaling uses `spawn.host.v1`; its DataChannel protocol is separately
+  versioned by the mandatory `protocol_version` signaling field and `version`
+  envelope field.
 - REST endpoints under `/api/` are versioned by additive evolution.

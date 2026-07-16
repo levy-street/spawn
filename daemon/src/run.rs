@@ -23,7 +23,7 @@ use crate::proto::{
     Outbound,
 };
 use crate::pty::{self, WsOutbound};
-use crate::rtc::RtcSessions;
+use crate::rtc::{HostRtcSignal, RtcSessions};
 use crate::upload;
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
@@ -53,6 +53,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
 
     let registry = AgentRegistry::new();
     let rtc_sessions = RtcSessions::new();
+    if let Some(host_id) = stored.host_id {
+        let _ = rtc_sessions.bind_registered_host_id(host_id).await;
+    }
 
     // Ctrl-C closes only this supervisor. Session workers remain alive and
     // are adopted by the next `spawnd` process.
@@ -248,6 +251,9 @@ async fn dispatch_loop(
             WsInbound::Closed => return Ok(()),
             WsInbound::Json(frame) => match frame {
                 Inbound::Registered { host_id } => {
+                    if !rtc_sessions.bind_registered_host_id(host_id).await {
+                        return Err(anyhow!("server registered daemon as an unexpected host"));
+                    }
                     tracing::info!(%host_id, "registered with server");
                 }
                 Inbound::HostHeartbeat => {
@@ -326,6 +332,7 @@ async fn dispatch_loop(
                 }
                 Inbound::AgentSnapshot {
                     agent_id,
+                    request_id,
                     lines,
                     plain,
                     rtc_session_id,
@@ -339,9 +346,12 @@ async fn dispatch_loop(
                     tokio::spawn(async move {
                         handle_agent_snapshot(
                             agent_id,
-                            lines.unwrap_or(5_000),
-                            plain.unwrap_or(false),
-                            rtc_session_id,
+                            SnapshotRequest {
+                                request_id,
+                                lines: lines.unwrap_or(5_000),
+                                plain: plain.unwrap_or(false),
+                                rtc_session_id,
+                            },
                             &registry,
                             &rtc_sessions,
                             &out_tx,
@@ -354,6 +364,7 @@ async fn dispatch_loop(
                 }
                 Inbound::AgentUpload {
                     agent_id,
+                    request_id,
                     cwd,
                     name,
                     mime_type,
@@ -365,6 +376,7 @@ async fn dispatch_loop(
                 } => {
                     handle_agent_upload(
                         agent_id,
+                        request_id,
                         cwd,
                         name,
                         mime_type,
@@ -382,36 +394,260 @@ async fn dispatch_loop(
                 Inbound::RtcOffer {
                     session_id,
                     generation,
+                    binding_nonce,
+                    binding_generation,
                     agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                     sdp,
                     ice_servers,
+                    ice_transport_policy,
                 } => {
-                    rtc_sessions
-                        .handle_offer(
-                            crate::rtc::RtcSessionBinding::new(session_id, generation, agent_id),
-                            sdp,
-                            ice_servers,
-                            registry.clone(),
-                            out_tx.clone(),
-                        )
-                        .await;
+                    match (
+                        generation,
+                        binding_nonce,
+                        binding_generation,
+                        agent_id,
+                        scope_type,
+                        scope_id,
+                        protocol,
+                        protocol_version,
+                    ) {
+                        (
+                            None,
+                            Some(nonce),
+                            Some(owner_generation),
+                            Some(agent_id),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ) => {
+                            if ice_transport_policy.is_none() {
+                                if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
+                                    session_id,
+                                    nonce,
+                                    owner_generation,
+                                    agent_id,
+                                ) {
+                                    rtc_sessions
+                                        .handle_offer(
+                                            binding,
+                                            sdp,
+                                            ice_servers,
+                                            registry.clone(),
+                                            out_tx.clone(),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        (Some(generation), None, None, Some(agent_id), None, None, None, None) => {
+                            if ice_transport_policy.is_none() {
+                                if let Some(binding) = crate::rtc::RtcSessionBinding::from_legacy(
+                                    session_id, generation, agent_id,
+                                ) {
+                                    rtc_sessions
+                                        .handle_offer(
+                                            binding,
+                                            sdp,
+                                            ice_servers,
+                                            registry.clone(),
+                                            out_tx.clone(),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        (
+                            None,
+                            Some(binding_nonce),
+                            None,
+                            None,
+                            scope_type,
+                            scope_id,
+                            protocol,
+                            protocol_version,
+                        ) => {
+                            rtc_sessions
+                                .handle_host_offer(
+                                    HostRtcSignal {
+                                        session_id,
+                                        binding_nonce: Some(binding_nonce),
+                                        scope_type,
+                                        scope_id,
+                                        protocol,
+                                        protocol_version,
+                                    },
+                                    sdp,
+                                    ice_servers,
+                                    ice_transport_policy,
+                                    out_tx.clone(),
+                                )
+                                .await;
+                        }
+                        _ => tracing::warn!("rejecting malformed mixed-scope rtc offer"),
+                    }
                 }
                 Inbound::RtcCandidate {
                     session_id,
                     generation,
+                    binding_nonce,
+                    binding_generation,
                     agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                     candidate,
                 } => {
-                    rtc_sessions
-                        .handle_candidate(session_id, generation, agent_id, candidate)
-                        .await;
+                    match (
+                        generation,
+                        binding_nonce,
+                        binding_generation,
+                        agent_id,
+                        scope_type,
+                        scope_id,
+                        protocol,
+                        protocol_version,
+                    ) {
+                        (
+                            None,
+                            Some(nonce),
+                            Some(owner_generation),
+                            Some(agent_id),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ) => {
+                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
+                                session_id,
+                                nonce,
+                                owner_generation,
+                                agent_id,
+                            ) {
+                                let (session_id, generation, agent_id) =
+                                    binding.into_routing_parts();
+                                rtc_sessions
+                                    .handle_candidate(session_id, generation, agent_id, candidate)
+                                    .await;
+                            }
+                        }
+                        (Some(generation), None, None, Some(agent_id), None, None, None, None) => {
+                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_legacy(
+                                session_id, generation, agent_id,
+                            ) {
+                                let (session_id, generation, agent_id) =
+                                    binding.into_routing_parts();
+                                rtc_sessions
+                                    .handle_candidate(session_id, generation, agent_id, candidate)
+                                    .await;
+                            }
+                        }
+                        (
+                            None,
+                            Some(binding_nonce),
+                            None,
+                            None,
+                            scope_type,
+                            scope_id,
+                            protocol,
+                            protocol_version,
+                        ) => {
+                            rtc_sessions
+                                .handle_host_candidate(
+                                    HostRtcSignal {
+                                        session_id,
+                                        binding_nonce: Some(binding_nonce),
+                                        scope_type,
+                                        scope_id,
+                                        protocol,
+                                        protocol_version,
+                                    },
+                                    candidate,
+                                )
+                                .await;
+                        }
+                        _ => tracing::warn!("rejecting malformed mixed-scope rtc candidate"),
+                    }
                 }
                 Inbound::RtcClose {
                     session_id,
                     generation,
+                    binding_nonce,
+                    binding_generation,
                     agent_id,
+                    scope_type,
+                    scope_id,
+                    protocol,
+                    protocol_version,
                 } => {
-                    rtc_sessions.close(&session_id, &generation, agent_id).await;
+                    match (
+                        generation,
+                        binding_nonce,
+                        binding_generation,
+                        agent_id,
+                        scope_type,
+                        scope_id,
+                        protocol,
+                        protocol_version,
+                    ) {
+                        (
+                            None,
+                            Some(nonce),
+                            Some(owner_generation),
+                            Some(agent_id),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ) => {
+                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
+                                session_id,
+                                nonce,
+                                owner_generation,
+                                agent_id,
+                            ) {
+                                let (session_id, generation, agent_id) =
+                                    binding.into_routing_parts();
+                                rtc_sessions.close(&session_id, &generation, agent_id).await;
+                            }
+                        }
+                        (Some(generation), None, None, Some(agent_id), None, None, None, None) => {
+                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_legacy(
+                                session_id, generation, agent_id,
+                            ) {
+                                let (session_id, generation, agent_id) =
+                                    binding.into_routing_parts();
+                                rtc_sessions.close(&session_id, &generation, agent_id).await;
+                            }
+                        }
+                        (
+                            None,
+                            Some(binding_nonce),
+                            None,
+                            None,
+                            scope_type,
+                            scope_id,
+                            protocol,
+                            protocol_version,
+                        ) => {
+                            rtc_sessions
+                                .close_host(HostRtcSignal {
+                                    session_id,
+                                    binding_nonce: Some(binding_nonce),
+                                    scope_type,
+                                    scope_id,
+                                    protocol,
+                                    protocol_version,
+                                })
+                                .await;
+                        }
+                        _ => tracing::warn!("rejecting malformed mixed-scope rtc close"),
+                    }
                 }
             },
             WsInbound::Binary {
@@ -2269,15 +2505,26 @@ async fn handle_agent_scroll(agent_id: Uuid, lines: i16, _registry: &AgentRegist
     tracing::debug!(%agent_id, lines, "ignoring deprecated agent.scroll frame");
 }
 
+struct SnapshotRequest {
+    request_id: Option<String>,
+    lines: u16,
+    plain: bool,
+    rtc_session_id: Option<String>,
+}
+
 async fn handle_agent_snapshot(
     agent_id: Uuid,
-    lines: u16,
-    _plain: bool,
-    rtc_session_id: Option<String>,
+    request: SnapshotRequest,
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
+    let SnapshotRequest {
+        request_id,
+        lines,
+        plain: _plain,
+        rtc_session_id,
+    } = request;
     let attach_outcome = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
     if attach_outcome != AttachOutcome::Attached {
         let message = match attach_outcome {
@@ -2315,6 +2562,7 @@ async fn handle_agent_snapshot(
         Ok(replay) => {
             let snapshot = Outbound::AgentSnapshot {
                 agent_id,
+                request_id,
                 bytes_b64: STANDARD.encode(replay.bytes()),
                 dc_offset,
                 rtc_session_id,
@@ -2338,6 +2586,7 @@ async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
 #[allow(clippy::too_many_arguments)]
 async fn handle_agent_upload(
     agent_id: Uuid,
+    request_id: Option<String>,
     cwd: String,
     name: String,
     mime_type: String,
@@ -2375,6 +2624,7 @@ async fn handle_agent_upload(
             let uploaded = Outbound::AgentUploaded {
                 agent_id,
                 path: path.to_string_lossy().into_owned(),
+                request_id,
                 client_id,
             };
             if let Ok(s) = serde_json::to_string(&uploaded) {
@@ -2384,8 +2634,27 @@ async fn handle_agent_upload(
         }
         Err(e) => {
             tracing::warn!(%agent_id, error = %e, "upload failed");
-            send_error(out_tx, Some(agent_id), "upload_failed", &e).await;
+            send_upload_error(out_tx, agent_id, request_id, client_id, &e).await;
         }
+    }
+}
+
+async fn send_upload_error(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    agent_id: Uuid,
+    request_id: Option<String>,
+    client_id: Option<String>,
+    err: &anyhow::Error,
+) {
+    let frame = Outbound::Error {
+        agent_id: Some(agent_id),
+        code: "upload_failed".into(),
+        message: format!("{err:#}"),
+        request_id,
+        client_id,
+    };
+    if let Ok(s) = serde_json::to_string(&frame) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
     }
 }
 
@@ -2399,6 +2668,8 @@ async fn send_error(
         agent_id,
         code: code.into(),
         message: format!("{err:#}"),
+        request_id: None,
+        client_id: None,
     };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::Json(s)).await;

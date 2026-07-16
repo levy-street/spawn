@@ -28,6 +28,36 @@ class _FakeWS:
         pass
 
 
+async def _accept_daemon(daemon, *, generation: int = 1) -> None:
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.broker import get_broker
+    from spawn_server.ws.host_signal import (
+        HOST_DAEMON_PRESENCE_TTL_SECONDS,
+        HostPresenceOwner,
+        encode_host_presence_owner,
+        host_presence_key,
+    )
+
+    daemon.host_generation = generation
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, daemon.host_id)
+        assert host is not None
+        host.daemon_connection_id = daemon.id
+        host.daemon_generation = generation
+        host.daemon_generation_counter = generation
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+    await get_backend().set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+    assert await get_broker().accept_daemon_owner(daemon, generation)
+
+
 async def test_agent_patch_name_archive_and_delete(client):
     token = await _signup(client, "agent-owner@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -322,6 +352,7 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
     r = await client.post(
@@ -383,8 +414,22 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
                 break
         await asyncio.sleep(0.01)
     sent = json.loads(fake_ws.sent_text[-1])
-    assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123, "plain": True}
-    await broker.resolve_snapshot(agent_id, {"bytes_b64": base64.b64encode(b"screen").decode("ascii")})
+    assert sent == {
+        "type": "agent.snapshot",
+        "request_id": sent["request_id"],
+        "agent_id": agent_id,
+        "lines": 123,
+        "plain": True,
+    }
+    assert await broker.resolve_snapshot(
+        agent_id,
+        {
+            "request_id": sent["request_id"],
+            "bytes_b64": base64.b64encode(b"screen").decode("ascii"),
+        },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
     r = await snapshot_task
     assert r.status_code == 200, r.text
     assert base64.b64decode(r.json()["bytes_b64"]) == b"screen"
@@ -420,8 +465,15 @@ async def test_agent_rest_control_dispatches_browser_equivalent_frames(client):
     assert sent["client_id"] == "rest-upload-1"
     await broker.resolve_upload(
         agent_id,
-        "rest-upload-1",
-        {"agent_id": agent_id, "path": "/repo/notes.txt", "client_id": "rest-upload-1"},
+        sent["request_id"],
+        {
+            "agent_id": agent_id,
+            "path": "/repo/notes.txt",
+            "client_id": "rest-upload-1",
+            "request_id": sent["request_id"],
+        },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await upload_task
     assert r.status_code == 200, r.text
@@ -471,6 +523,7 @@ async def test_agent_multipart_upload_file_dispatches_daemon_frame(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
     upload_task = asyncio.create_task(
@@ -500,8 +553,15 @@ async def test_agent_multipart_upload_file_dispatches_daemon_frame(client):
     assert sent["client_id"] == "multipart-upload-1"
     await broker.resolve_upload(
         agent_id,
-        "multipart-upload-1",
-        {"agent_id": agent_id, "path": "/repo/notes.txt", "client_id": "multipart-upload-1"},
+        sent["request_id"],
+        {
+            "agent_id": agent_id,
+            "path": "/repo/notes.txt",
+            "client_id": "multipart-upload-1",
+            "request_id": sent["request_id"],
+        },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await upload_task
     assert r.status_code == 200, r.text

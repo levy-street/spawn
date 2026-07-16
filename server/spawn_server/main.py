@@ -25,6 +25,8 @@ from .routes import presets as presets_routes
 from .routes import screens as screens_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
+from .ws import host as host_ws
+from .ws.broker import get_broker
 
 log = logging.getLogger("spawn.main")
 
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await hosts_routes.stop_auto_update_checker()
+        await get_broker().shutdown()
         await redis_shutdown()
         await dispose_engine()
 
@@ -78,6 +81,7 @@ def create_app() -> FastAPI:
 
     app.include_router(daemon_ws.router)
     app.include_router(browser_ws.router)
+    app.include_router(host_ws.router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

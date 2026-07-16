@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -24,6 +25,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -37,6 +39,14 @@ use crate::pty::{ForwarderControl, WsOutbound};
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
+const HOST_CONTROL_LABEL: &str = "spawn.host.ctl";
+const RTC_PROTOCOL_VERSION: u16 = 1;
+const HOST_CONTROL_MAX_FRAME_BYTES: usize = 16 * 1024;
+const HOST_CONTROL_MAX_REQUEST_ID_BYTES: usize = 128;
+const HOST_CONTROL_MAX_IN_FLIGHT: usize = 32;
+const MAX_RTC_PEERS: usize = 128;
+const MAX_HOST_RTC_PEERS: usize = 64;
+const MAX_SAFE_SIGNAL_GENERATION: u64 = 9_007_199_254_740_991;
 
 /// Peer connections that never reach `Connected` within this window are
 /// reaped. Closing is the daemon's own defense: `rtc.close` delivery from the
@@ -55,12 +65,62 @@ type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
 #[derive(Default, Clone)]
 pub struct RtcSessions {
     peers: Arc<Mutex<HashMap<String, RtcPeer>>>,
+    host_peers: Arc<Mutex<HashMap<String, HostRtcPeer>>>,
+    admission: Arc<Mutex<()>>,
+    registered_host_id: Arc<Mutex<Option<Uuid>>>,
     agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
     #[cfg(test)]
     peer_insert_attempted: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     pty_send_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+}
+
+#[derive(Clone)]
+struct HostRtcPeer {
+    pc: Arc<RTCPeerConnection>,
+    binding: HostRtcBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostRtcBinding {
+    host_id: Uuid,
+    binding_nonce: String,
+    protocol: String,
+    protocol_version: u16,
+}
+
+/// Immutable host-scope identity supplied on offer/candidate/close frames.
+#[derive(Clone)]
+pub struct HostRtcSignal {
+    pub session_id: String,
+    pub binding_nonce: Option<String>,
+    pub scope_type: Option<String>,
+    pub scope_id: Option<Uuid>,
+    pub protocol: Option<String>,
+    pub protocol_version: Option<u16>,
+}
+
+impl HostRtcSignal {
+    fn binding(&self) -> Option<HostRtcBinding> {
+        let nonce = self.binding_nonce.as_ref()?;
+        if nonce.len() != 32
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.scope_type.as_deref() != Some("host")
+            || self.protocol.as_deref() != Some(HOST_CONTROL_LABEL)
+            || self.protocol_version != Some(RTC_PROTOCOL_VERSION)
+        {
+            return None;
+        }
+        Some(HostRtcBinding {
+            host_id: self.scope_id?,
+            binding_nonce: nonce.clone(),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -84,18 +144,72 @@ struct RtcPeer {
 #[derive(Clone)]
 pub struct RtcSessionBinding {
     session_id: String,
+    binding_nonce: String,
     generation: String,
     agent_id: Uuid,
+    legacy_signal: bool,
 }
 
 impl RtcSessionBinding {
+    #[cfg(test)]
     pub fn new(session_id: String, generation: String, agent_id: Uuid) -> Self {
         Self {
             session_id,
+            binding_nonce: generation.clone(),
             generation,
             agent_id,
+            legacy_signal: true,
         }
     }
+
+    pub fn from_legacy(session_id: String, generation: String, agent_id: Uuid) -> Option<Self> {
+        if !valid_binding_nonce(&generation) {
+            return None;
+        }
+        Some(Self {
+            session_id,
+            binding_nonce: generation.clone(),
+            generation,
+            agent_id,
+            legacy_signal: true,
+        })
+    }
+
+    /// Bind an agent RTC attempt to both the browser nonce and the durable
+    /// daemon-owner generation selected by the signaling server. The
+    /// composite key is daemon-local only; signaling responses echo the nonce
+    /// and the server restores its own generation token.
+    pub fn from_server(
+        session_id: String,
+        binding_nonce: String,
+        binding_generation: u64,
+        agent_id: Uuid,
+    ) -> Option<Self> {
+        if !valid_binding_nonce(&binding_nonce)
+            || binding_generation == 0
+            || binding_generation > MAX_SAFE_SIGNAL_GENERATION
+        {
+            return None;
+        }
+        Some(Self {
+            session_id,
+            generation: format!("{binding_generation}:{binding_nonce}"),
+            binding_nonce,
+            agent_id,
+            legacy_signal: false,
+        })
+    }
+
+    pub fn into_routing_parts(self) -> (String, String, Uuid) {
+        (self.session_id, self.generation, self.agent_id)
+    }
+}
+
+fn valid_binding_nonce(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone)]
@@ -120,6 +234,15 @@ impl RtcSessions {
         Self::default()
     }
 
+    pub async fn bind_registered_host_id(&self, host_id: Uuid) -> bool {
+        let mut registered = self.registered_host_id.lock().await;
+        if registered.is_some_and(|current| current != host_id) {
+            return false;
+        }
+        *registered = Some(host_id);
+        true
+    }
+
     pub async fn handle_offer(
         &self,
         binding: RtcSessionBinding,
@@ -132,8 +255,9 @@ impl RtcSessions {
             send_status(
                 &out_tx,
                 binding.session_id,
-                binding.generation,
+                binding.binding_nonce,
                 binding.agent_id,
+                binding.legacy_signal,
                 "failed",
                 Some("agent is not running on this daemon"),
             )
@@ -144,8 +268,9 @@ impl RtcSessions {
             send_status(
                 &out_tx,
                 binding.session_id,
-                binding.generation,
+                binding.binding_nonce,
                 binding.agent_id,
+                binding.legacy_signal,
                 "failed",
                 Some("agent backend was replaced while binding RTC"),
             )
@@ -171,8 +296,9 @@ impl RtcSessions {
             send_status(
                 &out_tx,
                 bound.signaling.session_id,
-                bound.signaling.generation,
+                bound.signaling.binding_nonce,
                 bound.signaling.agent_id,
+                bound.signaling.legacy_signal,
                 "failed",
                 Some(&format!("{e:#}")),
             )
@@ -230,6 +356,7 @@ impl RtcSessions {
         // used to invalidate the registry entry and scan old peers.
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
+        let _admission = self.admission.lock().await;
         let transition = registry
             .lock_generation_transition(binding.signaling.agent_id)
             .await;
@@ -241,9 +368,18 @@ impl RtcSessions {
 
         // Track the peer connection BEFORE SDP negotiation so every exit path
         // below can reach it and close it.
-        let collision = {
+        let host_collision = self
+            .host_peers
+            .lock()
+            .await
+            .contains_key(&binding.signaling.session_id);
+        let collision_or_capacity = {
             let mut peers = self.peers.lock().await;
-            if peers.contains_key(&binding.signaling.session_id) {
+            let total = peers.len() + self.host_peers.lock().await.len();
+            if host_collision
+                || peers.contains_key(&binding.signaling.session_id)
+                || total >= MAX_RTC_PEERS
+            {
                 true
             } else {
                 peers.insert(
@@ -261,10 +397,11 @@ impl RtcSessions {
             }
         };
         drop(transition);
-        if collision {
+        if collision_or_capacity {
             let _ = pc.close().await;
-            anyhow::bail!("rtc session id is already active");
+            anyhow::bail!("rtc session admission rejected");
         }
+        drop(_admission);
 
         install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
         install_data_channel_handler(
@@ -298,17 +435,253 @@ impl RtcSessions {
             }
         };
 
+        let signal_generation = binding
+            .signaling
+            .legacy_signal
+            .then(|| binding.signaling.binding_nonce.clone());
+        let binding_nonce =
+            (!binding.signaling.legacy_signal).then(|| binding.signaling.binding_nonce.clone());
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
                 session_id: binding.signaling.session_id,
-                generation: binding.signaling.generation,
-                agent_id: binding.signaling.agent_id,
+                generation: signal_generation,
+                binding_nonce,
+                agent_id: Some(binding.signaling.agent_id),
+                scope_type: None,
+                scope_id: None,
+                protocol: None,
+                protocol_version: None,
                 sdp: local_sdp,
             },
         )
         .await;
         Ok(())
+    }
+
+    pub async fn handle_host_offer(
+        &self,
+        signal: HostRtcSignal,
+        sdp: String,
+        ice_servers: Vec<RtcIceServerConfig>,
+        ice_transport_policy: Option<String>,
+        out_tx: mpsc::Sender<WsOutbound>,
+    ) {
+        let Some(binding) = signal.binding() else {
+            tracing::warn!(session_id = %signal.session_id, "rejecting invalid host rtc offer binding");
+            return;
+        };
+        if *self.registered_host_id.lock().await != Some(binding.host_id) {
+            tracing::warn!(session_id = %signal.session_id, "rejecting host rtc offer for another daemon");
+            return;
+        }
+        if let Err(error) = self
+            .create_host_answer(
+                signal.session_id.clone(),
+                binding.clone(),
+                sdp,
+                ice_servers,
+                ice_transport_policy,
+                out_tx.clone(),
+            )
+            .await
+        {
+            tracing::warn!(session_id = %signal.session_id, %error, "host rtc offer failed");
+            send_host_status(&out_tx, signal.session_id, &binding, "failed").await;
+        }
+    }
+
+    async fn create_host_answer(
+        &self,
+        session_id: String,
+        binding: HostRtcBinding,
+        sdp: String,
+        ice_servers: Vec<RtcIceServerConfig>,
+        ice_transport_policy: Option<String>,
+        out_tx: mpsc::Sender<WsOutbound>,
+    ) -> Result<()> {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .context("registering WebRTC codecs")?;
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        setting_engine.set_interface_filter(Box::new(|name: &str| {
+            !(name.starts_with("docker")
+                || name.starts_with("br-")
+                || name.starts_with("veth")
+                || name == "lo")
+        }));
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
+            .build();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration {
+                ice_servers: ice_servers.into_iter().map(to_webrtc_ice_server).collect(),
+                ice_transport_policy: parse_ice_transport_policy(ice_transport_policy.as_deref())?,
+                ..Default::default()
+            })
+            .await
+            .context("creating host peer connection")?,
+        );
+
+        let _admission = self.admission.lock().await;
+        let agent_count = self.peers.lock().await.len();
+        let admitted = {
+            let mut hosts = self.host_peers.lock().await;
+            if hosts.contains_key(&session_id)
+                || hosts.len() >= MAX_HOST_RTC_PEERS
+                || agent_count + hosts.len() >= MAX_RTC_PEERS
+                || self.peers.lock().await.contains_key(&session_id)
+            {
+                false
+            } else {
+                hosts.insert(
+                    session_id.clone(),
+                    HostRtcPeer {
+                        pc: Arc::clone(&pc),
+                        binding: binding.clone(),
+                    },
+                );
+                true
+            }
+        };
+        if !admitted {
+            let _ = pc.close().await;
+            anyhow::bail!("host rtc session admission rejected");
+        }
+        drop(_admission);
+
+        install_host_ice_handler(&pc, session_id.clone(), binding.clone(), out_tx.clone());
+        install_host_data_channel_handler(&pc, session_id.clone(), binding.clone(), out_tx.clone());
+        self.install_host_reaper(&pc, session_id.clone());
+
+        let local_sdp = match negotiate(&pc, sdp).await {
+            Ok(sdp) => sdp,
+            Err(error) => {
+                self.close_host_if_same(&session_id, &pc).await;
+                return Err(error);
+            }
+        };
+        send_json(
+            &out_tx,
+            Outbound::RtcAnswer {
+                session_id,
+                generation: None,
+                binding_nonce: Some(binding.binding_nonce),
+                agent_id: None,
+                scope_type: Some("host".to_string()),
+                scope_id: Some(binding.host_id),
+                protocol: Some(binding.protocol),
+                protocol_version: Some(binding.protocol_version),
+                sdp: local_sdp,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    fn install_host_reaper(&self, pc: &Arc<RTCPeerConnection>, session_id: String) {
+        let weak = Arc::downgrade(pc);
+        {
+            let sessions = self.clone();
+            let session_id = session_id.clone();
+            let weak = weak.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RTC_CONNECT_TIMEOUT).await;
+                let Some(pc) = weak.upgrade() else { return };
+                if pc.connection_state() != RTCPeerConnectionState::Connected {
+                    sessions.close_host_if_same(&session_id, &pc).await;
+                }
+            });
+        }
+        let sessions = self.clone();
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let sessions = sessions.clone();
+            let session_id = session_id.clone();
+            let weak = weak.clone();
+            Box::pin(async move {
+                let delay = match state {
+                    RTCPeerConnectionState::Failed => Some(Duration::ZERO),
+                    RTCPeerConnectionState::Disconnected => Some(RTC_DISCONNECTED_GRACE),
+                    _ => None,
+                };
+                let Some(delay) = delay else { return };
+                let Some(pc) = weak.upgrade() else { return };
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if delay.is_zero()
+                        || pc.connection_state() == RTCPeerConnectionState::Disconnected
+                    {
+                        sessions.close_host_if_same(&session_id, &pc).await;
+                    }
+                });
+            })
+        }));
+    }
+
+    async fn close_host_if_same(&self, session_id: &str, pc: &Arc<RTCPeerConnection>) {
+        let removed = {
+            let mut peers = self.host_peers.lock().await;
+            if peers
+                .get(session_id)
+                .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
+            {
+                peers.remove(session_id)
+            } else {
+                None
+            }
+        };
+        if let Some(peer) = removed {
+            let _ = peer.pc.close().await;
+        } else {
+            let _ = pc.close().await;
+        }
+    }
+
+    pub async fn handle_host_candidate(&self, signal: HostRtcSignal, candidate: Value) {
+        let Some(binding) = signal.binding() else {
+            return;
+        };
+        let Some(peer) = self
+            .host_peers
+            .lock()
+            .await
+            .get(&signal.session_id)
+            .cloned()
+        else {
+            return;
+        };
+        if peer.binding != binding {
+            tracing::warn!(session_id = %signal.session_id, "ignoring stale host rtc candidate binding");
+            return;
+        }
+        if let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(candidate) {
+            if let Err(error) = peer.pc.add_ice_candidate(candidate).await {
+                tracing::debug!(session_id = %signal.session_id, %error, "adding host rtc candidate failed");
+            }
+        }
+    }
+
+    pub async fn close_host(&self, signal: HostRtcSignal) {
+        let Some(binding) = signal.binding() else {
+            return;
+        };
+        let peer = {
+            let mut peers = self.host_peers.lock().await;
+            if peers
+                .get(&signal.session_id)
+                .is_some_and(|peer| peer.binding == binding)
+            {
+                peers.remove(&signal.session_id)
+            } else {
+                None
+            }
+        };
+        if let Some(peer) = peer {
+            let _ = peer.pc.close().await;
+        }
     }
 
     /// Self-defense against missed `rtc.close` signals: close the peer if it
@@ -534,11 +907,15 @@ impl RtcSessions {
         for (session_id, peer) in peers {
             self.deactivate_peer(&session_id, peer).await;
         }
+        let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
+        for (_, peer) in host_peers {
+            let _ = peer.pc.close().await;
+        }
     }
 
     #[cfg(test)]
     async fn resident_session_count(&self) -> usize {
-        self.peers.lock().await.len()
+        self.peers.lock().await.len() + self.host_peers.lock().await.len()
     }
 
     #[cfg(test)]
@@ -589,12 +966,22 @@ fn install_ice_handler(
             };
             match serde_json::to_value(candidate) {
                 Ok(candidate) => {
+                    let signal_generation = binding
+                        .legacy_signal
+                        .then(|| binding.binding_nonce.clone());
+                    let binding_nonce =
+                        (!binding.legacy_signal).then(|| binding.binding_nonce.clone());
                     send_json(
                         &out_tx,
                         Outbound::RtcCandidate {
                             session_id: binding.session_id,
-                            generation: binding.generation,
-                            agent_id: binding.agent_id,
+                            generation: signal_generation,
+                            binding_nonce,
+                            agent_id: Some(binding.agent_id),
+                            scope_type: None,
+                            scope_id: None,
+                            protocol: None,
+                            protocol_version: None,
                             candidate,
                         },
                     )
@@ -682,7 +1069,8 @@ fn install_data_channel_handler(
 
             let open_registry = registry.clone();
             let open_session_id = binding.signaling.session_id.clone();
-            let open_generation = binding.signaling.generation.clone();
+            let open_binding_nonce = binding.signaling.binding_nonce.clone();
+            let open_legacy_signal = binding.signaling.legacy_signal;
             let open_viewer_id = viewer_id.clone();
             let open_out_tx = out_tx.clone();
             let open_dc = Arc::clone(&dc);
@@ -692,7 +1080,8 @@ fn install_data_channel_handler(
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
                 let session_id = open_session_id.clone();
-                let generation = open_generation.clone();
+                let binding_nonce = open_binding_nonce.clone();
+                let legacy_signal = open_legacy_signal;
                 let viewer_id = open_viewer_id.clone();
                 let out_tx = open_out_tx.clone();
                 let dc = Arc::clone(&open_dc);
@@ -713,8 +1102,9 @@ fn install_data_channel_handler(
                         send_status(
                             &out_tx,
                             session_id,
-                            generation,
+                            binding_nonce,
                             agent_id,
+                            legacy_signal,
                             "failed",
                             Some("worker replay is unavailable"),
                         )
@@ -727,8 +1117,9 @@ fn install_data_channel_handler(
                         send_status(
                             &out_tx,
                             session_id,
-                            generation,
+                            binding_nonce,
                             agent_id,
+                            legacy_signal,
                             "failed",
                             Some("worker replay barrier failed"),
                         )
@@ -750,8 +1141,9 @@ fn install_data_channel_handler(
                         send_status(
                             &out_tx,
                             session_id,
-                            generation,
+                            binding_nonce,
                             agent_id,
+                            legacy_signal,
                             "failed",
                             Some("worker live-stream barrier timed out"),
                         )
@@ -772,8 +1164,9 @@ fn install_data_channel_handler(
                     send_status(
                         &out_tx,
                         session_id.clone(),
-                        generation,
+                        binding_nonce,
                         agent_id,
+                        legacy_signal,
                         "connected",
                         None,
                     )
@@ -1382,20 +1775,223 @@ fn to_webrtc_ice_server(config: RtcIceServerConfig) -> RTCIceServer {
     }
 }
 
-async fn send_status(
+fn parse_ice_transport_policy(value: Option<&str>) -> Result<RTCIceTransportPolicy> {
+    match value {
+        Some("relay") => Ok(RTCIceTransportPolicy::Relay),
+        Some("all") | None => Ok(RTCIceTransportPolicy::All),
+        Some(_) => anyhow::bail!("unsupported ICE transport policy"),
+    }
+}
+
+fn install_host_ice_handler(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: String,
+    binding: HostRtcBinding,
+    out_tx: mpsc::Sender<WsOutbound>,
+) {
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let session_id = session_id.clone();
+        let binding = binding.clone();
+        let out_tx = out_tx.clone();
+        Box::pin(async move {
+            let Some(candidate) = candidate else { return };
+            let Ok(candidate) = candidate.to_json() else {
+                return;
+            };
+            let Ok(candidate) = serde_json::to_value(candidate) else {
+                return;
+            };
+            send_json(
+                &out_tx,
+                Outbound::RtcCandidate {
+                    session_id,
+                    generation: None,
+                    binding_nonce: Some(binding.binding_nonce),
+                    agent_id: None,
+                    scope_type: Some("host".to_string()),
+                    scope_id: Some(binding.host_id),
+                    protocol: Some(binding.protocol),
+                    protocol_version: Some(binding.protocol_version),
+                    candidate,
+                },
+            )
+            .await;
+        })
+    }));
+}
+
+fn install_host_data_channel_handler(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: String,
+    binding: HostRtcBinding,
+    out_tx: mpsc::Sender<WsOutbound>,
+) {
+    let accepted = Arc::new(AtomicBool::new(false));
+    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let accepted = Arc::clone(&accepted);
+        let session_id = session_id.clone();
+        let binding = binding.clone();
+        let out_tx = out_tx.clone();
+        Box::pin(async move {
+            if dc.label() != HOST_CONTROL_LABEL || accepted.swap(true, Ordering::AcqRel) {
+                let _ = dc.close().await;
+                return;
+            }
+            install_host_control_channel(dc, session_id, binding, out_tx);
+        })
+    }));
+}
+
+enum HostControlAction {
+    Reply(String),
+    Close,
+}
+
+fn host_control_response(data: &[u8], is_string: bool) -> HostControlAction {
+    if !is_string || data.is_empty() || data.len() > HOST_CONTROL_MAX_FRAME_BYTES {
+        return HostControlAction::Close;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        return HostControlAction::Close;
+    };
+    let Some(object) = value.as_object() else {
+        return HostControlAction::Close;
+    };
+    if object.get("version").and_then(Value::as_u64) != Some(u64::from(RTC_PROTOCOL_VERSION)) {
+        return HostControlAction::Close;
+    }
+    let Some(request_id) = object.get("request_id").and_then(Value::as_str) else {
+        return HostControlAction::Close;
+    };
+    if request_id.is_empty() || request_id.len() > HOST_CONTROL_MAX_REQUEST_ID_BYTES {
+        return HostControlAction::Close;
+    }
+    let response = match object.get("type").and_then(Value::as_str) {
+        Some("request") if object.get("operation").and_then(Value::as_str) == Some("ping") => {
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "response",
+                "request_id": request_id,
+                "ok": true,
+                "result": {"pong": true}
+            })
+        }
+        Some("cancel") => json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "response",
+            "request_id": request_id,
+            "ok": false,
+            "error": {"code": "cancelled"}
+        }),
+        Some("request") => json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "response",
+            "request_id": request_id,
+            "ok": false,
+            "error": {"code": "unsupported_operation"}
+        }),
+        _ => return HostControlAction::Close,
+    };
+    HostControlAction::Reply(response.to_string())
+}
+
+fn install_host_control_channel(
+    dc: Arc<RTCDataChannel>,
+    session_id: String,
+    binding: HostRtcBinding,
+    out_tx: mpsc::Sender<WsOutbound>,
+) {
+    let message_dc = Arc::clone(&dc);
+    let in_flight = Arc::new(Semaphore::new(HOST_CONTROL_MAX_IN_FLIGHT));
+    dc.on_message(Box::new(move |message: DataChannelMessage| {
+        let dc = Arc::clone(&message_dc);
+        let in_flight = Arc::clone(&in_flight);
+        Box::pin(async move {
+            let Ok(_permit) = in_flight.try_acquire_owned() else {
+                let _ = dc.close().await;
+                return;
+            };
+            match host_control_response(&message.data, message.is_string) {
+                HostControlAction::Reply(response) => {
+                    if dc.send_text(response).await.is_err() {
+                        let _ = dc.close().await;
+                    }
+                }
+                HostControlAction::Close => {
+                    let _ = dc.close().await;
+                }
+            }
+        })
+    }));
+
+    let open_dc = Arc::clone(&dc);
+    dc.on_open(Box::new(move || {
+        let dc = Arc::clone(&open_dc);
+        let out_tx = out_tx.clone();
+        let session_id = session_id.clone();
+        let binding = binding.clone();
+        Box::pin(async move {
+            let hello = json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "hello",
+                "protocol": HOST_CONTROL_LABEL,
+                "capabilities": ["ping"]
+            });
+            if dc.send_text(hello.to_string()).await.is_ok() {
+                send_host_status(&out_tx, session_id, &binding, "connected").await;
+            } else {
+                let _ = dc.close().await;
+            }
+        })
+    }));
+}
+
+async fn send_host_status(
     out_tx: &mpsc::Sender<WsOutbound>,
     session_id: String,
-    generation: String,
-    agent_id: Uuid,
+    binding: &HostRtcBinding,
     status: &str,
-    message: Option<&str>,
 ) {
     send_json(
         out_tx,
         Outbound::RtcStatus {
             session_id,
-            generation,
-            agent_id,
+            generation: None,
+            binding_nonce: Some(binding.binding_nonce.clone()),
+            agent_id: None,
+            scope_type: Some("host".to_string()),
+            scope_id: Some(binding.host_id),
+            protocol: Some(binding.protocol.clone()),
+            protocol_version: Some(binding.protocol_version),
+            status: status.to_string(),
+            message: None,
+        },
+    )
+    .await;
+}
+
+async fn send_status(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    session_id: String,
+    binding_nonce: String,
+    agent_id: Uuid,
+    legacy_signal: bool,
+    status: &str,
+    message: Option<&str>,
+) {
+    let signal_generation = legacy_signal.then(|| binding_nonce.clone());
+    let bound_nonce = (!legacy_signal).then_some(binding_nonce);
+    send_json(
+        out_tx,
+        Outbound::RtcStatus {
+            session_id,
+            generation: signal_generation,
+            binding_nonce: bound_nonce,
+            agent_id: Some(agent_id),
+            scope_type: None,
+            scope_id: None,
+            protocol: None,
+            protocol_version: None,
             status: status.to_string(),
             message: message.map(str::to_string),
         },
@@ -2597,5 +3193,239 @@ mod tests {
         assert!(
             crate::pty::OutputChunk::classify(b"genuine output".to_vec(), &control).is_activity()
         );
+    }
+
+    #[test]
+    fn server_agent_binding_requires_nonce_and_safe_owner_generation() {
+        let agent_id = Uuid::new_v4();
+        let nonce = "a".repeat(32);
+        let first =
+            RtcSessionBinding::from_server("session".to_string(), nonce.clone(), 1, agent_id)
+                .unwrap();
+        let second =
+            RtcSessionBinding::from_server("session".to_string(), nonce.clone(), 2, agent_id)
+                .unwrap();
+        assert_eq!(first.binding_nonce, nonce);
+        assert!(!first.legacy_signal);
+        assert_ne!(first.generation, second.generation);
+        let legacy =
+            RtcSessionBinding::from_legacy("legacy".to_string(), "f".repeat(32), agent_id).unwrap();
+        assert!(legacy.legacy_signal);
+        assert!(
+            RtcSessionBinding::from_legacy("legacy".to_string(), "weak".to_string(), agent_id,)
+                .is_none()
+        );
+        assert!(RtcSessionBinding::from_server(
+            "session".to_string(),
+            "not-a-nonce".to_string(),
+            1,
+            agent_id,
+        )
+        .is_none());
+        assert!(
+            RtcSessionBinding::from_server("session".to_string(), "b".repeat(32), 0, agent_id,)
+                .is_none()
+        );
+        assert!(RtcSessionBinding::from_server(
+            "session".to_string(),
+            "b".repeat(32),
+            MAX_SAFE_SIGNAL_GENERATION + 1,
+            agent_id,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn host_binding_requires_exact_identity_protocol_and_nonce() {
+        let host_id = Uuid::new_v4();
+        let valid = HostRtcSignal {
+            session_id: "host-session".to_string(),
+            binding_nonce: Some("c".repeat(32)),
+            scope_type: Some("host".to_string()),
+            scope_id: Some(host_id),
+            protocol: Some(HOST_CONTROL_LABEL.to_string()),
+            protocol_version: Some(RTC_PROTOCOL_VERSION),
+        };
+        assert_eq!(valid.binding().unwrap().host_id, host_id);
+
+        let mut invalid = valid.clone();
+        invalid.scope_type = Some("agent".to_string());
+        assert!(invalid.binding().is_none());
+        let mut invalid = valid.clone();
+        invalid.protocol = Some(CONTROL_DATA_CHANNEL_LABEL.to_string());
+        assert!(invalid.binding().is_none());
+        let mut invalid = valid;
+        invalid.binding_nonce = Some("C".repeat(32));
+        assert!(invalid.binding().is_none());
+    }
+
+    #[test]
+    fn host_control_is_versioned_bounded_and_request_bound() {
+        let request =
+            br#"{"version":1,"type":"request","request_id":"request-1","operation":"ping"}"#;
+        let HostControlAction::Reply(response) = host_control_response(request, true) else {
+            panic!("expected ping response")
+        };
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["request_id"], "request-1");
+        assert_eq!(response["result"]["pong"], true);
+
+        assert!(matches!(
+            host_control_response(request, false),
+            HostControlAction::Close
+        ));
+        assert!(matches!(
+            host_control_response(
+                br#"{"version":2,"type":"request","request_id":"r","operation":"ping"}"#,
+                true,
+            ),
+            HostControlAction::Close
+        ));
+        assert!(matches!(
+            host_control_response(&vec![b'x'; HOST_CONTROL_MAX_FRAME_BYTES + 1], true),
+            HostControlAction::Close
+        ));
+        let long_id = "x".repeat(HOST_CONTROL_MAX_REQUEST_ID_BYTES + 1);
+        let frame = json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "request",
+            "request_id": long_id,
+            "operation": "ping"
+        })
+        .to_string();
+        assert!(matches!(
+            host_control_response(frame.as_bytes(), true),
+            HostControlAction::Close
+        ));
+    }
+
+    #[test]
+    fn host_ice_transport_policy_fails_closed() {
+        assert_eq!(
+            parse_ice_transport_policy(Some("relay")).unwrap(),
+            RTCIceTransportPolicy::Relay
+        );
+        assert_eq!(
+            parse_ice_transport_policy(Some("all")).unwrap(),
+            RTCIceTransportPolicy::All
+        );
+        assert!(parse_ice_transport_policy(Some("unknown")).is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_host_identity_binds_without_an_agent_and_cannot_be_rebound() {
+        let sessions = RtcSessions::new();
+        let host_id = Uuid::new_v4();
+        assert!(sessions.bind_registered_host_id(host_id).await);
+        assert!(sessions.bind_registered_host_id(host_id).await);
+        assert!(!sessions.bind_registered_host_id(Uuid::new_v4()).await);
+        assert!(sessions.peers.lock().await.is_empty());
+        assert!(sessions.host_peers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_agent_host_control_channel_exchanges_hello_and_ping() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let browser_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let daemon_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let channel = browser_pc
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let extra_channel = browser_pc
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(4);
+        for (index, data_channel) in [(0, &channel), (1, &extra_channel)] {
+            let messages_tx = messages_tx.clone();
+            data_channel.on_message(Box::new(move |message: DataChannelMessage| {
+                let messages_tx = messages_tx.clone();
+                Box::pin(async move {
+                    let _ = messages_tx
+                        .send((index, String::from_utf8_lossy(&message.data).into_owned()))
+                        .await;
+                })
+            }));
+        }
+
+        let host_id = Uuid::new_v4();
+        let binding = HostRtcBinding {
+            host_id,
+            binding_nonce: "d".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        install_host_data_channel_handler(&daemon_pc, "host-e2e".to_string(), binding, out_tx);
+
+        let offer = browser_pc.create_offer(None).await.unwrap();
+        let mut offer_gathered = browser_pc.gathering_complete_promise().await;
+        browser_pc.set_local_description(offer).await.unwrap();
+        let _ = offer_gathered.recv().await;
+        daemon_pc
+            .set_remote_description(browser_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+        let answer = daemon_pc.create_answer(None).await.unwrap();
+        let mut answer_gathered = daemon_pc.gathering_complete_promise().await;
+        daemon_pc.set_local_description(answer).await.unwrap();
+        let _ = answer_gathered.recv().await;
+        browser_pc
+            .set_remote_description(daemon_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+
+        let (accepted_index, hello) =
+            tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
+                .await
+                .expect("host control channel did not open")
+                .expect("host control channel closed before hello");
+        let hello: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["protocol"], HOST_CONTROL_LABEL);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let accepted_channel = if accepted_index == 0 {
+            &channel
+        } else {
+            &extra_channel
+        };
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-ping",
+                    "operation": "ping"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, response) = tokio::time::timeout(Duration::from_secs(10), messages_rx.recv())
+            .await
+            .expect("host control ping timed out")
+            .expect("host control channel closed before ping response");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["request_id"], "e2e-ping");
+        assert_eq!(response["result"]["pong"], true);
+
+        browser_pc.close().await.unwrap();
+        daemon_pc.close().await.unwrap();
     }
 }

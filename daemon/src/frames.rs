@@ -129,14 +129,17 @@ mod tests {
         let uploaded = Outbound::AgentUploaded {
             agent_id: Uuid::nil(),
             path: "/repo/.spawn/attachments/shot.png".into(),
+            request_id: Some("request-1".into()),
             client_id: Some("upload-1".into()),
         };
         let s = serde_json::to_string(&uploaded).unwrap();
         assert!(s.contains("\"type\":\"agent.uploaded\""));
+        assert!(s.contains("\"request_id\":\"request-1\""));
         assert!(s.contains("\"client_id\":\"upload-1\""));
 
         let snapshot = Outbound::AgentSnapshot {
             agent_id: Uuid::nil(),
+            request_id: Some("snapshot-1".into()),
             bytes_b64: "b2s=".into(),
             dc_offset: Some(42),
             rtc_session_id: Some("sess-1".into()),
@@ -203,6 +206,65 @@ mod tests {
                 assert_eq!(rows, 24);
             }
             _ => panic!("expected AgentResize"),
+        }
+    }
+
+    #[test]
+    fn rtc_signaling_parses_generation_bound_agent_and_strict_host_shapes() {
+        use crate::proto::Inbound;
+
+        let agent: Inbound = serde_json::from_str(
+            r#"{"type":"rtc.offer","session_id":"agent","agent_id":"00000000-0000-4000-8000-000000000001","binding_nonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_generation":7,"sdp":"v=0"}"#,
+        )
+        .unwrap();
+        match agent {
+            Inbound::RtcOffer {
+                agent_id,
+                binding_nonce,
+                binding_generation,
+                scope_type,
+                protocol,
+                ..
+            } => {
+                assert!(agent_id.is_some());
+                assert_eq!(
+                    binding_nonce.as_deref(),
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+                assert_eq!(binding_generation, Some(7));
+                assert!(scope_type.is_none());
+                assert!(protocol.is_none());
+            }
+            _ => panic!("expected agent RTC offer"),
+        }
+
+        let host: Inbound = serde_json::from_str(
+            r#"{"type":"rtc.offer","session_id":"host","binding_nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","scope_type":"host","scope_id":"00000000-0000-4000-8000-000000000002","protocol":"spawn.host.ctl","protocol_version":1,"sdp":"v=0","ice_transport_policy":"relay"}"#,
+        )
+        .unwrap();
+        match host {
+            Inbound::RtcOffer {
+                agent_id,
+                binding_nonce,
+                scope_type,
+                scope_id,
+                protocol,
+                protocol_version,
+                ice_transport_policy,
+                ..
+            } => {
+                assert!(agent_id.is_none());
+                assert_eq!(
+                    binding_nonce.as_deref(),
+                    Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                );
+                assert_eq!(scope_type.as_deref(), Some("host"));
+                assert!(scope_id.is_some());
+                assert_eq!(protocol.as_deref(), Some("spawn.host.ctl"));
+                assert_eq!(protocol_version, Some(1));
+                assert_eq!(ice_transport_policy.as_deref(), Some("relay"));
+            }
+            _ => panic!("expected host RTC offer"),
         }
     }
 
@@ -335,6 +397,7 @@ mod tests {
             r#"{
                 "type":"agent.upload",
                 "agent_id":"00000000-0000-0000-0000-000000000004",
+                "request_id":"request-1",
                 "cwd":"/repo",
                 "name":"shot.png",
                 "mime_type":"image/png",
@@ -348,6 +411,7 @@ mod tests {
         .unwrap();
         match upload {
             Inbound::AgentUpload {
+                request_id,
                 cwd,
                 name,
                 mime_type,
@@ -358,6 +422,7 @@ mod tests {
                 client_id,
                 ..
             } => {
+                assert_eq!(request_id.as_deref(), Some("request-1"));
                 assert_eq!(cwd, "/repo");
                 assert_eq!(name, "shot.png");
                 assert_eq!(mime_type, "image/png");

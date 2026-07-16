@@ -12,9 +12,18 @@ from spawn_server import auth, transcript
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
-from spawn_server.ws.broker import BrowserConn, DaemonConn, get_broker
+from spawn_server.redis import get_backend
+from spawn_server.ws.broker import DaemonConn, get_broker
 from spawn_server.ws.browser import INITIAL_SNAPSHOT_LINES, browser_ws
+from spawn_server.ws.daemon import _pump_host_rtc_signals
 from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
+from spawn_server.ws.host_signal import (
+    HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    HostPresenceOwner,
+    encode_host_presence_owner,
+    host_presence_key,
+    wait_for_signal_pump,
+)
 
 
 class FakeBrowserWebSocket:
@@ -135,12 +144,41 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) ->
     raise AssertionError("timed out waiting for condition")
 
 
+async def _accept_daemon(daemon: DaemonConn, *, generation: int = 1) -> None:
+    daemon.host_generation = generation
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, daemon.host_id)
+        assert host is not None
+        host.daemon_connection_id = daemon.id
+        host.daemon_generation = generation
+        host.daemon_generation_counter = generation
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+    await get_backend().set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+    assert await get_broker().accept_daemon_owner(daemon, generation)
+
+
 def _sent_json(ws: FakeBrowserWebSocket) -> list[dict[str, Any]]:
     return [json.loads(item) for item in ws.sent_text]
 
 
 def _messages_of_type(ws: FakeBrowserWebSocket, frame_type: str) -> list[dict[str, Any]]:
     return [item for item in _sent_json(ws) if item.get("type") == frame_type]
+
+
+def _daemon_messages_of_type(
+    ws: FakeDaemonWebSocket, frame_type: str
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in (json.loads(payload) for payload in ws.sent_text)
+        if item.get("type") == frame_type
+    ]
 
 
 async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(client):
@@ -204,6 +242,7 @@ async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client)
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
     broker = get_broker()
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
@@ -223,9 +262,18 @@ async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client)
         "type": "agent.snapshot",
         "agent_id": agent_id,
         "lines": INITIAL_SNAPSHOT_LINES,
+        "request_id": snapshot_request["request_id"],
     }
 
-    await broker.resolve_snapshot(agent_id, {"bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii")})
+    assert await broker.resolve_snapshot(
+        agent_id,
+        {
+            "request_id": snapshot_request["request_id"],
+            "bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii"),
+        },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
     await _wait_until(lambda: len(_messages_of_type(ws, "history")) >= 1)
     history = _messages_of_type(ws, "history")[-1]
     assert base64.b64decode(history["bytes_b64"]) == b"daemon history\n"
@@ -289,7 +337,14 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
     broker = get_broker()
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
+    signal_ready = asyncio.Event()
+    expiry_tasks: set[asyncio.Task[None]] = set()
+    signal_task = asyncio.create_task(
+        _pump_host_rtc_signals(daemon, signal_ready, expiry_tasks)
+    )
+    await wait_for_signal_pump(signal_task, signal_ready)
 
     ws.queue_bytes(b"hello")
     await _wait_until(lambda: len(daemon_ws.sent_bytes) >= 1)
@@ -336,6 +391,9 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         lambda: any(json.loads(item).get("type") == "agent.upload" for item in daemon_ws.sent_text)
     )
     upload = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.upload"][-1]
+    request_id = upload.pop("request_id")
+    assert isinstance(request_id, str)
+    assert request_id != "client-1"
     assert upload == {
         "type": "agent.upload",
         "agent_id": agent_id,
@@ -348,6 +406,26 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "destination": "cwd",
         "client_id": "client-1",
     }
+    result = {
+        "type": "agent.uploaded",
+        "agent_id": agent_id,
+        "request_id": request_id,
+        "client_id": "client-1",
+        "path": "/repo/note.txt",
+    }
+    assert await broker.resolve_upload(
+        agent_id,
+        request_id,
+        result,
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
+    await _wait_until(lambda: bool(_messages_of_type(ws, "upload.saved")))
+    assert _messages_of_type(ws, "upload.saved")[-1] == {
+        "type": "upload.saved",
+        "client_id": "client-1",
+        "path": "/repo/note.txt",
+    }
 
     ws.queue_text({"type": "redraw"})
     ws.queue_text({"type": "rtc.offer", "session_id": "rtc-browser-1", "sdp": "v=0\r\n"})
@@ -355,15 +433,17 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         lambda: any(json.loads(item).get("type") == "rtc.offer" for item in daemon_ws.sent_text)
     )
     offer = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "rtc.offer"][-1]
-    generation = offer.pop("generation")
     assert not any(
         json.loads(item).get("type") == "agent.redraw" for item in daemon_ws.sent_text
     )
-    assert isinstance(generation, str) and len(generation) == 32
+    binding_nonce = offer["binding_nonce"]
+    assert isinstance(binding_nonce, str) and len(binding_nonce) == 32
     assert offer == {
         "type": "rtc.offer",
         "session_id": "rtc-browser-1",
         "agent_id": agent_id,
+        "binding_nonce": binding_nonce,
+        "binding_generation": daemon.host_generation,
         "sdp": "v=0\r\n",
         "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
     }
@@ -378,46 +458,111 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         for item in daemon_ws.sent_text
         if json.loads(item).get("type") == "rtc.candidate"
     ][-1]
-    assert rtc_candidate.pop("generation") == generation
     assert rtc_candidate == {
         "type": "rtc.candidate",
         "session_id": "rtc-browser-1",
         "agent_id": agent_id,
+        "binding_nonce": binding_nonce,
+        "binding_generation": daemon.host_generation,
         "candidate": candidate,
     }
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
+    signal_task.cancel()
+    await asyncio.gather(signal_task, return_exceptions=True)
+    for expiry_task in expiry_tasks:
+        expiry_task.cancel()
+    await asyncio.gather(*expiry_tasks, return_exceptions=True)
     await broker.unregister_daemon(daemon)
 
 
-async def test_rtc_session_binding_rejects_reuse_and_stale_browser_actions():
-    broker = get_broker()
+async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, monkeypatch):
+    monkeypatch.setattr("spawn_server.ws.browser.BROWSER_UPLOAD_TIMEOUT_SECONDS", 0.03)
+    user_id, token = await _signup(client, "ws-browser-upload-results@example.com")
+    host_id, agent_id = await _create_host_and_agent(user_id)
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None, cols=80, rows=24)  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
+
     daemon_ws = FakeDaemonWebSocket()
-    daemon = DaemonConn(host_id="host-a", user_id="user-a", websocket=daemon_ws)  # type: ignore[arg-type]
-    first = BrowserConn(
-        user_id="user-a", agent_id="agent-a", websocket=FakeBrowserWebSocket()
-    )  # type: ignore[arg-type]
-    second = BrowserConn(
-        user_id="user-a", agent_id="agent-a", websocket=FakeBrowserWebSocket()
-    )  # type: ignore[arg-type]
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
 
-    binding = await broker.register_rtc_session("reused-id", first, "agent-a", daemon)
-    assert binding is not None
-    assert await broker.register_rtc_session("reused-id", second, "agent-a", daemon) is None
-    assert await broker.rtc_binding_for_browser("reused-id", second, "agent-a") is None
-    assert await broker.rtc_binding_for_browser("reused-id", first, "agent-b") is None
-    assert await broker.unregister_rtc_session("reused-id", second, "agent-a") is None
-    assert await broker.rtc_binding_for_browser("reused-id", first, "agent-a") == binding
+    body = base64.b64encode(b"body").decode("ascii")
+    ws.queue_text(
+        {
+            "type": "upload",
+            "name": "error.txt",
+            "mime_type": "text/plain",
+            "bytes_b64": body,
+            "destination": "cwd",
+            "client_id": "upload-error",
+        }
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "agent.upload"
+            and message.get("client_id") == "upload-error"
+            for message in (json.loads(item) for item in daemon_ws.sent_text)
+        )
+    )
+    request = [
+        json.loads(item)
+        for item in daemon_ws.sent_text
+        if json.loads(item).get("client_id") == "upload-error"
+    ][-1]
+    error = {
+        "type": "error",
+        "code": "upload_failed",
+        "message": "disk full",
+        "request_id": request["request_id"],
+        "client_id": "upload-error",
+    }
+    await broker.resolve_upload(
+        agent_id,
+        request["request_id"],
+        error,
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("client_id") == "upload-error"
+            for message in _messages_of_type(ws, "upload.error")
+        )
+    )
+    assert _messages_of_type(ws, "upload.error")[-1] == {
+        "type": "upload.error",
+        "client_id": "upload-error",
+        "message": "disk full",
+    }
 
-    assert await broker.unregister_rtc_session("reused-id", first, "agent-a") == binding
-    replacement = await broker.register_rtc_session("reused-id", second, "agent-a", daemon)
-    assert replacement is not None
-    assert replacement.generation != binding.generation
-    # A stale close from the old browser cannot remove the replacement.
-    assert await broker.unregister_rtc_session("reused-id", first, "agent-a") is None
-    assert await broker.rtc_binding_for_browser("reused-id", second, "agent-a") == replacement
-    await broker.unregister_rtc_session("reused-id", second, "agent-a")
+    ws.queue_text(
+        {
+            "type": "upload",
+            "name": "timeout.txt",
+            "mime_type": "text/plain",
+            "bytes_b64": body,
+            "destination": "cwd",
+            "client_id": "upload-timeout",
+        }
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("client_id") == "upload-timeout"
+            and message.get("message") == "Upload timed out."
+            for message in _messages_of_type(ws, "upload.error")
+        )
+    )
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
 
 
 async def test_browser_ws_fans_out_live_bytes_and_isolates_agents(client):
@@ -529,6 +674,166 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
         ws.queue_disconnect()
         await asyncio.wait_for(task, timeout=1)
         await broker.unregister_daemon(daemon)
+
+
+async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client, monkeypatch):
+    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    user_id, token = await _signup(client, "ws-browser-v2-binding@example.com")
+    host_id, agent_id = await _create_host_and_agent(user_id)
+
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    expiry_tasks: set[asyncio.Task[None]] = set()
+    signal_task: asyncio.Task[None] | None = None
+
+    ws = FakeBrowserWebSocket(
+        authorization=f"Bearer {token}", subprotocols=["spawn.v2"]
+    )
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None, cols=100, rows=30)  # type: ignore[arg-type]
+    )
+    session_id = "reused-v2-session"
+    nonce_a = "a" * 32
+    nonce_b = "b" * 32
+
+    try:
+        await _wait_until(lambda: bool(_messages_of_type(ws, "rtc.config")))
+        assert _messages_of_type(ws, "rtc.config")[-1]["binding_nonce_required"] is True
+
+        await broker.register_daemon(daemon)
+        await _accept_daemon(daemon)
+        await broker.attach_agent_to_daemon(agent_id, daemon)
+        signal_ready = asyncio.Event()
+        signal_task = asyncio.create_task(
+            _pump_host_rtc_signals(daemon, signal_ready, expiry_tasks)
+        )
+        await wait_for_signal_pump(signal_task, signal_ready)
+
+        # v2 offers without a browser-generated binding identity fail closed.
+        ws.queue_text({"type": "rtc.offer", "session_id": session_id, "sdp": "v=0\r\n"})
+        await asyncio.sleep(0.02)
+        assert not _daemon_messages_of_type(daemon_ws, "rtc.offer")
+
+        ws.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "binding_nonce": nonce_a,
+                "sdp": "v=0\r\nA",
+            }
+        )
+        await _wait_until(
+            lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 1
+        )
+        first_offer = _daemon_messages_of_type(daemon_ws, "rtc.offer")[-1]
+        assert first_offer["binding_nonce"] == nonce_a
+        assert first_offer["binding_generation"] == daemon.host_generation
+
+        ws.queue_text(
+            {"type": "rtc.close", "session_id": session_id, "binding_nonce": nonce_a}
+        )
+        await _wait_until(
+            lambda: bool(_daemon_messages_of_type(daemon_ws, "rtc.close"))
+        )
+
+        negotiating_before = len(
+            [
+                message
+                for message in _messages_of_type(ws, "rtc.status")
+                if message.get("status") == "negotiating"
+            ]
+        )
+        ws.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "binding_nonce": nonce_a,
+                "sdp": "v=0\r\nretired-A",
+            }
+        )
+        await _wait_until(
+            lambda: any(
+                message.get("status") == "failed"
+                and message.get("binding_nonce") == nonce_a
+                for message in _messages_of_type(ws, "rtc.status")
+            )
+        )
+        assert len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 1
+        assert (
+            len(
+                [
+                    message
+                    for message in _messages_of_type(ws, "rtc.status")
+                    if message.get("status") == "negotiating"
+                ]
+            )
+            == negotiating_before
+        )
+        assert await broker.rtc_session_for(session_id) is None
+
+        ws.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "binding_nonce": nonce_b,
+                "sdp": "v=0\r\nB",
+            }
+        )
+        await _wait_until(
+            lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 2
+        )
+
+        before_candidate_count = len(
+            _daemon_messages_of_type(daemon_ws, "rtc.candidate")
+        )
+        before_close_count = len(_daemon_messages_of_type(daemon_ws, "rtc.close"))
+        candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
+        ws.queue_text(
+            {
+                "type": "rtc.candidate",
+                "session_id": session_id,
+                "binding_nonce": nonce_a,
+                "candidate": candidate,
+            }
+        )
+        ws.queue_text(
+            {"type": "rtc.close", "session_id": session_id, "binding_nonce": nonce_a}
+        )
+        await asyncio.sleep(0.02)
+        assert (
+            len(_daemon_messages_of_type(daemon_ws, "rtc.candidate"))
+            == before_candidate_count
+        )
+        assert len(_daemon_messages_of_type(daemon_ws, "rtc.close")) == before_close_count
+        current = await broker.rtc_session_for(session_id)
+        assert current is not None
+        assert current.nonce == nonce_b
+
+        ws.queue_text(
+            {
+                "type": "rtc.candidate",
+                "session_id": session_id,
+                "binding_nonce": nonce_b,
+                "candidate": candidate,
+            }
+        )
+        await _wait_until(
+            lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.candidate"))
+            == before_candidate_count + 1
+        )
+    finally:
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=1)
+        if signal_task is not None:
+            signal_task.cancel()
+            await asyncio.gather(signal_task, return_exceptions=True)
+        for expiry_task in expiry_tasks:
+            expiry_task.cancel()
+        await asyncio.gather(*expiry_tasks, return_exceptions=True)
+        await broker.unregister_daemon(daemon)
+        get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):

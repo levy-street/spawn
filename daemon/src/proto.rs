@@ -47,12 +47,16 @@ pub enum Outbound {
     AgentUploaded {
         agent_id: Uuid,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(default)]
         client_id: Option<String>,
     },
     #[serde(rename = "agent.snapshot")]
     AgentSnapshot {
         agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         bytes_b64: String,
         /// Cumulative bytes queued to the requesting browser's direct
         /// DataChannel sink at capture time; lets the client order the
@@ -111,22 +115,58 @@ pub enum Outbound {
     #[serde(rename = "rtc.answer")]
     RtcAnswer {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         sdp: String,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
         status: String,
         #[serde(default)]
         message: Option<String>,
@@ -135,6 +175,10 @@ pub enum Outbound {
         agent_id: Option<Uuid>,
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
 }
 
@@ -227,6 +271,8 @@ pub enum Inbound {
     AgentSnapshot {
         agent_id: Uuid,
         #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
         lines: Option<u16>,
         #[serde(default)]
         plain: Option<bool>,
@@ -240,6 +286,8 @@ pub enum Inbound {
     #[serde(rename = "agent.upload")]
     AgentUpload {
         agent_id: Uuid,
+        #[serde(default)]
+        request_id: Option<String>,
         cwd: String,
         name: String,
         mime_type: String,
@@ -256,24 +304,68 @@ pub enum Inbound {
     #[serde(rename = "rtc.offer")]
     RtcOffer {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
+        binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
         sdp: String,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
+        #[serde(default)]
+        ice_transport_policy: Option<String>,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
+        binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
         candidate: serde_json::Value,
     },
     #[serde(rename = "rtc.close")]
     RtcClose {
         session_id: String,
-        generation: String,
-        agent_id: Uuid,
+        #[serde(default)]
+        generation: Option<String>,
+        #[serde(default)]
+        binding_nonce: Option<String>,
+        #[serde(default)]
+        binding_generation: Option<u64>,
+        #[serde(default)]
+        agent_id: Option<Uuid>,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<Uuid>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u16>,
     },
 }
 

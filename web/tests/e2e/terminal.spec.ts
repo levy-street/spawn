@@ -40,7 +40,14 @@ async function openTerminalWithMockSocket(
       }),
     );
     if (options.rtc) {
-      ws.send(JSON.stringify({ type: "rtc.config", enabled: true, ice_servers: [] }));
+      ws.send(
+        JSON.stringify({
+          type: "rtc.config",
+          enabled: true,
+          ice_servers: [],
+          ...(options.v2 ? { binding_nonce_required: true } : {}),
+        }),
+      );
     }
     ws.send(
       JSON.stringify({
@@ -285,8 +292,11 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
   await page.waitForTimeout(300);
   expect(jsonMessages(messages).some((message) => message?.type === "resize")).toBe(false);
   await expect
-    .poll(() => jsonMessages(messages).some((message) => message?.type === "rtc.offer"))
-    .toBe(true);
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "rtc.offer"))
+    .toMatchObject({
+      type: "rtc.offer",
+      binding_nonce: expect.stringMatching(/^[0-9a-f]{32}$/),
+    });
 
   await page.getByLabel("Agent terminal").click();
   await page.keyboard.type("secret input");
