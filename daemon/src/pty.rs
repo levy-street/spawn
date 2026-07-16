@@ -802,6 +802,11 @@ impl AgentHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn worker_connection_keepalive(&self) -> mpsc::Sender<WorkerCmd> {
+        self.cmd_tx.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn input_copy_count(&self) -> u64 {
         self.input_copies.load(Ordering::Relaxed)
     }

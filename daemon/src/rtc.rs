@@ -86,6 +86,7 @@ pub struct RtcSessions {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TestEffectPoint {
+    CloseAllSnapshot,
     ControlRequest,
     PtyInput,
     PtySink,
@@ -957,6 +958,36 @@ impl RtcSessions {
         let _ = pc.close().await;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn send_agent_peer_status(
+        &self,
+        out_tx: &mpsc::Sender<WsOutbound>,
+        session_id: &str,
+        generation: &str,
+        pc: &Arc<RTCPeerConnection>,
+        active: &Arc<AtomicBool>,
+        channels: &Arc<RequiredAgentChannels>,
+        binding_nonce: &str,
+        agent_id: Uuid,
+        status: &str,
+        message: Option<&str>,
+    ) -> bool {
+        let sent = {
+            let peers = self.peers.lock().await;
+            peers.get(session_id).is_some_and(|current| {
+                current.generation == generation
+                    && Arc::ptr_eq(&current.pc, pc)
+                    && current.agent.agent_id() == agent_id
+            }) && try_send_status(out_tx, session_id, binding_nonce, agent_id, status, message)
+        };
+        if !sent {
+            channels.stop();
+            active.store(false, Ordering::Release);
+            self.schedule_close_if_same(session_id, generation, pc);
+        }
+        sent
+    }
+
     pub async fn handle_candidate(
         &self,
         session_id: String,
@@ -1083,9 +1114,35 @@ impl RtcSessions {
 
     pub async fn close_all(&self) {
         let peers = self.peers.lock().await.clone();
+        #[cfg(test)]
+        for session_id in peers.keys() {
+            self.pause_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+                .await;
+        }
         for (session_id, peer) in peers {
-            self.deactivate_peer(&session_id, peer).await;
-            self.peers.lock().await.remove(&session_id);
+            let closer = self.agent_closer(peer.agent).await;
+            let _closing = closer.lock().await;
+            let current = {
+                let peers = self.peers.lock().await;
+                peers
+                    .get(&session_id)
+                    .filter(|current| {
+                        current.generation == peer.generation
+                            && current.agent == peer.agent
+                            && Arc::ptr_eq(&current.pc, &peer.pc)
+                    })
+                    .cloned()
+            };
+            let Some(current) = current else { continue };
+            let pc = Arc::clone(&current.pc);
+            let generation = current.generation.clone();
+            self.deactivate_peer(&session_id, current).await;
+            let mut peers = self.peers.lock().await;
+            if peers.get(&session_id).is_some_and(|current| {
+                current.generation == generation && Arc::ptr_eq(&current.pc, &pc)
+            }) {
+                peers.remove(&session_id);
+            }
         }
         let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
         for (_, peer) in host_peers {
@@ -1182,6 +1239,7 @@ fn install_data_channel_handler(
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     {
+        let active = Arc::clone(&guard.active);
         let channels = Arc::clone(&channels);
         let pc = Arc::clone(pc);
         let sessions = sessions.clone();
@@ -1196,15 +1254,20 @@ fn install_data_channel_handler(
                 Ok(true)
             ) {
                 channels.fail().await;
-                send_status(
-                    &out_tx,
-                    session_id.clone(),
-                    binding_nonce,
-                    agent_id,
-                    "failed",
-                    Some("spawn.pty and spawn.ctl are both required"),
-                )
-                .await;
+                let _ = sessions
+                    .send_agent_peer_status(
+                        &out_tx,
+                        &session_id,
+                        &generation,
+                        &pc,
+                        &active,
+                        &channels,
+                        &binding_nonce,
+                        agent_id,
+                        "failed",
+                        Some("spawn.pty and spawn.ctl are both required"),
+                    )
+                    .await;
                 sessions.close_if_same(&session_id, &generation, &pc).await;
             }
         });
@@ -1334,7 +1397,6 @@ fn install_data_channel_handler(
             }));
 
             let open_registry = registry.clone();
-            let open_session_id = binding.signaling.session_id.clone();
             let open_binding_nonce = binding.signaling.binding_nonce.clone();
             let open_viewer_id = viewer_id.clone();
             let open_out_tx = out_tx.clone();
@@ -1349,7 +1411,6 @@ fn install_data_channel_handler(
             let open_generation = binding.signaling.generation.clone();
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
-                let session_id = open_session_id.clone();
                 let binding_nonce = open_binding_nonce.clone();
                 let viewer_id = open_viewer_id.clone();
                 let out_tx = open_out_tx.clone();
@@ -1388,29 +1449,45 @@ fn install_data_channel_handler(
                         replay_rx = handle.replay(64 * 1024);
                     });
                     let Some(replay_rx) = replay_rx else {
-                        send_status(
-                            &out_tx,
-                            session_id,
-                            binding_nonce,
-                            agent_id,
-                            "failed",
-                            Some("worker replay is unavailable"),
-                        )
-                        .await;
+                        let _ = sessions
+                            .send_agent_peer_status(
+                                &out_tx,
+                                &rtc_session_id,
+                                &generation,
+                                &pc,
+                                &active,
+                                &channels,
+                                &binding_nonce,
+                                agent_id,
+                                "failed",
+                                Some("worker replay is unavailable"),
+                            )
+                            .await;
+                        channels.stop();
+                        active.store(false, Ordering::Release);
+                        sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
                         return;
                     };
                     let Ok(Ok(Ok(replay))) =
                         tokio::time::timeout(Duration::from_secs(3), replay_rx).await
                     else {
-                        send_status(
-                            &out_tx,
-                            session_id,
-                            binding_nonce,
-                            agent_id,
-                            "failed",
-                            Some("worker replay barrier failed"),
-                        )
-                        .await;
+                        let _ = sessions
+                            .send_agent_peer_status(
+                                &out_tx,
+                                &rtc_session_id,
+                                &generation,
+                                &pc,
+                                &active,
+                                &channels,
+                                &binding_nonce,
+                                agent_id,
+                                "failed",
+                                Some("worker replay barrier failed"),
+                            )
+                            .await;
+                        channels.stop();
+                        active.store(false, Ordering::Release);
+                        sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
                         return;
                     };
                     let watermark = replay.watermark();
@@ -1428,15 +1505,23 @@ fn install_data_channel_handler(
                     .await
                     .is_err()
                     {
-                        send_status(
-                            &out_tx,
-                            session_id,
-                            binding_nonce,
-                            agent_id,
-                            "failed",
-                            Some("worker live-stream barrier timed out"),
-                        )
-                        .await;
+                        let _ = sessions
+                            .send_agent_peer_status(
+                                &out_tx,
+                                &rtc_session_id,
+                                &generation,
+                                &pc,
+                                &active,
+                                &channels,
+                                &binding_nonce,
+                                agent_id,
+                                "failed",
+                                Some("worker live-stream barrier timed out"),
+                            )
+                            .await;
+                        channels.stop();
+                        active.store(false, Ordering::Release);
+                        sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
                         return;
                     }
                     if !effect.valid()
@@ -1466,15 +1551,23 @@ fn install_data_channel_handler(
                         let _ = dc.close().await;
                         return;
                     }
-                    send_status(
-                        &out_tx,
-                        session_id.clone(),
-                        binding_nonce,
-                        agent_id,
-                        "connected",
-                        None,
-                    )
-                    .await;
+                    if !sessions
+                        .send_agent_peer_status(
+                            &out_tx,
+                            &rtc_session_id,
+                            &generation,
+                            &pc,
+                            &active,
+                            &channels,
+                            &binding_nonce,
+                            agent_id,
+                            "connected",
+                            None,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
                         || !registry.is_current(agent)
@@ -2430,6 +2523,31 @@ async fn send_host_status(
     .await;
 }
 
+fn try_send_status(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    session_id: &str,
+    binding_nonce: &str,
+    agent_id: Uuid,
+    status: &str,
+    message: Option<&str>,
+) -> bool {
+    let frame = Outbound::RtcStatus {
+        session_id: session_id.to_string(),
+        binding_nonce: Some(binding_nonce.to_string()),
+        agent_id: Some(agent_id),
+        scope_type: Some("agent".to_string()),
+        scope_id: Some(agent_id),
+        protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
+        protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
+        status: status.to_string(),
+        message: message.map(str::to_string),
+    };
+    let Ok(text) = serde_json::to_string(&frame) else {
+        return false;
+    };
+    out_tx.try_send(WsOutbound::json(text)).is_ok()
+}
+
 async fn send_status(
     out_tx: &mpsc::Sender<WsOutbound>,
     session_id: String,
@@ -2692,6 +2810,11 @@ mod tests {
                 }
             }
         });
+        // The production WebSocket sender remains alive for the RTC session.
+        // Keep draining late candidates/statuses too: dropping this receiver
+        // immediately after `ready` would deliberately trigger the new
+        // fail-closed signaling-backpressure path in otherwise positive tests.
+        tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
 
         RtcTestClient {
             pc,
@@ -3018,6 +3141,70 @@ mod tests {
         }
     }
 
+    /// Keeps the test worker's supervisor connection alive until an
+    /// identity-bound lifecycle KILL has been acknowledged. This makes every
+    /// panic path clean up the worker before `WorkerTestEnv` removes its
+    /// private endpoint directory.
+    struct WorkerCleanupGuard {
+        agent_id: Uuid,
+        lifecycle: Option<crate::pty::AgentLifecycle>,
+        supervisor_keepalive: Option<mpsc::Sender<crate::pty::WorkerCmd>>,
+    }
+
+    impl WorkerCleanupGuard {
+        fn new(agent_id: Uuid, handle: &crate::pty::AgentHandle) -> Self {
+            Self {
+                agent_id,
+                lifecycle: Some(handle.lifecycle()),
+                supervisor_keepalive: Some(handle.worker_connection_keepalive()),
+            }
+        }
+
+        fn refresh(&mut self, handle: &crate::pty::AgentHandle) {
+            self.lifecycle = Some(handle.lifecycle());
+            self.supervisor_keepalive = Some(handle.worker_connection_keepalive());
+        }
+
+        fn disarm(&mut self) {
+            self.lifecycle = None;
+            self.supervisor_keepalive = None;
+        }
+    }
+
+    impl Drop for WorkerCleanupGuard {
+        fn drop(&mut self) {
+            let Some(lifecycle) = self.lifecycle.take() else {
+                return;
+            };
+            let agent_id = self.agent_id;
+            let cleanup = std::thread::Builder::new()
+                .name("rtc-worker-test-cleanup".to_string())
+                .spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let _ = lifecycle
+                            .shutdown(spawnd::sessiond::wire::LifecycleSignal::Kill)
+                            .await;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while crate::worker_backend::socket_exists(agent_id)
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    });
+                });
+            if let Ok(cleanup) = cleanup {
+                let _ = cleanup.join();
+            }
+            self.supervisor_keepalive = None;
+        }
+    }
+
     async fn request_history(client: &mut RtcTestClient) -> Vec<u8> {
         let request_id = Uuid::new_v4();
         let request_id_text = request_id.to_string();
@@ -3336,6 +3523,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_signaling_outbox_cannot_hold_teardown_or_leak_stale_status() {
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (agent, _commands) = insert_test_worker(&registry, agent_id);
+        let control = registry.control_for_binding(agent).expect("worker control");
+        let api = APIBuilder::new().build();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let active = Arc::new(AtomicBool::new(true));
+        let channels = Arc::new(RequiredAgentChannels::default());
+        assert!(channels.register(AgentChannel::Pty).await);
+        assert!(channels.register(AgentChannel::Control).await);
+        channels.mark_open(AgentChannel::Pty).await;
+        channels.mark_open(AgentChannel::Control).await;
+        let fence = Arc::new(tokio::sync::RwLock::new(()));
+        let sessions = RtcSessions::new();
+        let session_id = "full-status-outbox";
+        let generation = "old-generation";
+        sessions.peers.lock().await.insert(
+            session_id.to_string(),
+            RtcPeer {
+                pc: Arc::clone(&pc),
+                agent,
+                generation: generation.to_string(),
+                active: Arc::clone(&active),
+                control: control.clone(),
+                channels: Arc::clone(&channels),
+                fence: Arc::clone(&fence),
+            },
+        );
+
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        out_tx
+            .try_send(WsOutbound::json(r#"{"type":"sentinel"}"#.to_string()))
+            .expect("fill signaling outbox");
+        let effect = channels.permit().await.expect("admitted PTY callback");
+        let callback = fence.read().await;
+        let old_nonce = "b".repeat(32);
+        let sent = tokio::time::timeout(
+            Duration::from_millis(100),
+            sessions.send_agent_peer_status(
+                &out_tx,
+                session_id,
+                generation,
+                &pc,
+                &active,
+                &channels,
+                &old_nonce,
+                agent_id,
+                "connected",
+                None,
+            ),
+        )
+        .await
+        .expect("full signaling outbox blocked the lifecycle callback");
+        assert!(!sent);
+        assert!(channels.failed.load(Ordering::SeqCst));
+        assert!(!active.load(Ordering::Acquire));
+
+        let closing_sessions = sessions.clone();
+        let close = tokio::spawn(async move {
+            closing_sessions.close_all().await;
+        });
+        tokio::task::yield_now().await;
+        drop(callback);
+        drop(effect);
+        tokio::time::timeout(Duration::from_secs(3), close)
+            .await
+            .expect("full signaling outbox wedged teardown")
+            .unwrap();
+        assert_eq!(sessions.resident_session_count().await, 0);
+        let sentinel = out_rx.recv().await.expect("sentinel frame");
+        assert_eq!(sentinel.as_str(), r#"{"type":"sentinel"}"#);
+        assert!(matches!(
+            out_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let replacement_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let replacement_active = Arc::new(AtomicBool::new(true));
+        let replacement_channels = Arc::new(RequiredAgentChannels::default());
+        let replacement_fence = Arc::new(tokio::sync::RwLock::new(()));
+        sessions.peers.lock().await.insert(
+            session_id.to_string(),
+            RtcPeer {
+                pc: Arc::clone(&replacement_pc),
+                agent,
+                generation: "replacement-generation".to_string(),
+                active: Arc::clone(&replacement_active),
+                control,
+                channels: Arc::clone(&replacement_channels),
+                fence: replacement_fence,
+            },
+        );
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
+        let replacement_nonce = "c".repeat(32);
+        assert!(
+            sessions
+                .send_agent_peer_status(
+                    &replacement_tx,
+                    session_id,
+                    "replacement-generation",
+                    &replacement_pc,
+                    &replacement_active,
+                    &replacement_channels,
+                    &replacement_nonce,
+                    agent_id,
+                    "connected",
+                    None,
+                )
+                .await
+        );
+        let replacement_status = replacement_rx.recv().await.expect("replacement status");
+        let replacement_status: serde_json::Value =
+            serde_json::from_str(replacement_status.as_str()).unwrap();
+        assert_eq!(replacement_status["binding_nonce"], replacement_nonce);
+        sessions.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn close_all_cannot_remove_a_same_session_replacement() {
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+        let old_control = registry
+            .control_for_binding(old)
+            .expect("old worker control");
+        let api = APIBuilder::new().build();
+        let old_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let old_active = Arc::new(AtomicBool::new(true));
+        let sessions = RtcSessions::new();
+        let session_id = "close-all-reinsert";
+        let generation = "old-signal-generation";
+        sessions.peers.lock().await.insert(
+            session_id.to_string(),
+            RtcPeer {
+                pc: Arc::clone(&old_pc),
+                agent: old,
+                generation: generation.to_string(),
+                active: Arc::clone(&old_active),
+                control: old_control,
+                channels: Arc::new(RequiredAgentChannels::default()),
+                fence: Arc::new(tokio::sync::RwLock::new(())),
+            },
+        );
+
+        let snapshot_gate = sessions
+            .stall_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+            .await;
+        let close_all_sessions = sessions.clone();
+        let close_all = tokio::spawn(async move {
+            close_all_sessions.close_all().await;
+        });
+        wait_effect_gate(&snapshot_gate).await;
+
+        let close_same_sessions = sessions.clone();
+        let close_same_pc = Arc::clone(&old_pc);
+        let close_same = tokio::spawn(async move {
+            close_same_sessions
+                .close_if_same(session_id, generation, &close_same_pc)
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), close_same)
+            .await
+            .expect("exact close did not remove the old peer")
+            .unwrap();
+        assert!(!sessions.peers.lock().await.contains_key(session_id));
+
+        let (replacement, _replacement_commands) = insert_test_worker(&registry, agent_id);
+        let replacement_control = registry
+            .control_for_binding(replacement)
+            .expect("replacement worker control");
+        let replacement_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let replacement_active = Arc::new(AtomicBool::new(true));
+        sessions.peers.lock().await.insert(
+            session_id.to_string(),
+            RtcPeer {
+                pc: Arc::clone(&replacement_pc),
+                agent: replacement,
+                generation: "replacement-signal-generation".to_string(),
+                active: Arc::clone(&replacement_active),
+                control: replacement_control,
+                channels: Arc::new(RequiredAgentChannels::default()),
+                fence: Arc::new(tokio::sync::RwLock::new(())),
+            },
+        );
+        snapshot_gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), close_all)
+            .await
+            .expect("close_all did not finish")
+            .unwrap();
+
+        let peers = sessions.peers.lock().await;
+        let tracked = peers
+            .get(session_id)
+            .expect("replacement was silently removed");
+        assert_eq!(tracked.agent, replacement);
+        assert!(Arc::ptr_eq(&tracked.pc, &replacement_pc));
+        drop(peers);
+        assert!(replacement_active.load(Ordering::Acquire));
+        assert!(!old_active.load(Ordering::Acquire));
+        sessions.close_all().await;
+        assert!(!replacement_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn real_spawn_pty_and_ctl_channels_replay_live_input_and_cleanup() {
         let agent_id = Uuid::new_v4();
         let viewer = "rtc-real:generation".to_string();
@@ -3544,6 +3952,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_worker_cleanup_guard_kills_on_unwind() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let _env = WorkerTestEnv::install();
+        let agent_id = Uuid::new_v4();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec cat".to_string(),
+        ];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            agent_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &env,
+        })
+        .await
+        .expect("launch cleanup-guard worker");
+        let crate::pty::Launched {
+            handle, exit_rx, ..
+        } = launched;
+        let cleanup = WorkerCleanupGuard::new(agent_id, &handle);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = cleanup;
+            drop(handle);
+            panic!("exercise worker cleanup guard");
+        }));
+        assert!(unwind.is_err(), "cleanup guard test did not unwind");
+        let reason = tokio::time::timeout(Duration::from_secs(5), exit_rx)
+            .await
+            .expect("cleanup guard worker exit timed out")
+            .expect("cleanup guard worker exit sender dropped");
+        assert!(reason.exit_code.is_some() || reason.signal.is_some());
+        assert!(
+            !crate::worker_backend::socket_exists(agent_id),
+            "cleanup guard left its worker endpoint behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_worker_rtc_launch_adopt_backpressure_catchup_and_exit() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
@@ -3575,6 +4032,7 @@ mod tests {
             exit_rx: initial_exit_rx,
             ..
         } = launched;
+        let mut worker_cleanup = WorkerCleanupGuard::new(agent_id, &handle);
         let initial_control = handle.control.clone();
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
         initial_control.set_sink(ws_tx).await;
@@ -3660,6 +4118,7 @@ mod tests {
             exit_rx: adopted_exit_rx,
             ..
         } = adopted;
+        worker_cleanup.refresh(&handle);
         let adopted_control = handle.control.clone();
         let (adopted_ws_tx, mut adopted_ws_rx) = mpsc::channel(1024);
         adopted_control.set_sink(adopted_ws_tx).await;
@@ -3811,6 +4270,7 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        worker_cleanup.disarm();
         drop(exited_handle);
         ws_drain.abort();
         adopted_ws_drain.abort();
