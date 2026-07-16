@@ -140,6 +140,51 @@ async function readyClient(options = {}) {
   return { client, ws, pc, offer };
 }
 
+function framesOf(channel, type) {
+  return channel.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === type);
+}
+
+async function startedTransfer(destinationOptions = {}) {
+  const source = await readyClient();
+  const destination = await readyClient(destinationOptions);
+  const transferring = source.client.transferFileTo(
+    destination.client,
+    "/source/notes.txt",
+    "/destination",
+  );
+  const readRequest = JSON.parse(source.pc.channel.sent.at(-1));
+  source.pc.channel.receive(
+    JSON.stringify({
+      version: 1,
+      type: "response",
+      request_id: readRequest.request_id,
+      ok: true,
+      result: {
+        stream_id: "source-stream",
+        path: "/source/notes.txt",
+        name: "notes.txt",
+        length: 3,
+        sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+    }),
+  );
+  await Bun.sleep(1);
+  const writeRequest = destination.pc.channel.sent
+    .map((frame) => JSON.parse(frame))
+    .find((frame) => frame.operation === "fs.write.begin");
+  destination.pc.channel.receive(
+    JSON.stringify({
+      version: 1,
+      type: "response",
+      request_id: writeRequest.request_id,
+      ok: true,
+      result: { stream_id: "destination-stream" },
+    }),
+  );
+  await Bun.sleep(1);
+  return { source, destination, transferring };
+}
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
   FakePeerConnection.instances = [];
@@ -172,6 +217,54 @@ describe("HostControlClient", () => {
       }),
     );
     await expect(ping).resolves.toEqual({ pong: true });
+    client.close();
+  });
+
+  test("returns one directory page at a time and advances only on an explicit cursor", async () => {
+    const { client, pc } = await readyClient();
+    const first = client.list("/private");
+    const firstRequest = JSON.parse(pc.channel.sent.at(-1));
+    expect(firstRequest).toMatchObject({
+      operation: "fs.list",
+      payload: { path: "/private", cursor: 0 },
+    });
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: firstRequest.request_id,
+        ok: true,
+        result: {
+          path: "/private",
+          home_dir: "/private",
+          entries: [{ name: "first", path: "/private/first", kind: "file", is_dir: false }],
+          next_cursor: 1,
+        },
+      }),
+    );
+    await expect(first).resolves.toMatchObject({
+      entries: [expect.objectContaining({ name: "first" })],
+      next_cursor: 1,
+    });
+    expect(
+      pc.channel.sent
+        .map((frame) => JSON.parse(frame))
+        .filter((frame) => frame.operation === "fs.list"),
+    ).toHaveLength(1);
+
+    const second = client.listPage("/private", 1);
+    const secondRequest = JSON.parse(pc.channel.sent.at(-1));
+    expect(secondRequest.payload.cursor).toBe(1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: secondRequest.request_id,
+        ok: true,
+        result: { path: "/private", home_dir: "/private", entries: [], next_cursor: null },
+      }),
+    );
+    await expect(second).resolves.toMatchObject({ entries: [], next_cursor: null });
     client.close();
   });
 
@@ -722,6 +815,110 @@ describe("HostControlClient", () => {
       }),
     );
     await expect(transferring).resolves.toEqual({ path: "/destination/notes.txt" });
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("destination stream errors stop both sides before more source bytes are forwarded", async () => {
+    const { source, destination, transferring } = await startedTransfer();
+    const failed = transferring.catch((error) => error);
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "source-stream",
+        sequence: 0,
+        bytes_b64: btoa("a"),
+      }),
+    );
+    await Bun.sleep(1);
+    const forwarded = framesOf(destination.pc.channel, "stream.chunk").length;
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.error",
+        stream_id: "destination-stream",
+        error: { code: "disk_full", detail: "destination rejected the write" },
+      }),
+    );
+    expect((await failed).code).toBe("disk_full");
+    expect(framesOf(source.pc.channel, "stream.cancel")).toHaveLength(1);
+    expect(framesOf(destination.pc.channel, "stream.cancel")).toHaveLength(1);
+
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "source-stream",
+        sequence: 1,
+        bytes_b64: btoa("b"),
+      }),
+    );
+    await Bun.sleep(1);
+    expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(forwarded);
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("destination stream timeout cancels the stalled source and sends no further bytes", async () => {
+    const { source, destination, transferring } = await startedTransfer({ streamTimeoutMs: 5 });
+    const failed = transferring.catch((error) => error);
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "source-stream",
+        sequence: 0,
+        bytes_b64: btoa("a"),
+      }),
+    );
+    await Bun.sleep(15);
+    expect((await failed).code).toBe("stream_timeout");
+    const forwarded = framesOf(destination.pc.channel, "stream.chunk").length;
+    expect(framesOf(source.pc.channel, "stream.cancel")).toHaveLength(1);
+    expect(framesOf(destination.pc.channel, "stream.cancel").length).toBeGreaterThanOrEqual(1);
+    await Bun.sleep(5);
+    expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(forwarded);
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("source stream errors immediately abort the destination write", async () => {
+    const { source, destination, transferring } = await startedTransfer();
+    const failed = transferring.catch((error) => error);
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.error",
+        stream_id: "source-stream",
+        error: { code: "read_failed", detail: "source read failed" },
+      }),
+    );
+    expect((await failed).code).toBe("read_failed");
+    expect(framesOf(destination.pc.channel, "stream.cancel")).toHaveLength(1);
+    expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("source peer loss aborts the destination write", async () => {
+    const { source, destination, transferring } = await startedTransfer();
+    const failed = transferring.catch((error) => error);
+    source.pc.channel.onclose?.();
+    expect((await failed).code).toBe("connection_closed");
+    expect(framesOf(destination.pc.channel, "stream.cancel")).toHaveLength(1);
+    expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("destination peer loss cancels the source read before more bytes are consumed", async () => {
+    const { source, destination, transferring } = await startedTransfer();
+    const failed = transferring.catch((error) => error);
+    destination.pc.channel.onclose?.();
+    expect((await failed).code).toBe("connection_closed");
+    expect(framesOf(source.pc.channel, "stream.cancel")).toHaveLength(1);
+    expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
     source.client.close();
     destination.client.close();
   });

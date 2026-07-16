@@ -14,6 +14,7 @@ const STREAM_CHUNK_BYTES = 8 * 1024;
 const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
 const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
+export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
 export class HostControlError extends Error {
   constructor(
@@ -113,6 +114,8 @@ export interface HostControlClientOptions {
   requestTimeoutMs?: number;
   maxPendingRequests?: number;
   reconnectBaseDelayMs?: number;
+  /** Primarily useful for bounded clients and deterministic timeout tests. */
+  streamTimeoutMs?: number;
 }
 
 export class HostControlClient {
@@ -264,22 +267,42 @@ export class HostControlClient {
     return this.request<{ home_dir: string }>("fs.home", undefined, options);
   }
 
-  async list(path?: string, options?: HostControlRequestOptions): Promise<HostDirList> {
-    let cursor: number | null = 0;
-    let result: HostDirList | null = null;
-    const entries: HostDirEntry[] = [];
-    do {
-      const page: HostDirList = await this.request<HostDirList>(
-        "fs.list",
-        { ...(path ? { path } : {}), cursor },
-        options,
+  async listPage(
+    path?: string,
+    cursor = 0,
+    options?: HostControlRequestOptions,
+  ): Promise<HostDirList> {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new HostControlError(
+        "invalid_request",
+        "Directory cursor must be a non-negative integer",
       );
-      result ??= page;
-      entries.push(...page.entries);
-      cursor = typeof page.next_cursor === "number" ? page.next_cursor : null;
-    } while (cursor !== null);
-    if (!result) throw new HostControlError("invalid_response", "Host returned no directory page");
-    return { ...result, entries, next_cursor: null };
+    }
+    const page = await this.request<HostDirList>(
+      "fs.list",
+      { ...(path ? { path } : {}), cursor },
+      options,
+    );
+    const nextCursor = page?.next_cursor;
+    if (
+      !page ||
+      typeof page.path !== "string" ||
+      typeof page.home_dir !== "string" ||
+      !Array.isArray(page.entries) ||
+      page.entries.length > HOST_DIRECTORY_PAGE_ENTRIES ||
+      (nextCursor !== undefined &&
+        nextCursor !== null &&
+        (!Number.isSafeInteger(nextCursor) || nextCursor <= cursor))
+    ) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid directory page");
+    }
+    return { ...page, next_cursor: typeof nextCursor === "number" ? nextCursor : null };
+  }
+
+  /** Return only the first page. Call listPage with next_cursor to continue. */
+  list(path?: string, options?: HostControlRequestOptions): Promise<HostDirList> {
+    return this.listPage(path, 0, options);
   }
 
   mkdir(path: string, options?: HostControlRequestOptions): Promise<HostFileOp> {
@@ -439,35 +462,63 @@ export class HostControlClient {
   ): Promise<string> {
     const begin = await this.request<{ stream_id: string }>("fs.write.begin", declaration, {
       signal,
-      timeoutMs: STREAM_TIMEOUT_MS,
+      timeoutMs: this.streamTimeoutMs(),
     });
     const streamId = begin.stream_id;
     if (typeof streamId !== "string" || this.outgoingStreams.has(streamId)) {
       throw new HostControlError("invalid_response", "Host returned an invalid write stream");
     }
+    let terminalError: Error | null = null;
+    let rejectTerminal!: (error: Error) => void;
+    const terminal = new Promise<never>((_, reject) => {
+      rejectTerminal = reject;
+    });
+    // The failure promise is deliberately raced with every blocking pump step.
+    // Attach a handler immediately in case the peer fails before the first read.
+    void terminal.catch(() => {});
     const committed = new Promise<string>((resolve, reject) => {
-      const pending = { resolve, reject };
+      const pending = {
+        resolve,
+        reject: (error: Error) => {
+          terminalError ??= error;
+          rejectTerminal(error);
+          reject(error);
+        },
+      };
       this.outgoingStreams.set(streamId, pending);
       this.resetOutgoingTimeout(streamId, pending);
     });
+    void committed.catch(() => {});
     const reader = stream.getReader();
+    let cleanup: Promise<void> | null = null;
+    const stop = (reason: Error): Promise<void> => {
+      if (cleanup) return cleanup;
+      cleanup = (async () => {
+        this.cancelStream(streamId);
+        const pending = this.outgoingStreams.get(streamId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.outgoingStreams.delete(streamId);
+          pending.reject(reason);
+        }
+        await reader.cancel(reason).catch(() => {});
+      })();
+      return cleanup;
+    };
     const abort = () => {
-      this.cancelStream(streamId);
-      const pending = this.outgoingStreams.get(streamId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.outgoingStreams.delete(streamId);
-        pending.reject(new DOMException("Host file write aborted", "AbortError"));
-      }
-      void reader.cancel();
+      void stop(new DOMException("Host file write aborted", "AbortError"));
     };
     signal?.addEventListener("abort", abort, { once: true });
+    const raceTerminal = async <T>(operation: Promise<T>): Promise<T> => {
+      if (terminalError) throw terminalError;
+      return await Promise.race([operation, terminal]);
+    };
     let sequence = 0;
     let sent = 0;
     try {
       for (;;) {
         if (signal?.aborted) throw new DOMException("Host file write aborted", "AbortError");
-        const { done, value } = await reader.read();
+        const { done, value } = await raceTerminal(reader.read());
         if (done) break;
         for (let offset = 0; offset < value.byteLength; offset += STREAM_CHUNK_BYTES) {
           const chunk = value.subarray(offset, offset + STREAM_CHUNK_BYTES);
@@ -475,7 +526,8 @@ export class HostControlClient {
           if (sent > declaration.length) {
             throw new HostControlError("length_mismatch", "Input exceeds declared length");
           }
-          await this.waitForWritable(signal);
+          await raceTerminal(this.waitForWritable(signal));
+          if (terminalError) throw terminalError;
           this.sendStreamFrame("stream.chunk", streamId, {
             sequence,
             bytes_b64: bytesToBase64(chunk),
@@ -488,17 +540,19 @@ export class HostControlClient {
       if (sent !== declaration.length) {
         throw new HostControlError("length_mismatch", "Input does not match declared length");
       }
+      if (terminalError) throw terminalError;
       this.sendStreamFrame("stream.end", streamId, {
         length: declaration.length,
         sha256: declaration.sha256,
       });
       return await committed;
     } catch (error) {
-      abort();
-      void committed.catch(() => {});
-      throw error;
+      const failure = error instanceof Error ? error : new Error("Host file write failed");
+      await stop(failure);
+      throw failure;
     } finally {
       signal?.removeEventListener("abort", abort);
+      if (cleanup) await cleanup;
       reader.releaseLock();
     }
   }
@@ -510,7 +564,7 @@ export class HostControlClient {
     overwrite = false,
     signal?: AbortSignal,
   ): Promise<HostFileOp> {
-    const source = await this.readFile(path, { signal, timeoutMs: STREAM_TIMEOUT_MS });
+    const source = await this.readFile(path, { signal, timeoutMs: this.streamTimeoutMs() });
     try {
       const destinationPath = await destination.writeStream(
         source.stream,
@@ -924,7 +978,7 @@ export class HostControlClient {
       this.incomingStreams.delete(streamId);
       this.cancelStream(streamId);
       incoming.controller.error(new HostControlError("stream_timeout", "File read timed out"));
-    }, STREAM_TIMEOUT_MS);
+    }, this.streamTimeoutMs());
   }
 
   private resetOutgoingTimeout(streamId: string, outgoing: OutgoingStream): void {
@@ -934,7 +988,7 @@ export class HostControlClient {
       this.outgoingStreams.delete(streamId);
       this.cancelStream(streamId);
       outgoing.reject(new HostControlError("stream_timeout", "File write timed out"));
-    }, STREAM_TIMEOUT_MS);
+    }, this.streamTimeoutMs());
   }
 
   private async waitForWritable(signal?: AbortSignal): Promise<void> {
@@ -1063,6 +1117,12 @@ export class HostControlClient {
     const configured = this.options.maxPendingRequests;
     if (configured === undefined || !Number.isFinite(configured)) return MAX_PENDING_REQUESTS;
     return Math.max(0, Math.min(MAX_PENDING_REQUESTS, Math.floor(configured)));
+  }
+
+  private streamTimeoutMs(): number {
+    const configured = this.options.streamTimeoutMs;
+    if (configured === undefined || !Number.isFinite(configured)) return STREAM_TIMEOUT_MS;
+    return Math.max(1, Math.min(STREAM_TIMEOUT_MS, Math.floor(configured)));
   }
 
   private setState(state: HostControlState): void {
