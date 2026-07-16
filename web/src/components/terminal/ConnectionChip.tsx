@@ -70,12 +70,15 @@ export function ConnectionChip({
 }) {
   if (!info) return null;
   const view = viewFor(info);
+  const v2TrustDetail = info.dcOpen
+    ? "spawn.v2 — direct WebRTC browser path active; daemon legacy server mirror remains until Phase 2 / P2-AGENT-02"
+    : "spawn.v2 — direct WebRTC browser path negotiating; daemon legacy server mirror remains until Phase 2 / P2-AGENT-02";
   const title = [
     view.detail,
     info.rttMs != null ? `round trip ${info.rttMs} ms` : null,
     info.protocol ? `via ${info.protocol}` : null,
     info.dcOpen ? "DataChannel open" : null,
-    info.v2 ? "spawn.v2 (server never relays terminal data)" : "spawn.v1",
+    info.v2 ? v2TrustDetail : "spawn.v1",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -94,10 +97,7 @@ export function ConnectionChip({
             ? "negotiating"
             : "WS relay",
     ],
-    [
-      "Protocol",
-      info.v2 ? "spawn.v2 — server never sees terminal data" : "spawn.v1 (legacy relay)",
-    ],
+    ["Protocol", info.v2 ? v2TrustDetail : "spawn.v1 (legacy relay)"],
   ];
 
   return (

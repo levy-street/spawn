@@ -80,7 +80,7 @@ pub struct DirectPayload {
 }
 
 impl DirectPayload {
-    fn new(bytes: Vec<u8>) -> Self {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
             #[cfg(test)]
@@ -122,7 +122,7 @@ impl<const N: usize> PartialEq<&[u8; N]> for DirectPayload {
 
 impl Drop for DirectPayload {
     fn drop(&mut self) {
-        self.bytes.zeroize();
+        self.bytes.as_mut_slice().zeroize();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
@@ -141,7 +141,9 @@ pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
 pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
 pub const WORKER_OUTPUT_QUEUE_DEPTH: usize = 32;
 pub const WORKER_COMMAND_QUEUE_DEPTH: usize = 32;
+pub const WORKER_LIFECYCLE_QUEUE_DEPTH: usize = 2;
 pub const MAX_WORKER_INPUT_BYTES: usize = 64 * 1024;
+const LIFECYCLE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Immutable result of handling one output event at its producer. Immediate
 /// activity and the eligibility/generation of an ambiguous idle candidate are
@@ -550,8 +552,72 @@ impl ForwarderControl {
     }
 }
 
-/// Commands routed from spawnd to a session worker's connection tasks.
-pub type WorkerReplayResult = Result<(u64, Vec<u8>)>;
+#[cfg(test)]
+type ReplayWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Decrypted replay owned by spawnd. The bytes wipe on every drop path,
+/// including receiver cancellation after a successful oneshot send.
+pub struct WorkerReplay {
+    watermark: u64,
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    wipe_probe: Option<ReplayWipeProbe>,
+}
+
+impl WorkerReplay {
+    pub(crate) fn new(watermark: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            watermark,
+            bytes,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    pub fn watermark(&self) -> u64 {
+        self.watermark
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wipe_probe(
+        watermark: u64,
+        bytes: Vec<u8>,
+        wipe_probe: ReplayWipeProbe,
+    ) -> Self {
+        Self {
+            watermark,
+            bytes,
+            wipe_probe: Some(wipe_probe),
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkerReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerReplay")
+            .field("watermark", &self.watermark)
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WorkerReplay {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe(&self.bytes);
+        }
+    }
+}
+
+/// Commands routed from spawnd to a session worker's socket writer.
+pub type WorkerReplayResult = Result<WorkerReplay>;
 pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
 
 #[derive(Debug)]
@@ -568,9 +634,42 @@ pub enum WorkerCmd {
         max_bytes: u32,
         resp: oneshot::Sender<WorkerReplayResult>,
     },
-    Shutdown {
-        signal: Option<String>,
-    },
+}
+
+/// Lifecycle signals bypass the normal worker command/socket queue. The
+/// receiver acknowledges only after the host signal syscall completes.
+#[derive(Debug)]
+pub(crate) struct LifecycleRequest {
+    pub signal: Option<String>,
+    pub delivered: oneshot::Sender<std::result::Result<(), String>>,
+}
+
+#[derive(Clone)]
+pub struct AgentLifecycle {
+    tx: mpsc::Sender<LifecycleRequest>,
+    alive: Arc<AtomicBool>,
+}
+
+impl AgentLifecycle {
+    pub async fn shutdown(&self, signal: Option<String>) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            anyhow::bail!("worker connection gone");
+        }
+        let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
+        let (delivered, receipt) = oneshot::channel();
+        tokio::time::timeout_at(
+            deadline,
+            self.tx.send(LifecycleRequest { signal, delivered }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("worker lifecycle queue deadline exceeded"))?
+        .map_err(|_| anyhow::anyhow!("worker lifecycle channel closed"))?;
+        tokio::time::timeout_at(deadline, receipt)
+            .await
+            .map_err(|_| anyhow::anyhow!("worker lifecycle delivery deadline exceeded"))?
+            .map_err(|_| anyhow::anyhow!("worker lifecycle delivery task closed"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 /// Per-agent runtime handle.
@@ -585,6 +684,7 @@ pub struct AgentHandle {
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
     cmd_tx: mpsc::Sender<WorkerCmd>,
+    lifecycle: AgentLifecycle,
     alive: Arc<AtomicBool>,
 }
 
@@ -592,6 +692,7 @@ pub struct AgentHandle {
 pub struct WorkerHandleParts {
     pub agent_id: Uuid,
     pub cmd_tx: mpsc::Sender<WorkerCmd>,
+    pub lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     pub alive: Arc<AtomicBool>,
     pub cols: u16,
     pub rows: u16,
@@ -607,14 +708,19 @@ impl AgentHandle {
             outbox_tx: parts.outbox_tx,
             control: parts.control,
             cmd_tx: parts.cmd_tx,
+            lifecycle: AgentLifecycle {
+                tx: parts.lifecycle_tx,
+                alive: Arc::clone(&parts.alive),
+            },
             alive: parts.alive,
         }
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
-        // The echo of this input shouldn't count as agent output-activity.
-        self.control
-            .suppress_activity(activity::INPUT_ECHO_SUPPRESS_WINDOW);
+        self.write_stdin_owned(DirectPayload::new(bytes.to_vec()))
+    }
+
+    pub(crate) fn write_stdin_owned(&self, bytes: DirectPayload) -> Result<()> {
         if !self.alive.load(Ordering::Acquire) {
             anyhow::bail!("worker connection gone");
         }
@@ -622,11 +728,15 @@ impl AgentHandle {
             anyhow::bail!("worker input exceeds {MAX_WORKER_INPUT_BYTES} byte limit");
         }
         self.cmd_tx
-            .try_send(WorkerCmd::Input(DirectPayload::new(bytes.to_vec())))
+            .try_send(WorkerCmd::Input(bytes))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("worker command queue full"),
                 mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
-            })
+            })?;
+        // Only admitted input can have an echo that should suppress activity.
+        self.control
+            .suppress_activity(activity::INPUT_ECHO_SUPPRESS_WINDOW);
+        Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
@@ -637,9 +747,6 @@ impl AgentHandle {
         if *size == (cols, rows) {
             return Ok(false);
         }
-        // The repaint this resize triggers shouldn't count as agent activity.
-        self.control
-            .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
         if !self.alive.load(Ordering::Acquire) {
             anyhow::bail!("worker connection gone");
         }
@@ -650,12 +757,18 @@ impl AgentHandle {
                 mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
             })?;
         *size = (cols, rows);
+        // Only an admitted resize can trigger a repaint.
+        self.control
+            .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
         Ok(true)
     }
 
-    pub fn shutdown(&self, signal: Option<String>) -> bool {
-        self.alive.load(Ordering::Acquire)
-            && self.cmd_tx.try_send(WorkerCmd::Shutdown { signal }).is_ok()
+    pub fn lifecycle(&self) -> AgentLifecycle {
+        self.lifecycle.clone()
+    }
+
+    pub async fn shutdown(&self, signal: Option<String>) -> Result<()> {
+        self.lifecycle.shutdown(signal).await
     }
 
     /// Request decrypted scrollback replay from the owning worker.
@@ -787,6 +900,93 @@ mod tests {
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
+    }
+
+    fn test_handle(
+        control: ForwarderControl,
+        cmd_tx: mpsc::Sender<WorkerCmd>,
+        alive: Arc<AtomicBool>,
+    ) -> AgentHandle {
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(WORKER_LIFECYCLE_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
+        AgentHandle::new_worker(WorkerHandleParts {
+            agent_id: Uuid::new_v4(),
+            cmd_tx,
+            lifecycle_tx,
+            alive,
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control,
+        })
+    }
+
+    #[test]
+    fn rejected_commands_do_not_suppress_genuine_output_activity() {
+        let oversized_control = ForwarderControl::new();
+        let (oversized_tx, _oversized_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let oversized = test_handle(
+            oversized_control.clone(),
+            oversized_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(oversized
+            .write_stdin(&vec![b'x'; MAX_WORKER_INPUT_BYTES + 1])
+            .is_err());
+        assert!(source_output(&oversized_control, b"genuine oversized rejection output").activity);
+
+        let dead_control = ForwarderControl::new();
+        let (dead_tx, _dead_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let dead = test_handle(
+            dead_control.clone(),
+            dead_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(dead.write_stdin(b"rejected dead input").is_err());
+        assert!(source_output(&dead_control, b"genuine dead rejection output").activity);
+
+        for resize in [false, true] {
+            let control = ForwarderControl::new();
+            let (cmd_tx, _cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+            for index in 0..WORKER_COMMAND_QUEUE_DEPTH {
+                cmd_tx
+                    .try_send(WorkerCmd::Resize {
+                        cols: 80 + index as u16,
+                        rows: 24,
+                    })
+                    .unwrap();
+            }
+            let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+            if resize {
+                assert!(handle.resize(120, 40).is_err());
+            } else {
+                assert!(handle.write_stdin(b"rejected full input").is_err());
+            }
+            assert!(source_output(&control, b"genuine full queue rejection output").activity);
+        }
+    }
+
+    #[test]
+    fn admitted_input_and_resize_suppress_their_expected_echoes() {
+        let input_control = ForwarderControl::new();
+        let (input_tx, _input_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let input = test_handle(
+            input_control.clone(),
+            input_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        input.write_stdin(b"accepted input").unwrap();
+        assert!(!source_output(&input_control, b"accepted input echo").activity);
+
+        let resize_control = ForwarderControl::new();
+        let (resize_tx, _resize_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let resize = test_handle(
+            resize_control.clone(),
+            resize_tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(resize.resize(120, 40).unwrap());
+        assert!(!source_output(&resize_control, b"resize repaint output").activity);
     }
 
     #[test]

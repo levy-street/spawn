@@ -721,7 +721,7 @@ fn install_data_channel_handler(
                         .await;
                         return;
                     };
-                    let Ok(Ok(Ok((watermark, _)))) =
+                    let Ok(Ok(Ok(replay))) =
                         tokio::time::timeout(Duration::from_secs(3), replay_rx).await
                     else {
                         send_status(
@@ -735,6 +735,7 @@ fn install_data_channel_handler(
                         .await;
                         return;
                     };
+                    let watermark = replay.watermark();
                     if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                         let _ = dc.close().await;
                         return;
@@ -1199,7 +1200,7 @@ async fn send_agent_replay(
     }
     let capture = capture_agent_replay(agent, spec.lines, spec.plain, registry, &control);
     tokio::pin!(capture);
-    let (source_boundary, bytes) = tokio::select! {
+    let replay = tokio::select! {
         result = &mut capture => result?,
         _ = sender.closed() => {
             return Err(ProtocolError::new(
@@ -1216,6 +1217,7 @@ async fn send_agent_replay(
             ));
         }
     };
+    let source_boundary = replay.watermark();
     let pty_offset = control
         .direct_sink_anchor(spec.session_id, source_boundary)
         .await
@@ -1232,7 +1234,7 @@ async fn send_agent_replay(
         spec.operation,
         spec.plain,
         Some(pty_offset),
-        bytes,
+        &replay,
     )
     .await
 }
@@ -1243,7 +1245,7 @@ async fn capture_agent_replay(
     _plain: bool,
     registry: &AgentRegistry,
     control: &crate::pty::ForwarderControl,
-) -> Result<(u64, Vec<u8>), ProtocolError> {
+) -> Result<crate::pty::WorkerReplay, ProtocolError> {
     let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
         8 * 1024 * 1024
     } else {
@@ -1257,9 +1259,9 @@ async fn capture_agent_replay(
     });
     match replay_rx {
         Some(receiver) => match receiver.await {
-            Ok(Ok((watermark, bytes))) => {
-                control.wait_source_offset(watermark).await;
-                Ok((watermark, bytes))
+            Ok(Ok(replay)) => {
+                control.wait_source_offset(replay.watermark()).await;
+                Ok(replay)
             }
             Ok(Err(error)) => Err(ProtocolError::new(
                 None,
@@ -1416,10 +1418,12 @@ mod tests {
         agent_id: Uuid,
     ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(crate::pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
             cmd_tx,
+            lifecycle_tx,
             alive: Arc::new(AtomicBool::new(true)),
             cols: 80,
             rows: 24,
@@ -1733,7 +1737,7 @@ mod tests {
             while let Some(command) = worker_commands.recv().await {
                 match command {
                     crate::pty::WorkerCmd::Replay { resp, .. } => {
-                        let _ = resp.send(Ok((
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
                             worker_control.source_offset(),
                             worker_replay_bytes.clone(),
                         )));
@@ -1741,8 +1745,7 @@ mod tests {
                     crate::pty::WorkerCmd::Input(bytes) => {
                         let _ = input_tx.send(bytes);
                     }
-                    crate::pty::WorkerCmd::Resize { .. }
-                    | crate::pty::WorkerCmd::Shutdown { .. } => {}
+                    crate::pty::WorkerCmd::Resize { .. } => {}
                 }
             }
         });
@@ -2138,9 +2141,11 @@ mod tests {
         }
         assert!(caught_up, "replay did not catch up the evicted viewer");
 
-        assert!(registry.with_handle(agent_id, |handle| {
-            assert!(handle.shutdown(Some("KILL".to_string())));
-        }));
+        let lifecycle = registry.lifecycle_for(agent_id).expect("agent lifecycle");
+        lifecycle
+            .shutdown(Some("KILL".to_string()))
+            .await
+            .expect("KILL delivery");
         let reason = tokio::time::timeout(Duration::from_secs(15), adopted_exit_rx)
             .await
             .expect("worker exit timed out")

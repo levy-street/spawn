@@ -147,7 +147,7 @@ guessed at.
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
 | `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = cumulative lifetime output bytes logged at capture, including output no longer retained |
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
-| `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?}` | signal the agent's process group (TERM/KILL/INT/HUP/QUIT) |
+| `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?}` | compatibility command for signaling the agent process group; current spawnd lifecycle delivery bypasses the ordinary socket queue as described below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
 
 Connection semantics: the worker serves **one live connection**; a newly
@@ -177,9 +177,13 @@ browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
 `pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
-routing. `AgentHandle` has one implementation: `write_stdin`, `resize`,
-`replay`, and `shutdown` dispatch `WorkerCmd`s over the worker socket. `spawnd`
-does not hold a local agent PTY or a backend discriminator.
+routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
+`replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown uses a
+separate two-slot, deadline-bounded lifecycle channel whose task signals the
+reported agent process group directly and acknowledges the host syscall. It
+therefore cannot sit behind queued or partially written PTY input; restart
+checks TERM delivery and deterministically escalates to KILL. `spawnd` does not
+hold a local agent PTY or a backend discriminator.
 
 The unix-socket hop adds no control-plane exposure, but the complete live path
 still does: until P2-AGENT-02, spawnd sends daemon WS `0x01` output for the
@@ -261,8 +265,12 @@ also retains its independent 12 MiB response rejection ceiling.
 - Owned plaintext is explicitly wiped on drop across the implemented handoff:
   worker PTY read chunks and reader/writer scratch, queued input and worker
   frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
-  owned `OutputChunk` bytes are wiped on drop, and direct RTC PTY/control send
-  source buffers use zeroizing guards. Direct-viewer queues are bounded.
+  replay result owns a self-wiping payload even while parked in a oneshot; its
+  source bytes wipe on receiver cancellation and normal consumption. Legacy
+  WS input owns and wipes the complete inbound binary frame after copying its
+  payload into the self-wiping worker-input wrapper. `OutputChunk`, WS/control
+  output, and direct-viewer payloads likewise wipe on drop; their queues are
+  bounded.
 
 **Not covered — stated plainly, per TRUST.md's "honest inventory" ethos:**
 - Plaintext **must** transit worker memory: kernel PTY buffers → userspace
@@ -413,14 +421,16 @@ handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
 each. The worker logs and forwards each chunk it consumes. If the supervisor
 socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
 PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
-queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 worker
-commands; each input command is capped at 64 KiB. The forwarder serves bounded
-direct-viewer sinks first, then offers output without blocking to the bounded
-legacy-WS mirror. A full or absent legacy mirror is detached instead of
-accumulating plaintext, while a lagging direct viewer is disconnected. Either
-transport reconnects and re-seeds from the worker replay watermark. The replay
-log uses the conservative total resource budget described in §6.2, including
-checkpoint and framing charges.
+queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 ordinary
+worker commands; each input command is capped at 64 KiB. A separate two-slot
+lifecycle queue is processed by an independent signal task, so TERM/KILL
+cannot be starved by the ordinary queue or a stalled worker socket. The
+forwarder serves bounded direct-viewer sinks first, then offers output without
+blocking to the bounded legacy-WS mirror. A full or absent legacy mirror is
+detached instead of accumulating plaintext, while a lagging direct viewer is
+disconnected. Either transport reconnects and re-seeds from the worker replay
+watermark. The replay log uses the conservative total resource budget
+described in §6.2, including checkpoint and framing charges.
 
 ## 10. Crash isolation, restart, upgrades
 

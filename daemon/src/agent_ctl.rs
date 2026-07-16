@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -327,9 +327,9 @@ pub async fn send_replay(
     operation: &str,
     plain: bool,
     pty_offset: Option<u64>,
-    bytes: Vec<u8>,
+    replay: &crate::pty::WorkerReplay,
 ) -> Result<(), ProtocolError> {
-    let bytes = Zeroizing::new(bytes);
+    let bytes = replay.bytes();
     if bytes.len() > MAX_REPLAY_BYTES {
         return Err(ProtocolError::new(
             Some(request_id),
@@ -684,7 +684,8 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(8);
         let bytes = vec![7; CHUNK_PAYLOAD_BYTES + 3];
-        send_replay(&tx, id, "snapshot", false, Some(42), bytes.clone())
+        let replay = crate::pty::WorkerReplay::new(0, bytes);
+        send_replay(&tx, id, "snapshot", false, Some(42), &replay)
             .await
             .unwrap();
         let metadata_message = rx.recv().await.unwrap();
@@ -706,18 +707,12 @@ mod tests {
             assert_eq!(frame.len() - CHUNK_HEADER_LEN, expected_len);
         }
 
+        let oversized = crate::pty::WorkerReplay::new(0, vec![0; MAX_REPLAY_BYTES + 1]);
         assert_eq!(
-            send_replay(
-                &tx,
-                id,
-                "snapshot",
-                false,
-                None,
-                vec![0; MAX_REPLAY_BYTES + 1],
-            )
-            .await
-            .unwrap_err()
-            .code,
+            send_replay(&tx, id, "snapshot", false, None, &oversized,)
+                .await
+                .unwrap_err()
+                .code,
             "response_too_large"
         );
     }

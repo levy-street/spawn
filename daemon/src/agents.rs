@@ -10,7 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use uuid::Uuid;
 
-use crate::pty::{AgentHandle, ForwarderControl};
+use crate::pty::{AgentHandle, AgentLifecycle, ForwarderControl};
 
 #[derive(Default, Clone)]
 pub struct AgentRegistry {
@@ -193,6 +193,11 @@ impl AgentRegistry {
     pub fn control_for(&self, id: Uuid) -> Option<ForwarderControl> {
         let guard = self.inner.lock().expect("agents lock");
         guard.get(&id).map(|entry| entry.handle.control.clone())
+    }
+
+    pub fn lifecycle_for(&self, id: Uuid) -> Option<AgentLifecycle> {
+        let guard = self.inner.lock().expect("agents lock");
+        guard.get(&id).map(|entry| entry.handle.lifecycle())
     }
 
     /// Snapshot the per-agent forwarder controls so a WS session can

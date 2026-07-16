@@ -18,10 +18,11 @@
 // The Next rewrite proxies /ws/* to the API server in local development.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
-// Offered in preference order. On spawn.v2 the WS is lifecycle/signaling only:
-// the server never relays PTY bytes or viewport/snapshot controls; those flow
-// exclusively over the spawn.pty and spawn.ctl WebRTC DataChannels
-// (docs/TRUST.md Phase 1). spawn.v1 keeps the legacy relay for old servers.
+// Offered in preference order. On spawn.v2 browser input and browser-requested
+// history use spawn.pty/spawn.ctl WebRTC DataChannels. Until P2-AGENT-02,
+// however, spawnd still mirrors live output through the legacy server path;
+// the protocol label must not imply that the server cannot observe content.
+// spawn.v1 also keeps browser input/history on the legacy relay.
 export const SPAWN_WS_SUBPROTOCOLS = ["spawn.v2", "spawn.v1"];
 
 export function spawnWsSubprotocols(): string[] {

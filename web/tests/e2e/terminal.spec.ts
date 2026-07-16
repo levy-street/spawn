@@ -692,13 +692,22 @@ test.describe("mobile terminal touch", () => {
 });
 
 test("connection chip opens a details popover", async ({ page }) => {
-  await openTerminalWithMockSocket(page);
+  await openTerminalWithMockSocket(page, { v2: true });
 
-  await page.getByRole("button", { name: /Connection details/ }).click();
+  const chip = page.getByRole("button", { name: /Connection details/ });
+  await expect(chip).toHaveAttribute(
+    "title",
+    /daemon legacy server mirror remains until (?:Phase 2 \/ )?P2-AGENT-02/,
+  );
+  await expect(chip).not.toHaveAttribute("title", /server never (sees|relays)/i);
+  await chip.click();
 
   await expect(page.getByText("Path", { exact: true })).toBeVisible();
   await expect(page.getByText("Round trip", { exact: true })).toBeVisible();
-  await expect(page.getByText(/spawn\.v/).first()).toBeVisible();
+  await expect(
+    page.getByText(/direct WebRTC browser path (active|negotiating); daemon legacy server mirror/),
+  ).toBeVisible();
+  await expect(page.getByText(/server never (sees|relays)/i)).toHaveCount(0);
 });
 
 // Terminal emulation fidelity in the real renderer. Grid-level behavior is

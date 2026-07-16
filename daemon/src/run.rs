@@ -424,8 +424,9 @@ async fn dispatch_loop(
                         let _ =
                             ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
                     }
+                    let input = payload.copy_to_direct();
                     let found = registry.with_handle(agent_id, |h| {
-                        if let Err(e) = h.write_stdin(&payload) {
+                        if let Err(e) = h.write_stdin_owned(input) {
                             tracing::warn!(%agent_id, error = %e, "PTY stdin write failed");
                         }
                     });
@@ -2134,14 +2135,22 @@ async fn handle_agent_restart(
     drop(transition);
     if let Some(handle) = removed {
         handle.control.clear_sink().await;
-        // Escalating shutdown; the worker unlinks its socket on exit.
-        handle.shutdown(Some("TERM".into()));
+        // Lifecycle delivery bypasses the potentially saturated worker input
+        // socket. Check each result and deterministically escalate to KILL.
+        let term_result = handle.shutdown(Some("TERM".into())).await;
+        if let Err(error) = &term_result {
+            tracing::warn!(%agent_id, %error, "restart TERM delivery failed; escalating now");
+        }
+        let mut kill_attempted = false;
         for attempt in 0..30u32 {
             if !worker_backend::socket_exists(agent_id) {
                 break;
             }
-            if attempt == 15 {
-                handle.shutdown(Some("KILL".into()));
+            if !kill_attempted && (attempt == 15 || term_result.is_err()) {
+                kill_attempted = true;
+                if let Err(error) = handle.shutdown(Some("KILL".into())).await {
+                    tracing::error!(%agent_id, %error, "restart KILL delivery failed");
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -2172,9 +2181,51 @@ async fn handle_agent_kill(
     if !registry.contains(agent_id) {
         let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
     }
-    registry.with_handle(agent_id, |h| {
-        h.shutdown(signal);
-    });
+    let Some(binding) = registry.binding_for(agent_id) else {
+        send_error(
+            out_tx,
+            Some(agent_id),
+            "kill_failed",
+            &anyhow!("agent lifecycle is unavailable"),
+        )
+        .await;
+        return;
+    };
+    let lifecycle = registry
+        .lifecycle_for(agent_id)
+        .expect("binding and lifecycle are stored atomically");
+    let requested = signal.unwrap_or_else(|| "TERM".to_string());
+    let requested_name = requested.trim_start_matches("SIG");
+    if let Err(error) = lifecycle.shutdown(Some(requested.clone())).await {
+        tracing::warn!(%agent_id, signal = %requested, %error, "agent signal delivery failed");
+        let final_error = if requested_name == "KILL" {
+            error
+        } else {
+            match lifecycle.shutdown(Some("KILL".to_string())).await {
+                Ok(()) => return,
+                Err(kill_error) => kill_error,
+            }
+        };
+        send_error(
+            out_tx,
+            Some(agent_id),
+            "kill_failed",
+            &final_error.context("lifecycle delivery failed after escalation"),
+        )
+        .await;
+    } else if requested_name == "TERM" {
+        // TERM is graceful but bounded. Fence the delayed escalation to this
+        // exact backend generation so a fast restart cannot be killed.
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if registry.is_current(binding) {
+                if let Err(error) = lifecycle.shutdown(Some("KILL".to_string())).await {
+                    tracing::warn!(%agent_id, %error, "delayed agent KILL delivery failed");
+                }
+            }
+        });
+    }
     // The worker reports exit and emits `agent.exit`. We do not
     // remove from the registry here — let the exit handler do it once it has
     // the exit code.
@@ -2239,17 +2290,17 @@ async fn handle_agent_snapshot(
     registry.with_handle(agent_id, |h| replay_rx = h.replay(max_bytes));
     let replay = match replay_rx {
         Some(rx) => match rx.await {
-            Ok(Ok((_watermark, bytes))) => Ok(bytes),
+            Ok(Ok(replay)) => Ok(replay),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("worker replay dropped")),
         },
         None => Err(anyhow!("worker connection gone")),
     };
     match replay {
-        Ok(bytes) => {
+        Ok(replay) => {
             let snapshot = Outbound::AgentSnapshot {
                 agent_id,
-                bytes_b64: STANDARD.encode(bytes),
+                bytes_b64: STANDARD.encode(replay.bytes()),
                 dc_offset,
                 rtc_session_id,
             };

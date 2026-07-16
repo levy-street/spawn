@@ -7,6 +7,8 @@
 //!   protocol,
 //! - bridges worker output into the per-agent outbox → forwarder →
 //!   {WS sink, DataChannel direct sinks} pipeline,
+//! - delivers TERM/KILL through an independent bounded host-signal task so
+//!   lifecycle cannot be starved by the worker input socket,
 //! - adopts already-running workers after a restart by scanning the socket
 //!   directory (the worker greets every connection with `Hello`).
 
@@ -19,12 +21,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use spawnd::sessiond::wire;
 
 use crate::config;
-use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, WorkerHandleParts};
+use crate::pty::{
+    self, AgentHandle, ExitReason, ForwarderControl, LifecycleRequest, WorkerCmd, WorkerHandleParts,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADOPT_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -226,19 +230,28 @@ pub fn discover_ids() -> Vec<Uuid> {
 }
 
 /// Wire a connected worker stream into the standard per-agent plumbing:
-/// outbox → forwarder, a command channel for stdin/resize/replay/shutdown,
-/// and an exit oneshot.
+/// outbox → forwarder, a command channel for stdin/resize/replay, a separate
+/// acknowledged lifecycle channel, and an exit oneshot.
 fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) -> pty::Launched {
     let (outbox_tx, outbox_rx) = mpsc::channel::<pty::OutputChunk>(pty::WORKER_OUTPUT_QUEUE_DEPTH);
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(pty::WORKER_COMMAND_QUEUE_DEPTH);
+    let (lifecycle_tx, lifecycle_rx) =
+        mpsc::channel::<LifecycleRequest>(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
     let (read_half, write_half) = stream.into_split();
     let pending: PendingReplays = Default::default();
     let alive = Arc::new(AtomicBool::new(true));
+
+    tokio::spawn(run_lifecycle(
+        pid,
+        lifecycle_rx,
+        Arc::clone(&alive),
+        agent_id,
+    ));
 
     tokio::spawn(run_writer(
         write_half,
@@ -260,6 +273,7 @@ fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) 
     let handle = AgentHandle::new_worker(WorkerHandleParts {
         agent_id,
         cmd_tx,
+        lifecycle_tx,
         alive,
         cols,
         rows,
@@ -273,7 +287,7 @@ fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) 
     }
 }
 
-type ReplayWaiter = oneshot::Sender<Result<(u64, Vec<u8>)>>;
+type ReplayWaiter = oneshot::Sender<pty::WorkerReplayResult>;
 type PendingReplays = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ReplayWaiter>>>;
 const MAX_PENDING_REPLAYS: usize = 8;
 
@@ -315,23 +329,62 @@ async fn run_writer(
                 )
                 .await
             }
-            WorkerCmd::Shutdown { signal } => {
-                wire::write_json_frame(
-                    &mut write_half,
-                    wire::T_SHUTDOWN,
-                    &wire::Shutdown { signal },
-                )
-                .await
-            }
         };
         if let Err(e) = res {
             tracing::debug!(%agent_id, error = %e, "worker write failed");
             break;
         }
     }
-    alive.store(false, Ordering::Release);
     // Fail any replay waiters still queued.
     fail_pending_replays(&pending);
+}
+
+/// Lifecycle delivery is deliberately independent of the normal framed
+/// command writer. A saturated input queue or blocked worker socket therefore
+/// cannot prevent TERM/KILL from reaching the agent process group.
+async fn run_lifecycle(
+    pid: u32,
+    mut lifecycle_rx: mpsc::Receiver<LifecycleRequest>,
+    alive: Arc<AtomicBool>,
+    agent_id: Uuid,
+) {
+    while let Some(request) = lifecycle_rx.recv().await {
+        if !alive.load(Ordering::Acquire) {
+            let _ = request
+                .delivered
+                .send(Err("worker connection gone".to_string()));
+            continue;
+        }
+        let result = signal_agent_process_group(pid, request.signal.as_deref())
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            tracing::warn!(%agent_id, pid, %error, "agent lifecycle signal failed");
+        }
+        let _ = request.delivered.send(result);
+    }
+}
+
+fn signal_agent_process_group(pid: u32, signal: Option<&str>) -> Result<()> {
+    use nix::sys::signal::{kill, killpg, Signal};
+    use nix::unistd::Pid;
+
+    let signal = match signal.unwrap_or("TERM").trim_start_matches("SIG") {
+        "KILL" => Signal::SIGKILL,
+        "INT" => Signal::SIGINT,
+        "HUP" => Signal::SIGHUP,
+        "QUIT" => Signal::SIGQUIT,
+        _ => Signal::SIGTERM,
+    };
+    let pid = i32::try_from(pid).context("agent pid exceeds i32")?;
+    if pid <= 1 {
+        bail!("refusing to signal invalid agent pid {pid}");
+    }
+    let pid = Pid::from_raw(pid);
+    // portable-pty makes the child a session leader, so pgid == pid. Retain
+    // the worker's direct-pid fallback for platforms where that setup races.
+    killpg(pid, signal)
+        .or_else(|_| kill(pid, signal))
+        .context("signaling agent process group")
 }
 
 fn enqueue_pending_replay(
@@ -394,7 +447,7 @@ async fn run_reader(
                             let replay = bytes.to_vec();
                             let barrier = pty::OutputChunk::source_barrier(watermark);
                             let _ = outbox_tx.send(barrier).await;
-                            Ok((watermark, replay))
+                            Ok(pty::WorkerReplay::new(watermark, replay))
                         }
                         Err(error) => Err(error),
                     };
@@ -449,19 +502,9 @@ async fn run_reader(
     fail_pending_replays(&pending);
 }
 
-fn send_replay_result(
-    waiter: oneshot::Sender<Result<(u64, Vec<u8>)>>,
-    result: Result<(u64, Vec<u8>)>,
-) {
-    if let Err(mut rejected) = waiter.send(result) {
-        wipe_replay_result(&mut rejected);
-    }
-}
-
-fn wipe_replay_result(result: &mut Result<(u64, Vec<u8>)>) {
-    if let Ok((_, bytes)) = result {
-        bytes.zeroize();
-    }
+fn send_replay_result(waiter: ReplayWaiter, result: pty::WorkerReplayResult) {
+    // WorkerReplay owns its zeroization, including the rejected-send value.
+    let _ = waiter.send(result);
 }
 
 async fn connect_with_retry(socket: &std::path::Path, timeout: Duration) -> Result<UnixStream> {
@@ -502,13 +545,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejected_replay_result_is_zeroized() {
-        let mut result = Ok((7, b"decrypted replay bytes".to_vec()));
-        wipe_replay_result(&mut result);
-        let Ok((_, bytes)) = result else {
-            unreachable!()
+    fn replay_wipes_after_successful_send_then_receiver_cancellation() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |bytes: &[u8]| observed.lock().unwrap().extend_from_slice(bytes))
         };
-        assert!(bytes.iter().all(|byte| *byte == 0));
+        let (waiter, receiver) = oneshot::channel();
+        send_replay_result(
+            waiter,
+            Ok(pty::WorkerReplay::with_wipe_probe(
+                7,
+                b"decrypted replay bytes".to_vec(),
+                probe,
+            )),
+        );
+        drop(receiver);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), b"decrypted replay bytes".len());
+        assert!(observed.iter().all(|byte| *byte == 0));
     }
 
     #[tokio::test]
@@ -518,6 +573,7 @@ mod tests {
         let (read_half, write_half) = daemon_stream.into_split();
         drop(read_half);
         let (cmd_tx, cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
         let capacity_probe = cmd_tx.clone();
         let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let alive = Arc::new(AtomicBool::new(true));
@@ -531,6 +587,7 @@ mod tests {
         let handle = AgentHandle::new_worker(WorkerHandleParts {
             agent_id,
             cmd_tx,
+            lifecycle_tx,
             alive,
             cols: 80,
             rows: 24,
@@ -562,6 +619,85 @@ mod tests {
             .await
             .expect("stalled writer did not stop")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn priority_lifecycle_bypasses_32_queued_inputs_and_completes_restart_escalation() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; while :; do sleep 1; done")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn signal-ignoring agent");
+        let pid = child.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .expect("agent readiness");
+        assert_eq!(ready.trim(), "ready");
+
+        let (cmd_tx, _stalled_cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
+        for _ in 0..pty::WORKER_COMMAND_QUEUE_DEPTH {
+            cmd_tx
+                .try_send(WorkerCmd::Input(pty::DirectPayload::new(vec![
+                    b'i';
+                    pty::MAX_WORKER_INPUT_BYTES
+                ])))
+                .unwrap();
+        }
+        assert_eq!(cmd_tx.capacity(), 0);
+
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
+        let alive = Arc::new(AtomicBool::new(true));
+        let lifecycle_task = tokio::spawn(run_lifecycle(
+            pid,
+            lifecycle_rx,
+            Arc::clone(&alive),
+            Uuid::new_v4(),
+        ));
+        let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let handle = AgentHandle::new_worker(WorkerHandleParts {
+            agent_id: Uuid::new_v4(),
+            cmd_tx,
+            lifecycle_tx,
+            alive,
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: ForwarderControl::new(),
+        });
+
+        handle
+            .shutdown(Some("TERM".to_string()))
+            .await
+            .expect("TERM bypassed stalled input");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            child.try_wait().expect("TERM status").is_none(),
+            "signal-ignoring agent unexpectedly exited on TERM"
+        );
+
+        handle
+            .shutdown(Some("KILL".to_string()))
+            .await
+            .expect("KILL bypassed stalled input");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if child.try_wait().expect("KILL status").is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart escalation timed out");
+
+        drop(handle);
+        lifecycle_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -686,16 +822,19 @@ mod tests {
         // Establish the same replay barrier used before a real DataChannel is
         // registered. Historical worker watermarks may predate this spawnd.
         let initial_replay_rx = launched.handle.replay(1 << 20).expect("replay req");
-        let (initial_watermark, initial_bytes) = initial_replay_rx
+        let initial_replay = initial_replay_rx
             .await
             .expect("replay resp")
             .expect("replay ok");
+        let initial_watermark = initial_replay.watermark();
         launched
             .handle
             .control
             .wait_source_offset(initial_watermark)
             .await;
-        let initial_replay_has_hello = String::from_utf8_lossy(&initial_bytes).contains("wb-hello");
+        let initial_replay_has_hello =
+            String::from_utf8_lossy(initial_replay.bytes()).contains("wb-hello");
+        drop(initial_replay);
 
         // DataChannel-style direct sink sees output after its exact origin.
         let mut direct = launched
@@ -712,14 +851,15 @@ mod tests {
 
         // Replay covers everything so far.
         let replay_rx = launched.handle.replay(1 << 20).expect("replay req");
-        let (watermark, bytes) = replay_rx.await.expect("replay resp").expect("replay ok");
-        assert!(watermark > 0);
-        let text = String::from_utf8_lossy(&bytes);
+        let replay = replay_rx.await.expect("replay resp").expect("replay ok");
+        assert!(replay.watermark() > 0);
+        let text = String::from_utf8_lossy(replay.bytes());
         assert!(text.contains("wb-hello"), "replay missing output: {text:?}");
         assert!(
             text.contains("ping-1"),
             "replay missing stdin echo: {text:?}"
         );
+        drop(replay);
 
         // Simulate a spawnd restart: drop the handle, adopt the live worker.
         drop(launched);
@@ -734,16 +874,18 @@ mod tests {
         adopted.handle.control.set_sink(ws_tx).await;
         tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
         let adopted_replay_rx = adopted.handle.replay(1 << 20).expect("adopt replay req");
-        let (adopted_watermark, adopted_bytes) = adopted_replay_rx
+        let adopted_replay = adopted_replay_rx
             .await
             .expect("adopt replay resp")
             .expect("adopt replay ok");
+        let adopted_watermark = adopted_replay.watermark();
         adopted
             .handle
             .control
             .wait_source_offset(adopted_watermark)
             .await;
-        assert!(String::from_utf8_lossy(&adopted_bytes).contains("ping-1"));
+        assert!(String::from_utf8_lossy(adopted_replay.bytes()).contains("ping-1"));
+        drop(adopted_replay);
         let mut direct = adopted
             .handle
             .control
@@ -755,9 +897,13 @@ mod tests {
 
         // Restart shutdown must not probe by connecting: a probe would become
         // the worker's current supervisor generation and fence this TERM.
-        // The agent ignores TERM so the same connection must remain usable
-        // for the KILL escalation.
-        assert!(adopted.handle.shutdown(Some("TERM".into())));
+        // The agent ignores TERM, so the independent lifecycle path must
+        // remain usable for KILL escalation even if ordinary commands stall.
+        adopted
+            .handle
+            .shutdown(Some("TERM".into()))
+            .await
+            .expect("TERM delivery");
         let mut exit_rx = adopted.exit_rx;
         assert!(
             tokio::time::timeout(Duration::from_millis(300), &mut exit_rx)
@@ -766,7 +912,11 @@ mod tests {
             "TERM unexpectedly stopped the signal-ignoring test agent"
         );
         assert!(socket_exists(agent_id));
-        assert!(adopted.handle.shutdown(Some("KILL".into())));
+        adopted
+            .handle
+            .shutdown(Some("KILL".into()))
+            .await
+            .expect("KILL delivery");
         let reason = tokio::time::timeout(Duration::from_secs(15), exit_rx)
             .await
             .expect("exit timed out")
