@@ -46,6 +46,7 @@ log = logging.getLogger("spawn.ws.host")
 HOST_WS_SUBPROTOCOL = "spawn.host.v1"
 MAX_SIGNAL_FRAME_BYTES = 1100 * 1024
 WS_CLOSE_BINARY = 4002
+MAX_HOST_RTC_BINDING_IDENTITIES = 256
 
 
 @dataclass(frozen=True)
@@ -104,25 +105,69 @@ def _retire_binding(
     retired: dict[tuple[str, str, int, str], float],
     binding: BrowserRtcSession,
     now: float,
-) -> None:
+    changed: asyncio.Event | None = None,
+) -> bool:
+    identity = _binding_identity(binding)
+    if (
+        identity not in retired
+        and len(retired) >= MAX_HOST_RTC_BINDING_IDENTITIES
+    ):
+        return False
     retired[_binding_identity(binding)] = now + RTC_BINDING_TOMBSTONE_TTL_SECONDS
+    if changed is not None:
+        changed.set()
+    return True
 
 
 def _prune_sessions(
     sessions: dict[str, BrowserRtcSession],
     retired: dict[tuple[str, str, int, str], float],
     now: float,
+    changed: asyncio.Event | None = None,
 ) -> None:
     for session_id in [
         session_id for session_id, binding in sessions.items() if binding.expires_at <= now
     ]:
-        binding = sessions.pop(session_id, None)
-        if binding is not None:
-            _retire_binding(retired, binding, now)
+        binding = sessions.get(session_id)
+        if binding is not None and _retire_binding(retired, binding, now, changed):
+            sessions.pop(session_id, None)
     for identity in [
         identity for identity, expires_at in retired.items() if expires_at <= now
     ]:
         retired.pop(identity, None)
+
+
+def _rtc_binding_capacity_available(
+    sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
+) -> bool:
+    return (
+        len(sessions) + len(retired) < MAX_HOST_RTC_BINDING_IDENTITIES
+    )
+
+
+async def _cleanup_retired_bindings(
+    sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
+    sessions_lock: asyncio.Lock,
+    changed: asyncio.Event,
+) -> None:
+    """Expire local tombstones even when the signaling connection is idle."""
+    while True:
+        async with sessions_lock:
+            now = time.monotonic()
+            _prune_sessions(sessions, retired, now, changed)
+            deadline = min(retired.values()) if retired else None
+            changed.clear()
+        try:
+            if deadline is None:
+                await changed.wait()
+            else:
+                await asyncio.wait_for(
+                    changed.wait(), timeout=max(0.0, deadline - time.monotonic())
+                )
+        except TimeoutError:
+            pass
 
 
 async def _forward_if_exact_binding(
@@ -132,6 +177,7 @@ async def _forward_if_exact_binding(
     sessions: dict[str, BrowserRtcSession],
     retired: dict[tuple[str, str, int, str], float],
     sessions_lock: asyncio.Lock,
+    tombstones_changed: asyncio.Event | None = None,
     *,
     connected: bool = False,
     retire: bool = False,
@@ -139,15 +185,16 @@ async def _forward_if_exact_binding(
     """CAS the captured identity and keep it stable through browser delivery."""
     async with sessions_lock:
         now = time.monotonic()
-        _prune_sessions(sessions, retired, now)
+        _prune_sessions(sessions, retired, now, tombstones_changed)
         if (
             sessions.get(binding.session_id) is not binding
             or _binding_identity(binding) in retired
         ):
             return False
         if retire:
+            if not _retire_binding(retired, binding, now, tombstones_changed):
+                return False
             sessions.pop(binding.session_id, None)
-            _retire_binding(retired, binding, now)
         elif connected:
             sessions[binding.session_id] = replace(
                 binding,
@@ -162,12 +209,16 @@ async def _retire_if_exact_binding(
     sessions: dict[str, BrowserRtcSession],
     retired: dict[tuple[str, str, int, str], float],
     sessions_lock: asyncio.Lock,
+    tombstones_changed: asyncio.Event | None = None,
 ) -> bool:
     async with sessions_lock:
         if sessions.get(binding.session_id) is not binding:
             return False
+        if not _retire_binding(
+            retired, binding, time.monotonic(), tombstones_changed
+        ):
+            return False
         sessions.pop(binding.session_id, None)
-        _retire_binding(retired, binding, time.monotonic())
         return True
 
 
@@ -203,6 +254,7 @@ async def _pump_browser_signals(
     sessions: dict[str, BrowserRtcSession],
     retired: dict[tuple[str, str, int, str], float],
     sessions_lock: asyncio.Lock,
+    tombstones_changed: asyncio.Event,
     ready: asyncio.Event,
 ) -> None:
     async with get_backend().subscribe_channel(channel) as stream:
@@ -218,7 +270,9 @@ async def _pump_browser_signals(
             if session_id is None:
                 continue
             async with sessions_lock:
-                _prune_sessions(sessions, retired, time.monotonic())
+                _prune_sessions(
+                    sessions, retired, time.monotonic(), tombstones_changed
+                )
                 binding = sessions.get(session_id)
                 if binding is None:
                     continue
@@ -260,6 +314,7 @@ async def _pump_browser_signals(
                 sessions,
                 retired,
                 sessions_lock,
+                tombstones_changed,
                 connected=dispatch_is_session_owner and status_value == "connected",
                 retire=(
                     not dispatch_is_session_owner
@@ -319,7 +374,12 @@ async def host_ws(
     sessions: dict[str, BrowserRtcSession] = {}
     retired: dict[tuple[str, str, int, str], float] = {}
     sessions_lock = asyncio.Lock()
+    tombstones_changed = asyncio.Event()
     pump_ready = asyncio.Event()
+
+    ice_servers = ice_servers_for_session(get_settings(), label=user.id)
+    transport_policy = "relay" if _is_turn_only(ice_servers) else "all"
+
     pump_task = asyncio.create_task(
         _pump_browser_signals(
             conn,
@@ -328,12 +388,18 @@ async def host_ws(
             sessions,
             retired,
             sessions_lock,
+            tombstones_changed,
             pump_ready,
         )
     )
-
-    ice_servers = ice_servers_for_session(get_settings(), label=user.id)
-    transport_policy = "relay" if _is_turn_only(ice_servers) else "all"
+    tombstone_cleanup_task = asyncio.create_task(
+        _cleanup_retired_bindings(
+            sessions,
+            retired,
+            sessions_lock,
+            tombstones_changed,
+        )
+    )
 
     try:
         await wait_for_signal_pump(pump_task, pump_ready)
@@ -393,8 +459,12 @@ async def host_ws(
                 daemon_connection_id = daemon_owner.daemon_connection_id
                 now = time.monotonic()
                 async with sessions_lock:
-                    _prune_sessions(sessions, retired, now)
-                    if session_id in sessions or len(sessions) >= MAX_HOST_RTC_SESSIONS_PER_BROWSER:
+                    _prune_sessions(sessions, retired, now, tombstones_changed)
+                    if (
+                        session_id in sessions
+                        or len(sessions) >= MAX_HOST_RTC_SESSIONS_PER_BROWSER
+                        or not _rtc_binding_capacity_available(sessions, retired)
+                    ):
                         binding = None
                     else:
                         binding = BrowserRtcSession(
@@ -410,7 +480,11 @@ async def host_ws(
                     continue
                 if not await _binding_is_current_owner(host_id, binding):
                     await _retire_if_exact_binding(
-                        binding, sessions, retired, sessions_lock
+                        binding,
+                        sessions,
+                        retired,
+                        sessions_lock,
+                        tombstones_changed,
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
@@ -430,20 +504,30 @@ async def host_ws(
                 )
                 if not published:
                     await _retire_if_exact_binding(
-                        binding, sessions, retired, sessions_lock
+                        binding,
+                        sessions,
+                        retired,
+                        sessions_lock,
+                        tombstones_changed,
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.candidate":
                 candidate = _valid_rtc_candidate(obj.get("candidate"))
                 async with sessions_lock:
-                    _prune_sessions(sessions, retired, time.monotonic())
+                    _prune_sessions(
+                        sessions, retired, time.monotonic(), tombstones_changed
+                    )
                     binding = sessions.get(session_id)
                 if candidate is None or binding is None:
                     continue
                 if not await _binding_is_current_owner(host_id, binding):
                     await _retire_if_exact_binding(
-                        binding, sessions, retired, sessions_lock
+                        binding,
+                        sessions,
+                        retired,
+                        sessions_lock,
+                        tombstones_changed,
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
@@ -461,15 +545,24 @@ async def host_ws(
                 )
                 if not published:
                     await _retire_if_exact_binding(
-                        binding, sessions, retired, sessions_lock
+                        binding,
+                        sessions,
+                        retired,
+                        sessions_lock,
+                        tombstones_changed,
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.close":
                 async with sessions_lock:
-                    binding = sessions.pop(session_id, None)
-                    if binding is not None:
-                        _retire_binding(retired, binding, time.monotonic())
+                    binding = sessions.get(session_id)
+                    if binding is not None and _retire_binding(
+                            retired,
+                            binding,
+                            time.monotonic(),
+                            tombstones_changed,
+                        ):
+                        sessions.pop(session_id, None)
                 if binding is not None and await _binding_is_current_owner(host_id, binding):
                     await _publish_signal(
                         host_id,
@@ -492,7 +585,7 @@ async def host_ws(
             sessions.clear()
             now = time.monotonic()
             for binding in remaining:
-                _retire_binding(retired, binding, now)
+                _retire_binding(retired, binding, now, tombstones_changed)
         for binding in remaining:
             try:
                 if not await _binding_is_current_owner(host_id, binding):
@@ -513,5 +606,10 @@ async def host_ws(
         pump_task.cancel()
         try:
             await pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        tombstone_cleanup_task.cancel()
+        try:
+            await tombstone_cleanup_task
         except (asyncio.CancelledError, Exception):
             pass

@@ -839,16 +839,31 @@ async def _process_host_rtc_signal(
         session_id = _valid_rtc_session_id(signal.get("session_id"))
         if session_id is None:
             return True
+        frame_type = signal.get("type")
+        binding_nonce = signal.get("binding_nonce")
         binding = await broker.rtc_session_for(session_id, daemon=conn)
         if (
             binding is None
             or binding.scope_type != "agent"
             or binding.scope_id != agent_id
             or binding.browser.route_id != envelope.browser_channel
-            or signal.get("binding_nonce") != binding.nonce
+            or binding_nonce != binding.nonce
+            or signal.get("binding_generation") != binding.daemon_generation
         ):
+            # Browser teardown retires before dispatch so a reused session id
+            # can never be mistaken for the binding being closed. The exact
+            # tombstone lets the daemon receive that delayed close; its own
+            # nonce CAS then ignores it if a replacement already exists.
+            if (
+                frame_type == "rtc.close"
+                and isinstance(binding_nonce, str)
+                and signal.get("binding_generation") == generation
+                and await broker.rtc_binding_identity_is_retired(
+                    session_id, conn, binding_nonce
+                )
+            ):
+                await _bounded_send_text(conn, signal)
             return True
-        frame_type = signal.get("type")
         if frame_type == "rtc.offer":
             if _valid_rtc_sdp(signal.get("sdp")) is None:
                 return True
@@ -1534,6 +1549,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "type": "rtc.answer",
                             "session_id": session_id,
                             "binding_nonce": binding.nonce,
+                            "binding_generation": binding.daemon_generation,
                             "sdp": sdp,
                         }
                         if binding.scope_type == "agent":
@@ -1563,6 +1579,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "type": "rtc.candidate",
                             "session_id": session_id,
                             "binding_nonce": binding.nonce,
+                            "binding_generation": binding.daemon_generation,
                             "candidate": candidate,
                         }
                         if binding.scope_type == "agent":
@@ -1601,6 +1618,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "type": "rtc.status",
                             "session_id": session_id,
                             "binding_nonce": binding.nonce,
+                            "binding_generation": binding.daemon_generation,
                             "status": status_value,
                         }
                         if binding.scope_type == "agent":

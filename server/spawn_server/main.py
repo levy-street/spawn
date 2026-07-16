@@ -26,6 +26,7 @@ from .routes import screens as screens_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
 from .ws import host as host_ws
+from .ws.broker import get_broker
 
 log = logging.getLogger("spawn.main")
 
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await hosts_routes.stop_auto_update_checker()
+        await get_broker().shutdown()
         await redis_shutdown()
         await dispose_engine()
 

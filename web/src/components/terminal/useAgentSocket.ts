@@ -6,6 +6,7 @@ import {
   buildAgentWsUrl,
   type DisplayControlState,
   parseInbound,
+  rtcBindingFrameMatches,
   spawnWsSubprotocols,
 } from "@/lib/ws";
 
@@ -52,6 +53,8 @@ type RtcState = {
   pc: RTCPeerConnection | null;
   dc: RTCDataChannel | null;
   sessionId: string | null;
+  bindingNonce: string | null;
+  bindingGeneration: number | null;
   open: boolean;
   /** Cumulative PTY bytes received over this session's DataChannel. */
   bytesReceived: number;
@@ -75,6 +78,16 @@ function newRtcSessionId(): string {
     return crypto.randomUUID();
   }
   return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function newRtcBindingNonce(): string {
+  if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  return Array.from({ length: 4 }, () => Math.random().toString(16).slice(2).padEnd(8, "0"))
+    .join("")
+    .slice(0, 32);
 }
 
 export function useAgentSocket({
@@ -105,6 +118,8 @@ export function useAgentSocket({
     pc: null,
     dc: null,
     sessionId: null,
+    bindingNonce: null,
+    bindingGeneration: null,
     open: false,
     bytesReceived: 0,
   });
@@ -173,11 +188,12 @@ export function useAgentSocket({
     const cleanupRtc = (signal = true, retry = false) => {
       const rtc = rtcRef.current;
       const sessionId = rtc.sessionId;
+      const bindingNonce = rtc.bindingNonce;
       clearRtcConnectTimer();
       clearRtcDisconnectedTimer();
       clearRelayFallback();
-      if (signal && sessionId) {
-        sendJsonOverWs({ type: "rtc.close", session_id: sessionId });
+      if (signal && sessionId && bindingNonce) {
+        sendJsonOverWs({ type: "rtc.close", session_id: sessionId, binding_nonce: bindingNonce });
       }
       try {
         rtc.dc?.close();
@@ -189,7 +205,15 @@ export function useAgentSocket({
       } catch {
         // ignore
       }
-      rtcRef.current = { pc: null, dc: null, sessionId: null, open: false, bytesReceived: 0 };
+      rtcRef.current = {
+        pc: null,
+        dc: null,
+        sessionId: null,
+        bindingNonce: null,
+        bindingGeneration: null,
+        open: false,
+        bytesReceived: 0,
+      };
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
       lastRtcDataAt = 0;
@@ -232,6 +256,7 @@ export function useAgentSocket({
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
       const sessionId = newRtcSessionId();
+      const bindingNonce = newRtcBindingNonce();
       // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
       // survive networks where no direct path exists (docs/TRUST.md Phase 1).
       const forceRelay =
@@ -245,7 +270,15 @@ export function useAgentSocket({
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       let offerSent = false;
       dc.binaryType = "arraybuffer";
-      rtcRef.current = { pc, dc, sessionId, open: false, bytesReceived: 0 };
+      rtcRef.current = {
+        pc,
+        dc,
+        sessionId,
+        bindingNonce,
+        bindingGeneration: null,
+        open: false,
+        bytesReceived: 0,
+      };
       rtcConnectTimer = setTimeout(() => {
         if (rtcRef.current.sessionId === sessionId && !rtcRef.current.open) {
           cleanupRtc(true, true);
@@ -256,6 +289,7 @@ export function useAgentSocket({
         sendJsonOverWs({
           type: "rtc.candidate",
           session_id: sessionId,
+          binding_nonce: bindingNonce,
           candidate,
         });
 
@@ -353,7 +387,14 @@ export function useAgentSocket({
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         if (cancelled || rtcRef.current.sessionId !== sessionId) return;
-        if (!sendJsonOverWs({ type: "rtc.offer", session_id: sessionId, sdp: offer.sdp })) {
+        if (
+          !sendJsonOverWs({
+            type: "rtc.offer",
+            session_id: sessionId,
+            binding_nonce: bindingNonce,
+            sdp: offer.sdp,
+          })
+        ) {
           cleanupRtc(false);
           return;
         }
@@ -426,6 +467,10 @@ export function useAgentSocket({
             h.onUploadError?.(msg.message);
           } else if (msg.type === "rtc.config") {
             if (msg.enabled) {
+              if (wsV2Ref.current && msg.binding_nonce_required !== true) {
+                ws.close(1002, "RTC binding identity negotiation is required");
+                return;
+              }
               lastRtcIceServers = msg.ice_servers ?? [];
               rtcRetryAttempts = 0;
               void startRtc(lastRtcIceServers);
@@ -434,17 +479,61 @@ export function useAgentSocket({
             }
           } else if (msg.type === "rtc.answer") {
             const current = rtcRef.current;
-            if (current.sessionId === msg.session_id && current.pc) {
-              void current.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
+            const bindingRequired = wsV2Ref.current;
+            if (
+              current.sessionId &&
+              current.bindingNonce &&
+              (!bindingRequired || current.bindingGeneration !== null) &&
+              current.pc &&
+              rtcBindingFrameMatches(
+                {
+                  sessionId: current.sessionId,
+                  bindingNonce: current.bindingNonce,
+                  bindingGeneration: current.bindingGeneration,
+                },
+                msg,
+                bindingRequired,
+              )
+            ) {
+              const pc = current.pc;
+              const acceptedBinding = {
+                sessionId: current.sessionId,
+                bindingNonce: current.bindingNonce,
+                bindingGeneration: current.bindingGeneration,
+              };
+              void pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
+                const latest = rtcRef.current;
+                if (
+                  latest.pc !== pc ||
+                  latest.sessionId !== acceptedBinding.sessionId ||
+                  latest.bindingNonce !== acceptedBinding.bindingNonce ||
+                  latest.bindingGeneration !== acceptedBinding.bindingGeneration
+                )
+                  return;
                 const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
                 for (const candidate of pending) {
-                  void current.pc?.addIceCandidate(candidate).catch(() => {});
+                  void pc.addIceCandidate(candidate).catch(() => {});
                 }
               });
             }
           } else if (msg.type === "rtc.candidate") {
             const current = rtcRef.current;
-            if (current.sessionId === msg.session_id && current.pc) {
+            const bindingRequired = wsV2Ref.current;
+            if (
+              current.sessionId &&
+              current.bindingNonce &&
+              (!bindingRequired || current.bindingGeneration !== null) &&
+              current.pc &&
+              rtcBindingFrameMatches(
+                {
+                  sessionId: current.sessionId,
+                  bindingNonce: current.bindingNonce,
+                  bindingGeneration: current.bindingGeneration,
+                },
+                msg,
+                bindingRequired,
+              )
+            ) {
               if (current.pc.remoteDescription) {
                 void current.pc.addIceCandidate(msg.candidate).catch(() => {});
               } else {
@@ -452,9 +541,42 @@ export function useAgentSocket({
               }
             }
           } else if (msg.type === "rtc.status") {
+            const current = rtcRef.current;
+            if (
+              msg.status === "negotiating" &&
+              current.sessionId === msg.session_id &&
+              current.bindingNonce === msg.binding_nonce &&
+              current.bindingGeneration === null &&
+              typeof msg.binding_generation === "number" &&
+              Number.isSafeInteger(msg.binding_generation) &&
+              msg.binding_generation > 0
+            ) {
+              rtcRef.current = {
+                ...current,
+                bindingGeneration: msg.binding_generation,
+              };
+              return;
+            }
+            const exactPrebindFailure =
+              current.bindingGeneration === null &&
+              current.sessionId === msg.session_id &&
+              current.bindingNonce === msg.binding_nonce &&
+              msg.binding_generation === undefined;
+            const exactBoundStatus =
+              current.sessionId !== null &&
+              current.bindingNonce !== null &&
+              rtcBindingFrameMatches(
+                {
+                  sessionId: current.sessionId,
+                  bindingNonce: current.bindingNonce,
+                  bindingGeneration: current.bindingGeneration,
+                },
+                msg,
+                wsV2Ref.current,
+              );
             if (
               msg.session_id &&
-              rtcRef.current.sessionId === msg.session_id &&
+              (exactPrebindFailure || exactBoundStatus) &&
               ["failed", "disabled", "unavailable"].includes(msg.status)
             ) {
               cleanupRtc(false, msg.status !== "disabled");

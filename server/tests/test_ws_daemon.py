@@ -1433,7 +1433,10 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
             assert dispatch.session_generation == live_daemon.host_generation
             assert dispatch.dispatch_connection_id == live_daemon.id
             assert dispatch.dispatch_generation == live_daemon.host_generation
-            assert dispatch.signal == expected
+            assert dispatch.signal == {
+                **expected,
+                "binding_generation": live_daemon.host_generation,
+            }
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)

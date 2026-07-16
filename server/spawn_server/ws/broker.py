@@ -146,6 +146,7 @@ class Broker:
         self._display_by_agent: dict[str, _DisplayState] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
         self._retired_rtc_bindings: dict[tuple[str, str, int, str], float] = {}
+        self._rtc_tombstone_cleanup_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -202,9 +203,9 @@ class Broker:
             if binding.daemon is conn and (include_host or binding.scope_type != "host")
         ]
         for session_id in stale:
-            binding = self._rtc_sessions.pop(session_id, None)
-            if binding is not None:
-                self._retire_rtc_binding_locked(binding)
+            binding = self._rtc_sessions.get(session_id)
+            if binding is not None and self._retire_rtc_binding_locked(binding):
+                self._rtc_sessions.pop(session_id, None)
 
     async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> DaemonOwnerAcceptance:
         """Atomically expose a fully claimed daemon to local routing.
@@ -359,13 +360,22 @@ class Broker:
             now = time.monotonic() if now is None else now
             self._prune_expired_rtc_sessions_locked(now)
             generation = daemon.host_generation if daemon.host_generation is not None else 0
-            from .host_signal import new_rtc_binding_nonce, valid_rtc_binding_nonce
+            from .host_signal import (
+                MAX_RTC_BINDING_IDENTITIES,
+                new_rtc_binding_nonce,
+                valid_rtc_binding_nonce,
+            )
 
             nonce = binding_nonce or new_rtc_binding_nonce()
             if not valid_rtc_binding_nonce(nonce):
                 return False
             route_nonce = getattr(conn, "binding_nonce", nonce)
             if route_nonce != nonce:
+                return False
+            if (
+                len(self._rtc_sessions) + len(self._retired_rtc_bindings)
+                >= MAX_RTC_BINDING_IDENTITIES
+            ):
                 return False
             if session_id in self._rtc_sessions:
                 return False
@@ -416,8 +426,8 @@ class Broker:
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
             if current is not None and (conn is None or current.browser is conn):
-                self._rtc_sessions.pop(session_id, None)
-                self._retire_rtc_binding_locked(current)
+                if self._retire_rtc_binding_locked(current):
+                    self._rtc_sessions.pop(session_id, None)
 
     async def unregister_rtc_sessions_for(
         self, conn: BrowserConn | HostBrowserConn | RedisBrowserConn
@@ -428,10 +438,12 @@ class Broker:
                 for session_id, binding in self._rtc_sessions.items()
                 if binding.browser is conn
             ]
+            removed: list[RtcSessionBinding] = []
             for session_id, binding in sessions:
-                self._rtc_sessions.pop(session_id, None)
-                self._retire_rtc_binding_locked(binding)
-            return [binding for _, binding in sessions]
+                if self._retire_rtc_binding_locked(binding):
+                    self._rtc_sessions.pop(session_id, None)
+                    removed.append(binding)
+            return removed
 
     async def rtc_session_for(
         self,
@@ -460,9 +472,9 @@ class Broker:
             if binding.expires_at <= now
         ]
         for session_id in expired:
-            binding = self._rtc_sessions.pop(session_id, None)
-            if binding is not None:
-                self._retire_rtc_binding_locked(binding, now=now)
+            binding = self._rtc_sessions.get(session_id)
+            if binding is not None and self._retire_rtc_binding_locked(binding, now=now):
+                self._rtc_sessions.pop(session_id, None)
 
     @staticmethod
     def _rtc_binding_identity(binding: RtcSessionBinding) -> tuple[str, str, int, str]:
@@ -475,13 +487,24 @@ class Broker:
 
     def _retire_rtc_binding_locked(
         self, binding: RtcSessionBinding, *, now: float | None = None
-    ) -> None:
-        from .host_signal import RTC_BINDING_TOMBSTONE_TTL_SECONDS
+    ) -> bool:
+        from .host_signal import (
+            MAX_RTC_BINDING_IDENTITIES,
+            RTC_BINDING_TOMBSTONE_TTL_SECONDS,
+        )
 
         timestamp = time.monotonic() if now is None else now
-        self._retired_rtc_bindings[self._rtc_binding_identity(binding)] = (
+        identity = self._rtc_binding_identity(binding)
+        if (
+            identity not in self._retired_rtc_bindings
+            and len(self._retired_rtc_bindings) >= MAX_RTC_BINDING_IDENTITIES
+        ):
+            return False
+        self._retired_rtc_bindings[identity] = (
             timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
         )
+        self._schedule_rtc_tombstone_cleanup_locked()
+        return True
 
     def _prune_rtc_tombstones_locked(self, now: float) -> None:
         for identity in [
@@ -490,6 +513,46 @@ class Broker:
             if expires_at <= now
         ]:
             self._retired_rtc_bindings.pop(identity, None)
+
+    def _schedule_rtc_tombstone_cleanup_locked(self) -> None:
+        if (
+            self._rtc_tombstone_cleanup_task is None
+            or self._rtc_tombstone_cleanup_task.done()
+        ):
+            self._rtc_tombstone_cleanup_task = asyncio.create_task(
+                self._rtc_tombstone_cleanup_loop()
+            )
+
+    async def _rtc_tombstone_cleanup_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                async with self._lock:
+                    now = time.monotonic()
+                    self._prune_expired_rtc_sessions_locked(now)
+                    if not self._retired_rtc_bindings:
+                        return
+                    delay = max(
+                        0.0,
+                        min(self._retired_rtc_bindings.values()) - time.monotonic(),
+                    )
+                await asyncio.sleep(delay)
+        finally:
+            if self._rtc_tombstone_cleanup_task is current_task:
+                self._rtc_tombstone_cleanup_task = None
+
+    async def shutdown(self) -> None:
+        task = self._rtc_tombstone_cleanup_task
+        self._rtc_tombstone_cleanup_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            self._rtc_sessions.clear()
+            self._retired_rtc_bindings.clear()
 
     def _rtc_binding_is_current_locked(self, binding: RtcSessionBinding) -> bool:
         return (
@@ -503,13 +566,33 @@ class Broker:
             self._prune_expired_rtc_sessions_locked(now)
             return self._rtc_binding_is_current_locked(binding)
 
+    async def rtc_binding_identity_is_retired(
+        self,
+        session_id: str,
+        daemon: DaemonConn,
+        binding_nonce: str,
+    ) -> bool:
+        """Recognize an exact retired binding for delayed teardown only."""
+        generation = daemon.host_generation
+        if generation is None:
+            return False
+        async with self._lock:
+            self._prune_rtc_tombstones_locked(time.monotonic())
+            return (
+                session_id,
+                daemon.id,
+                generation,
+                binding_nonce,
+            ) in self._retired_rtc_bindings
+
     async def expire_rtc_session(self, session_id: str, expected: RtcSessionBinding) -> bool:
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
             if current is not expected:
                 return False
+            if not self._retire_rtc_binding_locked(current):
+                return False
             self._rtc_sessions.pop(session_id, None)
-            self._retire_rtc_binding_locked(current)
             return True
 
     async def mark_rtc_session_connected(

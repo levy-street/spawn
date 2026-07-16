@@ -1008,6 +1008,61 @@ async def test_rtc_binding_nonce_is_immutable_across_session_id_reuse(app):
     assert second is not None and second.nonce == "2" * 32
     assert await broker.mark_rtc_session_connected("reused-session", first) is None
     assert await broker.rtc_session_for("reused-session") is second
+    await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_broker_rtc_tombstones_cap_and_expire_without_later_operation(
+    app, monkeypatch
+):
+    from spawn_server.ws import host_signal
+
+    monkeypatch.setattr(host_signal, "MAX_RTC_BINDING_IDENTITIES", 2)
+    monkeypatch.setattr(host_signal, "RTC_BINDING_TOMBSTONE_TTL_SECONDS", 0.02)
+    broker = Broker()
+    daemon = DaemonConn(
+        "rtc-tombstone-host",
+        "owner",
+        FakeWS(),  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    await _accept_owner(broker, daemon)
+    browser = HostBrowserConn("owner", daemon.host_id, FakeWS())  # type: ignore[arg-type]
+
+    async def register(session_id: str, nonce: str) -> bool:
+        return await broker.register_rtc_session(
+            session_id,
+            browser,
+            daemon=daemon,
+            scope_type="host",
+            scope_id=daemon.host_id,
+            protocol="spawn.host.ctl",
+            protocol_version=1,
+            binding_nonce=nonce,
+        )
+
+    assert await register("one", "1" * 32)
+    await broker.unregister_rtc_session("one", browser)
+    cleanup = broker._rtc_tombstone_cleanup_task
+    assert cleanup is not None and not cleanup.done()
+    assert await register("two", "2" * 32)
+    await broker.unregister_rtc_session("two", browser)
+    assert broker._rtc_tombstone_cleanup_task is cleanup
+    assert not await register("rejected-at-cap", "3" * 32)
+
+    for _ in range(40):
+        if not broker._retired_rtc_bindings:
+            break
+        await asyncio.sleep(0.005)
+    assert not broker._retired_rtc_bindings
+    assert cleanup.done()
+    assert await register("accepted-after-expiry", "4" * 32)
+    await broker.unregister_rtc_session("accepted-after-expiry", browser)
+    cleanup = broker._rtc_tombstone_cleanup_task
+    assert cleanup is not None
+    await broker.shutdown()
+    assert cleanup.cancelled()
+    assert broker._rtc_tombstone_cleanup_task is None
 
 
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():

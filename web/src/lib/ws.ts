@@ -85,13 +85,34 @@ export type InboundMessage =
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
   | { type: "upload.saved"; path: string; client_id?: string }
   | { type: "upload.error"; message: string }
-  | { type: "rtc.config"; enabled: boolean; ice_servers?: RTCIceServer[] }
-  | { type: "rtc.answer"; session_id: string; agent_id?: string; sdp: string }
-  | { type: "rtc.candidate"; session_id: string; agent_id?: string; candidate: RTCIceCandidateInit }
+  | {
+      type: "rtc.config";
+      enabled: boolean;
+      ice_servers?: RTCIceServer[];
+      binding_nonce_required?: boolean;
+    }
+  | {
+      type: "rtc.answer";
+      session_id: string;
+      agent_id?: string;
+      binding_nonce?: string;
+      binding_generation?: number;
+      sdp: string;
+    }
+  | {
+      type: "rtc.candidate";
+      session_id: string;
+      agent_id?: string;
+      binding_nonce?: string;
+      binding_generation?: number;
+      candidate: RTCIceCandidateInit;
+    }
   | {
       type: "rtc.status";
       session_id?: string;
       agent_id?: string;
+      binding_nonce?: string;
+      binding_generation?: number;
       status: string;
       message?: string;
     };
@@ -113,9 +134,14 @@ export type OutboundMessage =
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
   | { type: "snapshot"; lines?: number; plain?: boolean; rtc_session_id?: string }
-  | { type: "rtc.offer"; session_id: string; sdp: string }
-  | { type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit }
-  | { type: "rtc.close"; session_id: string }
+  | { type: "rtc.offer"; session_id: string; binding_nonce: string; sdp: string }
+  | {
+      type: "rtc.candidate";
+      session_id: string;
+      binding_nonce: string;
+      candidate: RTCIceCandidateInit;
+    }
+  | { type: "rtc.close"; session_id: string; binding_nonce: string }
   | {
       type: "upload";
       name: string;
@@ -136,6 +162,37 @@ export function base64ToBytes(b64: string): Uint8Array {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+export interface RtcBindingIdentity {
+  sessionId: string;
+  bindingNonce: string;
+  bindingGeneration: number | null;
+}
+
+export interface RtcBindingFrame {
+  session_id?: string;
+  binding_nonce?: string;
+  binding_generation?: number;
+}
+
+/** Match the immutable RTC identity, not merely its reusable session id. */
+export function rtcBindingFrameMatches(
+  current: RtcBindingIdentity,
+  frame: RtcBindingFrame,
+  required: boolean,
+): boolean {
+  if (frame.session_id !== current.sessionId) return false;
+  if (frame.binding_nonce === undefined && frame.binding_generation === undefined) {
+    return !required;
+  }
+  if (frame.binding_nonce === undefined || frame.binding_generation === undefined) return false;
+  return (
+    frame.binding_nonce === current.bindingNonce &&
+    Number.isSafeInteger(frame.binding_generation) &&
+    frame.binding_generation > 0 &&
+    (current.bindingGeneration === null || frame.binding_generation === current.bindingGeneration)
+  );
 }
 
 export { WS_URL };

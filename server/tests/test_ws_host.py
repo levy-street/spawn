@@ -19,9 +19,11 @@ from spawn_server.ws.host import (
     MAX_SIGNAL_FRAME_BYTES,
     BrowserRtcSession,
     _binding_identity,
+    _cleanup_retired_bindings,
     _forward_if_exact_binding,
     _prune_sessions,
     _retire_binding,
+    _rtc_binding_capacity_available,
     host_ws,
 )
 
@@ -98,6 +100,39 @@ async def test_connected_dispatch_cas_cannot_extend_reused_session_identity():
 
     _prune_sessions(sessions, retired, 10 + 5 * 60 + 1)
     assert _binding_identity(first) not in retired
+
+
+async def test_local_rtc_tombstones_are_bounded_expire_idle_and_cleanup_cancels(
+    monkeypatch,
+):
+    from spawn_server.ws import host as host_mod
+
+    monkeypatch.setattr(host_mod, "MAX_HOST_RTC_BINDING_IDENTITIES", 2)
+    monkeypatch.setattr(host_mod, "RTC_BINDING_TOMBSTONE_TTL_SECONDS", 0.02)
+    sessions: dict[str, BrowserRtcSession] = {}
+    retired: dict[tuple[str, str, int, str], float] = {}
+    lock = asyncio.Lock()
+    changed = asyncio.Event()
+    cleanup = asyncio.create_task(
+        _cleanup_retired_bindings(sessions, retired, lock, changed)
+    )
+    first = BrowserRtcSession("one", "a" * 32, 1, "1" * 32, float("inf"))
+    second = BrowserRtcSession("two", "a" * 32, 1, "2" * 32, float("inf"))
+    assert _retire_binding(retired, first, asyncio.get_running_loop().time(), changed)
+    assert _retire_binding(retired, second, asyncio.get_running_loop().time(), changed)
+    assert not _rtc_binding_capacity_available(sessions, retired)
+    assert not _retire_binding(
+        retired,
+        BrowserRtcSession("three", "a" * 32, 1, "3" * 32, float("inf")),
+        asyncio.get_running_loop().time(),
+        changed,
+    )
+
+    await _wait_until(lambda: not retired, timeout=0.2)
+    assert _rtc_binding_capacity_available(sessions, retired)
+    cleanup.cancel()
+    await asyncio.gather(cleanup, return_exceptions=True)
+    assert cleanup.cancelled()
 
 
 async def _signup(client, email: str) -> tuple[str, str]:
@@ -362,6 +397,7 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
         "type": "rtc.answer",
         "session_id": "bound-answer",
         "binding_nonce": binding_nonce,
+        "binding_generation": 1,
         "sdp": "v=0\r\nanswer",
         **_metadata(host_id),
     }
