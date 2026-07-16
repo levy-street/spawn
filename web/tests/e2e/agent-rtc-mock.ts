@@ -71,6 +71,7 @@ export async function installAgentRtcMock(
           string,
           { request: Record<string, unknown>; nextSequence: number; chunks: Uint8Array[] }
         >(),
+        heldUploadCompletes: [] as Array<{ channel: FakeDataChannel; message: string }>,
         ptyOffset: 0,
       };
 
@@ -235,26 +236,26 @@ export async function installAgentRtcMock(
               String(upload.request.destination),
               btoa(binary),
             );
+            const completion = JSON.stringify({
+              version: 1,
+              kind: "response",
+              request_id: uploadId,
+              operation: "upload_complete",
+              ok: true,
+              state: "complete",
+              path: `/Users/tester/projects/spawn/${String(upload.request.name)}`,
+              total_bytes: totalBytes,
+              sha256: upload.request.sha256,
+            });
             if (state.uploadFinalAction === "disconnect") {
               queueMicrotask(() => this.close());
               return;
             }
-            if (state.uploadFinalAction === "hold") return;
-            queueMicrotask(() =>
-              this.receive(
-                JSON.stringify({
-                  version: 1,
-                  kind: "response",
-                  request_id: uploadId,
-                  operation: "upload_complete",
-                  ok: true,
-                  state: "complete",
-                  path: `/Users/tester/projects/spawn/${String(upload.request.name)}`,
-                  total_bytes: totalBytes,
-                  sha256: upload.request.sha256,
-                }),
-              ),
-            );
+            if (state.uploadFinalAction === "hold") {
+              state.heldUploadCompletes.push({ channel: this, message: completion });
+              return;
+            }
+            queueMicrotask(() => this.receive(completion));
             return;
           }
           let request: Record<string, unknown>;
@@ -451,6 +452,8 @@ export async function installAgentRtcMock(
               maxRetransmits: number | null;
             } | null;
             releaseUploadBackpressure: () => void;
+            releaseHeldUploadCompletion: () => void;
+            replaceRtcGeneration: () => void;
           };
         }
       ).__spawnRtcTest = {
@@ -493,6 +496,13 @@ export async function installAgentRtcMock(
         },
         releaseUploadBackpressure() {
           state.channels.get("spawn.ctl")?.drainBufferedAmount();
+        },
+        releaseHeldUploadCompletion() {
+          const held = state.heldUploadCompletes.shift();
+          if (held) held.channel.receive(held.message);
+        },
+        replaceRtcGeneration() {
+          state.channels.get("spawn.ctl")?.close();
         },
       };
     },

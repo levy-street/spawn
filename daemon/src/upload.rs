@@ -694,7 +694,8 @@ impl UploadHub {
         Ok(cancelled)
     }
 
-    pub async fn cancel_session(&self, agent: AgentBinding, session_id: &str) {
+    #[cfg(test)]
+    async fn cancel_session(&self, agent: AgentBinding, session_id: &str) {
         let deadline = TokioInstant::now() + upload_close_timeout();
         self.cancel_session_until(agent, session_id, deadline).await;
     }
@@ -796,12 +797,42 @@ impl UploadHub {
     }
 
     #[cfg(test)]
-    fn operation_count(&self) -> usize {
+    pub(crate) fn arm_commit_pause_for_test(&self) {
+        self.inner.hooks.commit.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_commit_pause_for_test(&self) {
+        self.inner.hooks.commit.wait_until_entered().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_commit_pause_for_test(&self) {
+        self.inner.hooks.commit.release();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_cleanup_pause_for_test(&self) {
+        self.inner.hooks.cleanup.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_cleanup_pause_for_test(&self) {
+        self.inner.hooks.cleanup.wait_until_entered().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_cleanup_pause_for_test(&self) {
+        self.inner.hooks.cleanup.release();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_count(&self) -> usize {
         self.inner.operations.active.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
-    async fn wait_for_operations(&self, deadline: TokioInstant) -> bool {
+    pub(crate) async fn wait_for_operations(&self, deadline: TokioInstant) -> bool {
         self.inner.operations.wait_for_idle_until(deadline).await
     }
 

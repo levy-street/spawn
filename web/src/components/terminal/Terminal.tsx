@@ -35,6 +35,7 @@ import {
   TERMINAL_THEME,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
+import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -2437,7 +2438,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           sent += 1;
           handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
-          if (controller.signal.aborted) continue;
+          const outcomeUnknown =
+            error instanceof DirectAgentUploadError && error.code === "outcome_unknown";
+          // Removing an attachment is silent only while cancellation still
+          // proves there was no endpoint effect. Once the final chunk was
+          // dispatched, the same abort can race publication; keep the removed
+          // attachment gone, but retain the reconciliation warning.
+          if (controller.signal.aborted && !outcomeUnknown) continue;
           showUploadStatus(
             error instanceof Error && error.message
               ? error.message

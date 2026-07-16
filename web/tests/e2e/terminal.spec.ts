@@ -382,6 +382,92 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
   expect(uploads).toHaveLength(0);
 });
 
+test("removing an attachment after publication preserves outcome_unknown", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+  });
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["published"], "maybe.png", { type: "image/png" }));
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toBeVisible();
+  await expect.poll(() => uploads).toHaveLength(1);
+  await page.getByRole("button", { name: "Remove maybe.png" }).click();
+
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
+  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __spawnRtcTest: { releaseHeldUploadCompletion: () => void };
+      }
+    ).__spawnRtcTest.releaseHeldUploadCompletion();
+  });
+  await page.waitForTimeout(100);
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
+  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+});
+
+test("RTC generation replacement is definitive before final dispatch", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "before.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.alloc(100_000),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_start"))
+    .toBe(true);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  expect(uploads).toHaveLength(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("RTC generation replacement after final dispatch is outcome_unknown", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "after.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("published"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+});
+
 test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({
   page,
 }) => {

@@ -508,7 +508,13 @@ malformed chunks remove private temporary files. Preparation, writes, sync,
 commit, unlink, and directory sync run in owned blocking operations. A single
 absolute teardown deadline bounds waiting, while operation permits and the
 per-viewer/global admission charge remain held until descriptor/temp cleanup
-actually completes; timed-out cleanup stays tracked and cannot publish later.
+actually completes; timed-out cleanup stays tracked. A pre-publication
+cancellation cannot later publish, while an already-linearized final commit may
+finish only under the `outcome_unknown`/completed-cache rule below.
+The deadline is created at the initiating channel/peer close, not separately
+for each cleanup stage. Cancellation and viewer removal are published first;
+transport close, the effect fence, registry cleanup, and upload drain remain in
+one owned task after the peer-map deadline if they cannot all finish in time.
 
 The retained worker cwd is a canonical absolute capability root. The endpoint
 opens it and its attachment directories component-by-component without
@@ -527,6 +533,12 @@ cannot duplicate the file. Any later unlink/fsync failure is
 `error.code="outcome_unknown"`; callers must not infer rollback or retry the
 effect. Definite pre-publication validation, hash, write, or sync failures keep
 their request-bound stable error code.
+
+Removing an in-progress browser attachment aborts its upload generation. If no
+final chunk was dispatched this is a definite silent cancellation. If the
+final chunk was dispatched, removal still removes the local preview and ignores
+late success, but it must preserve the visible `outcome_unknown` reconciliation
+warning; endpoint publication may already have occurred.
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.

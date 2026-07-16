@@ -367,6 +367,7 @@ export function useAgentSocket({
       type PendingUpload = {
         expected: AgentCtlUploadStart;
         messages: UploadMessage[];
+        controller: AbortController;
         cancel?: () => void;
         waiter:
           | {
@@ -405,6 +406,7 @@ export function useAgentSocket({
       const rejectPendingUploads = (reason: Error) => {
         for (const pending of pendingUploads.values()) {
           pending.cancel?.();
+          pending.controller.abort(reason);
           if (pending.waiter) {
             clearTimeout(pending.waiter.timer);
             pending.waiter.reject(reason);
@@ -450,7 +452,11 @@ export function useAgentSocket({
               clearTimeout(pending.waiter.timer);
               pending.waiter = undefined;
             }
-            reject(new DOMException("Upload cancelled.", "AbortError"));
+            reject(
+              signal?.reason instanceof Error
+                ? signal.reason
+                : new DOMException("Upload cancelled.", "AbortError"),
+            );
           };
           const timer = setTimeout(() => {
             signal?.removeEventListener("abort", onAbort);
@@ -479,7 +485,12 @@ export function useAgentSocket({
         await new Promise<void>((resolve, reject) => {
           let timer: ReturnType<typeof setTimeout>;
           const onLow = () => finish();
-          const onAbort = () => finish(new DOMException("Upload cancelled.", "AbortError"));
+          const onAbort = () =>
+            finish(
+              signal?.reason instanceof Error
+                ? signal.reason
+                : new DOMException("Upload cancelled.", "AbortError"),
+            );
           const finish = (error?: Error) => {
             clearTimeout(timer);
             ctlDc.removeEventListener("bufferedamountlow", onLow);
@@ -524,7 +535,12 @@ export function useAgentSocket({
         const startText = makeAgentCtlUploadStart(expected);
         if (!startText) throw new Error("Upload metadata is outside protocol limits.");
         if (pendingUploads.has(uploadId)) throw new Error("Upload id is already active.");
-        pendingUploads.set(uploadId, { expected, messages: [], waiter: undefined });
+        const controller = new AbortController();
+        const abortFromCaller = () => controller.abort(options.signal?.reason);
+        if (options.signal?.aborted) abortFromCaller();
+        else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+        const uploadSignal = controller.signal;
+        pendingUploads.set(uploadId, { expected, messages: [], controller, waiter: undefined });
         const sendCancel = () => {
           const text = makeAgentCtlUploadCancel(
             newAgentCtlRequestId(),
@@ -556,12 +572,16 @@ export function useAgentSocket({
         try {
           let message: UploadMessage | null = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
-            if (options.signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+            if (uploadSignal.aborted) {
+              throw uploadSignal.reason instanceof Error
+                ? uploadSignal.reason
+                : new DOMException("Upload cancelled.", "AbortError");
+            }
             ctlDc.send(startText);
             try {
-              message = await waitUploadMessage(uploadId, 5000, options.signal);
+              message = await waitUploadMessage(uploadId, 5000, uploadSignal);
             } catch (error) {
-              if (attempt < 2 && !options.signal?.aborted) continue;
+              if (attempt < 2 && !uploadSignal.aborted) continue;
               throw error;
             }
             if (message.kind === "complete") return message.result;
@@ -579,7 +599,7 @@ export function useAgentSocket({
                 ? unknownAfterFinal(new Error("Direct agent upload channel closed."))
                 : new Error("Direct agent upload channel closed.");
             }
-            await waitForUploadBackpressure(options.signal).catch((error) => {
+            await waitForUploadBackpressure(uploadSignal).catch((error) => {
               throw finalDispatched ? unknownAfterFinal(error) : error;
             });
             const start = sequence * AGENT_CTL_UPLOAD_CHUNK_BYTES;
@@ -593,7 +613,7 @@ export function useAgentSocket({
             if (isFinal) finalDispatched = true;
           }
           try {
-            message = await waitUploadMessage(uploadId, 30_000, options.signal);
+            message = await waitUploadMessage(uploadId, 30_000, uploadSignal);
           } catch (error) {
             throw finalDispatched ? unknownAfterFinal(error) : error;
           }
@@ -610,6 +630,7 @@ export function useAgentSocket({
             ? unknownAfterFinal(error)
             : error;
         } finally {
+          options.signal?.removeEventListener("abort", abortFromCaller);
           const pending = pendingUploads.get(uploadId);
           if (pending?.waiter) clearTimeout(pending.waiter.timer);
           pendingUploads.delete(uploadId);

@@ -241,7 +241,12 @@ the completion cache before fallible unlink/fsync cleanup. Post-link cleanup
 failure, or browser timeout/abort/disconnect after final chunk dispatch, is the
 stable `outcome_unknown` result and is never retried automatically. Remove,
 unmount, and RTC-generation replacement abort browser uploads, send best-effort
-`upload_cancel`, and cannot resurrect UI state from late completion.
+`upload_cancel`, and cannot resurrect UI state from late completion. A Remove
+before final dispatch stays a silent definite cancellation; after final
+dispatch the thumbnail still disappears but the reconciliation warning remains
+visible. Control-channel teardown publishes cancellation and viewer removal
+immediately, then owns transport, fence, registry, and upload cleanup in a
+tracked task bounded by the one deadline created at the initiating close event.
 
 **Current P2-TERM-01 correction validation (review still pending):** 18 focused
 daemon upload tests pass, including partial resume/conflict, global-64 and
@@ -252,12 +257,16 @@ packet-lifetime-limited, and retransmit-limited `spawn.pty` and `spawn.ctl`
 channels without resident state. TypeScript and the browser protocol unit suite
 pass; focused browser tests cover declared reliability, large multi-chunk
 transfer, non-immediate `bufferedAmount` drain, Remove-driven cancellation, and
-lost final acknowledgement without retry. The broad production-source upload
+lost final acknowledgement without retry. Paired real WebRTC tests cover
+verified multi-chunk publication, a stalled-cleanup control close within one
+deadline with replacement isolation and eventual zero residue, and a lost
+final acknowledgement that reconciles the same stable ID on a replacement
+channel without a duplicate destination. The broad production-source upload
 guard and its adversarial self-test pass. Strict daemon format and all-target
-Clippy pass; all 60 library, 115 daemon, and 8 worker-E2E tests pass; server Ruff
-and all 134 server tests pass; web lint, all 55 unit tests, 71 Playwright tests
+Clippy pass; all 60 library, 118 daemon, and 8 worker-E2E tests pass; server Ruff
+and all 134 server tests pass; web lint, all 55 unit tests, 74 Playwright tests
 (3 opt-in audits skipped), and the production build pass.
-`SPAWN_E2E_PORT=45271 scripts/test-all.sh` passes the full repeatable matrix,
+`SPAWN_E2E_PORT=45274 scripts/test-all.sh` passes the full repeatable matrix,
 including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
 daemon lifecycle, live-browser, and service-manager smokes. Current-master
 mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base

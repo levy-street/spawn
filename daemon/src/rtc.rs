@@ -93,6 +93,7 @@ pub struct RtcSessions {
     agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
     uploads: UploadHub,
+    peer_cleanup_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
     #[cfg(test)]
     peer_insert_attempted: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -939,16 +940,39 @@ impl RtcSessions {
         generation: &str,
         pc: &Arc<RTCPeerConnection>,
     ) {
+        self.schedule_close_if_same_until(session_id, generation, pc, upload_teardown_deadline());
+    }
+
+    fn schedule_close_if_same_until(
+        &self,
+        session_id: &str,
+        generation: &str,
+        pc: &Arc<RTCPeerConnection>,
+        upload_deadline: tokio::time::Instant,
+    ) {
         let sessions = self.clone();
         let session_id = session_id.to_string();
         let generation = generation.to_string();
         let pc = Arc::clone(pc);
         tokio::spawn(async move {
-            sessions.close_if_same(&session_id, &generation, &pc).await;
+            sessions
+                .close_if_same_until(&session_id, &generation, &pc, upload_deadline)
+                .await;
         });
     }
 
     async fn close_if_same(&self, session_id: &str, generation: &str, pc: &Arc<RTCPeerConnection>) {
+        self.close_if_same_until(session_id, generation, pc, upload_teardown_deadline())
+            .await;
+    }
+
+    async fn close_if_same_until(
+        &self,
+        session_id: &str,
+        generation: &str,
+        pc: &Arc<RTCPeerConnection>,
+        upload_deadline: tokio::time::Instant,
+    ) {
         let agent = {
             let peers = self.peers.lock().await;
             peers
@@ -970,7 +994,8 @@ impl RtcSessions {
                 .cloned()
         };
         if let Some(peer) = peer {
-            self.deactivate_peer(session_id, peer).await;
+            self.deactivate_peer_until(session_id, peer, upload_deadline)
+                .await;
             let mut peers = self.peers.lock().await;
             if peers.get(session_id).is_some_and(|current| {
                 current.generation == generation && Arc::ptr_eq(&current.pc, pc)
@@ -1131,17 +1156,50 @@ impl RtcSessions {
         let upload_session_id = viewer_id(session_id, &peer.generation);
         self.uploads
             .cancel_session_now(peer.agent, &upload_session_id);
+        // Publish removal from the viewer/control registries immediately as
+        // well. The fenced late-cleanup task repeats both operations after all
+        // already-admitted callbacks drain, closing the narrow race where an
+        // on-open callback passed its final active check just before teardown.
+        let _ = tokio::time::timeout_at(upload_deadline, async {
+            peer.control.remove_direct_sink(&upload_session_id).await;
+            self.controls.unregister_session(&upload_session_id).await;
+        })
+        .await;
         // Closing transports wakes bounded WebRTC sends and control replies.
-        // Upload cancellation was already published, so a stalled blocking
-        // filesystem closure cannot delay that signal.
-        let _ = peer.pc.close().await;
-        let _lifecycle = peer.channels.fail().await;
-        let _drained = peer.fence.write().await;
-        peer.control.remove_direct_sink(&upload_session_id).await;
-        self.controls.unregister_session(&upload_session_id).await;
-        self.uploads
-            .cancel_session_until(peer.agent, &upload_session_id, upload_deadline)
-            .await;
+        // Own the complete late-cleanup sequence in the session registry, but
+        // wait for it only until the one deadline created by the initiating
+        // close event. A slow transport/fence cannot grant a second upload
+        // cleanup window or keep the peer map resident; the tracked task still
+        // removes generation-scoped sinks when it eventually unblocks.
+        let (done_tx, done_rx) = oneshot::channel();
+        let controls = self.controls.clone();
+        let uploads = self.uploads.clone();
+        {
+            let mut tasks = self.peer_cleanup_tasks.lock().await;
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let pc = Arc::clone(&peer.pc);
+                let cleanup = async move {
+                    let _lifecycle = peer.channels.fail().await;
+                    let _drained = peer.fence.write().await;
+                    peer.control.remove_direct_sink(&upload_session_id).await;
+                    controls.unregister_session(&upload_session_id).await;
+                    uploads
+                        .cancel_session_until(peer.agent, &upload_session_id, upload_deadline)
+                        .await;
+                };
+                let (_closed, ()) = tokio::join!(pc.close(), cleanup);
+                let _ = done_tx.send(());
+            });
+        }
+        let _ = tokio::time::timeout_at(upload_deadline, done_rx).await;
+    }
+
+    #[cfg(test)]
+    async fn peer_cleanup_task_count(&self) -> usize {
+        let mut tasks = self.peer_cleanup_tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+        tasks.len()
     }
 
     async fn agent_closer(&self, agent: AgentBinding) -> Arc<Mutex<()>> {
@@ -2027,13 +2085,19 @@ fn install_control_data_channel(
         let uploads = uploads.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
+            let upload_deadline = upload_teardown_deadline();
+            uploads.cancel_session_now(agent, &session_id);
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
             channels.stop();
             active.store(false, Ordering::Release);
-            uploads.cancel_session(agent, &session_id).await;
-            sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
+            sessions.schedule_close_if_same_until(
+                &rtc_session_id,
+                &generation,
+                &pc,
+                upload_deadline,
+            );
         })
     }));
 }
@@ -2936,11 +3000,19 @@ mod tests {
         registry: &AgentRegistry,
         agent_id: Uuid,
     ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
+        insert_test_worker_at(registry, agent_id, Path::new("/"))
+    }
+
+    fn insert_test_worker_at(
+        registry: &AgentRegistry,
+        agent_id: Uuid,
+        cwd: &Path,
+    ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
-            cwd: "/".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
             cmd_tx,
             lifecycle: crate::pty::AgentLifecycle::new(
                 std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
@@ -2965,6 +3037,8 @@ mod tests {
         ctl: Arc<RTCDataChannel>,
         pty_messages: mpsc::Receiver<Vec<u8>>,
         ctl_messages: mpsc::Receiver<(bool, Vec<u8>)>,
+        upload_capability: Option<Uuid>,
+        agent_generation: Option<u64>,
     }
 
     #[derive(Clone, Copy)]
@@ -3128,6 +3202,8 @@ mod tests {
         }
         assert!(answer_set);
         let mut pending_ctl_messages = Vec::new();
+        let mut upload_capability = None;
+        let mut ready_agent_generation = None;
         if await_ready {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -3142,6 +3218,19 @@ mod tests {
                         && value["kind"] == "event"
                         && value["event"] == "ready"
                     {
+                        upload_capability = Some(
+                            Uuid::parse_str(
+                                value["upload_capability"]
+                                    .as_str()
+                                    .expect("readiness upload capability"),
+                            )
+                            .expect("valid readiness upload capability"),
+                        );
+                        ready_agent_generation = Some(
+                            value["agent_generation"]
+                                .as_u64()
+                                .expect("readiness agent generation"),
+                        );
                         break;
                     }
                     pending_ctl_messages.push(message);
@@ -3176,6 +3265,8 @@ mod tests {
             ctl,
             pty_messages,
             ctl_messages,
+            upload_capability,
+            agent_generation: ready_agent_generation,
         }
     }
 
@@ -3453,6 +3544,100 @@ mod tests {
                 return serde_json::from_slice(&bytes).expect("valid spawn.ctl JSON");
             }
         }
+    }
+
+    async fn next_ctl_json_for(
+        messages: &mut mpsc::Receiver<(bool, Vec<u8>)>,
+        request_id: Uuid,
+    ) -> serde_json::Value {
+        let request_id = request_id.to_string();
+        loop {
+            let value = next_ctl_json(messages).await;
+            if value.get("request_id").and_then(Value::as_str) == Some(request_id.as_str()) {
+                return value;
+            }
+        }
+    }
+
+    fn real_upload_hash(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    async fn start_real_upload(
+        client: &mut RtcTestClient,
+        upload_id: Uuid,
+        name: &str,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        let capability = client.upload_capability.expect("RTC upload capability");
+        let agent_generation = client.agent_generation.expect("RTC agent generation");
+        client
+            .ctl
+            .send_text(
+                json!({
+                    "version": agent_ctl::PROTOCOL_VERSION,
+                    "kind": "request",
+                    "request_id": upload_id,
+                    "operation": "upload_start",
+                    "capability": capability,
+                    "agent_generation": agent_generation,
+                    "name": name,
+                    "mime_type": "application/octet-stream",
+                    "destination": "cwd",
+                    "total_bytes": bytes.len(),
+                    "chunks": bytes.len().div_ceil(crate::upload::UPLOAD_CHUNK_BYTES),
+                    "sha256": real_upload_hash(bytes),
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send real RTC upload start");
+        next_ctl_json_for(&mut client.ctl_messages, upload_id).await
+    }
+
+    fn real_upload_chunk(upload_id: Uuid, sequence: u32, last: bool, bytes: &[u8]) -> Bytes {
+        let mut frame = Vec::with_capacity(28 + bytes.len());
+        frame.extend_from_slice(b"SPCT");
+        frame.push(agent_ctl::PROTOCOL_VERSION);
+        frame.push(2);
+        frame.extend_from_slice(&u16::from(last).to_le_bytes());
+        frame.extend_from_slice(upload_id.as_bytes());
+        frame.extend_from_slice(&sequence.to_le_bytes());
+        frame.extend_from_slice(bytes);
+        Bytes::from(frame)
+    }
+
+    async fn send_real_upload_chunks(client: &RtcTestClient, upload_id: Uuid, bytes: &[u8]) {
+        let chunks = bytes.chunks(crate::upload::UPLOAD_CHUNK_BYTES);
+        let chunk_count = chunks.len();
+        for (sequence, chunk) in chunks.enumerate() {
+            client
+                .ctl
+                .send(&real_upload_chunk(
+                    upload_id,
+                    sequence as u32,
+                    sequence + 1 == chunk_count,
+                    chunk,
+                ))
+                .await
+                .expect("send real RTC upload chunk");
+        }
+    }
+
+    async fn wait_for_resident_sessions(sessions: &RtcSessions, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if sessions.resident_session_count().await == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RTC resident session count did not converge");
     }
 
     fn built_worker_bin() -> std::path::PathBuf {
@@ -4253,6 +4438,233 @@ mod tests {
         assert!(!old_active.load(Ordering::Acquire));
         sessions.close_all().await;
         assert!(!replacement_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn real_spawn_ctl_uploads_multiple_verified_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::new_v4();
+        let registry = AgentRegistry::new();
+        let (_agent, _worker_commands) = insert_test_worker_at(&registry, agent_id, tmp.path());
+        let sessions = RtcSessions::new();
+        let mut client =
+            connect_rtc_session(&sessions, &registry, agent_id, "rtc-upload", "generation").await;
+        let upload_id = Uuid::new_v4();
+        let bytes = vec![0x5a; crate::upload::UPLOAD_CHUNK_BYTES * 2 + 17];
+
+        let ready = start_real_upload(&mut client, upload_id, "verified.bin", &bytes).await;
+        assert_eq!(ready["operation"], "upload_start");
+        assert_eq!(ready["ok"], true);
+        assert_eq!(ready["state"], "ready");
+        assert_eq!(ready["next_sequence"], 0);
+        assert_eq!(ready["received_bytes"], 0);
+        send_real_upload_chunks(&client, upload_id, &bytes).await;
+        let complete = next_ctl_json_for(&mut client.ctl_messages, upload_id).await;
+        assert_eq!(complete["operation"], "upload_complete");
+        assert_eq!(complete["ok"], true);
+        assert_eq!(complete["state"], "complete");
+        assert_eq!(complete["total_bytes"], bytes.len());
+        assert_eq!(complete["sha256"], real_upload_hash(&bytes));
+        assert_eq!(
+            std::fs::read(tmp.path().join("verified.bin")).unwrap(),
+            bytes
+        );
+        assert!(!tmp.path().join("verified-2.bin").exists());
+
+        sessions.close("rtc-upload", "generation", agent_id).await;
+        close_test_peer(&client.pc).await;
+        assert_eq!(sessions.resident_session_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_control_close_uses_one_upload_deadline_and_isolates_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::new_v4();
+        let registry = AgentRegistry::new();
+        let (old_agent, _old_worker_commands) =
+            insert_test_worker_at(&registry, agent_id, tmp.path());
+        let sessions = RtcSessions::new();
+        let mut client =
+            connect_rtc_session(&sessions, &registry, agent_id, "rtc-close-stall", "old").await;
+        let abandoned_id = Uuid::new_v4();
+        let abandoned = b"must-not-publish";
+        let ready = start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned).await;
+        assert_eq!(ready["state"], "ready");
+        sessions.uploads.arm_cleanup_pause_for_test();
+
+        client.ctl.close().await.expect("close real spawn.ctl");
+        sessions.uploads.wait_cleanup_pause_for_test().await;
+        assert_eq!(sessions.uploads.retained_counts().await, (1, 0));
+        assert!(sessions.uploads.operation_count() >= 1);
+        let closed = tokio::time::timeout(Duration::from_millis(150), async {
+            while sessions.resident_session_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if closed.is_err() {
+            sessions.uploads.release_cleanup_pause_for_test();
+            panic!("control close consumed more than one upload teardown deadline");
+        }
+        assert!(!tmp.path().join("abandoned.bin").exists());
+
+        let (replacement, _replacement_worker_commands) =
+            insert_test_worker_at(&registry, agent_id, tmp.path());
+        assert_ne!(old_agent, replacement);
+        let mut replacement_client = connect_rtc_session(
+            &sessions,
+            &registry,
+            agent_id,
+            "rtc-close-stall",
+            "replacement",
+        )
+        .await;
+        let replacement_id = Uuid::new_v4();
+        let replacement_bytes = b"replacement-only";
+        let replacement_ready = start_real_upload(
+            &mut replacement_client,
+            replacement_id,
+            "replacement.bin",
+            replacement_bytes,
+        )
+        .await;
+        assert_eq!(replacement_ready["state"], "ready");
+        send_real_upload_chunks(&replacement_client, replacement_id, replacement_bytes).await;
+        let replacement_complete =
+            next_ctl_json_for(&mut replacement_client.ctl_messages, replacement_id).await;
+        assert_eq!(replacement_complete["state"], "complete");
+        assert_eq!(
+            std::fs::read(tmp.path().join("replacement.bin")).unwrap(),
+            replacement_bytes
+        );
+        assert_eq!(sessions.uploads.retained_counts().await, (1, 1));
+
+        sessions.uploads.release_cleanup_pause_for_test();
+        assert!(
+            sessions
+                .uploads
+                .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while sessions.peer_cleanup_task_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tracked peer cleanup task did not drain");
+        assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
+        assert!(!tmp.path().join("abandoned.bin").exists());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("spawn-upload")));
+
+        sessions
+            .close("rtc-close-stall", "replacement", agent_id)
+            .await;
+        close_test_peer(&replacement_client.pc).await;
+        close_test_peer(&client.pc).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_spawn_ctl_lost_final_ack_reconciles_once_after_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::new_v4();
+        let registry = AgentRegistry::new();
+        let (_agent, _worker_commands) = insert_test_worker_at(&registry, agent_id, tmp.path());
+        let sessions = RtcSessions::new();
+        let mut stale =
+            connect_rtc_session(&sessions, &registry, agent_id, "rtc-lost-ack", "stale").await;
+        let upload_id = Uuid::new_v4();
+        let bytes = b"published-exactly-once";
+        let ready = start_real_upload(&mut stale, upload_id, "once.bin", bytes).await;
+        assert_eq!(ready["state"], "ready");
+        sessions.uploads.arm_commit_pause_for_test();
+        send_real_upload_chunks(&stale, upload_id, bytes).await;
+        sessions.uploads.wait_commit_pause_for_test().await;
+        assert!(!tmp.path().join("once.bin").exists());
+
+        stale.ctl.close().await.expect("close stale real spawn.ctl");
+        let stale_disabled = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let active = sessions
+                    .peers
+                    .lock()
+                    .await
+                    .get("rtc-lost-ack")
+                    .is_some_and(|peer| peer.active.load(Ordering::Acquire));
+                if !active {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        sessions.uploads.release_commit_pause_for_test();
+        stale_disabled.expect("stale control close did not disable endpoint effects");
+        wait_for_resident_sessions(&sessions, 0).await;
+        assert!(
+            sessions
+                .uploads
+                .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
+        assert_eq!(std::fs::read(tmp.path().join("once.bin")).unwrap(), bytes);
+
+        let stale_ack = tokio::time::timeout(Duration::from_millis(150), async {
+            while let Some((is_string, message)) = stale.ctl_messages.recv().await {
+                if is_string {
+                    let value: Value = serde_json::from_slice(&message).unwrap();
+                    if value.get("request_id").and_then(Value::as_str)
+                        == Some(upload_id.to_string().as_str())
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !stale_ack,
+            "stale RTC session received a late upload acknowledgement"
+        );
+
+        let mut replacement = connect_rtc_session(
+            &sessions,
+            &registry,
+            agent_id,
+            "rtc-lost-ack",
+            "replacement",
+        )
+        .await;
+        let reconciled = start_real_upload(&mut replacement, upload_id, "once.bin", bytes).await;
+        assert_eq!(reconciled["operation"], "upload_complete");
+        assert_eq!(reconciled["state"], "complete");
+        assert_eq!(
+            reconciled["path"],
+            tmp.path().join("once.bin").to_str().unwrap()
+        );
+        assert!(!tmp.path().join("once-2.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name() == "once.bin"))
+                .count(),
+            1
+        );
+
+        sessions
+            .close("rtc-lost-ack", "replacement", agent_id)
+            .await;
+        close_test_peer(&replacement.pc).await;
+        close_test_peer(&stale.pc).await;
     }
 
     #[tokio::test]
