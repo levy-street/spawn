@@ -47,12 +47,16 @@ pub enum Outbound {
     AgentUploaded {
         agent_id: Uuid,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(default)]
         client_id: Option<String>,
     },
     #[serde(rename = "agent.snapshot")]
     AgentSnapshot {
         agent_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         bytes_b64: String,
         /// Cumulative bytes queued to the requesting browser's direct
         /// DataChannel sink at capture time; lets the client order the
@@ -159,6 +163,10 @@ pub enum Outbound {
         agent_id: Option<Uuid>,
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
 }
 
@@ -256,6 +264,8 @@ pub enum Inbound {
     AgentSnapshot {
         agent_id: Uuid,
         #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
         lines: Option<u16>,
         #[serde(default)]
         plain: Option<bool>,
@@ -269,6 +279,8 @@ pub enum Inbound {
     #[serde(rename = "agent.upload")]
     AgentUpload {
         agent_id: Uuid,
+        #[serde(default)]
+        request_id: Option<String>,
         cwd: String,
         name: String,
         mime_type: String,

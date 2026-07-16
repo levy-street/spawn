@@ -62,6 +62,37 @@ class _InProcPubSub:
         await self.publish(channel, data)
         return True
 
+    def host_owner_is_current(
+        self,
+        active_key: str,
+        pending_key: str,
+        expected: bytes,
+        generation: int,
+    ) -> bool:
+        if self.get_ephemeral(active_key) != expected:
+            return False
+        pending = self.get_ephemeral(pending_key)
+        if pending is None:
+            return True
+        pending_generation = _lease_generation(pending)
+        if pending_generation is None or pending_generation > generation:
+            return False
+        return pending_generation < generation or pending == expected
+
+    async def publish_if_host_owner(
+        self,
+        active_key: str,
+        pending_key: str,
+        expected: bytes,
+        generation: int,
+        channel: str,
+        data: bytes,
+    ) -> bool:
+        if not self.host_owner_is_current(active_key, pending_key, expected, generation):
+            return False
+        await self.publish(channel, data)
+        return True
+
     def subscribe(self, channel: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
         self._subs[channel].add(q)
@@ -133,6 +164,30 @@ class _InProcPubSub:
         if self.get_ephemeral(active_key) != expected_active:
             return False
         self.set_ephemeral(active_key, active_value, ttl_seconds)
+        self._values.pop(pending_key, None)
+        return True
+
+    def activate_ephemeral_if_newer(
+        self,
+        pending_key: str,
+        pending_value: bytes,
+        active_key: str,
+        generation: int,
+        ttl_seconds: int,
+    ) -> bool:
+        """Promote a DB-committed pending owner over only older active state."""
+        if self.get_ephemeral(pending_key) != pending_value:
+            return False
+        if _lease_generation(pending_value) != generation:
+            return False
+        active = self.get_ephemeral(active_key)
+        if active is not None:
+            active_generation = _lease_generation(active)
+            if active_generation is None or active_generation > generation:
+                return False
+            if active_generation == generation and active != pending_value:
+                return False
+        self.set_ephemeral(active_key, pending_value, ttl_seconds)
         self._values.pop(pending_key, None)
         return True
 
@@ -218,6 +273,101 @@ class RedisBackend:
         )
         return bool(result)
 
+    async def host_owner_is_current(
+        self,
+        active_key: str,
+        pending_key: str,
+        expected: bytes,
+        *,
+        generation: int,
+    ) -> bool:
+        """Atomically reject an active owner once a higher pending owner exists."""
+        if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+            return False
+        if _lease_generation(expected) != generation:
+            return False
+        if self._inproc is not None:
+            return self._inproc.host_owner_is_current(
+                active_key, pending_key, expected, generation
+            )
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "local pending = redis.call('get', KEYS[2]); "
+            "if not pending then return 1 end; "
+            "local separator = string.find(pending, ':', 1, true); "
+            "if not separator then return 0 end; "
+            "local raw = string.sub(pending, 1, separator - 1); "
+            "local owner = string.sub(pending, separator + 1); "
+            "if not string.match(raw, '^%d+$') or string.len(owner) ~= 32 "
+            "or not string.match(owner, '^[0-9a-f]+$') then return 0 end; "
+            "local candidate = tonumber(raw); "
+            "if not candidate or candidate < 1 or candidate > tonumber(ARGV[3]) "
+            "or candidate ~= math.floor(candidate) then return 0 end; "
+            "if candidate > tonumber(ARGV[2]) then return 0 end; "
+            "if candidate == tonumber(ARGV[2]) and pending ~= ARGV[1] then return 0 end; "
+            "return 1",
+            2,
+            active_key,
+            pending_key,
+            expected,
+            generation,
+            MAX_SAFE_FENCING_GENERATION,
+        )
+        return bool(result)
+
+    async def publish_if_host_owner(
+        self,
+        active_key: str,
+        pending_key: str,
+        expected: bytes,
+        *,
+        generation: int,
+        channel: str,
+        payload: bytes,
+    ) -> bool:
+        """Atomically publish only before any higher host generation is pending."""
+        if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+            return False
+        if _lease_generation(expected) != generation:
+            return False
+        if self._inproc is not None:
+            return await self._inproc.publish_if_host_owner(
+                active_key,
+                pending_key,
+                expected,
+                generation,
+                channel,
+                payload,
+            )
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "local pending = redis.call('get', KEYS[2]); "
+            "if pending then "
+            "local separator = string.find(pending, ':', 1, true); "
+            "if not separator then return 0 end; "
+            "local raw = string.sub(pending, 1, separator - 1); "
+            "local owner = string.sub(pending, separator + 1); "
+            "if not string.match(raw, '^%d+$') or string.len(owner) ~= 32 "
+            "or not string.match(owner, '^[0-9a-f]+$') then return 0 end; "
+            "local candidate = tonumber(raw); "
+            "if not candidate or candidate < 1 or candidate > tonumber(ARGV[5]) "
+            "or candidate ~= math.floor(candidate) then return 0 end; "
+            "if candidate > tonumber(ARGV[2]) then return 0 end; "
+            "if candidate == tonumber(ARGV[2]) and pending ~= ARGV[1] then return 0 end; "
+            "end; redis.call('publish', ARGV[3], ARGV[4]); return 1",
+            2,
+            active_key,
+            pending_key,
+            expected,
+            generation,
+            channel,
+            payload,
+            MAX_SAFE_FENCING_GENERATION,
+        )
+        return bool(result)
+
     @asynccontextmanager
     async def subscribe(self, agent_id: str) -> AsyncIterator[AsyncIterator[bytes]]:
         """Subscribe to PTY bytes for an agent.
@@ -241,12 +391,9 @@ class RedisBackend:
             queue = inproc.subscribe(channel)
 
             async def _iter_inproc() -> AsyncIterator[bytes]:
-                try:
-                    while True:
-                        item = await queue.get()
-                        yield item
-                except asyncio.CancelledError:
-                    return
+                while True:
+                    item = await queue.get()
+                    yield item
 
             try:
                 yield _iter_inproc()
@@ -259,15 +406,12 @@ class RedisBackend:
         await pubsub.subscribe(channel)
 
         async def _iter_redis() -> AsyncIterator[bytes]:
-            try:
-                async for msg in pubsub.listen():
-                    if msg.get("type") != "message":
-                        continue
-                    data = msg.get("data")
-                    if isinstance(data, bytes):
-                        yield data
-            except asyncio.CancelledError:
-                return
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                data = msg.get("data")
+                if isinstance(data, bytes):
+                    yield data
 
         try:
             yield _iter_redis()
@@ -430,6 +574,64 @@ class RedisBackend:
             expected_active or b"",
             active_value,
             ttl_seconds,
+        )
+        return bool(result)
+
+    async def activate_ephemeral_if_newer(
+        self,
+        pending_key: str,
+        pending_value: bytes,
+        active_key: str,
+        *,
+        generation: int,
+        ttl_seconds: int,
+    ) -> bool:
+        """Promote a proven DB owner over nil or strictly older Redis state.
+
+        The caller must invoke this only after an exact durable-owner read or
+        its own successful durable commit. Redis independently requires the
+        exact pending token and refuses malformed, equal-other, or newer
+        active owners.
+        """
+        if generation < 1 or generation > MAX_SAFE_FENCING_GENERATION:
+            raise ValueError("generation is outside Redis's exact integer range")
+        if _lease_generation(pending_value) != generation:
+            raise ValueError("pending lease does not contain the supplied generation")
+        if self._inproc is not None:
+            return self._inproc.activate_ephemeral_if_newer(
+                pending_key,
+                pending_value,
+                active_key,
+                generation,
+                ttl_seconds,
+            )
+        assert self._client is not None
+        result = await self._client.eval(
+            "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end; "
+            "local active = redis.call('get', KEYS[2]); "
+            "if active then "
+            "local separator = string.find(active, ':', 1, true); "
+            "if not separator then return 0 end; "
+            "local current_raw = string.sub(active, 1, separator - 1); "
+            "local current_owner = string.sub(active, separator + 1); "
+            "if not string.match(current_raw, '^%d+$') "
+            "or string.len(current_owner) ~= 32 "
+            "or not string.match(current_owner, '^[0-9a-f]+$') then return 0 end; "
+            "local current = tonumber(current_raw); "
+            "if not current or current < 1 or current > tonumber(ARGV[4]) "
+            "or current ~= math.floor(current) then return 0 end; "
+            "if current > tonumber(ARGV[2]) then return 0 end; "
+            "if current == tonumber(ARGV[2]) and active ~= ARGV[1] then return 0 end; "
+            "end; "
+            "redis.call('set', KEYS[2], ARGV[1], 'EX', ARGV[3]); "
+            "redis.call('del', KEYS[1]); return 1",
+            2,
+            pending_key,
+            active_key,
+            pending_value,
+            generation,
+            ttl_seconds,
+            MAX_SAFE_FENCING_GENERATION,
         )
         return bool(result)
 

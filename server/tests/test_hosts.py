@@ -43,6 +43,36 @@ async def _wait_for_text_frame(
     raise AssertionError(f"did not receive {frame_type}; got {fake_ws.sent_text[start:]!r}")
 
 
+async def _accept_daemon(daemon, *, generation: int = 1) -> None:
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.broker import get_broker
+    from spawn_server.ws.host_signal import (
+        HOST_DAEMON_PRESENCE_TTL_SECONDS,
+        HostPresenceOwner,
+        encode_host_presence_owner,
+        host_presence_key,
+    )
+
+    daemon.host_generation = generation
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, daemon.host_id)
+        assert host is not None
+        host.daemon_connection_id = daemon.id
+        host.daemon_generation = generation
+        host.daemon_generation_counter = generation
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+    await get_backend().set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+    assert await get_broker().accept_daemon_owner(daemon, generation)
+
+
 async def test_host_scoping(client):
     a_token = await _signup(client, "a@example.com")
     b_token = await _signup(client, "b@example.com")
@@ -108,6 +138,7 @@ async def test_host_tool_check_roundtrip(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
 
     task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/tools", headers=auth))
     for _ in range(100):
@@ -149,6 +180,8 @@ async def test_host_tool_check_roundtrip(client):
                 }
             ],
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -187,6 +220,8 @@ async def test_host_tool_check_roundtrip(client):
                 "status": None,
             },
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await install_task
     assert r.status_code == 200, r.text
@@ -251,6 +286,7 @@ async def test_host_dirs_roundtrip_requires_owned_online_daemon(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
 
     task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/dirs?path=/repo", headers=a_auth))
     sent = await _wait_for_text_frame(fake_ws, "host.fs.list")
@@ -263,6 +299,8 @@ async def test_host_dirs_roundtrip_requires_owned_online_daemon(client):
             "parent": "/",
             "entries": [{"name": "src", "path": "/repo/src"}],
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -305,6 +343,7 @@ async def test_host_files_listing_download_and_ops(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
 
     # Listing requests include files and pass metadata through.
     task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/files?path=/repo", headers=auth))
@@ -327,6 +366,8 @@ async def test_host_files_listing_download_and_ops(client):
                 },
             ],
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -350,6 +391,8 @@ async def test_host_files_listing_download_and_ops(client):
             "size": 2,
             "bytes_b64": base64.b64encode(b"hi").decode(),
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -371,7 +414,10 @@ async def test_host_files_listing_download_and_ops(client):
     assert sent["name"] == "notes.txt"
     assert base64.b64decode(sent["bytes_b64"]) == b"hello"
     await broker.resolve_fs_result(
-        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/notes.txt"}
+        sent["request_id"],
+        {"request_id": sent["request_id"], "path": "/repo/notes.txt"},
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -390,7 +436,10 @@ async def test_host_files_listing_download_and_ops(client):
     assert sent["path"] == "/repo/notes.txt"
     assert sent["name"] == "notes-v2.txt"
     await broker.resolve_fs_result(
-        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/notes-v2.txt"}
+        sent["request_id"],
+        {"request_id": sent["request_id"], "path": "/repo/notes-v2.txt"},
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -405,7 +454,10 @@ async def test_host_files_listing_download_and_ops(client):
     )
     sent = await _wait_for_text_frame(fake_ws, "host.fs.mkdir", start=start)
     await broker.resolve_fs_result(
-        sent["request_id"], {"request_id": sent["request_id"], "path": "/repo/new"}
+        sent["request_id"],
+        {"request_id": sent["request_id"], "path": "/repo/new"},
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     assert (await task).status_code == 200
 
@@ -422,6 +474,8 @@ async def test_host_files_listing_download_and_ops(client):
     await broker.resolve_fs_result(
         sent["request_id"],
         {"request_id": sent["request_id"], "path": "/repo/new", "error": "permission denied"},
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await task
     assert r.status_code == 400
@@ -461,6 +515,8 @@ async def test_host_file_transfer_pulls_from_source_and_pushes_to_dest(client):
     dest_daemon = DaemonConn(host_id=dest_id, user_id="user", websocket=dest_ws)  # type: ignore[arg-type]
     await broker.register_daemon(src_daemon)
     await broker.register_daemon(dest_daemon)
+    await _accept_daemon(src_daemon)
+    await _accept_daemon(dest_daemon)
 
     task = asyncio.create_task(
         client.post(
@@ -479,6 +535,8 @@ async def test_host_file_transfer_pulls_from_source_and_pushes_to_dest(client):
             "size": 2,
             "bytes_b64": base64.b64encode(b"hi").decode(),
         },
+        daemon=src_daemon,
+        expected_host_generation=src_daemon.host_generation,
     )
     write_frame = await _wait_for_text_frame(dest_ws, "host.fs.write")
     assert write_frame["dir"] == "/inbox"
@@ -487,6 +545,8 @@ async def test_host_file_transfer_pulls_from_source_and_pushes_to_dest(client):
     await broker.resolve_fs_result(
         write_frame["request_id"],
         {"request_id": write_frame["request_id"], "path": "/inbox/a.txt"},
+        daemon=dest_daemon,
+        expected_host_generation=dest_daemon.host_generation,
     )
     r = await task
     assert r.status_code == 200, r.text
@@ -524,6 +584,7 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
 
     r = await client.patch(
         f"/api/hosts/{host_id}/tools/{preset_id}/policy",
@@ -561,6 +622,8 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
                 }
             ],
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     r = await check_task
     assert r.status_code == 200, r.text
@@ -594,6 +657,8 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
                 "status": None,
             },
         },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
     )
     await asyncio.sleep(0)
     await broker.unregister_daemon(daemon)
@@ -639,6 +704,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
     fake_ws = _FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
 
     try:
         first_start = len(fake_ws.sent_text)
@@ -666,6 +732,8 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
                     }
                 ],
             },
+            daemon=daemon,
+            expected_host_generation=daemon.host_generation,
         )
         await first_task
 
@@ -689,6 +757,8 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
                     "status": None,
                 },
             },
+            daemon=daemon,
+            expected_host_generation=daemon.host_generation,
         )
 
         for _ in range(100):
@@ -727,6 +797,8 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
                     }
                 ],
             },
+            daemon=daemon,
+            expected_host_generation=daemon.host_generation,
         )
         await second_task
         await asyncio.sleep(0)

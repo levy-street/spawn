@@ -129,14 +129,17 @@ mod tests {
         let uploaded = Outbound::AgentUploaded {
             agent_id: Uuid::nil(),
             path: "/repo/.spawn/attachments/shot.png".into(),
+            request_id: Some("request-1".into()),
             client_id: Some("upload-1".into()),
         };
         let s = serde_json::to_string(&uploaded).unwrap();
         assert!(s.contains("\"type\":\"agent.uploaded\""));
+        assert!(s.contains("\"request_id\":\"request-1\""));
         assert!(s.contains("\"client_id\":\"upload-1\""));
 
         let snapshot = Outbound::AgentSnapshot {
             agent_id: Uuid::nil(),
+            request_id: Some("snapshot-1".into()),
             bytes_b64: "b2s=".into(),
             dc_offset: Some(42),
             rtc_session_id: Some("sess-1".into()),
@@ -382,6 +385,7 @@ mod tests {
             r#"{
                 "type":"agent.upload",
                 "agent_id":"00000000-0000-0000-0000-000000000004",
+                "request_id":"request-1",
                 "cwd":"/repo",
                 "name":"shot.png",
                 "mime_type":"image/png",
@@ -395,6 +399,7 @@ mod tests {
         .unwrap();
         match upload {
             Inbound::AgentUpload {
+                request_id,
                 cwd,
                 name,
                 mime_type,
@@ -405,6 +410,7 @@ mod tests {
                 client_id,
                 ..
             } => {
+                assert_eq!(request_id.as_deref(), Some("request-1"));
                 assert_eq!(cwd, "/repo");
                 assert_eq!(name, "shot.png");
                 assert_eq!(mime_type, "image/png");

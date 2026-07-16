@@ -42,6 +42,23 @@ class FakeWS:
         self.closed.append((code, reason))
 
 
+async def _accept_owner(broker: Broker, daemon: DaemonConn, generation: int = 1) -> None:
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import (
+        HostPresenceOwner,
+        encode_host_presence_owner,
+        host_presence_key,
+    )
+
+    daemon.host_generation = generation
+    assert await broker.accept_daemon_owner(daemon, generation)
+    await get_backend().set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
+        ttl_seconds=60,
+    )
+
+
 def test_frame_roundtrip():
     aid = "00000000-0000-4000-8000-00000000abcd"
     payload = b"hello terminal"
@@ -248,7 +265,7 @@ async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassocia
 
 
 @pytest.mark.asyncio
-async def test_broker_snapshot_request_roundtrip():
+async def test_broker_snapshot_request_roundtrip(app):
     broker = get_broker()
 
     host_id = "host-snapshot"
@@ -257,23 +274,28 @@ async def test_broker_snapshot_request_roundtrip():
 
     daemon_ws = FakeWS()
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
+    await _accept_owner(broker, daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
     task = asyncio.create_task(broker.request_snapshot(agent_id, daemon, lines=123, timeout=1))
     await asyncio.sleep(0)
 
     sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent == {"type": "agent.snapshot", "agent_id": agent_id, "lines": 123}
+    assert sent["type"] == "agent.snapshot"
+    assert sent["agent_id"] == agent_id
+    assert sent["lines"] == 123
 
-    await broker.resolve_snapshot(agent_id, {"bytes_b64": "aGVsbG8="})
-    assert await task == {"bytes_b64": "aGVsbG8="}
+    payload = {"request_id": sent["request_id"], "bytes_b64": "aGVsbG8="}
+    await broker.resolve_snapshot(
+        agent_id, payload, daemon=daemon, expected_host_generation=1
+    )
+    assert await task == payload
 
     await broker.unregister_daemon(daemon)
 
 
 @pytest.mark.asyncio
-async def test_broker_plain_snapshot_request_roundtrip():
+async def test_broker_plain_snapshot_request_roundtrip(app):
     broker = get_broker()
 
     daemon_ws = FakeWS()
@@ -282,7 +304,7 @@ async def test_broker_plain_snapshot_request_roundtrip():
         user_id="user-1",
         websocket=daemon_ws,  # type: ignore[arg-type]
     )
-    await broker.register_daemon(daemon)
+    await _accept_owner(broker, daemon)
     agent_id = "00000000-0000-4000-8000-0000000000cd"
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
@@ -292,19 +314,23 @@ async def test_broker_plain_snapshot_request_roundtrip():
     sent = json.loads(daemon_ws.sent_text[-1])
     assert sent == {
         "type": "agent.snapshot",
+        "request_id": sent["request_id"],
         "agent_id": agent_id,
         "lines": 321,
         "plain": True,
     }
 
-    await broker.resolve_snapshot(agent_id, {"bytes_b64": "cGxhaW4="})
-    assert await task == {"bytes_b64": "cGxhaW4="}
+    payload = {"request_id": sent["request_id"], "bytes_b64": "cGxhaW4="}
+    await broker.resolve_snapshot(
+        agent_id, payload, daemon=daemon, expected_host_generation=1
+    )
+    assert await task == payload
 
     await broker.unregister_daemon(daemon)
 
 
 @pytest.mark.asyncio
-async def test_broker_directory_request_roundtrip():
+async def test_broker_directory_request_roundtrip(app):
     broker = get_broker()
 
     host_id = "host-dirs"
@@ -316,7 +342,7 @@ async def test_broker_directory_request_roundtrip():
         websocket=daemon_ws,  # type: ignore[arg-type]
         home_dir="/home/me",
     )
-    await broker.register_daemon(daemon)
+    await _accept_owner(broker, daemon)
 
     task = asyncio.create_task(broker.request_dir_list(daemon, path="/home/me", timeout=1))
     await asyncio.sleep(0)
@@ -335,14 +361,16 @@ async def test_broker_directory_request_roundtrip():
         "entries": [{"name": "src", "path": "/home/me/src"}],
         "error": None,
     }
-    await broker.resolve_dir_list(request_id, payload)
+    await broker.resolve_dir_list(
+        request_id, payload, daemon=daemon, expected_host_generation=1
+    )
     assert await task == payload
 
     await broker.unregister_daemon(daemon)
 
 
 @pytest.mark.asyncio
-async def test_broker_tool_install_request_roundtrip():
+async def test_broker_tool_install_request_roundtrip(app):
     broker = get_broker()
 
     host_id = "host-tools-install"
@@ -352,7 +380,7 @@ async def test_broker_tool_install_request_roundtrip():
         user_id="user-1",
         websocket=daemon_ws,  # type: ignore[arg-type]
     )
-    await broker.register_daemon(daemon)
+    await _accept_owner(broker, daemon)
 
     target = {
         "preset_id": "00000000-0000-4000-8000-0000000000ef",
@@ -380,7 +408,9 @@ async def test_broker_tool_install_request_roundtrip():
             "status": None,
         },
     }
-    await broker.resolve_tool_install(sent["request_id"], payload)
+    await broker.resolve_tool_install(
+        sent["request_id"], payload, daemon=daemon, expected_host_generation=1
+    )
     assert await task == payload
 
     await broker.unregister_daemon(daemon)
@@ -531,7 +561,187 @@ async def test_distributed_presence_refresh_cannot_be_stolen_by_old_daemon(app):
 
 
 @pytest.mark.asyncio
-async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner():
+async def test_committed_owner_promotion_repairs_older_cache_but_never_overwrites_successor(app):
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import HostPresenceOwner, encode_host_presence_owner
+
+    backend = get_backend()
+    active_key = "spawn:rtc:host:activation-recovery:owner"
+    pending_key = "spawn:rtc:host:activation-recovery:pending"
+    owner_a = encode_host_presence_owner(HostPresenceOwner("a" * 32, 1))
+    owner_c = encode_host_presence_owner(HostPresenceOwner("c" * 32, 3))
+    owner_c_other = encode_host_presence_owner(HostPresenceOwner("e" * 32, 3))
+    owner_d = encode_host_presence_owner(HostPresenceOwner("d" * 32, 4))
+
+    # DB has committed C while Redis still reflects A: exact pending C may
+    # atomically repair the older active cache.
+    await backend.set_ephemeral(active_key, owner_a, ttl_seconds=60)
+    await backend.set_ephemeral(pending_key, owner_c, ttl_seconds=60)
+    assert await backend.activate_ephemeral_if_newer(
+        pending_key,
+        owner_c,
+        active_key,
+        generation=3,
+        ttl_seconds=60,
+    )
+    assert await backend.get_ephemeral(active_key) == owner_c
+    assert await backend.get_ephemeral(pending_key) is None
+
+    # A successor replacing pending C fences C's delayed recovery.
+    await backend.set_ephemeral(active_key, owner_a, ttl_seconds=60)
+    await backend.set_ephemeral(pending_key, owner_d, ttl_seconds=60)
+    assert not await backend.activate_ephemeral_if_newer(
+        pending_key,
+        owner_c,
+        active_key,
+        generation=3,
+        ttl_seconds=60,
+    )
+    assert await backend.activate_ephemeral_if_newer(
+        pending_key,
+        owner_d,
+        active_key,
+        generation=4,
+        ttl_seconds=60,
+    )
+    assert await backend.get_ephemeral(active_key) == owner_d
+
+    # Equal-generation other owners, higher owners, and corrupt cache values
+    # are never overwritten by recovery.
+    for protected in (owner_c_other, owner_d, b"corrupt"):
+        await backend.set_ephemeral(active_key, protected, ttl_seconds=60)
+        await backend.set_ephemeral(pending_key, owner_c, ttl_seconds=60)
+        assert not await backend.activate_ephemeral_if_newer(
+            pending_key,
+            owner_c,
+            active_key,
+            generation=3,
+            ttl_seconds=60,
+        )
+        assert await backend.get_ephemeral(active_key) == protected
+
+
+@pytest.mark.asyncio
+async def test_distributed_result_rejects_owner_when_successor_is_pending(app):
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import (
+        HostPresenceOwner,
+        encode_host_presence_owner,
+        host_pending_presence_key,
+    )
+
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-result-pending-fence",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    await _accept_owner(broker, daemon, generation=1)
+    task = asyncio.create_task(broker.request_snapshot("agent-1", daemon, timeout=0.05))
+    await asyncio.sleep(0)
+    request = json.loads(daemon.websocket.sent_text[-1])
+
+    successor = encode_host_presence_owner(HostPresenceOwner("b" * 32, 2))
+    await get_backend().set_ephemeral(
+        host_pending_presence_key(daemon.host_id),
+        successor,
+        ttl_seconds=60,
+    )
+    assert not await broker.resolve_snapshot(
+        "agent-1",
+        {"request_id": request["request_id"], "bytes_b64": "c3RhbGU="},
+        daemon=daemon,
+        expected_host_generation=1,
+    )
+    assert await task is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_result_waiter_matches_complete_owner_and_request_identity(app):
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.owner_dispatch import OwnerResultEnvelope, encode_owner_result
+
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-result-identity",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    await _accept_owner(broker, daemon, generation=1)
+    task = asyncio.create_task(broker.request_snapshot("agent-1", daemon, timeout=1))
+    await asyncio.sleep(0)
+    request = json.loads(daemon.websocket.sent_text[-1])
+    request_id = request["request_id"]
+
+    # Even on the deterministic request channel, a mismatched envelope cannot
+    # resolve or mutate the generation-bound waiter.
+    await get_backend().publish_channel(
+        f"spawn:host-result:{daemon.host_id}:agent.snapshot:{request_id}",
+        encode_owner_result(
+            OwnerResultEnvelope(
+                daemon.host_id,
+                daemon.id,
+                1,
+                "agent.snapshot",
+                "different-request",
+                {"bytes_b64": "d3Jvbmc="},
+            )
+        ),
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    valid = {"request_id": request_id, "bytes_b64": "dmFsaWQ="}
+    assert await broker.resolve_snapshot(
+        "agent-1",
+        valid,
+        daemon=daemon,
+        expected_host_generation=1,
+    )
+    assert await task == valid
+
+    # A result after the requester has gone is safe and cannot mutate a reused
+    # local future because there are no process-local waiter maps.
+    assert await broker.resolve_snapshot(
+        "agent-1",
+        valid,
+        daemon=daemon,
+        expected_host_generation=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_distributed_result_wait_is_cancellable_and_unsubscribes(app):
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.owner_dispatch import owner_result_channel
+
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-result-cancel",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    await _accept_owner(broker, daemon, generation=1)
+    task = asyncio.create_task(broker.request_snapshot("agent-1", daemon, timeout=30))
+    await asyncio.sleep(0)
+    request = json.loads(daemon.websocket.sent_text[-1])
+    channel = owner_result_channel(
+        daemon.host_id,
+        "agent.snapshot",
+        request["request_id"],
+    )
+    backend = get_backend()
+    assert backend.inproc is not None
+    assert len(backend.inproc._subs.get(channel, ())) == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not backend.inproc._subs.get(channel)
+
+
+@pytest.mark.asyncio
+async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner(app):
     broker = Broker()
     current = DaemonConn(
         host_id="host-upload-resolution",
@@ -539,7 +749,7 @@ async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner()
         websocket=FakeWS(),  # type: ignore[arg-type]
         host_generation=1,
     )
-    assert await broker.accept_daemon_owner(current, 1)
+    await _accept_owner(broker, current)
     assert (
         await broker.resolve_upload(
             "agent-1",
@@ -569,6 +779,53 @@ async def test_upload_resolution_distinguishes_missing_waiter_from_stale_owner()
 
 
 @pytest.mark.asyncio
+async def test_upload_result_uses_server_request_identity_not_reusable_client_id(app):
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-upload-request-id",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    await _accept_owner(broker, daemon)
+    task = asyncio.create_task(
+        broker.request_upload(
+            "agent-1",
+            daemon,
+            payload={
+                "type": "agent.upload",
+                "agent_id": "agent-1",
+                "client_id": "reusable-client-id",
+            },
+            client_id="reusable-client-id",
+            timeout=1,
+        )
+    )
+    await asyncio.sleep(0)
+    request = json.loads(daemon.websocket.sent_text[-1])
+    assert request["client_id"] == "reusable-client-id"
+    assert request["request_id"] != request["client_id"]
+
+    result = {
+        "type": "agent.uploaded",
+        "agent_id": "agent-1",
+        "client_id": "reusable-client-id",
+        "request_id": request["request_id"],
+        "path": "/repo/upload.txt",
+    }
+    assert (
+        await broker.resolve_upload(
+            "agent-1",
+            request["request_id"],
+            result,
+            daemon=daemon,
+            expected_host_generation=1,
+        )
+        is UploadResolution.RESOLVED
+    )
+    assert await task == result
+
+
+@pytest.mark.asyncio
 async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(app):
     from spawn_server.redis import get_backend
     from spawn_server.ws.host_signal import (
@@ -576,6 +833,7 @@ async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(a
         RedisBrowserConn,
         StaleHostOwnerError,
         encode_host_presence_owner,
+        host_pending_presence_key,
         host_presence_key,
     )
 
@@ -612,21 +870,24 @@ async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(a
     replacement = HostPresenceOwner("d" * 32, 2)
     await backend.set_ephemeral(
         host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, 1)),
+        ttl_seconds=60,
+    )
+    await backend.set_ephemeral(
+        host_pending_presence_key(daemon.host_id),
         encode_host_presence_owner(replacement),
         ttl_seconds=60,
     )
-    assert backend.inproc is not None
-    queue = backend.inproc.subscribe(channel)
-    try:
+    async with backend.subscribe_channel(channel) as stream:
         for payload in (
             {"type": "rtc.answer", "sdp": "v=0\r\n"},
             {"type": "rtc.status", "status": "connected"},
         ):
             with pytest.raises(StaleHostOwnerError):
                 await browser.send_text(payload)
-        assert queue.empty()
-    finally:
-        backend.inproc.unsubscribe(channel, queue)
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await anext(stream)
 
     assert await broker.rtc_session_for("rtc-exact-publish", daemon=daemon) is binding
     assert binding.expires_at != float("inf")

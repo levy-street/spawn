@@ -210,11 +210,16 @@ async def _attempt_host_activation(
     connection_id: str,
     generation: int,
     registration: dict[str, object],
-    previous_value: bytes | None,
+    _previous_value: bytes | None,
     value: bytes,
 ) -> None:
-    if await get_backend().get_ephemeral(host_presence_key(host_id)) != previous_value:
-        return
+    active = await get_backend().get_ephemeral(host_presence_key(host_id))
+    if active is not None:
+        active_owner = decode_host_presence_owner(active)
+        if active_owner is None or (
+            active_owner.generation >= generation and active != value
+        ):
+            return
     async with _bounded_host_ownership_session() as session:
         if not await _prepare_host_activation(
             session, host_id, connection_id, generation, registration
@@ -225,12 +230,11 @@ async def _attempt_host_activation(
     # Redis is deliberately outside the Host row-lock transaction. The DB is
     # authoritative during this short bridge; reconciliation repairs an
     # acknowledged or ambiguous CAS from fresh durable state.
-    await get_backend().activate_ephemeral(
+    await get_backend().activate_ephemeral_if_newer(
         host_pending_presence_key(host_id),
         value,
         host_presence_key(host_id),
-        previous_value,
-        value,
+        generation=generation,
         ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
     )
 
@@ -264,22 +268,33 @@ async def _reconcile_host_activation(
     pending_key = host_pending_presence_key(host_id)
     current = await backend.get_ephemeral(active_key)
     if committed:
-        if current != value:
-            await backend.set_ephemeral_if_newer(
-                pending_key,
-                value,
-                generation=generation,
-                ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
-            )
-            await backend.activate_ephemeral(
-                pending_key,
-                value,
-                active_key,
-                current,
-                value,
-                ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
-            )
-        return await backend.get_ephemeral(active_key) == value
+        if current == value and await backend.host_owner_is_current(
+            active_key,
+            pending_key,
+            value,
+            generation=generation,
+        ):
+            await backend.delete_ephemeral_if(pending_key, value)
+            return True
+        await backend.set_ephemeral_if_newer(
+            pending_key,
+            value,
+            generation=generation,
+            ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+        )
+        await backend.activate_ephemeral_if_newer(
+            pending_key,
+            value,
+            active_key,
+            generation=generation,
+            ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+        )
+        return await backend.host_owner_is_current(
+            active_key,
+            pending_key,
+            value,
+            generation=generation,
+        )
 
     if predecessor_remains:
         if current == value:
@@ -608,11 +623,16 @@ async def _publish_agent_event_if_owner(
     owner = _host_presence_value(conn)
     if owner is None:
         return False
-    return await get_backend().publish_if_ephemeral(
+    generation = conn.host_generation
+    if generation is None:
+        return False
+    return await get_backend().publish_if_host_owner(
         host_presence_key(conn.host_id),
+        host_pending_presence_key(conn.host_id),
         owner,
-        agent_event_channel(agent_id),
-        json.dumps(payload, separators=(",", ":")).encode(),
+        generation=generation,
+        channel=agent_event_channel(agent_id),
+        payload=json.dumps(payload, separators=(",", ":")).encode(),
     )
 
 
@@ -656,8 +676,14 @@ def _agent_owner_exists(conn: DaemonConn) -> Any:
 
 async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     expected = _host_presence_value(conn)
-    return expected is not None and (
-        await get_backend().get_ephemeral(host_presence_key(conn.host_id)) == expected
+    generation = conn.host_generation
+    return expected is not None and generation is not None and (
+        await get_backend().host_owner_is_current(
+            host_presence_key(conn.host_id),
+            host_pending_presence_key(conn.host_id),
+            expected,
+            generation=generation,
+        )
     )
 
 
@@ -670,6 +696,8 @@ async def _route_rtc_payload_if_owner(
     binding: RtcSessionBinding,
     payload: dict[str, object],
 ) -> bool:
+    if not isinstance(binding.browser, RedisBrowserConn):
+        return False
     if not await _validate_durable_host_owner(conn):
         return False
     if not await _redis_owner_is_current(conn):
@@ -800,6 +828,32 @@ async def _process_host_rtc_signal(
         await _fence_superseded_daemon(conn)
         return False
     signal = envelope.signal
+    agent_id = signal.get("agent_id")
+    if isinstance(agent_id, str):
+        session_id = _valid_rtc_session_id(signal.get("session_id"))
+        if session_id is None:
+            return True
+        binding = await broker.rtc_session_for(session_id, daemon=conn)
+        if (
+            binding is None
+            or binding.scope_type != "agent"
+            or binding.scope_id != agent_id
+            or binding.browser.route_id != envelope.browser_channel
+        ):
+            return True
+        frame_type = signal.get("type")
+        if frame_type == "rtc.offer":
+            if _valid_rtc_sdp(signal.get("sdp")) is None:
+                return True
+        elif frame_type == "rtc.candidate":
+            if _valid_rtc_candidate(signal.get("candidate")) is None:
+                return True
+        elif frame_type == "rtc.close":
+            await broker.unregister_rtc_session(session_id, binding.browser)
+        else:
+            return True
+        await _bounded_send_text(conn, signal)
+        return True
     if not _host_rtc_metadata_matches(signal, conn.host_id):
         return True
     session_id = _valid_rtc_session_id(signal.get("session_id"))
@@ -989,11 +1043,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 # Live output is dispatched by an exact generation token and
                 # is no longer appended to the shared transcript path. A
                 # stalled filesystem write therefore cannot land after B wins.
-                published = attached and await get_backend().publish_if_ephemeral(
+                published = attached and await get_backend().publish_if_host_owner(
                     host_presence_key(host.id),
+                    host_pending_presence_key(host.id),
                     _host_presence_value(conn) or b"",
-                    f"spawn:agent:{frame.agent_id}",
-                    frame.payload,
+                    generation=generation,
+                    channel=f"spawn:agent:{frame.agent_id}",
+                    payload=frame.payload,
                 )
                 if not published:
                     await _fence_superseded_daemon(conn)
@@ -1105,11 +1161,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             revoked_connection_id=previous_owner.daemon_connection_id,
                             replacement_connection_id=conn.id,
                         )
-                        registration_accepted = await get_backend().publish_if_ephemeral(
+                        registration_accepted = await get_backend().publish_if_host_owner(
                             host_presence_key(conn.host_id),
+                            host_pending_presence_key(conn.host_id),
                             value,
-                            host_signal_channel(conn.host_id),
-                            encode_host_owner_revocation(revocation),
+                            generation=generation,
+                            channel=host_signal_channel(conn.host_id),
+                            payload=encode_host_owner_revocation(revocation),
                         )
                     if registration_accepted:
                         # The exact Redis decision is the generation-bearing
@@ -1128,11 +1186,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "host.fs.list_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await _validate_durable_host_owner(
-                            conn
-                        ) or not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if not await broker.resolve_dir_list(
                             request_id,
                             obj,
@@ -1145,11 +1198,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype in ("host.fs.read_result", "host.fs.op_result"):
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await _validate_durable_host_owner(
-                            conn
-                        ) or not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if not await broker.resolve_fs_result(
                             request_id,
                             obj,
@@ -1162,11 +1210,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "host.tools.check_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await _validate_durable_host_owner(
-                            conn
-                        ) or not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if not await broker.resolve_tool_check(
                             request_id,
                             obj,
@@ -1179,11 +1222,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "host.tools.install_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await _validate_durable_host_owner(
-                            conn
-                        ) or not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if not await broker.resolve_tool_install(
                             request_id,
                             obj,
@@ -1402,6 +1440,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     aid = obj.get("agent_id")
                     path = obj.get("path")
                     client_id = obj.get("client_id")
+                    request_id = obj.get("request_id")
                     if aid and isinstance(path, str):
                         durable_owner = False
                         agent_authorized = False
@@ -1417,21 +1456,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if not agent_authorized:
                             log.warning("upload ack for unknown agent=%s", aid)
                             continue
-                        if not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         resolved = await broker.resolve_upload(
                             aid,
-                            client_id if isinstance(client_id, str) else None,
-                            {"agent_id": aid, "path": path, "client_id": client_id},
+                            request_id if isinstance(request_id, str) else None,
+                            dict(obj),
                             daemon=conn,
                             expected_host_generation=conn.host_generation,
                         )
                         if resolved is UploadResolution.STALE_OWNER:
                             await _fence_superseded_daemon(conn)
                             break
-                        if resolved is UploadResolution.NO_WAITER:
-                            continue
                         payload: dict[str, object] = {
                             "type": "upload.saved",
                             "path": path,
@@ -1445,7 +1479,8 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "agent.snapshot":
                     aid = obj.get("agent_id")
                     bytes_b64 = obj.get("bytes_b64")
-                    if aid and isinstance(bytes_b64, str):
+                    request_id = obj.get("request_id")
+                    if aid and isinstance(bytes_b64, str) and isinstance(request_id, str):
                         durable_owner = False
                         agent_authorized = False
                         async with _bounded_host_ownership_session() as session:
@@ -1460,12 +1495,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if not agent_authorized:
                             log.warning("snapshot for unknown agent=%s", aid)
                             continue
-                        if not await _redis_owner_is_current(conn):
-                            await _fence_superseded_daemon(conn)
-                            break
                         if not await broker.resolve_snapshot(
                             aid,
                             {
+                                "request_id": request_id,
                                 "bytes_b64": bytes_b64,
                                 "dc_offset": obj.get("dc_offset"),
                                 "rtc_session_id": obj.get("rtc_session_id"),
@@ -1580,24 +1613,42 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "error":
                     aid = obj.get("agent_id")
                     if obj.get("code") == "upload_failed" and aid:
-                        if not await _validate_durable_host_owner(
-                            conn
-                        ) or not await _redis_owner_is_current(conn):
+                        durable_owner = False
+                        agent_authorized = False
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            if durable_owner:
+                                agent = await session.get(Agent, aid)
+                                agent_authorized = agent is not None and agent.host_id == host.id
+                            await session.rollback()
+                        if not durable_owner:
                             await _fence_superseded_daemon(conn)
                             break
-                        rejected = await broker.reject_uploads_for_agent(
+                        if not agent_authorized:
+                            log.warning("upload error for unknown agent=%s", aid)
+                            continue
+                        request_id = obj.get("request_id")
+                        resolved = await broker.resolve_upload(
                             aid,
-                            obj.get("message") or "Upload failed.",
+                            request_id if isinstance(request_id, str) else None,
+                            dict(obj),
                             daemon=conn,
                             expected_host_generation=conn.host_generation,
                         )
-                        if not rejected or not await _publish_agent_event_if_owner(
+                        if resolved is UploadResolution.STALE_OWNER:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        event: dict[str, object] = {
+                            "type": "upload.error",
+                            "message": obj.get("message") or "Image upload failed.",
+                        }
+                        client_id = obj.get("client_id")
+                        if isinstance(client_id, str):
+                            event["client_id"] = client_id
+                        if not await _publish_agent_event_if_owner(
                             conn,
                             aid,
-                            {
-                                "type": "upload.error",
-                                "message": obj.get("message") or "Image upload failed.",
-                            },
+                            event,
                         ):
                             await _fence_superseded_daemon(conn)
                             break

@@ -14,7 +14,7 @@ from spawn_server.db import get_sessionmaker
 from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
 from spawn_server.models import Agent, Host, User
 from spawn_server.redis import get_backend
-from spawn_server.ws.broker import BrowserConn, DaemonConn, HostBrowserConn, get_broker
+from spawn_server.ws.broker import DaemonConn, HostBrowserConn, get_broker
 from spawn_server.ws.daemon import (
     _allocate_host_generation,
     _fence_superseded_daemon,
@@ -24,7 +24,10 @@ from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 from spawn_server.ws.host_signal import (
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
     HostPresenceOwner,
+    RedisBrowserConn,
+    browser_signal_channel,
     decode_host_presence_owner,
+    decode_rtc_signal_dispatch,
     encode_host_presence_owner,
     host_pending_presence_key,
     host_presence_key,
@@ -515,6 +518,133 @@ async def test_activation_lost_ack_after_commit_reconciles_new_owner(client, mon
     await asyncio.wait_for(new_task, timeout=1)
 
 
+async def test_registration_repairs_db_b_redis_a_with_successor_c(client):
+    user_id, _ = await _signup(client, "ws-daemon-db-b-redis-a@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    owner_a = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    owner_a_task = asyncio.create_task(daemon_ws(owner_a, token=None))  # type: ignore[arg-type]
+    owner_a.queue_text({"type": "register", "version": "owner-a"})
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(owner_a))
+    )
+    conn_a = get_broker().get_daemon_for_host(host_id)
+    assert conn_a is not None and conn_a.host_generation == 1
+    value_a = encode_host_presence_owner(HostPresenceOwner(conn_a.id, 1))
+
+    # Simulate B crashing after its durable commit and before Redis promotion.
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        host.daemon_connection_id = "b" * 32
+        host.daemon_generation = 2
+        host.daemon_generation_counter = 2
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+    assert await get_backend().get_ephemeral(host_presence_key(host_id)) == value_a
+
+    owner_c = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    owner_c_task = asyncio.create_task(daemon_ws(owner_c, token=None))  # type: ignore[arg-type]
+    owner_c.queue_text({"type": "register", "version": "owner-c"})
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(owner_c))
+    )
+    conn_c = get_broker().get_daemon_for_host(host_id)
+    assert conn_c is not None and conn_c.host_generation == 3
+    assert decode_host_presence_owner(
+        await get_backend().get_ephemeral(host_presence_key(host_id))
+    ) == HostPresenceOwner(conn_c.id, 3)
+    assert await get_backend().get_ephemeral(host_pending_presence_key(host_id)) is None
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == conn_c.id
+        assert host.daemon_generation == 3
+
+    owner_a.queue_disconnect()
+    await asyncio.wait_for(owner_a_task, timeout=1)
+    owner_c.queue_disconnect()
+    await asyncio.wait_for(owner_c_task, timeout=1)
+
+
+async def test_delayed_c_recovery_cannot_overwrite_successor_d(client, monkeypatch):
+    user_id, _ = await _signup(client, "ws-daemon-delayed-c-successor-d@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    owner_a = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    owner_a_task = asyncio.create_task(daemon_ws(owner_a, token=None))  # type: ignore[arg-type]
+    owner_a.queue_text({"type": "register", "version": "owner-a"})
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(owner_a))
+    )
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        host.daemon_connection_id = "b" * 32
+        host.daemon_generation = 2
+        host.daemon_generation_counter = 2
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+
+    backend = get_backend()
+    original_activate = backend.activate_ephemeral_if_newer
+    c_committed = asyncio.Event()
+    release_c = asyncio.Event()
+
+    async def delay_c_promotion(*args, generation, **kwargs):
+        if generation == 3 and not c_committed.is_set():
+            c_committed.set()
+            await release_c.wait()
+        return await original_activate(*args, generation=generation, **kwargs)
+
+    monkeypatch.setattr(backend, "activate_ephemeral_if_newer", delay_c_promotion)
+    owner_c = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    owner_c_task = asyncio.create_task(daemon_ws(owner_c, token=None))  # type: ignore[arg-type]
+    owner_c.queue_text({"type": "register", "version": "owner-c"})
+    await asyncio.wait_for(c_committed.wait(), timeout=1)
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_generation == 3
+        assert host.daemon_connection_id is not None
+    pending_c = decode_host_presence_owner(
+        await backend.get_ephemeral(host_pending_presence_key(host_id))
+    )
+    assert pending_c is not None and pending_c.generation == 3
+
+    owner_d = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    owner_d_task = asyncio.create_task(daemon_ws(owner_d, token=None))  # type: ignore[arg-type]
+    owner_d.queue_text({"type": "register", "version": "owner-d"})
+    await _wait_until(
+        lambda: any(item.get("type") == "registered" for item in _sent_json(owner_d))
+    )
+    conn_d = get_broker().get_daemon_for_host(host_id)
+    assert conn_d is not None and conn_d.host_generation == 4
+
+    release_c.set()
+    await asyncio.wait_for(owner_c_task, timeout=1)
+    assert owner_c.closed == (4000, "superseded")
+    assert decode_host_presence_owner(
+        await backend.get_ephemeral(host_presence_key(host_id))
+    ) == HostPresenceOwner(conn_d.id, 4)
+    assert await backend.get_ephemeral(host_pending_presence_key(host_id)) is None
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_connection_id == conn_d.id
+        assert host.daemon_generation == 4
+
+    owner_a.queue_disconnect()
+    await asyncio.wait_for(owner_a_task, timeout=1)
+    owner_d.queue_disconnect()
+    await asyncio.wait_for(owner_d_task, timeout=1)
+
+
 async def test_activation_cancellation_awaits_cleanup_and_restores_predecessor(client, monkeypatch):
     import spawn_server.ws.daemon as daemon_mod
 
@@ -957,14 +1087,29 @@ async def test_started_publish_failure_fences_without_broker_deadlock(client, mo
     assert other_conn is not None and other_conn.host_generation is not None
 
     backend = get_backend()
-    original_publish = backend.publish_if_ephemeral
+    original_publish = backend.publish_if_host_owner
 
-    async def fail_agent_event(key, expected, channel, payload):
+    async def fail_agent_event(
+        active_key,
+        pending_key,
+        expected,
+        *,
+        generation,
+        channel,
+        payload,
+    ):
         if channel == f"spawn:agent:{agent_id}:events":
             return False
-        return await original_publish(key, expected, channel, payload)
+        return await original_publish(
+            active_key,
+            pending_key,
+            expected,
+            generation=generation,
+            channel=channel,
+            payload=payload,
+        )
 
-    monkeypatch.setattr(backend, "publish_if_ephemeral", fail_agent_event)
+    monkeypatch.setattr(backend, "publish_if_host_owner", fail_agent_event)
     ws.queue_text({"type": "agent.started", "agent_id": agent_id})
     await asyncio.wait_for(task, timeout=1)
     assert ws.closed == (4000, "superseded")
@@ -981,6 +1126,63 @@ async def test_started_publish_failure_fences_without_broker_deadlock(client, mo
     )
     other.queue_disconnect()
     await asyncio.wait_for(other_task, timeout=1)
+
+
+async def test_upload_error_resolves_exact_distributed_request_and_publishes_event(client):
+    from spawn_server.redis import agent_event_channel
+
+    user_id, _ = await _signup(client, "ws-daemon-upload-error@example.com")
+    host_id = await _create_host(user_id)
+    agent_id = await _create_agent(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    daemon_task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "existing_agents": [agent_id]})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
+    conn = get_broker().get_daemon_for_host(host_id)
+    assert conn is not None and conn.host_generation is not None
+
+    request_task = asyncio.create_task(
+        get_broker().request_upload(
+            agent_id,
+            conn,
+            payload={
+                "type": "agent.upload",
+                "agent_id": agent_id,
+                "client_id": "upload-error-client",
+            },
+            client_id="upload-error-client",
+            timeout=1,
+        )
+    )
+    await _wait_until(
+        lambda: any(item.get("type") == "agent.upload" for item in _sent_json(ws))
+    )
+    request = [
+        item for item in _sent_json(ws) if item.get("type") == "agent.upload"
+    ][-1]
+
+    async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as events:
+        error = {
+            "type": "error",
+            "agent_id": agent_id,
+            "code": "upload_failed",
+            "message": "disk full",
+            "request_id": request["request_id"],
+            "client_id": "upload-error-client",
+        }
+        ws.queue_text(error)
+        assert await request_task == error
+        event = json.loads(await asyncio.wait_for(anext(events), timeout=1))
+        assert event == {
+            "type": "upload.error",
+            "message": "disk full",
+            "client_id": "upload-error-client",
+        }
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(daemon_task, timeout=1)
 
 
 async def test_fence_closes_before_stalled_rtc_revocation_and_keeps_broker_usable(app):
@@ -1154,27 +1356,21 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     agent_id = await _create_agent(user_id, host_id)
     token = auth.issue_daemon_token(host_id, user_id)
 
-    browser_ws = FakeDaemonWebSocket()
-    browser_conn = BrowserConn(user_id=user_id, agent_id=agent_id, websocket=browser_ws)  # type: ignore[arg-type]
-    signal_daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=FakeDaemonWebSocket())  # type: ignore[arg-type]
     broker = get_broker()
-    assert await broker.register_rtc_session(
-        "rtc-daemon-1",
-        browser_conn,
-        daemon=signal_daemon,
-        scope_type="agent",
-        scope_id=agent_id,
-        protocol="spawn.pty",
-        protocol_version=1,
-    )
 
     ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
     ws.queue_text({"type": "register", "version": "rtc-test"})
     await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
     live_daemon = get_broker().get_daemon_for_host(host_id)
-    assert live_daemon is not None
-    await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
+    assert live_daemon is not None and live_daemon.host_generation is not None
+    browser_conn = RedisBrowserConn(
+        user_id=user_id,
+        host_id=host_id,
+        channel=browser_signal_channel("a" * 32),
+        daemon_connection_id=live_daemon.id,
+        daemon_generation=live_daemon.host_generation,
+    )
     assert await broker.register_rtc_session(
         "rtc-daemon-1",
         browser_conn,
@@ -1185,60 +1381,39 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         protocol_version=1,
     )
 
-    ws.queue_text(
+    expected_signals = [
         {
             "type": "rtc.answer",
             "session_id": "rtc-daemon-1",
             "agent_id": agent_id,
             "sdp": "v=0\r\n",
-        }
-    )
-    await _wait_until(
-        lambda: any(item.get("type") == "rtc.answer" for item in _sent_json(browser_ws))
-    )
-    assert _sent_json(browser_ws)[-1] == {
-        "type": "rtc.answer",
-        "session_id": "rtc-daemon-1",
-        "agent_id": agent_id,
-        "sdp": "v=0\r\n",
-    }
-
-    candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
-    ws.queue_text(
+        },
         {
             "type": "rtc.candidate",
             "session_id": "rtc-daemon-1",
             "agent_id": agent_id,
-            "candidate": candidate,
-        }
-    )
-    await _wait_until(
-        lambda: any(item.get("type") == "rtc.candidate" for item in _sent_json(browser_ws))
-    )
-    assert _sent_json(browser_ws)[-1] == {
-        "type": "rtc.candidate",
-        "session_id": "rtc-daemon-1",
-        "agent_id": agent_id,
-        "candidate": candidate,
-    }
-
-    ws.queue_text(
+            "candidate": {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"},
+        },
         {
             "type": "rtc.status",
             "session_id": "rtc-daemon-1",
             "agent_id": agent_id,
             "status": "connected",
-        }
-    )
-    await _wait_until(
-        lambda: any(item.get("type") == "rtc.status" for item in _sent_json(browser_ws))
-    )
-    assert _sent_json(browser_ws)[-1] == {
-        "type": "rtc.status",
-        "session_id": "rtc-daemon-1",
-        "agent_id": agent_id,
-        "status": "connected",
-    }
+        },
+    ]
+    async with get_backend().subscribe_channel(browser_conn.channel) as stream:
+        for expected in expected_signals:
+            ws.queue_text(expected)
+            dispatch = decode_rtc_signal_dispatch(
+                await asyncio.wait_for(anext(stream), timeout=1)
+            )
+            assert dispatch is not None
+            assert dispatch.host_id == host_id
+            assert dispatch.session_connection_id == live_daemon.id
+            assert dispatch.session_generation == live_daemon.host_generation
+            assert dispatch.dispatch_connection_id == live_daemon.id
+            assert dispatch.dispatch_generation == live_daemon.host_generation
+            assert dispatch.signal == expected
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)

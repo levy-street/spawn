@@ -14,6 +14,7 @@ from ..redis import get_backend
 HOST_CONTROL_PROTOCOL = "spawn.host.ctl"
 HOST_CONTROL_VERSION = 1
 HOST_RTC_SESSION_TTL_SECONDS = 60
+RTC_CONNECTED_SESSION_TTL_SECONDS = 24 * 60 * 60
 HOST_DAEMON_PRESENCE_TTL_SECONDS = 90
 MAX_HOST_RTC_SESSIONS_PER_BROWSER = 8
 MAX_HOST_RTC_SESSIONS_PER_HOST = 64
@@ -124,6 +125,16 @@ class HostOwnerRevocation:
     replacement_connection_id: str
 
 
+@dataclass(frozen=True)
+class RtcSignalDispatch:
+    host_id: str
+    session_connection_id: str
+    session_generation: int
+    dispatch_connection_id: str
+    dispatch_generation: int
+    signal: dict[str, Any]
+
+
 def encode_host_owner_revocation(event: HostOwnerRevocation) -> bytes:
     if not valid_daemon_connection_id(
         event.revoked_connection_id
@@ -159,6 +170,67 @@ def decode_host_owner_revocation(payload: bytes) -> HostOwnerRevocation | None:
     ):
         return None
     return HostOwnerRevocation(revoked, replacement)
+
+
+def encode_rtc_signal_dispatch(dispatch: RtcSignalDispatch) -> bytes:
+    payload = json.dumps(
+        {
+            "host_id": dispatch.host_id,
+            "session_connection_id": dispatch.session_connection_id,
+            "session_generation": dispatch.session_generation,
+            "dispatch_connection_id": dispatch.dispatch_connection_id,
+            "dispatch_generation": dispatch.dispatch_generation,
+            "signal": dispatch.signal,
+        },
+        separators=(",", ":"),
+    ).encode()
+    if len(payload) > MAX_HOST_SIGNAL_ENVELOPE_BYTES:
+        raise ValueError("RTC signal dispatch is too large")
+    return payload
+
+
+def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
+    if not payload or len(payload) > MAX_HOST_SIGNAL_ENVELOPE_BYTES:
+        return None
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    host_id = value.get("host_id")
+    session_connection_id = value.get("session_connection_id")
+    session_generation = value.get("session_generation")
+    dispatch_connection_id = value.get("dispatch_connection_id")
+    dispatch_generation = value.get("dispatch_generation")
+    signal = value.get("signal")
+    if (
+        not isinstance(host_id, str)
+        or not host_id
+        or len(host_id) > 128
+        or not isinstance(session_connection_id, str)
+        or not valid_daemon_connection_id(session_connection_id)
+        or not isinstance(dispatch_connection_id, str)
+        or not valid_daemon_connection_id(dispatch_connection_id)
+        or not isinstance(session_generation, int)
+        or isinstance(session_generation, bool)
+        or session_generation < 1
+        or session_generation > MAX_SAFE_FENCING_GENERATION
+        or not isinstance(dispatch_generation, int)
+        or isinstance(dispatch_generation, bool)
+        or dispatch_generation < 1
+        or dispatch_generation > MAX_SAFE_FENCING_GENERATION
+        or not isinstance(signal, dict)
+    ):
+        return None
+    return RtcSignalDispatch(
+        host_id,
+        session_connection_id,
+        session_generation,
+        dispatch_connection_id,
+        dispatch_generation,
+        signal,
+    )
 
 
 def encode_host_signal(envelope: HostSignalEnvelope) -> bytes:
@@ -233,11 +305,21 @@ class RedisBrowserConn:
         return self.channel
 
     async def _send_text_as_owner(self, payload: dict, owner: HostPresenceOwner) -> None:
-        published = await get_backend().publish_if_ephemeral(
+        dispatch = RtcSignalDispatch(
+            host_id=self.host_id,
+            session_connection_id=self.daemon_connection_id,
+            session_generation=self.daemon_generation,
+            dispatch_connection_id=owner.daemon_connection_id,
+            dispatch_generation=owner.generation,
+            signal=payload,
+        )
+        published = await get_backend().publish_if_host_owner(
             host_presence_key(self.host_id),
+            host_pending_presence_key(self.host_id),
             encode_host_presence_owner(owner),
-            self.channel,
-            json.dumps(payload, separators=(",", ":")).encode(),
+            generation=owner.generation,
+            channel=self.channel,
+            payload=encode_rtc_signal_dispatch(dispatch),
         )
         if not published:
             raise StaleHostOwnerError("host RTC response owner is no longer current")

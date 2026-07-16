@@ -17,6 +17,14 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from ..redis import get_backend
+from .owner_dispatch import (
+    OwnerResultEnvelope,
+    decode_owner_result,
+    owner_result_channel,
+    publish_owner_result,
+)
+
 if TYPE_CHECKING:
     from fastapi import WebSocket
 
@@ -133,12 +141,6 @@ class Broker:
         self._daemon_by_agent: dict[str, DaemonConn] = {}
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
         self._display_by_agent: dict[str, _DisplayState] = {}
-        self._snapshot_waiters: dict[str, set[asyncio.Future[dict]]] = defaultdict(set)
-        self._dir_list_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._fs_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._tool_check_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._tool_install_waiters: dict[str, asyncio.Future[dict]] = {}
-        self._upload_waiters: dict[str, tuple[str, asyncio.Future[dict]]] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
         self._lock = asyncio.Lock()
 
@@ -449,12 +451,17 @@ class Broker:
     async def mark_rtc_session_connected(
         self, session_id: str, expected: RtcSessionBinding
     ) -> RtcSessionBinding | None:
-        """Remove the negotiation TTL while preserving the session cap."""
+        """Extend a token-dispatched session without making it immortal."""
+        from .host_signal import RTC_CONNECTED_SESSION_TTL_SECONDS
+
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
             if current is not expected:
                 return None
-            connected = replace(current, expires_at=float("inf"))
+            connected = replace(
+                current,
+                expires_at=time.monotonic() + RTC_CONNECTED_SESSION_TTL_SECONDS,
+            )
             self._rtc_sessions[session_id] = connected
             return connected
 
@@ -560,31 +567,24 @@ class Broker:
         timeout: float = 2.0,
         rtc_session_id: str | None = None,
     ) -> dict | None:
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._snapshot_waiters[agent_id].add(fut)
-        try:
-            payload: dict[str, object] = {
-                "type": "agent.snapshot",
-                "agent_id": agent_id,
-                "lines": lines,
-            }
-            if plain:
-                payload["plain"] = True
-            if rtc_session_id:
-                payload["rtc_session_id"] = rtc_session_id
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                waiters = self._snapshot_waiters.get(agent_id)
-                if waiters is not None:
-                    waiters.discard(fut)
-                    if not waiters:
-                        self._snapshot_waiters.pop(agent_id, None)
+        request_id = str(uuid.uuid4())
+        payload: dict[str, object] = {
+            "type": "agent.snapshot",
+            "request_id": request_id,
+            "agent_id": agent_id,
+            "lines": lines,
+        }
+        if plain:
+            payload["plain"] = True
+        if rtc_session_id:
+            payload["rtc_session_id"] = rtc_session_id
+        return await self._request_owner_result(
+            daemon,
+            "agent.snapshot",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
     async def resolve_snapshot(
         self,
@@ -594,17 +594,16 @@ class Broker:
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            waiters = list(self._snapshot_waiters.pop(agent_id, ()))
-        for fut in waiters:
-            if not fut.done():
-                fut.set_result(payload)
-        return True
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "agent.snapshot",
+            request_id,
+            payload,
+        )
 
     async def request_dir_list(
         self,
@@ -615,24 +614,18 @@ class Broker:
         timeout: float = 3.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._dir_list_waiters[request_id] = fut
-        try:
-            payload: dict[str, object] = {"type": "host.fs.list", "request_id": request_id}
-            if path is not None:
-                payload["path"] = path
-            if include_files:
-                payload["include_files"] = True
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._dir_list_waiters.get(request_id) is fut:
-                    self._dir_list_waiters.pop(request_id, None)
+        payload: dict[str, object] = {"type": "host.fs.list", "request_id": request_id}
+        if path is not None:
+            payload["path"] = path
+        if include_files:
+            payload["include_files"] = True
+        return await self._request_owner_result(
+            daemon,
+            "host.fs.list_result",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
     async def resolve_dir_list(
         self,
@@ -642,16 +635,15 @@ class Broker:
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            fut = self._dir_list_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
-        return True
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.fs.list_result",
+            request_id,
+            payload,
+        )
 
     async def _request_fs(
         self,
@@ -662,19 +654,13 @@ class Broker:
     ) -> dict | None:
         request_id = str(uuid.uuid4())
         payload["request_id"] = request_id
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._fs_waiters[request_id] = fut
-        try:
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._fs_waiters.get(request_id) is fut:
-                    self._fs_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.fs.result",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
     async def request_fs_read(
         self, daemon: DaemonConn, *, path: str, timeout: float = 60.0
@@ -736,16 +722,15 @@ class Broker:
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            fut = self._fs_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
-        return True
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.fs.result",
+            request_id,
+            payload,
+        )
 
     async def request_tool_check(
         self,
@@ -755,25 +740,17 @@ class Broker:
         timeout: float = 15.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._tool_check_waiters[request_id] = fut
-        try:
-            await daemon.send_text(
-                {
-                    "type": "host.tools.check",
-                    "request_id": request_id,
-                    "targets": targets,
-                }
-            )
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._tool_check_waiters.get(request_id) is fut:
-                    self._tool_check_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.tools.check_result",
+            request_id,
+            {
+                "type": "host.tools.check",
+                "request_id": request_id,
+                "targets": targets,
+            },
+            timeout=timeout,
+        )
 
     async def resolve_tool_check(
         self,
@@ -783,16 +760,15 @@ class Broker:
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            fut = self._tool_check_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
-        return True
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.tools.check_result",
+            request_id,
+            payload,
+        )
 
     async def request_tool_install(
         self,
@@ -802,25 +778,17 @@ class Broker:
         timeout: float = 180.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._tool_install_waiters[request_id] = fut
-        try:
-            await daemon.send_text(
-                {
-                    "type": "host.tools.install",
-                    "request_id": request_id,
-                    "target": target,
-                }
-            )
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                if self._tool_install_waiters.get(request_id) is fut:
-                    self._tool_install_waiters.pop(request_id, None)
+        return await self._request_owner_result(
+            daemon,
+            "host.tools.install_result",
+            request_id,
+            {
+                "type": "host.tools.install",
+                "request_id": request_id,
+                "target": target,
+            },
+            timeout=timeout,
+        )
 
     async def resolve_tool_install(
         self,
@@ -830,16 +798,15 @@ class Broker:
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            fut = self._tool_install_waiters.pop(request_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
-        return True
+        if daemon is None:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.tools.install_result",
+            request_id,
+            payload,
+        )
 
     async def request_upload(
         self,
@@ -850,72 +817,95 @@ class Broker:
         client_id: str,
         timeout: float = 30.0,
     ) -> dict | None:
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict] = loop.create_future()
-        async with self._lock:
-            self._upload_waiters[client_id] = (agent_id, fut)
-        try:
-            await daemon.send_text(payload)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError:
-            return None
-        finally:
-            async with self._lock:
-                current = self._upload_waiters.get(client_id)
-                if current is not None and current[1] is fut:
-                    self._upload_waiters.pop(client_id, None)
+        request_id = str(uuid.uuid4())
+        payload["request_id"] = request_id
+        return await self._request_owner_result(
+            daemon,
+            "agent.uploaded",
+            request_id,
+            payload,
+            timeout=timeout,
+        )
 
     async def resolve_upload(
         self,
         agent_id: str,
-        client_id: str | None,
+        request_id: str | None,
         payload: dict,
         *,
         daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> UploadResolution:
-        if not client_id:
+        if not request_id:
             return UploadResolution.NO_WAITER
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return UploadResolution.STALE_OWNER
-            waiter = self._upload_waiters.pop(client_id, None)
-        if waiter is None:
-            return UploadResolution.NO_WAITER
-        waiter_agent_id, fut = waiter
-        if waiter_agent_id != agent_id or fut.done():
-            return UploadResolution.NO_WAITER
-        fut.set_result(payload)
-        return UploadResolution.RESOLVED
+        if daemon is None:
+            return UploadResolution.STALE_OWNER
+        published = await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "agent.uploaded",
+            request_id,
+            payload,
+        )
+        return UploadResolution.RESOLVED if published else UploadResolution.STALE_OWNER
 
-    async def reject_uploads_for_agent(
+    async def _request_owner_result(
         self,
-        agent_id: str,
-        message: str,
+        daemon: DaemonConn,
+        kind: str,
+        request_id: str,
+        request: dict[str, object],
         *,
-        daemon: DaemonConn | None = None,
-        expected_host_generation: int | None = None,
+        timeout: float,
+    ) -> dict | None:
+        generation = daemon.host_generation
+        if generation is None:
+            return None
+        channel = owner_result_channel(daemon.host_id, kind, request_id)
+        async with get_backend().subscribe_channel(channel) as stream:
+            await daemon.send_text(request)
+            try:
+                async with asyncio.timeout(timeout):
+                    async for raw in stream:
+                        envelope = decode_owner_result(raw)
+                        if envelope is None or not (
+                            envelope.host_id == daemon.host_id
+                            and envelope.daemon_connection_id == daemon.id
+                            and envelope.daemon_generation == generation
+                            and envelope.kind == kind
+                            and envelope.request_id == request_id
+                        ):
+                            continue
+                        return envelope.payload
+            except TimeoutError:
+                return None
+        return None
+
+    @staticmethod
+    async def _publish_owner_result(
+        daemon: DaemonConn,
+        expected_host_generation: int | None,
+        kind: str,
+        request_id: str,
+        payload: dict,
     ) -> bool:
-        async with self._lock:
-            if daemon is not None and (
-                expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(daemon, expected_host_generation)
-            ):
-                return False
-            rejected = [
-                (client_id, fut)
-                for client_id, (waiter_agent_id, fut) in self._upload_waiters.items()
-                if waiter_agent_id == agent_id
-            ]
-            for client_id, _ in rejected:
-                self._upload_waiters.pop(client_id, None)
-        for _, fut in rejected:
-            if not fut.done():
-                fut.set_exception(RuntimeError(message))
-        return True
+        generation = daemon.host_generation
+        if (
+            expected_host_generation is None
+            or generation != expected_host_generation
+            or generation < 1
+        ):
+            return False
+        return await publish_owner_result(
+            OwnerResultEnvelope(
+                host_id=daemon.host_id,
+                daemon_connection_id=daemon.id,
+                daemon_generation=generation,
+                kind=kind,
+                request_id=request_id,
+                payload=payload,
+            )
+        )
 
 
 _broker = Broker()

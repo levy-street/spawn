@@ -12,9 +12,18 @@ from spawn_server import auth, transcript
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Agent, Host
+from spawn_server.redis import get_backend
 from spawn_server.ws.broker import DaemonConn, get_broker
 from spawn_server.ws.browser import INITIAL_SNAPSHOT_LINES, browser_ws
+from spawn_server.ws.daemon import _pump_host_rtc_signals
 from spawn_server.ws.frames import KIND_INPUT, decode_binary_frame
+from spawn_server.ws.host_signal import (
+    HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    HostPresenceOwner,
+    encode_host_presence_owner,
+    host_presence_key,
+    wait_for_signal_pump,
+)
 
 
 class FakeBrowserWebSocket:
@@ -135,6 +144,25 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) ->
     raise AssertionError("timed out waiting for condition")
 
 
+async def _accept_daemon(daemon: DaemonConn, *, generation: int = 1) -> None:
+    daemon.host_generation = generation
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, daemon.host_id)
+        assert host is not None
+        host.daemon_connection_id = daemon.id
+        host.daemon_generation = generation
+        host.daemon_generation_counter = generation
+        host.daemon_pending_connection_id = None
+        host.daemon_pending_generation = None
+        await session.commit()
+    await get_backend().set_ephemeral(
+        host_presence_key(daemon.host_id),
+        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
+        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+    )
+    assert await get_broker().accept_daemon_owner(daemon, generation)
+
+
 def _sent_json(ws: FakeBrowserWebSocket) -> list[dict[str, Any]]:
     return [json.loads(item) for item in ws.sent_text]
 
@@ -204,6 +232,7 @@ async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client)
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
     broker = get_broker()
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
 
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
@@ -223,9 +252,18 @@ async def test_browser_ws_seeds_history_from_small_connect_time_snapshot(client)
         "type": "agent.snapshot",
         "agent_id": agent_id,
         "lines": INITIAL_SNAPSHOT_LINES,
+        "request_id": snapshot_request["request_id"],
     }
 
-    await broker.resolve_snapshot(agent_id, {"bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii")})
+    assert await broker.resolve_snapshot(
+        agent_id,
+        {
+            "request_id": snapshot_request["request_id"],
+            "bytes_b64": base64.b64encode(b"daemon history\n").decode("ascii"),
+        },
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
     await _wait_until(lambda: len(_messages_of_type(ws, "history")) >= 1)
     history = _messages_of_type(ws, "history")[-1]
     assert base64.b64decode(history["bytes_b64"]) == b"daemon history\n"
@@ -289,7 +327,14 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
     broker = get_broker()
     await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
     await broker.attach_agent_to_daemon(agent_id, daemon)
+    signal_ready = asyncio.Event()
+    expiry_tasks: set[asyncio.Task[None]] = set()
+    signal_task = asyncio.create_task(
+        _pump_host_rtc_signals(daemon, signal_ready, expiry_tasks)
+    )
+    await wait_for_signal_pump(signal_task, signal_ready)
 
     ws.queue_bytes(b"hello")
     await _wait_until(lambda: len(daemon_ws.sent_bytes) >= 1)
@@ -392,6 +437,11 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
+    signal_task.cancel()
+    await asyncio.gather(signal_task, return_exceptions=True)
+    for expiry_task in expiry_tasks:
+        expiry_task.cancel()
+    await asyncio.gather(*expiry_tasks, return_exceptions=True)
     await broker.unregister_daemon(daemon)
 
 

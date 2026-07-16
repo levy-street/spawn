@@ -359,6 +359,7 @@ async fn dispatch_loop(
                 }
                 Inbound::AgentSnapshot {
                     agent_id,
+                    request_id,
                     lines,
                     plain,
                     rtc_session_id,
@@ -371,6 +372,7 @@ async fn dispatch_loop(
                     tokio::spawn(async move {
                         handle_agent_snapshot(
                             agent_id,
+                            request_id,
                             lines.unwrap_or(5_000),
                             plain.unwrap_or(false),
                             rtc_session_id,
@@ -385,6 +387,7 @@ async fn dispatch_loop(
                 }
                 Inbound::AgentUpload {
                     agent_id,
+                    request_id,
                     cwd,
                     name,
                     mime_type,
@@ -396,6 +399,7 @@ async fn dispatch_loop(
                 } => {
                     handle_agent_upload(
                         agent_id,
+                        request_id,
                         cwd,
                         name,
                         mime_type,
@@ -2376,6 +2380,7 @@ async fn handle_agent_scroll(agent_id: Uuid, lines: i16, registry: &AgentRegistr
 
 async fn handle_agent_snapshot(
     agent_id: Uuid,
+    request_id: Option<String>,
     lines: u16,
     plain: bool,
     rtc_session_id: Option<String>,
@@ -2415,6 +2420,7 @@ async fn handle_agent_snapshot(
             Ok(bytes) => {
                 let snapshot = Outbound::AgentSnapshot {
                     agent_id,
+                    request_id,
                     bytes_b64: STANDARD.encode(bytes),
                     dc_offset,
                     rtc_session_id,
@@ -2436,6 +2442,7 @@ async fn handle_agent_snapshot(
             tracing::debug!(%agent_id, "snapshot for agent with no tmux session");
             send_snapshot_text(
                 agent_id,
+                request_id,
                 out_tx,
                 "\r\n[spawn] agent is not attached to this daemon and no matching tmux session was found\r\n",
             )
@@ -2470,6 +2477,7 @@ async fn handle_agent_snapshot(
         Ok(bytes) => {
             let snapshot = Outbound::AgentSnapshot {
                 agent_id,
+                request_id,
                 bytes_b64: STANDARD.encode(bytes),
                 dc_offset,
                 rtc_session_id,
@@ -2509,6 +2517,7 @@ async fn handle_agent_redraw(agent_id: Uuid, registry: &AgentRegistry) {
 #[allow(clippy::too_many_arguments)]
 async fn handle_agent_upload(
     agent_id: Uuid,
+    request_id: Option<String>,
     cwd: String,
     name: String,
     mime_type: String,
@@ -2551,6 +2560,7 @@ async fn handle_agent_upload(
             let uploaded = Outbound::AgentUploaded {
                 agent_id,
                 path: path.to_string_lossy().into_owned(),
+                request_id,
                 client_id,
             };
             if let Ok(s) = serde_json::to_string(&uploaded) {
@@ -2560,8 +2570,27 @@ async fn handle_agent_upload(
         }
         Err(e) => {
             tracing::warn!(%agent_id, error = %e, "upload failed");
-            send_error(out_tx, Some(agent_id), "upload_failed", &e).await;
+            send_upload_error(out_tx, agent_id, request_id, client_id, &e).await;
         }
+    }
+}
+
+async fn send_upload_error(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    agent_id: Uuid,
+    request_id: Option<String>,
+    client_id: Option<String>,
+    err: &anyhow::Error,
+) {
+    let frame = Outbound::Error {
+        agent_id: Some(agent_id),
+        code: "upload_failed".into(),
+        message: format!("{err:#}"),
+        request_id,
+        client_id,
+    };
+    if let Ok(s) = serde_json::to_string(&frame) {
+        let _ = out_tx.send(WsOutbound::Json(s)).await;
     }
 }
 
@@ -2575,6 +2604,8 @@ async fn send_error(
         agent_id,
         code: code.into(),
         message: format!("{err:#}"),
+        request_id: None,
+        client_id: None,
     };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::Json(s)).await;
@@ -2599,9 +2630,15 @@ async fn send_spawn_failed_exit(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound
     }
 }
 
-async fn send_snapshot_text(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, text: &str) {
+async fn send_snapshot_text(
+    agent_id: Uuid,
+    request_id: Option<String>,
+    out_tx: &mpsc::Sender<WsOutbound>,
+    text: &str,
+) {
     let snapshot = Outbound::AgentSnapshot {
         agent_id,
+        request_id,
         bytes_b64: STANDARD.encode(text.as_bytes()),
         dc_offset: None,
         rtc_session_id: None,

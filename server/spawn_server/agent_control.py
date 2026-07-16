@@ -240,6 +240,11 @@ async def upload_agent_file(
         raise HTTPException(status_code=502, detail=str(e)) from e
     if result is None:
         raise HTTPException(status_code=504, detail="agent upload timed out")
+    if result.get("code") == "upload_failed":
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("message") or "Agent upload failed.",
+        )
     return {
         "agent_id": agent.id,
         "path": result["path"],

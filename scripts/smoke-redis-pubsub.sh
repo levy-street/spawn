@@ -266,15 +266,14 @@ async def main() -> None:
             assert await _prepare_host_activation(
                 session, inverse_host_id, old_owner, old_generation, {"version": "old"}
             )
-            assert await backend.activate_ephemeral(
-                inverse_pending_key,
-                old_lease,
-                inverse_owner_key,
-                None,
-                old_lease,
-                ttl_seconds=60,
-            )
             await session.commit()
+        assert await backend.activate_ephemeral_if_newer(
+            inverse_pending_key,
+            old_lease,
+            inverse_owner_key,
+            generation=old_generation,
+            ttl_seconds=60,
+        )
 
         async with sessions() as session:
             new_generation = await _allocate_host_generation(
@@ -300,15 +299,14 @@ async def main() -> None:
             assert await _prepare_host_activation(
                 session, inverse_host_id, new_owner, new_generation, {"version": "new"}
             )
-            assert await backend.activate_ephemeral(
-                inverse_pending_key,
-                new_lease,
-                inverse_owner_key,
-                old_lease,
-                new_lease,
-                ttl_seconds=60,
-            )
             await session.commit()
+        assert await backend.activate_ephemeral_if_newer(
+            inverse_pending_key,
+            new_lease,
+            inverse_owner_key,
+            generation=new_generation,
+            ttl_seconds=60,
+        )
         async with sessions() as session:
             durable = await session.get(Host, inverse_host_id)
             assert durable is not None
@@ -391,6 +389,7 @@ from spawn_server.ws.daemon import _pump_host_rtc_signals
 from spawn_server.ws.host_signal import (
     HostPresenceOwner,
     browser_signal_channel,
+    decode_rtc_signal_dispatch,
     encode_host_presence_owner,
     host_presence_key,
 )
@@ -482,14 +481,19 @@ async def main() -> None:
             unavailable = None
             async with asyncio.timeout(5):
                 async for raw in responses:
-                    value = json.loads(raw)
-                    if value.get("status") == "unavailable":
-                        unavailable = value
+                    dispatch = decode_rtc_signal_dispatch(raw)
+                    if dispatch is not None and dispatch.signal.get("status") == "unavailable":
+                        unavailable = dispatch
                         break
 
             frames = [json.loads(value) for value in websocket.sent_text]
             assert unavailable is not None
-            assert unavailable["session_id"] == session_id
+            assert unavailable.host_id == host_id
+            assert unavailable.session_connection_id == old_owner
+            assert unavailable.session_generation == 1
+            assert unavailable.dispatch_connection_id != old_owner
+            assert unavailable.dispatch_generation == 2
+            assert unavailable.signal["session_id"] == session_id
             assert any(
                 frame.get("type") == "rtc.close" and frame.get("session_id") == session_id
                 for frame in frames
@@ -626,12 +630,11 @@ async def main() -> None:
                 session, host_id, new_owner, generation, {"version": "replacement"}
             )
             await session.commit()
-        assert await backend.activate_ephemeral(
+        assert await backend.activate_ephemeral_if_newer(
             host_pending_presence_key(host_id),
             replacement_lease,
             host_presence_key(host_id),
-            old_lease,
-            replacement_lease,
+            generation=generation,
             ttl_seconds=60,
         )
         # Deliberately publish the stale offer before the revocation event. The

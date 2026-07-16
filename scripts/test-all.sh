@@ -30,6 +30,15 @@ scripts/smoke-local-http-surface.sh
 printf '%s\n' "== real Redis pubsub smoke =="
 scripts/smoke-redis-pubsub.sh
 
+printf '%s\n' "== real PostgreSQL + Redis owner recovery smoke =="
+if [[ -n "${SPAWN_TEST_POSTGRES_URL:-}" && -n "${SPAWN_TEST_REDIS_URL:-}" ]] \
+  || { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }; then
+  scripts/smoke-host-owner-recovery.sh
+else
+  printf '%s\n' \
+    "set SPAWN_TEST_POSTGRES_URL and SPAWN_TEST_REDIS_URL, or start Docker, to run the owner recovery smoke"
+fi
+
 printf '%s\n' "== daemon login smoke =="
 scripts/smoke-local-login.sh
 

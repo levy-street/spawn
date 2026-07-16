@@ -9,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 TEST_ALL = SCRIPTS_DIR / "test-all.sh"
 REDIS_SMOKE = SCRIPTS_DIR / "smoke-redis-pubsub.sh"
+OWNER_RECOVERY_SMOKE = SCRIPTS_DIR / "smoke-host-owner-recovery.sh"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
 
 
@@ -22,6 +23,10 @@ def _workflow_body() -> str:
 
 def _redis_smoke_body() -> str:
     return REDIS_SMOKE.read_text(encoding="utf-8")
+
+
+def _owner_recovery_smoke_body() -> str:
+    return OWNER_RECOVERY_SMOKE.read_text(encoding="utf-8")
 
 
 def test_all_shell_scripts_are_executable():
@@ -39,6 +44,7 @@ def test_test_all_runs_required_local_smoke_matrix():
         "smoke-install-prebuilt.sh",
         "smoke-local-http-surface.sh",
         "smoke-redis-pubsub.sh",
+        "smoke-host-owner-recovery.sh",
         "smoke-local-login.sh",
         "smoke-local-daemon.sh",
         "smoke-local-browser-live.sh",
@@ -65,6 +71,21 @@ def test_redis_smoke_exercises_supported_cross_process_pubsub():
     removed_ring_calls = ["ring_append", "ring_read", "ring_clear"]
     stale = [item for item in removed_ring_calls if item in body]
     assert stale == []
+
+
+def test_owner_recovery_smoke_uses_real_postgres_and_redis_crash_gates():
+    body = _owner_recovery_smoke_body()
+    expected = [
+        "postgres:16-alpine",
+        "redis:7-alpine",
+        "SPAWN_TEST_EXTERNAL_SERVICES=1",
+        "test_registration_repairs_db_b_redis_a_with_successor_c",
+        "test_delayed_c_recovery_cannot_overwrite_successor_d",
+        "test_distributed_result_rejects_owner_when_successor_is_pending",
+        "test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding",
+    ]
+    missing = [item for item in expected if item not in body]
+    assert missing == []
 
 
 def test_test_all_keeps_external_smokes_explicitly_gated():

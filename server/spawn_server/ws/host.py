@@ -23,12 +23,15 @@ from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
     MAX_HOST_RTC_SESSIONS_PER_BROWSER,
+    RTC_CONNECTED_SESSION_TTL_SECONDS,
     HostPresenceOwner,
     HostSignalEnvelope,
     browser_signal_channel,
     decode_host_presence_owner,
+    decode_rtc_signal_dispatch,
     encode_host_presence_owner,
     encode_host_signal,
+    host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
     receive_with_signal_pump,
@@ -128,12 +131,10 @@ async def _pump_browser_signals(
     async with get_backend().subscribe_channel(channel) as stream:
         ready.set()
         async for raw in stream:
-            if not raw or len(raw) > MAX_SIGNAL_FRAME_BYTES:
+            dispatch = decode_rtc_signal_dispatch(raw)
+            if dispatch is None or dispatch.host_id != host_id:
                 continue
-            try:
-                signal = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
+            signal = dispatch.signal
             if not isinstance(signal, dict) or not _metadata_matches(signal, host_id):
                 continue
             session_id = _valid_rtc_session_id(signal.get("session_id"))
@@ -144,6 +145,11 @@ async def _pump_browser_signals(
                 binding = sessions.get(session_id)
                 if binding is None:
                     continue
+            if not (
+                dispatch.session_connection_id == binding.daemon_connection_id
+                and dispatch.session_generation == binding.daemon_generation
+            ):
+                continue
             frame_type = signal.get("type")
             if frame_type == "rtc.answer":
                 if _valid_rtc_sdp(signal.get("sdp")) is None:
@@ -156,15 +162,16 @@ async def _pump_browser_signals(
                     continue
             else:
                 continue
-            current_owner = decode_host_presence_owner(
-                await get_backend().get_ephemeral(host_presence_key(host_id))
+            dispatch_is_session_owner = (
+                dispatch.dispatch_connection_id == binding.daemon_connection_id
+                and dispatch.dispatch_generation == binding.daemon_generation
             )
-            binding_is_current = current_owner is not None and (
-                current_owner.daemon_connection_id == binding.daemon_connection_id
-                and current_owner.generation == binding.daemon_generation
-            )
-            if not binding_is_current:
-                if frame_type != "rtc.status" or signal.get("status") != "unavailable":
+            if not dispatch_is_session_owner:
+                if (
+                    frame_type != "rtc.status"
+                    or signal.get("status") != "unavailable"
+                    or dispatch.dispatch_generation <= binding.daemon_generation
+                ):
                     continue
                 async with sessions_lock:
                     sessions.pop(session_id, None)
@@ -177,7 +184,7 @@ async def _pump_browser_signals(
                         session_id=current.session_id,
                         daemon_connection_id=current.daemon_connection_id,
                         daemon_generation=current.daemon_generation,
-                        expires_at=float("inf"),
+                        expires_at=time.monotonic() + RTC_CONNECTED_SESSION_TTL_SECONDS,
                     )
             await conn.send_text(signal)
 
@@ -188,16 +195,18 @@ async def _publish_signal(
     binding: BrowserRtcSession,
     signal: dict[str, object],
 ) -> bool:
-    return await get_backend().publish_if_ephemeral(
+    return await get_backend().publish_if_host_owner(
         host_presence_key(host_id),
+        host_pending_presence_key(host_id),
         encode_host_presence_owner(
             HostPresenceOwner(
                 binding.daemon_connection_id,
                 binding.daemon_generation,
             )
         ),
-        host_signal_channel(host_id),
-        encode_host_signal(
+        generation=binding.daemon_generation,
+        channel=host_signal_channel(host_id),
+        payload=encode_host_signal(
             HostSignalEnvelope(
                 daemon_connection_id=binding.daemon_connection_id,
                 daemon_generation=binding.daemon_generation,
