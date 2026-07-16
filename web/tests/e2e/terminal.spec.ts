@@ -444,8 +444,35 @@ test("terminal reconciles stale live content when returning from a fresh scrollb
   await expect(terminal).toBeVisible();
   await expect(liveTerminalRows(page)).toContainText("WRONG-LIVE-BOTTOM");
 
+  // The live terminal has a separate endpoint-backed scrollback overlay, so
+  // its native viewport must always follow the PTY tail. Reproduce the xterm
+  // slow-frame failure deterministically: its scroll element can lag behind
+  // the already-bottomed buffer while a live write is consumed.
+  await page
+    .getByTestId("terminal-live-host")
+    .locator(".xterm-viewport")
+    .evaluate((viewport) => {
+      viewport.scrollTop = Math.max(0, viewport.scrollTop - 40);
+    });
   await sendPty(page, "\r\nDIRTY-LIVE-BYTE\n");
   await expect(liveTerminalRows(page)).toContainText("DIRTY-LIVE-BYTE");
+  await expect
+    .poll(async () => {
+      const { scrollTop, scrollHeight, clientHeight } = await page
+        .getByTestId("terminal-live-host")
+        .locator(".xterm-viewport")
+        .evaluate((viewport) => ({
+          scrollTop: viewport.scrollTop,
+          scrollHeight: viewport.scrollHeight,
+          clientHeight: viewport.clientHeight,
+        }));
+      const rowHeight = await liveTerminalRows(page)
+        .locator("> div")
+        .first()
+        .evaluate((row) => row.getBoundingClientRect().height);
+      return Math.abs(scrollHeight - clientHeight - scrollTop) / Math.max(1, rowHeight);
+    })
+    .toBeLessThanOrEqual(1);
 
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -300);
@@ -543,15 +570,48 @@ test("resizing invalidates cached scrollback so history re-wraps at the new widt
   await page.setViewportSize({ width: 700, height: 500 });
   await expect.poll(snapshotCount).toBeGreaterThan(baseline);
 
+  // The resize invalidates the rendered overlay. Send a live chunk only
+  // after its first replacement render has started: it must cross the
+  // reset/write barrier exactly once instead of disappearing in that window.
+  const liveDuringInitialRender = "\x1b[2A\rLIVE-DURING-INITIAL-OVERLAY-RENDER";
+  await page.evaluate((text) => {
+    const overlay = document.querySelector<HTMLElement>(
+      '[data-testid="terminal-scrollback-overlay"]',
+    );
+    const rtc = (
+      window as unknown as {
+        __spawnRtcTest: { sendPty: (value: string) => boolean };
+      }
+    ).__spawnRtcTest;
+    if (!overlay) throw new Error("scrollback overlay is not mounted");
+    const injectWhenBusy = () => {
+      if (overlay.getAttribute("aria-busy") !== "true") return false;
+      if (!rtc.sendPty(text)) throw new Error("RTC mock has no ready spawn.pty channel");
+      overlay.dataset.liveInjectedDuringRender = "true";
+      return true;
+    };
+    if (injectWhenBusy()) return;
+    const observer = new MutationObserver(() => {
+      if (!injectWhenBusy()) return;
+      observer.disconnect();
+    });
+    observer.observe(overlay, { attributes: true, attributeFilter: ["aria-busy"] });
+  }, liveDuringInitialRender);
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -30);
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay).toHaveAttribute("data-live-injected-during-render", "true");
+  await expect(overlay).toHaveAttribute("aria-busy", "false");
+  await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-DURING-INITIAL-OVERLAY-RENDER");
+  const initialRenderText = await overlay.locator(".xterm-rows").innerText();
+  expect(initialRenderText.match(/LIVE-DURING-INITIAL-OVERLAY-RENDER/g)?.length ?? 0).toBe(1);
+
   const rewrapped = `${Array.from({ length: 160 }, (_, i) => {
     return `REWRAPPED-${String(i).padStart(3, "0")}`;
   }).join("\n")}\n`;
   await replyReplay(page, rewrapped);
 
-  await liveTerminal(page).hover();
-  await page.mouse.wheel(0, -300);
-  const overlay = page.getByTestId("terminal-scrollback-overlay");
-  await expect(overlay).toBeVisible();
   await expect(overlay.locator(".xterm-rows")).toContainText("REWRAPPED-");
   await expect(overlay.locator(".xterm-rows")).not.toContainText("history-");
 });
@@ -658,10 +718,36 @@ test.describe("mobile terminal touch", () => {
     await sendPty(page, "\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED");
     await expect(overlay).toBeVisible();
     await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
+    await expect
+      .poll(async () => {
+        const text = await liveTerminalRows(page).innerText();
+        return text.split("MOBILE-LIVE-WHILE-SCROLLED").length - 1;
+      })
+      .toBe(1);
+    await expect(overlay).toHaveAttribute("aria-busy", "false");
 
-    await dragTouchInTerminal(page, 0.6, 0.35);
+    // Advance with bounded full-height touch gestures after the overlay's
+    // render/drain barrier settles. A single flick's momentum is inherently
+    // frame-rate-dependent; every gesture must instead either move the reader
+    // toward the live edge or close the overlay there.
+    for (let attempt = 0; attempt < 6 && (await overlay.isVisible()); attempt += 1) {
+      const before = await scrollbackOverlayMetrics(page);
+      await dragTouchInTerminal(page, 0.9, 0.1);
+      await expect
+        .poll(async () => {
+          if (!(await overlay.isVisible())) return true;
+          const after = await scrollbackOverlayMetrics(page);
+          return after.scrollTop > before.scrollTop + 20;
+        })
+        .toBe(true);
+    }
     await expect(overlay).not.toBeVisible();
-    await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
+    await expect
+      .poll(async () => {
+        const text = await liveTerminalRows(page).innerText();
+        return text.split("MOBILE-LIVE-WHILE-SCROLLED").length - 1;
+      })
+      .toBe(1);
   });
 });
 
@@ -711,11 +797,13 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
   await expect(rows).toContainText("LINKTEXT");
   await expect(rows).not.toContainText("example.com");
 
-  const decoration = await rows
-    .locator("span", { hasText: "LINKTEXT" })
-    .first()
-    .evaluate((node) => getComputedStyle(node).textDecorationLine);
-  expect(decoration).toContain("underline");
+  const linkSpan = rows.locator("span", { hasText: "LINKTEXT" }).first();
+  // xterm discovers/decorates links after the row itself paints. Poll the
+  // computed style so parallel renderer pressure cannot sample the brief
+  // undecorated frame while preserving the exact underline requirement.
+  await expect
+    .poll(() => linkSpan.evaluate((node) => getComputedStyle(node).textDecorationLine))
+    .toContain("underline");
   const plainDecoration = await rows
     .locator("span", { hasText: "plain" })
     .first()

@@ -102,6 +102,13 @@ stable.
 | P2-PURGE-01 | BLOCKED | Inventory, migrate, close/drain ingress, restart processes, and purge transcripts, DB/derived names, Redis, memory/queues/swap/core, logs/observability, WAL/AOF, backups, replicas, raw blocks, and snapshots | P2-TMUX-01, P2-AGENT-02, P2-HOST-02, P2-HOST-03B, P2-TERM-01, P2-TERM-02, P2-DATA-02, P2-ERROR-01 | Two-operator evidence follows the eight-step runbook; process/observability and oldest-backup checks find no recoverable plaintext; no content rollback path remains |
 | P2-AUDIT-01 | BLOCKED | Final adversarial server audit and Phase 2 claim gate | P2-PURGE-01 | Code/route/frame/schema inventory; server memory/queue/swap/core/disk/DB/Redis/log/observability scans; backup evidence; TURN-only tests; ciphertext and retained-metadata disclosure all pass |
 
+**Permanent P2-TMUX-01 scheduling rule:** this completed cutover must never be
+reopened as a backend repair, compatibility, fallback, or incident-recovery
+task. Translate any old-backend bug report into the equivalent `spawn-worker`
+behavior and schedule that worker-only fix instead. Reversing the decision
+requires a new ADR and explicit trust-boundary review; see
+[`TMUX_REMOVAL.md`](TMUX_REMOVAL.md).
+
 `P2-HOST-03B`, `P2-DATA-02`, `P2-ERROR-01`, `P2-PURGE-01`, and `P2-AUDIT-01`
 are marked `BLOCKED` because their declared dependencies do not exist yet, not
 because their scope is optional.

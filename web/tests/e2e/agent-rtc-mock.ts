@@ -31,6 +31,7 @@ export async function installAgentRtcMock(
         openChannels,
         autoSnapshot,
         connections: 0,
+        activePtyChannel: null as FakeDataChannel | null,
         channels: new Map<string, FakeDataChannel>(),
         ptyChannels: [] as FakeDataChannel[],
         pendingReplay: [] as Array<{ channel: FakeDataChannel; request: Record<string, unknown> }>,
@@ -221,6 +222,8 @@ export async function installAgentRtcMock(
           this.connectionState = "connected";
           this.iceConnectionState = "connected";
           for (const channel of this.channels) channel.open();
+          state.activePtyChannel =
+            this.channels.find((channel) => channel.label === "spawn.pty") ?? null;
           this.onconnectionstatechange?.();
           this.oniceconnectionstatechange?.();
         }
@@ -231,6 +234,9 @@ export async function installAgentRtcMock(
         }
         close() {
           this.connectionState = "closed";
+          if (state.activePtyChannel && this.channels.includes(state.activePtyChannel)) {
+            state.activePtyChannel = null;
+          }
           for (const channel of this.channels) channel.close();
         }
       }
@@ -240,18 +246,27 @@ export async function installAgentRtcMock(
       (
         window as unknown as {
           __spawnRtcTest: {
-            sendPty: (text: string, connectionIndex?: number) => void;
+            ptyReady: () => boolean;
+            sendPty: (text: string, connectionIndex?: number) => boolean;
             replyReplay: (text: string) => void;
             setControl: (next: typeof control) => void;
           };
         }
       ).__spawnRtcTest = {
+        ptyReady() {
+          return (
+            state.activePtyChannel?.readyState === "open" &&
+            state.activePtyChannel.onmessage !== null
+          );
+        },
         sendPty(text, connectionIndex) {
           const bytes = encoder.encode(text);
-          state.ptyOffset += bytes.length;
           const channel =
-            connectionIndex == null ? state.ptyChannels.at(-1) : state.ptyChannels[connectionIndex];
-          channel?.receive(bytes.buffer);
+            connectionIndex == null ? state.activePtyChannel : state.ptyChannels[connectionIndex];
+          if (!channel) return false;
+          state.ptyOffset += bytes.length;
+          channel.receive(bytes.buffer);
+          return true;
         },
         replyReplay(text) {
           const pending = state.pendingReplay.shift();
@@ -311,16 +326,26 @@ export function handleAgentRtcSignal(ws: WebSocketRoute, message: string | Buffe
 }
 
 export async function sendPty(page: Page, text: string, connectionIndex?: number) {
-  await page.evaluate(
-    ({ value, index }) => {
-      (
+  if (connectionIndex === undefined) {
+    await page.waitForFunction(() => {
+      return (
         window as unknown as {
-          __spawnRtcTest: { sendPty: (text: string, connectionIndex?: number) => void };
+          __spawnRtcTest?: { ptyReady: () => boolean };
+        }
+      ).__spawnRtcTest?.ptyReady();
+    });
+  }
+  const delivered = await page.evaluate(
+    ({ value, index }) => {
+      return (
+        window as unknown as {
+          __spawnRtcTest: { sendPty: (text: string, connectionIndex?: number) => boolean };
         }
       ).__spawnRtcTest.sendPty(value, index);
     },
     { value: text, index: connectionIndex },
   );
+  if (!delivered) throw new Error("RTC mock has no ready spawn.pty channel");
 }
 
 export async function replyReplay(page: Page, text: string) {

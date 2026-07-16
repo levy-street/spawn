@@ -124,8 +124,8 @@ content path returning.
 
 **Current P2-AGENT-02 review-candidate validation:** strict daemon format and
 Clippy pass; all 140 daemon tests pass; server Ruff and all 146 server tests
-pass; web lint, all 27 unit tests, 67 browser tests (3 opt-in audits skipped),
-and the production build pass. `SPAWN_E2E_PORT=3427 scripts/test-all.sh` passes
+pass; web lint, all 30 unit tests, 67 browser tests (3 opt-in audits skipped),
+and the production build pass. `SPAWN_E2E_PORT=3717 scripts/test-all.sh` passes
 all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
 daemon, live-browser, and service-manager smokes.
 

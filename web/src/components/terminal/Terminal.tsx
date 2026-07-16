@@ -20,6 +20,7 @@ import {
   useState,
 } from "react";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
@@ -257,6 +258,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
+  // Connect-time history is intentionally shallow even when offset-anchored;
+  // opening deep scrollback must still request the endpoint's full capture.
+  const scrollbackCachedSnapshotIsShallowRef = useRef(false);
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderGenerationRef = useRef(0);
   const scrollbackCacheDirtyRef = useRef(true);
@@ -303,6 +307,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
+  const scrollbackPendingLiveWritesRef = useRef(
+    new PostRenderLiveWriteBuffer(SCROLLBACK_DC_REPLAY_BUFFER_BYTES),
+  );
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
@@ -319,6 +326,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
   const recentDcChunksSizeRef = useRef(0);
   const dcActiveRef = useRef(false);
+  // xterm's reset/seed write is asynchronous. Keep live bytes behind that
+  // barrier so a DataChannel message cannot be consumed and then erased by
+  // the still-running initial replay.
+  const liveSeedWriteInFlightRef = useRef(false);
+  const pendingLiveSeedWritesRef = useRef(
+    new PostRenderLiveWriteBuffer(SCROLLBACK_DC_REPLAY_BUFFER_BYTES),
+  );
+  const liveSeedCoveredOffsetRef = useRef<number | null>(null);
+  const flushPendingLiveSeedWritesRef = useRef<() => void>(() => {});
+  const liveViewportPinFrameRef = useRef<number | null>(null);
+  const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
@@ -514,6 +532,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     scrollbackVisibleRef.current = false;
     scrollbackRenderInFlightRef.current = false;
+    scrollbackPendingLiveWritesRef.current.clear();
+    scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
     scrollbackStableLineRef.current = null;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
@@ -556,12 +576,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     (bytes: Uint8Array | null, reveal: boolean) => {
       const historyTerm = scrollbackTermRef.current;
       if (!bytes || !historyTerm) return;
+      const renderAlreadyInFlight = scrollbackRenderInFlightRef.current;
       const generation = scrollbackRenderGenerationRef.current + 1;
       scrollbackRenderGenerationRef.current = generation;
       scrollbackRenderInFlightRef.current = true;
-      console.log(
-        `[sbdbg] render start gen=${generation} reveal=${reveal} visible=${scrollbackVisibleRef.current} hasSnap=${scrollbackOverlayHasSnapshotRef.current} restore=${scrollbackRestoreLineRef.current} bytes=${bytes.length}`,
-      );
+      scrollbackOverlayRef.current?.setAttribute("aria-busy", "true");
 
       // A visible re-render must preserve the reader's place even when the
       // idle-gate didn't stage an explicit restore. Measure the distance
@@ -573,7 +592,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackOverlayHasSnapshotRef.current &&
         scrollbackRestoreLineRef.current === null
       ) {
-        if (scrollbackRenderInFlightRef.current) {
+        if (renderAlreadyInFlight) {
           scrollbackRestoreLineRef.current = scrollbackStableLineRef.current;
         } else {
           scrollbackRestoreLineRef.current = historyTerm.buffer.active.viewportY;
@@ -588,10 +607,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // best effort for the overlay; the scheduled refresh converges it.
       // Worker replays are geometry-tagged: each chunk renders at the size
       // its bytes were produced for, and xterm reflows on each transition.
-      const replaySlices = takeDcReplaySlices(bytes) ?? [];
+      const replaySlices = takeDcReplaySlices(bytes);
+      const snapshotOffset = scrollbackSnapshotOffsetsRef.current.get(bytes);
+      const latestOffset = recentDcChunksRef.current.at(-1)?.offsetAfter;
+      let coveredOffset =
+        replaySlices !== null && snapshotOffset !== undefined
+          ? Math.max(snapshotOffset, latestOffset ?? snapshotOffset)
+          : null;
       const ops: SequencedWrite[] = [
         ...overlayWriteOps(decodeUtf8(bytes), { cols, rows }),
-        ...replaySlices.map((slice) => ({ data: slice })),
+        ...(replaySlices ?? []).map((slice) => ({ data: slice })),
       ];
       writeSequenced(historyTerm, ops, () => {
         // Two frames let xterm's renderer settle the viewport height, but
@@ -604,39 +629,74 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           if (scrollbackRenderGenerationRef.current !== generation) return;
           requestAnimationFrame(() => {
             if (scrollbackRenderGenerationRef.current !== generation) return;
-            scrollbackRenderInFlightRef.current = false;
-            scrollbackRenderedSnapshotBytesRef.current = bytes;
-            const overlay = getScrollbackViewport();
-            console.log(
-              `[sbdbg] render done gen=${generation} overlay=${!!overlay} visible=${scrollbackVisibleRef.current}`,
-            );
-            if (!overlay) return;
-            if (!reveal && !scrollbackVisibleRef.current) {
-              historyTerm.scrollToBottom();
-              overlay.scrollTop = maxElementScrollTop(overlay);
-              return;
-            }
-            scrollbackOverlayHasSnapshotRef.current = true;
-            healScrollbackScrollState();
-            const restoreLine = scrollbackRestoreLineRef.current;
-            scrollbackRestoreLineRef.current = null;
-            if (restoreLine !== null) {
-              historyTerm.scrollToLine(restoreLine);
-            } else {
-              historyTerm.scrollToBottom();
-            }
-            const pendingDelta = scrollbackPendingDeltaPxRef.current;
-            const pendingLines = Math.trunc(
-              pendingDelta / Math.max(1, terminalRowHeightRef.current),
-            );
-            if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-            scrollbackPendingDeltaPxRef.current = 0;
-            scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-            scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
-            console.log(
-              `[sbdbg] positioned gen=${generation} st=${Math.round(overlay.scrollTop)} max=${Math.round(maxElementScrollTop(overlay))}`,
-            );
-            updateScrollbackReveal(overlay);
+            const requestConvergedSnapshot = () => {
+              scrollbackRenderInFlightRef.current = false;
+              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
+              scrollbackCacheDirtyRef.current = true;
+              if (scrollbackVisibleRef.current) {
+                requestSnapshotRef.current("overlay");
+              } else {
+                scheduleScrollbackCacheRefreshRef.current(100);
+              }
+            };
+            const finishRender = () => {
+              scrollbackRenderInFlightRef.current = false;
+              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
+              scrollbackRenderedSnapshotBytesRef.current = bytes;
+              const overlay = getScrollbackViewport();
+              if (!overlay) return;
+              if (!reveal && !scrollbackVisibleRef.current) {
+                historyTerm.scrollToBottom();
+                overlay.scrollTop = maxElementScrollTop(overlay);
+                return;
+              }
+              scrollbackOverlayHasSnapshotRef.current = true;
+              healScrollbackScrollState();
+              const restoreLine = scrollbackRestoreLineRef.current;
+              scrollbackRestoreLineRef.current = null;
+              if (restoreLine !== null) {
+                historyTerm.scrollToLine(restoreLine);
+              } else {
+                historyTerm.scrollToBottom();
+              }
+              const pendingDelta = scrollbackPendingDeltaPxRef.current;
+              const pendingLines = Math.trunc(
+                pendingDelta / Math.max(1, terminalRowHeightRef.current),
+              );
+              if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+              scrollbackPendingDeltaPxRef.current = 0;
+              scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+              scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
+              updateScrollbackReveal(overlay);
+            };
+            const drainPendingLiveWrites = () => {
+              if (scrollbackRenderGenerationRef.current !== generation) return;
+              const geometry = lastSizeRef.current;
+              if (
+                replaySlices === null ||
+                historyTerm.cols !== geometry.cols ||
+                historyTerm.rows !== geometry.rows
+              ) {
+                requestConvergedSnapshot();
+                return;
+              }
+              const pending = scrollbackPendingLiveWritesRef.current.drain(coveredOffset, geometry);
+              if (pending.kind === "refresh") {
+                requestConvergedSnapshot();
+                return;
+              }
+              coveredOffset = pending.coveredOffset;
+              if (pending.chunks.length === 0) {
+                finishRender();
+                return;
+              }
+              writeSequenced(
+                historyTerm,
+                pending.chunks.map((data) => ({ data })),
+                drainPendingLiveWrites,
+              );
+            };
+            drainPendingLiveWrites();
           });
         });
       });
@@ -680,22 +740,44 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   prepareScrollbackSnapshotRef.current = prepareScrollbackSnapshot;
 
   const writeScrollbackLiveBytes = useCallback(
-    (bytes: Uint8Array) => {
+    (bytes: Uint8Array, dcOffsetAfter?: number) => {
       const historyTerm = scrollbackTermRef.current;
-      if (!historyTerm || scrollbackRenderedSnapshotBytesRef.current === null) return;
-      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) return;
+      if (!historyTerm) return;
+      const geometry = lastSizeRef.current;
+      const queueForPostRender = () => {
+        scrollbackPendingLiveWritesRef.current.enqueue(bytes, dcOffsetAfter, geometry);
+      };
+      // The first visible render has no completed snapshot yet. Hold bytes
+      // arriving after that render captured its replay slices, then append
+      // them exactly once when the reset/geometry walk reaches its barrier.
+      // A visible overlay waiting for its first snapshot uses the same queue.
+      if (scrollbackRenderedSnapshotBytesRef.current === null) {
+        if (scrollbackRenderInFlightRef.current || scrollbackVisibleRef.current) {
+          queueForPostRender();
+        }
+        return;
+      }
+      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) {
+        queueForPostRender();
+        return;
+      }
       // Warm-cache appends are an optimization and must never write at the
       // wrong geometry. Mid-render, xterm's shared write queue would slot
       // these bytes between the sequenced chunk walk's writes — at whatever
       // historical geometry the walk is passing through. And after an
       // external PTY resize (another window taking control), bytes at the
-      // new width can arrive before this client learns the geometry. In both
-      // cases: drop; the snapshot covering these bytes re-renders shortly.
-      if (scrollbackRenderInFlightRef.current) return;
-      const { cols, rows } = lastSizeRef.current;
-      if (historyTerm.cols !== cols || historyTerm.rows !== rows) {
+      // new width can arrive before this client learns the geometry. Hold a
+      // bounded tail in both cases; drain it at the final geometry or request
+      // a fresh endpoint checkpoint when exact append is impossible.
+      if (scrollbackRenderInFlightRef.current) {
+        queueForPostRender();
+        return;
+      }
+      if (historyTerm.cols !== geometry.cols || historyTerm.rows !== geometry.rows) {
+        queueForPostRender();
         scrollbackCacheDirtyRef.current = true;
-        scheduleScrollbackCacheRefreshRef.current();
+        if (scrollbackVisibleRef.current) requestSnapshotRef.current("overlay");
+        else scheduleScrollbackCacheRefreshRef.current();
         return;
       }
 
@@ -942,6 +1024,41 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [imagePasteMode, removePendingAttachment, showUploadStatus, updatePendingAttachments],
   );
 
+  flushPendingLiveSeedWritesRef.current = () => {
+    const term = termRef.current;
+    if (!term) {
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedWriteInFlightRef.current = false;
+      return;
+    }
+    const geometry = lastSizeRef.current;
+    const pending = pendingLiveSeedWritesRef.current.drain(
+      liveSeedCoveredOffsetRef.current,
+      geometry,
+    );
+    if (pending.kind === "refresh") {
+      liveSeedWriteInFlightRef.current = false;
+      historyReseedPendingRef.current = true;
+      scrollbackCacheDirtyRef.current = true;
+      if (!requestSnapshotRef.current("cache")) {
+        scheduleScrollbackCacheRefreshRef.current(100);
+      }
+      pinLiveViewportToBottomRef.current();
+      return;
+    }
+    liveSeedCoveredOffsetRef.current = pending.coveredOffset;
+    if (pending.chunks.length === 0) {
+      liveSeedWriteInFlightRef.current = false;
+      pinLiveViewportToBottomRef.current();
+      return;
+    }
+    writeSequenced(
+      term,
+      pending.chunks.map((data) => ({ data })),
+      () => flushPendingLiveSeedWritesRef.current(),
+    );
+  };
+
   const socket = useAgentSocket({
     agentId,
     enabled: socketInitialSize !== null,
@@ -991,12 +1108,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }, 250);
       }
       scheduleScrollbackCacheRefreshRef.current();
-      writeScrollbackLiveBytes(bytes);
-      termRef.current?.write(bytes);
+      writeScrollbackLiveBytes(bytes, dcOffsetAfter);
+      if (liveSeedWriteInFlightRef.current) {
+        pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
+      } else {
+        termRef.current?.write(bytes, () => {
+          pinLiveViewportToBottomRef.current();
+        });
+      }
     },
-    onHistory: (bytes) => {
+    onHistory: (bytes, dcOffset) => {
       const term = termRef.current;
       if (!term) return;
+      if (typeof dcOffset === "number") {
+        scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
+      }
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedCoveredOffsetRef.current = typeof dcOffset === "number" ? dcOffset : null;
+      liveSeedWriteInFlightRef.current = true;
       const exactChunks = parseExactReplay(decodeUtf8(bytes));
       if (exactChunks) exactStreamRef.current = true;
       // Remember whether the endpoint seed included exact geometry markers;
@@ -1020,6 +1149,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         : containsAlternateBufferSwitch(bytes);
       if (altActive) {
         scrollbackCachedSnapshotBytesRef.current = null;
+        scrollbackCachedSnapshotIsShallowRef.current = false;
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       } else {
@@ -1027,6 +1157,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // scrollback opens instantly, but leave the cache dirty so the full
         // depth is fetched once the terminal is interactive.
         scrollbackCachedSnapshotBytesRef.current = bytes;
+        scrollbackCachedSnapshotIsShallowRef.current = true;
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
@@ -1034,6 +1165,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       term.reset();
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
+        flushPendingLiveSeedWritesRef.current();
       });
     },
     onDisplayControl: applyDisplayControl,
@@ -1054,6 +1186,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
+      scrollbackCachedSnapshotIsShallowRef.current = false;
       if (typeof dcOffset === "number") {
         // Offset-anchored snapshot: renders are made exact by replaying live
         // DataChannel bytes past the capture offset, so the cache converges
@@ -1258,7 +1391,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotOffsetsRef.current.get(scrollbackSnapshotBytesRef.current) !== undefined;
       if (
         !scrollbackSnapshotBytesRef.current ||
-        (scrollbackCacheDirtyRef.current && !cachedAnchored)
+        (scrollbackCacheDirtyRef.current &&
+          (!cachedAnchored || scrollbackCachedSnapshotIsShallowRef.current))
       ) {
         requestSnapshot("overlay");
       }
@@ -1503,6 +1637,37 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const maxScrollTop = (viewport: HTMLElement) => {
       return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    };
+
+    // xterm advances its buffer viewport when output appends at the bottom,
+    // but under a slow render frame its native scroll element can remain one
+    // or two rows behind. Because this UI renders historical navigation in a
+    // separate endpoint-backed overlay, the live terminal must stay pinned to
+    // the current PTY tail. Reconcile after xterm consumes a write and
+    // coalesce streaming chunks to one refresh per animation frame.
+    pinLiveViewportToBottomRef.current = () => {
+      if (liveViewportPinFrameRef.current !== null) return;
+      liveViewportPinFrameRef.current = requestAnimationFrame(() => {
+        if (termRef.current !== term) {
+          liveViewportPinFrameRef.current = null;
+          return;
+        }
+        const reconcile = () => {
+          term.scrollToBottom();
+          const viewport = getViewport();
+          if (viewport) viewport.scrollTop = maxScrollTop(viewport);
+          term.refresh(0, term.rows - 1);
+        };
+        reconcile();
+        // A native scroll event already queued from the slow frame can run
+        // after the first correction and restore the stale scrollTop. Verify
+        // once more on the following frame; streaming writes arriving in
+        // between are coalesced into this same final reconciliation.
+        liveViewportPinFrameRef.current = requestAnimationFrame(() => {
+          liveViewportPinFrameRef.current = null;
+          if (termRef.current === term) reconcile();
+        });
+      });
     };
 
     const alignViewportToRows = () => {
@@ -2203,11 +2368,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (resizeTimer) clearTimeout(resizeTimer);
       onDataDisposableRef.current?.dispose();
       if (uploadStatusTimerRef.current) clearTimeout(uploadStatusTimerRef.current);
+      if (liveViewportPinFrameRef.current !== null) {
+        cancelAnimationFrame(liveViewportPinFrameRef.current);
+        liveViewportPinFrameRef.current = null;
+      }
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedCoveredOffsetRef.current = null;
+      liveSeedWriteInFlightRef.current = false;
+      scrollbackPendingLiveWritesRef.current.clear();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
       fitTerminalRef.current = () => {};
       layoutTerminalSurfaceRef.current = () => {};
+      pinLiveViewportToBottomRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.

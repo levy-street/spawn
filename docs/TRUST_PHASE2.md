@@ -6,20 +6,26 @@ be independently reviewed and shippable, but the Phase 2 claim is made only
 after the historical-data purge and final inventory pass. Grep is one check,
 not proof that old plaintext has left disks, databases, Redis, or backups.
 
-## Current reality (why this is the sequence)
+## Current source reality (P2-AGENT-02 review checkpoint)
 
-- The mandatory session worker feeds one `run_forwarder` that sends every output
-  chunk to **two sinks unconditionally**: the WebRTC DataChannel direct-sinks
-  **and** the server-bound `0x01` WS leg. No v2 gate on the daemon side.
-- The only DataChannel is a raw per-agent `spawn.pty` byte pipe
-  (`daemon/src/rtc.rs`, `web/src/components/terminal/useAgentSocket.ts`). There
-  is no per-agent control channel and no host-scoped peer connection.
-- Since Increment 1, the server-bound `0x01` leg remains for **transcript
-  persistence** (the connect-time history seed) and **v1 relay fan-out**. The
-  server no longer needs its bytes for activity classification.
-- v2 already keeps *live* PTY off the server (Phase 1), but the connect-time
-  `history` frame and every `snapshot` frame still transit the server for every
-  client, v1 and v2.
+- `spawn-worker` is the only session backend. Its bounded encrypted-at-rest
+  replay log is the live endpoint's only history source; tmux execution and
+  fallback are retired and guarded against reintroduction.
+- Agent terminals require two ordered WebRTC DataChannels: `spawn.pty` carries
+  PTY bytes and `spawn.ctl` carries request-bound history/snapshot plus
+  resize/display ownership. Missing, duplicate, closed, unknown, or unordered
+  channels fail closed, with no server-content fallback.
+- The daemon control socket requires `spawn.control.v2`; the browser agent
+  socket requires `spawn.v2`. Both are text/JSON-only signaling, disclosed
+  lifecycle, and still-pending upload/launch control. Binary terminal frames,
+  `spawn.v1`, the `0x01`/`0x02` relay, transcripts, agent-content Redis pubsub,
+  and server history/snapshot/display relay are removed in the current
+  P2-AGENT-02 source candidate. Browser RTC offer/candidate/close frames bind
+  the exact agent/scope/protocol/version/nonce tuple.
+- A reviewed host-scoped `spawn.host.ctl` transport root is integrated and
+  works independently of any agent. It currently provides bounded host-bound
+  control primitives; moving all host filesystem/tool payloads remains later
+  work.
 - Host directory/file routes in `server/spawn_server/routes/hosts.py` proxy
   `host.fs.*` through the server. Downloads and uploads put complete file bytes
   in server memory; cross-host transfer reads into the server before writing to
@@ -30,11 +36,9 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   `output` and `error` can contain arbitrary commands, paths, and secrets;
   `HostToolPolicy.last_auto_update_error` persists a detailed error derived
   from the result.
-- REST `/api/agents/{id}/input` and `/snapshot` are content-bearing terminal
-  paths independent of the browser WebSocket flow.
-- Terminal resize/scroll/redraw and display-control traffic exposes dimensions,
-  scroll deltas, and viewport timing through REST, `/ws/browser`, and
-  server↔daemon `agent.resize`/`scroll`/`redraw` frames.
+- REST and WebSocket terminal input/snapshot/resize/scroll/redraw/display
+  surfaces are removed in the current source candidate. Agent uploads still
+  cross the server and remain assigned to P2-TERM-01.
 - `Agent.cwd`/`argv`/`env`, `Skill.content`, and
   `Preset.default_argv`/`env_template`/`install` are plaintext database fields.
   Preset templates are merged into the launch environment in `routes/agents.py`;
@@ -45,7 +49,7 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
 - Daemon `Outbound::Error.message` frames contain full `anyhow` chains (often
   including cwd/file paths). `ws/daemon.py` forwards upload messages and logs
   every free-form message; other detailed status/exit strings can do the same.
-- Removing future writes is insufficient: existing transcript files, database
+- Removing current and future writes is insufficient: existing transcript files, database
   values, derived names, server/observability logs, legacy
   `spawn:agent:*:ring` Redis keys, and infrastructure backups/snapshots remain
   readable until explicitly purged.
@@ -67,26 +71,15 @@ longer inspects `0x01` bytes for activity. This intentionally discloses the
 coarse time at which meaningful output occurred; `docs/TRUST.md` lists that as
 retained behavioral metadata.
 
-### 1A — activity correctness gate (before Increment 2)
+### 1A — activity correctness gate ✅ done
 
-Increment 1 is directionally complete but is not the behavioral acceptance
-gate yet:
-
-- Emit a content-free, monotonic-throttled input-activity frame for DataChannel
-  input so v2 typing updates `last_input_at`; the server currently stamps only
-  REST/v1 input. Preserve the current at-most-once-per-second granularity.
-- Apply daemon-owned suppression before every daemon-induced repaint,
-  including `agent.scroll` and copy-mode cancellation before stdin.
-- Make classification match the intended invalid/incomplete UTF-8 behavior
-  across PTY chunk boundaries. Replacement characters must not turn arbitrary
-  invalid bytes into three meaningful characters; escape/control sequences
-  split across chunks need bounded carry or an equivalent streaming parser.
-- Use monotonic time for throttle/suppression intervals. Wall-clock timestamps
-  are appropriate only in the metadata frame/database stamp.
-- Add tests for throttle, every suppression source, output/input frame
-  emission, channel backpressure/drop behavior, and the guarantee that binary
-  PTY output never updates activity server-side. Delete the unused server-side
-  classifier/suppression code once no live path imports it.
+Before the terminal relay cut, this gate added content-free,
+monotonic-throttled input activity for DataChannel input; daemon-owned repaint
+suppression; streaming invalid/incomplete UTF-8 and escape-sequence handling;
+and monotonic throttle/suppression timing. Its regression suite covers every
+suppression source, producer ordering, bounded classifier carry, output/input
+frame emission, and channel backpressure/drop behavior. The removed binary PTY
+path is no longer an activity source.
 
 Trust-touched Rust formatting is also a pre-Increment-2 gate. Repository-wide
 formatting, lint, and Clippy debt is tracked separately from trust correctness in
@@ -94,18 +87,14 @@ formatting, lint, and Clippy debt is tracked separately from trust correctness i
 become Phase 2 blockers, but any file touched by a trust task must leave its
 relevant gate clean.
 
-### 2 — DataChannel control channel (`spawn.ctl`) + history/snapshot over it
-Add a second DC label `spawn.ctl` (daemon already gates on label at
-`rtc.rs:348`; browser creates only `spawn.pty` at `useAgentSocket.ts:244`).
-Carry snapshot/replay **requests + responses** over it, framed. On DC-open the
-browser requests the connect-time backfill + scrollback from the daemon over
-`spawn.ctl` from the worker's encrypted bounded replay instead of the server
-`history`/`snapshot` frames. This removes those two v2
-content paths only. It does **not** complete the server cut: the daemon still
-mirrors every output chunk on `0x01` until Increment 3. The
-server-bound `rtc_session_id` correlation collapses once both live and
-backfill use the peer connection. An endpoint-only PTY byte anchor remains
-necessary: separate ordered DataChannels do not share a total order.
+### 2 — DataChannel control channel (`spawn.ctl`) + endpoint replay ✅ reviewed and merged
+
+The browser and daemon now require `spawn.pty` and `spawn.ctl`. The latter
+carries bounded, request-bound JSON control plus chunked binary replay from the
+worker's encrypted rolling log. Connect history, snapshots, resize, and
+display ownership no longer transit the application server. An endpoint-only
+PTY byte anchor orders replay against live bytes because separate ordered
+DataChannels do not share a total order.
 
 This increment reuses the worker's actual resource-budgeted history; it does
 not add a durable daemon transcript archive. The worker keeps an
@@ -124,8 +113,7 @@ The same channel carries resize/scroll/redraw, multi-viewer display ownership,
 and their acknowledgements. The daemon, not the server, arbitrates viewport
 state so geometry, deltas, and event timing remain E2E.
 
-**Implementation checkpoint (independent review pending):** `spawn.ctl` v1 is
-implemented as bounded request-bound JSON plus chunked binary replay frames.
+`spawn.ctl` v1 is implemented as bounded request-bound JSON plus chunked binary replay frames.
 Worker replay propagates its durable output watermark into the same producer
 coordinate as live frames. Each producer boundary is translated through the
 viewer's attach origin into an exact
@@ -134,24 +122,26 @@ binding and a teardown fence, preventing a late callback from resolving the
 same agent UUID to a replacement backend. The browser uses the explicit offset
 and a bounded bootstrap queue because ordering on one DataChannel does not
 imply ordering against the other. Slow viewers are disconnected from bounded
-queues and catch up through replay on reconnect. Legacy v1 server
-history/snapshot/viewport paths remain temporarily for compatibility, and
-daemon `0x01` mirroring still remains for Increment 3; this checkpoint therefore
-does not make the Phase 2 claim.
+queues and catch up through replay on reconnect. This transport root passed
+independent review and was integrated through `1f66d2d`; it does not by itself
+make the Phase 2 claim.
 
-### 3 — drop the `0x01` output leg + delete server content stores
-Safe once (1) and (2) land and the DataChannel is mandatory (v1 retired):
-- Daemon: drop the `WsOutbound::Binary` sink in `run_forwarder`
-  (`pty.rs:658-702`); reroute `send_pty_text`/`send_snapshot_text` banners onto
-  `spawn.ctl` or drop them.
-- Server: delete `transcript.py` + `daemon.py:148` append + `browser.py`
-  history/snapshot forwarding + the v1 `_pump_pubsub`/`0x02` input legs +
-  `redis.py` pubsub. Drop `spawn.v1` + `WS_CLOSE_BINARY_ON_V2` branching.
-- **Accepted regression:** offline-host history replay (documented in TRUST.md).
+### 3 — retire the WS terminal relay and server content stores (implemented, review pending)
 
-### 4 — host-scoped E2E control transport (`spawn.host.ctl`)
+The current P2-AGENT-02 source candidate removes the daemon binary output/input
+sink, server transcript writes and forwarding, agent-content pubsub, browser
+binary fallback, `spawn.v1`, and the old REST/WS terminal viewport surfaces.
+The daemon and server require their exact v2 subprotocols, every browser RTC
+signal carries the full agent tuple, and invalid mandatory DataChannel shapes
+remove the peer, viewer, and direct sink. The accepted regression is that an
+offline or exited worker has no history replay; there is no server transcript
+to show. Historical copies still require Increment 8 purge evidence, and this
+increment remains review pending until the branch is independently accepted
+and merged.
 
-Create a browser↔daemon WebRTC session keyed by `host_id`, not `agent_id`, with
+### 4 — host-scoped E2E control transport (`spawn.host.ctl`) ✅ reviewed and merged
+
+The browser and daemon create a WebRTC session keyed by `host_id`, not `agent_id`, with
 a `spawn.host.ctl` DataChannel. The control plane authenticates the browser,
 checks host ownership, mints TURN credentials, and forwards offer/answer/ICE;
 it never receives DataChannel messages. The session remains usable when the
@@ -164,13 +154,14 @@ authorizes operations to its own host identity; the browser binds every
 response to the requested host/session. Phase 3 adds signed signaling to both
 agent- and host-scoped peer connections.
 
-Implementation note: the transport root is intentionally separable from the
-content migrations in Increment 5. Its first reviewed cut uses a dedicated
+The transport root is intentionally separable from the content migrations in
+Increment 5. Its reviewed, merged cut uses a dedicated
 `/ws/host` signaling websocket, binds each RTC session to browser connection,
 daemon connection, host scope, protocol, and version, and exposes only a
-bounded `hello`/`ping` request-response primitive. This permits ownership,
-zero-agent, TURN-only, reconnect, cancellation, size, and cross-scope behavior
-to be tested before any protected filesystem/tool payload is moved. It does
+bounded `hello`/`ping` request-response primitive. Its acceptance covers
+ownership, zero-agent, TURN-only, reconnect, cancellation, size, and
+cross-scope behavior. Those gates passed before any protected filesystem/tool
+payload is moved. It does
 not make the Phase 2 claim and does not remove any legacy host content route.
 Host signaling is routed between websocket workers through ephemeral Redis
 pub/sub channels and an atomic, compare-refreshed daemon ownership lease; it
@@ -218,21 +209,21 @@ is restricted to stable content-free values.
   after the web client and daemon path is live. Tool route deletion remains
   deferred to Increment 7.
 
-### 6 — agent uploads and terminal control-plane retirement
+### 6 — agent uploads and terminal control-plane retirement (partially implemented)
 
-Replace agent `bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`,
+P2-TERM-01 still must replace agent `bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`,
 and `agent_control.decode_upload`) with a chunked per-agent `spawn.ctl` stream.
 Keep only a content-free saved/failed acknowledgement; paths remain on the
 encrypted channel.
 
-Remove REST input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`
+The current P2-TERM-02/P2-AGENT-02 candidate removes REST
+input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`
 viewport/display-control handlers, and their schemas/broker/server↔daemon
-frames. Browser input already uses `spawn.pty`; snapshot/history and viewport
-control use `spawn.ctl`. Migrate smoke/integration tooling to an RTC endpoint
-harness instead of keeping a server content proxy for tests. Return a
-non-content deprecation response only during a bounded compatibility window.
+frames. Browser input uses `spawn.pty`; snapshot/history and viewport control
+use `spawn.ctl`. Smoke/integration tooling uses an RTC endpoint harness instead
+of a server content proxy. This portion remains independent-review pending.
 
-Replace agent-scoped free-form daemon error messages with stable server-visible
+P2-ERROR-01 must replace agent-scoped free-form daemon error messages with stable server-visible
 codes and E2E detail on `spawn.ctl`. Remove server forwarding/logging of error
 text; lifecycle status and exit code remain disclosed metadata.
 

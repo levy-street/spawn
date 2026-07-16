@@ -38,7 +38,7 @@ export interface UseAgentSocketOptions {
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
   onData: (bytes: Uint8Array, dcOffsetAfter?: number) => void;
-  onHistory?: (bytes: Uint8Array) => void;
+  onHistory?: (bytes: Uint8Array, dcOffset?: number | null) => void;
   onDisplayControl?: (state: DisplayControlState) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
   onStatus?: (status: string) => void;
@@ -428,7 +428,7 @@ export function useAgentSocket({
         const anchor = typeof ptyOffset === "number" && ptyOffset >= 0 ? ptyOffset : 0;
         const handlers = currentHandlers();
         if (!handlers) return;
-        if (handlers.onHistory) handlers.onHistory(bytes);
+        if (handlers.onHistory) handlers.onHistory(bytes, ptyOffset);
         else handlers.onData(bytes);
         bootstrapPtyAnchor = anchor;
         for (const chunk of pendingBootstrapPty.splice(0)) {
