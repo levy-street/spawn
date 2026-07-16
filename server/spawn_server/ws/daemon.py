@@ -1178,6 +1178,18 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _fence_superseded_daemon(conn)
                             break
 
+                elif ftype == "host.pong":
+                    request_id = obj.get("request_id")
+                    if isinstance(request_id, str):
+                        if not await broker.resolve_host_pong(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
+
                 elif ftype == "host.tools.install_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):

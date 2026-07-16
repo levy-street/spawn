@@ -298,5 +298,16 @@ mod tests {
         assert!(
             matches!(frame, WsInbound::Json(inner) if matches!(*inner, Inbound::HostHeartbeat))
         );
+
+        let frame = classify(Message::Text(
+            r#"{"type":"host.ping","request_id":"request-1"}"#.into(),
+        ))
+        .expect("classify")
+        .expect("message");
+        assert!(matches!(
+            frame,
+            WsInbound::Json(inner)
+                if matches!(*inner, Inbound::HostPing { ref request_id } if request_id == "request-1")
+        ));
     }
 }

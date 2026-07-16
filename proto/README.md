@@ -33,6 +33,7 @@ also accepts `Bearer` for API testing).
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
+| POST   | `/api/hosts/{id}/control/ping` | owner-authorized, content-free current daemon-generation readiness check (204) |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
@@ -174,6 +175,8 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 
 {"type": "host.heartbeat"}
 
+{"type": "host.pong", "request_id": "uuid"}
+
 {"type": "agent.exit",
  "agent_id": "uuid",
  "exit_code": 0,
@@ -280,6 +283,8 @@ detail is not placed on the signaling websocket.
 {"type": "registered", "host_id": "uuid"}
 
 {"type": "host.heartbeat"}
+
+{"type": "host.ping", "request_id": "uuid"}
 
 {"type": "host.tools.check",
  "request_id": "uuid",

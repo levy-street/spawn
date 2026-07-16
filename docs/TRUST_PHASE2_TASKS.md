@@ -66,6 +66,23 @@ integrated, leaving a clean quality baseline for the transport work.
 | QUAL-03 | DONE | Fix the Ruff import-order failure in `server/spawn_server/routes/hosts.py` (`ec1f86e`) | Completed baseline cleanup | `uv run ruff check spawn_server tests` passes |
 | QUAL-04 | DONE | Fix the two Clippy warnings: `type_complexity` at `pty.rs` worker replay and `nonminimal_bool` in `upload.rs` (`775b7d0`; merged with the parallel format cleanup by `640a2e0`) | Completed baseline cleanup | `cargo clippy --all-targets --all-features -- -D warnings` passes |
 | QUAL-05 | DONE | Make the full server test baseline hermetic by isolating auth-provider environment and migration connection state (`aa524d9`) | Completed test-harness cleanup | Full server suite passes without relying on ambient environment or prior engine state |
+| QUAL-FLAKE-01 | DONE — REVIEWED, MERGED (`22c1f0c`) | Remove three observed baseline races without weakening assertions: centrally own, observe, drain, and cancel every background auto-update task; make local-daemon teardown bounded and scoped to stable launch plus worker identities before filesystem cleanup; gate persistent-agent create on an owner-authorized, content-free current-generation daemon ping after the intentionally failing agent is deleted | Completed baseline stability correction | Focused server repeats, cleanup/reconnect self-tests, repeated local-daemon smoke, trust guards, exact gates, and current-master mergeability passed with bounded fail-closed diagnostics |
+
+QUAL-FLAKE-01 keeps all three independently reproduced failures visible with
+their reviewed corrections, integrated at `22c1f0c`:
+
+1. **DONE — REVIEWED, MERGED:** the server centrally owns, observes, drains,
+   and cancels auto-update result-persistence tasks.
+2. **DONE — REVIEWED, MERGED:** local-daemon cleanup is bounded and scoped to
+   stable daemon and worker identities before private filesystem removal.
+3. **DONE — REVIEWED, MERGED:** persistent-shell creation waits for an
+   owner-authorized, content-free current-generation daemon ping after deletion
+   of the capability-test agent.
+
+The first candidate failed independent review. Its replacement added production
+task ownership, stable process identity, content-free readiness, and fail-closed
+platform/socket-path guards, reran the acceptance evidence, passed independent
+review, and merged at `22c1f0c`.
 
 ### Integrated validation at `640a2e0`
 
@@ -165,9 +182,10 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
    P2-HOST-01 passed independent review and are integrated on `master` through
    `1f66d2d`.
 3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 are reviewed and integrated
-   through `5722288`; P2-HOST-02 is implemented with independent review pending.
-   P2-TERM-01 remains planned while P2-HOST-03A implements separate host-channel
-   operations
+   through `5722288`; QUAL-FLAKE-01 is reviewed and integrated through
+   `22c1f0c`, and P2-HOST-02 is implemented with independent review pending.
+   P2-TERM-01 remains planned on the agent protocol while P2-HOST-02 and
+   P2-HOST-03A implement separate host-channel operations
    (rebasing/serializing shared route edits before merge). P2-DATA-01 design
    review may run alongside them once P2-HOST-01 fixes the transport boundary.
 4. **Wave 3:** P2-DATA-02 after its design pass, then P2-HOST-03B and

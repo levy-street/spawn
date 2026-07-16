@@ -27,6 +27,7 @@ from spawn_server.db import Base  # noqa: E402
 from spawn_server.main import app as fastapi_app  # noqa: E402
 from spawn_server.presets import seed_builtin_presets  # noqa: E402
 from spawn_server.redis import get_backend  # noqa: E402
+from spawn_server.routes import hosts as hosts_routes  # noqa: E402
 from spawn_server.ws.broker import get_broker  # noqa: E402
 
 # Force the cached settings to re-read env on each session.
@@ -68,6 +69,7 @@ async def app():
 
     yield fastapi_app
 
+    await hosts_routes.stop_auto_update_checker()
     await get_broker().shutdown()
     await get_backend().shutdown()
     if external_services:

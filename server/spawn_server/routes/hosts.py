@@ -25,7 +25,9 @@ router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 log = logging.getLogger("spawn.routes.hosts")
 AUTO_UPDATE_THROTTLE = timedelta(minutes=30)
 AUTO_UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
+AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS = 5.0
 _AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
+_AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 _AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
 
 
@@ -193,7 +195,6 @@ def _auto_update_error_from_result(result: schemas.HostToolInstallResult | None)
 async def _run_auto_update(
     *, user_id: str, host_id: str, preset_id: str, target: dict
 ) -> None:
-    key = (user_id, host_id, preset_id)
     try:
         daemon = get_broker().get_daemon_for_host(host_id)
         if daemon is None:
@@ -209,24 +210,88 @@ async def _run_auto_update(
     except Exception as e:  # noqa: BLE001
         log.warning("auto update failed host=%s preset=%s: %s", host_id, preset_id, e)
         error = str(e)
-    try:
-        sm = get_sessionmaker()
-        async with sm() as session:
-            policy = (
-                await session.execute(
-                    select(HostToolPolicy).where(
-                        HostToolPolicy.owner_user_id == user_id,
-                        HostToolPolicy.host_id == host_id,
-                        HostToolPolicy.preset_id == preset_id,
-                    )
+    sm = get_sessionmaker()
+    async with sm() as session:
+        policy = (
+            await session.execute(
+                select(HostToolPolicy).where(
+                    HostToolPolicy.owner_user_id == user_id,
+                    HostToolPolicy.host_id == host_id,
+                    HostToolPolicy.preset_id == preset_id,
                 )
-            ).scalar_one_or_none()
-            if policy is not None:
-                policy.last_auto_update_at = _utcnow()
-                policy.last_auto_update_error = error
-                await session.commit()
+            )
+        ).scalar_one_or_none()
+        if policy is not None:
+            policy.last_auto_update_at = _utcnow()
+            policy.last_auto_update_error = error
+            await session.commit()
+
+
+async def _owned_auto_update(
+    *, user_id: str, host_id: str, preset_id: str, target: dict
+) -> None:
+    key = (user_id, host_id, preset_id)
+    try:
+        await _run_auto_update(
+            user_id=user_id,
+            host_id=host_id,
+            preset_id=preset_id,
+            target=target,
+        )
     finally:
+        # This outer ownership boundary covers request cancellation and every
+        # persistence failure, so throttling cannot retain a stuck key.
         _AUTO_UPDATE_IN_FLIGHT.discard(key)
+
+
+def _auto_update_task_done(task: asyncio.Task[None]) -> None:
+    _AUTO_UPDATE_TASKS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        log.error(
+            "owned auto update task failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+def _start_auto_update(
+    *, user_id: str, host_id: str, preset_id: str, target: dict
+) -> bool:
+    key = (user_id, host_id, preset_id)
+    if key in _AUTO_UPDATE_IN_FLIGHT:
+        return False
+    _AUTO_UPDATE_IN_FLIGHT.add(key)
+    try:
+        task = asyncio.create_task(
+            _owned_auto_update(
+                user_id=user_id,
+                host_id=host_id,
+                preset_id=preset_id,
+                target=target,
+            ),
+            name=f"auto-update:{host_id}:{preset_id}",
+        )
+    except BaseException:
+        _AUTO_UPDATE_IN_FLIGHT.discard(key)
+        raise
+    _AUTO_UPDATE_TASKS.add(task)
+    task.add_done_callback(_auto_update_task_done)
+    return True
+
+
+async def wait_for_auto_update_tasks_idle(*, timeout: float | None = None) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    while _AUTO_UPDATE_TASKS:
+        remaining = None if deadline is None else max(0.0, deadline - loop.time())
+        if remaining == 0.0:
+            return False
+        _, pending = await asyncio.wait(tuple(_AUTO_UPDATE_TASKS), timeout=remaining)
+        if pending and deadline is not None and loop.time() >= deadline:
+            return False
+    return True
 
 
 async def run_auto_update_checks_once() -> None:
@@ -273,18 +338,14 @@ async def run_auto_update_checks_once() -> None:
                     continue
                 policy.last_checked_at = now
                 if _should_auto_update(tool, policy, now):
-                    key = (user_id, host_id, tool.preset_id)
-                    _AUTO_UPDATE_IN_FLIGHT.add(key)
-                    policy.last_auto_update_at = now
-                    policy.last_auto_update_error = None
-                    asyncio.create_task(
-                        _run_auto_update(
-                            user_id=user_id,
-                            host_id=host_id,
-                            preset_id=tool.preset_id,
-                            target=target,
-                        )
-                    )
+                    if _start_auto_update(
+                        user_id=user_id,
+                        host_id=host_id,
+                        preset_id=tool.preset_id,
+                        target=target,
+                    ):
+                        policy.last_auto_update_at = now
+                        policy.last_auto_update_error = None
             await session.commit()
 
 
@@ -311,13 +372,21 @@ async def stop_auto_update_checker() -> None:
     global _AUTO_UPDATE_CHECK_TASK
     task = _AUTO_UPDATE_CHECK_TASK
     _AUTO_UPDATE_CHECK_TASK = None
-    if task is None:
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    if await wait_for_auto_update_tasks_idle(timeout=AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS):
         return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+
+    pending = tuple(_AUTO_UPDATE_TASKS)
+    log.warning("cancelling %d auto update task(s) after shutdown drain", len(pending))
+    for update_task in pending:
+        update_task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
 
 
 @router.get("", response_model=list[schemas.HostOut])
@@ -416,23 +485,34 @@ async def list_host_tools(
         policy.last_checked_at = now
         _merge_tool_policy(tool, policy)
         if _should_auto_update(tool, policy, now):
-            key = (policy.owner_user_id, policy.host_id, policy.preset_id)
-            _AUTO_UPDATE_IN_FLIGHT.add(key)
-            policy.last_auto_update_at = now
-            policy.last_auto_update_error = None
-            _merge_tool_policy(tool, policy)
             target = targets_by_preset.get(tool.preset_id)
-            if target is not None:
-                asyncio.create_task(
-                    _run_auto_update(
-                        user_id=policy.owner_user_id,
-                        host_id=policy.host_id,
-                        preset_id=policy.preset_id,
-                        target=target.model_dump(),
-                    )
-                )
+            if target is not None and _start_auto_update(
+                user_id=policy.owner_user_id,
+                host_id=policy.host_id,
+                preset_id=policy.preset_id,
+                target=target.model_dump(),
+            ):
+                policy.last_auto_update_at = now
+                policy.last_auto_update_error = None
+                _merge_tool_policy(tool, policy)
     await session.commit()
     return checked
+
+
+@router.post("/{host_id}/control/ping", status_code=status.HTTP_204_NO_CONTENT)
+async def ping_host_control(
+    host_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> Response:
+    await _get_owned_host(session, host_id, user)
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+    await session.commit()
+    if not await get_broker().request_host_ping(daemon):
+        raise HTTPException(status_code=504, detail="host daemon control ping timed out")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{host_id}/tools/{preset_id}/install", response_model=schemas.HostToolInstallResult)

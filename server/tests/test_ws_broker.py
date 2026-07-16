@@ -132,6 +132,42 @@ async def test_broker_tool_install_request_roundtrip(app):
     await broker.unregister_daemon(daemon)
 
 
+@pytest.mark.asyncio
+async def test_host_ping_rejects_stale_daemon_and_generation(app):
+    broker = Broker()
+    old_ws = FakeWS()
+    old = DaemonConn("host-ping", "owner", old_ws)  # type: ignore[arg-type]
+    await _accept_owner(broker, old, generation=1)
+
+    new_ws = FakeWS()
+    new = DaemonConn("host-ping", "owner", new_ws)  # type: ignore[arg-type]
+    await _accept_owner(broker, new, generation=2)
+
+    assert not await broker.request_host_ping(old, timeout=0.01)
+    assert old_ws.sent_text == []
+
+    task = asyncio.create_task(broker.request_host_ping(new, timeout=1))
+    await asyncio.sleep(0)
+    sent = json.loads(new_ws.sent_text[-1])
+    payload = {"type": "host.pong", "request_id": sent["request_id"]}
+    assert not await broker.resolve_host_pong(
+        sent["request_id"],
+        payload,
+        daemon=new,
+        expected_host_generation=1,
+    )
+    assert not task.done()
+    assert await broker.resolve_host_pong(
+        sent["request_id"],
+        payload,
+        daemon=new,
+        expected_host_generation=2,
+    )
+    assert await task
+
+    await broker.unregister_daemon(new)
+
+
 
 @pytest.mark.asyncio
 async def test_host_rtc_bindings_enforce_caps_and_expire_deterministically(monkeypatch):

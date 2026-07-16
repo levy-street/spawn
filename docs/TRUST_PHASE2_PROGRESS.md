@@ -100,6 +100,12 @@ The reviewed P2-AGENT-02/P2-TERM-02 terminal-relay cut is integrated on
 replay, snapshot, or viewport content paths; both agent DataChannels and strict
 v2 signaling tuples are mandatory.
 
+The QUAL-FLAKE-01 stability correction passed independent review and is merged
+at `22c1f0c`. Server auto-update tasks are centrally owned and drained,
+local-daemon cleanup is bounded and tied to stable process identities, and the
+persistent-agent smoke waits on an owner-authorized, content-free
+current-generation `host.ping`/`host.pong` exchange.
+
 P2-HOST-02 now has an integrated implementation candidate on its isolated
 review branch: host home/list/stat/read/write/mkdir/rename/remove, browser
 download/upload, and browser-mediated cross-host transfer use bounded,

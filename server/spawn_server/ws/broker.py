@@ -572,6 +572,40 @@ class Broker:
             timeout=timeout,
         )
 
+    async def request_host_ping(
+        self,
+        daemon: DaemonConn,
+        *,
+        timeout: float = 3.0,
+    ) -> bool:
+        request_id = str(uuid.uuid4())
+        result = await self._request_owner_result(
+            daemon,
+            "host.pong",
+            request_id,
+            {"type": "host.ping", "request_id": request_id},
+            timeout=timeout,
+        )
+        return result == {"type": "host.pong", "request_id": request_id}
+
+    async def resolve_host_pong(
+        self,
+        request_id: str,
+        payload: dict,
+        *,
+        daemon: DaemonConn | None = None,
+        expected_host_generation: int | None = None,
+    ) -> bool:
+        if daemon is None or payload != {"type": "host.pong", "request_id": request_id}:
+            return False
+        return await self._publish_owner_result(
+            daemon,
+            expected_host_generation,
+            "host.pong",
+            request_id,
+            payload,
+        )
+
     async def resolve_tool_check(
         self,
         request_id: str,
@@ -681,7 +715,7 @@ class Broker:
         timeout: float,
     ) -> dict | None:
         generation = daemon.host_generation
-        if generation is None:
+        if generation is None or not await self.is_accepted_daemon_owner(daemon, generation):
             return None
         channel = owner_result_channel(daemon.host_id, kind, request_id)
         async with get_backend().subscribe_channel(channel) as stream:
