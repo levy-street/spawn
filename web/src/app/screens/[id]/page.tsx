@@ -1102,10 +1102,7 @@ function ScreenPane({
   const zoomed = zoomedId === agentId;
   const attention = agent ? agentNeedsAttention(agent) : null;
   const restartM = useMutation({
-    mutationFn: () => {
-      const size = getHandle()?.getSize();
-      return agents.restart(agentId, size ? { ...size, create_cwd: true } : undefined);
-    },
+    mutationFn: () => agents.restart(agentId, { create_cwd: true }),
     onError: (err) => onPaneError(String(err)),
   });
 

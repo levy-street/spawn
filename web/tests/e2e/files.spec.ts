@@ -173,12 +173,21 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
 });
 
 test("right-click opens a context menu with download and send to host", async ({ page }) => {
-  const transfers: unknown[] = [];
+  const reads: Array<{ hostId: string; path: string }> = [];
+  const uploads: Array<{ hostId: string; dir: string | null }> = [];
   await mockAuthenticatedApi(page, {
     hosts: [host, otherHost],
     files: treeFiles,
-    fileTransfer: async (_h, body, route) => {
-      transfers.push(body);
+    fileRead: (hostId, path) => {
+      reads.push({ hostId, path });
+      return "hi";
+    },
+    fileUpload: async (hostId, route) => {
+      const dir = route
+        .request()
+        .postData()
+        ?.match(/name="dir"\r\n\r\n([^\r]*)/)?.[1];
+      uploads.push({ hostId, dir: dir ?? null });
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -194,16 +203,16 @@ test("right-click opens a context menu with download and send to host", async ({
   const downloadEvent = page.waitForEvent("download");
   await page.getByRole("menuitem", { name: "Download" }).click();
   expect((await downloadEvent).suggestedFilename()).toBe("notes.txt");
+  await expect
+    .poll(() => reads.at(-1))
+    .toEqual({ hostId: HOST_ID, path: "/Users/tester/notes.txt" });
 
   await notes.click({ button: "right" });
   await page.getByRole("menuitem", { name: "Linux box" }).click();
   await expect
-    .poll(() => transfers.at(-1))
-    .toMatchObject({
-      path: "/Users/tester/notes.txt",
-      dest_host_id: OTHER_HOST_ID,
-      dest_dir: "/home/tester",
-    });
+    .poll(() => reads.at(-1))
+    .toEqual({ hostId: HOST_ID, path: "/Users/tester/notes.txt" });
+  await expect.poll(() => uploads.at(-1)).toEqual({ hostId: OTHER_HOST_ID, dir: "/home/tester" });
 });
 
 test("keyboard navigation: arrows move selection, F2 renames", async ({ page }) => {

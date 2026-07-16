@@ -161,7 +161,6 @@ printf '%s\n' "smoke-local-browser-live: starting API server on $base_url"
     SPAWN_JWT_SECRET=smoke-browser-live-secret-with-enough-length \
     SPAWN_PUBLIC_URL="$web_url" \
     SPAWN_CORS_ORIGINS="$web_url" \
-    SPAWN_TRANSCRIPT_DIR="$tmp_dir/transcripts" \
     SPAWN_WEBRTC_ENABLED=1 \
     uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port"
 ) >"$server_log" 2>&1 &

@@ -97,52 +97,10 @@ class HostOut(BaseModel):
     status: str
     last_seen_at: datetime | None = None
     agent_count: int = 0
-    home_dir: str | None = None
 
 
 class HostPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-
-
-class HostDirEntry(BaseModel):
-    name: str
-    path: str
-    is_dir: bool | None = None
-    size: int | None = None
-    modified_at: int | None = None
-
-
-class HostDirList(BaseModel):
-    path: str
-    home_dir: str | None = None
-    parent: str | None = None
-    entries: list[HostDirEntry] = Field(default_factory=list)
-    error: str | None = None
-
-
-class HostFileOpOut(BaseModel):
-    path: str | None = None
-
-
-class HostFileMkdirRequest(BaseModel):
-    path: str = Field(min_length=1, max_length=1024)
-
-
-class HostFileDeleteRequest(BaseModel):
-    path: str = Field(min_length=1, max_length=1024)
-    recursive: bool = False
-
-
-class HostFileRenameRequest(BaseModel):
-    path: str = Field(min_length=1, max_length=1024)
-    name: str = Field(min_length=1, max_length=255)
-
-
-class HostFileTransferRequest(BaseModel):
-    path: str = Field(min_length=1, max_length=1024)
-    dest_host_id: str = Field(min_length=1, max_length=64)
-    dest_dir: str = Field(min_length=1, max_length=1024)
-    overwrite: bool = False
 
 
 class HostToolTarget(BaseModel):
@@ -281,62 +239,11 @@ class AgentCreate(BaseModel):
     argv: list[str] | None = None
     env: dict[str, str] | None = None
     skill_ids: list[str] | None = None
-    cols: int = 120
-    rows: int = 32
     create_cwd: bool = True
 
 
 class AgentRestart(BaseModel):
-    cols: int = 120
-    rows: int = 32
     create_cwd: bool = True
-
-
-class AgentInput(BaseModel):
-    text: str | None = None
-    bytes_b64: str | None = None
-
-
-class AgentInputResult(BaseModel):
-    agent_id: str
-    bytes: int
-
-
-class AgentResize(BaseModel):
-    cols: int = Field(default=120, ge=20, le=400)
-    rows: int = Field(default=32, ge=5, le=200)
-
-
-class AgentResizeResult(BaseModel):
-    agent_id: str
-    cols: int
-    rows: int
-
-
-class AgentScroll(BaseModel):
-    lines: int = Field(ge=-200, le=200)
-
-
-class AgentScrollResult(BaseModel):
-    agent_id: str
-    lines: int
-
-
-class AgentRedrawResult(BaseModel):
-    agent_id: str
-    redraw: bool
-
-
-class AgentSnapshotRequest(BaseModel):
-    lines: int = Field(default=5000, ge=100, le=10000)
-    plain: bool = False
-
-
-class AgentSnapshotOut(BaseModel):
-    agent_id: str
-    bytes_b64: str
-    plain: bool
-    lines: int
 
 
 class AgentUploadRequest(BaseModel):

@@ -6,27 +6,25 @@
 
 use std::time::Duration;
 
+use crate::proto::{Inbound, Outbound};
+use crate::pty::WsOutbound;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
-
-use crate::proto::{Inbound, Outbound};
-use crate::pty::WsOutbound;
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const SUBPROTOCOL: &str = "spawn.v1";
+const SUBPROTOCOL: &str = "spawn.control.v2";
 
 /// Open a WS/WSS connection with `Authorization: Bearer <token>` and
-/// `Sec-WebSocket-Protocol: spawn.v1`. We TCP-connect manually first so we
+/// `Sec-WebSocket-Protocol: spawn.control.v2`. We TCP-connect manually first so we
 /// can enable TCP keepalive on the socket — without it, a half-dead remote
 /// (e.g. `uvicorn` shut down without a clean WS close) leaves the daemon's
 /// socket in `CLOSE-WAIT` indefinitely with no way for tungstenite to
@@ -98,14 +96,21 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
         other => anyhow::bail!("unsupported ws scheme: {other}"),
     };
 
-    // Verify the server actually accepted our subprotocol (if it sent one).
-    if let Some(sp) = response.headers().get("Sec-WebSocket-Protocol") {
-        if sp.to_str().unwrap_or("") != SUBPROTOCOL {
-            return Err(anyhow!("server selected unexpected subprotocol: {:?}", sp));
-        }
-    }
+    require_selected_subprotocol(response.headers())?;
 
     Ok(stream)
+}
+
+fn require_selected_subprotocol(headers: &HeaderMap) -> Result<()> {
+    let selected = headers
+        .get("Sec-WebSocket-Protocol")
+        .ok_or_else(|| anyhow!("server did not select the required websocket subprotocol"))?
+        .to_str()
+        .context("server selected a malformed websocket subprotocol")?;
+    if selected != SUBPROTOCOL {
+        anyhow::bail!("server did not select the required websocket subprotocol");
+    }
+    Ok(())
 }
 
 fn configure_keepalive(tcp: &TcpStream) -> Result<()> {
@@ -130,78 +135,10 @@ pub async fn send_json(stream: &mut WsStream, frame: &Outbound) -> Result<()> {
     Ok(())
 }
 
-/// Send a binary frame directly on a stream half. See `send_json` re: usage.
-#[allow(dead_code)]
-pub async fn send_binary(stream: &mut WsStream, payload: Vec<u8>) -> Result<()> {
-    stream.send(Message::Binary(payload)).await?;
-    Ok(())
-}
-
-#[cfg(test)]
-type InboundWipeProbe = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
-
-/// Original owned legacy-WS binary frame. The payload slice is copied once
-/// into a self-wiping worker input wrapper; this complete source frame then
-/// wipes on normal dispatch, malformed-frame rejection, or channel teardown.
-pub struct WsInboundPayload {
-    frame: Vec<u8>,
-    payload_offset: usize,
-    #[cfg(test)]
-    wipe_probe: Option<InboundWipeProbe>,
-}
-
-impl WsInboundPayload {
-    fn new(frame: Vec<u8>, payload_offset: usize) -> Self {
-        Self {
-            frame,
-            payload_offset,
-            #[cfg(test)]
-            wipe_probe: None,
-        }
-    }
-
-    pub(crate) fn copy_to_direct(&self) -> crate::pty::DirectPayload {
-        crate::pty::DirectPayload::new(self.frame[self.payload_offset..].to_vec())
-    }
-
-    #[cfg(test)]
-    fn set_wipe_probe(&mut self, wipe_probe: InboundWipeProbe) {
-        self.wipe_probe = Some(wipe_probe);
-    }
-}
-
-impl std::fmt::Debug for WsInboundPayload {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WsInboundPayload")
-            .field(
-                "payload_len",
-                &self.frame.len().saturating_sub(self.payload_offset),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for WsInboundPayload {
-    fn drop(&mut self) {
-        self.frame.as_mut_slice().zeroize();
-        #[cfg(test)]
-        if let Some(probe) = self.wipe_probe.as_ref() {
-            probe(&self.frame);
-        }
-    }
-}
-
 /// One inbound message from the WS, normalized.
 #[derive(Debug)]
 pub enum WsInbound {
-    Json(Inbound),
-    /// Decoded binary frame: (kind, agent_id, payload-as-owned-vec).
-    Binary {
-        kind: u8,
-        agent_id: uuid::Uuid,
-        payload: WsInboundPayload,
-    },
+    Json(Box<Inbound>),
     /// Server closed the connection.
     Closed,
 }
@@ -213,26 +150,10 @@ pub fn classify(msg: Message) -> Result<Option<WsInbound>> {
         Message::Text(t) => {
             let frame: Inbound = serde_json::from_str(&t)
                 .with_context(|| format!("decoding inbound JSON frame: {t}"))?;
-            Ok(Some(WsInbound::Json(frame)))
+            Ok(Some(WsInbound::Json(Box::new(frame))))
         }
-        Message::Binary(b) => {
-            let mut frame = Zeroizing::new(b);
-            let (kind, agent_id, payload) = crate::frames::decode_binary(&frame)?;
-            if kind != crate::frames::KIND_PTY_INPUT {
-                anyhow::bail!("unexpected inbound binary frame kind {kind}");
-            }
-            if payload.len() > crate::pty::MAX_WORKER_INPUT_BYTES {
-                anyhow::bail!(
-                    "inbound PTY input exceeds {} byte limit",
-                    crate::pty::MAX_WORKER_INPUT_BYTES
-                );
-            }
-            let payload_offset = frame.len() - payload.len();
-            Ok(Some(WsInbound::Binary {
-                kind,
-                agent_id,
-                payload: WsInboundPayload::new(std::mem::take(&mut *frame), payload_offset),
-            }))
+        Message::Binary(_) => {
+            anyhow::bail!("binary frames are forbidden on the daemon control socket")
         }
         Message::Close(_) => Ok(Some(WsInbound::Closed)),
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
@@ -245,13 +166,8 @@ pub async fn run_sender_loop(
     mut stream_tx: futures_util::stream::SplitSink<WsStream, Message>,
     mut rx: mpsc::Receiver<WsOutbound>,
 ) {
-    while let Some(mut out) = rx.recv().await {
-        let res = match &mut out {
-            WsOutbound::Json(text) => stream_tx.send(Message::Text(std::mem::take(text))).await,
-            WsOutbound::Binary(bytes) => {
-                stream_tx.send(Message::Binary(std::mem::take(bytes))).await
-            }
-        };
+    while let Some(out) = rx.recv().await {
+        let res = stream_tx.send(Message::Text(out.into_text())).await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "ws send error; sender loop exiting");
             break;
@@ -342,72 +258,56 @@ pub fn backoff_for_attempt(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
-    fn observed_probe(observed: &Arc<Mutex<Vec<Vec<u8>>>>) -> InboundWipeProbe {
-        let observed = Arc::clone(observed);
-        Arc::new(move |bytes| observed.lock().unwrap().push(bytes.to_vec()))
+    #[test]
+    fn daemon_control_handshake_requires_exact_selected_subprotocol() {
+        let mut headers = HeaderMap::new();
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&["spawn.control.v", "1"].concat()).unwrap(),
+        );
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_bytes(&[0x80]).expect("non-ASCII header value"),
+        );
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static(SUBPROTOCOL),
+        );
+        require_selected_subprotocol(&headers).expect("exact subprotocol accepted");
     }
 
     #[test]
-    fn binary_input_owns_and_wipes_the_complete_websocket_frame() {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let frame = crate::frames::encode_binary(
-            crate::frames::KIND_PTY_INPUT,
-            uuid::Uuid::new_v4(),
-            b"legacy websocket secret",
-        );
-        let Some(WsInbound::Binary { mut payload, .. }) =
-            classify(Message::Binary(frame)).expect("classify")
-        else {
-            panic!("expected binary input");
-        };
-        let direct = payload.copy_to_direct();
-        assert_eq!(&*direct, b"legacy websocket secret");
-        payload.set_wipe_probe(observed_probe(&observed));
-        drop(payload);
-        drop(direct);
-
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].len(), 17 + b"legacy websocket secret".len());
-        assert!(observed[0].iter().all(|byte| *byte == 0));
+    fn binary_frames_fail_closed() {
+        let error = classify(Message::Binary(b"terminal secret".to_vec()))
+            .expect_err("binary daemon control frame must be rejected");
+        assert!(error.to_string().contains("binary frames are forbidden"));
     }
 
-    #[tokio::test]
-    async fn inbound_channel_teardown_wipes_queued_binary_frames() {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let frame = crate::frames::encode_binary(
-            crate::frames::KIND_PTY_INPUT,
-            uuid::Uuid::new_v4(),
-            b"queued legacy websocket secret",
+    #[test]
+    fn json_control_frames_remain_supported() {
+        let frame = classify(Message::Text(r#"{"type":"host.heartbeat"}"#.into()))
+            .expect("classify")
+            .expect("message");
+        assert!(
+            matches!(frame, WsInbound::Json(inner) if matches!(*inner, Inbound::HostHeartbeat))
         );
-        let Some(WsInbound::Binary {
-            kind,
-            agent_id,
-            mut payload,
-        }) = classify(Message::Binary(frame)).expect("classify")
-        else {
-            panic!("expected binary input");
-        };
-        payload.set_wipe_probe(observed_probe(&observed));
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(WsInbound::Binary {
-            kind,
-            agent_id,
-            payload,
-        })
-        .await
-        .unwrap();
-        drop(rx);
-        drop(tx);
 
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(
-            observed[0].len(),
-            17 + b"queued legacy websocket secret".len()
-        );
-        assert!(observed[0].iter().all(|byte| *byte == 0));
+        let frame = classify(Message::Text(
+            r#"{"type":"host.ping","request_id":"request-1"}"#.into(),
+        ))
+        .expect("classify")
+        .expect("message");
+        assert!(matches!(
+            frame,
+            WsInbound::Json(inner)
+                if matches!(*inner, Inbound::HostPing { ref request_id } if request_id == "request-1")
+        ));
     }
 }

@@ -32,8 +32,8 @@ also accepts `Bearer` for API testing).
 |--------|-----------------------|------------------------------------------|
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
-| GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
+| POST   | `/api/hosts/{id}/control/ping` | owner-authorized, content-free current daemon-generation readiness check (204) |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
@@ -49,8 +49,7 @@ Host shape:
   "version": "0.1.0",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
-  "agent_count": 2,
-  "home_dir": "/home/me|null"
+  "agent_count": 2
 }
 ```
 
@@ -62,10 +61,10 @@ Host shape:
 | GET    | `/api/agents/{id}`   |                                                                                   |
 | POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, skill_ids?, create_cwd?}` — at least one of preset_id or argv |
 | PATCH  | `/api/agents/{id}`   | rename/pin/archive: `{name?, pinned?, archived?}`                                 |
-| POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
+| POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{create_cwd?}` |
 | GET    | `/api/agents/{id}/access` | list skill grants for an agent                                               |
 | PATCH  | `/api/agents/{id}/access` | replace grants with `{skill_ids?}`                                          |
-| DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
+| DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, then deletes the agent row                           |
 
 Agent shape:
 ```json
@@ -158,22 +157,11 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 ## Daemon WebSocket — `/ws/daemon`
 
 - Handshake header: `Authorization: Bearer <daemon_token>`
-- Subprotocol: `spawn.v1`
-- Frames: text frames are JSON, binary frames are PTY data.
-
-### Binary frame layout
-
-```
-+------+--------------+-----------------+
-| kind | agent_id     | payload         |
-| u8   | 16 bytes     | N bytes         |
-+------+--------------+-----------------+
-```
-
-- `kind = 0x01` — PTY output (daemon → server → browsers)
-- `kind = 0x02` — PTY input  (browser → server → daemon)
-
-Agent IDs are big-endian 16-byte UUIDs.
+- Required subprotocol: `spawn.control.v2`
+- Frames: JSON text only. Binary frames close with `4002`; an old/missing
+  subprotocol receives content-free `protocol.required` and closes with `4003`.
+- The retired daemon-WS `0x01` PTY output and `0x02` PTY input layouts are not
+  valid compatibility frames.
 
 ### Daemon → server JSON frames
 
@@ -183,10 +171,11 @@ Agent IDs are big-endian 16-byte UUIDs.
  "os": "linux",
  "arch": "x86_64",
  "version": "0.1.0",
- "home_dir": "/home/me",
  "existing_agents": ["uuid", ...]}
 
 {"type": "host.heartbeat"}
+
+{"type": "host.pong", "request_id": "uuid"}
 
 {"type": "agent.exit",
  "agent_id": "uuid",
@@ -210,26 +199,28 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
  "client_id": "browser-upload-id"}
 
-{"type": "agent.snapshot",
- "agent_id": "uuid",
- "bytes_b64": "..."}
-
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "sdp": "v=0..."}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.status",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "status": "connected|failed",
  "message": "optional detail"}
 
@@ -250,31 +241,6 @@ an explicit, mandatory binding tuple on every frame:
 Host `rtc.candidate` and `rtc.status` frames carry the identical tuple and
 binding nonce. Host status values are content-free codes; endpoint error
 detail is not placed on the signaling websocket.
-
-{"type": "host.fs.list_result",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "home_dir": "/home/me",
- "parent": "/home/me",
- "entries": [{"name": "foo",
-              "path": "/home/me/projects/foo",
-              "is_dir": true,
-              "size": null,
-              "modified_at": 1750000000}],
- "error": null}
-
-{"type": "host.fs.read_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "a.txt",
- "size": 2,
- "bytes_b64": "aGk=",
- "error": null}
-
-{"type": "host.fs.op_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "error": null}
 
 {"type": "host.tools.check_result",
  "request_id": "uuid",
@@ -318,35 +284,7 @@ detail is not placed on the signaling websocket.
 
 {"type": "host.heartbeat"}
 
-{"type": "host.fs.list",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "include_files": false}
-
-{"type": "host.fs.read",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt"}
-
-{"type": "host.fs.write",
- "request_id": "uuid",
- "dir": "/home/me/projects",
- "name": "a.txt",
- "bytes_b64": "aGk=",
- "overwrite": false}
-
-{"type": "host.fs.mkdir",
- "request_id": "uuid",
- "path": "/home/me/projects/new-dir"}
-
-{"type": "host.fs.rename",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "b.txt"}
-
-{"type": "host.fs.remove",
- "request_id": "uuid",
- "path": "/home/me/projects/old",
- "recursive": false}
+{"type": "host.ping", "request_id": "uuid"}
 
 {"type": "host.tools.check",
  "request_id": "uuid",
@@ -374,8 +312,6 @@ detail is not placed on the signaling websocket.
  "skills": [{"id": "uuid", "name": "spawn-control",
              "description": "House style for agents", "content": "..."}],
  "install": "npm install -g @anthropic-ai/claude-code",
- "cols": 120,
- "rows": 32,
  "create_cwd": true}
 
 {"type": "agent.restart",
@@ -385,22 +321,12 @@ detail is not placed on the signaling websocket.
  "env": {"FOO": "bar"},
  "skills": [],
  "install": "npm install -g @anthropic-ai/claude-code",
- "cols": 120,
- "rows": 32,
  "create_cwd": true}
 
 {"type": "agent.kill", "agent_id": "uuid", "signal": "TERM"}
 
 `agent.kill.signal` is optional and accepts only `TERM` or `KILL`; omitted
 means `TERM`. Other values are rejected before lifecycle dispatch.
-
-{"type": "agent.resize", "agent_id": "uuid", "cols": 120, "rows": 32}
-
-{"type": "agent.scroll", "agent_id": "uuid", "lines": -8}
-
-{"type": "agent.snapshot", "agent_id": "uuid", "lines": 100000}
-
-{"type": "agent.redraw", "agent_id": "uuid"}
 
 {"type": "agent.upload",
  "agent_id": "uuid",
@@ -418,6 +344,8 @@ means `TERM`. Other values are rejected before lifecycle dispatch.
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "sdp": "v=0...",
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
@@ -426,13 +354,17 @@ means `TERM`. Other values are rejected before lifecycle dispatch.
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.close",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
- "agent_id": "uuid"}
+ "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2}
 ```
 
 For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
@@ -440,10 +372,11 @@ For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
 `scope_id`, `protocol:"spawn.host.ctl"`, and `protocol_version:1`. A host offer
 also carries `ice_transport_policy:"all|relay"`; when the server supplies only
 TURN URLs both endpoints use `relay` and do not gather direct/STUN candidates.
-Agent signaling additionally carries the selected daemon owner's monotonic
+Agent signaling requires the same full scope/protocol tuple and additionally
+carries the selected daemon owner's monotonic
 `binding_generation`; the daemon combines it with the nonce so frames from an
 older daemon ownership generation cannot affect a replacement session. The
-legacy `generation` spelling is accepted only for rollout compatibility.
+legacy `generation` spelling is rejected.
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
@@ -461,36 +394,23 @@ distinguish healthy idle connections from dead sockets.
 ## Browser WebSocket — `/ws/browser?agent_id=<uuid>`
 
 - Auth: session cookie (or `?token=` for testing).
-- Subprotocol: clients offer `spawn.v2, spawn.v1` in preference order; the
-  server selects `spawn.v2` when WebRTC is enabled, else `spawn.v1`.
-  - **`spawn.v2`** (docs/TRUST.md Phase 1): the WS is control + signaling
-    only. The server never sends binary frames (live PTY output flows over
-    the WebRTC DataChannels exclusively) and closes the socket with code
-    `4002` if the browser sends a binary frame or a terminal viewport/snapshot
-    JSON frame. History, snapshots, geometry, scrolling, redraw and display
-    ownership use `spawn.ctl`; the server does not receive them.
-  - **`spawn.v1`** (legacy): binary frames relay PTY bytes in both
-    directions through the server. Kept for rollout compatibility.
-- On legacy v1 only, `cols` and `rows` may be optional initial browser
-  dimensions. When present,
-  the server resizes the session worker before producing the initial history
-  snapshot.
+- Required subprotocol: `spawn.v2`. An old/missing subprotocol receives only
+  `{"type":"protocol.required","protocol":"spawn.v2","version":2}` and
+  closes with `4003`.
+- This WebSocket is content-free signaling, disclosed lifecycle/status, and
+  the still-pending upload migration. It never sends binary frames and closes
+  with `4002` for a binary frame or terminal viewport/history/snapshot JSON.
+- History, snapshots, geometry, scrolling, redraw and display ownership use
+  `spawn.ctl`; terminal bytes use `spawn.pty`. Neither reaches the server.
 
 ### Browser → server
 
 ```json
-{"type": "resize", "cols": 120, "rows": 32}
-{"type": "scroll", "lines": -8}
 {"type": "upload", "name": "screenshot.png", "mime_type": "image/png", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 {"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 ```
-Plus raw binary stdin bytes.
 
-`scroll` / `agent.scroll` remains a temporary content-free compatibility no-op.
-Browser UI scrollback is local to xterm and must not mutate daemon-side
-viewport state.
-
-When the server advertises WebRTC support, the browser may additionally send
+The browser additionally sends
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
 The server authorizes the browser against the agent, forwards signaling to the
 owning daemon over `/ws/daemon`, and keeps this websocket open as the
@@ -503,22 +423,20 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
  "enabled": true,
  "binding_nonce_required": true,
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-{"type": "history", "bytes_b64": "..."}    // initial replay buffer
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
 {"type": "upload.error", "message": "..."}
-{"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "sdp": "v=0..."}
-{"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "candidate": {"candidate": "..."}}
-{"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "status": "connected|failed"}
+{"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "sdp": "v=0..."}
+{"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "candidate": {"candidate": "..."}}
+{"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "status": "connected|failed"}
 ```
-Plus raw binary stdout bytes.
 
 ## Direct per-agent DataChannels
 
-The low-latency terminal data plane is an optional WebRTC DataChannel layered
-on top of the websocket control plane.
+The terminal data plane is two mandatory WebRTC DataChannels negotiated over
+the content-free WebSocket signaling plane.
 
 - The browser creates ordered DataChannels named `spawn.pty` and `spawn.ctl`.
 - Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
@@ -528,11 +446,9 @@ on top of the websocket control plane.
 - `spawn.ctl` carries the versioned bounded control protocol below. A v2
   terminal is ready only after both channels open and its initial history
   response is applied.
-- Legacy `spawn.v1` keeps the server-relayed binary PTY fallback. The daemon
-  still mirrors output to the server for transcripts until P2-AGENT-02, but
-  a `spawn.v2` browser neither subscribes to nor renders that relay.
-- `SPAWN_WEBRTC_ENABLED` enables the direct path, and
-  `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
+- Missing, duplicate, closed, or unknown agent channels close the peer; there
+  is no server-content fallback.
+- `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
   enough for many LAN/home-network cases; TURN is required for reliable
   fallback across restrictive NATs and mobile/corporate networks.
 - `SPAWN_TURN_URLS` + `SPAWN_TURN_SECRET` (+ `SPAWN_TURN_TTL_SECONDS`) point
@@ -645,7 +561,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping"]}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -655,9 +571,120 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Filesystem/tool/launch operations and their bounded
-chunk streams are added by later trust Phase 2 tasks; the transport root
-currently advertises only `ping`.
+outstanding request ID. Request IDs may not be reused within a host session;
+the daemon closes rather than evicting its bounded replay set.
+
+`spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
+channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
+before the host-control handler is installed. The normal/fast queue arrival
+ordinal, cancellation cutoffs, and tombstones rely on that transport contract.
+
+Every daemon DataChannel send registers a bounded, cancellable publication
+permit before starting its asynchronous channel write. Close atomically rejects
+new permits, cancels every registered send, and waits for permit drain only to
+the same absolute session-close deadline. A callback that was not scheduled by
+that deadline can retain an already-cancelled permit, but on its next poll a
+biased cancellation branch wins before `send_text`, so it cannot advance or
+publish. The server-visible content-free `connected` status uses a separate
+short fence with a nonblocking queue insertion, so it likewise cannot publish
+after close.
+
+Host filesystem paths and detailed errors exist only in this DataChannel.
+`fs.home`, `fs.stat`, `fs.mkdir`, `fs.rename`, and `fs.remove` use ordinary
+request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns one
+unsorted page of at most 96 entries plus `next_cursor`; the browser fetches a
+page only after an explicit **Load more** action. A daemon request never scans
+more than the fixed 1024-entry directory ceiling, and the final page sets
+`truncated:true` when additional entries exist. The browser retains at most 32
+pages/3072 entries for an active directory and evicts collapsed directory
+pages. Entries contain `name`, `path`, `kind`, `is_dir`, optional `size`, and
+optional `modified_at`.
+
+The daemon acquires the canonical home directory once as a filesystem
+capability. Every component is then opened relative to held directory handles
+with no-follow semantics; request-time operations never resolve an ambient
+path. Final read/write/list/mkdir/remove/rename/temp operations are anchored to
+those handles, reject symlink components, and refuse to rename/remove the root.
+`overwrite` defaults false. A no-clobber rename/commit uses the platform atomic
+`RENAME_NOREPLACE`/`RENAME_EXCL` operation and fails closed where that primitive
+is unavailable; it never uses a check-then-rename sequence.
+
+Mutating operations have an explicit acknowledgement boundary. For
+`fs.mkdir`, `fs.rename`, and `fs.remove`, the daemon acquires its session effect
+fence and observes the session as open immediately before invoking the
+filesystem mutation. A close or cancellation that wins before that point
+prevents the effect. Once the operation passes that point it is authorized and
+may finish even if the channel closes before its response is delivered. The
+same rule applies to a write commit after the browser has dispatched
+`stream.end`; disconnect or cancellation is not rollback.
+
+Every upload temporary is registered with the session before creation. A
+per-temporary state claim decides close versus commit without waiting behind an
+unrelated filesystem mutation: cleanup that claims a pending temporary unlinks
+it and prevents commit, while a commit that has already claimed its temporary
+may finish under the acknowledgement rule above. Unlink jobs run as accounted
+blocking work. Session close waits only to its one absolute deadline; if an
+underlying unlink itself stalls, close returns on time and the still-accounted
+cleanup finishes later, without permitting destination publication or
+resurrection.
+
+An acknowledged success is definitive. An explicit daemon error other than
+`outcome_unknown` is also definitive and reports that no user-visible mutation
+occurred. Once the effect fence has been crossed, however, a syscall can apply
+partially or completely before a later operation such as directory sync fails;
+the daemon therefore maps every post-boundary mutation failure to stable code
+`outcome_unknown`. The browser uses the same code if a dispatched mutation
+loses its acknowledgement to timeout, local cancellation, or session loss. It
+never automatically retries that operation and must be conservative even when
+a cancellation frame may have won. Reconcile before any manual retry:
+list/stat the mkdir target; inspect both source and destination for rename;
+stat/list the removal target; and stat/read the write destination, verifying
+its expected length and SHA-256 where applicable. These details and the error
+remain inside the encrypted host DataChannel.
+
+Reads start with:
+
+```json
+{"version":1,"type":"request","request_id":"r","operation":"fs.read","payload":{"path":"~/a.txt"}}
+{"version":1,"type":"response","request_id":"r","ok":true,"result":{"stream_id":"s","path":"/home/me/a.txt","name":"a.txt","length":2,"sha256":"...64 hex..."}}
+{"version":1,"type":"stream.chunk","stream_id":"s","sequence":0,"bytes_b64":"aGk="}
+{"version":1,"type":"stream.ack","stream_id":"s","sequence":1}
+{"version":1,"type":"stream.end","stream_id":"s","length":2,"sha256":"...64 hex..."}
+```
+
+The daemon permits at most eight unacknowledged 8 KiB chunks. DataChannel
+callbacks only validate and enqueue bounded frames: ACK/cancel frames use a
+separate 64-frame fast queue and per-read signal channel, while ordered normal
+frames use their own 64-frame queue. Hash/send jobs run outside the callback
+under an eight-task semaphore, so a sender waiting for its window cannot block
+its own ACK or cancellation. It hashes before and during the read; a mutation
+produces `stream.error` rather than a valid end.
+
+Every received frame is stamped with a session-local arrival ordinal before it
+enters either queue. A fast cancellation records that cutoff, so an earlier
+ordered chunk/end already waiting in the normal queue is validated and drained
+without resurrecting the cancelled write; a later, duplicate, unknown, or
+cross-session frame still fails closed. The browser applies the equivalent
+bounded tombstone to at most the eight already-authorized read chunks and their
+terminal frame. Tombstones expire and have fixed session-local cardinality
+limits. Completed/cancelled writes are maintained by one session-owned reaper,
+not one sleeper task per stream; it is tracked and drained on channel close.
+Writes start with `fs.write.begin` payload
+`{dir,name,length,sha256,overwrite?}`, then the browser sends the same chunk and
+end shapes. The daemon rejects wrong sequence/length/hash, writes a unique temp
+file, flushes and fsyncs it, atomically renames it, and fsyncs the parent before
+`stream.committed`. Timeout, cancellation, peer loss, or integrity failure
+removes the temp file. Files are capped at 512 MiB.
+
+For cross-host transfer, the browser opens two independently authorized host
+sessions and pumps the source read stream into the destination write stream;
+it neither buffers the whole file nor sends any path, metadata, error, or byte
+through the signaling server. Source/destination errors, timeouts, cancellation,
+or either peer closing race the pump; the first terminal outcome cancels both
+streams and awaits cleanup before returning. The former REST
+`/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
+Browser downloads stream to a native file destination when supported; the
+object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 
 ### Approved P2-DATA-02 store contract (not implemented)
 
@@ -724,10 +751,9 @@ or offline host fails closed as defined by the ADR.
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
-  negotiates `spawn.v2` (DataChannel-only PTY) with `spawn.v1` as the
-  legacy relay fallback; the daemon WS remains `spawn.v1` until the
-  daemon-owned-data migration (docs/TRUST.md Phase 2). Server SHOULD
-  support both during a rollout window.
+  requires `spawn.v2`; the daemon WS requires `spawn.control.v2`. Older or
+  missing subprotocols receive a content-free protocol-required close. There
+  is deliberately no mixed-version rollout or terminal relay fallback.
 - Host signaling uses `spawn.host.v1`; its DataChannel protocol is separately
   versioned by the mandatory `protocol_version` signaling field and `version`
   envelope field.

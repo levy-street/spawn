@@ -29,10 +29,17 @@ from spawn_server.ws.host import (
 
 
 class FakeWebSocket:
-    def __init__(self, *, authorization: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        authorization: str | None = None,
+        subprotocols: list[str] | None = None,
+    ) -> None:
         self.headers = {"authorization": authorization} if authorization else {}
         self.cookies: dict[str, str] = {}
-        self.scope: dict[str, Any] = {"subprotocols": ["spawn.host.v1"]}
+        self.scope: dict[str, Any] = {
+            "subprotocols": subprotocols or ["spawn.host.v1"]
+        }
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -50,6 +57,9 @@ class FakeWebSocket:
 
     async def send_text(self, value: str) -> None:
         self.sent_text.append(value)
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self.sent_text.append(json.dumps(value))
 
     async def send_bytes(self, value: bytes) -> None:
         self.sent_bytes.append(value)
@@ -175,7 +185,10 @@ def _metadata(host_id: str) -> dict[str, object]:
 
 
 async def _start_daemon(user_id: str, host_id: str) -> tuple[FakeWebSocket, asyncio.Task[None]]:
-    socket = FakeWebSocket(authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}")
+    socket = FakeWebSocket(
+        authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}",
+        subprotocols=["spawn.control.v2"],
+    )
     task = asyncio.create_task(daemon_ws(socket))  # type: ignore[arg-type]
     socket.queue_text(
         {

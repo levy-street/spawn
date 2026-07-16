@@ -81,32 +81,8 @@ export const HostSchema = z.object({
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   agent_count: z.number().int(),
-  home_dir: z.string().nullable().optional(),
 });
 export type Host = z.infer<typeof HostSchema>;
-
-export const HostDirEntrySchema = z.object({
-  name: z.string(),
-  path: z.string(),
-  is_dir: z.boolean().nullable().optional(),
-  size: z.number().int().nullable().optional(),
-  modified_at: z.number().int().nullable().optional(),
-});
-export type HostDirEntry = z.infer<typeof HostDirEntrySchema>;
-
-export const HostFileOpSchema = z.object({
-  path: z.string().nullable().optional(),
-});
-export type HostFileOp = z.infer<typeof HostFileOpSchema>;
-
-export const HostDirListSchema = z.object({
-  path: z.string(),
-  home_dir: z.string().nullable().optional(),
-  parent: z.string().nullable().optional(),
-  entries: z.array(HostDirEntrySchema).default([]),
-  error: z.string().nullable().optional(),
-});
-export type HostDirList = z.infer<typeof HostDirListSchema>;
 
 export const HostToolStatusSchema = z.object({
   preset_id: z.string(),
@@ -179,39 +155,6 @@ export const AgentSchema = z.object({
   archived_at: z.string().nullable().default(null),
 });
 export type Agent = z.infer<typeof AgentSchema>;
-
-export const AgentInputResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  bytes: z.number().int(),
-});
-export type AgentInputResult = z.infer<typeof AgentInputResultSchema>;
-
-export const AgentResizeResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  cols: z.number().int(),
-  rows: z.number().int(),
-});
-export type AgentResizeResult = z.infer<typeof AgentResizeResultSchema>;
-
-export const AgentScrollResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  lines: z.number().int(),
-});
-export type AgentScrollResult = z.infer<typeof AgentScrollResultSchema>;
-
-export const AgentRedrawResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  redraw: z.boolean(),
-});
-export type AgentRedrawResult = z.infer<typeof AgentRedrawResultSchema>;
-
-export const AgentSnapshotSchema = z.object({
-  agent_id: z.string().uuid(),
-  bytes_b64: z.string(),
-  plain: z.boolean(),
-  lines: z.number().int(),
-});
-export type AgentSnapshot = z.infer<typeof AgentSnapshotSchema>;
 
 export const AgentUploadResultSchema = z.object({
   agent_id: z.string().uuid(),
@@ -378,105 +321,6 @@ export const hosts = {
       schema: HostSchema,
     }),
   remove: (id: string) => api<void>(`/api/hosts/${id}`, { method: "DELETE" }),
-  dirs: (id: string, path?: string) => {
-    const search = new URLSearchParams();
-    if (path) search.set("path", path);
-    const qs = search.size ? `?${search.toString()}` : "";
-    return api(`/api/hosts/${id}/dirs${qs}`, {
-      method: "GET",
-      schema: HostDirListSchema,
-    });
-  },
-  files: (id: string, path?: string) => {
-    const search = new URLSearchParams();
-    if (path) search.set("path", path);
-    const qs = search.size ? `?${search.toString()}` : "";
-    return api(`/api/hosts/${id}/files${qs}`, {
-      method: "GET",
-      schema: HostDirListSchema,
-    });
-  },
-  downloadFile: async (id: string, path: string): Promise<Blob> => {
-    const search = new URLSearchParams({ path });
-    const res = await fetch(`${API_URL}/api/hosts/${id}/files/download?${search.toString()}`, {
-      credentials: "include",
-    });
-    if (!res.ok) {
-      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
-      try {
-        payload = await res.json();
-      } catch {
-        // ignore
-      }
-      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
-      throw new ApiError(
-        res.status,
-        payload?.code ?? `http_${res.status}`,
-        payload?.message ?? detailMsg ?? res.statusText,
-        payload?.detail,
-      );
-    }
-    return res.blob();
-  },
-  uploadFile: async (
-    id: string,
-    file: File,
-    options: { dir: string; overwrite?: boolean },
-  ): Promise<HostFileOp> => {
-    const body = new FormData();
-    body.set("file", file);
-    body.set("dir", options.dir);
-    if (options.overwrite) body.set("overwrite", "true");
-    const res = await fetch(`${API_URL}/api/hosts/${id}/files/upload`, {
-      method: "POST",
-      credentials: "include",
-      headers: { Accept: "application/json" },
-      body,
-    });
-    if (!res.ok) {
-      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
-      try {
-        payload = await res.json();
-      } catch {
-        // ignore
-      }
-      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
-      throw new ApiError(
-        res.status,
-        payload?.code ?? `http_${res.status}`,
-        payload?.message ?? detailMsg ?? res.statusText,
-        payload?.detail,
-      );
-    }
-    return HostFileOpSchema.parse(await res.json());
-  },
-  mkdir: (id: string, path: string) =>
-    api(`/api/hosts/${id}/files/mkdir`, {
-      method: "POST",
-      body: JSON.stringify({ path }),
-      schema: HostFileOpSchema,
-    }),
-  deleteFile: (id: string, body: { path: string; recursive?: boolean }) =>
-    api(`/api/hosts/${id}/files/delete`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: HostFileOpSchema,
-    }),
-  renameFile: (id: string, body: { path: string; name: string }) =>
-    api(`/api/hosts/${id}/files/rename`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: HostFileOpSchema,
-    }),
-  transferFile: (
-    id: string,
-    body: { path: string; dest_host_id: string; dest_dir: string; overwrite?: boolean },
-  ) =>
-    api(`/api/hosts/${id}/files/transfer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: HostFileOpSchema,
-    }),
   tools: (id: string) =>
     api(`/api/hosts/${id}/tools`, {
       method: "GET",
@@ -519,8 +363,6 @@ export const agents = {
     argv?: string[];
     env?: Record<string, string>;
     skill_ids?: string[];
-    cols?: number;
-    rows?: number;
     create_cwd?: boolean;
   }) =>
     api("/api/agents", {
@@ -534,40 +376,11 @@ export const agents = {
       body: JSON.stringify(body),
       schema: AgentSchema,
     }),
-  restart: (id: string, body?: { cols?: number; rows?: number; create_cwd?: boolean }) =>
+  restart: (id: string, body?: { create_cwd?: boolean }) =>
     api(`/api/agents/${id}/restart`, {
       method: "POST",
       body: JSON.stringify(body ?? {}),
       schema: AgentSchema,
-    }),
-  input: (id: string, body: { text?: string; bytes_b64?: string }) =>
-    api(`/api/agents/${id}/input`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentInputResultSchema,
-    }),
-  resize: (id: string, body: { cols: number; rows: number }) =>
-    api(`/api/agents/${id}/resize`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentResizeResultSchema,
-    }),
-  scroll: (id: string, body: { lines: number }) =>
-    api(`/api/agents/${id}/scroll`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentScrollResultSchema,
-    }),
-  redraw: (id: string) =>
-    api(`/api/agents/${id}/redraw`, {
-      method: "POST",
-      schema: AgentRedrawResultSchema,
-    }),
-  snapshot: (id: string, body?: { lines?: number; plain?: boolean }) =>
-    api(`/api/agents/${id}/snapshot`, {
-      method: "POST",
-      body: JSON.stringify(body ?? {}),
-      schema: AgentSnapshotSchema,
     }),
   upload: (
     id: string,

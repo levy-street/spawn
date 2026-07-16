@@ -42,7 +42,13 @@ export interface AgentCtlDisplayEvent {
   viewers: number;
 }
 
-export type AgentCtlTextMessage = AgentCtlResponse | AgentCtlDisplayEvent;
+export interface AgentCtlReadyEvent {
+  version: number;
+  kind: "event";
+  event: "ready";
+}
+
+export type AgentCtlTextMessage = AgentCtlResponse | AgentCtlDisplayEvent | AgentCtlReadyEvent;
 
 export interface AgentCtlChunk {
   requestId: string;
@@ -284,6 +290,9 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
       (value.operation === undefined || isAgentCtlOperation(value.operation))
     ) {
       return value as unknown as AgentCtlResponse;
+    }
+    if (value.kind === "event" && value.event === "ready") {
+      return value as unknown as AgentCtlReadyEvent;
     }
     if (
       value.kind === "event" &&

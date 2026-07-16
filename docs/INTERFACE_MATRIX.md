@@ -2,8 +2,9 @@
 
 This table records the current compatibility surface. It is not permission to
 keep a protected REST/server frame. The Phase 2 target makes REST the disclosed
-metadata plane and the DataChannels the protected-content plane. (The MCP tool
-surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md.)
+metadata plane and authenticated end-to-end DataChannels the protected-content
+plane. REST remains the source of truth only for server-visible semantics. (The
+MCP tool surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md.)
 
 | Capability | Browser UI | REST | Web helper | Daemon frame |
 | --- | --- | --- | --- | --- |
@@ -11,7 +12,7 @@ surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md.)
 | Device approval | device page | `/api/auth/device/*` | `auth.approveDevice` | `device.start`, poll/login CLI |
 | List/get hosts | hosts page, agent form | `GET /api/hosts`, `GET /api/hosts/{id}` | `hosts.list/get` | register/heartbeat updates |
 | Rename/delete host | hosts page | `PATCH/DELETE /api/hosts/{id}` | `hosts.rename/remove` | delete closes connected daemon |
-| List host directories | new-agent picker | `GET /api/hosts/{id}/dirs` | `hosts.dirs` | `host.dirs` request/result |
+| List/manage host files | file explorer, new-agent picker | none | `HostControlClient` | capability-rooted E2E `spawn.host.ctl` `fs.*`; explicit bounded pages and streams |
 | Check/install host tools | hosts page, agent update badge | `/tools`, `/install`, `/policy` | `hosts.tools/installTool/updateToolPolicy` | `host.tools.check`, `host.tools.install` |
 | List/create/update/delete presets | settings | `/api/presets` | `presets.*` | used at agent launch |
 | Manage skills | settings, new-agent access picker | `/api/skills` | `skills.*` | included in `agent.create` |
@@ -19,9 +20,9 @@ surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md.)
 | List/get/create agents | agents page, sidebar, new-agent form | `/api/agents` | `agents.list/get/create` | `agent.create` |
 | Rename/pin/archive/delete agent | agents page, detail header, sidebar | `PATCH/DELETE /api/agents/{id}` | `agents.update/rename/pin/archive/remove` | metadata update; `agent.kill` for delete |
 | Restart agent | agents page, detail header, sidebar | `POST /api/agents/{id}/restart` | `agents.restart` | `agent.restart` |
-| Terminal input | terminal page | `POST /api/agents/{id}/input` | `agents.input` | binary input frame |
-| Resize/scroll/redraw terminal | terminal page display owner | `/resize`, `/scroll`, `/redraw` | `agents.resize/scroll/redraw` | `agent.resize`, `agent.scroll`, `agent.redraw` |
-| Capture terminal snapshot | terminal reconnect/history | `POST /api/agents/{id}/snapshot` | `agents.snapshot` | `agent.snapshot` request/result |
+| Terminal input | terminal page | none | terminal socket hook | `spawn.pty` DataChannel direct to endpoint |
+| Resize/scroll/redraw/display ownership | terminal page | none | `spawn.ctl` client | versioned `spawn.ctl` request direct to endpoint |
+| History/snapshot replay | terminal reconnect/history | none | `spawn.ctl` client | bounded `spawn.ctl` chunk response direct from worker |
 | Upload file/image to agent cwd | terminal upload/drop/paste | `/upload`, `/upload-file` | `agents.upload/uploadFile` | `agent.upload` request/result |
 
 ## Approved durable protected-data target (P2-DATA-01)
@@ -46,9 +47,13 @@ content-free upgrade failure after cutover.
 
 Intentional differences:
 
-- Browser display ownership is a UI/WebSocket coordination feature. REST
-  exposes the underlying resize, scroll, redraw, snapshot, upload, and input
-  actions but does not model viewer ownership.
+- Host home, paths, directory metadata, file bytes, and detailed filesystem
+  errors never use REST or the server daemon WebSocket. The browser talks to
+  the selected host on its independently bound `spawn.host.ctl` DataChannel;
+  cross-host copies are browser-mediated between two such sessions.
+- Browser display ownership, terminal input, viewport control, and replay are
+  endpoint-owned DataChannel features. REST and server WebSockets deliberately
+  expose none of those content-bearing operations.
 - The `spawnd` CLI is host-side daemon administration only: login, status,
   logout, run, install, and service setup. User agent control lives in browser
   and REST.

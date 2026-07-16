@@ -20,7 +20,6 @@ from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import Agent, Host
 from ..redis import agent_event_channel, get_backend
 from .broker import DaemonConn, RtcSessionBinding, UploadResolution, get_broker
-from .frames import KIND_OUTPUT, decode_binary_frame
 from .host_signal import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
@@ -49,6 +48,9 @@ log = logging.getLogger("spawn.ws.daemon")
 HOST_ACTIVATION_DEADLINE_SECONDS = 30
 HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS = 2.0
 HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS = 10.0
+DAEMON_WS_PROTOCOL = "spawn.control.v2"
+WS_CLOSE_PROTOCOL_REQUIRED = 4003
+WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
 
 def _utcnow() -> datetime:
@@ -489,12 +491,7 @@ def _valid_rtc_sdp(value: object) -> str | None:
 
 
 def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
-    """Bind daemon signaling to its registered session, endpoint and scope.
-
-    Legacy agent daemons omit the generalized fields, so those fields remain
-    optional only for agent sessions. Host sessions always require the full
-    tuple; the signaling server never guesses host scope from an unbound frame.
-    """
+    """Bind daemon signaling to its registered session, endpoint and scope."""
     scope_type = binding.scope_type
     if obj.get("session_id") != binding.session_id:
         return False
@@ -507,10 +504,7 @@ def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
         "protocol_version": binding.protocol_version,
     }
     for key, value in expected.items():
-        actual = obj.get(key)
-        if scope_type == "host" and actual != value:
-            return False
-        if scope_type == "agent" and actual is not None and actual != value:
+        if obj.get(key) != value:
             return False
     if scope_type == "agent" and obj.get("agent_id") != binding.scope_id:
         return False
@@ -846,9 +840,15 @@ async def _process_host_rtc_signal(
             binding is None
             or binding.scope_type != "agent"
             or binding.scope_id != agent_id
+            or binding.protocol != "spawn.pty"
+            or binding.protocol_version != 2
             or binding.browser.route_id != envelope.browser_channel
             or binding_nonce != binding.nonce
             or signal.get("binding_generation") != binding.daemon_generation
+            or signal.get("scope_type") != binding.scope_type
+            or signal.get("scope_id") != binding.scope_id
+            or signal.get("protocol") != binding.protocol
+            or signal.get("protocol_version") != binding.protocol_version
         ):
             # Browser teardown retires before dispatch so a reused session id
             # can never be mistaken for the binding being closed. The exact
@@ -1000,9 +1000,15 @@ async def _pump_host_rtc_signals(
 
 @router.websocket("/ws/daemon")
 async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
-    # Pre-accept-time auth check: we accept first because most clients can't read
-    # close frames pre-handshake; but we only progress past handshake on success.
-    await websocket.accept(subprotocol="spawn.v1")
+    offered = websocket.scope.get("subprotocols") or []
+    if DAEMON_WS_PROTOCOL not in offered:
+        await websocket.accept()
+        await websocket.send_json(
+            {"type": "protocol.required", "protocol": DAEMON_WS_PROTOCOL, "version": 2}
+        )
+        await websocket.close(code=WS_CLOSE_PROTOCOL_REQUIRED, reason="protocol upgrade required")
+        return
+    await websocket.accept(subprotocol=DAEMON_WS_PROTOCOL)
     host = await _resolve_daemon_host(websocket, token)
     if host is None:
         return
@@ -1028,61 +1034,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             data_bytes = msg.get("bytes")
 
             if data_bytes is not None:
-                if not registered:
-                    log.warning("pending daemon sent binary frame before register")
-                    continue
-                try:
-                    frame = decode_binary_frame(data_bytes)
-                except ValueError as e:
-                    log.warning("bad binary frame from daemon: %s", e)
-                    continue
-                if frame.kind != KIND_OUTPUT:
-                    log.warning("daemon sent non-output binary frame kind=%s", frame.kind)
-                    continue
-
-                # Activity is no longer derived from these bytes — the daemon
-                # classifies output locally and emits a content-free
-                # `agent.activity` frame (trust Phase 2), handled below. This
-                # compatibility path stays only for exact-generation live
-                # relay until the DataChannel owns all output.
-
-                generation = conn.host_generation
-                if generation is None:
-                    await _fence_superseded_daemon(conn)
-                    break
-                durable_owner = False
-                agent_authorized = False
-                async with _bounded_host_ownership_session() as owner_session:
-                    durable_owner = await _lock_durable_host_owner(owner_session, conn)
-                    if durable_owner:
-                        agent = await owner_session.get(Agent, frame.agent_id)
-                        agent_authorized = agent is not None and agent.host_id == host.id
-                    await owner_session.rollback()
-                if not durable_owner:
-                    await _fence_superseded_daemon(conn)
-                    break
-                if not agent_authorized:
-                    log.warning("daemon stream for unknown agent=%s", frame.agent_id)
-                    continue
-                attached = frame.agent_id in conn.agent_ids or await broker.attach_agent_to_daemon(
-                    frame.agent_id,
-                    conn,
-                    expected_host_generation=generation,
+                log.warning("content-bearing binary frame on daemon control socket; closing")
+                await websocket.close(
+                    code=WS_CLOSE_CONTENT_FORBIDDEN,
+                    reason="binary terminal frames are retired",
                 )
-                # Live output is dispatched by an exact generation token and
-                # is no longer appended to the shared transcript path. A
-                # stalled filesystem write therefore cannot land after B wins.
-                published = attached and await get_backend().publish_if_host_owner(
-                    host_presence_key(host.id),
-                    host_pending_presence_key(host.id),
-                    _host_presence_value(conn) or b"",
-                    generation=generation,
-                    channel=f"spawn:agent:{frame.agent_id}",
-                    payload=frame.payload,
-                )
-                if not published:
-                    await _fence_superseded_daemon(conn)
-                    break
+                break
 
             elif data_text is not None:
                 try:
@@ -1154,9 +1111,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await _fence_superseded_daemon(conn)
                         break
                     existing = obj.get("existing_agents") or []
-                    home_dir = obj.get("home_dir")
-                    if isinstance(home_dir, str) and home_dir:
-                        conn.home_dir = home_dir
                     valid_existing: list[str] = []
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
@@ -1212,34 +1166,22 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await _fence_superseded_daemon(conn)
                         break
 
-                elif ftype == "host.fs.list_result":
-                    request_id = obj.get("request_id")
-                    if isinstance(request_id, str):
-                        if not await broker.resolve_dir_list(
-                            request_id,
-                            obj,
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
-
-                elif ftype in ("host.fs.read_result", "host.fs.op_result"):
-                    request_id = obj.get("request_id")
-                    if isinstance(request_id, str):
-                        if not await broker.resolve_fs_result(
-                            request_id,
-                            obj,
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
-
                 elif ftype == "host.tools.check_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
                         if not await broker.resolve_tool_check(
+                            request_id,
+                            obj,
+                            daemon=conn,
+                            expected_host_generation=conn.host_generation,
+                        ):
+                            await _fence_superseded_daemon(conn)
+                            break
+
+                elif ftype == "host.pong":
+                    request_id = obj.get("request_id")
+                    if isinstance(request_id, str):
+                        if not await broker.resolve_host_pong(
                             request_id,
                             obj,
                             daemon=conn,
@@ -1504,39 +1446,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _fence_superseded_daemon(conn)
                             break
 
-                elif ftype == "agent.snapshot":
-                    aid = obj.get("agent_id")
-                    bytes_b64 = obj.get("bytes_b64")
-                    request_id = obj.get("request_id")
-                    if aid and isinstance(bytes_b64, str) and isinstance(request_id, str):
-                        durable_owner = False
-                        agent_authorized = False
-                        async with _bounded_host_ownership_session() as session:
-                            durable_owner = await _lock_durable_host_owner(session, conn)
-                            if durable_owner:
-                                agent = await session.get(Agent, aid)
-                                agent_authorized = agent is not None and agent.host_id == host.id
-                            await session.rollback()
-                        if not durable_owner:
-                            await _fence_superseded_daemon(conn)
-                            break
-                        if not agent_authorized:
-                            log.warning("snapshot for unknown agent=%s", aid)
-                            continue
-                        if not await broker.resolve_snapshot(
-                            aid,
-                            {
-                                "request_id": request_id,
-                                "bytes_b64": bytes_b64,
-                                "dc_offset": obj.get("dc_offset"),
-                                "rtc_session_id": obj.get("rtc_session_id"),
-                            },
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
-
                 elif ftype == "rtc.answer":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     sdp = _valid_rtc_sdp(obj.get("sdp"))
@@ -1554,15 +1463,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         }
                         if binding.scope_type == "agent":
                             payload["agent_id"] = binding.scope_id
-                        else:
-                            payload.update(
-                                {
-                                    "scope_type": binding.scope_type,
-                                    "scope_id": binding.scope_id,
-                                    "protocol": binding.protocol,
-                                    "protocol_version": binding.protocol_version,
-                                }
-                            )
+                        payload.update(
+                            {
+                                "scope_type": binding.scope_type,
+                                "scope_id": binding.scope_id,
+                                "protocol": binding.protocol,
+                                "protocol_version": binding.protocol_version,
+                            }
+                        )
                         if not await _route_rtc_payload_if_owner(conn, binding, payload):
                             await _fence_superseded_daemon(conn)
                             break
@@ -1584,15 +1492,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         }
                         if binding.scope_type == "agent":
                             payload["agent_id"] = binding.scope_id
-                        else:
-                            payload.update(
-                                {
-                                    "scope_type": binding.scope_type,
-                                    "scope_id": binding.scope_id,
-                                    "protocol": binding.protocol,
-                                    "protocol_version": binding.protocol_version,
-                                }
-                            )
+                        payload.update(
+                            {
+                                "scope_type": binding.scope_type,
+                                "scope_id": binding.scope_id,
+                                "protocol": binding.protocol,
+                                "protocol_version": binding.protocol_version,
+                            }
+                        )
                         if not await _route_rtc_payload_if_owner(conn, binding, payload):
                             await _fence_superseded_daemon(conn)
                             break
@@ -1626,15 +1533,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             message = obj.get("message")
                             if isinstance(message, str):
                                 payload["message"] = message
-                        else:
-                            payload.update(
-                                {
-                                    "scope_type": binding.scope_type,
-                                    "scope_id": binding.scope_id,
-                                    "protocol": binding.protocol,
-                                    "protocol_version": binding.protocol_version,
-                                }
-                            )
+                        payload.update(
+                            {
+                                "scope_type": binding.scope_type,
+                                "scope_id": binding.scope_id,
+                                "protocol": binding.protocol,
+                                "protocol_version": binding.protocol_version,
+                            }
+                        )
                         if not await _route_rtc_payload_if_owner(conn, binding, payload):
                             await _fence_superseded_daemon(conn)
                             break

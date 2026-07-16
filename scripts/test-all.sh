@@ -25,6 +25,12 @@ scripts/check-worker-only-daemon.sh
 printf '%s\n' "== durable protected-data decision guard =="
 scripts/check-durable-data-decision.sh
 
+printf '%s\n' "== local daemon smoke cleanup guard =="
+scripts/smoke-local-daemon.sh --self-test
+
+printf '%s\n' "== no server terminal content guard =="
+scripts/check-no-server-terminal-content.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

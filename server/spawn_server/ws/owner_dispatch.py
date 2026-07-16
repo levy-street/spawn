@@ -19,10 +19,8 @@ from .host_signal import (
 MAX_OWNER_RESULT_ENVELOPE_BYTES = 96 * 1024 * 1024
 OWNER_RESULT_KINDS = frozenset(
     {
-        "agent.snapshot",
         "agent.uploaded",
-        "host.fs.list_result",
-        "host.fs.result",
+        "host.pong",
         "host.tools.check_result",
         "host.tools.install_result",
     }

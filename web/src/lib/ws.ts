@@ -3,14 +3,9 @@
  *
  * See `proto/README.md`:
  *   - URL: `${WS_URL}/ws/browser?agent_id=<uuid>`
- *   - Subprotocol: `spawn.v2` preferred, `spawn.v1` legacy.
- *   - Legacy-v1 inbound: text JSON ({type:"history", bytes_b64} | {type:"display.control",...} |
- *             {type:"agent.exit",...} | {type:"agent.status",...} |
- *             {type:"upload.saved",...} | {type:"upload.error",...} |
- *             WebRTC signaling frames); binary stdout bytes.
- *   - Legacy-v1 outbound: text JSON ({type:"resize",cols,rows} | {type:"take_control",cols,rows} |
- *              {type:"scroll",lines} | {type:"upload",...});
- *               binary stdin bytes.
+ *   - Subprotocol: `spawn.v2` (signaling and disclosed lifecycle only).
+ *   - Terminal bytes and viewport/history operations are mandatory
+ *     `spawn.pty`/`spawn.ctl` WebRTC DataChannel traffic.
  */
 
 // When this env var is unset/empty, we build the WS URL from the current
@@ -18,24 +13,7 @@
 // The Next rewrite proxies /ws/* to the API server in local development.
 const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
-// Offered in preference order. On spawn.v2 browser input and browser-requested
-// history use spawn.pty/spawn.ctl WebRTC DataChannels. Until P2-AGENT-02,
-// however, spawnd still mirrors live output through the legacy server path;
-// the protocol label must not imply that the server cannot observe content.
-// spawn.v1 also keeps browser input/history on the legacy relay.
-export const SPAWN_WS_SUBPROTOCOLS = ["spawn.v2", "spawn.v1"];
-
-export function spawnWsSubprotocols(): string[] {
-  // Test hook: Playwright's WS mock always selects the first offered
-  // subprotocol, so relay-path specs pin the client to v1 explicitly.
-  if (
-    typeof window !== "undefined" &&
-    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1
-  ) {
-    return ["spawn.v1"];
-  }
-  return SPAWN_WS_SUBPROTOCOLS;
-}
+export const SPAWN_WS_SUBPROTOCOL = "spawn.v2";
 
 function originForWs(): string {
   if (WS_URL) return WS_URL;
@@ -44,16 +22,9 @@ function originForWs(): string {
   return `${wsScheme}://${window.location.host}`;
 }
 
-export function buildAgentWsUrl(
-  agentId: string,
-  size?: { cols: number; rows: number } | null,
-): string {
+export function buildAgentWsUrl(agentId: string): string {
   const u = new URL(`${originForWs()}/ws/browser`);
   u.searchParams.set("agent_id", agentId);
-  if (size) {
-    u.searchParams.set("cols", String(size.cols));
-    u.searchParams.set("rows", String(size.rows));
-  }
   return u.toString();
 }
 
@@ -73,15 +44,6 @@ export interface DisplayControlState {
 }
 
 export type InboundMessage =
-  | { type: "history"; bytes_b64: string }
-  | ({ type: "display.control" } & DisplayControlState)
-  | {
-      type: "snapshot";
-      bytes_b64: string;
-      plain?: boolean;
-      dc_offset?: number;
-      rtc_session_id?: string;
-    }
   | { type: "agent.exit"; exit_code: number | null; signal: string | null }
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
   | { type: "upload.saved"; path: string; client_id?: string }
@@ -98,6 +60,10 @@ export type InboundMessage =
       agent_id?: string;
       binding_nonce?: string;
       binding_generation?: number;
+      scope_type?: string;
+      scope_id?: string;
+      protocol?: string;
+      protocol_version?: number;
       sdp: string;
     }
   | {
@@ -106,6 +72,10 @@ export type InboundMessage =
       agent_id?: string;
       binding_nonce?: string;
       binding_generation?: number;
+      scope_type?: string;
+      scope_id?: string;
+      protocol?: string;
+      protocol_version?: number;
       candidate: RTCIceCandidateInit;
     }
   | {
@@ -114,6 +84,10 @@ export type InboundMessage =
       agent_id?: string;
       binding_nonce?: string;
       binding_generation?: number;
+      scope_type?: string;
+      scope_id?: string;
+      protocol?: string;
+      protocol_version?: number;
       status: string;
       message?: string;
     };
@@ -130,19 +104,42 @@ export function parseInbound(raw: string): InboundMessage | null {
 
 // ---------- Outbound JSON frame types ----------
 
+export interface AgentRtcTuple {
+  agent_id: string;
+  scope_type: "agent";
+  scope_id: string;
+  protocol: "spawn.pty";
+  protocol_version: 2;
+}
+
+export function agentRtcTuple(agentId: string): AgentRtcTuple {
+  return {
+    agent_id: agentId,
+    scope_type: "agent",
+    scope_id: agentId,
+    protocol: "spawn.pty",
+    protocol_version: 2,
+  };
+}
+
 export type OutboundMessage =
   | { type: "resize"; cols: number; rows: number }
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
   | { type: "snapshot"; lines?: number; plain?: boolean; rtc_session_id?: string }
-  | { type: "rtc.offer"; session_id: string; binding_nonce: string; sdp: string }
-  | {
+  | (AgentRtcTuple & {
+      type: "rtc.offer";
+      session_id: string;
+      binding_nonce: string;
+      sdp: string;
+    })
+  | (AgentRtcTuple & {
       type: "rtc.candidate";
       session_id: string;
       binding_nonce: string;
       candidate: RTCIceCandidateInit;
-    }
-  | { type: "rtc.close"; session_id: string; binding_nonce: string }
+    })
+  | (AgentRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string })
   | {
       type: "upload";
       name: string;
@@ -152,47 +149,42 @@ export type OutboundMessage =
       client_id?: string;
     };
 
-// ---------- Base64 helpers (history replay payload) ----------
-
-export function base64ToBytes(b64: string): Uint8Array {
-  if (typeof atob === "undefined") {
-    // Server-side fallback (we should not really hit this, but just in case).
-    return new Uint8Array(Buffer.from(b64, "base64"));
-  }
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
 export interface RtcBindingIdentity {
   sessionId: string;
   bindingNonce: string;
   bindingGeneration: number | null;
+  agentId: string;
 }
 
 export interface RtcBindingFrame {
   session_id?: string;
   binding_nonce?: string;
   binding_generation?: number;
+  agent_id?: string;
+  scope_type?: string;
+  scope_id?: string;
+  protocol?: string;
+  protocol_version?: number;
 }
 
 /** Match the immutable RTC identity, not merely its reusable session id. */
 export function rtcBindingFrameMatches(
   current: RtcBindingIdentity,
   frame: RtcBindingFrame,
-  required: boolean,
 ): boolean {
   if (frame.session_id !== current.sessionId) return false;
-  if (frame.binding_nonce === undefined && frame.binding_generation === undefined) {
-    return !required;
-  }
   if (frame.binding_nonce === undefined || frame.binding_generation === undefined) return false;
   return (
     frame.binding_nonce === current.bindingNonce &&
     Number.isSafeInteger(frame.binding_generation) &&
     frame.binding_generation > 0 &&
-    (current.bindingGeneration === null || frame.binding_generation === current.bindingGeneration)
+    (current.bindingGeneration === null ||
+      frame.binding_generation === current.bindingGeneration) &&
+    frame.agent_id === current.agentId &&
+    frame.scope_type === "agent" &&
+    frame.scope_id === current.agentId &&
+    frame.protocol === "spawn.pty" &&
+    frame.protocol_version === 2
   );
 }
 

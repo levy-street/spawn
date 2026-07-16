@@ -1,6 +1,7 @@
 # ADR: mandatory session workers and tmux removal
 
-Status: **accepted for the P2-TMUX-01 cutover checkpoint** (2026-07-15).
+Status: **accepted, independently reviewed, and merged for P2-TMUX-01**
+(`1f66d2d`, 2026-07-15).
 
 ## Decision
 
@@ -21,6 +22,16 @@ Remaining tmux references belong only in historical/migration documentation.
 `scripts/check-worker-only-daemon.sh`, run by `scripts/test-all.sh`, rejects
 reintroduction in daemon code, tests, dependency metadata, selectors, or
 protocol structs.
+
+### Maintenance rule: do not revive tmux
+
+A bug report against the retired tmux backend is not a tmux repair task. Close
+it as obsolete or restate the user-visible behavior against `spawn-worker`.
+Do not add tmux dependencies, commands, socket discovery, adapters, fixtures,
+feature flags, service configuration, or compatibility tests. The normal fix
+path is the worker-only implementation. Any proposal to reverse this decision
+requires a new ADR, an explicit trust-boundary review, and replacement of the
+worker-only source guard; incident response is not an exception.
 
 ## Cutover boundary
 
@@ -67,6 +78,8 @@ and therefore was not safe compatibility metadata. No new writes or derived
 values are allowed. P2-PURGE-01 still covers historical logs, caches, backups,
 and other recoverable copies outside the live schema.
 
-This cutover does **not** complete P2-AGENT-02. The legacy `spawn.v1` WebSocket
-binary `0x01` output mirror and `0x02` input leg still exist until that task
-makes DataChannels mandatory and removes server transcript/history relay.
+The follow-on P2-AGENT-02 checkpoint removes the legacy `spawn.v1` WebSocket,
+binary `0x01` output mirror, `0x02` input leg, and server transcript/history
+relay. It does not weaken this ADR: tmux remains retired and must not be
+reintroduced as a compatibility, replay, fallback, or incident-recovery path.
+The only accepted direction is worker-only, mandatory-DataChannel roll-forward.

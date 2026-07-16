@@ -36,12 +36,11 @@ everything else.
 
 ## 2. Design principles
 
-1. **The server-never-sees-content model is the target, not this checkpoint's
-   current claim** (TRUST.md). The new worker protocol itself stays on a unix
+1. **The agent terminal path is endpoint-owned at the P2-AGENT-02
+   implementation checkpoint** (review pending; TRUST.md). The worker protocol stays on a Unix
    socket in a `0700` directory, and the browser's low-latency copy travels over
-   WebRTC DataChannels. Until P2-AGENT-02, however, spawnd also mirrors every
-   normally connected agent's output over daemon WS `0x01`; the control plane
-   can relay and persist that plaintext even when the browser negotiated v2.
+   mandatory WebRTC DataChannels. `spawnd` sends only content-free activity and
+   signaling/lifecycle JSON over its server control socket.
 2. **User-facing terminal rendering lives in the browser.** xterm.js in
    `web/` owns the grid a human sees. The worker also holds a *headless
    checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
@@ -72,7 +71,7 @@ everything else.
 
 ```
 spawnd (host supervisor, one per host)
- ├── ws/rtc: signaling/control + legacy PTY mirror; WebRTC peer connections
+ ├── ws/rtc: content-free signaling/lifecycle; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
@@ -207,12 +206,11 @@ spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
   ▼ T_OUTPUT (unix socket, 0700 dir, same host)
 spawnd: bounded per-agent outbox → forwarder ──→ DataChannel direct sinks
-                                            └──→ bounded daemon WS mirror
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
 browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
-`pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
+`pty::run_forwarder` and `ForwarderControl` provide bounded outbox → direct-sink
 routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
 `replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
 short-lived `0600` datagram endpoint in the same private directory and sends to
@@ -225,13 +223,12 @@ Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
 does not hold a local agent PTY, a child process handle, or a backend
 discriminator.
 
-The unix-socket hop adds no control-plane exposure, but the complete live path
-still does: until P2-AGENT-02, spawnd sends daemon WS `0x01` output for the
-legacy relay/transcript path for v1 and v2 browser sessions alike. Legacy
-snapshot responses can also ride browser WS as `agent.snapshot` JSON (base64).
-P2-AGENT-01 adds `spawn.ctl` replay with a stream-position watermark; it does
-not cut either legacy content leg. P2-AGENT-02 must remove them before Phase 2
-is true.
+The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removes daemon
+WS terminal binary frames, browser relay/history/snapshot frames, transcripts,
+and content pubsub. `spawn.ctl` replay carries a stream-position watermark
+directly to the browser. This agent cut does not make all of Phase 2 true:
+uploads, host operations, launch manifests, error detail, historical purge,
+and the final audit remain separate tracked tasks.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -306,11 +303,10 @@ also retains its independent 12 MiB response rejection ceiling.
   worker PTY read chunks and reader/writer scratch, queued input and worker
   frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
   replay result owns a self-wiping payload even while parked in a oneshot; its
-  source bytes wipe on receiver cancellation and normal consumption. Legacy
-  WS input owns and wipes the complete inbound binary frame after copying its
-  payload into the self-wiping worker-input wrapper. `OutputChunk`, WS/control
-  output, and direct-viewer payloads likewise wipe on drop; their queues are
-  bounded.
+  source bytes wipe on receiver cancellation and normal consumption.
+  DataChannel input is copied into the self-wiping worker-input wrapper.
+  `OutputChunk`, control output, and direct-viewer payloads likewise wipe on
+  drop; their queues are bounded.
 
 **Not covered — stated plainly, per TRUST.md's "honest inventory" ethos:**
 - Plaintext **must** transit worker memory: kernel PTY buffers → userspace
@@ -327,9 +323,8 @@ also retains its independent 12 MiB response rejection ceiling.
 - Kernel-side copies (PTY line discipline, unix socket buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
 - spawnd still handles plaintext in flight (worker socket → bounded outbox →
-  WS mirror/DataChannel). The outbox, worker-command channel, direct-viewer
-  queues, control responses, and WS session sink are bounded; a missing/full
-  legacy mirror is detached and discarded while direct viewers continue, and
+  DataChannel). The outbox, worker-command channel, direct-viewer queues, and
+  control responses are bounded; a lagging direct viewer is detached, and
   reconnect catch-up comes from worker replay. Owned queued payloads wipe on
   drop. Copies inside kernel unix/WebRTC/DTLS stacks are not owned or wiped by
   this code, so this is not a claim of complete system-wide zeroization.
@@ -443,12 +438,12 @@ through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
 
 **Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
 sends `T_RESIZE`; the worker applies it to the PTY master and the checkpoint
-emulator, and checkpoints the log at the new geometry. Resize *authority* is a client/server-side
-concern: the display-control feature (commit c43340c) designates one
+emulator, and checkpoints the log at the new geometry. Resize *authority* is
+negotiated endpoint-to-endpoint over `spawn.ctl`: the daemon's display-control
+hub designates one
 controlling viewer whose geometry drives the session while other viewers dim
-— `display.control` frames carry owner + geometry + viewer metadata only (no
-content), so the worker correctly stays a single-size PTY and needs no
-multi-size machinery.
+without sending geometry or viewer timing through the application server. The
+worker therefore stays a single-size PTY and needs no multi-size machinery.
 
 **Multi-viewer.** Fan-out happens in spawnd's forwarder via per-viewer
 DataChannel direct sinks: every viewer gets the same raw byte stream, and input
@@ -467,10 +462,8 @@ the caller's slice. The worker's separate lifecycle datagram endpoint accepts
 only one atomic fixed 17-byte request into one fixed buffer and is independent
 of the ordinary socket task, so TERM/KILL cannot be starved by the ordinary
 queue, partial stream peers, or a stalled worker socket. The forwarder serves
-bounded direct-viewer sinks first, then offers output without
-blocking to the bounded legacy-WS mirror. A full or absent legacy mirror is
-detached instead of accumulating plaintext, while a lagging direct viewer is
-disconnected. Either transport reconnects and re-seeds from the worker replay
+only bounded direct-viewer sinks; a lagging viewer is disconnected instead of
+accumulating plaintext. A new direct connection re-seeds from the worker replay
 watermark. The replay log uses the conservative total resource budget
 described in §6.2, including checkpoint and framing charges.
 
@@ -577,8 +570,8 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 | TRUST.md phase | sessiond contribution |
 |---|---|
-| **Phase 1** (shipped) — DataChannel-only PTY | worker backend adds no exposure beyond the existing legacy mirror: its unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server). Normally connected output still mirrors through daemon WS until P2-AGENT-02 removes that leg |
-| **Phase 2** — daemon-owned data, server stores deleted | this is the enabling work: scrollback/history/snapshot become daemon-owned artifacts (encrypted, at that) with a watermarked raw-byte replay primitive ready to move from WS-JSON onto a DataChannel history stream; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc` on the way to E2E `agent.create` |
+| **Phase 1** (shipped) — DataChannel-only PTY | worker backend removed tmux as a plaintext holder; P2-AGENT-02 now removes the legacy server mirror at its review-pending implementation checkpoint |
+| **Phase 2** — endpoint-owned data, server stores deleted | scrollback/history/snapshot are worker-owned encrypted artifacts with watermarked replay over `spawn.ctl`; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc`, while later tasks must still make launch and host paths E2E and purge historical copies |
 | **Phase 3** — signed signaling | orthogonal to sessiond (signaling-layer); nothing here assumes server-trusted introductions |
 | **Phase 4 / Later** — open source; encrypted transcript backup | worker is self-contained and auditable (`daemon/src/sessiond/` has no control-plane deps); device-key-sealed backup slots in as a separate artifact per §7 |
 
@@ -587,10 +580,10 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 - **Backpressure follow-up** (§9): Phase 2 uses bounded per-viewer sinks,
   disconnect-on-stall and replay-based catch-up; future work may add adaptive
   queue sizing and transport telemetry.
-- **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
+- **History over DataChannel review** (Phase 2): `spawn.ctl` carries
   worker-backed connect history and snapshots using request-bound chunks
-  and explicit PTY byte anchors; independent review and the later removal of
-  the legacy base64-WS leg remain before the cut is complete.
+  and explicit PTY byte anchors; the legacy base64-WS leg is removed in the
+  P2-AGENT-02 implementation and independent review remains.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed
   streams via the harness.
 - **Worker resource limits**: per-worker RLIMIT/cgroup knobs if agents start

@@ -16,11 +16,11 @@ your phone.
                    └────────────────────────┘     └─────────────────┘
 ```
 
-- **server/** — FastAPI control plane. Auth, host/agent registry, WS broker
-  between daemons and browsers.
+- **server/** — FastAPI control plane. Auth, host/agent registry, content-free
+  lifecycle/WebRTC signaling, TURN credentials, and owner fencing.
 - **daemon/** — `spawnd` plus `spawn-worker` binaries that run on each remote host.
-  Dials *out* to the server (no inbound ports needed). Manages local agent
-  Each purpose-built worker owns one agent PTY and encrypted bounded replay.
+  Dials *out* to the server (no inbound ports needed). Each purpose-built
+  worker owns one agent PTY and encrypted bounded replay.
 - **web/** — Next.js 15 PWA. xterm.js terminal, mobile-first composer +
   modifier bar, hosts/agents UI.
 - **proto/** — single source of truth for the WS + REST contract shared by all
@@ -63,9 +63,10 @@ curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spaw
 For CI or smoke tests that should prove the minimal binary path without a Rust
 fallback, add `--prebuilt-only`.
 
-Interactive terminal sessions prefer a direct browser↔daemon WebRTC
-DataChannel when available, with the server websocket kept as auth/signaling,
-transcript, and fallback relay. Configure STUN/TURN with
+Interactive terminal sessions require direct browser↔daemon WebRTC
+DataChannels: `spawn.pty` for bytes and `spawn.ctl` for endpoint replay and
+viewport control. Server WebSockets carry only auth, disclosed lifecycle, and
+signaling; there is no terminal relay or transcript fallback. Configure STUN/TURN with
 `SPAWN_WEBRTC_ICE_SERVERS`; the default is STUN-only. Add TURN credentials for
 reliable off-LAN, mobile, and corporate-network direct transport.
 
@@ -124,15 +125,16 @@ scripts/test-all.sh
 
 That runs server lint/tests, daemon Rust tests, hosted prebuilt-install smoke,
 local HTTP-surface smoke, real `spawnd login` smoke, local server+daemon
-recovery smoke, real Redis pub/sub smoke,
+recovery smoke, real Redis coordination/signaling smoke,
 live browser+daemon smoke, service-manager crash-restart smoke, web lint,
 Playwright browser tests, web production build, and diff hygiene. The Redis
-smoke starts an isolated Redis instance and proves publish/subscribe plus ring
-buffer behavior across separate Python processes using the production backend.
+smoke starts an isolated Redis instance and proves owner fencing and
+cross-process signaling using the production backend; Redis carries no PTY
+content.
 The local daemon smoke also launches multiple shell agents concurrently and verifies
 each PTY stream stays isolated. The live browser smoke drives the real Next app
 against a disposable FastAPI server and real daemon, creates an agent through
-the UI, attaches xterm over the browser websocket, sends input, verifies output
+the UI, negotiates the mandatory DataChannels, sends input, verifies output
 from the session worker, uploads a file into the agent cwd, and proves a second
 browser tab can take terminal control and send input.
 
@@ -211,18 +213,18 @@ space clear:
 ## Agent file uploads
 
 The agent terminal pane accepts local files through drag and drop or the upload
-button. Files are streamed through the browser websocket to the daemon for that
-agent's host and saved directly into the agent working directory using
+button. This upload path still transits the server pending P2-TERM-01, then the
+daemon saves it into the agent working directory using
 sanitized, non-overwriting filenames. Image paste/attachment behavior remains
 separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
 
 ## Known limits in this scaffold
 
-- **Single API worker for daemon command/control.** Live PTY output fan-out uses
-  Redis pub/sub and is covered by the real Redis smoke, but input, resize,
-  upload, snapshot, and host-management commands are still process-local to the
-  worker that owns the daemon websocket. Keep production on one API worker until
-  those control messages are moved onto a shared bus.
+- **Single API worker for remaining daemon command/control.** Terminal input,
+  output, replay and viewport state are direct DataChannel traffic, while
+  uploads and some host-management commands still depend on the worker that
+  owns the daemon socket. Keep production on one API worker until those later
+  trust tasks move endpoint operations off server routes.
 - **No CSRF protection on cookie auth yet.** Add SameSite=Strict cookies +
   CSRF tokens before any non-localhost deployment.
 - **shadcn components are hand-rolled** (Tailwind v4 + React 19 ergonomics
@@ -230,9 +232,9 @@ separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
   mechanical.
 - **PWA icons are placeholders.** Replace `web/public/icon-{192,512}.png`
   before shipping.
-- **Agent transcripts are local files.** They survive server restarts on one
-  machine but need shared storage before multiple API hosts can replay the same
-  history.
+- **Offline history is intentionally unavailable.** Replay comes from a live
+  endpoint worker; the server stores no terminal transcript. Optional
+  client-key-encrypted backup is later work.
 - **Agent provider auth is per host.** Each host needs its own
   `claude /login` / `codex login` / etc. There is no central credential
   store; this is a deliberate non-goal for spawn.

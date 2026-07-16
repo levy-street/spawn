@@ -6,6 +6,8 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
+from spawn_server.routes import hosts as hosts_routes
+
 
 async def _signup(client, email: str) -> str:
     r = await client.post("/api/auth/signup", json={"email": email, "password": "passpasspass"})
@@ -253,11 +255,11 @@ async def test_host_tools_require_online_daemon(client):
     assert r.status_code == 409
 
 
-async def test_host_dirs_roundtrip_requires_owned_online_daemon(client):
-    a_token = await _signup(client, "host-dirs-a@example.com")
-    b_token = await _signup(client, "host-dirs-b@example.com")
-    a_auth = {"Authorization": f"Bearer {a_token}"}
-    b_auth = {"Authorization": f"Bearer {b_token}"}
+async def test_host_control_ping_is_owner_authorized_content_free_and_current(client):
+    owner_token = await _signup(client, "host-ping-owner@example.com")
+    other_token = await _signup(client, "host-ping-other@example.com")
+    owner_auth = {"Authorization": f"Bearer {owner_token}"}
+    other_auth = {"Authorization": f"Bearer {other_token}"}
 
     from sqlalchemy import select
 
@@ -267,61 +269,72 @@ async def test_host_dirs_roundtrip_requires_owned_online_daemon(client):
 
     sm = get_sessionmaker()
     async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "host-dirs-a@example.com"))
+        owner = (
+            await session.execute(select(User).where(User.email == "host-ping-owner@example.com"))
         ).scalar_one()
-        host = Host(owner_user_id=user.id, name="dir-box", status="online")
-        offline_host = Host(owner_user_id=user.id, name="offline-dir-box", status="offline")
-        session.add_all([host, offline_host])
+        host = Host(owner_user_id=owner.id, name="ping-box", status="online")
+        session.add(host)
         await session.commit()
         host_id = host.id
-        offline_host_id = offline_host.id
-
-    assert (
-        await client.get(f"/api/hosts/{host_id}/dirs?path=/repo", headers=b_auth)
-    ).status_code == 404
-    assert (await client.get(f"/api/hosts/{offline_host_id}/dirs", headers=a_auth)).status_code == 409
 
     broker = get_broker()
     fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    daemon = DaemonConn(host_id=host_id, user_id=owner.id, websocket=fake_ws)  # type: ignore[arg-type]
     await broker.register_daemon(daemon)
     await _accept_daemon(daemon)
 
-    task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/dirs?path=/repo", headers=a_auth))
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.list")
-    assert sent["path"] == "/repo"
-    await broker.resolve_dir_list(
+    unauthorized = await client.post(f"/api/hosts/{host_id}/control/ping", headers=other_auth)
+    assert unauthorized.status_code == 404
+    assert not fake_ws.sent_text
+
+    task = asyncio.create_task(
+        client.post(f"/api/hosts/{host_id}/control/ping", headers=owner_auth)
+    )
+    sent = await _wait_for_text_frame(fake_ws, "host.ping")
+    assert set(sent) == {"type", "request_id"}
+    assert await broker.resolve_host_pong(
         sent["request_id"],
-        {
-            "path": "/repo",
-            "home_dir": "/home/oem",
-            "parent": "/",
-            "entries": [{"name": "src", "path": "/repo/src"}],
-        },
+        {"type": "host.pong", "request_id": sent["request_id"]},
         daemon=daemon,
         expected_host_generation=daemon.host_generation,
     )
-    r = await task
-    assert r.status_code == 200, r.text
-    assert r.json() == {
-        "path": "/repo",
-        "home_dir": "/home/oem",
-        "parent": "/",
-        "entries": [
-            {"name": "src", "path": "/repo/src", "is_dir": None, "size": None, "modified_at": None}
-        ],
-        "error": None,
-    }
+    response = await task
+    assert response.status_code == 204
+    assert response.content == b""
 
     await broker.unregister_daemon(daemon)
 
 
-async def test_host_files_listing_download_and_ops(client):
-    import base64
+async def test_host_control_ping_rejects_stale_online_status(client):
+    token = await _signup(client, "host-ping-stale-status@example.com")
 
-    token = await _signup(client, "host-files@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        owner = (
+            await session.execute(
+                select(User).where(User.email == "host-ping-stale-status@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=owner.id, name="stale-ping-box", status="online")
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    response = await client.post(
+        f"/api/hosts/{host_id}/control/ping",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 409
+
+
+async def test_host_file_rest_surfaces_are_retired_without_content_forwarding(client):
+    a_token = await _signup(client, "host-dirs-a@example.com")
+    auth = {"Authorization": f"Bearer {a_token}"}
 
     from sqlalchemy import select
 
@@ -331,10 +344,8 @@ async def test_host_files_listing_download_and_ops(client):
 
     sm = get_sessionmaker()
     async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "host-files@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="files-box", status="online")
+        user = (await session.execute(select(User).where(User.email == "host-dirs-a@example.com"))).scalar_one()
+        host = Host(owner_user_id=user.id, name="dir-box", status="online")
         session.add(host)
         await session.commit()
         host_id = host.id
@@ -345,215 +356,27 @@ async def test_host_files_listing_download_and_ops(client):
     await broker.register_daemon(daemon)
     await _accept_daemon(daemon)
 
-    # Listing requests include files and pass metadata through.
-    task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/files?path=/repo", headers=auth))
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.list")
-    assert sent["include_files"] is True
-    await broker.resolve_dir_list(
-        sent["request_id"],
-        {
-            "path": "/repo",
-            "home_dir": "/home/oem",
-            "parent": "/",
-            "entries": [
-                {"name": "src", "path": "/repo/src", "is_dir": True},
-                {
-                    "name": "a.txt",
-                    "path": "/repo/a.txt",
-                    "is_dir": False,
-                    "size": 2,
-                    "modified_at": 1750000000,
-                },
-            ],
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 200, r.text
-    entries = r.json()["entries"]
-    assert entries[1]["size"] == 2
-    assert entries[1]["modified_at"] == 1750000000
-
-    # Download decodes the daemon payload and sets a filename.
-    start = len(fake_ws.sent_text)
-    task = asyncio.create_task(
-        client.get(f"/api/hosts/{host_id}/files/download?path=/repo/a.txt", headers=auth)
-    )
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.read", start=start)
-    assert sent["path"] == "/repo/a.txt"
-    await broker.resolve_fs_result(
-        sent["request_id"],
-        {
-            "request_id": sent["request_id"],
-            "path": "/repo/a.txt",
-            "name": "a.txt",
-            "size": 2,
-            "bytes_b64": base64.b64encode(b"hi").decode(),
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 200, r.text
-    assert r.content == b"hi"
-    assert 'filename="a.txt"' in r.headers["content-disposition"]
-
-    # Upload turns multipart into an fs.write frame.
-    start = len(fake_ws.sent_text)
-    task = asyncio.create_task(
-        client.post(
-            f"/api/hosts/{host_id}/files/upload",
-            headers=auth,
-            data={"dir": "/repo"},
-            files={"file": ("notes.txt", b"hello", "text/plain")},
-        )
-    )
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.write", start=start)
-    assert sent["dir"] == "/repo"
-    assert sent["name"] == "notes.txt"
-    assert base64.b64decode(sent["bytes_b64"]) == b"hello"
-    await broker.resolve_fs_result(
-        sent["request_id"],
-        {"request_id": sent["request_id"], "path": "/repo/notes.txt"},
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 200, r.text
-    assert r.json() == {"path": "/repo/notes.txt"}
-
-    # Rename round-trips through the daemon.
-    start = len(fake_ws.sent_text)
-    task = asyncio.create_task(
-        client.post(
-            f"/api/hosts/{host_id}/files/rename",
-            headers=auth,
-            json={"path": "/repo/notes.txt", "name": "notes-v2.txt"},
-        )
-    )
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.rename", start=start)
-    assert sent["path"] == "/repo/notes.txt"
-    assert sent["name"] == "notes-v2.txt"
-    await broker.resolve_fs_result(
-        sent["request_id"],
-        {"request_id": sent["request_id"], "path": "/repo/notes-v2.txt"},
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 200, r.text
-    assert r.json() == {"path": "/repo/notes-v2.txt"}
-
-    # mkdir + delete round-trip; daemon errors surface as 400s.
-    start = len(fake_ws.sent_text)
-    task = asyncio.create_task(
-        client.post(
-            f"/api/hosts/{host_id}/files/mkdir", headers=auth, json={"path": "/repo/new"}
-        )
-    )
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.mkdir", start=start)
-    await broker.resolve_fs_result(
-        sent["request_id"],
-        {"request_id": sent["request_id"], "path": "/repo/new"},
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    assert (await task).status_code == 200
-
-    start = len(fake_ws.sent_text)
-    task = asyncio.create_task(
-        client.post(
-            f"/api/hosts/{host_id}/files/delete",
-            headers=auth,
-            json={"path": "/repo/new", "recursive": True},
-        )
-    )
-    sent = await _wait_for_text_frame(fake_ws, "host.fs.remove", start=start)
-    assert sent["recursive"] is True
-    await broker.resolve_fs_result(
-        sent["request_id"],
-        {"request_id": sent["request_id"], "path": "/repo/new", "error": "permission denied"},
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 400
-    assert "permission denied" in r.json()["detail"]
+    secret = "private-path-canary"
+    paths = [
+        f"/api/hosts/{host_id}/dirs?path=/{secret}",
+        f"/api/hosts/{host_id}/files?path=/{secret}",
+        f"/api/hosts/{host_id}/files/download?path=/{secret}",
+        f"/api/hosts/{host_id}/files/upload",
+        f"/api/hosts/{host_id}/files/mkdir",
+        f"/api/hosts/{host_id}/files/rename",
+        f"/api/hosts/{host_id}/files/delete",
+        f"/api/hosts/{host_id}/files/transfer",
+    ]
+    for path in paths:
+        response = await client.request("POST" if path.rsplit("/", 1)[-1] in {"upload", "mkdir", "rename", "delete", "transfer"} else "GET", path, headers=auth, json={"path": secret})
+        assert response.status_code == 404
+    assert fake_ws.sent_text == []
+    openapi = (await client.get("/openapi.json")).text
+    assert "/files" not in openapi
+    assert '"home_dir"' not in openapi
+    assert "host.fs" not in openapi
 
     await broker.unregister_daemon(daemon)
-
-
-async def test_host_file_transfer_pulls_from_source_and_pushes_to_dest(client):
-    import base64
-
-    token = await _signup(client, "host-transfer@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "host-transfer@example.com"))
-        ).scalar_one()
-        src = Host(owner_user_id=user.id, name="src-box", status="online")
-        dest = Host(owner_user_id=user.id, name="dest-box", status="online")
-        session.add_all([src, dest])
-        await session.commit()
-        src_id = src.id
-        dest_id = dest.id
-
-    broker = get_broker()
-    src_ws = _FakeWS()
-    dest_ws = _FakeWS()
-    src_daemon = DaemonConn(host_id=src_id, user_id="user", websocket=src_ws)  # type: ignore[arg-type]
-    dest_daemon = DaemonConn(host_id=dest_id, user_id="user", websocket=dest_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(src_daemon)
-    await broker.register_daemon(dest_daemon)
-    await _accept_daemon(src_daemon)
-    await _accept_daemon(dest_daemon)
-
-    task = asyncio.create_task(
-        client.post(
-            f"/api/hosts/{src_id}/files/transfer",
-            headers=auth,
-            json={"path": "/repo/a.txt", "dest_host_id": dest_id, "dest_dir": "/inbox"},
-        )
-    )
-    read_frame = await _wait_for_text_frame(src_ws, "host.fs.read")
-    await broker.resolve_fs_result(
-        read_frame["request_id"],
-        {
-            "request_id": read_frame["request_id"],
-            "path": "/repo/a.txt",
-            "name": "a.txt",
-            "size": 2,
-            "bytes_b64": base64.b64encode(b"hi").decode(),
-        },
-        daemon=src_daemon,
-        expected_host_generation=src_daemon.host_generation,
-    )
-    write_frame = await _wait_for_text_frame(dest_ws, "host.fs.write")
-    assert write_frame["dir"] == "/inbox"
-    assert write_frame["name"] == "a.txt"
-    assert base64.b64decode(write_frame["bytes_b64"]) == b"hi"
-    await broker.resolve_fs_result(
-        write_frame["request_id"],
-        {"request_id": write_frame["request_id"], "path": "/inbox/a.txt"},
-        daemon=dest_daemon,
-        expected_host_generation=dest_daemon.host_generation,
-    )
-    r = await task
-    assert r.status_code == 200, r.text
-    assert r.json() == {"path": "/inbox/a.txt"}
-
-    await broker.unregister_daemon(src_daemon)
-    await broker.unregister_daemon(dest_daemon)
 
 
 async def test_host_tool_policy_auto_update_schedules_install(client):
@@ -660,7 +483,9 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
         daemon=daemon,
         expected_host_generation=daemon.host_generation,
     )
-    await asyncio.sleep(0)
+    assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
+    assert not hosts_routes._AUTO_UPDATE_TASKS
+    assert not hosts_routes._AUTO_UPDATE_IN_FLIGHT
     await broker.unregister_daemon(daemon)
 
 
@@ -760,16 +585,12 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             daemon=daemon,
             expected_host_generation=daemon.host_generation,
         )
-
-        for _ in range(100):
-            async with sm() as session:
-                stored = await session.get(HostToolPolicy, policy_id)
-                assert stored is not None
-                last_auto_update_at = stored.last_auto_update_at
-                last_auto_update_error = stored.last_auto_update_error
-            if last_auto_update_error == "failed install":
-                break
-            await asyncio.sleep(0.01)
+        assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
+        async with sm() as session:
+            stored = await session.get(HostToolPolicy, policy_id)
+            assert stored is not None
+            last_auto_update_at = stored.last_auto_update_at
+            last_auto_update_error = stored.last_auto_update_error
         assert last_auto_update_at is not None
         assert last_auto_update_error == "failed install"
 
@@ -801,7 +622,6 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             expected_host_generation=daemon.host_generation,
         )
         await second_task
-        await asyncio.sleep(0)
         assert not any(
             json.loads(raw).get("type") == "host.tools.install"
             for raw in fake_ws.sent_text[second_start:]
@@ -809,3 +629,96 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
     finally:
         hosts_routes._AUTO_UPDATE_IN_FLIGHT.clear()
         await broker.unregister_daemon(daemon)
+
+
+async def test_auto_update_task_registry_observes_errors_and_clears_inflight(
+    client, monkeypatch, caplog
+):
+    started = asyncio.Event()
+
+    async def fail_update(**_kwargs) -> None:
+        started.set()
+        raise RuntimeError("owned update failed")
+
+    monkeypatch.setattr(hosts_routes, "_run_auto_update", fail_update)
+    caplog.set_level("ERROR", logger="spawn.routes.hosts")
+    key = ("user", "host", "preset")
+
+    assert hosts_routes._start_auto_update(
+        user_id=key[0],
+        host_id=key[1],
+        preset_id=key[2],
+        target={},
+    )
+    await started.wait()
+    assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
+
+    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
+    assert not hosts_routes._AUTO_UPDATE_TASKS
+    assert "owned auto update task failed" in caplog.text
+    assert "owned update failed" in caplog.text
+
+
+async def test_auto_update_shutdown_drains_owned_tasks(client, monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = False
+
+    async def drain_update(**_kwargs) -> None:
+        nonlocal cancelled
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    monkeypatch.setattr(hosts_routes, "_run_auto_update", drain_update)
+    key = ("user-drain", "host-drain", "preset-drain")
+    assert hosts_routes._start_auto_update(
+        user_id=key[0],
+        host_id=key[1],
+        preset_id=key[2],
+        target={},
+    )
+    await started.wait()
+
+    stop = asyncio.create_task(hosts_routes.stop_auto_update_checker())
+    await asyncio.sleep(0)
+    assert not stop.done()
+    release.set()
+    await stop
+
+    assert not cancelled
+    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
+    assert not hosts_routes._AUTO_UPDATE_TASKS
+
+
+async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(
+    client, monkeypatch
+):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_update(**_kwargs) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(hosts_routes, "_run_auto_update", blocked_update)
+    monkeypatch.setattr(hosts_routes, "AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS", 0.01)
+    key = ("user-cancel", "host-cancel", "preset-cancel")
+    assert hosts_routes._start_auto_update(
+        user_id=key[0],
+        host_id=key[1],
+        preset_id=key[2],
+        target={},
+    )
+    await started.wait()
+
+    await hosts_routes.stop_auto_update_checker()
+    assert cancelled.is_set()
+    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
+    assert not hosts_routes._AUTO_UPDATE_TASKS

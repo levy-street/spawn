@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
+import { useHostControl } from "@/hooks/useHostControl";
 import type { AgentKind } from "@/lib/agents";
 import { ApiError, agents, hosts, presets, screens, skills as skillApi } from "@/lib/api";
 import { normalizeCommandText, parseArgv } from "@/lib/argv";
@@ -47,13 +48,17 @@ export function NewAgentForm({
   const [presetId, setPresetId] = useState("");
   const [cwd, setCwd] = useState("");
   const [argv, setArgv] = useState("");
-  const [cols, setCols] = useState("120");
-  const [rows, setRows] = useState("32");
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastAutoCwd, setLastAutoCwd] = useState("");
   const [presetTouched, setPresetTouched] = useState(false);
+  const { client: hostControl, state: hostControlState } = useHostControl(hostId || null);
+  const homeQ = useQuery({
+    queryKey: ["host-home", hostId],
+    queryFn: () => hostControl!.home(),
+    enabled: hostControlState === "ready" && hostControl !== null,
+  });
 
   const m = useMutation({
     mutationFn: agents.create,
@@ -99,7 +104,7 @@ export function NewAgentForm({
     [presetsQ.data],
   );
   const selectedHost = hostOptions.find((h) => h.id === hostId);
-  const selectedHostHomeDir = selectedHost?.home_dir ?? "/";
+  const selectedHostHomeDir = homeQ.data?.home_dir;
   const selectedPreset = presetOptions.find((p) => p.id === presetId);
   const skillOptions = skillsQ.data ?? [];
 
@@ -119,7 +124,8 @@ export function NewAgentForm({
 
   useEffect(() => {
     if (!hostId) return;
-    const nextCwd = withTrailingSlash(selectedHostHomeDir.trim() || "/");
+    if (!selectedHostHomeDir) return;
+    const nextCwd = withTrailingSlash(selectedHostHomeDir.trim());
     if (!cwd.trim() || cwd === lastAutoCwd) {
       setCwd(nextCwd);
       setLastAutoCwd(nextCwd);
@@ -133,6 +139,10 @@ export function NewAgentForm({
       setError("Choose a host.");
       return;
     }
+    if (!selectedHostHomeDir) {
+      setError("Connect to the host before choosing a directory.");
+      return;
+    }
     let argvArr: string[] | undefined;
     try {
       argvArr = argv.trim() ? parseArgv(argv) : undefined;
@@ -144,16 +154,6 @@ export function NewAgentForm({
       setError("Choose an agent or provide a custom command.");
       return;
     }
-    const parsedCols = Number.parseInt(cols, 10);
-    const parsedRows = Number.parseInt(rows, 10);
-    if (!Number.isInteger(parsedCols) || parsedCols < 20 || parsedCols > 400) {
-      setError("Columns must be between 20 and 400.");
-      return;
-    }
-    if (!Number.isInteger(parsedRows) || parsedRows < 5 || parsedRows > 200) {
-      setError("Rows must be between 5 and 200.");
-      return;
-    }
     m.mutate({
       name: normalizeCommandText(name).trim() || undefined,
       host_id: hostId,
@@ -161,8 +161,6 @@ export function NewAgentForm({
       cwd: normalizeCwdForHost(cwd, selectedHostHomeDir),
       argv: argvArr,
       skill_ids: skillIds,
-      cols: parsedCols,
-      rows: parsedRows,
       create_cwd: true,
     });
   };
@@ -207,10 +205,7 @@ export function NewAgentForm({
                 </span>
                 <span className="min-w-0">
                   <span className="block truncate text-sm font-medium">{h.name}</span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {h.status}
-                    {h.home_dir ? ` · ${h.home_dir}` : ""}
-                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">{h.status}</span>
                 </span>
               </button>
             );
@@ -351,30 +346,6 @@ export function NewAgentForm({
               <p className="text-xs text-muted-foreground">
                 Overrides the preset command when set.
               </p>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="agent-cols">Initial columns</Label>
-              <Input
-                id="agent-cols"
-                type="number"
-                min={20}
-                max={400}
-                value={cols}
-                onChange={(e) => setCols(e.target.value)}
-                disabled={disabled}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="agent-rows">Initial rows</Label>
-              <Input
-                id="agent-rows"
-                type="number"
-                min={5}
-                max={200}
-                value={rows}
-                onChange={(e) => setRows(e.target.value)}
-                disabled={disabled}
-              />
             </div>
           </div>
         )}

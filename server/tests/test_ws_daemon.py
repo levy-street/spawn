@@ -21,7 +21,6 @@ from spawn_server.ws.daemon import (
     _fence_superseded_daemon,
     daemon_ws,
 )
-from spawn_server.ws.frames import KIND_OUTPUT, encode_binary_frame
 from spawn_server.ws.host_signal import (
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
     HostPresenceOwner,
@@ -36,10 +35,18 @@ from spawn_server.ws.host_signal import (
 
 
 class FakeDaemonWebSocket:
-    def __init__(self, *, authorization: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        authorization: str | None = None,
+        subprotocols: list[str] | None = None,
+    ) -> None:
         self.headers: dict[str, str] = {}
         if authorization is not None:
             self.headers["authorization"] = authorization
+        self.scope: dict[str, Any] = {
+            "subprotocols": subprotocols or ["spawn.control.v2"]
+        }
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -62,6 +69,9 @@ class FakeDaemonWebSocket:
 
     async def send_text(self, value: str) -> None:
         self.sent_text.append(value)
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self.sent_text.append(json.dumps(value))
 
     async def send_bytes(self, value: bytes) -> None:
         self.sent_bytes.append(value)
@@ -137,7 +147,7 @@ async def test_daemon_ws_rejects_missing_and_non_daemon_tokens(client):
 
     missing = FakeDaemonWebSocket()
     await daemon_ws(missing, token=None)  # type: ignore[arg-type]
-    assert missing.accepted_subprotocol == "spawn.v1"
+    assert missing.accepted_subprotocol == "spawn.control.v2"
     assert missing.closed == (1008, "missing token")
 
     wrong_kind = FakeDaemonWebSocket(authorization=f"Bearer {access_token}")
@@ -154,6 +164,20 @@ async def test_daemon_ws_rejects_missing_and_non_daemon_tokens(client):
     accepted.queue_disconnect()
     await daemon_ws(accepted, token=None)  # type: ignore[arg-type]
     assert accepted.closed is None
+
+    old = FakeDaemonWebSocket(
+        authorization=f"Bearer {daemon_token}", subprotocols=["spawn.v1"]
+    )
+    await daemon_ws(old, token=None)  # type: ignore[arg-type]
+    assert old.accepted_subprotocol is None
+    assert _sent_json(old) == [
+        {
+            "type": "protocol.required",
+            "protocol": "spawn.control.v2",
+            "version": 2,
+        }
+    ]
+    assert old.closed == (4003, "protocol upgrade required")
 
 
 async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(client):
@@ -212,7 +236,6 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
             "os": "linux",
             "arch": "x86_64",
             "version": "0.2.0",
-            "home_dir": "/home/tester",
             "existing_agents": [agent_id, other_agent_id, "00000000-0000-4000-8000-999999999999"],
         }
     )
@@ -220,7 +243,6 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
     daemon = get_broker().get_daemon_for_host(host_id)
     assert daemon is not None
-    assert daemon.home_dir == "/home/tester"
     assert get_broker().get_daemon_for_agent(agent_id) is daemon
     assert get_broker().get_daemon_for_agent(other_agent_id) is None
 
@@ -258,11 +280,11 @@ async def test_pending_daemon_cannot_evict_or_reroute_accepted_owner(client):
 
     pending = FakeDaemonWebSocket(authorization=f"Bearer {token}")
     pending_task = asyncio.create_task(daemon_ws(pending, token=None))  # type: ignore[arg-type]
-    await _wait_until(lambda: pending.accepted_subprotocol == "spawn.v1")
+    await _wait_until(lambda: pending.accepted_subprotocol == "spawn.control.v2")
 
-    # Before register, neither binary output nor lifecycle frames may attach
+    # Before register, neither activity nor lifecycle frames may attach
     # this authenticated-but-pending socket or mutate accepted agent routing.
-    pending.queue_bytes(encode_binary_frame(KIND_OUTPUT, agent_id, b"pending"))
+    pending.queue_text({"type": "agent.activity", "agent_id": agent_id})
     pending.queue_text({"type": "agent.exit", "agent_id": agent_id, "exit_code": 9})
     await _wait_until(lambda: pending.receive_count >= 2)
     assert broker.get_daemon_for_host(host_id) is accepted_conn
@@ -1394,7 +1416,7 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         scope_type="agent",
         scope_id=agent_id,
         protocol="spawn.pty",
-        protocol_version=1,
+        protocol_version=2,
         binding_nonce="a" * 32,
     )
 
@@ -1404,6 +1426,10 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
             "session_id": "rtc-daemon-1",
             "binding_nonce": "a" * 32,
             "agent_id": agent_id,
+            "scope_type": "agent",
+            "scope_id": agent_id,
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
             "sdp": "v=0\r\n",
         },
         {
@@ -1411,6 +1437,10 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
             "session_id": "rtc-daemon-1",
             "binding_nonce": "a" * 32,
             "agent_id": agent_id,
+            "scope_type": "agent",
+            "scope_id": agent_id,
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
             "candidate": {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"},
         },
         {
@@ -1418,6 +1448,10 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
             "session_id": "rtc-daemon-1",
             "binding_nonce": "a" * 32,
             "agent_id": agent_id,
+            "scope_type": "agent",
+            "scope_id": agent_id,
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
             "status": "connected",
         },
     ]
@@ -1443,12 +1477,8 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
     await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
 
 
-async def test_daemon_ws_activity_is_content_free_and_host_scoped(client, monkeypatch, tmp_path):
+async def test_daemon_ws_activity_is_content_free_and_binary_fails_closed(client, caplog):
     """Only metadata frames stamp activity, and only for this daemon's host."""
-    from spawn_server.config import get_settings
-
-    monkeypatch.setenv("SPAWN_TRANSCRIPT_DIR", str(tmp_path))
-    get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, _ = await _signup(client, "ws-daemon-activity@example.com")
     host_id = await _create_host(user_id)
     other_host_id = await _create_host(user_id, name="other-daemon-box")
@@ -1467,12 +1497,11 @@ async def test_daemon_ws_activity_is_content_free_and_host_scoped(client, monkey
             "version": "0.1.0",
         }
     )
-    ws.queue_bytes(encode_binary_frame(KIND_OUTPUT, binary_only_agent_id, b"secret terminal bytes"))
     ws.queue_text({"type": "agent.activity", "agent_id": agent_id})
     ws.queue_text({"type": "agent.input_activity", "agent_id": agent_id})
     ws.queue_text({"type": "agent.activity", "agent_id": other_agent_id})
     ws.queue_text({"type": "agent.input_activity", "agent_id": other_agent_id})
-    ws.queue_disconnect()
+    ws.queue_bytes(b"secret terminal bytes")
 
     await daemon_ws(ws, token=token)  # type: ignore[arg-type]
 
@@ -1496,5 +1525,5 @@ async def test_daemon_ws_activity_is_content_free_and_host_scoped(client, monkey
         host = await session.get(Host, host_id)
         assert host is not None
         assert host.last_seen_at is not None
-
-    get_settings.cache_clear()  # type: ignore[attr-defined]
+    assert ws.closed == (4002, "binary terminal frames are retired")
+    assert "secret terminal bytes" not in caplog.text
