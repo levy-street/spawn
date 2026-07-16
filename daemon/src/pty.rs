@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::activity;
 use crate::frames;
@@ -98,6 +99,12 @@ impl OutputChunk {
             activity: false,
             idle_resolution: None,
         }
+    }
+}
+
+impl Drop for OutputChunk {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
     }
 }
 
@@ -427,7 +434,9 @@ impl ForwarderControl {
         }
         sinks.retain(|_, entry| {
             for part in chunk.chunks(DIRECT_SINK_CHUNK_BYTES) {
-                if entry.sink.try_send(part.to_vec()).is_err() {
+                if let Err(error) = entry.sink.try_send(part.to_vec()) {
+                    let mut rejected = error.into_inner();
+                    rejected.zeroize();
                     let _ = entry.disconnected.send(true);
                     return false;
                 }

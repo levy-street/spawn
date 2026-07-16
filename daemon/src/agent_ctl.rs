@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -34,6 +35,15 @@ const CHUNK_FLAG_LAST: u16 = 1;
 pub enum ControlOutbound {
     Text(String),
     Binary(Vec<u8>),
+}
+
+impl ControlOutbound {
+    fn wipe(&mut self) {
+        match self {
+            Self::Text(text) => text.zeroize(),
+            Self::Binary(bytes) => bytes.zeroize(),
+        }
+    }
 }
 
 pub type ControlSender = mpsc::Sender<ControlOutbound>;
@@ -230,10 +240,16 @@ async fn enqueue(
     sender
         .send_timeout(message, OUTBOUND_ENQUEUE_TIMEOUT)
         .await
-        .map_err(|error| {
-            let code = match error {
-                mpsc::error::SendTimeoutError::Timeout(_) => "viewer_backpressure",
-                mpsc::error::SendTimeoutError::Closed(_) => "channel_closed",
+        .map_err(|mut error| {
+            let code = match &mut error {
+                mpsc::error::SendTimeoutError::Timeout(message) => {
+                    message.wipe();
+                    "viewer_backpressure"
+                }
+                mpsc::error::SendTimeoutError::Closed(message) => {
+                    message.wipe();
+                    "channel_closed"
+                }
             };
             ProtocolError::new(
                 request_id,
@@ -289,6 +305,7 @@ pub async fn send_replay(
     pty_offset: Option<u64>,
     bytes: Vec<u8>,
 ) -> Result<(), ProtocolError> {
+    let bytes = Zeroizing::new(bytes);
     if bytes.len() > MAX_REPLAY_BYTES {
         return Err(ProtocolError::new(
             Some(request_id),
@@ -623,6 +640,23 @@ mod tests {
             ControlRequest::decode(&partial_geometry).unwrap_err().code,
             "invalid_parameters"
         );
+    }
+
+    #[test]
+    fn rejected_outbound_messages_are_wipeable() {
+        let mut binary = ControlOutbound::Binary(b"replay plaintext".to_vec());
+        binary.wipe();
+        let ControlOutbound::Binary(bytes) = binary else {
+            unreachable!()
+        };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+
+        let mut text = ControlOutbound::Text("protected error detail".to_string());
+        text.wipe();
+        let ControlOutbound::Text(text) = text else {
+            unreachable!()
+        };
+        assert!(text.as_bytes().iter().all(|byte| *byte == 0));
     }
 
     #[tokio::test]

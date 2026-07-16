@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PROTO_VERSION: u32 = 2;
 
@@ -64,6 +65,16 @@ pub struct StartSpec {
     pub env: std::collections::BTreeMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+}
+
+impl Drop for StartSpec {
+    fn drop(&mut self) {
+        self.cwd.zeroize();
+        self.argv.zeroize();
+        for value in self.env.values_mut() {
+            value.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +190,7 @@ pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(
     frame_type: u8,
     value: &T,
 ) -> Result<()> {
-    let payload = serde_json::to_vec(value).context("encoding json frame")?;
+    let payload = Zeroizing::new(serde_json::to_vec(value).context("encoding json frame")?);
     write_frame(w, frame_type, &payload).await
 }
 
@@ -197,9 +208,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<(u8, V
     }
     let frame_type = header[4];
     let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)
-        .await
-        .context("reading frame payload")?;
+    if let Err(error) = r.read_exact(&mut payload).await {
+        payload.zeroize();
+        return Err(error).context("reading frame payload");
+    }
     Ok(Some((frame_type, payload)))
 }
 

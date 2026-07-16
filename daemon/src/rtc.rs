@@ -26,6 +26,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use zeroize::Zeroizing;
 
 use crate::agent_ctl::{
     self, AgentControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
@@ -797,6 +798,7 @@ fn install_data_channel_handler(
                                 chunk = direct.receiver.recv() => chunk,
                             };
                             let Some(chunk) = chunk else { break };
+                            let chunk = Zeroizing::new(chunk);
                             #[cfg(test)]
                             if let Some(gate) = pty_send_gate.take() {
                                 gate.notified().await;
@@ -809,7 +811,7 @@ fn install_data_channel_handler(
                             }
                             match tokio::time::timeout(
                                 DATA_CHANNEL_SEND_TIMEOUT,
-                                dc.send(&Bytes::from(chunk)),
+                                dc.send(&Bytes::copy_from_slice(&chunk)),
                             )
                             .await
                             {
@@ -889,7 +891,10 @@ fn install_control_data_channel(
             let send = async {
                 match message {
                     ControlOutbound::Text(text) => send_dc.send_text(text).await,
-                    ControlOutbound::Binary(bytes) => send_dc.send(&Bytes::from(bytes)).await,
+                    ControlOutbound::Binary(bytes) => {
+                        let bytes = Zeroizing::new(bytes);
+                        send_dc.send(&Bytes::copy_from_slice(&bytes)).await
+                    }
                 }
             };
             match tokio::time::timeout(DATA_CHANNEL_SEND_TIMEOUT, send).await {
@@ -1171,6 +1176,13 @@ async fn send_agent_replay(
     registry: &AgentRegistry,
     sender: &ControlSender,
 ) -> Result<(), ProtocolError> {
+    if spec.plain {
+        return Err(ProtocolError::new(
+            Some(spec.request_id),
+            "plain_replay_unsupported",
+            "plain replay is not supported; request styled terminal replay",
+        ));
+    }
     let Some(control) = registry.control_for_binding(agent) else {
         return Err(ProtocolError::new(
             Some(spec.request_id),
@@ -1725,6 +1737,27 @@ mod tests {
         let mut client =
             connect_rtc_session(&sessions, &registry, agent_id, "rtc-real", "generation").await;
         assert_eq!(sessions.resident_session_count().await, 1);
+        let plain_request_id = Uuid::new_v4();
+        let plain_request_id_text = plain_request_id.to_string();
+        client
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{plain_request_id}","operation":"history","lines":400,"plain":true}}"#
+            ))
+            .await
+            .unwrap();
+        let plain_error = loop {
+            let value = next_ctl_json(&mut client.ctl_messages).await;
+            if value.get("request_id").and_then(|id| id.as_str())
+                == Some(plain_request_id_text.as_str())
+            {
+                break value;
+            }
+        };
+        assert_eq!(plain_error["request_id"], plain_request_id.to_string());
+        assert_eq!(plain_error["ok"], false);
+        assert_eq!(plain_error["error"]["code"], "plain_replay_unsupported");
+
         let request_id = Uuid::new_v4();
         client
             .ctl

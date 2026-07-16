@@ -19,6 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use spawnd::sessiond::wire;
 
@@ -290,8 +291,10 @@ async fn run_writer(
             break;
         }
         let res = match cmd {
-            WorkerCmd::Input(bytes) => {
-                wire::write_frame(&mut write_half, wire::T_INPUT, &bytes).await
+            WorkerCmd::Input(mut bytes) => {
+                let result = wire::write_frame(&mut write_half, wire::T_INPUT, &bytes).await;
+                bytes.zeroize();
+                result
             }
             WorkerCmd::Resize { cols, rows } => {
                 wire::write_frame(
@@ -349,20 +352,27 @@ async fn run_reader(
     let mut exit_tx = Some(exit_tx);
     loop {
         match wire::read_frame(&mut read_half).await {
-            Ok(Some((wire::T_OUTPUT, payload))) => match wire::decode_output(&payload) {
-                Ok((watermark, bytes)) => {
-                    let chunk =
-                        pty::OutputChunk::classify_at_source(bytes.to_vec(), watermark, &control);
-                    if outbox_tx.send(chunk).is_err() {
+            Ok(Some((wire::T_OUTPUT, payload))) => {
+                let payload = Zeroizing::new(payload);
+                match wire::decode_output(&payload) {
+                    Ok((watermark, bytes)) => {
+                        let chunk = pty::OutputChunk::classify_at_source(
+                            bytes.to_vec(),
+                            watermark,
+                            &control,
+                        );
+                        if outbox_tx.send(chunk).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%agent_id, %error, "invalid worker output frame");
                         break;
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(%agent_id, %error, "invalid worker output frame");
-                    break;
-                }
-            },
+            }
             Ok(Some((wire::T_REPLAY, payload))) => {
+                let payload = Zeroizing::new(payload);
                 let waiter = pending.lock().expect("pending lock").pop_front();
                 if let Some(waiter) = waiter {
                     let result = wire::decode_replay(&payload).map(|(watermark, bytes)| {
@@ -373,6 +383,7 @@ async fn run_reader(
                 }
             }
             Ok(Some((wire::T_EXIT, payload))) => {
+                let payload = Zeroizing::new(payload);
                 let info: wire::ExitInfo = wire::decode_json(&payload).unwrap_or(wire::ExitInfo {
                     exit_code: None,
                     signal: None,
@@ -386,12 +397,19 @@ async fn run_reader(
                 break;
             }
             Ok(Some((wire::T_ERROR, payload))) => {
+                let payload = Zeroizing::new(payload);
                 if let Ok(err) = wire::decode_json::<wire::WorkerError>(&payload) {
                     tracing::warn!(%agent_id, message = %err.message, "worker error");
+                    if let Some(waiter) = pending.lock().expect("pending lock").pop_front() {
+                        let _ = waiter.send(Err(anyhow!("worker replay failed: {}", err.message)));
+                    }
                 }
             }
-            Ok(Some((wire::T_HELLO, _))) => {}
-            Ok(Some((other, _))) => {
+            Ok(Some((wire::T_HELLO, payload))) => {
+                drop(Zeroizing::new(payload));
+            }
+            Ok(Some((other, payload))) => {
+                drop(Zeroizing::new(payload));
                 tracing::debug!(%agent_id, frame_type = other, "ignoring worker frame");
             }
             Ok(None) | Err(_) => {
