@@ -6,7 +6,7 @@ be independently reviewed and shippable, but the Phase 2 claim is made only
 after the historical-data purge and final inventory pass. Grep is one check,
 not proof that old plaintext has left disks, databases, Redis, or backups.
 
-## Current source reality (P2-HOST-02 review candidate)
+## Current source reality (reviewed master through `4e7c89b`)
 
 - `spawn-worker` is the only session backend. Its bounded encrypted-at-rest
   replay log is the live endpoint's only history source; tmux execution and
@@ -27,25 +27,30 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   socket requires `spawn.v2`. Both are text/JSON-only signaling, disclosed
   lifecycle, and still-pending upload/launch control. Binary terminal frames,
   `spawn.v1`, the `0x01`/`0x02` relay, transcripts, agent-content Redis pubsub,
-  and server history/snapshot/display relay are removed in the reviewed
-  P2-AGENT-02 cut. Browser RTC offer/candidate/close frames bind
-  the exact agent/scope/protocol/version/nonce tuple.
+  and server history/snapshot/display relay are removed in the reviewed and
+  merged P2-AGENT-02/P2-TERM-02 cut at `5722288`. Browser RTC
+  offer/candidate/close frames bind the exact
+  agent/scope/protocol/version/nonce tuple.
 - A reviewed host-scoped `spawn.host.ctl` transport root is integrated and
-  works independently of any agent. The current P2-HOST-02 candidate moves
-  host list/stat/read/write/mkdir/rename/remove, browser download/upload, and
-  browser-mediated cross-host transfer onto bounded capability-rooted streams
-  on that channel.
+  works independently of any agent. P2-HOST-02 is reviewed and merged at
+  `4e7c89b`: host list/stat/read/write/mkdir/rename/remove, browser
+  download/upload, and browser-mediated cross-host transfer use bounded
+  capability-rooted streams on that channel.
 - Host directory/file REST routes, server broker waiters/result schemas,
-  daemon `host.fs.*` frames, and registration `home_dir` are removed in the
-  current candidate. Host paths, entry metadata, file bytes, hashes, and
-  detailed filesystem errors therefore remain endpoint-to-endpoint.
-- Tool checks and installs also use server↔daemon control frames. Installer
-  `output` and `error` can contain arbitrary commands, paths, and secrets;
+  daemon `host.fs.*` frames, and registration `home_dir` are absent from merged
+  master. Current source therefore has no server-visible host filesystem path;
+  host paths, entry metadata, file bytes, hashes, and detailed filesystem
+  errors remain endpoint-to-endpoint.
+- Merged master still sends tool checks and installs through server↔daemon
+  control frames. Installer `output` and `error` can contain arbitrary
+  commands, paths, and secrets;
   `HostToolPolicy.last_auto_update_error` persists a detailed error derived
-  from the result.
+  from the result. P2-HOST-03A has an E2E implementation candidate under
+  independent review; it is not merged and the legacy route remains.
 - REST and WebSocket terminal input/snapshot/resize/scroll/redraw/display
-  surfaces are removed in the reviewed source. Agent uploads still
-  cross the server and remain assigned to P2-TERM-01.
+  surfaces are removed in merged source. Agent uploads on current master still
+  cross the server. P2-TERM-01 has a direct-upload implementation candidate
+  under independent review; it is not merged.
 - `Agent.cwd`/`argv`/`env`, `Skill.content`, and
   `Preset.default_argv`/`env_template`/`install` are plaintext database fields.
   Preset templates are merged into the launch environment in `routes/agents.py`;
@@ -195,8 +200,9 @@ is restricted to stable content-free values.
 
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
-The filesystem portion is **IMPLEMENTED, REVIEW PENDING** in P2-HOST-02. The
-interactive tool portion remains planned separately as P2-HOST-03A.
+The filesystem portion is **REVIEWED AND MERGED** in P2-HOST-02 at `4e7c89b`.
+The interactive tool portion is **IMPLEMENTED, REVIEW PENDING** separately as
+P2-HOST-03A; it is not current-master behavior.
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
@@ -229,10 +235,12 @@ interactive tool portion remains planned separately as P2-HOST-03A.
 
 ### 6 — agent uploads and terminal control-plane retirement (terminal cut reviewed)
 
-P2-TERM-01 still must replace agent `bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`,
-and `agent_control.decode_upload`) with a chunked per-agent `spawn.ctl` stream.
-Keep only a content-free saved/failed acknowledgement; paths remain on the
-encrypted channel.
+P2-TERM-01 has an **IMPLEMENTED, REVIEW PENDING** candidate to replace agent
+`bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`, and
+`agent_control.decode_upload`) with a chunked per-agent `spawn.ctl` stream. It
+is not merged; current master still carries uploads through the server. The
+accepted result may keep only a content-free saved/failed acknowledgement;
+paths remain on the encrypted channel.
 
 The reviewed P2-TERM-02/P2-AGENT-02 cut removes REST
 input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`
@@ -261,7 +269,12 @@ AEAD object envelopes, exact-revision conflict semantics, local restart
 manifests, fail-closed compatibility, and passphrase-encrypted export/import.
 It also requires endpoint-durable `outcome_unknown` reconciliation for
 mutations whose acknowledgement or external effect is ambiguous; browser or
-server lifecycle state cannot authorize an automatic retry.
+server lifecycle state cannot authorize an automatic retry. Monotonic
+per-object/agent/tool/root effect generations remain after retry-result expiry,
+and exact prepared/effect-started records cover HOST-02 filesystem mutations,
+TERM-01 uploads, HOST-03A installs, and DATA-02 launch/restart. Only a
+target-specific conclusive `not_applied` proof unlocks retry; user dismissal or
+acknowledgement does not.
 The browser copies presets/skills only between online hosts over two host
 channels. Account recovery does not recover a lost endpoint, and no protected
 server sync queue exists. Opaque client-encrypted server blobs are deferred,

@@ -175,6 +175,17 @@ exact retained server metadata, and hand-offs to
 P2-DATA-02/P2-HOST-03B/P2-PURGE-01. Ten falsifiable acceptance gates are
 defined.
 
+The first DATA-01 review candidate was rejected. The corrected design now keeps
+durable monotonic per-target/root anti-replay heads after retry-result expiry;
+fails request 4,097 before effect while 4,096 younger-than-24h results are
+retained; journals exact HOST-02 filesystem, TERM-01 upload, HOST-03A install,
+and DATA-02 launch identities/preconditions before effect; forbids
+acknowledgement/dismissal from unlocking retry; and specifies separate immutable
+key epochs plus crash-atomic two-slot mutable anchors. A section-aware guard
+with hostile comment/dead-section, duplicate/missing-section, unsafe-retry,
+capacity, anchor, and stale-status fixtures must pass before rereview. These are
+still design requirements, not implemented runtime behavior.
+
 This checkpoint is documentation only. No endpoint store, protected-data
 DataChannel operation, migration, server-column clearing, deployment, or purge
 has occurred, and P2-DATA-02 remains blocked until the decision passes review

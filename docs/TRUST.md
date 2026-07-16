@@ -62,12 +62,14 @@ not come for free:
    session. Fixing this requires endpoint identity keys that sign the
    SDP (Phase 3).
 2. **Historical relay data and the remaining content surfaces.** The
-   P2-AGENT-02 implementation checkpoint removes `spawn.v1`, daemon WS PTY
-   binary frames, transcripts, content pubsub, snapshots/history, and viewport
-   routes; review, merge, coordinated deployment, and historical purge remain.
-   Uploads, host file/tool operations, launch manifests, skill bodies, and
-   detailed errors still have server-readable paths tracked in the Phase 2
-   ledger.
+   P2-AGENT-02/P2-TERM-02 cut is reviewed and merged at `5722288`; it removes
+   `spawn.v1`, daemon WS PTY binary frames, transcripts, content pubsub,
+   snapshots/history, and viewport routes. P2-HOST-02 is reviewed and merged at
+   `4e7c89b`; current source has no server-visible host filesystem route/frame.
+   Coordinated deployment and historical purge still remain. Current master
+   still has server-readable agent-upload, tool, launch-manifest, skill-body,
+   and detailed-error paths. P2-TERM-01 and P2-HOST-03A correction candidates
+   are implemented but independently review-pending, not merged behavior.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.
@@ -126,23 +128,23 @@ answer for users for whom this metadata is itself sensitive.
 
 | Content class | Current or historical path | Migration state |
 |---------------|----------------------------|-----------------|
-| PTY bytes (retired live relay) | former binary frames on `/ws/browser`, `/ws/daemon` | removed in P2-AGENT-02 implementation; mandatory DataChannels; review/deploy pending |
+| PTY bytes (retired live relay) | former binary frames on `/ws/browser`, `/ws/daemon` | removed in P2-AGENT-02/P2-TERM-02, reviewed and merged at `5722288`; deployment/purge pending |
 | Transcripts (~64 MB/agent historically on server disk) | retired `transcript.py`; historical files/Redis/backups may remain | code path deleted; bounded endpoint replay; historical copies still require P2-PURGE-01 |
 | History replay | former `{"type":"history"}` on `/ws/browser` | removed from server; `spawn.ctl` endpoint stream |
-| Agent file uploads | `upload` frames, `bytes_b64` through both WS legs and REST | per-agent DataChannel file stream |
+| Agent file uploads | current master: `upload` frames and `bytes_b64` through both WS legs and REST | P2-TERM-01 DataChannel candidate implemented, independent review pending; server path remains until merge |
 | Terminal snapshots / card previews | retired `agent.snapshot` frames | removed from server; rendered from endpoint replay/output |
 | REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
 | Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-agent `spawn.ctl` only |
-| Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-readably |
-| Preset environment templates | `presets.env_template`, merged into agent `env` | canonical in the selected per-host endpoint store; values sent E2E at spawn time |
-| Launch paths/arguments and preset commands | `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | canonical per-host launch manifest sent over `spawn.host.ctl` |
-| Default agent names derived from `cwd` | `_default_agent_name` copies the working-directory basename into `agents.name` | explicit user metadata or neutral ID-based default; legacy derived names scrubbed |
-| Skill bodies | `agent.create`, `skills` table | canonical in the selected per-host endpoint store; decrypted only at endpoints |
+| Agent `env` (may contain real secrets) | current master: `agent.create`, persisted in `agents.env` | DATA-02 target: E2E and endpoint-local only; not implemented |
+| Preset environment templates | current master: `presets.env_template`, merged into agent `env` | DATA-02 target: canonical in selected per-host endpoint store; not implemented |
+| Launch paths/arguments and preset commands | current master: `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | DATA-02 target: canonical per-host launch manifest over `spawn.host.ctl`; not implemented |
+| Default agent names derived from `cwd` | current master: `_default_agent_name` copies the cwd basename into `agents.name` | DATA-02 target: explicit/neutral metadata and scrubbed legacy names; not implemented |
+| Skill bodies | current master: `agent.create`, `skills` table | DATA-02 target: endpoint-local and E2E only; not implemented |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
-| Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | REST host-file routes plus `host.fs.*` server↔daemon frames | host-scoped `spawn.host.ctl` DataChannel |
-| Cross-host file transfer | server reads the source and forwards its bytes to the destination | browser streams source host → browser → destination host over two host channels |
-| Tool check/install commands, paths, installed/latest versions, output, and detailed errors | `host.tools.*`; policy errors can persist in Postgres | host-scoped DataChannel; unattended jobs return content-free status only |
-| Free-form daemon errors | `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | stable content-free server code; detail delivered over the appropriate E2E control channel |
+| Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | former REST host-file routes plus `host.fs.*` frames | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source uses `spawn.host.ctl` only |
+| Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
+| Tool check/install commands, paths, installed/latest versions, output, and detailed errors | current master: `host.tools.*`; policy errors can persist in Postgres | P2-HOST-03A E2E candidate implemented, independent review pending; legacy server route remains until HOST-03B |
+| Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
 Preset names, skill names/descriptions, and explicitly chosen or neutral agent
 names remain server-visible metadata; users must not place secrets in those

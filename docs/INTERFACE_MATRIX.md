@@ -39,7 +39,7 @@ per-host endpoint store and exact failure/migration semantics are specified in
 | tool target/policy | allowed enabled flag, IDs, coarse timestamps and content-free status | executable/install target, endpoint execution policy, versions/output/detail | unattended endpoint policy may run locally; server cannot reconstruct a missing target |
 | copy preset/skill across hosts | no content operation | browser streams source host → browser → destination host over two authenticated host channels | both hosts must be online |
 | export/import/recover | no key or archive endpoint | bounded passphrase-encrypted archive over `spawn.host.ctl` | account/password recovery alone cannot recover a lost host |
-| reconcile ambiguous mutation | no protected request/record state; disclosed lifecycle metadata is not proof of outcome | endpoint-durable `outcome_unknown` inventory and operation-specific check/ack over `spawn.host.ctl` | lock survives daemon/browser restart; no automatic retry |
+| reconcile ambiguous mutation | no protected request/record state; disclosed lifecycle metadata is not proof of outcome | endpoint-durable anti-replay head plus `outcome_unknown` inventory and target-specific proof over `spawn.host.ctl`; dismissal cannot unlock | lock survives result expiry, daemon/browser restart, and same-lineage restore; only conclusive `not_applied` permits retry |
 | delete/wipe | metadata deletion/revocation only | revisioned tombstone/object crypto-delete; explicit local store wipe | server revocation cannot prove an offline endpoint was erased |
 
 There is deliberately no server helper that accepts protected values, opaque

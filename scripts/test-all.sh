@@ -23,6 +23,7 @@ scripts/check-worker-only-daemon.sh --self-test
 scripts/check-worker-only-daemon.sh
 
 printf '%s\n' "== durable protected-data decision guard =="
+scripts/check-durable-data-decision.sh --self-test
 scripts/check-durable-data-decision.sh
 
 printf '%s\n' "== local daemon smoke cleanup guard =="

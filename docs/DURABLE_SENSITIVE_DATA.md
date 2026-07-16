@@ -137,21 +137,19 @@ only through a superseding ADR with equivalent tests.
   created/replaced files, and verify crash recovery after truncating each write
   boundary. Corrupt pages/envelopes are quarantined; recovery never edits the
   only copy in place.
-- The credential record also holds `store_uuid`, the latest committed store
-  generation, and an HMAC state tag over the canonical set of object heads,
-  envelope hashes, tombstones, settled request results, and unresolved
-  reconciliation heads. Every durable journal transition advances the
-  generation. A mutation first commits generation `n` and its tag in SQLite,
-  then advances the credential anchor; no later write is accepted until the
-  anchor succeeds. On restart, database=anchor is normal;
-  database=anchor+1 is accepted only after its tag verifies (crash between the
-  two writes) and advances the anchor; database older than the anchor, more
-  than one generation ahead, or tag-mismatched fails as `data_rollback`/
-  `data_integrity`. This detects a database-only rollback when the credential
-  anchor survives without pretending the two stores are transactional. An
-  anchor-advance failure leaves a durable local recovery marker and blocks all
-  later writes until the exact committed generation is authenticated and the
-  anchor is advanced; it is never papered over by a new mutation.
+- The mutable anchor holds `store_uuid`, key epoch, latest committed store
+  generation, previous-anchor hash, and an HMAC state tag over the canonical
+  set of object heads, envelope hashes, tombstones, anti-replay heads, settled
+  request results, and unresolved reconciliation heads. Every durable journal
+  transition advances the generation. A mutation first commits generation `n`
+  and its tag in SQLite, then durably advances the anchor; no external effect or
+  later write is accepted until the anchor succeeds. On restart,
+  database=anchor is normal; database=anchor+1 is accepted only after its tag
+  verifies (crash between the two writes) and the anchor is advanced. Database
+  older than the anchor, more than one generation ahead, or tag-mismatched
+  fails as `data_rollback`/`data_integrity`. The committed database generation
+  itself is the recovery evidence; the design does not assume a separate
+  marker can be made durable after an anchor write has failed.
 - Serialization is deterministic canonical CBOR. Limits are checked before
   allocation and again after serialization. Temporary plaintext buffers and
   keys are excluded from core dumps/locked where supported and zeroized on
@@ -163,16 +161,16 @@ only through a superseding ADR with equivalent tests.
 1. Each host store has a random 256-bit **store master key** and random
    `store_uuid`. The master key is independent of the account password, daemon
    bearer token, WebRTC identity key, server secrets, and other hosts.
-2. The master key and anchor record are stored in an OS credential facility
-   only when DATA-02 proves that facility can unlock non-interactively under the
-   actual daemon service account after boot, logout, and offline restart. A
-   desktop session prompt or an unavailable login keyring is not a supported
-   daemon dependency. For an unattended/headless installation without such a
-   facility, Spawn may use a separately created local `0600` key/anchor file in
-   the private state directory, but must label that protection mode in local
-   diagnostics. This fallback protects the control-plane boundary and supports
-   crypto-erasure; it does not protect a disk image that contains both the
-   database and key file.
+2. Each master-key epoch is an immutable credential record. The current epoch
+   is selected by the authenticated mutable anchor, but the key bytes and anchor
+   are never overwritten as one record. An OS credential facility is usable
+   only when DATA-02 proves non-interactive unlock under the actual daemon
+   service account after boot, logout, and offline restart. A desktop prompt or
+   unavailable login keyring is unsupported. Without such a facility, Spawn
+   creates a separate immutable local `0600` master-key file and uses the
+   crash-atomic anchor files below. This fallback protects the control-plane
+   boundary and supports crypto-erasure; it does not protect a disk image that
+   contains both database and key material.
 3. Every object revision gets a fresh random 256-bit data-encryption key (DEK)
    and nonce. The canonical plaintext is sealed with XChaCha20-Poly1305. The
    DEK is separately wrapped by the current master-key epoch with
@@ -187,6 +185,47 @@ only through a superseding ADR with equivalent tests.
    browser-to-endpoint DTLS session. Workers receive only the
    launch/materialization values they
    require over the existing private local worker channel.
+
+### Crash-atomic key and anchor storage
+
+The local-file mode stores immutable `master-key.<epoch>` records separately
+from two mutable anchor slots, `anchor.a` and `anchor.b`. Each slot contains
+magic/version, slot sequence, `store_uuid`, key epoch, database generation,
+state tag, previous-valid-slot hash, and both a corruption checksum and
+anchor-key HMAC. Initial creation and rotation write a new key epoch through a
+same-directory temporary file, check all writes, `fdatasync`, rename, and
+directory-fsync it before any anchor may reference that epoch; an epoch record
+is never updated in place. To advance, the daemon writes the inactive slot
+through a same-directory temporary file, checks every write/close result,
+`fdatasync`s the file, atomically renames it over that inactive slot, and fsyncs
+the containing directory. Only then may an external effect begin. It never
+truncates or edits the last valid slot in place.
+
+Recovery reads both slots without modifying them and validates each slot's
+checksum, HMAC, identity, and sequence independently. With two valid slots, the
+sequences must be adjacent and the newer predecessor hash must match the older;
+equal-sequence disagreement or an invalid link fails closed. With one valid and
+one torn/partial slot, the independently authenticated valid slot remains
+eligible. The daemon selects the highest valid slot first and only then compares
+it with SQLite: its generation must equal the authenticated database generation
+or be exactly one behind it. One-behind is the bounded SQLite-commit/anchor-
+advance gap and is repaired by writing the other slot before work resumes. An
+anchor ahead of SQLite or a gap larger than one fails closed; it may not ignore
+a higher valid anchor in favor of a convenient lower slot. Disk-full,
+short-write, rename, or directory-fsync failure leaves the former valid slot
+authoritative and prevents effect invocation; if SQLite already committed,
+recovery uses the one-behind rule.
+
+An OS credential mode must keep immutable key epochs separate and provide the
+same two-slot/version/checksum/HMAC semantics using a platform primitive with
+documented atomic durable replace and post-restart read guarantees. If the
+credential API cannot prove those properties, only the immutable key lives
+there and the mutable anchor uses the file slots above. A generic successful
+"set secret" return is not assumed power-loss atomic. DATA-02 tests both modes
+with injected short writes, disk-full, torn records, rename/fsync failure, and
+power loss before and after every SQLite, slot-write, rename, and directory-
+fsync boundary. Each recovery must select only the prior or new authenticated
+generation and must never invent an unavailable committed state.
 
 The three public object types above and the daemon-internal
 `internal_reconciliation` envelope use the same revision-key/envelope rules.
@@ -230,12 +269,9 @@ key destruction. It does not change the declared trust in the user's host.
   request_id)` to an authenticated request fingerprint and result. The
   principal is stable across reconnects and is not an ephemeral WebRTC session
   ID. An identical retry returns the original result; reuse with different
-  bytes returns `request_id_reused`. Settled results are capped at 4,096 entries
-  and retained for at least 24 hours. Pending or `outcome_unknown` entries are
-  never age/LRU-evicted; their separate cap blocks new affected mutations until
-  the user reconciles them. After a settled entry expires, a late retry is not
-  treated as fresh authority: it must re-read the current revision/state and
-  obtain a new request ID and explicit user action.
+  bytes returns `request_id_reused`. This result map is a retry convenience, not
+  the replay boundary; durable target generations below remain after a result
+  mapping is collected.
 - Delete writes a revisioned tombstone before deleting the wrapped DEK and
   ciphertext. An ID cannot be recreated. Tombstones contain no protected value
   and remain for the life of that store lineage, preventing stale retry/copy
@@ -258,6 +294,43 @@ external monotonic anchor. That limitation is disclosed; Spawn does not claim
 rollback detection against an attacker who controls the trusted endpoint and
 all of its backups.
 
+### Durable anti-replay heads and admission
+
+Every effect-bearing request carries the current store lineage plus an exact
+`expected_effect_generation`. The daemon maintains an authenticated durable
+anti-replay head for each bounded effect namespace. Object writes use the
+object revision/tombstone as that head. Launches use one head per agent; tool
+installs use one per local tool target; agent uploads use one per agent/cwd
+capability; and all HOST-02 filesystem mkdir/rename/remove/write and transfer-
+destination effects share a monotonic head for the host root capability. The
+coarser root head intentionally serializes Spawn filesystem effects so an old
+path request cannot become current merely because its short-lived result map
+expired.
+
+Admission atomically CASes `expected_effect_generation`, consumes the next
+checked 64-bit generation, stores the request fingerprint and predecessor-head
+hash, and writes the prepared journal record in the same SQLite transaction.
+The new head hash commits `(store_uuid, account, user principal, host, effect
+namespace, generation, request_id, request fingerprint, prior head hash,
+journal record ID/state)`. It is included in the crash anchor. A replay after
+result-map expiry, daemon restart, or same-lineage restore still carries the
+old expected generation and fails `stale_effect_generation`; supplying the old
+request ID with changed bytes fails `request_id_reused` while its head remains.
+An explicit older-backup restore creates a new `store_uuid`, so every old frame
+is wrong-lineage rather than fresh authority.
+
+Settled request results are retained for **at least** 24 hours and capped at
+4,096. The cap is an admission cap, not an eviction target: when all 4,096
+entries are younger than 24 hours, request 4,097 fails `journal_capacity`
+before allocating a stream, committing a prepared record, or invoking an
+effect. Garbage collection may remove a settled result only after 24 hours and
+only after verifying that the durable target head/tombstone/new lineage makes
+the original request stale. It never removes anti-replay heads for live effect
+namespaces, tombstones, prepared/effect-started/unresolved records, or proof
+needed to resolve an effect. Deleting a target retains its head in the
+tombstone; root/agent/tool head quotas fail closed before effect rather than
+reuse or evict a generation. Exhaustion likewise fails closed.
+
 ### Ambiguous-effect reconciliation
 
 Store-only mutations make the encrypted revision, head CAS, request result, and
@@ -268,26 +341,79 @@ committed head/result. If integrity/anchor checks cannot authenticate either
 state, the daemon returns `data_integrity`, blocks the object, and does not
 invent an `outcome_unknown` record from untrusted state.
 
-Operations with effects outside SQLite—launch, installer/package-manager work,
-and future host mutations—record `prepared`, then durably cross an
-`effect_started` boundary before invocation. A disconnect or crash after that
-boundary leaves an encrypted `outcome_unknown` record containing the exact
-target reference and safe reconciliation method. Neither the browser nor daemon
-automatically repeats the effect. A later browser, including a different device,
-enumerates bounded unresolved records over `spawn.host.ctl` and performs the
-operation-specific definitive check: worker identity/state for launch; a direct
-executable/version/latest check for tool installation; or exact object
-revision/request lookup for store changes. Only a conclusive check or explicit
-user acknowledgement records `committed`/`not_applied` and releases the lock.
+The same endpoint journal must cover all external effects already accepted or
+pending in this wave: merged HOST-02 filesystem mkdir, rename, remove, write,
+and transfer-destination commit; review-pending TERM-01 agent upload commit;
+review-pending HOST-03A tool install; and DATA-02 launch/restart. Before any
+effect it stores an encrypted, versioned record containing at least:
+
+- store lineage; exact account ID, authorized user/principal ID, host ID,
+  protocol/session binding, operation, request/idempotency ID and fingerprint,
+  effect namespace, prior and allocated effect generations, and predecessor
+  head hash;
+- the stable root capability identity and protected canonical target identity,
+  including device/inode/generation where the platform supplies them, exact
+  relative path components, expected existence/type/content hash or other
+  operation-specific precondition, and overwrite/no-clobber policy;
+- for agent uploads, the agent ID, backend/worker generation, cwd capability,
+  destination identity, stream/temp ID, declared length and digest; for
+  cross-host transfer, both source host/root/object identity and digest plus
+  the destination precondition;
+- for launch/restart, the agent ID, backend generation, expected worker
+  generation/state, cwd capability, and exact manifest ID/revision/digest; and
+- for tool installation, the preset/tool ID, executable/install target and
+  command digest, endpoint policy generation, installed/latest-version
+  precondition, and tool/package-manager reconciliation method.
+
+Admission is `prepared`; it consumes the anti-replay generation. The daemon
+then durably records and anchors `effect_started` **before** invoking the file,
+worker, or package-manager effect. Journal capacity, quota, encryption,
+SQLite, anchor, disk-full, or fsync failure at either pre-effect transition
+prevents invocation. After invocation, `applied` plus target-specific proof is
+persisted if possible. If that post-effect write fails, the already durable
+`effect_started` record remains unresolved across restart and continues to lock
+that effect namespace; lack of an `applied` record is never interpreted as
+rollback.
+
+A later authorized browser, including a different device, enumerates bounded
+unresolved records over `spawn.host.ctl`. Reconciliation is conservative and
+target-specific:
+
+- mkdir is applied only when the expected directory identity exists and is
+  not-applied only when the exact parent/basename precondition is unchanged;
+- rename is applied only when the source identity is at the destination and
+  absent at the source; it is not-applied only when that identity remains at
+  the source and the destination precondition is unchanged;
+- remove is applied when the exact target identity is absent and not-applied
+  only when that same identity remains; any replacement/conflict stays locked;
+- write, transfer, and upload are applied only when destination identity,
+  length, and digest match, and not-applied only when the recorded destination
+  precondition is unchanged;
+- launch/restart is applied only when an endpoint worker identity and generation
+  attest the exact manifest digest, and not-applied only when the recorded prior
+  worker state is unchanged; and
+- install is applied only with a direct executable/version/latest or
+  package-manager transaction proof for the intended target. It is not-applied
+  only when a tool-specific authoritative check proves the recorded
+  precondition and absence of the transaction; version ambiguity stays locked.
+
+Only a conclusive `not_applied` proof permits a new generation and retry.
+`applied` stores the proof and permanently consumes the old generation. User
+acknowledgement is never retry authority. A user may dismiss an unresolved item
+from the default UI, but dismissal preserves its durable record, anti-replay
+head, and effect lock and remains visible in an explicit unresolved inventory.
+An inconclusive or conflicting check stays `outcome_unknown`; neither browser
+nor daemon automatically repeats it.
 
 Browser storage may retain only disclosed IDs and a hint that reconciliation is
 needed; it is not authoritative and its loss cannot remove the endpoint lock.
 Protected target, command, output, and error detail remain encrypted locally
 and E2E. Unresolved records survive daemon restart, native same-host backup, and
-same-lineage restore. Cross-host import does not transfer an external side
-effect to the destination; it reports the source ambiguity in preview and
-requires acknowledgement before rebinding objects under the destination's new
-lineage.
+same-lineage restore. Cross-host import reports source ambiguities but cannot
+dismiss or unlock them; source frames are bound to the source lineage/host/root
+and cannot authorize a destination effect. The destination gets new anti-replay
+heads under its new lineage, while the source lock persists until conclusively
+resolved.
 
 ### Launch resolution
 
@@ -324,7 +450,8 @@ P2-DATA-02 may lower these limits but must not raise them without review:
 | encrypted current/history revision payload | 256 MiB total; referenced revisions are counted and never evicted |
 | tombstones per store | 20,000; exceeding the cap blocks new IDs rather than evicting replay protection |
 | unresolved reconciliation records | 256; reaching the cap blocks new external-effect mutations, never evicts ambiguity |
-| settled idempotency results | 4,096, retained at least 24 hours |
+| durable external-effect anti-replay heads | 10,000 agent/upload/tool heads plus one filesystem head per registered host root; live/tombstoned heads are never evicted |
+| settled idempotency results | 4,096, each retained at least 24 hours; cap+1 fails before effect |
 | encrypted database payload | 256 MiB by default, inclusive of envelopes/journals; operator may lower it |
 | encrypted export archive | 512 MiB |
 | concurrent protected write/import streams | 4 |
@@ -340,12 +467,14 @@ renamed only after verification. Backpressure pauses reads instead of growing
 queues. Repeated quota failures expose only a stable content-free code to the
 server and bounded local/E2E detail.
 
-Automatic eviction may remove only expired settled request results and
+Automatic garbage collection may remove only expired settled request results
+after proving their target anti-replay head remains, and
 unreferenced historical object revisions under the documented retention rule.
 It may never remove a current head, tombstone, referenced revision, unresolved
-reconciliation record, or active stream. Reaching those caps is an explicit
-availability failure with an E2E remediation path, not permission to weaken
-replay/ambiguity protection.
+reconciliation record, live/tombstoned effect head, or active stream. Admission
+reserves all journal/head/disk capacity before allocating a stream or invoking
+an effect. Reaching a cap or disk backpressure is an explicit E2E availability
+failure before effect, not permission to weaken replay/ambiguity protection.
 
 The authenticated user can still exhaust their own host quota or delete their
 own data; availability against a malicious authorized endpoint is out of scope.
@@ -362,9 +491,12 @@ store.
 The supported recovery artifact is an explicit streamed export created on the
 host and delivered to the requesting browser over `spawn.host.ctl`. It contains
 the format/store lineage, object IDs, current and referenced immutable
-revisions, tombstones, protected values, and same-host unresolved reconciliation
-records in one authenticated archive encrypted under a user-supplied recovery
-passphrase. Settled request-result history need not be exported.
+revisions, tombstones, protected values, all live/tombstoned anti-replay heads,
+and same-host unresolved reconciliation records in one authenticated archive
+encrypted under a user-supplied recovery passphrase. Settled request-result
+history need not be exported because the retained heads make its requests
+stale. A same-host/same-lineage restore must restore every head; an archive that
+does not is rejected rather than treated as a fresh store.
 Version 1 uses Argon2id with a random salt (64 MiB, 3 iterations, parallelism
 1) to derive an archive key, then XChaCha20-Poly1305 with a random nonce. An
 import rejects different/out-of-range KDF parameters before allocating. The
@@ -398,18 +530,19 @@ decryptable by whoever can restore that trusted endpoint. A backup containing
 only the encrypted database is not recoverable. Copying SQLite and its
 credential anchor independently can capture the generation gap and is not a
 supported backup: use the passphrase export or a daemon-quiesced, read-back
-verified snapshot of the database/WAL plus key/anchor. Restore validates the
-pair before exposing a head. Restoring an older pair requires the explicit new
-lineage/re-encryption flow above. Operators must choose a platform backup that
-can restore the credential facility consistently or the explicit export and
-document its retention.
+verified snapshot of the database/WAL, immutable key epochs, and both mutable
+anchor slots. Restore validates the complete set before exposing a head.
+Restoring an older set requires the explicit new lineage/re-encryption flow
+above. Operators must choose a platform backup that can restore the credential
+facility consistently or the explicit export and document its retention.
 
 Host re-registration, account ownership change, or token rotation never
 silently rebinds a store: the AAD/account/host binding fails closed. A lost host
 can be replaced only from a retained export or reconfiguration; server metadata
 cannot reconstruct it. Cross-host import creates a new lineage and excludes the
-source host's external side effects after presenting unresolved records for
-explicit acknowledgement.
+source host's external effects after presenting unresolved records. A user can
+dismiss that source warning, but cannot clear the source anti-replay head/effect
+lock or authorize retry without conclusive source-side reconciliation.
 
 ## Rotation, revocation, deletion, and purge
 
@@ -530,8 +663,9 @@ length, key epoch, or read log. It does not claim traffic-analysis resistance.
 | corrupt/tag-invalid object | quarantine ciphertext, return E2E `data_integrity`, do not launch or substitute defaults |
 | newer schema/algorithm | refuse writes and request an upgrade; never guess |
 | stale revision/replayed request | conflict or idempotent original result as specified above |
-| lost acknowledgement or uncertain external effect | durable endpoint `outcome_unknown`; block retry until operation-specific reconciliation proves applied/not-applied or the user explicitly acknowledges uncertainty |
-| credential anchor advance failure | preserve the committed generation, refuse later writes, and repair only by authenticated one-generation recovery |
+| lost acknowledgement or uncertain external effect | durable endpoint `outcome_unknown`; block retry until target-specific reconciliation conclusively proves `not_applied`; acknowledgement/dismissal never unlocks it |
+| settled result map full | fail `journal_capacity` before stream allocation, journal admission, or effect; never evict a younger-than-24h result or required anti-replay head |
+| credential anchor advance failure | do not invoke the effect; keep the last valid anchor slot, refuse later work, and repair only by authenticated one-generation recovery |
 | missing preset/skill revision | E2E error and no launch/tool execution |
 | quota/timeout/cancel/disconnect | abort atomically, erase temporary plaintext, preserve previous revision |
 | endpoint copy unavailable after server scrub | recovery import or explicit reconfiguration; never restore the server field |
@@ -558,18 +692,27 @@ of assuming it.
 4. AEAD mutation, wrong object/host/account binding, truncated stream, unknown
    version, stale expected revision, request replay with changed bytes, and
    partial database/journal rollback all fail without changing the current
-   object or clearing an unresolved-effect lock. Power loss at every
-   SQLite/anchor transition recovers only the old or committed generation.
+   object or clearing an unresolved-effect lock. File-fallback and credential
+   modes inject short-write, disk-full, torn-slot, rename/fsync failure, and
+   power loss before/after every SQLite/anchor transition; recovery selects
+   only the old or committed authenticated generation.
 5. Two browsers racing writes get exactly one commit and one conflict. Two
    online hosts can copy a preset/skill through the browser; an offline
    destination creates no server-held queue. Cross-account and cross-host
    attempts return no object or existence oracle. A second browser can enumerate
    and reconcile a first browser's endpoint-durable `outcome_unknown` record;
-   closing the first tab or restarting the daemon cannot unlock an automatic
-   retry.
+   closing the first tab, dismissing the warning, restarting the daemon, or
+   restoring a same-lineage backup cannot unlock an automatic retry. Tests
+   cover HOST-02 mkdir/rename/remove/write/transfer, TERM-01 upload, HOST-03A
+   install, and DATA-02 launch journals with failure at every pre/post-effect
+   persistence boundary and target-specific applied/not-applied/conflict proof.
 6. Quota, concurrency, timeout, cancel, disconnect, and oversized declarations
    keep memory/disk within the stated bounds and leave no readable partial
-   value. Previous revisions remain usable after aborted replacement.
+   value. Previous revisions remain usable after aborted replacement. With
+   4,096 younger-than-24h settled results, request 4,097 fails before effect;
+   after safe mapping expiry, the old request still fails its durable effect
+   generation after daemon restart and same-lineage backup/restore. Required
+   heads and unresolved records are never reclaimed under quota pressure.
 7. Export/import uses a wrong-passphrase failure oracle no richer than
    authentication failure, preserves current/referenced revisions,
    tombstones/conflicts and same-host unresolved reconciliation, and requires

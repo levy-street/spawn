@@ -77,9 +77,10 @@
   owns one independently keyed, endpoint-local canonical store for launch and
   restart manifests, preset/tool operational values, and skill bodies. It is
   available after daemon restart and exposed only over `spawn.host.ctl`.
-  Endpoint-durable reconciliation records also lock ambiguous external effects
-  across daemon/browser restarts; the control plane stores neither their
-  protected detail nor their presence.
+  Endpoint-durable monotonic anti-replay heads and reconciliation records lock
+  ambiguous external effects across result expiry, daemon/browser restart, and
+  same-lineage restore; the control plane stores neither their protected detail
+  nor their presence. Dismissing an ambiguity never authorizes retry.
   `DURABLE_SENSITIVE_DATA.md` defines its envelope, recovery, conflicts,
   quotas, migration, and accepted offline/cross-host regressions.
 
