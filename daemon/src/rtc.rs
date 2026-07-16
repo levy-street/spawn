@@ -3126,6 +3126,10 @@ mod tests {
                 _dir: dir,
             }
         }
+
+        fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
     }
 
     impl Drop for WorkerTestEnv {
@@ -3145,6 +3149,8 @@ mod tests {
     /// identity-bound lifecycle KILL has been acknowledged. This makes every
     /// panic path clean up the worker before `WorkerTestEnv` removes its
     /// private endpoint directory.
+    const WORKER_TEST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
     struct WorkerCleanupGuard {
         agent_id: Uuid,
         lifecycle: Option<crate::pty::AgentLifecycle>,
@@ -3187,14 +3193,18 @@ mod tests {
                         return;
                     };
                     runtime.block_on(async move {
+                        let deadline = tokio::time::Instant::now() + WORKER_TEST_CLEANUP_TIMEOUT;
                         let _ = lifecycle
                             .shutdown(spawnd::sessiond::wire::LifecycleSignal::Kill)
                             .await;
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                         while crate::worker_backend::socket_exists(agent_id)
                             && tokio::time::Instant::now() < deadline
                         {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            tokio::time::sleep_until(std::cmp::min(
+                                deadline,
+                                tokio::time::Instant::now() + Duration::from_millis(25),
+                            ))
+                            .await;
                         }
                     });
                 });
@@ -3203,6 +3213,111 @@ mod tests {
             }
             self.supervisor_keepalive = None;
         }
+    }
+
+    struct TestChildCleanup(std::process::Child);
+
+    impl Drop for TestChildCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn saturate_test_lifecycle_endpoint(
+        dir: &std::path::Path,
+        lifecycle_path: &std::path::Path,
+    ) -> (
+        std::os::unix::net::UnixDatagram,
+        std::os::unix::net::UnixDatagram,
+        spawnd::sessiond::endpoint::EndpointIdentity,
+    ) {
+        spawnd::sessiond::endpoint::ensure_private_dir(dir)
+            .expect("secure saturated guard lifecycle directory");
+        let server = std::os::unix::net::UnixDatagram::bind(lifecycle_path)
+            .expect("bind saturated guard lifecycle endpoint");
+        let identity = spawnd::sessiond::endpoint::secure_bound_socket(lifecycle_path)
+            .expect("secure saturated guard lifecycle endpoint");
+        let flood_path = dir.join("guard-flood.sock");
+        let flood = std::os::unix::net::UnixDatagram::bind(&flood_path)
+            .expect("bind guard lifecycle flood sender");
+        flood
+            .connect(lifecycle_path)
+            .expect("connect guard lifecycle flood sender");
+        flood
+            .set_nonblocking(true)
+            .expect("set guard lifecycle flood sender nonblocking");
+        let payload = [0u8; spawnd::sessiond::wire::LIFECYCLE_REQUEST_LEN];
+        let mut saturated = false;
+        for _ in 0..1024 {
+            match flood.send(&payload) {
+                Ok(size) => assert_eq!(size, payload.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("saturating guard lifecycle endpoint failed: {error}"),
+            }
+        }
+        assert!(
+            saturated,
+            "guard lifecycle endpoint did not become nonwritable"
+        );
+        (server, flood, identity)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_cleanup_guard_drop_is_bounded_on_a_nonwritable_endpoint() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let env = WorkerTestEnv::install();
+        let agent_id = Uuid::new_v4();
+        spawnd::sessiond::endpoint::ensure_private_dir(env.path())
+            .expect("secure guard test worker directory");
+        let ordinary_path = env.path().join(format!("{agent_id}.sock"));
+        let ordinary = std::os::unix::net::UnixDatagram::bind(&ordinary_path)
+            .expect("bind persistent fake worker endpoint");
+        let ordinary_identity = spawnd::sessiond::endpoint::secure_bound_socket(&ordinary_path)
+            .expect("secure persistent fake worker endpoint");
+        let lifecycle_path = spawnd::sessiond::wire::lifecycle_socket_path(&ordinary_path);
+        let (_lifecycle, _flood, _lifecycle_identity) =
+            saturate_test_lifecycle_endpoint(env.path(), &lifecycle_path);
+        let mut unrelated = TestChildCleanup(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn guard sentinel process"),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
+            agent_id,
+            cmd_tx,
+            lifecycle: crate::pty::AgentLifecycle::new(lifecycle_path, Uuid::new_v4()),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: crate::pty::ForwarderControl::new(),
+        });
+        let guard = WorkerCleanupGuard::new(agent_id, &handle);
+        drop(handle);
+
+        let started = std::time::Instant::now();
+        drop(guard);
+        assert!(
+            started.elapsed() <= WORKER_TEST_CLEANUP_TIMEOUT + Duration::from_millis(500),
+            "worker cleanup guard exceeded its advertised bound"
+        );
+        assert!(
+            crate::worker_backend::socket_exists(agent_id),
+            "test did not retain the deliberately stuck worker endpoint"
+        );
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "worker cleanup guard touched an unrelated process"
+        );
+        drop(ordinary_identity);
+        drop(ordinary);
     }
 
     async fn request_history(client: &mut RtcTestClient) -> Vec<u8> {

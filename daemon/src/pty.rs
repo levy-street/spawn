@@ -667,9 +667,25 @@ impl AgentLifecycle {
                 .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
             let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
                 .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
-            if socket.connect(&self.socket).is_err() || socket.send(&request).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            if socket.connect(&self.socket).is_err() {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                ))
+                .await;
                 continue;
+            }
+            match tokio::time::timeout_at(deadline, socket.send(&request)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
+                    tokio::time::sleep_until(std::cmp::min(
+                        deadline,
+                        tokio::time::Instant::now() + Duration::from_millis(10),
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(_) => anyhow::bail!("worker lifecycle delivery deadline exceeded"),
             }
             let mut ack = [0u8; 2];
             let attempt_deadline = std::cmp::min(
@@ -678,7 +694,11 @@ impl AgentLifecycle {
             );
             let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
             let Ok(Ok(1)) = received else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                ))
+                .await;
                 continue;
             };
             return match ack[0] {
@@ -931,7 +951,87 @@ async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixDatagram as StdUnixDatagram;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct ChildCleanup(std::process::Child);
+
+    impl Drop for ChildCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn saturate_lifecycle_endpoint(
+        dir: &std::path::Path,
+        server_path: &std::path::Path,
+    ) -> (
+        StdUnixDatagram,
+        StdUnixDatagram,
+        spawnd::sessiond::endpoint::EndpointIdentity,
+    ) {
+        spawnd::sessiond::endpoint::ensure_private_dir(dir)
+            .expect("secure saturated lifecycle directory");
+        let server = StdUnixDatagram::bind(server_path).expect("bind saturated lifecycle server");
+        let identity = spawnd::sessiond::endpoint::secure_bound_socket(server_path)
+            .expect("secure saturated lifecycle server");
+        let flood_path = dir.join("flood.sock");
+        let flood = StdUnixDatagram::bind(&flood_path).expect("bind lifecycle flood sender");
+        flood
+            .connect(server_path)
+            .expect("connect lifecycle flood sender");
+        flood
+            .set_nonblocking(true)
+            .expect("set lifecycle flood sender nonblocking");
+        let payload = [0u8; wire::LIFECYCLE_REQUEST_LEN];
+        let mut saturated = false;
+        for _ in 0..1024 {
+            match flood.send(&payload) {
+                Ok(size) => assert_eq!(size, payload.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("saturating lifecycle endpoint failed: {error}"),
+            }
+        }
+        assert!(saturated, "lifecycle endpoint did not become nonwritable");
+        (server, flood, identity)
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_send_obeys_the_absolute_deadline() {
+        let dir = tempfile::tempdir().expect("lifecycle timeout tempdir");
+        let server_path = dir.path().join("lifecycle.sock");
+        let (_server, _flood, _identity) = saturate_lifecycle_endpoint(dir.path(), &server_path);
+        let mut unrelated = ChildCleanup(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn unrelated sentinel process"),
+        );
+        let lifecycle = AgentLifecycle::new(server_path, Uuid::new_v4());
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            LIFECYCLE_DELIVERY_TIMEOUT + Duration::from_secs(1),
+            lifecycle.shutdown(wire::LifecycleSignal::Kill),
+        )
+        .await
+        .expect("lifecycle send exceeded its advertised deadline")
+        .expect_err("saturated lifecycle endpoint accepted shutdown");
+        assert!(error
+            .to_string()
+            .contains("worker lifecycle delivery deadline exceeded"));
+        assert!(
+            started.elapsed() <= LIFECYCLE_DELIVERY_TIMEOUT + Duration::from_millis(500),
+            "lifecycle send returned beyond its deadline"
+        );
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "lifecycle timeout touched an unrelated process"
+        );
+    }
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
