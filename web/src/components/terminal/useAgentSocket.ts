@@ -434,6 +434,7 @@ export function useAgentSocket({
         if (!pending) return false;
         const message = parseAgentCtlUploadResponse(response, pending.expected);
         if (!message) return true;
+        if (pending.controller.signal.aborted || !isCurrentRtcGeneration()) return true;
         if (pending.waiter) {
           const waiter = pending.waiter;
           pending.waiter = undefined;
@@ -448,10 +449,13 @@ export function useAgentSocket({
       const waitUploadMessage = (
         uploadId: string,
         timeoutMs: number,
-        signal?: AbortSignal,
+        signal: AbortSignal,
+        invalidReason: () => Error | null,
       ): Promise<UploadMessage> => {
         const pending = pendingUploads.get(uploadId);
         if (!pending) return Promise.reject(new Error("Upload request is no longer active."));
+        const invalid = invalidReason();
+        if (invalid) return Promise.reject(invalid);
         const queued = pending.messages.shift();
         if (queued) return Promise.resolve(queued);
         if (pending.waiter) return Promise.reject(new Error("Upload response wait is duplicated."));
@@ -462,29 +466,31 @@ export function useAgentSocket({
               pending.waiter = undefined;
             }
             reject(
-              signal?.reason instanceof Error
+              signal.reason instanceof Error
                 ? signal.reason
                 : new DOMException("Upload cancelled.", "AbortError"),
             );
           };
           const timer = setTimeout(() => {
-            signal?.removeEventListener("abort", onAbort);
+            signal.removeEventListener("abort", onAbort);
             pending.waiter = undefined;
-            reject(new Error("Direct upload response timed out."));
+            reject(invalidReason() ?? new Error("Direct upload response timed out."));
           }, timeoutMs);
           pending.waiter = {
             resolve: (message) => {
-              signal?.removeEventListener("abort", onAbort);
-              resolve(message);
+              signal.removeEventListener("abort", onAbort);
+              const invalid = invalidReason();
+              if (invalid) reject(invalid);
+              else resolve(message);
             },
             reject: (error) => {
-              signal?.removeEventListener("abort", onAbort);
+              signal.removeEventListener("abort", onAbort);
               reject(error);
             },
             timer,
           };
-          if (signal?.aborted) onAbort();
-          else signal?.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
         });
       };
 
@@ -518,16 +524,33 @@ export function useAgentSocket({
         blob: Blob,
         options: DirectAgentUploadOptions,
       ): Promise<AgentCtlUploadResult> => {
-        if (
-          !isCurrentRtcGeneration() ||
-          !rtcRef.current.open ||
-          ctlDc.readyState !== "open" ||
-          !uploadCapability ||
-          uploadAgentGeneration === null
-        ) {
+        const uploadContextError = (signal?: AbortSignal): Error | null => {
+          if (signal?.aborted) {
+            return signal.reason instanceof Error
+              ? signal.reason
+              : new DOMException("Upload cancelled.", "AbortError");
+          }
+          const current = rtcRef.current;
+          if (
+            !isCurrentRtcGeneration() ||
+            !current.open ||
+            current.ctlDc !== ctlDc ||
+            ctlDc.readyState !== "open"
+          ) {
+            return new Error("Direct agent upload channel closed.");
+          }
+          return null;
+        };
+        const assertUploadContext = (signal?: AbortSignal) => {
+          const error = uploadContextError(signal);
+          if (error) throw error;
+        };
+        assertUploadContext(options.signal);
+        if (!uploadCapability || uploadAgentGeneration === null) {
           throw new Error("Direct agent upload channel is not ready.");
         }
-        const sha256 = await sha256Blob(blob);
+        const sha256 = await sha256Blob(blob, () => assertUploadContext(options.signal));
+        assertUploadContext(options.signal);
         if (!sha256) throw new Error("Could not securely hash the upload.");
         const uploadId = options.uploadId ?? newAgentCtlRequestId();
         const expected: AgentCtlUploadStart = {
@@ -549,8 +572,13 @@ export function useAgentSocket({
         if (options.signal?.aborted) abortFromCaller();
         else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
         const uploadSignal = controller.signal;
+        const invalidUploadReason = () => uploadContextError(uploadSignal);
         pendingUploads.set(uploadId, { expected, messages: [], controller, waiter: undefined });
+        let startDispatched = false;
+        let cancelSent = false;
         const sendCancel = () => {
+          if (!startDispatched || cancelSent) return;
+          cancelSent = true;
           const text = makeAgentCtlUploadCancel(
             newAgentCtlRequestId(),
             uploadId,
@@ -567,6 +595,9 @@ export function useAgentSocket({
         };
         const pending = pendingUploads.get(uploadId);
         if (pending) pending.cancel = sendCancel;
+        const cancelOnAbort = () => sendCancel();
+        uploadSignal.addEventListener("abort", cancelOnAbort, { once: true });
+        if (uploadSignal.aborted) cancelOnAbort();
         let finalDispatched = false;
         const unknownAfterFinal = (error: unknown) => {
           if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
@@ -581,17 +612,16 @@ export function useAgentSocket({
         try {
           let message: UploadMessage | null = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
-            if (uploadSignal.aborted) {
-              throw uploadSignal.reason instanceof Error
-                ? uploadSignal.reason
-                : new DOMException("Upload cancelled.", "AbortError");
-            }
+            assertUploadContext(uploadSignal);
             options.beforeUploadStart?.();
+            assertUploadContext(uploadSignal);
             ctlDc.send(startText);
+            startDispatched = true;
             try {
-              message = await waitUploadMessage(uploadId, 5000, uploadSignal);
+              message = await waitUploadMessage(uploadId, 5000, uploadSignal, invalidUploadReason);
+              assertUploadContext(uploadSignal);
             } catch (error) {
-              if (attempt < 2 && !uploadSignal.aborted) continue;
+              if (attempt < 2 && invalidUploadReason() === null) continue;
               throw error;
             }
             if (message.kind === "complete") return message.result;
@@ -604,22 +634,36 @@ export function useAgentSocket({
             throw new Error("Direct agent upload did not start after bounded retries.");
           }
           for (let sequence = message.nextSequence; sequence < expected.chunks; sequence += 1) {
-            if (!isCurrentRtcGeneration() || ctlDc.readyState !== "open") {
-              throw finalDispatched
-                ? unknownAfterFinal(new Error("Direct agent upload channel closed."))
-                : new Error("Direct agent upload channel closed.");
-            }
+            assertUploadContext(uploadSignal);
             await waitForUploadBackpressure(uploadSignal).catch((error) => {
               throw finalDispatched ? unknownAfterFinal(error) : error;
             });
+            assertUploadContext(uploadSignal);
             const start = sequence * AGENT_CTL_UPLOAD_CHUNK_BYTES;
             const end = Math.min(start + AGENT_CTL_UPLOAD_CHUNK_BYTES, blob.size);
-            const payload = new Uint8Array(await blob.slice(start, end).arrayBuffer());
+            const chunkBuffer = await blob.slice(start, end).arrayBuffer();
+            const payload = new Uint8Array(chunkBuffer);
+            let frame: ReturnType<typeof encodeAgentCtlUploadChunk>;
+            try {
+              assertUploadContext(uploadSignal);
+              frame = encodeAgentCtlUploadChunk(
+                uploadId,
+                sequence,
+                sequence + 1 === expected.chunks,
+                payload,
+              );
+            } finally {
+              payload.fill(0);
+            }
             const isFinal = sequence + 1 === expected.chunks;
-            const frame = encodeAgentCtlUploadChunk(uploadId, sequence, isFinal, payload);
-            payload.fill(0);
             if (!frame) throw new Error("Could not frame upload chunk.");
-            if (isFinal) options.beforeFinalDispatch?.();
+            assertUploadContext(uploadSignal);
+            if (isFinal) {
+              assertUploadContext(uploadSignal);
+              options.beforeFinalDispatch?.();
+              assertUploadContext(uploadSignal);
+            }
+            assertUploadContext(uploadSignal);
             ctlDc.send(frame.buffer as ArrayBuffer);
             if (isFinal) {
               finalDispatched = true;
@@ -627,7 +671,8 @@ export function useAgentSocket({
             }
           }
           try {
-            message = await waitUploadMessage(uploadId, 30_000, uploadSignal);
+            message = await waitUploadMessage(uploadId, 30_000, uploadSignal, invalidUploadReason);
+            assertUploadContext(uploadSignal);
           } catch (error) {
             throw finalDispatched ? unknownAfterFinal(error) : error;
           }
@@ -645,6 +690,7 @@ export function useAgentSocket({
             : error;
         } finally {
           options.signal?.removeEventListener("abort", abortFromCaller);
+          uploadSignal.removeEventListener("abort", cancelOnAbort);
           const pending = pendingUploads.get(uploadId);
           if (pending?.waiter) clearTimeout(pending.waiter.timer);
           pendingUploads.delete(uploadId);

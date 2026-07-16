@@ -506,7 +506,12 @@ both `sessionStorage` and history fallback writes fail, and native storage/
 history exceptions never replace the typed upload-blocked result. The browser
 then hashes before sending, applies SCTP buffered-amount backpressure, and
 retries only the pre-effect `upload_start` exchange with a stable upload UUID a
-bounded number of times. Immediately before the final chunk it durably promotes
+bounded number of times. After every asynchronous hash, digest, backpressure,
+chunk-read, and response boundary it rechecks cancellation, the immutable RTC
+generation, and the exact open control-channel identity. It repeats those
+checks before and after durable reconciliation promotion and synchronously
+before sending the final frame; queued completion cannot outrun cancellation or
+generation replacement. Immediately before the final chunk it durably promotes
 the reserved
 record to `outcome_unknown`; a failed promotion prevents final dispatch and
 cancels the unpublished upload. It never retries after dispatching the final
@@ -514,7 +519,11 @@ chunk. A timeout, abort, or disconnect after that dispatch is stable
 `outcome_unknown`; best-effort cancellation cannot downgrade it, and the user
 must reconcile the destination before retrying. The daemon admits
 at most 20 MiB per upload, 48 KiB per chunk, four active uploads per viewer,
-and 64 active uploads globally. A retry with the identical manifest resumes at
+and 64 active uploads globally. Hub lookup and admission are one atomic state
+operation returning `Inserted`, `Existing`, or `Complete`; only `Inserted`
+prepares a descriptor and private temporary file. `Existing` performs exact
+owner, manifest, lifecycle, and resume/conflict checks without replacing the
+resident slot. A retry with the identical manifest resumes at
 the acknowledged sequence or returns the cached completion; reuse with a
 different manifest fails. Chunks must be ordered with exact lengths and final
 flag. Length, SHA-256, capability, backend generation, framing, and destination

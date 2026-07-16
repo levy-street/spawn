@@ -453,6 +453,7 @@ export async function installAgentRtcMock(
             } | null;
             releaseUploadBackpressure: () => void;
             releaseHeldUploadCompletion: () => void;
+            queueActiveUploadCompletion: () => boolean;
             replaceRtcGeneration: () => void;
           };
         }
@@ -500,6 +501,28 @@ export async function installAgentRtcMock(
         releaseHeldUploadCompletion() {
           const held = state.heldUploadCompletes.shift();
           if (held) held.channel.receive(held.message);
+        },
+        queueActiveUploadCompletion() {
+          const active = state.uploads.entries().next().value as
+            | [string, { request: Record<string, unknown> }]
+            | undefined;
+          const channel = state.channels.get("spawn.ctl");
+          if (!active || !channel) return false;
+          const [uploadId, upload] = active;
+          channel.receive(
+            JSON.stringify({
+              version: 1,
+              kind: "response",
+              request_id: uploadId,
+              operation: "upload_complete",
+              ok: true,
+              state: "complete",
+              path: `/Users/tester/projects/spawn/${String(upload.request.name)}`,
+              total_bytes: upload.request.total_bytes,
+              sha256: upload.request.sha256,
+            }),
+          );
+          return true;
         },
         replaceRtcGeneration() {
           state.channels.get("spawn.ctl")?.close();

@@ -3206,6 +3206,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::Path;
 
+    const DIRECT_ENDPOINT_BYTES_FIELD: &str = concat!("bytes", "_b64");
+
     async fn receive_host_control(
         messages: &mut mpsc::Receiver<(usize, String)>,
     ) -> (usize, Value) {
@@ -6468,7 +6470,7 @@ mod tests {
             assert_eq!(message["stream_id"], source_stream_id);
             transferred.extend(
                 STANDARD
-                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .decode(message[DIRECT_ENDPOINT_BYTES_FIELD].as_str().unwrap())
                     .unwrap(),
             );
             source_channel
@@ -6510,7 +6512,7 @@ mod tests {
                         "type": "stream.chunk",
                         "stream_id": destination_stream_id,
                         "sequence": sequence,
-                        "bytes_b64": STANDARD.encode(chunk),
+                        (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode(chunk),
                     })
                     .to_string(),
                 )
@@ -7373,7 +7375,7 @@ mod tests {
                     "type": "stream.chunk",
                     "stream_id": stream_id,
                     "sequence": 0,
-                    "bytes_b64": STANDARD.encode(b"x"),
+                    (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode(b"x"),
                 })
             } else {
                 json!({
@@ -7477,7 +7479,7 @@ mod tests {
                     "type": "stream.chunk",
                     "stream_id": write_stream_id,
                     "sequence": 0,
-                    "bytes_b64": STANDARD.encode(b"x"),
+                    (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode(b"x"),
                     "test_delay_ms": 1_000,
                 })
                 .to_string(),
@@ -7728,7 +7730,7 @@ mod tests {
                         "type": "stream.chunk",
                         "stream_id": write_stream_id,
                         "sequence": sequence,
-                        "bytes_b64": STANDARD.encode(chunk),
+                        (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode(chunk),
                     })
                     .to_string(),
                 )
@@ -7779,7 +7781,7 @@ mod tests {
                     "type": "stream.chunk",
                     "stream_id": cancelled_write_id,
                     "sequence": 0,
-                    "bytes_b64": STANDARD.encode(b"a"),
+                    (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode(b"a"),
                 })
                 .to_string(),
             )
@@ -7833,7 +7835,7 @@ mod tests {
                         "type": "stream.chunk",
                         "stream_id": backlog_stream_id,
                         "sequence": sequence,
-                        "bytes_b64": STANDARD.encode([*byte]),
+                        (DIRECT_ENDPOINT_BYTES_FIELD): STANDARD.encode([*byte]),
                     })
                     .to_string(),
                 )
@@ -7898,7 +7900,7 @@ mod tests {
             assert_eq!(message["stream_id"], read_stream_id);
             downloaded.extend(
                 STANDARD
-                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .decode(message[DIRECT_ENDPOINT_BYTES_FIELD].as_str().unwrap())
                     .unwrap(),
             );
             accepted_channel

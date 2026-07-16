@@ -74,19 +74,31 @@ allowed_server_sentinel() {
   esac
 }
 
-allowed_rtc_test_only_bytes() {
+allowed_daemon_endpoint_bytes() {
   local match="$1"
-  [[ "$match" == daemon/src/rtc.rs:*bytes_b64* ]] || return 1
-  local remainder="${match#daemon/src/rtc.rs:}"
+  local file="${match%%:*}"
+  local remainder="${match#*:}"
   local match_line="${remainder%%:*}"
+  local content="${remainder#*:}"
   [[ "$match_line" =~ ^[0-9]+$ ]] || return 1
-  local tests_line status
-  set +e
-  tests_line="$(rg -n --color never '^mod tests \{$' daemon/src/rtc.rs 2>/dev/null)"
-  status=$?
-  set -e
-  [[ $status == 0 && "$tests_line" =~ ^([0-9]+): ]] || return 1
-  ((match_line > BASH_REMATCH[1]))
+  [[ "$file" == "daemon/src/host_control.rs" ]] || return 1
+  [[ "$content" == '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' || \
+    "$content" == '            object.get("bytes_b64").and_then(Value::as_str),' ]]
+}
+
+allowed_web_endpoint_bytes() {
+  local match="$1"
+  local file="${match%%:*}"
+  local remainder="${match#*:}"
+  local match_line="${remainder%%:*}"
+  local content="${remainder#*:}"
+  [[ "$match_line" =~ ^[0-9]+$ ]] || return 1
+  [[ "$file" == "web/src/lib/hostControl.ts" ]] || return 1
+  [[ "$content" == '            bytes_b64: bytesToBase64(chunk),' || \
+    "$content" == '      bytes_b64?: string;' || \
+    "$content" == '            message.bytes_b64,' || \
+    "$content" == '        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {' || \
+    "$content" == '          bytes = base64ToBytes(message.bytes_b64);' ]]
 }
 
 run_guard() {
@@ -131,10 +143,7 @@ run_guard() {
   rejected=""
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
-    case "$match" in
-      daemon/src/host_control.rs:*bytes_b64*) ;;
-      *) allowed_rtc_test_only_bytes "$match" || rejected+="$match"$'\n' ;;
-    esac
+    allowed_daemon_endpoint_bytes "$match" || rejected+="$match"$'\n'
   done <<<"$matches"
   if [[ -n "$rejected" ]]; then
     printf 'no-server-agent-upload: daemon WebSocket/content upload leg returned:\n%s' \
@@ -148,9 +157,9 @@ run_guard() {
   rejected=""
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
-    case "$match" in
-      web/src/lib/hostControl.ts:*bytes_b64* | web/src/lib/hostControl.test.ts:*bytes_b64*) ;;
-      *) rejected+="$match"$'\n' ;;
+    case "${match%%:*}" in
+      *.test.ts | *.test.tsx) ;;
+      *) allowed_web_endpoint_bytes "$match" || rejected+="$match"$'\n' ;;
     esac
   done <<<"$matches"
   if [[ -n "$rejected" ]]; then
@@ -203,10 +212,29 @@ self_test() {
     'fn production_rtc() {}' \
     '#[cfg(test)]' \
     'mod tests {' \
-    '    const DIRECT_ENDPOINT_FIELD: &str = "bytes_b64";' \
+    '    const DIRECT_ENDPOINT_FIELD: &str = concat!("bytes", "_b64");' \
     '}' \
     >"$fixture/daemon/src/rtc.rs"
+  printf '%s\n' \
+    'fn direct_read() {' \
+    '                    "bytes_b64": STANDARD.encode(&buffer[..read]),' \
+    '}' \
+    'fn direct_write(object: Object) {' \
+    '            object.get("bytes_b64").and_then(Value::as_str),' \
+    '}' \
+    >"$fixture/daemon/src/host_control.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
+  printf '%s\n' \
+    'export function directHostChannel() {' \
+    '            bytes_b64: bytesToBase64(chunk),' \
+    '      bytes_b64?: string;' \
+    '            message.bytes_b64,' \
+    '        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {' \
+    '          bytes = base64ToBytes(message.bytes_b64);' \
+    '}' \
+    >"$fixture/web/src/lib/hostControl.ts"
+  printf '%s\n' 'const directTest = { bytes_b64: btoa("x") };' \
+    >"$fixture/web/src/lib/hostControl.test.ts"
 
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
@@ -245,6 +273,46 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$rtc_original" >"$fixture/daemon/src/rtc.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$rtc_original" \
+    'fn legacy_agent_upload_after_tests(bytes_b64: &str) { send_to_server(bytes_b64); }' \
+    >"$fixture/daemon/src/rtc.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: post-tests rtc.rs relay passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$rtc_original" >"$fixture/daemon/src/rtc.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local host_control_original
+  host_control_original="$(<"$fixture/daemon/src/host_control.rs")"
+  printf '%s\n' \
+    "$host_control_original" \
+    'fn legacy_host_relay(bytes_b64: &str) { send_to_server(bytes_b64); }' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: privileged daemon host-control relay passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local web_host_control_original
+  web_host_control_original="$(<"$fixture/web/src/lib/hostControl.ts")"
+  printf '%s\n' \
+    "$web_host_control_original" \
+    'export function legacyHostRelay(bytes_b64: string) { sendToServer(bytes_b64); }' \
+    >"$fixture/web/src/lib/hostControl.ts"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: privileged web host-control relay passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$web_host_control_original" >"$fixture/web/src/lib/hostControl.ts"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   sed -i '/agent uploads belong on spawn.ctl/d' "$fixture/server/spawn_server/ws/browser.py"

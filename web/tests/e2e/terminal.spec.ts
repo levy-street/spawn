@@ -174,6 +174,34 @@ async function stallFirstUploadHash(page: Page) {
   });
 }
 
+async function stallFinalUploadRead(page: Page) {
+  await page.addInitScript(() => {
+    const original = Blob.prototype.arrayBuffer;
+    let uploadReads = 0;
+    let finalReadStarted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Blob.prototype.arrayBuffer = async function () {
+      uploadReads += 1;
+      if (uploadReads === 2) {
+        finalReadStarted = true;
+        await gate;
+      }
+      return original.call(this);
+    };
+    (
+      window as unknown as {
+        __spawnFinalUploadReadGate: { started: () => boolean; release: () => void };
+      }
+    ).__spawnFinalUploadReadGate = {
+      started: () => finalReadStarted,
+      release,
+    };
+  });
+}
+
 function liveTerminal(page: Page) {
   return page.getByTestId("terminal-live-host").locator(".xterm");
 }
@@ -773,6 +801,59 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
 });
 
+test("remove during the final Blob read ignores queued completion and sends no final frame", async ({
+  page,
+}) => {
+  await stallFinalUploadRead(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["gated final read"], "gated-remove.png", { type: "image/png" }));
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove gated-remove.png" })).toBeVisible();
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __spawnFinalUploadReadGate: { started: () => boolean };
+          }
+        ).__spawnFinalUploadReadGate.started(),
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as {
+          __spawnRtcTest: { queueActiveUploadCompletion: () => boolean };
+        }
+      ).__spawnRtcTest.queueActiveUploadCompletion(),
+    ),
+  ).toBe(true);
+  await page.waitForTimeout(25);
+
+  await page.getByRole("button", { name: "Remove gated-remove.png" }).click();
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnFinalUploadReadGate: { release: () => void } }
+    ).__spawnFinalUploadReadGate.release();
+  });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+});
+
 test("removing an attachment after publication preserves outcome_unknown", async ({ page }) => {
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
@@ -895,6 +976,46 @@ test("RTC generation replacement is definitive before final dispatch", async ({ 
   });
   await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
   expect(uploads).toHaveLength(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("RTC generation replacement during the final Blob read cannot dispatch", async ({ page }) => {
+  await stallFinalUploadRead(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "gated-generation.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("gated generation"),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __spawnFinalUploadReadGate: { started: () => boolean };
+          }
+        ).__spawnFinalUploadReadGate.started(),
+      ),
+    )
+    .toBe(true);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+    (
+      window as unknown as { __spawnFinalUploadReadGate: { release: () => void } }
+    ).__spawnFinalUploadReadGate.release();
+  });
+  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
   );

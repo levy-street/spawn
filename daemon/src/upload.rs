@@ -3,9 +3,9 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-#[cfg(test)]
-use std::sync::Condvar;
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
+use std::sync::{Barrier, Condvar};
 use std::time::{Duration, Instant as StdInstant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -237,6 +237,12 @@ struct ActiveEntry {
     changed: Notify,
 }
 
+enum UploadAdmission {
+    Inserted(Arc<ActiveEntry>),
+    Existing(Arc<ActiveEntry>),
+    Complete(UploadResult),
+}
+
 struct CompletedUpload {
     manifest: UploadManifest,
     result: UploadResult,
@@ -265,7 +271,11 @@ struct UploadOperationPermit {
 #[derive(Default)]
 struct UploadLifecycleHooks {
     #[cfg(test)]
+    admit: StdMutex<Option<Arc<AdmissionBarrier>>>,
+    #[cfg(test)]
     prepare: BlockingPause,
+    #[cfg(test)]
+    prepare_count: AtomicUsize,
     #[cfg(test)]
     write_sync: BlockingPause,
     #[cfg(test)]
@@ -279,9 +289,51 @@ struct UploadLifecycleHooks {
 }
 
 impl UploadLifecycleHooks {
+    #[cfg(test)]
+    fn arm_admit_barrier(&self, participants: usize) {
+        assert!(participants > 1);
+        *self
+            .admit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(AdmissionBarrier {
+                barrier: Barrier::new(participants),
+                remaining: AtomicUsize::new(participants),
+            }));
+    }
+
+    fn pause_admit(&self) {
+        #[cfg(test)]
+        {
+            let pause = self
+                .admit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(pause) = pause {
+                pause.barrier.wait();
+                if pause.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let mut armed = self
+                        .admit
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if armed
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &pause))
+                    {
+                        *armed = None;
+                    }
+                }
+            }
+        }
+    }
+
     fn pause_prepare(&self) {
         #[cfg(test)]
-        self.prepare.pause_if_armed();
+        {
+            self.prepare_count.fetch_add(1, Ordering::AcqRel);
+            self.prepare.pause_if_armed();
+        }
     }
 
     fn pause_write_sync(&self) {
@@ -322,6 +374,12 @@ impl UploadLifecycleHooks {
         #[cfg(not(test))]
         false
     }
+}
+
+#[cfg(test)]
+struct AdmissionBarrier {
+    barrier: Barrier,
+    remaining: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -429,67 +487,45 @@ impl UploadHub {
             capability,
             session_id: session_id.to_string(),
         };
-        let entry = loop {
-            let existing = {
-                let mut state = self
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                prune_completed(&mut state);
-                if state
-                    .retired_generations
-                    .contains(&(key.agent_id, key.agent_generation))
-                {
-                    return Err(UploadError::new(
-                        "stale_agent_generation",
-                        "the upload belongs to a replaced agent backend",
-                    ));
-                }
-                if let Some(completed) = state.completed.get(&key) {
-                    if completed.manifest != manifest {
-                        return Err(UploadError::failed(
-                            "upload id was reused with a conflicting manifest",
-                        ));
-                    }
-                    return Ok(UploadStartOutcome::Complete(completed.result.clone()));
-                }
-                state.active.get(&key).cloned()
-            };
-            let Some(existing) = existing else {
-                break self.admit(key.clone(), owner.clone(), manifest.clone())?;
-            };
-            if existing.owner != owner || existing.manifest != manifest {
-                return Err(UploadError::failed(
-                    "upload id is already active with another manifest or capability",
-                ));
+        let entry = match self.admit(key.clone(), owner.clone(), manifest.clone())? {
+            UploadAdmission::Inserted(entry) => entry,
+            UploadAdmission::Complete(result) => {
+                return Ok(UploadStartOutcome::Complete(result));
             }
-            match existing.lifecycle.load(Ordering::Acquire) {
-                UPLOAD_PREPARING => {
-                    let changed = existing.changed.notified();
-                    if existing.lifecycle.load(Ordering::Acquire) == UPLOAD_PREPARING {
-                        changed.await;
-                    }
-                    continue;
-                }
-                UPLOAD_ACTIVE => {
-                    let upload = existing.upload.try_lock().map_err(|_| {
-                        UploadError::failed("upload operation is already in progress")
-                    })?;
-                    let upload = upload
-                        .as_ref()
-                        .ok_or_else(|| UploadError::failed("upload preparation is incomplete"))?;
-                    return Ok(UploadStartOutcome::Ready {
-                        next_sequence: upload.next_sequence,
-                        received_bytes: upload.received_bytes,
-                    });
-                }
-                UPLOAD_COMMITTING | UPLOAD_PUBLISHED => {
-                    return Err(UploadError::outcome_unknown(
-                        "the final upload operation has no acknowledged result",
+            UploadAdmission::Existing(existing) => {
+                if existing.owner != owner || existing.manifest != manifest {
+                    return Err(UploadError::failed(
+                        "upload id is already active with another manifest or capability",
                     ));
                 }
-                _ => return Err(UploadError::cancelled()),
+                loop {
+                    match existing.lifecycle.load(Ordering::Acquire) {
+                        UPLOAD_PREPARING => {
+                            let changed = existing.changed.notified();
+                            if existing.lifecycle.load(Ordering::Acquire) == UPLOAD_PREPARING {
+                                changed.await;
+                            }
+                        }
+                        UPLOAD_ACTIVE => {
+                            let upload = existing.upload.try_lock().map_err(|_| {
+                                UploadError::failed("upload operation is already in progress")
+                            })?;
+                            let upload = upload.as_ref().ok_or_else(|| {
+                                UploadError::failed("upload preparation is incomplete")
+                            })?;
+                            return Ok(UploadStartOutcome::Ready {
+                                next_sequence: upload.next_sequence,
+                                received_bytes: upload.received_bytes,
+                            });
+                        }
+                        UPLOAD_COMMITTING | UPLOAD_PUBLISHED => {
+                            return Err(UploadError::outcome_unknown(
+                                "the final upload operation has no acknowledged result",
+                            ));
+                        }
+                        _ => return Err(UploadError::cancelled()),
+                    }
+                }
             }
         };
 
@@ -888,12 +924,14 @@ impl UploadHub {
         key: UploadKey,
         owner: UploadOwner,
         manifest: UploadManifest,
-    ) -> UploadOpResult<Arc<ActiveEntry>> {
+    ) -> UploadOpResult<UploadAdmission> {
+        self.inner.hooks.pause_admit();
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_completed(&mut state);
         if state
             .retired_generations
             .contains(&(key.agent_id, key.agent_generation))
@@ -903,8 +941,16 @@ impl UploadHub {
                 "the upload belongs to a replaced agent backend",
             ));
         }
+        if let Some(completed) = state.completed.get(&key) {
+            if completed.manifest != manifest {
+                return Err(UploadError::failed(
+                    "upload id was reused with a conflicting manifest",
+                ));
+            }
+            return Ok(UploadAdmission::Complete(completed.result.clone()));
+        }
         if let Some(entry) = state.active.get(&key) {
-            return Ok(Arc::clone(entry));
+            return Ok(UploadAdmission::Existing(Arc::clone(entry)));
         }
         let session_active = state
             .active
@@ -927,7 +973,7 @@ impl UploadHub {
             changed: Notify::new(),
         });
         state.active.insert(key, Arc::clone(&entry));
-        Ok(entry)
+        Ok(UploadAdmission::Inserted(entry))
     }
 
     fn matching_entries(
@@ -1767,6 +1813,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hub.retained_counts().await, (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_owner_start_prepares_once_and_resumes_the_inserted_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = UploadHub::default();
+        let hooks = hub.lifecycle_hooks();
+        hooks.arm_admit_barrier(2);
+        hooks.prepare.arm();
+        let agent = AgentBinding::new(Uuid::new_v4(), 81);
+        let capability = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let upload_manifest = manifest(b"same", "same.bin", UploadDestination::Cwd);
+
+        let first_hub = hub.clone();
+        let first_cwd = cwd.clone();
+        let first_manifest = upload_manifest.clone();
+        let first = tokio::spawn(async move {
+            first_hub
+                .start(
+                    agent,
+                    "viewer",
+                    capability,
+                    upload_id,
+                    &first_cwd,
+                    first_manifest,
+                )
+                .await
+        });
+        let second_hub = hub.clone();
+        let second_manifest = upload_manifest.clone();
+        let second = tokio::spawn(async move {
+            second_hub
+                .start(
+                    agent,
+                    "viewer",
+                    capability,
+                    upload_id,
+                    &cwd,
+                    second_manifest,
+                )
+                .await
+        });
+        hooks.prepare.wait_until_entered().await;
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+        assert_eq!(hub.retained_counts().await.0, 1);
+
+        hooks.prepare.release();
+        let (first, second) = tokio::join!(first, second);
+        for outcome in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
+            assert!(matches!(
+                outcome,
+                UploadStartOutcome::Ready {
+                    next_sequence: 0,
+                    received_bytes: 0
+                }
+            ));
+        }
+        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+        let private_temps = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
+            .count();
+        assert_eq!(private_temps, 1);
+
+        assert!(hub
+            .cancel(agent, "viewer", capability, upload_id)
+            .await
+            .unwrap());
+        wait_for_upload_drain(&hub).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("spawn-upload")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_different_owner_start_conflicts_without_replacing_the_inserted_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = UploadHub::default();
+        let hooks = hub.lifecycle_hooks();
+        hooks.arm_admit_barrier(2);
+        hooks.prepare.arm();
+        let agent = AgentBinding::new(Uuid::new_v4(), 82);
+        let capability = Uuid::new_v4();
+        let other_capability = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let upload_manifest = manifest(b"owner", "owner.bin", UploadDestination::Cwd);
+
+        let first_hub = hub.clone();
+        let first_cwd = cwd.clone();
+        let first_manifest = upload_manifest.clone();
+        let first = tokio::spawn(async move {
+            first_hub
+                .start(
+                    agent,
+                    "viewer-a",
+                    capability,
+                    upload_id,
+                    &first_cwd,
+                    first_manifest,
+                )
+                .await
+        });
+        let second_hub = hub.clone();
+        let second_cwd = cwd.clone();
+        let second_manifest = upload_manifest.clone();
+        let second = tokio::spawn(async move {
+            second_hub
+                .start(
+                    agent,
+                    "viewer-b",
+                    other_capability,
+                    upload_id,
+                    &second_cwd,
+                    second_manifest,
+                )
+                .await
+        });
+        hooks.prepare.wait_until_entered().await;
+        for _ in 0..100 {
+            if first.is_finished() || second.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_ne!(first.is_finished(), second.is_finished());
+        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+        assert_eq!(hub.retained_counts().await.0, 1);
+
+        hooks.prepare.release();
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let is_ready = |result: &UploadOpResult<UploadStartOutcome>| {
+            matches!(
+                result,
+                Ok(UploadStartOutcome::Ready {
+                    next_sequence: 0,
+                    received_bytes: 0
+                })
+            )
+        };
+        assert_ne!(is_ready(&first), is_ready(&second));
+        let conflict = if is_ready(&first) {
+            second.as_ref().unwrap_err()
+        } else {
+            first.as_ref().unwrap_err()
+        };
+        assert!(conflict.detail.contains("another manifest or capability"));
+        let (winner_session, winner_capability) = if is_ready(&first) {
+            ("viewer-a", capability)
+        } else {
+            ("viewer-b", other_capability)
+        };
+        assert!(matches!(
+            hub.start(
+                agent,
+                winner_session,
+                winner_capability,
+                upload_id,
+                &cwd,
+                upload_manifest,
+            )
+            .await
+            .unwrap(),
+            UploadStartOutcome::Ready {
+                next_sequence: 0,
+                received_bytes: 0
+            }
+        ));
+        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+        let private_temps = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
+            .count();
+        assert_eq!(private_temps, 1);
+
+        assert!(hub
+            .cancel(agent, winner_session, winner_capability, upload_id)
+            .await
+            .unwrap());
+        wait_for_upload_drain(&hub).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("spawn-upload")));
     }
 
     #[tokio::test]

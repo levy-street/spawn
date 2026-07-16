@@ -472,18 +472,27 @@ export function parseAgentCtlUploadResponse(
   return null;
 }
 
-export async function sha256Blob(blob: Blob): Promise<string | null> {
+export async function sha256Blob(blob: Blob, checkpoint?: () => void): Promise<string | null> {
   if (!globalThis.crypto?.subtle) return null;
   if (blob.size <= 0 || blob.size > AGENT_CTL_MAX_UPLOAD_BYTES) return null;
   let buffer: ArrayBuffer | null = null;
   try {
-    buffer = await blob.arrayBuffer();
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+    try {
+      buffer = await blob.arrayBuffer();
+    } catch {
+      return null;
+    }
+    checkpoint?.();
+    let digest: ArrayBuffer;
+    try {
+      digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+    } catch {
+      return null;
+    }
+    checkpoint?.();
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(
       "",
     );
-  } catch {
-    return null;
   } finally {
     if (buffer) new Uint8Array(buffer).fill(0);
   }
