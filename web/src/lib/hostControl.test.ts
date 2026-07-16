@@ -187,6 +187,35 @@ async function startedTransfer(destinationOptions = {}) {
   return { source, destination, transferring };
 }
 
+async function startedEmptyWrite(options = {}, signal?: AbortSignal) {
+  const endpoint = await readyClient(options);
+  const writing = endpoint.client.writeStream(
+    new Blob([]).stream(),
+    {
+      dir: "/private",
+      name: "empty.bin",
+      length: 0,
+      sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    },
+    signal,
+  );
+  const begin = endpoint.pc.channel.sent
+    .map((frame) => JSON.parse(frame))
+    .find((frame) => frame.operation === "fs.write.begin");
+  endpoint.pc.channel.receive(
+    JSON.stringify({
+      version: 1,
+      type: "response",
+      request_id: begin.request_id,
+      ok: true,
+      result: { stream_id: "indeterminate-write" },
+    }),
+  );
+  await Bun.sleep(2);
+  expect(framesOf(endpoint.pc.channel, "stream.end")).toHaveLength(1);
+  return { ...endpoint, writing };
+}
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
   FakePeerConnection.instances = [];
@@ -625,6 +654,106 @@ describe("HostControlClient", () => {
     client.close();
   });
 
+  test("lost acknowledgements classify every dispatched ordinary mutation as outcome_unknown", async () => {
+    const cases = [
+      ["fs.mkdir", (client) => client.mkdir("/private/new")],
+      ["fs.rename", (client) => client.rename("/private/old", "new")],
+      ["fs.remove", (client) => client.remove("/private/old")],
+    ];
+    for (const [operation, mutate] of cases) {
+      const { client, pc } = await readyClient({ reconnectBaseDelayMs: 1000 });
+      const mutation = mutate(client);
+      expect(JSON.parse(pc.channel.sent.at(-1)).operation).toBe(operation);
+      const failed = mutation.catch((error) => error);
+      pc.channel.onclose?.();
+      await expect(failed).resolves.toMatchObject({
+        name: "HostControlError",
+        code: "outcome_unknown",
+      });
+      client.close();
+    }
+  });
+
+  test("mutation timeout and abort are conservative only after dispatch", async () => {
+    const timed = await readyClient();
+    const timedOut = timed.client.mkdir("/private/new", { timeoutMs: 1 }).catch((error) => error);
+    await Bun.sleep(5);
+    await expect(timedOut).resolves.toMatchObject({ code: "outcome_unknown" });
+    expect(JSON.parse(timed.pc.channel.sent.at(-1)).type).toBe("cancel");
+    timed.client.close();
+
+    const activeAbort = new AbortController();
+    const active = await readyClient();
+    const aborted = active.client
+      .rename("/private/old", "new", false, { signal: activeAbort.signal })
+      .catch((error) => error);
+    expect(JSON.parse(active.pc.channel.sent.at(-1)).operation).toBe("fs.rename");
+    activeAbort.abort();
+    await expect(aborted).resolves.toMatchObject({ code: "outcome_unknown" });
+    active.client.close();
+
+    const preDispatchAbort = new AbortController();
+    preDispatchAbort.abort();
+    const before = await readyClient();
+    const preDispatch = await before.client
+      .remove("/private/old", false, { signal: preDispatchAbort.signal })
+      .catch((error) => error);
+    expect(preDispatch.name).toBe("AbortError");
+    expect(preDispatch.code).not.toBe("outcome_unknown");
+    expect(
+      before.pc.channel.sent.some((frame) => JSON.parse(frame).operation === "fs.remove"),
+    ).toBe(false);
+    before.client.close();
+  });
+
+  test("read-only acknowledgement loss and explicit no-effect mutation errors stay definitive", async () => {
+    const readOnly = await readyClient();
+    const ping = readOnly.client.ping({ timeoutMs: 1 }).catch((error) => error);
+    await Bun.sleep(5);
+    const pingError = await ping;
+    expect(pingError.code).toBeUndefined();
+    expect(pingError.message).toContain("timed out");
+    readOnly.client.close();
+
+    const explicit = await readyClient();
+    const mutation = explicit.client.mkdir("/private/new");
+    const request = JSON.parse(explicit.pc.channel.sent.at(-1));
+    explicit.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: false,
+        error: { code: "already_exists", detail: "destination exists" },
+      }),
+    );
+    await expect(mutation).rejects.toMatchObject({ code: "already_exists" });
+    explicit.client.close();
+  });
+
+  test("propagates an explicit daemon outcome_unknown without retrying", async () => {
+    const { client, pc } = await readyClient();
+    const mutation = client.remove("/private/old");
+    const request = JSON.parse(pc.channel.sent.at(-1));
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: false,
+        error: {
+          code: "outcome_unknown",
+          detail: "filesystem mutation may have completed; reconcile host state before retrying",
+        },
+      }),
+    );
+    await expect(mutation).rejects.toMatchObject({ code: "outcome_unknown" });
+    expect(
+      pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "fs.remove"),
+    ).toHaveLength(1);
+    client.close();
+  });
+
   test("configured pending cap can lower but never raise the protocol maximum", async () => {
     const { client, pc } = await readyClient({
       maxPendingRequests: 1000,
@@ -867,6 +996,65 @@ describe("HostControlClient", () => {
     );
     await expect(writing).resolves.toBe("/private/notes.txt");
     client.close();
+  });
+
+  test("write acknowledgement loss after stream.end is outcome_unknown", async () => {
+    const closed = await startedEmptyWrite({ reconnectBaseDelayMs: 1000 });
+    const lost = closed.writing.catch((error) => error);
+    closed.pc.channel.onclose?.();
+    await expect(lost).resolves.toMatchObject({ code: "outcome_unknown" });
+    closed.client.close();
+
+    const timed = await startedEmptyWrite({ streamTimeoutMs: 5 });
+    const timedOut = timed.writing.catch((error) => error);
+    await Bun.sleep(10);
+    await expect(timedOut).resolves.toMatchObject({ code: "outcome_unknown" });
+    expect(framesOf(timed.pc.channel, "stream.cancel")).toHaveLength(1);
+    timed.client.close();
+
+    const controller = new AbortController();
+    const aborted = await startedEmptyWrite({}, controller.signal);
+    const abortError = aborted.writing.catch((error) => error);
+    controller.abort();
+    await expect(abortError).resolves.toMatchObject({ code: "outcome_unknown" });
+    aborted.client.close();
+  });
+
+  test("pre-commit write loss and explicit post-end errors retain their ordinary outcome", async () => {
+    const preCommit = await readyClient({ reconnectBaseDelayMs: 1000 });
+    const stalledInput = new ReadableStream({ pull: () => new Promise(() => {}) });
+    const writing = preCommit.client.writeStream(stalledInput, {
+      dir: "/private",
+      name: "pending.bin",
+      length: 1,
+      sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    const begin = JSON.parse(preCommit.pc.channel.sent.at(-1));
+    preCommit.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: begin.request_id,
+        ok: true,
+        result: { stream_id: "pre-commit-write" },
+      }),
+    );
+    const preCommitError = writing.catch((error) => error);
+    preCommit.pc.channel.onclose?.();
+    await expect(preCommitError).resolves.toMatchObject({ code: "connection_closed" });
+    preCommit.client.close();
+
+    const explicit = await startedEmptyWrite();
+    explicit.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.error",
+        stream_id: "indeterminate-write",
+        error: { code: "already_exists", detail: "destination exists" },
+      }),
+    );
+    await expect(explicit.writing).rejects.toMatchObject({ code: "already_exists" });
+    explicit.client.close();
   });
 
   test("pumps cross-host bytes through two independent host sessions", async () => {

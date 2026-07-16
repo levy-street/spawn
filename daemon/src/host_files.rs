@@ -4,10 +4,11 @@
 //! relative to held directory handles, walks each component with no-follow
 //! semantics, and never re-enters the ambient filesystem namespace.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -29,6 +30,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 pub const MAX_LIST_ENTRIES_PER_PAGE: usize = 96;
 pub const MAX_DIRECTORY_ENTRIES: usize = 1024;
+const MAX_REGISTERED_TEMPORARIES: usize = 16;
 
 #[derive(Debug)]
 pub struct FsError {
@@ -106,7 +108,7 @@ pub struct ReadStream {
 pub struct PendingWrite {
     pub stream_id: String,
     pub request_id: String,
-    parent: Dir,
+    parent: Arc<Dir>,
     destination_name: OsString,
     temporary_name: OsString,
     destination_display: PathBuf,
@@ -118,10 +120,111 @@ pub struct PendingWrite {
     pub next_sequence: u64,
     pub hasher: Sha256,
     last_activity: Instant,
-    temporary_owned: bool,
+    cleanup: Arc<PendingWriteCleanup>,
+    operations: Arc<HostFileOperations>,
     #[cfg(test)]
     write_lifecycle_hooks: Arc<WriteLifecycleTestHooks>,
 }
+
+pub(crate) struct PendingWriteCleanup {
+    parent: Arc<Dir>,
+    temporary_name: OsString,
+    state: AtomicU8,
+}
+
+impl PendingWriteCleanup {
+    fn unlink_if_pending(&self) -> FsResult<bool> {
+        if !self.claim_pending_cleanup() {
+            return Ok(false);
+        }
+        self.finish_unlink()
+    }
+
+    fn claim_pending_cleanup(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TEMP_PENDING,
+                TEMP_CLEANING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn unlink_owned(&self) -> FsResult<bool> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if !matches!(state, TEMP_PENDING | TEMP_LINEARIZED) {
+                return Ok(false);
+            }
+            if self
+                .state
+                .compare_exchange(state, TEMP_CLEANING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return self.finish_unlink();
+            }
+        }
+    }
+
+    fn finish_unlink(&self) -> FsResult<bool> {
+        match self.parent.remove_file(&self.temporary_name) {
+            Ok(()) => {
+                self.state.store(TEMP_CLEANED, Ordering::Release);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.state.store(TEMP_CLEANED, Ordering::Release);
+                Ok(true)
+            }
+            Err(error) => {
+                self.state.store(TEMP_PENDING, Ordering::Release);
+                Err(error.into())
+            }
+        }
+    }
+
+    fn linearize(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TEMP_PENDING,
+                TEMP_LINEARIZED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn commit(&self) {
+        debug_assert_eq!(self.state.load(Ordering::Acquire), TEMP_LINEARIZED);
+        self.state.store(TEMP_COMMITTED, Ordering::Release);
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            TEMP_CLEANED | TEMP_COMMITTED
+        )
+    }
+
+    fn is_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) == TEMP_PENDING
+    }
+
+    fn unlink_late_created(&self) -> FsResult<()> {
+        match self.parent.remove_file(&self.temporary_name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+const TEMP_PENDING: u8 = 0;
+const TEMP_LINEARIZED: u8 = 1;
+const TEMP_CLEANING: u8 = 2;
+const TEMP_CLEANED: u8 = 3;
+const TEMP_COMMITTED: u8 = 4;
 
 #[derive(Clone)]
 pub(crate) struct WriteSessionGuard {
@@ -135,6 +238,9 @@ pub(crate) struct HostFileOperations {
     effect_fence: StdMutex<()>,
     active: AtomicUsize,
     idle: Notify,
+    temporaries: StdMutex<HashMap<String, Arc<PendingWriteCleanup>>>,
+    #[cfg(test)]
+    effect_hooks: StdMutex<Option<Arc<WriteLifecycleTestHooks>>>,
 }
 
 struct HostFileOperationPermit {
@@ -148,7 +254,15 @@ impl HostFileOperations {
             effect_fence: StdMutex::new(()),
             active: AtomicUsize::new(0),
             idle: Notify::new(),
+            temporaries: StdMutex::new(HashMap::new()),
+            #[cfg(test)]
+            effect_hooks: StdMutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_effect_test_hooks(&self, hooks: Arc<WriteLifecycleTestHooks>) {
+        *self.effect_hooks.lock().expect("effect hooks lock") = Some(hooks);
     }
 
     fn cancelled(&self) -> bool {
@@ -194,7 +308,28 @@ impl HostFileOperations {
         });
     }
 
-    fn effect<T>(&self, effect: impl FnOnce() -> FsResult<T>) -> FsResult<T> {
+    fn effect<T>(
+        &self,
+        kind: HostOperationKind,
+        effect: impl FnOnce() -> FsResult<T>,
+    ) -> FsResult<T> {
+        self.effect_inner(kind, None, effect)
+    }
+
+    fn write_commit_effect<T>(
+        &self,
+        cleanup: &PendingWriteCleanup,
+        effect: impl FnOnce() -> FsResult<T>,
+    ) -> FsResult<T> {
+        self.effect_inner(HostOperationKind::WriteCommit, Some(cleanup), effect)
+    }
+
+    fn effect_inner<T>(
+        &self,
+        kind: HostOperationKind,
+        write_cleanup: Option<&PendingWriteCleanup>,
+        effect: impl FnOnce() -> FsResult<T>,
+    ) -> FsResult<T> {
         let _fence = self
             .effect_fence
             .lock()
@@ -202,11 +337,121 @@ impl HostFileOperations {
         if self.cancelled() {
             return Err(cancelled_error());
         }
-        // This check is the mutation's linearization point. Close publishes
-        // `closed` before waiting for operations: a closure that reaches this
-        // point first may finish its already-admitted syscall, while every
-        // closure that was still queued or stalled must fail without effects.
-        effect()
+        // Close publishes `closed` before cleaning pending temporaries. A
+        // write commit must atomically claim its temporary after that check
+        // and while holding the global effect fence. Cleanup that wins the
+        // per-temp claim prevents commit; a commit that wins may finish.
+        if write_cleanup.is_some_and(|cleanup| !cleanup.linearize()) {
+            return Err(cancelled_error());
+        }
+        // This check (plus the per-temp claim for commit) is the mutation's
+        // linearization point. A closure that reaches it first may finish its
+        // already-admitted syscall, while queued or stalled closures fail
+        // without effects.
+        #[cfg(test)]
+        let hooks = self.effect_hooks.lock().expect("effect hooks lock").clone();
+        #[cfg(test)]
+        if let Some(hooks) = hooks {
+            hooks.effect_boundary[kind.index()].pause_if_armed();
+        }
+        match effect() {
+            Ok(value) => Ok(value),
+            Err(_) if kind.has_user_visible_effect() => Err(outcome_unknown_error()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn register_temporary(
+        &self,
+        stream_id: &str,
+        cleanup: Arc<PendingWriteCleanup>,
+    ) -> FsResult<()> {
+        let mut temporaries = self
+            .temporaries
+            .lock()
+            .map_err(|_| FsError::new("io_error", "temporary registry is poisoned"))?;
+        if self.cancelled() {
+            return Err(cancelled_error());
+        }
+        if temporaries.len() >= MAX_REGISTERED_TEMPORARIES {
+            return Err(FsError::new(
+                "too_many_streams",
+                "too many registered write temporaries",
+            ));
+        }
+        match temporaries.entry(stream_id.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(cleanup);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(FsError::new(
+                    "io_error",
+                    "temporary registry identity collision",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn unregister_temporary(&self, stream_id: &str, cleanup: &Arc<PendingWriteCleanup>) {
+        let mut temporaries = self
+            .temporaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if temporaries
+            .get(stream_id)
+            .is_some_and(|current| Arc::ptr_eq(current, cleanup))
+        {
+            temporaries.remove(stream_id);
+        }
+    }
+
+    pub(crate) async fn cleanup_temporaries_until(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) {
+        let temporaries = self
+            .temporaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(stream_id, cleanup)| (stream_id.clone(), Arc::clone(cleanup)))
+            .collect::<Vec<_>>();
+        let mut cleanups = Vec::with_capacity(temporaries.len());
+        for (stream_id, cleanup) in temporaries {
+            let operations = Arc::clone(self);
+            let permit = self.admit_cleanup();
+            #[cfg(test)]
+            let hooks = self.effect_hooks.lock().expect("effect hooks lock").clone();
+            cleanups.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let claimed = cleanup.claim_pending_cleanup();
+                #[cfg(test)]
+                if claimed {
+                    if let Some(hooks) = hooks.as_ref() {
+                        hooks.temporary_cleanup.pause_if_armed();
+                    }
+                }
+                if claimed {
+                    let _ = cleanup.finish_unlink();
+                }
+                if cleanup.is_terminal() {
+                    operations.unregister_temporary(&stream_id, &cleanup);
+                }
+                #[cfg(test)]
+                if let Some(hooks) = hooks {
+                    hooks.temporary_cleanup.finished.notify_one();
+                }
+            }));
+        }
+        // Dropping a timed-out JoinHandle detaches its blocking closure; the
+        // closure keeps its active permit and cleanup capability, so it stays
+        // accounted and completes safely without extending session close.
+        for cleanup in cleanups {
+            if tokio::time::timeout_at(deadline, cleanup).await.is_err() {
+                return;
+            }
+        }
     }
 
     pub(crate) async fn wait_for_idle_until(&self, deadline: tokio::time::Instant) -> bool {
@@ -247,6 +492,13 @@ pub(crate) enum HostOperationKind {
 impl HostOperationKind {
     const fn index(self) -> usize {
         self as usize
+    }
+
+    const fn has_user_visible_effect(self) -> bool {
+        matches!(
+            self,
+            Self::Mkdir | Self::Rename | Self::Remove | Self::WriteCommit
+        )
     }
 }
 
@@ -327,10 +579,16 @@ impl WritePause {
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct WriteLifecycleTestHooks {
-    begin_after_create: WritePause,
+    begin_after_create: BlockingPause,
+    open_after_context: WritePause,
+    open_before_connected: WritePause,
+    open_after_publication_claim: WritePause,
+    publication_send_finished: Notify,
     shutdown_started: Notify,
     shutdown_returned: Notify,
     blocking: [BlockingPause; 8],
+    effect_boundary: [BlockingPause; 8],
+    temporary_cleanup: BlockingPause,
 }
 
 #[cfg(test)]
@@ -351,16 +609,99 @@ impl WriteLifecycleTestHooks {
         self.blocking[kind.index()].finished.notified().await;
     }
 
+    pub(crate) fn arm_effect_boundary(&self, kind: HostOperationKind) {
+        self.effect_boundary[kind.index()].arm();
+    }
+
+    pub(crate) async fn wait_effect_boundary_entered(&self, kind: HostOperationKind) {
+        self.effect_boundary[kind.index()].entered.notified().await;
+    }
+
+    pub(crate) fn release_effect_boundary(&self, kind: HostOperationKind) {
+        self.effect_boundary[kind.index()].release();
+    }
+
     pub(crate) fn arm_begin_after_create(&self) {
         self.begin_after_create.arm();
     }
 
     pub(crate) async fn wait_begin_after_create(&self) {
-        self.begin_after_create.wait_until_entered().await;
+        self.begin_after_create.entered.notified().await;
     }
 
     pub(crate) fn release_begin_after_create(&self) {
         self.begin_after_create.release();
+    }
+
+    pub(crate) fn arm_temporary_cleanup(&self) {
+        self.temporary_cleanup.arm();
+    }
+
+    pub(crate) async fn wait_temporary_cleanup_entered(&self) {
+        self.temporary_cleanup.entered.notified().await;
+    }
+
+    pub(crate) fn release_temporary_cleanup(&self) {
+        self.temporary_cleanup.release();
+    }
+
+    pub(crate) async fn wait_temporary_cleanup_finished(&self) {
+        self.temporary_cleanup.finished.notified().await;
+    }
+
+    pub(crate) fn arm_open_after_context(&self) {
+        self.open_after_context.arm();
+    }
+
+    pub(crate) async fn wait_open_after_context(&self) {
+        self.open_after_context.wait_until_entered().await;
+    }
+
+    pub(crate) async fn pause_open_after_context(&self, shutdown: &CancellationToken) -> bool {
+        self.open_after_context.pause_if_armed(Some(shutdown)).await
+    }
+
+    pub(crate) fn arm_open_before_connected(&self) {
+        self.open_before_connected.arm();
+    }
+
+    pub(crate) async fn wait_open_before_connected(&self) {
+        self.open_before_connected.wait_until_entered().await;
+    }
+
+    pub(crate) async fn pause_open_before_connected(&self, shutdown: &CancellationToken) -> bool {
+        self.open_before_connected
+            .pause_if_armed(Some(shutdown))
+            .await
+    }
+
+    pub(crate) fn arm_open_after_publication_claim(&self) {
+        self.open_after_publication_claim.arm();
+    }
+
+    pub(crate) async fn wait_open_after_publication_claim(&self) {
+        self.open_after_publication_claim.wait_until_entered().await;
+    }
+
+    pub(crate) async fn pause_open_after_publication_claim(
+        &self,
+        cancelled: &CancellationToken,
+    ) -> bool {
+        self.open_after_publication_claim
+            .pause_if_armed(Some(cancelled))
+            .await
+    }
+
+    pub(crate) fn release_open_after_publication_claim(&self) {
+        self.open_after_publication_claim.release();
+    }
+
+    pub(crate) fn notify_publication_send_finished(&self) {
+        self.publication_send_finished.notify_one();
+    }
+
+    pub(crate) async fn wait_publication_send_finished(&self) {
+        self.publication_send_finished.notified().await;
     }
 
     pub(crate) async fn wait_shutdown_returned(&self) {
@@ -799,17 +1140,16 @@ impl HostFileService {
         operations: Arc<HostFileOperations>,
     ) -> FsResult<String> {
         let service = self.clone();
-        let input = input.to_string();
+        let components = self.relative_components(input)?;
         self.run_blocking(operations, HostOperationKind::Mkdir, move |operations| {
-            operations.effect(|| service.mkdir_sync(&input))
+            operations.effect(HostOperationKind::Mkdir, || service.mkdir_sync(&components))
         })
         .await
     }
 
-    fn mkdir_sync(&self, input: &str) -> FsResult<String> {
-        let components = self.relative_components(input)?;
+    fn mkdir_sync(&self, components: &[OsString]) -> FsResult<String> {
         let mut current = self.root.try_clone()?;
-        for component in &components {
+        for component in components {
             current = match current.symlink_metadata(component) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err(symlink_error());
@@ -836,10 +1176,7 @@ impl HostFileService {
                 Err(error) => return Err(error.into()),
             };
         }
-        Ok(self
-            .display_path(&components)
-            .to_string_lossy()
-            .into_owned())
+        Ok(self.display_path(components).to_string_lossy().into_owned())
     }
 
     #[cfg(test)]
@@ -861,17 +1198,26 @@ impl HostFileService {
         operations: Arc<HostFileOperations>,
     ) -> FsResult<String> {
         validate_name(name)?;
+        let components = self.relative_components(input)?;
+        if components.is_empty() {
+            return Err(FsError::new("root_protected", "home root is protected"));
+        }
         let service = self.clone();
-        let input = input.to_string();
         let name = OsString::from(name);
         self.run_blocking(operations, HostOperationKind::Rename, move |operations| {
-            operations.effect(|| service.rename_sync(&input, &name, overwrite))
+            operations.effect(HostOperationKind::Rename, || {
+                service.rename_sync(components, &name, overwrite)
+            })
         })
         .await
     }
 
-    fn rename_sync(&self, input: &str, name: &OsStr, overwrite: bool) -> FsResult<String> {
-        let components = self.relative_components(input)?;
+    fn rename_sync(
+        &self,
+        components: Vec<OsString>,
+        name: &OsStr,
+        overwrite: bool,
+    ) -> FsResult<String> {
         let (parent, source_name) = self.open_parent(&components)?;
         let source_metadata = parent.symlink_metadata(&source_name)?;
         if source_metadata.file_type().is_symlink() {
@@ -914,17 +1260,21 @@ impl HostFileService {
         recursive: bool,
         operations: Arc<HostFileOperations>,
     ) -> FsResult<String> {
+        let components = self.relative_components(input)?;
+        if components.is_empty() {
+            return Err(FsError::new("root_protected", "home root is protected"));
+        }
         let service = self.clone();
-        let input = input.to_string();
         self.run_blocking(operations, HostOperationKind::Remove, move |operations| {
-            operations.effect(|| service.remove_sync(&input, recursive))
+            operations.effect(HostOperationKind::Remove, || {
+                service.remove_sync(&components, recursive)
+            })
         })
         .await
     }
 
-    fn remove_sync(&self, input: &str, recursive: bool) -> FsResult<String> {
-        let components = self.relative_components(input)?;
-        let (parent, name) = self.open_parent(&components)?;
+    fn remove_sync(&self, components: &[OsString], recursive: bool) -> FsResult<String> {
+        let (parent, name) = self.open_parent(components)?;
         let metadata = parent.symlink_metadata(&name)?;
         if metadata.file_type().is_symlink() {
             return Err(symlink_error());
@@ -939,10 +1289,7 @@ impl HostFileService {
             parent.remove_file(&name)?;
         }
         sync_directory(&parent)?;
-        Ok(self
-            .display_path(&components)
-            .to_string_lossy()
-            .into_owned())
+        Ok(self.display_path(components).to_string_lossy().into_owned())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1018,12 +1365,13 @@ impl HostFileService {
         let name = name.to_string();
         let expected_sha256 = expected_sha256.to_string();
         let cleanup_operations = Arc::clone(&operations);
+        let write_operations = Arc::clone(&operations);
         let write = self
             .run_blocking(
                 operations,
                 HostOperationKind::WriteBegin,
                 move |operations| {
-                    operations.effect(|| {
+                    operations.effect(HostOperationKind::WriteBegin, || {
                         service.begin_write_sync(
                             request_id,
                             &dir,
@@ -1031,21 +1379,12 @@ impl HostFileService {
                             expected_length,
                             &expected_sha256,
                             overwrite,
+                            write_operations,
                         )
                     })
                 },
             )
             .await?;
-        #[cfg(test)]
-        if !write
-            .write_lifecycle_hooks
-            .begin_after_create
-            .pause_if_armed(cancelled.as_ref())
-            .await
-        {
-            cleanup_operations.cleanup_write(write).await;
-            return Err(cancelled_error());
-        }
         if cancelled
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -1065,6 +1404,7 @@ impl HostFileService {
         expected_length: u64,
         expected_sha256: &str,
         overwrite: bool,
+        operations: Arc<HostFileOperations>,
     ) -> FsResult<PendingWrite> {
         validate_name(name)?;
         if expected_length > MAX_FILE_BYTES {
@@ -1079,7 +1419,7 @@ impl HostFileService {
             return Err(FsError::new("invalid_hash", "expected SHA-256 is invalid"));
         }
         let components = self.relative_components(dir)?;
-        let parent = self.open_dir_components(&components)?;
+        let parent = Arc::new(self.open_dir_components(&components)?);
         let destination_name = OsString::from(name);
         if let Ok(metadata) = parent.symlink_metadata(&destination_name) {
             if metadata.file_type().is_symlink() {
@@ -1091,15 +1431,41 @@ impl HostFileService {
         }
         let stream_id = Uuid::new_v4().to_string();
         let temporary_name = OsString::from(format!(".spawn-upload-{stream_id}.tmp"));
+        let cleanup = Arc::new(PendingWriteCleanup {
+            parent: Arc::clone(&parent),
+            temporary_name: temporary_name.clone(),
+            state: AtomicU8::new(TEMP_PENDING),
+        });
+        operations.register_temporary(&stream_id, Arc::clone(&cleanup))?;
+        if operations.cancelled() || !cleanup.is_pending() {
+            operations.unregister_temporary(&stream_id, &cleanup);
+            return Err(cancelled_error());
+        }
         let mut options = OpenOptions::new();
         options
             .create_new(true)
             .write(true)
             .follow(FollowSymlinks::No);
-        let file = parent
-            .open_with(&temporary_name, &options)
-            .map_err(nofollow_error)?
-            .into_std();
+        let file = match parent.open_with(&temporary_name, &options) {
+            Ok(file) => file.into_std(),
+            Err(error) => {
+                let error = nofollow_error(error);
+                let _ = cleanup.unlink_owned();
+                operations.unregister_temporary(&stream_id, &cleanup);
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        self.write_lifecycle_hooks
+            .begin_after_create
+            .pause_if_armed();
+        if operations.cancelled() || !cleanup.is_pending() {
+            drop(file);
+            let _ = cleanup.unlink_late_created();
+            let _ = cleanup.unlink_if_pending();
+            operations.unregister_temporary(&stream_id, &cleanup);
+            return Err(cancelled_error());
+        }
         let mut destination_components = components;
         destination_components.push(destination_name.clone());
         Ok(PendingWrite {
@@ -1117,7 +1483,8 @@ impl HostFileService {
             next_sequence: 0,
             hasher: Sha256::new(),
             last_activity: Instant::now(),
-            temporary_owned: true,
+            cleanup,
+            operations,
             #[cfg(test)]
             write_lifecycle_hooks: Arc::clone(&self.write_lifecycle_hooks),
         })
@@ -1216,6 +1583,7 @@ impl PendingWrite {
         if let Err(error) = sync {
             return Err(error.into());
         }
+        drop(self.file.take());
         if let Some(guard) = guard {
             if guard.cancelled.is_cancelled() || guard.closed.load(Ordering::Acquire) {
                 return Err(cancelled_error());
@@ -1232,7 +1600,8 @@ impl PendingWrite {
                 let result = if cancelled.is_cancelled() || operations.cancelled() {
                     Err(cancelled_error())
                 } else {
-                    operations.effect(|| self.commit_sync())
+                    let cleanup = Arc::clone(&self.cleanup);
+                    operations.write_commit_effect(&cleanup, || self.commit_sync())
                 };
                 #[cfg(test)]
                 hooks.blocking[HostOperationKind::WriteCommit.index()]
@@ -1247,7 +1616,9 @@ impl PendingWrite {
             }
             return result;
         }
-        self.commit_sync()
+        let operations = Arc::clone(&self.operations);
+        let cleanup = Arc::clone(&self.cleanup);
+        operations.write_commit_effect(&cleanup, || self.commit_sync())
     }
 
     fn commit_sync(mut self) -> FsResult<String> {
@@ -1258,28 +1629,34 @@ impl PendingWrite {
                     Err(symlink_error())
                 } else {
                     renameat(
-                        &self.parent,
+                        self.parent.as_ref(),
                         &self.temporary_name,
-                        &self.parent,
+                        self.parent.as_ref(),
                         &self.destination_name,
                     )
                     .map_err(rustix_io_error)
                 }
             } else {
                 renameat(
-                    &self.parent,
+                    self.parent.as_ref(),
                     &self.temporary_name,
-                    &self.parent,
+                    self.parent.as_ref(),
                     &self.destination_name,
                 )
                 .map_err(rustix_io_error)
             }
         } else {
-            atomic_rename_noreplace(&self.parent, &self.temporary_name, &self.destination_name)
+            atomic_rename_noreplace(
+                self.parent.as_ref(),
+                &self.temporary_name,
+                &self.destination_name,
+            )
         };
         commit?;
-        self.temporary_owned = false;
-        sync_directory(&self.parent)?;
+        self.cleanup.commit();
+        self.operations
+            .unregister_temporary(&self.stream_id, &self.cleanup);
+        sync_directory(self.parent.as_ref())?;
         Ok(self.destination_display.to_string_lossy().into_owned())
     }
 }
@@ -1290,9 +1667,9 @@ impl Drop for PendingWrite {
         // is the final safety net for cancelled futures and cleanup messages
         // dropped while a session is shutting down.
         drop(self.file.take());
-        if self.temporary_owned {
-            let _ = self.parent.remove_file(&self.temporary_name);
-            self.temporary_owned = false;
+        if self.cleanup.unlink_owned().is_ok() && self.cleanup.is_terminal() {
+            self.operations
+                .unregister_temporary(&self.stream_id, &self.cleanup);
         }
     }
 }
@@ -1339,6 +1716,13 @@ fn cancelled_error() -> FsError {
     FsError::new("cancelled", "filesystem operation was cancelled")
 }
 
+fn outcome_unknown_error() -> FsError {
+    FsError::new(
+        "outcome_unknown",
+        "filesystem mutation may have completed; reconcile host state before retrying",
+    )
+}
+
 fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
     metadata
         .modified()
@@ -1368,6 +1752,95 @@ mod tests {
     use std::io::Write as _;
     use std::sync::atomic::AtomicBool;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn post_boundary_mutation_errors_are_indeterminate() {
+        let operations = HostFileOperations::new(Arc::new(AtomicBool::new(false)));
+        for kind in [
+            HostOperationKind::Mkdir,
+            HostOperationKind::Rename,
+            HostOperationKind::Remove,
+            HostOperationKind::WriteCommit,
+        ] {
+            let error = operations
+                .effect::<()>(kind, || Err(FsError::new("io_error", "injected failure")))
+                .unwrap_err();
+            assert_eq!(error.code, "outcome_unknown");
+            assert_eq!(
+                error.detail,
+                "filesystem mutation may have completed; reconcile host state before retrying"
+            );
+        }
+
+        let error = operations
+            .effect::<()>(HostOperationKind::WriteBegin, || {
+                Err(FsError::new("already_exists", "injected no-effect failure"))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "already_exists");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_temp_cleanup_does_not_wait_for_an_unrelated_linearized_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        let hooks = service.write_lifecycle_test_hooks();
+        let closed = Arc::new(AtomicBool::new(false));
+        let operations = HostFileOperations::new(Arc::clone(&closed));
+        operations.set_effect_test_hooks(Arc::clone(&hooks));
+        let write = service
+            .begin_write_cancellable(
+                "registered-temp".to_string(),
+                "~",
+                "pending.bin",
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                false,
+                CancellationToken::new(),
+                Arc::clone(&operations),
+            )
+            .await
+            .unwrap();
+        assert!(temp.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spawn-upload-")));
+
+        hooks.arm_effect_boundary(HostOperationKind::Mkdir);
+        let effect_operations = Arc::clone(&operations);
+        let effect = tokio::task::spawn_blocking(move || {
+            effect_operations.effect(HostOperationKind::Mkdir, || Ok(()))
+        });
+        hooks
+            .wait_effect_boundary_entered(HostOperationKind::Mkdir)
+            .await;
+
+        closed.store(true, Ordering::Release);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            operations.cleanup_temporaries_until(
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("pending temporary cleanup stalled behind an unrelated effect");
+        assert!(!temp.path().join("pending.bin").exists());
+        assert!(!temp.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spawn-upload-")));
+
+        hooks.release_effect_boundary(HostOperationKind::Mkdir);
+        tokio::time::timeout(Duration::from_secs(2), effect)
+            .await
+            .expect("unrelated effect did not resume")
+            .unwrap()
+            .unwrap();
+        drop(write);
+        assert!(!temp.path().join("pending.bin").exists());
+    }
 
     #[tokio::test]
     async fn confines_paths_and_rejects_symlinks() {
@@ -1419,7 +1892,7 @@ mod tests {
             .unwrap();
         raced.append(0, b"hello").await.unwrap();
         std::fs::write(temp.path().join("raced.txt"), b"canary").unwrap();
-        assert_eq!(raced.finish().await.unwrap_err().code, "already_exists");
+        assert_eq!(raced.finish().await.unwrap_err().code, "outcome_unknown");
         assert_eq!(
             std::fs::read(temp.path().join("raced.txt")).unwrap(),
             b"canary"
@@ -1627,7 +2100,8 @@ mod tests {
             let bytes = std::fs::read(&destination).unwrap();
             if contender_won {
                 assert_eq!(bytes, b"contender");
-                assert_eq!(renamed.unwrap_err().code, "already_exists");
+                assert_eq!(renamed.unwrap_err().code, "outcome_unknown");
+                assert!(temp.path().join(&source_name).exists());
             } else {
                 assert_eq!(bytes, b"source");
                 assert!(renamed.is_ok());

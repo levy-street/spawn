@@ -17,6 +17,7 @@ const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
 const MAX_STREAM_TOMBSTONES = 256;
 const STREAM_TOMBSTONE_TTL_MS = 120_000;
+const INDETERMINATE_REQUEST_OPERATIONS = new Set(["fs.mkdir", "fs.rename", "fs.remove"]);
 export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
 export class HostControlError extends Error {
@@ -66,6 +67,8 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  mutation: boolean;
+  dispatched: boolean;
   removeAbort?: () => void;
 }
 
@@ -93,6 +96,8 @@ interface CancelledIncomingStream {
 interface OutgoingStream {
   resolve: (path: string) => void;
   reject: (error: Error) => void;
+  commitDispatched: boolean;
+  cancelSent: boolean;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -217,7 +222,8 @@ export class HostControlClient {
     payload?: unknown,
     options: HostControlRequestOptions = {},
   ): Promise<T> {
-    if (this.state !== "ready" || this.channel?.readyState !== "open") {
+    const channel = this.channel;
+    if (this.state !== "ready" || channel?.readyState !== "open") {
       return Promise.reject(new Error("Host control channel is not ready"));
     }
     if (this.pending.size >= this.maxPendingRequests()) {
@@ -247,26 +253,36 @@ export class HostControlClient {
         const current = this.finishPending(requestId);
         if (!current) return;
         this.sendCancel(requestId);
-        current.reject(new Error("Host control request timed out"));
+        current.reject(
+          this.requestAcknowledgementLost(current, new Error("Host control request timed out")),
+        );
       }, timeoutMs);
       const pending: PendingRequest = {
         resolve: (value) => resolve(value as T),
         reject,
         timer,
+        mutation: INDETERMINATE_REQUEST_OPERATIONS.has(operation),
+        dispatched: false,
       };
       if (options.signal) {
         const onAbort = () => {
-          if (!this.pending.delete(requestId)) return;
-          clearTimeout(timer);
+          const current = this.finishPending(requestId);
+          if (!current) return;
           this.sendCancel(requestId);
-          reject(new DOMException("Host control request aborted", "AbortError"));
+          current.reject(
+            this.requestAcknowledgementLost(
+              current,
+              new DOMException("Host control request aborted", "AbortError"),
+            ),
+          );
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
         pending.removeAbort = () => options.signal?.removeEventListener("abort", onAbort);
       }
       this.pending.set(requestId, pending);
       try {
-        this.channel?.send(frame);
+        channel.send(frame);
+        pending.dispatched = true;
       } catch (error) {
         this.finishPending(requestId);
         reject(error instanceof Error ? error : new Error("Host control send failed"));
@@ -498,17 +514,20 @@ export class HostControlClient {
     // The failure promise is deliberately raced with every blocking pump step.
     // Attach a handler immediately in case the peer fails before the first read.
     void terminal.catch(() => {});
+    let outgoing!: OutgoingStream;
     const committed = new Promise<string>((resolve, reject) => {
-      const pending = {
+      outgoing = {
         resolve,
         reject: (error: Error) => {
           terminalError ??= error;
           rejectTerminal(error);
           reject(error);
         },
+        commitDispatched: false,
+        cancelSent: false,
       };
-      this.outgoingStreams.set(streamId, pending);
-      this.resetOutgoingTimeout(streamId, pending);
+      this.outgoingStreams.set(streamId, outgoing);
+      this.resetOutgoingTimeout(streamId, outgoing);
     });
     void committed.catch(() => {});
     const reader = stream.getReader();
@@ -516,12 +535,12 @@ export class HostControlClient {
     const stop = (reason: Error): Promise<void> => {
       if (cleanup) return cleanup;
       cleanup = (async () => {
-        this.cancelStream(streamId);
+        this.cancelOutgoing(streamId, outgoing);
         const pending = this.outgoingStreams.get(streamId);
         if (pending) {
           clearTimeout(pending.timer);
           this.outgoingStreams.delete(streamId);
-          pending.reject(reason);
+          pending.reject(this.writeAcknowledgementLost(pending, reason));
         }
         await reader.cancel(reason).catch(() => {});
       })();
@@ -567,6 +586,8 @@ export class HostControlClient {
         length: declaration.length,
         sha256: declaration.sha256,
       });
+      const pending = this.outgoingStreams.get(streamId);
+      if (pending) pending.commitDispatched = true;
       return await committed;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error("Host file write failed");
@@ -1104,8 +1125,13 @@ export class HostControlClient {
     outgoing.timer = setTimeout(() => {
       if (this.outgoingStreams.get(streamId) !== outgoing) return;
       this.outgoingStreams.delete(streamId);
-      this.cancelStream(streamId);
-      outgoing.reject(new HostControlError("stream_timeout", "File write timed out"));
+      this.cancelOutgoing(streamId, outgoing);
+      outgoing.reject(
+        this.writeAcknowledgementLost(
+          outgoing,
+          new HostControlError("stream_timeout", "File write timed out"),
+        ),
+      );
     }, this.streamTimeoutMs());
   }
 
@@ -1140,9 +1166,32 @@ export class HostControlClient {
     return pending;
   }
 
+  private requestAcknowledgementLost(pending: PendingRequest, fallback: Error): Error {
+    if (!pending.mutation || !pending.dispatched) return fallback;
+    return new HostControlError(
+      "outcome_unknown",
+      "The host mutation may have completed; reconcile host state before retrying",
+    );
+  }
+
+  private writeAcknowledgementLost(outgoing: OutgoingStream, fallback: Error): Error {
+    if (!outgoing.commitDispatched) return fallback;
+    return new HostControlError(
+      "outcome_unknown",
+      "The host write may have committed; reconcile host state before retrying",
+    );
+  }
+
+  private cancelOutgoing(streamId: string, outgoing: OutgoingStream): void {
+    if (outgoing.cancelSent) return;
+    outgoing.cancelSent = true;
+    this.cancelStream(streamId);
+  }
+
   private rejectPending(error: Error): void {
     for (const requestId of [...this.pending.keys()]) {
-      this.finishPending(requestId)?.reject(error);
+      const pending = this.finishPending(requestId);
+      if (pending) pending.reject(this.requestAcknowledgementLost(pending, error));
     }
   }
 
@@ -1178,7 +1227,7 @@ export class HostControlClient {
     for (const [streamId, outgoing] of this.outgoingStreams) {
       this.outgoingStreams.delete(streamId);
       clearTimeout(outgoing.timer);
-      outgoing.reject(streamError);
+      outgoing.reject(this.writeAcknowledgementLost(outgoing, streamError));
     }
     if (!this.stopped && this.state === "ready") this.setState("open");
   }

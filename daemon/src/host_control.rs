@@ -21,7 +21,7 @@ use crate::host_files::{
     STREAM_CHUNK_BYTES,
 };
 use crate::pty::WsOutbound;
-use crate::rtc::{send_host_status, HostRtcBinding};
+use crate::rtc::{try_send_host_status, HostRtcBinding};
 
 const PROTOCOL: &str = "spawn.host.ctl";
 const VERSION: u16 = 1;
@@ -37,6 +37,7 @@ const STREAM_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WRITE_STREAMS: usize = 8;
 const MAX_STREAM_TOMBSTONES: usize = 4096;
+const MAX_ACTIVE_PUBLICATIONS: usize = 128;
 
 #[derive(Default)]
 struct ArrivalArbiter {
@@ -152,6 +153,97 @@ enum ReadSignal {
     Cancel,
 }
 
+#[derive(Default)]
+struct PublicationState {
+    closed: bool,
+    next_id: u64,
+    active: HashMap<u64, CancellationToken>,
+}
+
+#[derive(Default)]
+struct PublicationFence {
+    state: StdMutex<PublicationState>,
+    idle: Notify,
+}
+
+struct PublicationPermit {
+    id: u64,
+    cancelled: CancellationToken,
+    fence: Arc<PublicationFence>,
+}
+
+impl PublicationFence {
+    fn claim(self: &Arc<Self>) -> Option<PublicationPermit> {
+        let mut state = self.state.lock().ok()?;
+        if state.closed || state.active.len() >= MAX_ACTIVE_PUBLICATIONS {
+            return None;
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.checked_add(1)?;
+        let cancelled = CancellationToken::new();
+        state.active.insert(id, cancelled.clone());
+        Some(PublicationPermit {
+            id,
+            cancelled,
+            fence: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        let publications = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            state.active.values().cloned().collect::<Vec<_>>()
+        };
+        for publication in publications {
+            publication.cancel();
+        }
+    }
+
+    async fn wait_for_idle_until(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.idle.notified();
+            let idle = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .is_empty();
+            if idle {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active
+                    .is_empty();
+            }
+        }
+    }
+}
+
+impl Drop for PublicationPermit {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = self
+                .fence
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active.remove(&self.id);
+            state.active.is_empty()
+        };
+        if idle {
+            self.fence.idle.notify_waiters();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Context {
     dc: Arc<RTCDataChannel>,
@@ -162,6 +254,7 @@ struct Context {
     file_operations: Arc<HostFileOperations>,
     cleanup_tx: mpsc::Sender<WriteCleanup>,
     arrivals: Arc<StdMutex<ArrivalArbiter>>,
+    publications: Arc<PublicationFence>,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
 }
@@ -232,11 +325,45 @@ impl Context {
     }
 
     async fn send(&self, value: Value) -> bool {
-        if self.closed.load(Ordering::Acquire) {
+        #[cfg(test)]
+        let is_hello = value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            == Some("hello");
+        let Some(publication) = Arc::clone(&self.publications).claim() else {
+            return false;
+        };
+        #[cfg(test)]
+        if is_hello
+            && !self
+                .files
+                .write_lifecycle_test_hooks()
+                .pause_open_after_publication_claim(&publication.cancelled)
+                .await
+        {
+            self.files
+                .write_lifecycle_test_hooks()
+                .notify_publication_send_finished();
             return false;
         }
         let encoded = value.to_string();
-        encoded.len() <= MAX_FRAME_BYTES && self.dc.send_text(encoded).await.is_ok()
+        let sent = if encoded.len() > MAX_FRAME_BYTES {
+            false
+        } else {
+            tokio::select! {
+                biased;
+                _ = publication.cancelled.cancelled() => false,
+                result = self.dc.send_text(encoded) => result.is_ok(),
+            }
+        };
+        #[cfg(test)]
+        if is_hello {
+            self.files
+                .write_lifecycle_test_hooks()
+                .notify_publication_send_finished();
+        }
+        sent
     }
 
     async fn response(&self, request_id: &str, result: Value) -> bool {
@@ -502,7 +629,7 @@ impl Context {
             let sent = context.send_read(&request_id, &path, cancelled).await;
             context.state.lock().await.read_requests.remove(&request_id);
             if !sent && !context.closed.load(Ordering::Acquire) {
-                close_later(Arc::clone(&context.dc));
+                close_with_deadline_later(Arc::clone(&context.dc));
             }
         };
         if self.spawn_session_task(task).await {
@@ -717,7 +844,7 @@ impl Context {
                 cleanup = cleanup_rx.recv() => {
                     let Some(cleanup) = cleanup else { break; };
                     if !self.process_write_cleanup(cleanup).await {
-                        close_later(Arc::clone(&self.dc));
+                        close_with_deadline_later(Arc::clone(&self.dc));
                         break;
                     }
                 }
@@ -729,7 +856,7 @@ impl Context {
                 }
                 _ = tokio::time::sleep(write_reaper_interval()) => {
                     if !self.reap_stale_writes().await {
-                        close_later(Arc::clone(&self.dc));
+                        close_with_deadline_later(Arc::clone(&self.dc));
                         break;
                     }
                 }
@@ -1264,8 +1391,8 @@ impl Context {
         true
     }
 
-    async fn abort_all(&self) {
-        let deadline = tokio::time::Instant::now() + session_close_timeout();
+    async fn abort_all(&self, deadline: tokio::time::Instant) {
+        self.publications.close();
         self.closed.store(true, Ordering::Release);
         self.shutdown.cancel();
         #[cfg(test)]
@@ -1298,6 +1425,13 @@ impl Context {
         for write in &writes {
             write.cancelled.cancel();
         }
+        // The session registry owns cleanup capabilities independently of
+        // PendingWrite futures and blocking commit closures. This removes
+        // every still-pending temporary before waiting for task ownership;
+        // a commit that already linearized has atomically claimed its temp.
+        self.file_operations
+            .cleanup_temporaries_until(deadline)
+            .await;
         for write in writes {
             if let Ok(mut pending) = tokio::time::timeout_at(deadline, write.pending.lock()).await {
                 if let Some(write) = pending.take() {
@@ -1327,7 +1461,8 @@ impl Context {
             }
         };
         let drain_operations = self.file_operations.wait_for_idle_until(deadline);
-        let _ = tokio::join!(drain_tasks, drain_operations);
+        let drain_publications = self.publications.wait_for_idle_until(deadline);
+        let _ = tokio::join!(drain_tasks, drain_operations, drain_publications);
         #[cfg(test)]
         self.files
             .write_lifecycle_test_hooks()
@@ -1369,6 +1504,8 @@ pub(crate) fn install(
 ) {
     let message_dc = Arc::clone(&dc);
     let context_slot = Arc::new(Mutex::new(None::<Context>));
+    let publications = Arc::new(PublicationFence::default());
+    let status_publication_fence = Arc::new(StdMutex::new(()));
     let shutdown = CancellationToken::new();
     let context_shutdown = shutdown.child_token();
     let closed = Arc::new(AtomicBool::new(false));
@@ -1392,11 +1529,11 @@ pub(crate) fn install(
             }
             if !message.is_string || message.data.is_empty() || message.data.len() > MAX_FRAME_BYTES
             {
-                close_later(dc);
+                close_with_deadline_later(dc);
                 return;
             }
             let Ok(value) = serde_json::from_slice::<Value>(&message.data) else {
-                close_later(dc);
+                close_with_deadline_later(dc);
                 return;
             };
             let fast = value.as_object().is_some_and(|object| {
@@ -1410,7 +1547,7 @@ pub(crate) fn install(
                 .ok()
                 .and_then(|mut arrivals| arrivals.stamp(&value))
             else {
-                close_later(dc);
+                close_with_deadline_later(dc);
                 return;
             };
             let frame = QueuedFrame {
@@ -1423,13 +1560,15 @@ pub(crate) fn install(
                 normal_tx.try_send(frame)
             };
             if queued.is_err() {
-                close_later(dc);
+                close_with_deadline_later(dc);
             }
         })
     }));
 
     let open_dc = Arc::clone(&dc);
     let open_context = Arc::clone(&context_slot);
+    let open_publications = Arc::clone(&publications);
+    let open_status_publication_fence = Arc::clone(&status_publication_fence);
     let open_shutdown = context_shutdown;
     let open_arrivals = Arc::clone(&arrivals);
     let open_closed = Arc::clone(&closed);
@@ -1438,6 +1577,8 @@ pub(crate) fn install(
     dc.on_open(Box::new(move || {
         let dc = Arc::clone(&open_dc);
         let context_slot = Arc::clone(&open_context);
+        let publications = Arc::clone(&open_publications);
+        let status_publication_fence = Arc::clone(&open_status_publication_fence);
         let out_tx = out_tx.clone();
         let session_id = session_id.clone();
         let binding = binding.clone();
@@ -1463,6 +1604,8 @@ pub(crate) fn install(
             }
             let (cleanup_tx, cleanup_rx) = mpsc::channel(MAX_WRITE_STREAMS);
             let file_operations = HostFileOperations::new(Arc::clone(&closed));
+            #[cfg(test)]
+            file_operations.set_effect_test_hooks(files.write_lifecycle_test_hooks());
             let context = Context {
                 dc: Arc::clone(&dc),
                 files,
@@ -1472,6 +1615,7 @@ pub(crate) fn install(
                 file_operations,
                 cleanup_tx,
                 arrivals,
+                publications,
                 closed,
                 shutdown,
             };
@@ -1485,7 +1629,7 @@ pub(crate) fn install(
                 .and_then(|mut receiver| receiver.take())
             else {
                 drop(context_slot);
-                close_later(Arc::clone(&dc));
+                close_with_deadline_later(Arc::clone(&dc));
                 return;
             };
             let Some(mut fast_rx) = fast_rx
@@ -1494,7 +1638,7 @@ pub(crate) fn install(
                 .and_then(|mut receiver| receiver.take())
             else {
                 drop(context_slot);
-                close_later(Arc::clone(&dc));
+                close_with_deadline_later(Arc::clone(&dc));
                 return;
             };
             {
@@ -1509,7 +1653,7 @@ pub(crate) fn install(
                         };
                         let Some(value) = value else { break; };
                         if !normal_context.handle_normal(value).await {
-                            close_later(Arc::clone(&normal_context.dc));
+                            close_with_deadline_later(Arc::clone(&normal_context.dc));
                             break;
                         }
                     }
@@ -1535,14 +1679,24 @@ pub(crate) fn install(
                             }
                         }
                         if !fast_context.handle_fast(value).await {
-                            close_later(Arc::clone(&fast_context.dc));
+                            close_with_deadline_later(Arc::clone(&fast_context.dc));
                             break;
                         }
                     }
                 });
             }
+            let publication_context = context.clone();
             *context_slot = Some(context);
             drop(context_slot);
+            #[cfg(test)]
+            if !publication_context
+                .files
+                .write_lifecycle_test_hooks()
+                .pause_open_after_context(&publication_context.shutdown)
+                .await
+            {
+                return;
+            }
             let hello = json!({
                 "version": VERSION,
                 "type": "hello",
@@ -1562,35 +1716,81 @@ pub(crate) fn install(
                     "write_reapers": 1,
                 }
             });
-            if dc.send_text(hello.to_string()).await.is_ok() {
-                send_host_status(&out_tx, session_id, &binding, "connected").await;
-            } else {
-                let _ = dc.close().await;
+            if !publication_context.send(hello).await {
+                close_with_deadline_later(Arc::clone(&dc));
+                return;
+            }
+            #[cfg(test)]
+            if !publication_context
+                .files
+                .write_lifecycle_test_hooks()
+                .pause_open_before_connected(&publication_context.shutdown)
+                .await
+            {
+                return;
+            }
+            let connected = match status_publication_fence.lock() {
+                Ok(_publication) => {
+                    !publication_context.closed.load(Ordering::Acquire)
+                        && !publication_context.shutdown.is_cancelled()
+                        && try_send_host_status(&out_tx, session_id, &binding, "connected")
+                }
+                Err(_) => false,
+            };
+            if !connected {
+                close_with_deadline_later(Arc::clone(&dc));
             }
         })
     }));
 
     let close_context = Arc::clone(&context_slot);
+    let close_publications = publications;
+    let close_status_publication_fence = status_publication_fence;
     let close_shutdown = shutdown;
     let close_closed = Arc::clone(&closed);
     dc.on_close(Box::new(move || {
         let context_slot = Arc::clone(&close_context);
+        let publications = Arc::clone(&close_publications);
+        let status_publication_fence = Arc::clone(&close_status_publication_fence);
         let shutdown = close_shutdown.clone();
         let closed = Arc::clone(&close_closed);
         Box::pin(async move {
-            closed.store(true, Ordering::Release);
-            shutdown.cancel();
-            if let Some(context) = context_slot.lock().await.take() {
-                context.abort_all().await;
+            let deadline = tokio::time::Instant::now() + session_close_timeout();
+            {
+                let _publication = status_publication_fence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                publications.close();
+                closed.store(true, Ordering::Release);
+                shutdown.cancel();
+            }
+            let context = match tokio::time::timeout_at(deadline, context_slot.lock()).await {
+                Ok(mut context_slot) => context_slot.take(),
+                Err(_) => None,
+            };
+            if let Some(context) = context {
+                context.abort_all(deadline).await;
             }
         })
     }));
 }
 
-fn close_later(dc: Arc<RTCDataChannel>) {
-    tokio::spawn(async move {
+fn close_with_deadline_later(dc: Arc<RTCDataChannel>) {
+    // This task is intentionally outside the session JoinSet: a dispatcher
+    // cannot await a set containing itself while its close callback drains
+    // that set. Unlike an ordinary detached task, the wrapper has a hard
+    // lifetime bound and owns no session state beyond the channel reference.
+    std::mem::drop(spawn_bounded_close(async move {
         let _ = dc.close().await;
-    });
+    }));
+}
+
+fn spawn_bounded_close(
+    close: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(session_close_timeout(), close).await;
+    })
 }
 
 fn stream_ack_timeout() -> Duration {
@@ -1624,4 +1824,18 @@ fn tombstone_deadline() -> Instant {
         Duration::from_secs(120)
     };
     Instant::now() + lifetime
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn detached_close_invoker_has_a_hard_lifetime_bound() {
+        let task = spawn_bounded_close(std::future::pending());
+        tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("bounded close task exceeded its advertised deadline")
+            .expect("bounded close task panicked");
+    }
 }

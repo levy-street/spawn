@@ -2392,14 +2392,24 @@ fn install_host_data_channel_handler(
     files_override: Option<Arc<HostFileService>>,
 ) {
     let accepted = Arc::new(AtomicBool::new(false));
+    let handler_pc = Arc::clone(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let accepted = Arc::clone(&accepted);
+        let pc = Arc::clone(&handler_pc);
         let session_id = session_id.clone();
         let binding = binding.clone();
         let out_tx = out_tx.clone();
         let files = files_override.clone();
         Box::pin(async move {
-            if dc.label() != HOST_CONTROL_LABEL || accepted.swap(true, Ordering::AcqRel) {
+            let reliable = dc.ordered()
+                && dc.max_packet_lifetime().is_none()
+                && dc.max_retransmits().is_none();
+            if dc.label() != HOST_CONTROL_LABEL || !reliable {
+                let _ = dc.close().await;
+                let _ = pc.close().await;
+                return;
+            }
+            if accepted.swap(true, Ordering::AcqRel) {
                 let _ = dc.close().await;
                 return;
             }
@@ -2494,6 +2504,29 @@ pub(crate) async fn send_host_status(
         },
     )
     .await;
+}
+
+pub(crate) fn try_send_host_status(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    session_id: String,
+    binding: &HostRtcBinding,
+    status: &str,
+) -> bool {
+    let frame = Outbound::RtcStatus {
+        session_id,
+        binding_nonce: Some(binding.binding_nonce.clone()),
+        agent_id: None,
+        scope_type: Some("host".to_string()),
+        scope_id: Some(binding.host_id),
+        protocol: Some(binding.protocol.clone()),
+        protocol_version: Some(binding.protocol_version),
+        status: status.to_string(),
+        message: None,
+    };
+    let Ok(text) = serde_json::to_string(&frame) else {
+        return false;
+    };
+    out_tx.try_send(WsOutbound::json(text)).is_ok()
 }
 
 fn try_send_status(
@@ -2593,15 +2626,17 @@ mod tests {
         receive_host_control(messages).await.1
     }
 
-    async fn paired_host_endpoint(
+    async fn start_paired_host_endpoint_with_init(
         files: Arc<HostFileService>,
         binding: HostRtcBinding,
         session_id: &str,
+        init: Option<webrtc::data_channel::data_channel_init::RTCDataChannelInit>,
     ) -> (
         Arc<RTCPeerConnection>,
         Arc<RTCPeerConnection>,
         Arc<RTCDataChannel>,
         mpsc::Receiver<(usize, String)>,
+        mpsc::Receiver<WsOutbound>,
     ) {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
@@ -2617,10 +2652,10 @@ mod tests {
                 .unwrap(),
         );
         let channel = browser_pc
-            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .create_data_channel(HOST_CONTROL_LABEL, init)
             .await
             .unwrap();
-        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(64);
+        let (messages_tx, messages_rx) = mpsc::channel::<(usize, String)>(64);
         channel.on_message(Box::new(move |message: DataChannelMessage| {
             let messages_tx = messages_tx.clone();
             Box::pin(async move {
@@ -2629,7 +2664,7 @@ mod tests {
                     .await;
             })
         }));
-        let (out_tx, _out_rx) = mpsc::channel(4);
+        let (out_tx, out_rx) = mpsc::channel(4);
         install_host_data_channel_handler(
             &daemon_pc,
             session_id.to_string(),
@@ -2654,6 +2689,35 @@ mod tests {
             .set_remote_description(daemon_pc.local_description().await.unwrap())
             .await
             .unwrap();
+        (browser_pc, daemon_pc, channel, messages_rx, out_rx)
+    }
+
+    async fn start_paired_host_endpoint(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+        mpsc::Receiver<WsOutbound>,
+    ) {
+        start_paired_host_endpoint_with_init(files, binding, session_id, None).await
+    }
+
+    async fn paired_host_endpoint(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+    ) {
+        let (browser_pc, daemon_pc, channel, mut messages_rx, _out_rx) =
+            start_paired_host_endpoint(files, binding, session_id).await;
         let (_, hello) = receive_host_control(&mut messages_rx).await;
         assert_eq!(hello["type"], "hello");
         (browser_pc, daemon_pc, channel, messages_rx)
@@ -5205,6 +5269,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_after_host_context_publication_suppresses_hello_and_connected_status() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_after_context();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "d".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-after-host-context").await;
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_open_after_context())
+            .await
+            .expect("host open did not pause after context publication");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host close exceeded its absolute deadline");
+        close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(messages.try_recv().is_err(), "hello published after close");
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn closing_between_hello_and_connected_suppresses_connected_status() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_before_connected();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "e".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-before-connected").await;
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_open_before_connected())
+            .await
+            .expect("host open did not pause before connected publication");
+        let (_, hello) = receive_host_control(&mut messages).await;
+        assert_eq!(hello.get("type").and_then(Value::as_str), Some("hello"));
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("host close exceeded its absolute deadline");
+        close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_presend_hello_claim_before_shutdown_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        hooks.arm_open_after_publication_claim();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "9".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+            start_paired_host_endpoint(files, binding, "close-after-hello-claim").await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_open_after_publication_claim(),
+        )
+        .await
+        .expect("hello did not claim publication");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("close did not cancel the hello claim");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("claimed hello send survived the close deadline");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_publication_send_finished(),
+        )
+        .await
+        .expect("cancelled hello claim did not drain");
+        close.await.unwrap().unwrap();
+        hooks.release_open_after_publication_claim();
+        tokio::task::yield_now().await;
+        assert!(
+            messages.try_recv().is_err(),
+            "hello published after shutdown returned"
+        );
+        assert!(
+            statuses.try_recv().is_err(),
+            "connected status claimed publication after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn host_control_rejects_unordered_and_partially_reliable_channels() {
+        let cases = [
+            (
+                "unordered",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    ordered: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "packet-lifetime",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    max_packet_life_time: Some(1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "retransmits",
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    max_retransmits: Some(1),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, init) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "4".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages, mut statuses) =
+                start_paired_host_endpoint_with_init(
+                    files,
+                    binding,
+                    &format!("invalid-host-channel-{label}"),
+                    Some(init),
+                )
+                .await;
+            wait_for_host_channel_close(&channel).await;
+            assert!(messages.try_recv().is_err(), "{label} received a hello");
+            assert!(
+                statuses.try_recv().is_err(),
+                "{label} published connected status"
+            );
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
+    }
+
+    #[tokio::test]
     async fn closing_host_channel_during_write_begin_cleans_unpublished_temporary() {
         let root = tempfile::tempdir().unwrap();
         let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
@@ -5215,7 +5453,7 @@ mod tests {
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
-        let (browser_pc, daemon_pc, channel, _messages) =
+        let (browser_pc, daemon_pc, channel, mut messages) =
             paired_host_endpoint(files, binding, "close-during-write-begin").await;
 
         hooks.arm_begin_after_create();
@@ -5247,14 +5485,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
             .await
             .expect("host write shutdown did not start");
-        hooks.release_begin_after_create();
-        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_returned())
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
             .await
             .expect("host write shutdown did not terminate");
+        assert!(!root.path().join("must-not-exist.bin").exists());
+        assert_no_upload_temporaries(root.path());
+
+        hooks.release_begin_after_create();
         close.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
 
         assert!(!root.path().join("must-not-exist.bin").exists());
         assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "write begin published after close"
+        );
         close_test_peer(&browser_pc).await;
         close_test_peer(&daemon_pc).await;
     }
@@ -5318,6 +5564,9 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
             .await
             .expect("host write shutdown did not terminate");
+        assert!(!root.path().join("must-not-commit.bin").exists());
+        assert_no_upload_temporaries(root.path());
+
         hooks.release_blocking(HostOperationKind::WriteCommit);
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -5329,6 +5578,77 @@ mod tests {
 
         assert!(!root.path().join("must-not-commit.bin").exists());
         assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "write commit published after close"
+        );
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_temporary_unlink_cannot_extend_close_or_resurrect_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "0".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "stalled-temp-cleanup").await;
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-cleanup",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "must-stay-uncommitted.bin",
+                "length": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        assert!(write["result"]["stream_id"].is_string());
+
+        hooks.arm_temporary_cleanup();
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_temporary_cleanup_entered(),
+        )
+        .await
+        .expect("temporary cleanup did not enter its blocking unlink");
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("stalled temporary unlink extended the close deadline");
+        close.await.unwrap().unwrap();
+
+        assert!(!root.path().join("must-stay-uncommitted.bin").exists());
+        assert!(root.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spawn-upload-")));
+
+        hooks.release_temporary_cleanup();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_temporary_cleanup_finished(),
+        )
+        .await
+        .expect("late temporary cleanup did not finish");
+        assert!(!root.path().join("must-stay-uncommitted.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        assert!(
+            messages.try_recv().is_err(),
+            "stalled cleanup published after close"
+        );
         close_test_peer(&browser_pc).await;
         close_test_peer(&daemon_pc).await;
     }
@@ -5460,6 +5780,190 @@ mod tests {
             close_test_peer(&browser_pc).await;
             close_test_peer(&daemon_pc).await;
         }
+    }
+
+    #[tokio::test]
+    async fn linearized_mutations_may_finish_after_bounded_close_without_publication() {
+        let cases = [
+            (
+                HostOperationKind::Mkdir,
+                "mkdir",
+                "linearized-mkdir",
+                "fs.mkdir",
+                json!({"path": "new-dir"}),
+            ),
+            (
+                HostOperationKind::Rename,
+                "rename",
+                "linearized-rename",
+                "fs.rename",
+                json!({"path": "source.txt", "name": "renamed.txt", "overwrite": false}),
+            ),
+            (
+                HostOperationKind::Remove,
+                "remove",
+                "linearized-remove",
+                "fs.remove",
+                json!({"path": "victim.txt", "recursive": false}),
+            ),
+        ];
+
+        for (kind, label, request_id, operation, payload) in cases {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("source.txt"), b"source")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("victim.txt"), b"victim")
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let hooks = files.write_lifecycle_test_hooks();
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "2".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("effect-close-{label}")).await;
+
+            hooks.arm_effect_boundary(kind);
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "request",
+                        "request_id": request_id,
+                        "operation": operation,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                hooks.wait_effect_boundary_entered(kind),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not reach the effect linearization boundary"));
+
+            let closing_channel = Arc::clone(&channel);
+            let close = tokio::spawn(async move { closing_channel.close().await });
+            tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+                .await
+                .unwrap_or_else(|_| panic!("{label} close exceeded its absolute deadline"));
+
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            hooks.release_effect_boundary(kind);
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_finished(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} authorized effect did not finish"));
+            close.await.unwrap().unwrap();
+
+            assert!(
+                messages.try_recv().is_err(),
+                "{label} published after close"
+            );
+            match label {
+                "mkdir" => assert!(root.path().join("new-dir").is_dir()),
+                "rename" => {
+                    assert!(!root.path().join("source.txt").exists());
+                    assert_eq!(
+                        tokio::fs::read(root.path().join("renamed.txt"))
+                            .await
+                            .unwrap(),
+                        b"source"
+                    );
+                }
+                "remove" => assert!(!root.path().join("victim.txt").exists()),
+                _ => unreachable!(),
+            }
+            assert_no_upload_temporaries(root.path());
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn linearized_write_commit_finishes_after_bounded_close_without_publication_or_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "3".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "linearized-write-close").await;
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "linearized-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "committed.bin",
+                "length": 0,
+                "sha256": sha256,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+        hooks.arm_effect_boundary(HostOperationKind::WriteCommit);
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_effect_boundary_entered(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write did not reach the commit linearization boundary");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+            .await
+            .expect("linearized write close exceeded its absolute deadline");
+        assert!(!root.path().join("committed.bin").exists());
+        hooks.release_effect_boundary(HostOperationKind::WriteCommit);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_finished(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("authorized write commit did not finish");
+        close.await.unwrap().unwrap();
+
+        assert_eq!(
+            tokio::fs::read(root.path().join("committed.bin"))
+                .await
+                .unwrap(),
+            b""
+        );
+        assert!(messages.try_recv().is_err(), "write published after close");
+        assert_no_upload_temporaries(root.path());
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
     }
 
     #[tokio::test]

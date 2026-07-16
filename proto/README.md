@@ -574,6 +574,21 @@ timeout, sends cancellation on timeout/abort, and binds responses to the
 outstanding request ID. Request IDs may not be reused within a host session;
 the daemon closes rather than evicting its bounded replay set.
 
+`spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
+channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
+before the host-control handler is installed. The normal/fast queue arrival
+ordinal, cancellation cutoffs, and tombstones rely on that transport contract.
+
+Every daemon DataChannel send registers a bounded, cancellable publication
+permit before starting its asynchronous channel write. Close atomically rejects
+new permits, cancels every registered send, and waits for permit drain only to
+the same absolute session-close deadline. A callback that was not scheduled by
+that deadline can retain an already-cancelled permit, but on its next poll a
+biased cancellation branch wins before `send_text`, so it cannot advance or
+publish. The server-visible content-free `connected` status uses a separate
+short fence with a nonblocking queue insertion, so it likewise cannot publish
+after close.
+
 Host filesystem paths and detailed errors exist only in this DataChannel.
 `fs.home`, `fs.stat`, `fs.mkdir`, `fs.rename`, and `fs.remove` use ordinary
 request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns one
@@ -593,6 +608,39 @@ those handles, reject symlink components, and refuse to rename/remove the root.
 `overwrite` defaults false. A no-clobber rename/commit uses the platform atomic
 `RENAME_NOREPLACE`/`RENAME_EXCL` operation and fails closed where that primitive
 is unavailable; it never uses a check-then-rename sequence.
+
+Mutating operations have an explicit acknowledgement boundary. For
+`fs.mkdir`, `fs.rename`, and `fs.remove`, the daemon acquires its session effect
+fence and observes the session as open immediately before invoking the
+filesystem mutation. A close or cancellation that wins before that point
+prevents the effect. Once the operation passes that point it is authorized and
+may finish even if the channel closes before its response is delivered. The
+same rule applies to a write commit after the browser has dispatched
+`stream.end`; disconnect or cancellation is not rollback.
+
+Every upload temporary is registered with the session before creation. A
+per-temporary state claim decides close versus commit without waiting behind an
+unrelated filesystem mutation: cleanup that claims a pending temporary unlinks
+it and prevents commit, while a commit that has already claimed its temporary
+may finish under the acknowledgement rule above. Unlink jobs run as accounted
+blocking work. Session close waits only to its one absolute deadline; if an
+underlying unlink itself stalls, close returns on time and the still-accounted
+cleanup finishes later, without permitting destination publication or
+resurrection.
+
+An acknowledged success is definitive. An explicit daemon error other than
+`outcome_unknown` is also definitive and reports that no user-visible mutation
+occurred. Once the effect fence has been crossed, however, a syscall can apply
+partially or completely before a later operation such as directory sync fails;
+the daemon therefore maps every post-boundary mutation failure to stable code
+`outcome_unknown`. The browser uses the same code if a dispatched mutation
+loses its acknowledgement to timeout, local cancellation, or session loss. It
+never automatically retries that operation and must be conservative even when
+a cancellation frame may have won. Reconcile before any manual retry:
+list/stat the mkdir target; inspect both source and destination for rename;
+stat/list the removal target; and stat/read the write destination, verifying
+its expected length and SHA-256 where applicable. These details and the error
+remain inside the encrypted host DataChannel.
 
 Reads start with:
 
