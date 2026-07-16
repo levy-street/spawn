@@ -105,6 +105,12 @@ struct BoundRtcSession {
     control: ForwarderControl,
 }
 
+#[derive(Clone)]
+struct RtcCallbackGuard {
+    active: Arc<AtomicBool>,
+    fence: Arc<tokio::sync::RwLock<()>>,
+}
+
 fn viewer_id(session_id: &str, generation: &str) -> String {
     format!("{session_id}:{generation}")
 }
@@ -266,8 +272,10 @@ impl RtcSessions {
             binding.clone(),
             registry,
             self.controls.clone(),
-            Arc::clone(&active),
-            fence,
+            RtcCallbackGuard {
+                active: Arc::clone(&active),
+                fence,
+            },
             #[cfg(test)]
             self.pty_send_gates
                 .lock()
@@ -605,8 +613,7 @@ fn install_data_channel_handler(
     binding: BoundRtcSession,
     registry: AgentRegistry,
     controls: AgentControlHub,
-    active: Arc<AtomicBool>,
-    fence: Arc<tokio::sync::RwLock<()>>,
+    guard: RtcCallbackGuard,
     #[cfg(test)] pty_send_gate: Option<Arc<tokio::sync::Notify>>,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
@@ -614,8 +621,8 @@ fn install_data_channel_handler(
         let binding = binding.clone();
         let registry = registry.clone();
         let controls = controls.clone();
-        let active = Arc::clone(&active);
-        let fence = Arc::clone(&fence);
+        let active = Arc::clone(&guard.active);
+        let fence = Arc::clone(&guard.fence);
         #[cfg(test)]
         let pty_send_gate = pty_send_gate.clone();
         let out_tx = out_tx.clone();
@@ -1564,6 +1571,128 @@ mod tests {
         }
     }
 
+    fn built_worker_bin() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("current_exe");
+        exe.parent()
+            .and_then(|deps| deps.parent())
+            .map(|debug| debug.join("spawn-worker"))
+            .expect("worker bin path")
+    }
+
+    struct WorkerTestEnv {
+        old_dir: Option<std::ffi::OsString>,
+        old_bin: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl WorkerTestEnv {
+        fn install() -> Self {
+            let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
+            let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
+            let dir = tempfile::tempdir().expect("worker tempdir");
+            std::env::set_var("SPAWND_WORKER_DIR", dir.path());
+            std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
+            Self {
+                old_dir,
+                old_bin,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for WorkerTestEnv {
+        fn drop(&mut self) {
+            match self.old_dir.take() {
+                Some(value) => std::env::set_var("SPAWND_WORKER_DIR", value),
+                None => std::env::remove_var("SPAWND_WORKER_DIR"),
+            }
+            match self.old_bin.take() {
+                Some(value) => std::env::set_var("SPAWND_WORKER_BIN", value),
+                None => std::env::remove_var("SPAWND_WORKER_BIN"),
+            }
+        }
+    }
+
+    async fn request_history(client: &mut RtcTestClient) -> Vec<u8> {
+        let request_id = Uuid::new_v4();
+        let request_id_text = request_id.to_string();
+        client
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":10000,"plain":false}}"#
+            ))
+            .await
+            .expect("history request");
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut expected_chunks = None;
+            let mut expected_bytes = None;
+            let mut chunks = std::collections::BTreeMap::<u32, Vec<u8>>::new();
+            loop {
+                let (is_string, bytes) = client
+                    .ctl_messages
+                    .recv()
+                    .await
+                    .expect("spawn.ctl closed during history");
+                if is_string {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).expect("history metadata JSON");
+                    if value.get("request_id").and_then(|id| id.as_str())
+                        == Some(request_id_text.as_str())
+                    {
+                        assert_eq!(value["ok"], true, "history failed: {value}");
+                        expected_chunks =
+                            Some(value["chunks"].as_u64().expect("history chunk count") as usize);
+                        expected_bytes = Some(
+                            value["total_bytes"].as_u64().expect("history byte count") as usize,
+                        );
+                    }
+                } else if bytes.len() >= 28
+                    && &bytes[..4] == b"SPCT"
+                    && bytes.get(8..24) == Some(request_id.as_bytes())
+                {
+                    let sequence = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+                    chunks.insert(sequence, bytes[28..].to_vec());
+                }
+
+                if expected_chunks.is_some_and(|count| chunks.len() == count) {
+                    let mut replay = Vec::new();
+                    for (sequence, chunk) in chunks {
+                        assert_eq!(
+                            sequence as usize,
+                            replay.len() / agent_ctl::CHUNK_PAYLOAD_BYTES
+                        );
+                        replay.extend_from_slice(&chunk);
+                    }
+                    assert_eq!(Some(replay.len()), expected_bytes);
+                    return replay;
+                }
+            }
+        })
+        .await
+        .expect("history response timed out")
+    }
+
+    async fn collect_pty_until(messages: &mut mpsc::Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut output = Vec::new();
+            loop {
+                let chunk = messages.recv().await.expect("spawn.pty closed");
+                output.extend_from_slice(&chunk);
+                if output.windows(needle.len()).any(|window| window == needle) {
+                    return output;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for PTY output {:?}",
+                String::from_utf8_lossy(needle)
+            )
+        })
+    }
+
     #[tokio::test]
     async fn real_spawn_pty_and_ctl_channels_replay_live_input_and_cleanup() {
         let agent_id = Uuid::new_v4();
@@ -1753,6 +1882,276 @@ mod tests {
         worker.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_worker_rtc_launch_adopt_backpressure_catchup_and_exit() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let _env = WorkerTestEnv::install();
+        let agent_id = Uuid::new_v4();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'rtc-worker-ready\\n'; exec cat".to_string(),
+        ];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            agent_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &env,
+        })
+        .await
+        .expect("launch real worker");
+        let crate::pty::Launched {
+            handle,
+            exit_rx: initial_exit_rx,
+            ..
+        } = launched;
+        let initial_control = handle.control.clone();
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        initial_control.set_sink(ws_tx).await;
+        let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+        let registry = AgentRegistry::new();
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(agent_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        let mut first =
+            connect_rtc_session(&sessions, &registry, agent_id, "worker-first", "launch").await;
+        let history = request_history(&mut first).await;
+        assert!(
+            history
+                .windows(b"rtc-worker-ready".len())
+                .any(|window| window == b"rtc-worker-ready"),
+            "launch history missing worker output"
+        );
+        first
+            .pty
+            .send(&Bytes::from_static(b"rtc-worker-input\n"))
+            .await
+            .expect("real worker input");
+        collect_pty_until(&mut first.pty_messages, b"rtc-worker-input").await;
+
+        let mut second =
+            connect_rtc_session(&sessions, &registry, agent_id, "worker-second", "launch").await;
+        loop {
+            let event = next_ctl_json(&mut first.ctl_messages).await;
+            if event["event"] == "display_state" && event["viewers"] == 2 {
+                assert_eq!(event["owner"], true);
+                break;
+            }
+        }
+        loop {
+            let event = next_ctl_json(&mut second.ctl_messages).await;
+            if event["event"] == "display_state" && event["viewers"] == 2 {
+                assert_eq!(event["owner"], false);
+                break;
+            }
+        }
+        let take_request = Uuid::new_v4();
+        second
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{take_request}","operation":"take_control","cols":100,"rows":30}}"#
+            ))
+            .await
+            .expect("take control request");
+        loop {
+            let message = next_ctl_json(&mut second.ctl_messages).await;
+            if message["request_id"] == take_request.to_string() && message["ok"] == true {
+                break;
+            }
+        }
+
+        sessions.close("worker-second", "launch", agent_id).await;
+        second.pc.close().await.unwrap();
+        sessions.close("worker-first", "launch", agent_id).await;
+        first.pc.close().await.unwrap();
+        assert_eq!(sessions.resident_session_count().await, 0);
+
+        // Simulate a supervisor restart: invalidate and drain the old RTC
+        // generation, drop its worker connection, then adopt the live worker.
+        let old = registry.binding_for(agent_id).expect("launch binding");
+        let transition = registry.lock_generation_transition(agent_id).await;
+        let old_handle = registry
+            .remove_if_generation(agent_id, old.generation())
+            .expect("remove launch binding");
+        sessions.close_for_agent(agent_id, old.generation()).await;
+        drop(transition);
+        drop(old_handle);
+        drop(initial_exit_rx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let adopted = crate::worker_backend::adopt(agent_id)
+            .await
+            .expect("adopt worker")
+            .expect("live worker socket");
+        let crate::pty::Launched {
+            handle,
+            exit_rx: adopted_exit_rx,
+            ..
+        } = adopted;
+        let adopted_control = handle.control.clone();
+        let (adopted_ws_tx, mut adopted_ws_rx) = mpsc::channel(1024);
+        adopted_control.set_sink(adopted_ws_tx).await;
+        let adopted_ws_drain =
+            tokio::spawn(async move { while adopted_ws_rx.recv().await.is_some() {} });
+        let transition = registry.lock_generation_transition(agent_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        let mut reconnected =
+            connect_rtc_session(&sessions, &registry, agent_id, "worker-adopted", "adopt").await;
+        let adopted_history = request_history(&mut reconnected).await;
+        assert!(
+            adopted_history
+                .windows(b"rtc-worker-input".len())
+                .any(|window| window == b"rtc-worker-input"),
+            "adopted replay lost pre-adoption output"
+        );
+        sessions.close("worker-adopted", "adopt", agent_id).await;
+        reconnected.pc.close().await.unwrap();
+
+        // Stall the first outbound PTY send, then drive real worker output
+        // until the bounded direct queue evicts this RTC viewer. The earlier
+        // RTC input assertion already covers the endpoint input path; direct
+        // worker injection here makes output volume deterministic.
+        let stall_gate = sessions.stall_first_pty_send("worker-stalled").await;
+        let stalled =
+            connect_rtc_session(&sessions, &registry, agent_id, "worker-stalled", "adopt").await;
+        let stalled_viewer = viewer_id("worker-stalled", "adopt");
+        assert!(
+            adopted_control
+                .wait_for_direct_sink(&stalled_viewer, Duration::from_secs(3))
+                .await
+        );
+        let tail_marker = format!("rtc-catchup-tail-{agent_id}");
+        // Wait for each one-byte TTY echo to traverse the real worker before
+        // sending the next. This deterministically creates more queue entries
+        // than the stalled sink can hold without a multi-megabyte flood.
+        for _ in 0..(crate::pty::DIRECT_SINK_QUEUE_DEPTH + 12) {
+            let expected = adopted_control.source_offset() + 1;
+            assert!(registry.with_handle(agent_id, |handle| {
+                handle.write_stdin(b"x").expect("flood input");
+            }));
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                adopted_control.wait_source_offset(expected),
+            )
+            .await
+            .expect("worker echo did not reach the forwarder");
+        }
+        let expected_tail = adopted_control.source_offset() + tail_marker.len() as u64;
+        assert!(registry.with_handle(agent_id, |handle| {
+            handle
+                .write_stdin(tail_marker.as_bytes())
+                .expect("tail input");
+        }));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            adopted_control.wait_source_offset(expected_tail),
+        )
+        .await
+        .expect("worker never logged the catch-up marker");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while adopted_control
+                .direct_sink_offset(&stalled_viewer)
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real worker stalled viewer was not evicted");
+        stall_gate.notify_one();
+        sessions.close("worker-stalled", "adopt", agent_id).await;
+        stalled.pc.close().await.unwrap();
+
+        let mut catchup =
+            connect_rtc_session(&sessions, &registry, agent_id, "worker-catchup", "adopt").await;
+        let mut caught_up = false;
+        for _ in 0..10 {
+            let replay = request_history(&mut catchup).await;
+            if replay
+                .windows(tail_marker.len())
+                .any(|window| window == tail_marker.as_bytes())
+            {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(caught_up, "replay did not catch up the evicted viewer");
+
+        assert!(registry.with_handle(agent_id, |handle| {
+            assert!(handle.shutdown(Some("KILL".to_string())));
+        }));
+        let reason = tokio::time::timeout(Duration::from_secs(15), adopted_exit_rx)
+            .await
+            .expect("worker exit timed out")
+            .expect("worker exit sender dropped");
+        assert!(reason.exit_code.is_some() || reason.signal.is_some());
+        let current = registry.binding_for(agent_id).expect("adopted binding");
+        let transition = registry.lock_generation_transition(agent_id).await;
+        let exited_handle = registry
+            .remove_if_generation(agent_id, current.generation())
+            .expect("remove exited worker");
+        sessions
+            .close_for_agent(agent_id, current.generation())
+            .await;
+        drop(transition);
+        if let Some(replay_after_exit) = exited_handle.replay(1 << 20) {
+            assert!(
+                !matches!(replay_after_exit.await, Ok(Ok(_))),
+                "replay remained available after worker exit"
+            );
+        }
+        assert_eq!(sessions.resident_session_count().await, 0);
+        catchup.pc.close().await.unwrap();
+
+        // A fresh signaling attempt after exit fails before any peer can be
+        // inserted for the now-tombstoned generation.
+        let (status_tx, mut status_rx) = mpsc::channel(4);
+        sessions
+            .handle_offer(
+                RtcSessionBinding::new(
+                    "worker-after-exit".to_string(),
+                    "after-exit".to_string(),
+                    agent_id,
+                ),
+                String::new(),
+                Vec::new(),
+                registry.clone(),
+                status_tx,
+            )
+            .await;
+        let WsOutbound::Json(status) = status_rx.recv().await.expect("post-exit status") else {
+            panic!("unexpected binary post-exit status");
+        };
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["type"], "rtc.status");
+        assert_eq!(status["status"], "failed");
+        assert_eq!(sessions.resident_session_count().await, 0);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while crate::worker_backend::socket_exists(agent_id) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(exited_handle);
+        ws_drain.abort();
+        adopted_ws_drain.abort();
+    }
+
     #[tokio::test]
     async fn replacement_fences_stale_peer_input_control_and_output() {
         let registry = AgentRegistry::new();
@@ -1822,7 +2221,7 @@ mod tests {
 
         let registry = AgentRegistry::new();
         let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
         let sessions = RtcSessions::new();
         let transition = registry.lock_generation_transition(agent_id).await;
         let insert_attempted = sessions.peer_insert_attempted.notified();
@@ -1852,7 +2251,7 @@ mod tests {
             .remove_if_generation(agent_id, old.generation())
             .is_some());
         sessions.close_for_agent(agent_id, old.generation()).await;
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
         drop(transition);
         offer_task.await.unwrap();
 
@@ -1902,7 +2301,7 @@ mod tests {
 
         let registry = AgentRegistry::new();
         let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id, "old");
+        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
         let sessions = RtcSessions::new();
         let (out_tx, _out_rx) = mpsc::channel(16);
         sessions
@@ -1925,7 +2324,7 @@ mod tests {
             .remove_if_generation(agent_id, old.generation())
             .is_some());
         sessions.close_for_agent(agent_id, old.generation()).await;
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id, "current");
+        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
         drop(transition);
 
         assert!(registry.is_current(current));
