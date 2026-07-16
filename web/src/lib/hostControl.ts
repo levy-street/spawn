@@ -1518,10 +1518,18 @@ function parseToolStatus(value: unknown, expected: HostToolTargetRef): HostToolS
     (value.installed &&
       (typeof value.path !== "string" ||
         typeof value.version !== "string" ||
+        parseNumericVersion(value.version) === null ||
         value.error != null)) ||
     (!value.installed &&
-      (value.path != null || value.version != null || value.update_available != null))
+      (value.path != null || value.version != null || value.update_available != null)) ||
+    (typeof value.latest_version === "string" && parseNumericVersion(value.latest_version) === null)
   ) {
+    return null;
+  }
+  if (value.installed && typeof value.latest_version === "string") {
+    const expectedUpdate = versionSuggestsUpdate(value.version as string, value.latest_version);
+    if (expectedUpdate === null || value.update_available !== expectedUpdate) return null;
+  } else if (value.update_available != null) {
     return null;
   }
   return value as unknown as HostToolStatus;
@@ -1583,11 +1591,42 @@ function parseToolInstallResult(
         status.update_available !== false ||
         value.exit_code !== 0 ||
         value.error != null)) ||
-    (value.outcome === "unknown" && (value.success || typeof value.error !== "string"))
+    (value.outcome === "unknown" &&
+      (value.success ||
+        typeof value.error !== "string" ||
+        (status?.installed === true && status.update_available === false)))
   ) {
     return null;
   }
   return { ...(value as unknown as HostToolInstallResult), status };
+}
+
+function parseNumericVersion(text: string): bigint[] | null {
+  let best: bigint[] = [];
+  for (const raw of text.split(/[^A-Za-z0-9.]+/)) {
+    const candidate = raw.replace(/^v/, "");
+    if (!/^\d/.test(candidate)) continue;
+    const parts: bigint[] = [];
+    for (const part of candidate.split(".")) {
+      if (!/^\d+$/.test(part)) break;
+      parts.push(BigInt(part));
+    }
+    if (parts.length > best.length) best = parts;
+  }
+  return best.length > 0 ? best : null;
+}
+
+function versionSuggestsUpdate(installedText: string, latestText: string): boolean | null {
+  const installed = parseNumericVersion(installedText);
+  const latest = parseNumericVersion(latestText);
+  if (!installed || !latest) return null;
+  for (let index = 0; index < Math.max(installed.length, latest.length); index += 1) {
+    const left = installed[index] ?? 0n;
+    const right = latest[index] ?? 0n;
+    if (left < right) return true;
+    if (left > right) return false;
+  }
+  return false;
 }
 
 function optionalBoundedString(value: unknown, maxBytes: number): boolean {

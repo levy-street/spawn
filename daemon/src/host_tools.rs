@@ -932,6 +932,7 @@ async fn run_program_capture(
         kill_process_group(pid);
         let _ = child.start_kill();
         let status = child.wait().await.ok();
+        let _ = settle_process_group(pid).await;
         process_group.disarm();
         return Ok(ProgramCapture {
             status,
@@ -1002,12 +1003,17 @@ async fn run_program_capture(
             child.wait().await.ok()
         }
     };
-    process_group.disarm();
     let (stdout, stderr) = tokio::join!(finish_tail(stdout_task), finish_tail(stderr_task));
     if stdout.1 || stderr.1 {
         kill_process_group(pid);
         failure.get_or_insert_with(|| "tool output pipes did not close before deadline".into());
     }
+    if settle_process_group(pid).await {
+        failure.get_or_insert_with(|| {
+            "tool process group remained active after the direct command exited".into()
+        });
+    }
+    process_group.disarm();
     Ok(ProgramCapture {
         status,
         stdout: stdout.0,
@@ -1103,6 +1109,48 @@ fn kill_process_group(pid: Option<u32>) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_pid: Option<u32>) {}
+
+#[cfg(unix)]
+async fn settle_process_group(pid: Option<u32>) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return false;
+    };
+    let group = Pid::from_raw(pid);
+    let remained = match killpg(group, None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    };
+    if !remained {
+        return false;
+    }
+
+    // A direct command is never permitted to daemonize. Keep admission and
+    // the same-tool install claim until every member of its private process
+    // group is gone, including orphaned/zombie descendants being reaped by
+    // the OS. The armed drop guard continues sending SIGKILL if this owner
+    // future is cancelled while settlement is in progress.
+    let _ = killpg(group, Signal::SIGKILL);
+    loop {
+        match killpg(group, None) {
+            Err(Errno::ESRCH) => break,
+            _ => {
+                let _ = killpg(group, Signal::SIGKILL);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(unix))]
+async fn settle_process_group(_pid: Option<u32>) -> bool {
+    false
+}
 
 fn first_meaningful_line(output: &str) -> Option<String> {
     output
@@ -1352,6 +1400,52 @@ mod tests {
         .expect("capture");
         assert!(capture.stdout.truncated);
         assert_eq!(capture.stdout.text.len(), OUTPUT_TAIL_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_parent_cannot_release_a_closed_pipe_descendant_or_process_permit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child_pid = dir.path().join("child-pid");
+        let script = executable(
+            dir.path(),
+            "fork-and-exit",
+            &format!(
+                "/bin/sh -c 'exec </dev/null >/dev/null 2>&1; printf \"%s\" $$ > {}; while :; do :; done' & \
+                 while [ ! -s {} ]; do :; done; exit 0",
+                child_pid.display(),
+                child_pid.display(),
+            ),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let started = std::time::Instant::now();
+        let capture = run_program_capture(
+            Arc::clone(&permits),
+            Arc::new(HostToolLifecycleHooks::default()),
+            &script,
+            &[],
+            &test_env(dir.path()),
+            Duration::from_secs(1),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("capture");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(capture.status.is_some_and(|status| status.success()));
+        assert!(capture
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("process group remained active")));
+        assert_eq!(permits.available_permits(), 1);
+
+        let pid = std::fs::read_to_string(child_pid).expect("descendant pid");
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "closed-pipe descendant remained as a process or zombie"
+        );
     }
 
     #[cfg(unix)]

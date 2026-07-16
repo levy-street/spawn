@@ -112,10 +112,25 @@ const metadata = {
   protocol: HOST_CONTROL_PROTOCOL,
   protocol_version: 1,
 };
+const activeClients = new Set<HostControlClient>();
+
+function trackedClient(clientHostId = hostId, options = {}) {
+  const client = new HostControlClient(clientHostId, options);
+  activeClients.add(client);
+  return client;
+}
+
+async function waitUntil(predicate: () => boolean, description: string, timeoutMs = 1000) {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await Bun.sleep(1);
+  }
+}
 
 async function readyClient(options = {}, clientHostId = hostId) {
   const clientMetadata = { ...metadata, scope_id: clientHostId };
-  const client = new HostControlClient(clientHostId, options);
+  const client = trackedClient(clientHostId, options);
   client.connect();
   const ws = FakeWebSocket.instances.at(-1);
   ws.onopen?.();
@@ -217,6 +232,7 @@ async function startedEmptyWrite(options = {}, signal?: AbortSignal) {
 }
 
 beforeEach(() => {
+  activeClients.clear();
   FakeWebSocket.instances = [];
   FakePeerConnection.instances = [];
   globalThis.WebSocket = FakeWebSocket;
@@ -224,6 +240,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const client of activeClients) client.close();
+  activeClients.clear();
   for (const ws of FakeWebSocket.instances) ws.onclose = null;
 });
 
@@ -303,7 +321,6 @@ describe("HostControlClient", () => {
     const first = await readyClient();
     const timedOut = first.client.ping({ timeoutMs: 1 });
     const timedOutAssertion = expect(timedOut).rejects.toThrow("timed out");
-    await Bun.sleep(5);
     await timedOutAssertion;
     expect(JSON.parse(first.pc.channel.sent.at(-1)).type).toBe("cancel");
 
@@ -323,7 +340,7 @@ describe("HostControlClient", () => {
   });
 
   test("ignores signaling metadata for another host", async () => {
-    const client = new HostControlClient(hostId);
+    const client = trackedClient();
     client.connect();
     const ws = FakeWebSocket.instances.at(-1);
     ws.onopen?.();
@@ -341,7 +358,7 @@ describe("HostControlClient", () => {
   });
 
   test("times out before an answer or hello and reconnects exactly once", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = trackedClient(hostId, {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -355,7 +372,10 @@ describe("HostControlClient", () => {
       ice_transport_policy: "all",
       ...metadata,
     });
-    await Bun.sleep(8);
+    await waitUntil(
+      () => FakePeerConnection.instances[0].channel.closed && FakeWebSocket.instances.length === 2,
+      "answer timeout reconnect",
+    );
 
     expect(FakePeerConnection.instances[0].channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -364,7 +384,7 @@ describe("HostControlClient", () => {
 
     FakeWebSocket.instances = [];
     FakePeerConnection.instances = [];
-    const noHelloClient = new HostControlClient(hostId, {
+    const noHelloClient = trackedClient(hostId, {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -389,31 +409,34 @@ describe("HostControlClient", () => {
       ...metadata,
     });
     noHelloPc.channel.onopen?.();
-    await Bun.sleep(8);
+    await waitUntil(
+      () => noHelloPc.channel.closed && FakeWebSocket.instances.length === 2,
+      "hello timeout reconnect",
+    );
     expect(noHelloPc.channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
     noHelloClient.close();
   });
 
   test("attempt deadline covers a websocket that never opens or never receives config", async () => {
-    const neverOpen = new HostControlClient(hostId, {
+    const neverOpen = trackedClient(hostId, {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
     neverOpen.connect();
-    await Bun.sleep(8);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "never-open reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     neverOpen.close();
 
     FakeWebSocket.instances = [];
     FakePeerConnection.instances = [];
-    const noConfig = new HostControlClient(hostId, {
+    const noConfig = trackedClient(hostId, {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
     noConfig.connect();
     FakeWebSocket.instances[0].onopen?.();
-    await Bun.sleep(8);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "no-config reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     noConfig.close();
   });
@@ -424,7 +447,10 @@ describe("HostControlClient", () => {
       FakePeerConnection.instances = [];
       const signaling = await readyClient({ reconnectBaseDelayMs: 1 });
       signaling.ws.receive(value);
-      await Bun.sleep(5);
+      await waitUntil(
+        () => signaling.pc.channel.closed && FakeWebSocket.instances.length === 2,
+        "invalid signaling reconnect",
+      );
       expect(signaling.pc.channel.closed).toBe(true);
       expect(FakeWebSocket.instances).toHaveLength(2);
       signaling.client.close();
@@ -435,7 +461,10 @@ describe("HostControlClient", () => {
       FakePeerConnection.instances = [];
       const control = await readyClient({ reconnectBaseDelayMs: 1 });
       control.pc.channel.receive(raw);
-      await Bun.sleep(5);
+      await waitUntil(
+        () => control.pc.channel.closed && FakeWebSocket.instances.length === 2,
+        "invalid control reconnect",
+      );
       expect(control.pc.channel.closed).toBe(true);
       expect(FakeWebSocket.instances).toHaveLength(2);
       control.client.close();
@@ -443,7 +472,7 @@ describe("HostControlClient", () => {
   });
 
   test("repeated unavailable attempts increase backoff until a valid hello", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = trackedClient(hostId, {
       connectTimeoutMs: 1000,
       reconnectBaseDelayMs: 20,
     });
@@ -466,7 +495,7 @@ describe("HostControlClient", () => {
       status: "unavailable",
       ...metadata,
     });
-    await Bun.sleep(25);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "first unavailable reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
 
     const secondWs = FakeWebSocket.instances[1];
@@ -487,9 +516,9 @@ describe("HostControlClient", () => {
       status: "unavailable",
       ...metadata,
     });
-    await Bun.sleep(25);
+    await Promise.resolve();
     expect(FakeWebSocket.instances).toHaveLength(2);
-    await Bun.sleep(25);
+    await waitUntil(() => FakeWebSocket.instances.length === 3, "backed-off unavailable reconnect");
     expect(FakeWebSocket.instances).toHaveLength(3);
     client.close();
   });
@@ -499,7 +528,7 @@ describe("HostControlClient", () => {
     const closeHandler = first.pc.channel.onclose;
     closeHandler?.();
     closeHandler?.();
-    await Bun.sleep(5);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "channel-loss reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     first.client.close();
 
@@ -518,7 +547,7 @@ describe("HostControlClient", () => {
       status: "failed",
       ...metadata,
     });
-    await Bun.sleep(5);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "daemon-loss reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     second.client.close();
 
@@ -528,13 +557,13 @@ describe("HostControlClient", () => {
     const wsCloseHandler = third.ws.onclose;
     wsCloseHandler?.();
     wsCloseHandler?.();
-    await Bun.sleep(5);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "browser-loss reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     third.client.close();
   });
 
   test("queued callbacks from a replaced websocket cannot affect the current attempt", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = trackedClient(hostId, {
       connectTimeoutMs: 1000,
       reconnectBaseDelayMs: 1,
     });
@@ -547,7 +576,7 @@ describe("HostControlClient", () => {
 
     oldWs.onopen?.();
     staleClose?.();
-    await Bun.sleep(5);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "replacement websocket");
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(oldWs.onopen).toBeNull();
     expect(oldWs.onmessage).toBeNull();
@@ -649,7 +678,6 @@ describe("HostControlClient", () => {
     const request = client.ping({ timeoutMs: 1 });
     pc.channel.throwOnCancel = true;
     const assertion = expect(request).rejects.toThrow("timed out");
-    await Bun.sleep(5);
     await assertion;
     client.close();
   });
@@ -678,7 +706,6 @@ describe("HostControlClient", () => {
   test("mutation timeout and abort are conservative only after dispatch", async () => {
     const timed = await readyClient();
     const timedOut = timed.client.mkdir("/private/new", { timeoutMs: 1 }).catch((error) => error);
-    await Bun.sleep(5);
     await expect(timedOut).resolves.toMatchObject({ code: "outcome_unknown" });
     expect(JSON.parse(timed.pc.channel.sent.at(-1)).type).toBe("cancel");
     timed.client.close();
@@ -710,7 +737,6 @@ describe("HostControlClient", () => {
   test("read-only acknowledgement loss and explicit no-effect mutation errors stay definitive", async () => {
     const readOnly = await readyClient();
     const ping = readOnly.client.ping({ timeoutMs: 1 }).catch((error) => error);
-    await Bun.sleep(5);
     const pingError = await ping;
     expect(pingError.code).toBeUndefined();
     expect(pingError.message).toContain("timed out");
@@ -1008,7 +1034,6 @@ describe("HostControlClient", () => {
 
     const timed = await startedEmptyWrite({ streamTimeoutMs: 5 });
     const timedOut = timed.writing.catch((error) => error);
-    await Bun.sleep(10);
     await expect(timedOut).resolves.toMatchObject({ code: "outcome_unknown" });
     expect(framesOf(timed.pc.channel, "stream.cancel")).toHaveLength(1);
     timed.client.close();
@@ -1426,6 +1451,41 @@ describe("HostControlClient", () => {
       {
         installed: true,
         path: "/bin/codex",
+        version: "",
+        latest_version: "1.0",
+        update_available: false,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "not-a-version",
+        latest_version: "1.0",
+        update_available: false,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "1.0",
+        latest_version: "",
+        update_available: false,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "1.0",
+        latest_version: "1.1",
+        update_available: false,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "1.1",
+        latest_version: "1.0",
+        update_available: true,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
         version: "codex 1.0",
         latest_version: "1.0",
         update_available: false,
@@ -1467,6 +1527,46 @@ describe("HostControlClient", () => {
       expect(endpoint.pc.channel.closed).toBe(true);
       endpoint.client.close();
     }
+
+    const definitiveUnknown = await readyClient({ reconnectBaseDelayMs: 1000 });
+    const installing = definitiveUnknown.client
+      .installTool({ target_id: "preset-1", tool: "codex" })
+      .catch((error) => error);
+    const request = JSON.parse(definitiveUnknown.pc.channel.sent.at(-1));
+    definitiveUnknown.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          target_id: "preset-1",
+          tool: "codex",
+          command: ["codex"],
+          install_argv: ["npm", "install", "--global", "@openai/codex"],
+          outcome: "unknown",
+          success: false,
+          exit_code: 0,
+          stdout: "",
+          stderr: "",
+          output_truncated: false,
+          error: "contradicts definitive status",
+          status: {
+            target_id: "preset-1",
+            tool: "codex",
+            command: ["codex"],
+            installed: true,
+            path: "/bin/codex",
+            version: "codex 1.0",
+            latest_version: "1.0",
+            update_available: false,
+          },
+        },
+      }),
+    );
+    expect((await installing).code).toBe("invalid_response");
+    expect(definitiveUnknown.pc.channel.closed).toBe(true);
+    definitiveUnknown.client.close();
   });
 
   test("surfaces protected install output and unknown outcomes without retrying", async () => {
@@ -1601,7 +1701,6 @@ describe("HostControlClient", () => {
       )
       .catch((error) => error);
     lostAbort.abort();
-    await Bun.sleep(10);
     await expect(lostOutcome).resolves.toMatchObject({ code: "outcome_unknown" });
     expect(
       lost.pc.channel.sent.filter((frame) => JSON.parse(frame).operation === "tool.install"),
@@ -1628,7 +1727,7 @@ describe("HostControlClient", () => {
 
     endpoint.pc.channel.onclose?.();
     await expect(installing).resolves.toMatchObject({ code: "outcome_unknown" });
-    await Bun.sleep(5);
+    await waitUntil(() => FakeWebSocket.instances.length === 2, "lost-install reconnect");
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(
       FakePeerConnection.instances

@@ -141,7 +141,7 @@ export async function mockAuthenticatedApi(
     fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
-    toolTargets?: unknown[];
+    toolTargets?: unknown[] | (() => unknown[]);
     toolCheck?: (hostId: string, payload: Record<string, unknown>) => unknown;
     toolInstall?: (hostId: string, payload: Record<string, unknown>) => unknown;
   } = {},
@@ -554,10 +554,12 @@ export async function mockAuthenticatedApi(
       return;
     }
     if (path === `/api/hosts/${HOST_ID}/tool-targets`) {
+      const toolTargets =
+        typeof options.toolTargets === "function" ? options.toolTargets() : options.toolTargets;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        json: { tools: options.toolTargets ?? [] },
+        json: { tools: toolTargets ?? [] },
       });
       return;
     }

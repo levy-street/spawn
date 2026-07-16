@@ -12,6 +12,7 @@ import {
   HostControlError,
   type HostToolInstallResult,
   type HostToolStatus,
+  type HostToolTargetRef,
   isInteractiveToolKind,
 } from "@/lib/hostControl";
 
@@ -30,7 +31,7 @@ interface VisibleResult {
 }
 
 interface ReconciliationEntry extends VisibleResult {
-  targetId: string;
+  target: HostToolTargetRef;
 }
 
 type ReconciliationMap = Record<string, ReconciliationEntry>;
@@ -93,26 +94,31 @@ export function HostToolsPanel({ host }: { host: Host }) {
       };
     },
     enabled: host.status === "online" && state === "ready",
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
     refetchInterval: 60_000,
   });
   const installM = useMutation({
-    mutationFn: async ({ tool, controller }: { tool: ToolRow; controller: AbortController }) => {
-      if (!client || !isInteractiveToolKind(tool.agent_kind)) {
+    mutationFn: async ({
+      target,
+      controller,
+    }: {
+      tool: ToolRow;
+      target: HostToolTargetRef;
+      controller: AbortController;
+    }) => {
+      if (!client) {
         throw new HostControlError(
           "unsupported_tool",
           "Tool is not supported by the endpoint policy",
         );
       }
-      return client.installTool(
-        { target_id: tool.preset_id, tool: tool.agent_kind },
-        { signal: controller.signal },
-      );
+      return client.installTool(target, { signal: controller.signal });
     },
-    onSuccess: (result, { tool, controller }) => {
+    onSuccess: (result, { tool, target, controller }) => {
       if (controller.signal.aborted) {
         const unknown: ReconciliationEntry = {
-          targetId: tool.preset_id,
+          target,
           name: tool.preset_name,
           code: "outcome_unknown",
           outcomeUnknown: true,
@@ -128,7 +134,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
       setLastResult({ name: tool.preset_name, result });
       qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
     },
-    onError: (err, { tool }) => {
+    onError: (err, { tool, target }) => {
       const uncertain = err instanceof HostControlError ? err.data : undefined;
       const code = err instanceof HostControlError ? err.code : undefined;
       const visible: VisibleResult = {
@@ -143,7 +149,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
       if (visible.outcomeUnknown) {
         const unknown: ReconciliationEntry = {
           ...visible,
-          targetId: tool.preset_id,
+          target,
         };
         qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => ({
           ...current,
@@ -159,16 +165,25 @@ export function HostToolsPanel({ host }: { host: Host }) {
     },
   });
   const reconcileM = useMutation({
-    mutationFn: async (tool: ToolRow) => {
-      if (!client || !isInteractiveToolKind(tool.agent_kind)) {
+    mutationFn: async ({
+      tool,
+      reconciliation,
+    }: {
+      tool: ToolRow;
+      reconciliation: ReconciliationEntry;
+    }) => {
+      if (
+        !client ||
+        tool.preset_id !== reconciliation.target.target_id ||
+        tool.agent_kind !== reconciliation.target.tool ||
+        !isInteractiveToolKind(tool.agent_kind)
+      ) {
         throw new HostControlError(
-          "unsupported_tool",
-          "Tool is not supported by the endpoint policy",
+          "reconciliation_target_changed",
+          "Target metadata changed; the original tool ambiguity cannot be cleared here",
         );
       }
-      const [status] = await client.checkTools([
-        { target_id: tool.preset_id, tool: tool.agent_kind },
-      ]);
+      const [status] = await client.checkTools([reconciliation.target]);
       if (!status || !isDefinitiveReconciliation(status)) {
         throw new HostControlError(
           "reconciliation_failed",
@@ -176,10 +191,21 @@ export function HostToolsPanel({ host }: { host: Host }) {
           status,
         );
       }
+      const current = qc
+        .getQueryData<{ tools: ToolRow[] }>(["host-tools", host.id])
+        ?.tools.find((row) => row.preset_id === reconciliation.target.target_id);
+      if (!current || current.agent_kind !== reconciliation.target.tool) {
+        throw new HostControlError(
+          "reconciliation_target_changed",
+          "Target metadata changed while status was checked; reconciliation remains required",
+        );
+      }
       return status;
     },
-    onSuccess: (status, tool) => {
+    onSuccess: (status, { tool, reconciliation }) => {
       qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => {
+        const existing = current[tool.preset_id];
+        if (!existing || !sameTarget(existing.target, reconciliation.target)) return current;
         const next = { ...current };
         delete next[tool.preset_id];
         return next;
@@ -195,10 +221,9 @@ export function HostToolsPanel({ host }: { host: Host }) {
       );
       setLastResult(null);
     },
-    onError: (error, tool) => {
-      const existing = reconciliationByTarget[tool.preset_id];
+    onError: (error, { reconciliation }) => {
       setLastResult({
-        ...(existing ?? { name: tool.preset_name, outcomeUnknown: true }),
+        ...reconciliation,
         error: `Check now failed: ${error instanceof Error ? error.message : String(error)}`,
       });
     },
@@ -330,11 +355,13 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 onClick={() => {
                   if (reconciliationByTarget[tool.preset_id]) return;
                   if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
+                    if (!isInteractiveToolKind(tool.agent_kind)) return;
                     setLastResult(null);
                     const controller = new AbortController();
+                    const target = { target_id: tool.preset_id, tool: tool.agent_kind };
                     installAbortRef.current?.controller.abort();
                     installAbortRef.current = { controller, client, hostId: host.id, tool };
-                    installM.mutate({ tool, controller });
+                    installM.mutate({ tool, target, controller });
                   }
                 }}
               >
@@ -351,9 +378,12 @@ export function HostToolsPanel({ host }: { host: Host }) {
                   size="sm"
                   className="shrink-0"
                   disabled={reconcileM.isPending}
-                  onClick={() => reconcileM.mutate(tool)}
+                  onClick={() => {
+                    const reconciliation = reconciliationByTarget[tool.preset_id];
+                    if (reconciliation) reconcileM.mutate({ tool, reconciliation });
+                  }}
                 >
-                  {reconcileM.isPending && reconcileM.variables?.preset_id === tool.preset_id
+                  {reconcileM.isPending && reconcileM.variables?.tool.preset_id === tool.preset_id
                     ? "Checking..."
                     : "Check now"}
                 </Button>
@@ -446,4 +476,8 @@ function isDefinitiveReconciliation(status: HostToolStatus): boolean {
     typeof status.latest_version === "string" &&
     typeof status.update_available === "boolean"
   );
+}
+
+function sameTarget(left: HostToolTargetRef, right: HostToolTargetRef): boolean {
+  return left.target_id === right.target_id && left.tool === right.tool;
 }

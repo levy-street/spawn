@@ -179,7 +179,7 @@ test("outcome unknown survives navigation and only a definitive Check now unlock
             target_id: PRESET_ID,
             tool: "codex",
             command: ["codex"],
-            ...(checkCalls === 2
+            ...(checkCalls === 3
               ? {
                   installed: true,
                   path: "/private/bin/codex",
@@ -240,7 +240,74 @@ test("outcome unknown survives navigation and only a definitive Check now unlock
   await expect(page.getByRole("button", { name: "Install" })).toBeEnabled();
   await expect(page.getByText("typed reconciliation output")).toHaveCount(0);
   expect(installs).toHaveLength(1);
-  expect(checkCalls).toBe(3);
+  expect(checkCalls).toBe(4);
+});
+
+test("reconciliation stays bound to the original tool when metadata drifts on remount", async ({
+  page,
+}) => {
+  let metadataKind = "codex";
+  const checks: unknown[] = [];
+  page.on("dialog", (dialog) => dialog.accept());
+  await mockAuthenticatedApi(page, {
+    toolTargets: () => [
+      {
+        preset_id: PRESET_ID,
+        preset_name: "same preset",
+        agent_kind: metadataKind,
+        auto_update: false,
+        last_checked_at: null,
+        last_auto_update_at: null,
+      },
+    ],
+    toolCheck: (_hostId, payload) => {
+      checks.push(payload);
+      const target = (payload.targets as Array<{ target_id: string; tool: string }>)[0];
+      return {
+        tools: [
+          {
+            ...target,
+            command: [target.tool],
+            installed: false,
+          },
+        ],
+      };
+    },
+    toolInstall: () => ({
+      target_id: PRESET_ID,
+      tool: "codex",
+      command: ["codex"],
+      install_argv: ["npm", "install", "--global", "@openai/codex"],
+      outcome: "unknown",
+      success: false,
+      exit_code: 0,
+      stdout: "original codex ambiguity",
+      stderr: "",
+      output_truncated: false,
+      error: "codex reconciliation was ambiguous",
+    }),
+  });
+
+  await page.goto(`/hosts/${HOST_ID}`);
+  await page.getByRole("button", { name: "Install" }).click();
+  await expect(page.getByText("original codex ambiguity")).toBeVisible();
+  metadataKind = "aider";
+  await page.getByRole("link", { name: "All hosts" }).click();
+  await page.locator(`a[href="/hosts/${HOST_ID}"]`).click();
+  await expect(page.getByText("reconciliation required")).toBeVisible();
+  await expect(page.getByText("aider")).toBeVisible();
+
+  const checksBeforeReconciliation = checks.length;
+  await page.getByRole("button", { name: "Check now" }).click();
+  await expect(
+    page.getByText(/Check now failed: Target metadata changed; the original tool ambiguity/),
+  ).toBeVisible();
+  await expect(page.getByText("reconciliation required")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Install" })).toBeDisabled();
+  expect(checks).toHaveLength(checksBeforeReconciliation);
+  expect(checks.at(-1)).toEqual({
+    targets: [{ target_id: PRESET_ID, tool: "aider" }],
+  });
 });
 
 test("built-in Aider metadata uses its canonical endpoint kind", async ({ page }) => {

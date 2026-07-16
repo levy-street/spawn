@@ -16,7 +16,9 @@ require_tool() {
 
 run_guard() {
   require_tool git
+  require_tool node
   require_tool python3
+  require_tool rustc
   require_tool "$rg_bin"
   "$rg_bin" --version >/dev/null 2>&1 || fail "ripgrep health check failed"
   [[ -d "$repo_root" ]] || fail "root does not exist: $repo_root"
@@ -40,7 +42,10 @@ run_guard() {
 from __future__ import annotations
 
 import ast
+import hashlib
+import os
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -122,11 +127,72 @@ for relative, source in sources.items():
     except SyntaxError as exc:
         die(f"cannot parse server production source {relative}: {exc}")
 
+def static_python_string(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = static_python_string(node.left, bindings)
+        right = static_python_string(node.right, bindings)
+        return None if left is None or right is None else left + right
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = [static_python_string(item, bindings) for item in node.elts]
+        return None if any(value is None for value in values) else "".join(values)  # type: ignore[arg-type]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+    ):
+        separator = static_python_string(node.func.value, bindings)
+        values_node = node.args[0]
+        if separator is not None and isinstance(values_node, (ast.List, ast.Tuple)):
+            values = [static_python_string(item, bindings) for item in values_node.elts]
+            if all(value is not None for value in values):
+                return separator.join(values)  # type: ignore[arg-type]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "chr"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, int)
+    ):
+        try:
+            return chr(node.args[0].value)
+        except ValueError:
+            return None
+    return None
+
+
+server_string_bindings: dict[str, dict[str, str]] = {}
 for relative, tree in server_trees.items():
+    bindings: dict[str, str] = {}
+    for _ in range(8):
+        changed = False
+        for node in ast.walk(tree):
+            target: ast.Name | None = None
+            value_node: ast.AST | None = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target, value_node = node.targets[0], node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target, value_node = node.target, node.value
+            if target is None or value_node is None:
+                continue
+            value = static_python_string(value_node, bindings)
+            if value is not None and bindings.get(target.id) != value:
+                bindings[target.id] = value
+                changed = True
+        if not changed:
+            break
+    server_string_bindings[relative] = bindings
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value in {"tool.check", "tool.install"}:
-                die(f"server production code names endpoint-only operation in {relative}:{node.lineno}")
+        value = static_python_string(node, bindings)
+        if value in {"tool.check", "tool.install"}:
+            die(f"server production computes endpoint-only operation in {relative}:{node.lineno}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "vars":
+            die(f"server production uses unreviewed vars() field access in {relative}:{node.lineno}")
 
 hosts_relative = "server/spawn_server/routes/hosts.py"
 hosts_tree = server_trees[hosts_relative]
@@ -156,10 +222,14 @@ for relative, tree in server_trees.items():
                 continue
             if decorator.func.attr not in {"get", "post", "put", "patch", "delete"}:
                 continue
-            if not decorator.args or not isinstance(decorator.args[0], ast.Constant):
-                continue
-            route = decorator.args[0].value
-            if not isinstance(route, str) or "tool" not in route.lower():
+            if not decorator.args:
+                die(f"server route has no literal path in {relative}:{node.lineno}")
+            route = static_python_string(
+                decorator.args[0], server_string_bindings.get(relative, {})
+            )
+            if route is None:
+                die(f"server route path is computed or unresolved in {relative}:{node.lineno}")
+            if "tool" not in route.lower():
                 continue
             found = (decorator.func.attr, route, node.name)
             if relative != hosts_relative or found not in allowed_routes:
@@ -274,6 +344,9 @@ protected_server_attributes = {
 }
 expected_server_attribute_reads = Counter({
     ("server/spawn_server/presets.py", "seed_builtin_presets", "install"): 2,
+    ("server/spawn_server/presets.py", "seed_builtin_presets", "subscript:default_argv"): 1,
+    ("server/spawn_server/presets.py", "seed_builtin_presets", "get:install"): 2,
+    ("server/spawn_server/agent_control.py", "upload_agent_file", "subscript:path"): 1,
     ("server/spawn_server/routes/agents.py", "_dispatch_agent_launch", "install"): 1,
     ("server/spawn_server/routes/agents.py", "create_agent", "default_argv"): 1,
     ("server/spawn_server/routes/device.py", "device_poll", "version"): 1,
@@ -293,7 +366,10 @@ expected_server_attribute_reads = Counter({
     ("server/spawn_server/routes/presets.py", "update_preset", "default_argv"): 2,
     ("server/spawn_server/routes/presets.py", "update_preset", "install"): 2,
     ("server/spawn_server/ws/broker.py", "_request_owner_result", "payload"): 1,
+    ("server/spawn_server/ws/browser.py", "browser_ws", "get:path"): 1,
+    ("server/spawn_server/ws/daemon.py", "daemon_ws", "get:path"): 1,
     ("server/spawn_server/ws/owner_dispatch.py", "encode_owner_result", "payload"): 1,
+    ("server/spawn_server/ws/owner_dispatch.py", "decode_owner_result", "get:payload"): 1,
 })
 
 
@@ -318,6 +394,36 @@ class LegacyStringVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in protected_server_attributes:
             self.protected_attributes[(self.relative, self.scope[-1], node.attr)] += 1
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.slice, ast.Constant) and node.slice.value in protected_server_attributes:
+            self.protected_attributes[
+                (self.relative, self.scope[-1], f"subscript:{node.slice.value}")
+            ] += 1
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in protected_server_attributes
+        ):
+            self.protected_attributes[
+                (self.relative, self.scope[-1], f"getattr:{node.args[1].value}")
+            ] += 1
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in protected_server_attributes
+        ):
+            self.protected_attributes[
+                (self.relative, self.scope[-1], f"get:{node.args[0].value}")
+            ] += 1
         self.generic_visit(node)
 
 
@@ -539,6 +645,48 @@ def rust_production_source(source: str) -> str:
     return source
 
 
+expected_command_ast_hashes = {
+    "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
+    "daemon/src/host_tools.rs": "4f042f9e27aa992d2cebcfe5f02546cebf321bde469758168682ce16b034ad6c",
+    "daemon/src/main.rs": "b96fa7f9a1ad9f52e4be6a98923ca643d37da2e0be0d97d487ec77d25b6f3e05",
+    "daemon/src/run.rs": "636f41839e6014df18aebe8e3c6dbbf9b4f5d25e36451d9f6a8c47b1691157ad",
+    "daemon/src/worker_backend.rs": "7b3d600b3ba7e0553a405e50c3b35e9120b3f000198efd7ed90541fef8b99baa",
+}
+found_command_sources = {
+    relative
+    for relative, source in sources.items()
+    if relative.startswith("daemon/src/")
+    and relative.endswith(".rs")
+    and re.search(r"\bCommand\b", rust_production_source(source))
+}
+if found_command_sources != expected_command_ast_hashes.keys():
+    die(f"daemon process-launch source inventory changed: {sorted(found_command_sources)!r}")
+for relative, expected_hash in expected_command_ast_hashes.items():
+    production = rust_production_source(sources[relative])
+    try:
+        parsed = subprocess.run(
+            [
+                "rustc", "--edition", "2021", "--crate-type", "lib",
+                "-Z", "unpretty=ast-tree", "-",
+            ],
+            input=production,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "RUSTC_BOOTSTRAP": "1"},
+            check=False,
+        )
+    except OSError as exc:
+        die(f"cannot parse reviewed Rust process-launch source {relative}: {exc}")
+    if parsed.returncode != 0:
+        die(f"cannot parse reviewed Rust process-launch source {relative}: {parsed.stderr.strip()}")
+    found_hash = hashlib.sha256(parsed.stdout.encode()).hexdigest()
+    if found_hash != expected_hash:
+        die(
+            f"reviewed Rust process-launch AST changed in {relative}: "
+            f"expected {expected_hash}, found {found_hash}"
+        )
+
+
 daemon_shell_evals = Counter()
 daemon_login_shell_symbols = Counter()
 for relative, source in sources.items():
@@ -630,6 +778,313 @@ if not re.search(
     die("server Aider preset no longer discloses canonical agent_kind='aider'")
 PY
 
+  node - "$repo_root" "$inventory" "$(cd "$(dirname "$script_path")/.." && pwd)/web/node_modules/typescript/lib/typescript.js" <<'JS'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = path.resolve(process.argv[2]);
+const inventoryPath = process.argv[3];
+const typescriptPath = process.argv[4];
+let ts;
+try {
+  ts = require(typescriptPath);
+} catch (error) {
+  throw new Error(`host-tool-e2e-boundary: cannot load TypeScript parser: ${error}`);
+}
+
+function die(message) {
+  throw new Error(`host-tool-e2e-boundary: ${message}`);
+}
+
+const relativePaths = fs
+  .readFileSync(inventoryPath, "utf8")
+  .split(/\r?\n/)
+  .map((value) => value.trim().replaceAll("\\", "/"))
+  .filter(
+    (relative) =>
+      relative.startsWith("web/src/") &&
+      /\.(?:ts|tsx)$/.test(relative) &&
+      !/\.(?:test|spec)\.[^.]+$/.test(relative),
+  );
+const files = new Map();
+for (const relative of relativePaths) {
+  const sourceText = fs.readFileSync(path.join(root, relative), "utf8");
+  const sourceFile = ts.createSourceFile(
+    relative,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+    relative.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  if (sourceFile.parseDiagnostics.length > 0) {
+    die(`cannot parse browser production source ${relative}`);
+  }
+  files.set(relative, sourceFile);
+}
+
+const apiRelative = "web/src/lib/api.ts";
+const controlRelative = "web/src/lib/hostControl.ts";
+const panelRelative = "web/src/components/hosts/HostToolsPanel.tsx";
+for (const required of [apiRelative, controlRelative, panelRelative]) {
+  if (!files.has(required)) die(`required browser source is missing: ${required}`);
+}
+
+function walk(node, visitor) {
+  visitor(node);
+  ts.forEachChild(node, (child) => walk(child, visitor));
+}
+
+function collectBindings(sourceFile) {
+  const bindings = new Map();
+  for (let pass = 0; pass < 8; pass += 1) {
+    let changed = false;
+    walk(sourceFile, (node) => {
+      if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || !node.initializer) return;
+      const value = staticString(node.initializer, bindings);
+      if (value !== null && bindings.get(node.name.text) !== value) {
+        bindings.set(node.name.text, value);
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  return bindings;
+}
+
+function staticString(node, bindings) {
+  if (!node) return null;
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (ts.isIdentifier(node)) return bindings.get(node.text) ?? null;
+  if (ts.isParenthesizedExpression(node)) return staticString(node.expression, bindings);
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticString(node.left, bindings);
+    const right = staticString(node.right, bindings);
+    return left === null || right === null ? null : left + right;
+  }
+  if (ts.isTemplateExpression(node)) {
+    let value = node.head.text;
+    for (const span of node.templateSpans) {
+      const expression = staticString(span.expression, bindings);
+      if (expression === null) return null;
+      value += expression + span.literal.text;
+    }
+    return value;
+  }
+  if (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === "join" &&
+    ts.isArrayLiteralExpression(node.expression.expression)
+  ) {
+    const separator = node.arguments.length === 0 ? "" : staticString(node.arguments[0], bindings);
+    const values = node.expression.expression.elements.map((element) => staticString(element, bindings));
+    return separator === null || values.some((value) => value === null)
+      ? null
+      : values.join(separator);
+  }
+  if (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === "String" &&
+    node.expression.name.text === "fromCharCode" &&
+    node.arguments.every((argument) => ts.isNumericLiteral(argument))
+  ) {
+    return String.fromCharCode(...node.arguments.map((argument) => Number(argument.text)));
+  }
+  return null;
+}
+
+const printer = ts.createPrinter({ removeComments: true });
+function structuralHash(node, sourceFile) {
+  return crypto
+    .createHash("sha256")
+    .update(printer.printNode(ts.EmitHint.Unspecified, node, sourceFile))
+    .digest("hex");
+}
+function propertyName(node, sourceFile, bindings) {
+  if (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) return node.name.text;
+  if (ts.isComputedPropertyName(node.name)) return staticString(node.name.expression, bindings);
+  return node.name?.getText(sourceFile) ?? null;
+}
+function requireHash(label, node, sourceFile, expected) {
+  if (!node) die(`reviewed browser structure is missing: ${label}`);
+  const found = structuralHash(node, sourceFile);
+  if (found !== expected) die(`reviewed browser AST changed for ${label}: expected ${expected}, found ${found}`);
+}
+
+// Freeze the legacy API surface structurally. Comments, unreachable sentinels,
+// aliases, and computed property names cannot satisfy this inventory.
+const apiFile = files.get(apiRelative);
+const apiBindings = collectBindings(apiFile);
+let hostsDeclaration;
+walk(apiFile, (node) => {
+  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "hosts") {
+    if (hostsDeclaration) die("api.ts defines hosts more than once");
+    hostsDeclaration = node;
+  }
+});
+if (!hostsDeclaration || !hostsDeclaration.initializer || !ts.isObjectLiteralExpression(hostsDeclaration.initializer)) {
+  die("api.ts hosts object is missing or computed");
+}
+const hostProperties = new Map();
+for (const property of hostsDeclaration.initializer.properties) {
+  const name = propertyName(property, apiFile, apiBindings);
+  if (!name || hostProperties.has(name)) die("api.ts hosts object has a computed or duplicate property");
+  hostProperties.set(name, property);
+}
+const expectedHostKeys = ["list", "get", "rename", "remove", "tools", "toolTargets", "installTool", "updateToolPolicy"];
+if (JSON.stringify([...hostProperties.keys()]) !== JSON.stringify(expectedHostKeys)) {
+  die(`api.ts hosts property inventory changed: ${JSON.stringify([...hostProperties.keys()])}`);
+}
+for (const [name, expected] of Object.entries({
+  tools: "d548a191bf1d1c5038847f9da02d1326f73eb4dd988d0c1fe13f094e6b034898",
+  toolTargets: "8d711092e496dcbc59efc65551579b09afe17ecc401821d5a94781984f4c1db1",
+  installTool: "18ffe0e4da1222a19ee5e186ab69d0d53a258ca650698460ab9bb66273fcf770",
+  updateToolPolicy: "131a2d0355019697efd8e8bb2e2e0137cc882fd24bb5b3e16600eef83fda6f13",
+})) requireHash(`api.hosts.${name}`, hostProperties.get(name), apiFile, expected);
+
+for (const [relative, sourceFile] of files) {
+  const bindings = collectBindings(sourceFile);
+  const aliases = new Set(["hosts"]);
+  walk(sourceFile, (node) => {
+    if (ts.isImportSpecifier(node) && (node.propertyName?.text ?? node.name.text) === "hosts") aliases.add(node.name.text);
+  });
+  for (let pass = 0; pass < 8; pass += 1) {
+    let changed = false;
+    walk(sourceFile, (node) => {
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer &&
+        ts.isIdentifier(node.initializer) &&
+        aliases.has(node.initializer.text) &&
+        !aliases.has(node.name.text)
+      ) {
+        aliases.add(node.name.text);
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  walk(sourceFile, (node) => {
+    const computed = staticString(node, bindings);
+    if (relative !== controlRelative && (computed === "tool.check" || computed === "tool.install")) {
+      die(`endpoint-only tool operation escaped hostControl.ts in ${relative}`);
+    }
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && ts.isIdentifier(node.initializer) && aliases.has(node.initializer.text)) {
+      die(`browser production destructures the hosts API in ${relative}`);
+    }
+    if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && aliases.has(node.expression.text)) {
+      if (["tools", "installTool"].includes(node.name.text) && relative !== apiRelative) {
+        die(`browser production references legacy hosts.${node.name.text} in ${relative}`);
+      }
+    }
+    if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) && aliases.has(node.expression.text)) {
+      die(`browser production uses computed hosts API access in ${relative}`);
+    }
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const callee = node.expression;
+      const calleeName = ts.isIdentifier(callee)
+        ? callee.text
+        : ts.isPropertyAccessExpression(callee)
+          ? callee.name.text
+          : "";
+      if (calleeName === "eval" || calleeName === "Function") {
+        die(`browser production contains dynamic evaluation in ${relative}`);
+      }
+      const strings = [];
+      for (const argument of node.arguments ?? []) {
+        walk(argument, (part) => {
+          const value = staticString(part, bindings);
+          if (value !== null) strings.push(value);
+        });
+      }
+      if (strings.some((value) => value === "sh" || value === "bash") && strings.includes("-c")) {
+        die(`browser production contains shell evaluation in ${relative}`);
+      }
+    }
+  });
+}
+
+function namedNodes(sourceFile) {
+  const result = new Map();
+  walk(sourceFile, (node) => {
+    if ((ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) && node.name) {
+      const name = node.name.getText(sourceFile);
+      if (!result.has(name)) result.set(name, node);
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && !result.has(node.name.text)) {
+      result.set(node.name.text, node);
+    }
+  });
+  return result;
+}
+const panelFile = files.get(panelRelative);
+const panelNodes = namedNodes(panelFile);
+for (const [name, expected] of Object.entries({
+  HostToolsPanel: "776149d6ad38edf6ebb9a6d5fc13b090d74d46ea5aa48901573f2ab90b38d9bd",
+  reconciliationQ: "6aefd5966c2f6ee70ea4d77e52499f6050a07a1ff626c75ed7c9279562a1d4e5",
+  installM: "e1ea630c5b970c6301d9652aeb7a521dd8e4e57cacce52846e7f2746b4b01cc0",
+  reconcileM: "6599d05128f42455330f61a5a62e98b7f0a01f4f78ca8971c64ddabb67c36e87",
+  isDefinitiveReconciliation: "91bd98e42a127af99f0c52d5abbbc10cf8820f954e460a94358f5a492bb3527b",
+  sameTarget: "d51a557bdd8d1c51b9f485902f7039cac6c902fd9e5bc295765c920ea4fc0137",
+})) requireHash(`HostToolsPanel.${name}`, panelNodes.get(name), panelFile, expected);
+
+const controlFile = files.get(controlRelative);
+const controlNodes = namedNodes(controlFile);
+for (const [name, expected] of Object.entries({
+  checkTools: "0c8e4ff7c8eaf7cdcd532b82ffc1d7229f500d8d28d6ef91ee2cf5ee02ef49dc",
+  installTool: "56f663efe01395322537c2bdb8ccc26db4df7ccd490ba5bb23a6e21359b10284",
+  parseToolStatus: "bafce8efc628f2bf58975b87c87add95b3096f6648d1c21814bb607ed6249c36",
+  parseToolInstallResult: "633146e70ea7cfaf14835c398f01f3abcd36c6ba9bf22757fbf48c7b414d5164",
+  parseNumericVersion: "dd65dd03d102bd6b66050843ad83ed79d60c09fe150ca14a2aa9d9a8c813685d",
+  versionSuggestsUpdate: "eba099db5d0e73eb02efbde29a53392f5bbc6634e32e0267a97ebd62a2aa8866",
+})) requireHash(`hostControl.${name}`, controlNodes.get(name), controlFile, expected);
+
+function requestOperation(method) {
+  const operations = [];
+  walk(method, (node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === "request"
+    ) {
+      operations.push(staticString(node.arguments[0], collectBindings(controlFile)));
+    }
+  });
+  return operations;
+}
+if (JSON.stringify(requestOperation(controlNodes.get("checkTools"))) !== JSON.stringify(["tool.check"])) {
+  die("HostControlClient.checkTools no longer performs the exact tool.check request");
+}
+if (JSON.stringify(requestOperation(controlNodes.get("installTool"))) !== JSON.stringify(["tool.install"])) {
+  die("HostControlClient.installTool no longer performs the exact tool.install request");
+}
+
+let commandPolicy;
+walk(controlFile, (node) => {
+  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "TOOL_COMMANDS") {
+    commandPolicy = node.initializer;
+  }
+});
+if (ts.isAsExpression(commandPolicy)) commandPolicy = commandPolicy.expression;
+if (!commandPolicy || !ts.isObjectLiteralExpression(commandPolicy)) die("browser canonical tool policy is missing");
+const commands = {};
+for (const property of commandPolicy.properties) {
+  if (!ts.isPropertyAssignment(property)) die("browser canonical tool policy contains a computed member");
+  const name = propertyName(property, controlFile, collectBindings(controlFile));
+  const value = staticString(property.initializer, collectBindings(controlFile));
+  if (!name || value === null || Object.hasOwn(commands, name)) die("browser canonical tool policy is dynamic");
+  commands[name] = value;
+}
+const expectedCommands = { "claude-code": "claude", codex: "codex", opencode: "opencode", aider: "aider", shell: "bash" };
+if (JSON.stringify(commands) !== JSON.stringify(expectedCommands)) {
+  die(`browser canonical tool policy changed: ${JSON.stringify(commands)}`);
+}
+JS
+
   printf '%s\n' "host-tool-e2e-boundary: passed"
 }
 
@@ -709,10 +1164,39 @@ p.write_text(p.read_text() + '\n@router.get("/{host_id}/tool-detail")\nasync def
 PY
   expect_rejected server-extra-route
 
+  new_case server-computed-route
+  python3 - "$case_dir/server/spawn_server/routes/hosts.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+DETAIL_ROUTE = "/{host_id}/to" + "ol-detail"
+@router.get(DETAIL_ROUTE)
+async def computed_tool_detail():
+    return {}
+''')
+PY
+  expect_rejected server-computed-route
+
   new_case server-endpoint-operation
   printf '%s\n' 'ENDPOINT_TOOL_OPERATION = "tool.install"' \
     >>"$case_dir/server/spawn_server/routes/hosts.py"
   expect_rejected server-endpoint-operation
+
+  new_case server-encoded-endpoint-operation
+  printf '%s\n' 'ENDPOINT = "".join([chr(116), chr(111), chr(111), chr(108), ".install"])' \
+    >>"$case_dir/server/spawn_server/routes/hosts.py"
+  expect_rejected server-encoded-endpoint-operation
+
+  new_case server-protected-subscript
+  printf '%s\n' 'def relay(value): return value["default_argv"]' \
+    >"$case_dir/server/spawn_server/routes/relay.py"
+  expect_rejected server-protected-subscript
+
+  new_case server-vars-access
+  printf '%s\n' 'def relay(value): return vars(value).get("install")' \
+    >"$case_dir/server/spawn_server/routes/relay.py"
+  expect_rejected server-vars-access
 
   new_case web-legacy-alias
   printf '%s\n' 'export const hostToolFallback = hosts["installTool"];' \
@@ -728,6 +1212,11 @@ PY
   printf '%s\n' 'export const relay = hosts["install" + "Tool"];' \
     >"$case_dir/web/src/lib/relay.ts"
   expect_rejected web-computed-property-alias
+
+  new_case web-transitive-property-alias
+  printf '%s\n' 'const apiAlias = hosts; export const relay = apiAlias.installTool;' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-transitive-property-alias
 
   new_case web-legacy-route
   printf '%s\n' 'export const hostToolFallback = (id: string) => fetch(`/api/hosts/${id}/tools`);' \
@@ -745,6 +1234,12 @@ PY
     >"$case_dir/web/src/lib/relay.ts"
   expect_rejected web-computed-operation
 
+  new_case web-encoded-operation
+  printf '%s\n' \
+    'export const relay = String.fromCharCode(116, 111, 111, 108, 46, 105, 110, 115, 116, 97, 108, 108);' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-encoded-operation
+
   new_case web-shell-fallback
   printf '%s\n' 'export const hostToolFallback = () => spawn(["sh", "-c", "npm install"])' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
@@ -754,6 +1249,12 @@ PY
   printf '%s\n' 'export const run = () => spawn(["sh", "-c", "echo unsafe"])' \
     >"$case_dir/web/src/lib/worker.ts"
   expect_rejected web-generic-shell-helper
+
+  new_case web-encoded-shell-helper
+  printf '%s\n' \
+    'const shell = ["s", "h"].join(""); const flag = String.fromCharCode(45, 99); export const run = () => spawn([shell, flag, "echo unsafe"]);' \
+    >"$case_dir/web/src/lib/worker.ts"
+  expect_rejected web-encoded-shell-helper
 
   new_case daemon-multiline-shell
   python3 - "$case_dir/daemon/src/host_tool_fallback.rs" <<'PY'
@@ -782,6 +1283,40 @@ Path(sys.argv[1]).write_text('''fn run() {
 PY
   expect_rejected daemon-generic-shell-helper
 
+  new_case daemon-command-alias
+  python3 - "$case_dir/daemon/src/helpers.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''use tokio::process::Command as Runner;
+fn run() { Runner::new("sh").args(["-c", "echo unsafe"]); }
+''')
+PY
+  expect_rejected daemon-command-alias
+
+  new_case daemon-args-shell
+  python3 - "$case_dir/daemon/src/helpers.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''fn run() {
+    Command::new("sh").args(["-c", "echo unsafe"]);
+}
+''')
+PY
+  expect_rejected daemon-args-shell
+
+  new_case daemon-computed-shell
+  python3 - "$case_dir/daemon/src/host_tools.rs" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text().replace(
+    'Command::new(program)',
+    'Command::new(["s", "h"].concat()).args(["-c", program])',
+    1,
+))
+PY
+  expect_rejected daemon-computed-shell
+
   new_case daemon-login-shell-dependency
   printf '%s\n' \
     'async fn load_environment() { let _ = crate::run::resolved_command_env().await; }' \
@@ -802,6 +1337,16 @@ p = Path(sys.argv[1])
 p.write_text(p.read_text().replace("client.installTool(", "client['installTool'](", 1))
 PY
   expect_rejected missing-sentinel
+
+  new_case dead-sentinel-cannot-mask-change
+  python3 - "$case_dir/web/src/components/hosts/HostToolsPanel.tsx" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+source = p.read_text().replace("client.installTool(", "client['installTool'](", 1)
+p.write_text(source + '\n// client.installTool( dead sentinel must not satisfy the guard\n')
+PY
+  expect_rejected dead-sentinel-cannot-mask-change
 
   new_case missing-reconciliation-sentinel
   python3 - "$case_dir/web/src/components/hosts/HostToolsPanel.tsx" <<'PY'
