@@ -587,7 +587,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -602,12 +602,23 @@ the daemon closes rather than evicting its bounded replay set.
 
 Host filesystem paths and detailed errors exist only in this DataChannel.
 `fs.home`, `fs.stat`, `fs.mkdir`, `fs.rename`, and `fs.remove` use ordinary
-request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns at
-most 96 sorted entries plus `next_cursor`; the browser follows pages. Entries
-contain `name`, `path`, `kind`, `is_dir`, optional `size`, and optional
-`modified_at`. The daemon confines all operations to its canonical home root,
-rejects `..`, paths outside that root, and every symlink component, and refuses
-to rename/remove the root. `overwrite` defaults false.
+request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns one
+unsorted page of at most 96 entries plus `next_cursor`; the browser fetches a
+page only after an explicit **Load more** action. A daemon request never scans
+more than the fixed 1024-entry directory ceiling, and the final page sets
+`truncated:true` when additional entries exist. The browser retains at most 32
+pages/3072 entries for an active directory and evicts collapsed directory
+pages. Entries contain `name`, `path`, `kind`, `is_dir`, optional `size`, and
+optional `modified_at`.
+
+The daemon acquires the canonical home directory once as a filesystem
+capability. Every component is then opened relative to held directory handles
+with no-follow semantics; request-time operations never resolve an ambient
+path. Final read/write/list/mkdir/remove/rename/temp operations are anchored to
+those handles, reject symlink components, and refuse to rename/remove the root.
+`overwrite` defaults false. A no-clobber rename/commit uses the platform atomic
+`RENAME_NOREPLACE`/`RENAME_EXCL` operation and fails closed where that primitive
+is unavailable; it never uses a check-then-rename sequence.
 
 Reads start with:
 
@@ -619,8 +630,13 @@ Reads start with:
 {"version":1,"type":"stream.end","stream_id":"s","length":2,"sha256":"...64 hex..."}
 ```
 
-The daemon permits at most eight unacknowledged 8 KiB chunks. It hashes before
-and during the read; a mutation produces `stream.error` rather than a valid end.
+The daemon permits at most eight unacknowledged 8 KiB chunks. DataChannel
+callbacks only validate and enqueue bounded frames: ACK/cancel frames use a
+separate 64-frame fast queue and per-read signal channel, while ordered normal
+frames use their own 64-frame queue. Hash/send jobs run outside the callback
+under an eight-task semaphore, so a sender waiting for its window cannot block
+its own ACK or cancellation. It hashes before and during the read; a mutation
+produces `stream.error` rather than a valid end.
 Writes start with `fs.write.begin` payload
 `{dir,name,length,sha256,overwrite?}`, then the browser sends the same chunk and
 end shapes. The daemon rejects wrong sequence/length/hash, writes a unique temp
@@ -631,7 +647,9 @@ removes the temp file. Files are capped at 512 MiB.
 For cross-host transfer, the browser opens two independently authorized host
 sessions and pumps the source read stream into the destination write stream;
 it neither buffers the whole file nor sends any path, metadata, error, or byte
-through the signaling server. Failure aborts both streams. The former REST
+through the signaling server. Source/destination errors, timeouts, cancellation,
+or either peer closing race the pump; the first terminal outcome cancels both
+streams and awaits cleanup before returning. The former REST
 `/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.

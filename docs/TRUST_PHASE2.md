@@ -206,7 +206,11 @@ is restricted to stable content-free values.
 - Browser downloads and uploads stream directly. Cross-host transfer uses two
   authorized host sessions and streams source daemon → browser → destination
   daemon; the server never buffers the file. Preserve bounded memory and
-  destination overwrite semantics.
+  destination overwrite semantics. Filesystem calls are capability-rooted and
+  no-follow for every component, no-clobber commits use a single atomic rename,
+  directory pages have daemon and browser retention ceilings, and ACK/cancel
+  dispatch cannot wait behind a long sender. The first source/destination
+  timeout, error, cancellation, or peer loss aborts and cleans up both streams.
 - Add a parallel E2E request/response path for interactive tool checks/installs,
   including commands, paths, installed/latest versions, stdout/stderr, and
   detailed errors. This increment proves and ships the endpoint transport, but

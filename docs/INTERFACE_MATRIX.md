@@ -12,7 +12,7 @@ see docs/TRUST.md.)
 | Device approval | device page | `/api/auth/device/*` | `auth.approveDevice` | `device.start`, poll/login CLI |
 | List/get hosts | hosts page, agent form | `GET /api/hosts`, `GET /api/hosts/{id}` | `hosts.list/get` | register/heartbeat updates |
 | Rename/delete host | hosts page | `PATCH/DELETE /api/hosts/{id}` | `hosts.rename/remove` | delete closes connected daemon |
-| List/manage host files | file explorer, new-agent picker | none | `HostControlClient` | E2E `spawn.host.ctl` `fs.*` requests and bounded streams |
+| List/manage host files | file explorer, new-agent picker | none | `HostControlClient` | capability-rooted E2E `spawn.host.ctl` `fs.*`; explicit bounded pages and streams |
 | Check/install host tools | hosts page, agent update badge | `/tools`, `/install`, `/policy` | `hosts.tools/installTool/updateToolPolicy` | `host.tools.check`, `host.tools.install` |
 | List/create/update/delete presets | settings | `/api/presets` | `presets.*` | used at agent launch |
 | Manage skills | settings, new-agent access picker | `/api/skills` | `skills.*` | included in `agent.create` |

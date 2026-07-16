@@ -97,9 +97,18 @@ REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
 are removed in that branch. This is **implementation-complete, review-pending**,
 not an integrated or `DONE` claim.
 
+The first P2-HOST-02 review rejected the candidate for path-resolution races,
+serial DataChannel read deadlock, check-then-rename clobbering, incomplete
+bilateral transfer aborts, unbounded directory aggregation, and inadequate
+two-host isolation coverage. The revised candidate uses a held capability root
+and no-follow directory handles, atomic no-replace rename, separate bounded
+ACK/cancel dispatch, explicit bounded directory pages/UI retention, bilateral
+abort cleanup, and real distinct-host paired-channel coverage. It remains
+`ACTIVE` until the independent re-review passes and the result is merged.
+
 P2-AGENT-01 and P2-TMUX-01 subsequently passed independent review and were
-integrated on `master` through `1f66d2d`; P2-HOST-02 is being rebased onto that
-worker-only checkpoint before its own independent review.
+integrated on `master` through `1f66d2d`; the P2-HOST-02 candidate includes
+that worker-only checkpoint and must retain its guard through re-review.
 
 **P2-TMUX-01 cutover checkpoint (reviewed and integrated):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the

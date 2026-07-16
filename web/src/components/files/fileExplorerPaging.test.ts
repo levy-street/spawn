@@ -32,4 +32,14 @@ describe("FileExplorer paging", () => {
     expect(retained.nextCursor).toBeNull();
     expect(retained.limitReached).toBe(true);
   });
+
+  test("surfaces the daemon directory scan ceiling as a terminal limit", () => {
+    const capped = page(["last"], null);
+    capped.truncated = true;
+    expect(retainDirectoryPages([capped])).toEqual({
+      entries: [expect.objectContaining({ name: "last" })],
+      nextCursor: null,
+      limitReached: true,
+    });
+  });
 });

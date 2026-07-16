@@ -1981,6 +1981,7 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_files::STREAM_CHUNK_BYTES;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
 
@@ -2015,6 +2016,72 @@ mod tests {
             .await
             .unwrap();
         receive_host_control(messages).await.1
+    }
+
+    async fn paired_host_endpoint(
+        files: Arc<HostFileService>,
+        binding: HostRtcBinding,
+        session_id: &str,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+        Arc<RTCDataChannel>,
+        mpsc::Receiver<(usize, String)>,
+    ) {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let browser_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let daemon_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let channel = browser_pc
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(64);
+        channel.on_message(Box::new(move |message: DataChannelMessage| {
+            let messages_tx = messages_tx.clone();
+            Box::pin(async move {
+                let _ = messages_tx
+                    .send((0, String::from_utf8_lossy(&message.data).into_owned()))
+                    .await;
+            })
+        }));
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        install_host_data_channel_handler(
+            &daemon_pc,
+            session_id.to_string(),
+            binding,
+            out_tx,
+            Some(files),
+        );
+
+        let offer = browser_pc.create_offer(None).await.unwrap();
+        let mut offer_gathered = browser_pc.gathering_complete_promise().await;
+        browser_pc.set_local_description(offer).await.unwrap();
+        let _ = offer_gathered.recv().await;
+        daemon_pc
+            .set_remote_description(browser_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+        let answer = daemon_pc.create_answer(None).await.unwrap();
+        let mut answer_gathered = daemon_pc.gathering_complete_promise().await;
+        daemon_pc.set_local_description(answer).await.unwrap();
+        let _ = answer_gathered.recv().await;
+        browser_pc
+            .set_remote_description(daemon_pc.local_description().await.unwrap())
+            .await
+            .unwrap();
+        let (_, hello) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(hello["type"], "hello");
+        (browser_pc, daemon_pc, channel, messages_rx)
     }
 
     fn insert_test_worker(
@@ -3332,6 +3399,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_real_host_channels_keep_source_and_destination_capabilities_isolated() {
+        let source_root = tempfile::tempdir().unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        let source_bytes = (0..(STREAM_CHUNK_BYTES * 3 + 17))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        tokio::fs::write(source_root.path().join("source.bin"), &source_bytes)
+            .await
+            .unwrap();
+        let source_files = Arc::new(
+            HostFileService::rooted_at(source_root.path())
+                .await
+                .unwrap(),
+        );
+        let destination_files = Arc::new(
+            HostFileService::rooted_at(destination_root.path())
+                .await
+                .unwrap(),
+        );
+        let source_host_id = Uuid::new_v4();
+        let destination_host_id = Uuid::new_v4();
+        let source_binding = HostRtcBinding {
+            host_id: source_host_id,
+            binding_nonce: "a".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let destination_binding = HostRtcBinding {
+            host_id: destination_host_id,
+            binding_nonce: "b".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        assert_ne!(source_binding.host_id, destination_binding.host_id);
+        assert_ne!(
+            source_binding.binding_nonce,
+            destination_binding.binding_nonce
+        );
+
+        let (source_browser, source_daemon, source_channel, mut source_messages) =
+            paired_host_endpoint(
+                Arc::clone(&source_files),
+                source_binding,
+                "source-generation-1",
+            )
+            .await;
+        let (
+            destination_browser,
+            destination_daemon,
+            destination_channel,
+            mut destination_messages,
+        ) = paired_host_endpoint(
+            Arc::clone(&destination_files),
+            destination_binding,
+            "destination-generation-7",
+        )
+        .await;
+        assert!(!Arc::ptr_eq(&source_channel, &destination_channel));
+
+        let source = request_host_control(
+            &source_channel,
+            &mut source_messages,
+            "two-host-read",
+            "fs.read",
+            json!({"path": "source.bin"}),
+        )
+        .await;
+        let source_stream_id = source["result"]["stream_id"].as_str().unwrap();
+        let source_hash = source["result"]["sha256"].as_str().unwrap().to_string();
+        let mut transferred = Vec::new();
+        loop {
+            let (_, message) = receive_host_control(&mut source_messages).await;
+            if message["type"] == "stream.end" {
+                break;
+            }
+            assert_eq!(message["stream_id"], source_stream_id);
+            transferred.extend(
+                STANDARD
+                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            source_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": source_stream_id,
+                        "sequence": message["sequence"].as_u64().unwrap() + 1,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(transferred, source_bytes);
+        assert!(!source_root.path().join("destination.bin").exists());
+
+        let destination = request_host_control(
+            &destination_channel,
+            &mut destination_messages,
+            "two-host-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "destination.bin",
+                "length": transferred.len(),
+                "sha256": source_hash,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let destination_stream_id = destination["result"]["stream_id"].as_str().unwrap();
+        for (sequence, chunk) in transferred.chunks(STREAM_CHUNK_BYTES).enumerate() {
+            destination_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": destination_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode(chunk),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        destination_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": destination_stream_id,
+                    "length": transferred.len(),
+                    "sha256": source_hash,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, committed) = receive_host_control(&mut destination_messages).await;
+        assert_eq!(committed["type"], "stream.committed");
+        assert_eq!(
+            tokio::fs::read(destination_root.path().join("destination.bin"))
+                .await
+                .unwrap(),
+            source_bytes
+        );
+        assert!(source_root.path().join("source.bin").exists());
+
+        destination_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.ack",
+                    "stream_id": source_stream_id,
+                    "sequence": 1,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while destination_channel.ready_state()
+                != webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a source-host stream id must be rejected on the destination channel");
+        assert_eq!(
+            source_channel.ready_state(),
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        );
+
+        source_browser.close().await.unwrap();
+        source_daemon.close().await.unwrap();
+        destination_browser.close().await.unwrap();
+        destination_daemon.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn zero_agent_host_files_round_trip_over_paired_data_channel() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
@@ -3379,6 +3629,12 @@ mod tests {
         tokio::fs::write(file_root.path().join("source.txt"), b"source body")
             .await
             .unwrap();
+        tokio::fs::write(
+            file_root.path().join("hash-cancel.bin"),
+            vec![b'h'; 16 * 1024 * 1024],
+        )
+        .await
+        .unwrap();
         let files = Arc::new(HostFileService::rooted_at(file_root.path()).await.unwrap());
         install_host_data_channel_handler(
             &daemon_pc,
@@ -3413,6 +3669,10 @@ mod tests {
         let hello: Value = serde_json::from_str(&hello).unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["protocol"], HOST_CONTROL_LABEL);
+        assert_eq!(hello["limits"]["normal_queue"], 64);
+        assert_eq!(hello["limits"]["fast_queue"], 64);
+        assert_eq!(hello["limits"]["long_tasks"], 8);
+        assert_eq!(hello["limits"]["directory_entries"], 1024);
         assert!(
             tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
                 .await
@@ -3453,10 +3713,16 @@ mod tests {
         )
         .await;
         assert_eq!(listing["result"]["home_dir"], files.home_dir());
-        assert_eq!(listing["result"]["entries"][0]["name"], "source.txt");
+        assert!(listing["result"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "source.txt"));
 
-        let upload = b"uploaded through the paired data channel";
-        let upload_hash = format!("{:x}", Sha256::digest(upload));
+        let upload = (0..(STREAM_CHUNK_BYTES * 20 + 73))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let upload_hash = format!("{:x}", Sha256::digest(&upload));
         let write_started = request_host_control(
             accepted_channel,
             &mut messages_rx,
@@ -3472,19 +3738,21 @@ mod tests {
         )
         .await;
         let write_stream_id = write_started["result"]["stream_id"].as_str().unwrap();
-        accepted_channel
-            .send_text(
-                json!({
-                    "version": RTC_PROTOCOL_VERSION,
-                    "type": "stream.chunk",
-                    "stream_id": write_stream_id,
-                    "sequence": 0,
-                    "bytes_b64": STANDARD.encode(upload),
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap();
+        for (sequence, chunk) in upload.chunks(STREAM_CHUNK_BYTES).enumerate() {
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": write_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode(chunk),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
         accepted_channel
             .send_text(
                 json!({
@@ -3518,18 +3786,122 @@ mod tests {
         assert_eq!(read_started["result"]["length"], upload.len());
         assert_eq!(read_started["result"]["sha256"], upload_hash);
         let read_stream_id = read_started["result"]["stream_id"].as_str().unwrap();
-        let (_, chunk) = receive_host_control(&mut messages_rx).await;
-        assert_eq!(chunk["stream_id"], read_stream_id);
-        assert_eq!(
-            STANDARD
-                .decode(chunk["bytes_b64"].as_str().unwrap())
-                .unwrap(),
-            upload,
-        );
-        let (_, ended) = receive_host_control(&mut messages_rx).await;
+        let mut downloaded = Vec::new();
+        let ended = loop {
+            let (_, message) = receive_host_control(&mut messages_rx).await;
+            if message["type"] == "stream.end" {
+                break message;
+            }
+            assert_eq!(message["type"], "stream.chunk");
+            assert_eq!(message["stream_id"], read_stream_id);
+            downloaded.extend(
+                STANDARD
+                    .decode(message["bytes_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": read_stream_id,
+                        "sequence": message["sequence"].as_u64().unwrap() + 1,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        };
+        assert_eq!(downloaded, upload);
         assert_eq!(ended["type"], "stream.end");
         assert_eq!(ended["length"], upload.len());
         assert_eq!(ended["sha256"], upload_hash);
+
+        let stalled = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-stalled-read",
+            "fs.read",
+            json!({"path": "uploaded.txt"}),
+        )
+        .await;
+        let stalled_stream_id = stalled["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages_rx).await;
+            assert_eq!(chunk["type"], "stream.chunk");
+            assert_eq!(chunk["stream_id"], stalled_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+        let (_, timeout_error) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(timeout_error["type"], "stream.error");
+        assert_eq!(timeout_error["stream_id"], stalled_stream_id);
+        assert_eq!(timeout_error["error"]["code"], "stream_timeout");
+
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-hash-cancel",
+                    "operation": "fs.read",
+                    "payload": {"path": "hash-cancel.bin"},
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "cancel",
+                    "request_id": "e2e-hash-cancel",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, cancelled_hash) = receive_host_control(&mut messages_rx).await;
+        assert_eq!(cancelled_hash["type"], "response");
+        assert_eq!(cancelled_hash["request_id"], "e2e-hash-cancel");
+        assert_eq!(cancelled_hash["ok"], false);
+        assert_eq!(cancelled_hash["error"]["code"], "cancelled");
+
+        let cancelled = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-send-cancel",
+            "fs.read",
+            json!({"path": "uploaded.txt"}),
+        )
+        .await;
+        let cancelled_stream_id = cancelled["result"]["stream_id"].as_str().unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": cancelled_stream_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut queued_after_cancel = 0;
+        while let Ok(Some((_, encoded))) =
+            tokio::time::timeout(Duration::from_millis(100), messages_rx.recv()).await
+        {
+            let message: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(message["type"], "stream.chunk");
+            assert_eq!(message["stream_id"], cancelled_stream_id);
+            queued_after_cancel += 1;
+        }
+        assert!(queued_after_cancel <= 8);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), messages_rx.recv())
+                .await
+                .is_err()
+        );
 
         let made = request_host_control(
             accepted_channel,
@@ -3579,7 +3951,20 @@ mod tests {
         assert!(!file_root.path().join("renamed.txt").exists());
         assert!(!file_root.path().join("folder").exists());
 
-        browser_pc.close().await.unwrap();
+        let closing = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-peer-close",
+            "fs.read",
+            json!({"path": "hash-cancel.bin"}),
+        )
+        .await;
+        assert_eq!(closing["ok"], true);
+
+        tokio::time::timeout(Duration::from_secs(2), browser_pc.close())
+            .await
+            .expect("peer close must not wait behind a read sender")
+            .unwrap();
         daemon_pc.close().await.unwrap();
     }
 }

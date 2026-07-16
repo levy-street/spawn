@@ -41,6 +41,7 @@ export interface HostDirList {
   parent?: string | null;
   entries: HostDirEntry[];
   next_cursor?: number | null;
+  truncated?: boolean;
 }
 
 export interface HostFileOp {
@@ -290,6 +291,7 @@ export class HostControlClient {
       typeof page.home_dir !== "string" ||
       !Array.isArray(page.entries) ||
       page.entries.length > HOST_DIRECTORY_PAGE_ENTRIES ||
+      (page.truncated !== undefined && typeof page.truncated !== "boolean") ||
       (nextCursor !== undefined &&
         nextCursor !== null &&
         (!Number.isSafeInteger(nextCursor) || nextCursor <= cursor))

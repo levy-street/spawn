@@ -30,6 +30,7 @@ export function retainDirectoryPages(
     }
   }
   const nextCursor = pages.at(-1)?.next_cursor;
+  if (pages.at(-1)?.truncated === true) limitReached = true;
   if (entries.length >= entryLimit && typeof nextCursor === "number") limitReached = true;
   return {
     entries,

@@ -1,23 +1,30 @@
 //! Endpoint-only host filesystem operations for `spawn.host.ctl`.
 //!
-//! The signaling websocket must never receive values produced by this module.
-//! Paths are confined to the daemon user's home directory, `..` is rejected
-//! instead of normalized, and symlinks are not followed. This deliberately
-//! trades broad machine browsing for an auditable endpoint boundary.
+//! The root directory is opened once as a capability. Every later operation is
+//! relative to held directory handles, walks each component with no-follow
+//! semantics, and never re-enters the ambient filesystem namespace.
 
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
+use cap_std::{ambient_authority, fs};
+use rustix::fs::{renameat, renameat_with, RenameFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 pub const MAX_LIST_ENTRIES_PER_PAGE: usize = 96;
+pub const MAX_DIRECTORY_ENTRIES: usize = 1024;
 
 #[derive(Debug)]
 pub struct FsError {
@@ -51,7 +58,8 @@ pub type FsResult<T> = Result<T, FsError>;
 
 #[derive(Clone, Debug)]
 pub struct HostFileService {
-    root: PathBuf,
+    root: Arc<Dir>,
+    root_display: Arc<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +79,7 @@ pub struct DirectoryPage {
     pub parent: Option<String>,
     pub entries: Vec<DirEntry>,
     pub next_cursor: Option<usize>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,8 +100,10 @@ pub struct ReadStream {
 pub struct PendingWrite {
     pub stream_id: String,
     pub request_id: String,
-    pub destination: PathBuf,
-    pub temporary: PathBuf,
+    parent: Dir,
+    destination_name: OsString,
+    temporary_name: OsString,
+    destination_display: PathBuf,
     pub file: File,
     pub expected_length: u64,
     pub expected_sha256: String,
@@ -108,22 +119,30 @@ impl HostFileService {
         let configured = dirs::home_dir()
             .or_else(|| std::env::current_dir().ok())
             .ok_or_else(|| FsError::new("home_unavailable", "home directory is unavailable"))?;
-        let root = fs::canonicalize(configured).await?;
-        Ok(Self { root })
+        Self::open_root(configured)
     }
 
     #[cfg(test)]
     pub async fn rooted_at(root: &Path) -> FsResult<Self> {
+        Self::open_root(root.to_path_buf())
+    }
+
+    fn open_root(root: PathBuf) -> FsResult<Self> {
+        // Ambient authority is consumed exactly once to acquire the root
+        // capability. All request-time operations use `Dir` handles below.
+        let root_display = std::fs::canonicalize(root)?;
+        let root = Dir::open_ambient_dir(&root_display, ambient_authority())?;
         Ok(Self {
-            root: fs::canonicalize(root).await?,
+            root: Arc::new(root),
+            root_display: Arc::new(root_display),
         })
     }
 
     pub fn home_dir(&self) -> String {
-        self.root.to_string_lossy().into_owned()
+        self.root_display.to_string_lossy().into_owned()
     }
 
-    fn lexical_path(&self, input: &str) -> FsResult<PathBuf> {
+    fn relative_components(&self, input: &str) -> FsResult<Vec<OsString>> {
         if input.as_bytes().contains(&0) {
             return Err(FsError::new("invalid_path", "path contains a NUL byte"));
         }
@@ -135,130 +154,160 @@ impl HostFileService {
         } else {
             let path = Path::new(trimmed);
             if path.is_absolute() {
-                path.strip_prefix(&self.root)
+                path.strip_prefix(self.root_display.as_ref())
                     .map(Path::to_path_buf)
                     .map_err(|_| FsError::new("outside_root", "path is outside the home root"))?
             } else {
                 path.to_path_buf()
             }
         };
-        if relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            return Err(FsError::new(
-                "traversal_rejected",
-                "parent traversal is not allowed",
-            ));
-        }
-        Ok(self.root.join(relative))
-    }
-
-    async fn reject_symlink_prefixes(&self, target: &Path, allow_missing: bool) -> FsResult<()> {
-        let relative = target
-            .strip_prefix(&self.root)
-            .map_err(|_| FsError::new("outside_root", "path is outside the home root"))?;
-        let mut current = self.root.clone();
+        let mut components = Vec::new();
         for component in relative.components() {
-            current.push(component.as_os_str());
-            match fs::symlink_metadata(&current).await {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+            match component {
+                Component::Normal(value) => components.push(value.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(FsError::new(
-                        "symlink_rejected",
-                        "symbolic links are not followed",
+                        "traversal_rejected",
+                        "parent traversal is not allowed",
                     ));
                 }
-                Ok(_) => {}
-                Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
+        Ok(components)
     }
 
-    async fn existing_path(&self, input: &str) -> FsResult<PathBuf> {
-        let target = self.lexical_path(input)?;
-        self.reject_symlink_prefixes(&target, false).await?;
-        Ok(target)
+    fn display_path(&self, components: &[OsString]) -> PathBuf {
+        let mut path = self.root_display.as_ref().clone();
+        for component in components {
+            path.push(component);
+        }
+        path
     }
 
-    async fn new_path(&self, input: &str) -> FsResult<PathBuf> {
-        let target = self.lexical_path(input)?;
-        self.reject_symlink_prefixes(&target, true).await?;
-        Ok(target)
+    fn open_dir_components(&self, components: &[OsString]) -> FsResult<Dir> {
+        let mut current = self.root.try_clone()?;
+        for component in components {
+            let metadata = current.symlink_metadata(component)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !metadata.is_dir() {
+                return Err(FsError::new(
+                    "not_directory",
+                    "path component is not a directory",
+                ));
+            }
+            current = current
+                .open_dir_nofollow(component)
+                .map_err(nofollow_error)?;
+        }
+        Ok(current)
+    }
+
+    fn open_parent(&self, components: &[OsString]) -> FsResult<(Dir, OsString)> {
+        let (name, parents) = components
+            .split_last()
+            .ok_or_else(|| FsError::new("root_protected", "home root is protected"))?;
+        Ok((self.open_dir_components(parents)?, name.clone()))
     }
 
     pub async fn list(&self, input: &str, cursor: usize) -> FsResult<DirectoryPage> {
-        let target = self.existing_path(input).await?;
-        let metadata = fs::symlink_metadata(&target).await?;
-        if !metadata.is_dir() {
-            return Err(FsError::new("not_directory", "path is not a directory"));
+        let service = self.clone();
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || service.list_sync(&input, cursor))
+            .await
+            .map_err(join_error)?
+    }
+
+    fn list_sync(&self, input: &str, cursor: usize) -> FsResult<DirectoryPage> {
+        if cursor > MAX_DIRECTORY_ENTRIES {
+            return Err(FsError::new("invalid_cursor", "directory cursor is stale"));
         }
-        let mut reader = fs::read_dir(&target).await?;
-        let mut entries = Vec::new();
-        while let Some(entry) = reader.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "." || name == ".." {
+        let components = self.relative_components(input)?;
+        let target = self.open_dir_components(&components)?;
+        let mut entries = Vec::with_capacity(MAX_LIST_ENTRIES_PER_PAGE);
+        let mut next_cursor = None;
+        let mut truncated = false;
+        for (index, entry) in target.entries()?.enumerate() {
+            let entry = entry?;
+            if index < cursor {
                 continue;
             }
-            let metadata = fs::symlink_metadata(entry.path()).await?;
-            let file_type = metadata.file_type();
+            if index >= MAX_DIRECTORY_ENTRIES {
+                truncated = true;
+                break;
+            }
+            if entries.len() == MAX_LIST_ENTRIES_PER_PAGE {
+                next_cursor = Some(index);
+                break;
+            }
+            let name_os = entry.file_name();
+            if name_os == OsStr::new(".") || name_os == OsStr::new("..") {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let metadata = entry.metadata()?;
             let (kind, is_dir) = if file_type.is_symlink() {
                 ("symlink", false)
-            } else if metadata.is_dir() {
+            } else if file_type.is_dir() {
                 ("directory", true)
-            } else if metadata.is_file() {
+            } else if file_type.is_file() {
                 ("file", false)
             } else {
                 ("other", false)
             };
+            let mut entry_components = components.clone();
+            entry_components.push(name_os.clone());
             entries.push(DirEntry {
-                name,
-                path: entry.path().to_string_lossy().into_owned(),
+                name: name_os.to_string_lossy().into_owned(),
+                path: self
+                    .display_path(&entry_components)
+                    .to_string_lossy()
+                    .into_owned(),
                 kind,
                 is_dir,
-                size: metadata.is_file().then_some(metadata.len()),
-                modified_at: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+                size: file_type.is_file().then_some(metadata.len()),
+                modified_at: modified_seconds(&metadata),
             });
         }
-        entries.sort_by(|left, right| {
-            right
-                .is_dir
-                .cmp(&left.is_dir)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        if cursor > entries.len() {
-            return Err(FsError::new("invalid_cursor", "directory cursor is stale"));
-        }
-        let end = entries
-            .len()
-            .min(cursor.saturating_add(MAX_LIST_ENTRIES_PER_PAGE));
-        let next_cursor = (end < entries.len()).then_some(end);
-        let entries = entries.drain(cursor..end).collect();
         Ok(DirectoryPage {
-            path: target.to_string_lossy().into_owned(),
+            path: self
+                .display_path(&components)
+                .to_string_lossy()
+                .into_owned(),
             home_dir: self.home_dir(),
-            parent: (target != self.root)
-                .then(|| target.parent())
-                .flatten()
-                .map(|path| path.to_string_lossy().into_owned()),
+            parent: (!components.is_empty()).then(|| {
+                self.display_path(&components[..components.len() - 1])
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             entries,
             next_cursor,
+            truncated,
         })
     }
 
     pub async fn stat(&self, input: &str) -> FsResult<FileStat> {
-        let target = self.existing_path(input).await?;
-        let metadata = fs::symlink_metadata(&target).await?;
+        let service = self.clone();
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || service.stat_sync(&input))
+            .await
+            .map_err(join_error)?
+    }
+
+    fn stat_sync(&self, input: &str) -> FsResult<FileStat> {
+        let components = self.relative_components(input)?;
+        let (metadata, name) = if components.is_empty() {
+            (self.root.dir_metadata()?, "file".to_string())
+        } else {
+            let (parent, name) = self.open_parent(&components)?;
+            let metadata = parent.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            (metadata, name.to_string_lossy().into_owned())
+        };
         let kind = if metadata.is_dir() {
             "directory"
         } else if metadata.is_file() {
@@ -267,44 +316,54 @@ impl HostFileService {
             "other"
         };
         Ok(FileStat {
-            path: target.to_string_lossy().into_owned(),
-            name: target
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".to_string()),
+            path: self
+                .display_path(&components)
+                .to_string_lossy()
+                .into_owned(),
+            name,
             kind,
             size: metadata.len(),
-            modified_at: metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+            modified_at: modified_seconds(&metadata),
         })
     }
 
     #[cfg(test)]
     pub async fn open_read(&self, input: &str) -> FsResult<ReadStream> {
-        let cancelled = AtomicBool::new(false);
-        self.open_read_cancellable(input, &cancelled).await
+        self.open_read_cancellable(input, Arc::new(AtomicBool::new(false)))
+            .await
     }
 
     pub async fn open_read_cancellable(
         &self,
         input: &str,
-        cancelled: &AtomicBool,
+        cancelled: Arc<AtomicBool>,
     ) -> FsResult<ReadStream> {
-        let stat = self.stat(input).await?;
-        if stat.kind != "file" {
+        let service = self.clone();
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || service.open_read_sync(&input, &cancelled))
+            .await
+            .map_err(join_error)?
+    }
+
+    fn open_read_sync(&self, input: &str, cancelled: &AtomicBool) -> FsResult<ReadStream> {
+        let components = self.relative_components(input)?;
+        let (parent, name) = self.open_parent(&components)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent
+            .open_with(&name, &options)
+            .map_err(nofollow_error)?
+            .into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(FsError::new("not_file", "path is not a regular file"));
         }
-        if stat.size > MAX_FILE_BYTES {
+        if metadata.len() > MAX_FILE_BYTES {
             return Err(FsError::new(
                 "file_too_large",
                 "file exceeds the stream limit",
             ));
         }
-        let target = PathBuf::from(&stat.path);
-        let mut hash_file = File::open(&target).await?;
         let mut buffer = vec![0_u8; 64 * 1024];
         let mut hasher = Sha256::new();
         let mut length = 0_u64;
@@ -312,75 +371,156 @@ impl HostFileService {
             if cancelled.load(Ordering::Acquire) {
                 return Err(FsError::new("cancelled", "file read was cancelled"));
             }
-            let read = hash_file.read(&mut buffer).await?;
+            let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             length = length.saturating_add(read as u64);
-            if length > stat.size || length > MAX_FILE_BYTES {
+            if length > metadata.len() || length > MAX_FILE_BYTES {
                 return Err(FsError::new("file_changed", "file changed while hashing"));
             }
             hasher.update(&buffer[..read]);
+            #[cfg(test)]
+            std::thread::yield_now();
         }
-        if length != stat.size {
+        if length != metadata.len() {
             return Err(FsError::new("file_changed", "file changed while hashing"));
         }
+        file.seek(SeekFrom::Start(0))?;
         Ok(ReadStream {
-            stat,
+            stat: FileStat {
+                path: self
+                    .display_path(&components)
+                    .to_string_lossy()
+                    .into_owned(),
+                name: name.to_string_lossy().into_owned(),
+                kind: "file",
+                size: metadata.len(),
+                modified_at: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+            },
             sha256: format!("{:x}", hasher.finalize()),
-            file: File::open(target).await?,
+            file: File::from_std(file),
         })
     }
 
     pub async fn mkdir(&self, input: &str) -> FsResult<String> {
-        let target = self.new_path(input).await?;
-        fs::create_dir_all(&target).await?;
-        self.reject_symlink_prefixes(&target, false).await?;
-        Ok(target.to_string_lossy().into_owned())
+        let service = self.clone();
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || service.mkdir_sync(&input))
+            .await
+            .map_err(join_error)?
+    }
+
+    fn mkdir_sync(&self, input: &str) -> FsResult<String> {
+        let components = self.relative_components(input)?;
+        let mut current = self.root.try_clone()?;
+        for component in &components {
+            current = match current.symlink_metadata(component) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(symlink_error());
+                }
+                Ok(metadata) if metadata.is_dir() => current
+                    .open_dir_nofollow(component)
+                    .map_err(nofollow_error)?,
+                Ok(_) => {
+                    return Err(FsError::new(
+                        "not_directory",
+                        "path component is not a directory",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match current.create_dir(component) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    current
+                        .open_dir_nofollow(component)
+                        .map_err(nofollow_error)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+        }
+        Ok(self
+            .display_path(&components)
+            .to_string_lossy()
+            .into_owned())
     }
 
     pub async fn rename(&self, input: &str, name: &str, overwrite: bool) -> FsResult<String> {
         validate_name(name)?;
-        let source = self.existing_path(input).await?;
-        if source == self.root {
-            return Err(FsError::new(
-                "root_protected",
-                "home root cannot be renamed",
-            ));
+        let service = self.clone();
+        let input = input.to_string();
+        let name = OsString::from(name);
+        tokio::task::spawn_blocking(move || service.rename_sync(&input, &name, overwrite))
+            .await
+            .map_err(join_error)?
+    }
+
+    fn rename_sync(&self, input: &str, name: &OsStr, overwrite: bool) -> FsResult<String> {
+        let components = self.relative_components(input)?;
+        let (parent, source_name) = self.open_parent(&components)?;
+        let source_metadata = parent.symlink_metadata(&source_name)?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(symlink_error());
         }
-        let destination = source
-            .parent()
-            .ok_or_else(|| FsError::new("invalid_path", "source has no parent"))?
-            .join(name);
-        self.reject_symlink_prefixes(&destination, true).await?;
-        if !overwrite && fs::try_exists(&destination).await? {
-            return Err(FsError::new("already_exists", "destination already exists"));
+        if let Ok(destination_metadata) = parent.symlink_metadata(name) {
+            if destination_metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
         }
-        fs::rename(&source, &destination).await?;
-        Ok(destination.to_string_lossy().into_owned())
+        if overwrite {
+            renameat(&parent, &source_name, &parent, name).map_err(rustix_io_error)?;
+        } else {
+            atomic_rename_noreplace(&parent, &source_name, name)?;
+        }
+        let mut destination_components = components;
+        *destination_components
+            .last_mut()
+            .expect("parent requires a name") = name.to_os_string();
+        sync_directory(&parent)?;
+        Ok(self
+            .display_path(&destination_components)
+            .to_string_lossy()
+            .into_owned())
     }
 
     pub async fn remove(&self, input: &str, recursive: bool) -> FsResult<String> {
-        let target = self.existing_path(input).await?;
-        if target == self.root {
-            return Err(FsError::new(
-                "root_protected",
-                "home root cannot be removed",
-            ));
-        }
-        let metadata = fs::symlink_metadata(&target).await?;
-        if metadata.is_dir() {
-            if recursive {
-                fs::remove_dir_all(&target).await?;
-            } else {
-                fs::remove_dir(&target).await?;
-            }
-        } else {
-            fs::remove_file(&target).await?;
-        }
-        Ok(target.to_string_lossy().into_owned())
+        let service = self.clone();
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || service.remove_sync(&input, recursive))
+            .await
+            .map_err(join_error)?
     }
 
+    fn remove_sync(&self, input: &str, recursive: bool) -> FsResult<String> {
+        let components = self.relative_components(input)?;
+        let (parent, name) = self.open_parent(&components)?;
+        let metadata = parent.symlink_metadata(&name)?;
+        if metadata.file_type().is_symlink() {
+            return Err(symlink_error());
+        }
+        if metadata.is_dir() {
+            if recursive {
+                parent.remove_dir_all(&name)?;
+            } else {
+                parent.remove_dir(&name)?;
+            }
+        } else {
+            parent.remove_file(&name)?;
+        }
+        sync_directory(&parent)?;
+        Ok(self
+            .display_path(&components)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_write(
         &self,
         request_id: String,
@@ -402,31 +542,38 @@ impl HostFileService {
         {
             return Err(FsError::new("invalid_hash", "expected SHA-256 is invalid"));
         }
-        let directory = self.existing_path(dir).await?;
-        if !fs::symlink_metadata(&directory).await?.is_dir() {
-            return Err(FsError::new(
-                "not_directory",
-                "destination is not a directory",
-            ));
-        }
-        let destination = directory.join(name);
-        self.reject_symlink_prefixes(&destination, true).await?;
-        if !overwrite && fs::try_exists(&destination).await? {
-            return Err(FsError::new("already_exists", "destination already exists"));
+        let components = self.relative_components(dir)?;
+        let parent = self.open_dir_components(&components)?;
+        let destination_name = OsString::from(name);
+        if let Ok(metadata) = parent.symlink_metadata(&destination_name) {
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !overwrite {
+                return Err(FsError::new("already_exists", "destination already exists"));
+            }
         }
         let stream_id = Uuid::new_v4().to_string();
-        let temporary = directory.join(format!(".spawn-upload-{stream_id}.tmp"));
-        let file = OpenOptions::new()
+        let temporary_name = OsString::from(format!(".spawn-upload-{stream_id}.tmp"));
+        let mut options = OpenOptions::new();
+        options
             .create_new(true)
             .write(true)
-            .open(&temporary)
-            .await?;
+            .follow(FollowSymlinks::No);
+        let file = parent
+            .open_with(&temporary_name, &options)
+            .map_err(nofollow_error)?
+            .into_std();
+        let mut destination_components = components;
+        destination_components.push(destination_name.clone());
         Ok(PendingWrite {
             stream_id,
             request_id,
-            destination,
-            temporary,
-            file,
+            parent,
+            destination_name,
+            temporary_name,
+            destination_display: self.display_path(&destination_components),
+            file: File::from_std(file),
             expected_length,
             expected_sha256: expected_sha256.to_ascii_lowercase(),
             overwrite,
@@ -473,8 +620,10 @@ impl PendingWrite {
 
     pub async fn finish(self) -> FsResult<String> {
         let PendingWrite {
-            destination,
-            temporary,
+            parent,
+            destination_name,
+            temporary_name,
+            destination_display,
             mut file,
             expected_length,
             expected_sha256,
@@ -485,7 +634,7 @@ impl PendingWrite {
         } = self;
         if received != expected_length {
             drop(file);
-            let _ = fs::remove_file(&temporary).await;
+            let _ = parent.remove_file(&temporary_name);
             return Err(FsError::new(
                 "length_mismatch",
                 "stream length does not match declaration",
@@ -494,7 +643,7 @@ impl PendingWrite {
         let actual = format!("{:x}", hasher.finalize_reset());
         if actual != expected_sha256 {
             drop(file);
-            let _ = fs::remove_file(&temporary).await;
+            let _ = parent.remove_file(&temporary_name);
             return Err(FsError::new(
                 "hash_mismatch",
                 "stream SHA-256 does not match declaration",
@@ -503,55 +652,92 @@ impl PendingWrite {
         for result in [file.flush().await, file.sync_all().await] {
             if let Err(error) = result {
                 drop(file);
-                let _ = fs::remove_file(&temporary).await;
+                let _ = parent.remove_file(&temporary_name);
                 return Err(error.into());
             }
         }
         drop(file);
-        if overwrite {
-            #[cfg(windows)]
-            if fs::try_exists(&destination).await? {
-                let _ = fs::remove_file(&temporary).await;
-                return Err(FsError::new(
-                    "atomic_overwrite_unsupported",
-                    "atomic replacement of an existing file is unavailable on this platform",
-                ));
-            }
-            if let Err(error) = fs::rename(&temporary, &destination).await {
-                let _ = fs::remove_file(&temporary).await;
-                return Err(error.into());
+        let commit = if overwrite {
+            if let Ok(metadata) = parent.symlink_metadata(&destination_name) {
+                if metadata.file_type().is_symlink() {
+                    Err(symlink_error())
+                } else {
+                    renameat(&parent, &temporary_name, &parent, &destination_name)
+                        .map_err(rustix_io_error)
+                }
+            } else {
+                renameat(&parent, &temporary_name, &parent, &destination_name)
+                    .map_err(rustix_io_error)
             }
         } else {
-            // Linking into the final name is an atomic create-if-absent. A
-            // check followed by rename would clobber a destination created in
-            // the race window on Unix even when overwrite=false.
-            if let Err(error) = fs::hard_link(&temporary, &destination).await {
-                let _ = fs::remove_file(&temporary).await;
-                return Err(error.into());
-            }
-            if let Err(error) = fs::remove_file(&temporary).await {
-                let _ = fs::remove_file(&destination).await;
-                return Err(error.into());
-            }
+            atomic_rename_noreplace(&parent, &temporary_name, &destination_name)
+        };
+        if let Err(error) = commit {
+            let _ = parent.remove_file(&temporary_name);
+            return Err(error);
         }
-        if let Some(parent) = destination.parent() {
-            if let Ok(directory) = File::open(parent).await {
-                let _ = directory.sync_all().await;
-            }
-        }
-        Ok(destination.to_string_lossy().into_owned())
+        sync_directory(&parent)?;
+        Ok(destination_display.to_string_lossy().into_owned())
     }
 
     pub async fn abort(self) {
         let PendingWrite {
-            temporary,
+            parent,
+            temporary_name,
             mut file,
             ..
         } = self;
         let _ = file.flush().await;
         drop(file);
-        let _ = fs::remove_file(&temporary).await;
+        let _ = parent.remove_file(&temporary_name);
     }
+}
+
+fn atomic_rename_noreplace(parent: &Dir, source: &OsStr, destination: &OsStr) -> FsResult<()> {
+    match renameat_with(parent, source, parent, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
+            Err(FsError::new(
+                "atomic_no_clobber_unsupported",
+                "atomic no-clobber rename is unavailable on this filesystem",
+            ))
+        }
+        Err(error) => Err(rustix_io_error(error)),
+    }
+}
+
+fn rustix_io_error(error: rustix::io::Errno) -> FsError {
+    std::io::Error::from_raw_os_error(error.raw_os_error()).into()
+}
+
+fn nofollow_error(error: std::io::Error) -> FsError {
+    if matches!(error.raw_os_error(), Some(40)) {
+        symlink_error()
+    } else {
+        error.into()
+    }
+}
+
+fn sync_directory(directory: &Dir) -> FsResult<()> {
+    directory.open(".")?.into_std().sync_all()?;
+    Ok(())
+}
+
+fn symlink_error() -> FsError {
+    FsError::new("symlink_rejected", "symbolic links are not followed")
+}
+
+fn join_error(error: tokio::task::JoinError) -> FsError {
+    FsError::new("io_error", format!("filesystem task failed: {error}"))
+}
+
+fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .map(cap_std::time::SystemTime::into_std)
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
 }
 
 fn validate_name(name: &str) -> FsResult<()> {
@@ -571,11 +757,14 @@ fn validate_name(name: &str) -> FsResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn confines_paths_and_rejects_symlinks() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir(temp.path().join("safe")).await.unwrap();
+        std::fs::create_dir(temp.path().join("safe")).unwrap();
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
         assert_eq!(
             service.list("../escape", 0).await.unwrap_err().code,
@@ -604,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_write_verifies_length_and_hash() {
+    async fn atomic_write_verifies_length_hash_and_no_clobber() {
         let temp = tempfile::tempdir().unwrap();
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
         let expected = format!("{:x}", Sha256::digest(b"hello"));
@@ -614,7 +803,19 @@ mod tests {
             .unwrap();
         write.append(0, b"hello").await.unwrap();
         let path = write.finish().await.unwrap();
-        assert_eq!(fs::read(path).await.unwrap(), b"hello");
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+
+        let mut raced = service
+            .begin_write("race".into(), "~", "raced.txt", 5, &expected, false)
+            .await
+            .unwrap();
+        raced.append(0, b"hello").await.unwrap();
+        std::fs::write(temp.path().join("raced.txt"), b"canary").unwrap();
+        assert_eq!(raced.finish().await.unwrap_err().code, "already_exists");
+        assert_eq!(
+            std::fs::read(temp.path().join("raced.txt")).unwrap(),
+            b"canary"
+        );
 
         let mut bad = service
             .begin_write("bad".into(), "~", "bad.txt", 6, &expected, false)
@@ -628,41 +829,48 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains("spawn-upload")));
-
-        let mut corrupt = service
-            .begin_write("corrupt".into(), "~", "corrupt.txt", 5, &expected, false)
-            .await
-            .unwrap();
-        corrupt.append(0, b"HELLO").await.unwrap();
-        assert_eq!(corrupt.finish().await.unwrap_err().code, "hash_mismatch");
-        assert!(!temp.path().join("corrupt.txt").exists());
     }
 
     #[tokio::test]
-    async fn lists_reads_renames_and_removes_without_following_metadata_paths() {
+    async fn list_is_bounded_without_inventorying_or_sorting_the_directory() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..100 {
-            fs::write(temp.path().join(format!("file-{index:03}.txt")), b"body")
-                .await
-                .unwrap();
+        for index in 0..(MAX_DIRECTORY_ENTRIES + 100) {
+            std::fs::write(temp.path().join(format!("file-{index:04}.txt")), b"body").unwrap();
         }
-        fs::create_dir(temp.path().join("folder")).await.unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        let mut cursor = 0;
+        let mut seen = 0;
+        loop {
+            let page = service.list("~", cursor).await.unwrap();
+            assert!(page.entries.len() <= MAX_LIST_ENTRIES_PER_PAGE);
+            seen += page.entries.len();
+            if page.truncated {
+                assert_eq!(seen, MAX_DIRECTORY_ENTRIES);
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            cursor = page
+                .next_cursor
+                .expect("large directory has another bounded page");
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_reads_renames_and_removes_through_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source.txt"), b"body").unwrap();
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
         let first = service.list("~", 0).await.unwrap();
-        assert_eq!(first.entries.len(), MAX_LIST_ENTRIES_PER_PAGE);
-        assert_eq!(first.next_cursor, Some(MAX_LIST_ENTRIES_PER_PAGE));
-        assert!(first.entries[0].is_dir);
-        let second = service.list("~", first.next_cursor.unwrap()).await.unwrap();
-        assert_eq!(first.entries.len() + second.entries.len(), 101);
+        assert_eq!(first.entries.len(), 1);
 
-        let mut read = service.open_read("file-000.txt").await.unwrap();
+        let mut read = service.open_read("source.txt").await.unwrap();
         let mut bytes = Vec::new();
         read.file.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"body");
         assert_eq!(read.sha256, format!("{:x}", Sha256::digest(b"body")));
 
         let renamed = service
-            .rename("file-000.txt", "renamed.txt", false)
+            .rename("source.txt", "renamed.txt", false)
             .await
             .unwrap();
         assert!(Path::new(&renamed).exists());
@@ -672,5 +880,150 @@ mod tests {
             service.remove("~", true).await.unwrap_err().code,
             "root_protected"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_operation_resists_a_component_symlink_swap_loop() {
+        const ITERATIONS: usize = 48;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        let swap = root.join("swap");
+        std::fs::create_dir_all(&swap).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(swap.join("inside-only"), b"inside").unwrap();
+        std::fs::write(swap.join("read.txt"), b"inside").unwrap();
+        std::fs::write(outside.join("outside-canary"), b"outside").unwrap();
+        std::fs::write(outside.join("read.txt"), b"outside-secret").unwrap();
+        for index in 0..ITERATIONS {
+            std::fs::write(swap.join(format!("rename-{index}")), b"inside").unwrap();
+            std::fs::write(outside.join(format!("rename-{index}")), b"outside").unwrap();
+            std::fs::create_dir(swap.join(format!("remove-{index}"))).unwrap();
+            std::fs::write(
+                outside.join(format!("remove-{index}")),
+                b"outside-remove-canary",
+            )
+            .unwrap();
+        }
+        let service = HostFileService::rooted_at(&root).await.unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let swap_stop = Arc::clone(&stop);
+        let swap_root = root.clone();
+        let swap_outside = outside.clone();
+        let swapper = std::thread::spawn(move || {
+            let swap = swap_root.join("swap");
+            let held = swap_root.join("held");
+            while !swap_stop.load(Ordering::Acquire) {
+                if std::fs::rename(&swap, &held).is_ok() {
+                    let _ = std::os::unix::fs::symlink(&swap_outside, &swap);
+                    std::thread::yield_now();
+                    let _ = std::fs::remove_file(&swap);
+                    let _ = std::fs::rename(&held, &swap);
+                }
+            }
+            let _ = std::fs::remove_file(&swap);
+            let _ = std::fs::rename(&held, &swap);
+        });
+
+        let expected_hash = format!("{:x}", Sha256::digest(b"inside"));
+        for index in 0..ITERATIONS {
+            if let Ok(page) = service.list("swap", 0).await {
+                assert!(page
+                    .entries
+                    .iter()
+                    .all(|entry| entry.name != "outside-canary"));
+            }
+            if let Ok(stat) = service.stat("swap/read.txt").await {
+                assert_eq!(stat.size, 6);
+            }
+            if let Ok(mut read) = service.open_read("swap/read.txt").await {
+                let mut bytes = Vec::new();
+                read.file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, b"inside");
+            }
+            let _ = service.mkdir(&format!("swap/mkdir-{index}")).await;
+            let _ = service
+                .rename(
+                    &format!("swap/rename-{index}"),
+                    &format!("renamed-{index}"),
+                    false,
+                )
+                .await;
+            let _ = service.remove(&format!("swap/remove-{index}"), true).await;
+            if let Ok(mut write) = service
+                .begin_write(
+                    format!("swap-write-{index}"),
+                    "swap",
+                    &format!("upload-{index}"),
+                    6,
+                    &expected_hash,
+                    false,
+                )
+                .await
+            {
+                write.append(0, b"inside").await.unwrap();
+                let _ = write.finish().await;
+            }
+        }
+        stop.store(true, Ordering::Release);
+        swapper.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(outside.join("outside-canary")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("read.txt")).unwrap(),
+            b"outside-secret"
+        );
+        for index in 0..ITERATIONS {
+            assert_eq!(
+                std::fs::read(outside.join(format!("rename-{index}"))).unwrap(),
+                b"outside"
+            );
+            assert_eq!(
+                std::fs::read(outside.join(format!("remove-{index}"))).unwrap(),
+                b"outside-remove-canary"
+            );
+            assert!(!outside.join(format!("mkdir-{index}")).exists());
+            assert!(!outside.join(format!("renamed-{index}")).exists());
+            assert!(!outside.join(format!("upload-{index}")).exists());
+            assert!(!outside.read_dir().unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_clobber_rename_is_atomic_under_destination_creation_races() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        for index in 0..128 {
+            let source_name = format!("source-{index}");
+            let destination_name = format!("destination-{index}");
+            std::fs::write(temp.path().join(&source_name), b"source").unwrap();
+            let destination = temp.path().join(&destination_name);
+            let contender_destination = destination.clone();
+            let contender = tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(contender_destination)
+                    .and_then(|mut file| file.write_all(b"contender"))
+            });
+            let renamed = service.rename(&source_name, &destination_name, false).await;
+            let contender_won = contender.await.unwrap().is_ok();
+            let bytes = std::fs::read(&destination).unwrap();
+            if contender_won {
+                assert_eq!(bytes, b"contender");
+                assert_eq!(renamed.unwrap_err().code, "already_exists");
+            } else {
+                assert_eq!(bytes, b"source");
+                assert!(renamed.is_ok());
+            }
+        }
     }
 }

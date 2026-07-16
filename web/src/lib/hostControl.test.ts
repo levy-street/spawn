@@ -105,6 +105,7 @@ class FakeWebSocket {
 }
 
 const hostId = "00000000-0000-4000-8000-000000000001";
+const destinationHostId = "00000000-0000-4000-8000-000000000002";
 const metadata = {
   scope_type: "host",
   scope_id: hostId,
@@ -112,8 +113,9 @@ const metadata = {
   protocol_version: 1,
 };
 
-async function readyClient(options = {}) {
-  const client = new HostControlClient(hostId, options);
+async function readyClient(options = {}, clientHostId = hostId) {
+  const clientMetadata = { ...metadata, scope_id: clientHostId };
+  const client = new HostControlClient(clientHostId, options);
   client.connect();
   const ws = FakeWebSocket.instances.at(-1);
   ws.onopen?.();
@@ -122,7 +124,7 @@ async function readyClient(options = {}) {
     enabled: true,
     ice_servers: [{ urls: ["turn:relay.example"] }],
     ice_transport_policy: "relay",
-    ...metadata,
+    ...clientMetadata,
   });
   await Promise.resolve();
   await Promise.resolve();
@@ -146,7 +148,7 @@ function framesOf(channel, type) {
 
 async function startedTransfer(destinationOptions = {}) {
   const source = await readyClient();
-  const destination = await readyClient(destinationOptions);
+  const destination = await readyClient(destinationOptions, destinationHostId);
   const transferring = source.client.transferFileTo(
     destination.client,
     "/source/notes.txt",
@@ -734,7 +736,15 @@ describe("HostControlClient", () => {
 
   test("pumps cross-host bytes through two independent host sessions", async () => {
     const source = await readyClient();
-    const destination = await readyClient();
+    const destination = await readyClient({}, destinationHostId);
+    expect(source.client.hostId).toBe(hostId);
+    expect(destination.client.hostId).toBe(destinationHostId);
+    expect(source.ws.url).toContain(`host_id=${hostId}`);
+    expect(destination.ws.url).toContain(`host_id=${destinationHostId}`);
+    expect(source.offer.scope_id).toBe(hostId);
+    expect(destination.offer.scope_id).toBe(destinationHostId);
+    expect(source.offer.session_id).not.toBe(destination.offer.session_id);
+    expect(source.pc.channel).not.toBe(destination.pc.channel);
     const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
     const transferring = source.client.transferFileTo(
       destination.client,
@@ -815,6 +825,49 @@ describe("HostControlClient", () => {
       }),
     );
     await expect(transferring).resolves.toEqual({ path: "/destination/notes.txt" });
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("rejects cross-host signaling and cannot settle a request on the other host channel", async () => {
+    const source = await readyClient();
+    const destination = await readyClient({}, destinationHostId);
+    source.ws.receive({
+      type: "rtc.status",
+      session_id: source.offer.session_id,
+      status: "failed",
+      ...metadata,
+      scope_id: destinationHostId,
+    });
+    expect(source.pc.channel.closed).toBe(false);
+
+    const ping = source.client.ping();
+    let settled = false;
+    void ping.finally(() => {
+      settled = true;
+    });
+    const request = JSON.parse(source.pc.channel.sent.at(-1));
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { pong: "wrong-host" },
+      }),
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { pong: true },
+      }),
+    );
+    await expect(ping).resolves.toEqual({ pong: true });
     source.client.close();
     destination.client.close();
   });
