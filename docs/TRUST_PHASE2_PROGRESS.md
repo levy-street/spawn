@@ -186,6 +186,15 @@ with hostile comment/dead-section, duplicate/missing-section, unsafe-retry,
 capacity, anchor, and stale-status fixtures must pass before rereview. These are
 still design requirements, not implemented runtime behavior.
 
+The next rereview also rejected the candidate until three additional contracts
+were explicit: active-prose contradictions must fail the structured guard even
+when comments/fences contain a safe decoy; rotation must retain the old epoch
+until every wrapper and two consecutive A/B new-epoch slot advances are
+durably synced/read-back/authenticated; and DATA-02 must wait for reviewed,
+merged TERM-01/HOST-03A protocols and name their exact commits. This document
+records those corrections for another independent rereview; it does not claim
+they have passed.
+
 This checkpoint is documentation only. No endpoint store, protected-data
 DataChannel operation, migration, server-column clearing, deployment, or purge
 has occurred, and P2-DATA-02 remains blocked until the decision passes review
@@ -199,12 +208,15 @@ and is merged.
 2. Finish independent review of the parallel P2-HOST-03A interactive installer
    candidate. Keep the legacy tool route until its endpoint-owned durable
    targets exist; this wave is not the final tool cut.
-3. After this P2-DATA-01 decision passes independent review, implement the
-   approved per-host endpoint-local store in P2-DATA-02 and move full launch
-   manifests, `Agent.env`, preset environment/install/tool targets, and skill
-   bodies into it over `spawn.host.ctl`. Preserve the explicit offline-host and
-   cross-host-sync regressions in `DURABLE_SENSITIVE_DATA.md`; do not introduce
-   a protected server queue as a convenience fallback.
+3. Only after this P2-DATA-01 decision, P2-TERM-01, and P2-HOST-03A have each
+   passed independent review and merged (with the already merged P2-HOST-02),
+   implement the approved per-host endpoint-local store in P2-DATA-02 and name
+   the exact reviewed protocol/effect-boundary commits in its evidence. Move
+   full launch manifests, `Agent.env`, preset environment/install/tool targets,
+   and skill bodies into it over `spawn.host.ctl`. Preserve the explicit
+   offline-host and cross-host-sync regressions in
+   `DURABLE_SENSITIVE_DATA.md`; do not introduce a protected server queue as a
+   convenience fallback.
    Stop cwd-derived default names, then make the interactive E2E tool path
    mandatory, remove its legacy server route, finish unattended tool migration,
    and replace free-form server-visible daemon errors with E2E details.

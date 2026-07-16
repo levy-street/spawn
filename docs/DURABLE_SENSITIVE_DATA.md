@@ -546,14 +546,48 @@ lock or authorize retry without conclusive source-side reconciliation.
 
 ## Rotation, revocation, deletion, and purge
 
-- Routine master-key rotation creates a new epoch and rewraps every live DEK in
-  one resumable transaction sequence. The old master key is destroyed only
-  after every wrapper has been read back and successfully authenticated under
-  the new epoch.
+- Routine master-key rotation is an authenticated resumable state machine; it
+  never changes both mutable slots or destroys the old epoch in one step. The
+  database first records `(old_epoch, new_epoch, rotation_phase)` while both
+  immutable key records remain available. Transition generations carry the
+  rotation-state/inventory digest and state HMACs under both old and new anchor
+  keys, binding the new immutable key to the still-authoritative old epoch. It
+  rewraps every live/historical DEK and every internal reconciliation,
+  idempotency, anti-replay, tombstone, and journal envelope/wrapper under the
+  new epoch, syncs the database/WAL, then reads back and authenticates the
+  complete wrapper inventory. A missing or old-epoch wrapper blocks progress.
+- After wrapper verification, rotation commits database generation `n` and
+  durably advances the inactive anchor slot under the new epoch. It reads that
+  slot back and verifies its checksum/HMAC/state tag. The other slot and old
+  key remain untouched, so a torn first new slot is recoverable. Rotation then
+  commits a distinct `rotation_anchor_confirmed` generation `n+1`, advances the
+  other slot under the new epoch, syncs it, and reads it back. The result must
+  be two adjacent, predecessor-linked, independently authenticated new-epoch
+  slots. These are two consecutive new-epoch anchor advances, not two copies
+  written before one durability barrier.
+- During this transition recovery accepts mixed old/new slot epochs only when
+  the database transition state validates under both epoch HMACs, names both
+  immutable keys, and its inventory digest matches. It selects the highest
+  valid slot using the normal generation rules, resumes wrapper/slot
+  verification, and never treats a missing/torn new slot as permission to
+  delete the old key. Short write, disk-full, crash, rename/fsync failure, or
+  failed read-back at every wrapper, database, first-slot,
+  confirmation-generation, and second-slot boundary keeps the old key and a
+  safe recoverable slot selection.
+- The old master-key epoch may be destroyed only after a final database scan
+  proves no envelope/journal wrapper names it and **both** A/B slots have been
+  synced, read back, and authenticated under the new epoch. Destruction is a
+  separate `old_epoch_retire_ready` database/anchor step after the two-slot
+  proof; that step is itself synced, read back, and authenticated before key
+  deletion is attempted. Until deletion succeeds and read-back confirms the
+  old immutable credential is absent, diagnostics say rotation is incomplete;
+  they never claim old-epoch retirement.
 - If the old master key may be compromised, rewrapping is insufficient because
   retained old ciphertext/wrappers remain decryptable. Every object must be
   decrypted, resealed under fresh DEKs, verified, and old database/WAL/backups
   destroyed or allowed to expire before claiming recovery from compromise.
+  The full-reseal path still follows the same two verified new-epoch slot
+  advances before retiring the old key.
 - Revoking the daemon token/host at the server stops future authorized
   connections but cannot prove erasure of an offline endpoint. `spawnd logout`
   preserves the local store by default. An explicit local `--wipe-private-data`
@@ -718,8 +752,16 @@ of assuming it.
    tombstones/conflicts and same-host unresolved reconciliation, and requires
    explicit lineage change before rollback or cross-host rebinding. A
    database-only, key-only, or generation-split native restore fails closed.
-8. Routine and compromise rotations survive interruption and prove the stated
-   distinction between rewrap and full reseal. Wipe makes the store
+8. Routine and compromise rotations inject short-write, disk-full, crash, and
+   rename/fsync/read-back failure at every wrapper/database/first-slot/
+   confirmation/second-slot boundary. Every interruption retains the old key
+   and recovers a safe authenticated slot. The old epoch is not destroyed until
+   an inventory proves every envelope/journal wrapper uses the new epoch and
+   two consecutive, adjacent A/B slot advances are synced, read back, and
+   authenticated under it. Mixed-epoch recovery validates the transition under
+   both epoch HMACs. The recorded retire-ready step and deletion read-back must
+   succeed before diagnostics report the old immutable key absent. Tests also
+   prove the distinction between rewrap and full reseal. Wipe makes the store
    unrecoverable without a retained native backup/export and does not claim an
    offline remote wipe succeeded.
 9. Migration counts match, endpoint read-back and daemon restart/launch/preset/
@@ -762,6 +804,13 @@ interactive-installer candidates are still independently review-pending; their
 browser retry/ambiguity behavior is not evidence that this ADR's durable
 reconciliation store exists. DATA-02 and HOST-03B must integrate the reviewed
 versions and satisfy the gates below without reviving the removed server paths.
+
+P2-DATA-02 is schedulable only after P2-DATA-01 and P2-HOST-02 are reviewed and
+merged **and** the P2-TERM-01 upload and P2-HOST-03A interactive-tool candidates
+have each passed independent review and merged. Its effect-wrapper evidence
+must name the exact reviewed TERM-01/HOST-03A protocol commits and demonstrate
+their request/effect boundaries; an unreviewed candidate or documentation-only
+DATA-01 commit is not sufficient dependency evidence.
 
 - **P2-DATA-02** implements this store, host-channel operations, endpoint-only
   create/edit/restart flows, durable reconciliation journal, migration, neutral

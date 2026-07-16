@@ -285,6 +285,12 @@ metadata, rotation/revocation/deletion rules, rollback limitations,
 observability contract, and falsifiable gates. It must not claim that this
 documentation implements the store.
 
+P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and
+P2-HOST-03A have each passed independent review and merged. Its evidence must
+name the exact reviewed TERM-01 upload and HOST-03A tool protocol/effect-boundary
+commits before it wraps those operations in durable journals; an unreviewed
+candidate is not an implementation dependency.
+
 The security invariant is non-negotiable: no plaintext `Agent.env`,
 `Skill.content`, or `Preset.env_template` remains server-readable. Existing
 values are copied and verified through the chosen endpoint path before any

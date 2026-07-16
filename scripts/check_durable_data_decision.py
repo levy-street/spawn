@@ -251,7 +251,24 @@ def validate(root: Path) -> None:
     require(
         rotation,
         adr,
+        "rewraps every live/historical DEK",
+        "every internal reconciliation, idempotency, anti-replay, tombstone, and journal envelope/wrapper",
+        "state HMACs under both old and new anchor keys",
+        "two consecutive new-epoch anchor advances",
+        "**both** A/B slots have been synced, read back, and authenticated under the new epoch",
+        "The old master-key epoch may be destroyed only after a final database scan",
+        "separate `old_epoch_retire_ready` database/anchor step after the two-slot proof",
+        "read-back confirms the old immutable credential is absent",
+        "disk-full, crash, rename/fsync failure, or failed read-back at every wrapper",
         "P2-PURGE-01 still inventories and destroys the historical server database",
+    )
+    forbid_patterns(
+        rotation.body,
+        adr,
+        (
+            r"old master-key epoch may be destroyed after (?:the )?first new(?:-epoch)? slot",
+            r"destroy(?:s|ed)? the old (?:master )?key after (?:the )?first new(?:-epoch)? slot",
+        ),
     )
 
     compatibility = unique_section(parsed, 2, "Compatibility failure behavior", adr)
@@ -272,9 +289,22 @@ def validate(root: Path) -> None:
         "HOST-02 mkdir/rename/remove/write/transfer, TERM-01 upload, HOST-03A install, and DATA-02 launch journals",
         "short-write, disk-full, torn-slot, rename/fsync failure",
         "dismissing the warning, restarting the daemon, or restoring a same-lineage backup cannot unlock",
+        "Every interruption retains the old key and recovers a safe authenticated slot.",
+        "two consecutive, adjacent A/B slot advances are synced, read back, and authenticated",
+        "Mixed-epoch recovery validates the transition under both epoch HMACs.",
+        "recorded retire-ready step and deletion read-back must succeed",
     )
 
-    active_without_rejected = "\n".join(
+    dependency = unique_section(parsed, 2, "Dependency hand-off", adr)
+    require(
+        dependency,
+        adr,
+        "P2-DATA-02 is schedulable only after P2-DATA-01 and P2-HOST-02 are reviewed and merged",
+        "P2-TERM-01 upload and P2-HOST-03A interactive-tool candidates have each passed independent review and merged",
+        "must name the exact reviewed TERM-01/HOST-03A protocol commits",
+    )
+
+    active_without_rejected = preamble + "\n" + "\n".join(
         section.body
         for section in parsed
         if section.level == 2 and section.title != "Rejected alternatives"
@@ -287,6 +317,15 @@ def validate(root: Path) -> None:
             r"(?:acknowledgement|acknowledgment|dismissal).{0,80}(?:releases|clears|removes) (?:the )?(?:effect )?lock",
             r"(?:may|can) evict (?:an? )?(?:unresolved|anti-replay|effect)",
             r"(?:may|can) remove (?:an? )?(?:unresolved record|anti-replay head|effect head)",
+            r"(?:endpoint-local|durable protected-data|private) store (?:is|has been|is now) (?:implemented|deployed|live|available at runtime)",
+            r"\bruntime (?:is |has been |now )?implemented\b",
+            r"(?:P2-DATA-02|DATA-02) (?:is|has been|is now) (?:implemented|done|complete|completed|merged)",
+            r"Phase\s*2 (?:is|has been|is now) (?:complete|completed|done|achieved)(?! when\b)",
+            r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?allowed (?:Phase\s*2 )?fallback",
+            r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed).{0,50}Phase\s*2",
+            r"Phase\s*2 may (?:use|fall back to|store) opaque.{0,40}server blobs?",
+            r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
+            r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains) (?:an? )?(?:review-pending|review pending|unmerged|not merged|review candidate))",
         ),
     )
 
@@ -302,6 +341,15 @@ def validate(root: Path) -> None:
                 r"retained only at endpoints or as opaque",
                 r"opaque endpoint-encrypted blobs are selected",
                 r"server[- ]readable canonical store",
+                r"(?:endpoint-local|durable protected-data|private) store (?:is|has been|is now) (?:implemented|deployed|live|available at runtime)",
+                r"\bruntime (?:is |has been |now )?implemented\b",
+                r"(?:P2-DATA-02|DATA-02) (?:is|has been|is now) (?:implemented|done|complete|completed|merged)",
+                r"Phase\s*2 (?:is|has been|is now) (?:complete|completed|done|achieved)(?! when\b)",
+                r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?allowed (?:Phase\s*2 )?fallback",
+                r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed).{0,50}Phase\s*2",
+                r"Phase\s*2 may (?:use|fall back to|store) opaque.{0,40}server blobs?",
+                r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
+                r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains) (?:an? )?(?:review-pending|review pending|unmerged|not merged|review candidate))",
             ),
         )
 
@@ -335,6 +383,8 @@ def validate(root: Path) -> None:
         "Current source therefore has no server-visible host filesystem path",
         "P2-HOST-03A has an E2E implementation candidate under independent review; it is not merged",
         "P2-TERM-01 has a direct-upload implementation candidate under independent review; it is not merged",
+        "P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged",
+        "name the exact reviewed TERM-01 upload and HOST-03A tool protocol/effect-boundary commits",
     )
     forbid_patterns(
         phase2_text,
@@ -353,6 +403,16 @@ def validate(root: Path) -> None:
         "P2-HOST-02 | DONE — REVIEWED, MERGED (`4e7c89b`)",
         "P2-HOST-03A | ACTIVE — IMPLEMENTED, REVIEW PENDING",
         "P2-TERM-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING",
+        "P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged)",
+        "Evidence names the exact reviewed TERM-01/HOST-03A protocol commits and effect boundaries",
+    )
+
+    progress = active_markdown(root / "docs/TRUST_PHASE2_PROGRESS.md")
+    require(
+        progress,
+        root / "docs/TRUST_PHASE2_PROGRESS.md",
+        "Only after this P2-DATA-01 decision, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged",
+        "name the exact reviewed protocol/effect-boundary commits in its evidence",
     )
 
     proto = active_markdown(root / "proto/README.md")
@@ -383,6 +443,11 @@ def replace_required(path: Path, old: str, new: str) -> None:
 def self_test(source: Path) -> None:
     validate(source)
     mutations: list[tuple[str, Callable[[Path], None]]] = []
+
+    def add_comment_and_fence_decoys(path: Path, safe: str) -> None:
+        text = path.read_text(encoding="utf-8")
+        decoys = f"<!-- {safe} -->\n\n```text\n{safe}\n```\n\n"
+        path.write_text(decoys + text, encoding="utf-8")
 
     def canonical_html(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
@@ -447,6 +512,50 @@ def self_test(source: Path) -> None:
             "## Current source reality (P2-HOST-02 review candidate)",
         )
 
+    def runtime_implemented_claim(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        safe = "Status: **proposed for independent review; runtime not implemented**."
+        replace_required(path, safe, "Status: **runtime implemented; endpoint-local store live**.")
+        add_comment_and_fence_decoys(path, safe)
+
+    def phase2_complete_claim(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        safe = "Phase 2 remains incomplete."
+        add_comment_and_fence_decoys(path, safe)
+        path.write_text(path.read_text(encoding="utf-8") + "\n\nPhase 2 is complete.\n", encoding="utf-8")
+
+    def opaque_fallback_claim(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        safe = "Opaque client-encrypted server blobs are **not selected** for Phase 2."
+        replace_required(
+            path,
+            safe,
+            "Opaque client-encrypted server blobs are an allowed Phase 2 fallback.",
+        )
+        add_comment_and_fence_decoys(path, safe)
+
+    def host02_unmerged_claim(root: Path) -> None:
+        path = root / "docs/TRUST_PHASE2.md"
+        safe = "P2-HOST-02 is reviewed and merged at\n  `4e7c89b`"
+        replace_required(path, safe, "P2-HOST-02 is an unmerged review candidate")
+        add_comment_and_fence_decoys(path, "P2-HOST-02 is reviewed and merged at `4e7c89b`")
+
+    def unsafe_rotation_retirement(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        safe = "The old master-key epoch may be destroyed only after a final database scan"
+        replace_required(
+            path,
+            safe,
+            "The old master-key epoch may be destroyed after the first new-epoch slot",
+        )
+        add_comment_and_fence_decoys(path, safe)
+
+    def missing_data02_dependencies(root: Path) -> None:
+        path = root / "docs/TRUST_PHASE2_TASKS.md"
+        safe = "P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged)"
+        replace_required(path, safe, "P2-DATA-01")
+        add_comment_and_fence_decoys(path, safe)
+
     def malformed_markdown(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         path.write_text(path.read_text(encoding="utf-8") + "\n<!-- broken", encoding="utf-8")
@@ -465,6 +574,12 @@ def self_test(source: Path) -> None:
             ("missing capacity rule", missing_capacity),
             ("missing crash anchor", missing_anchor),
             ("stale status", stale_status),
+            ("runtime implemented active claim with decoys", runtime_implemented_claim),
+            ("Phase 2 complete active claim with decoys", phase2_complete_claim),
+            ("opaque Phase 2 fallback active claim with decoys", opaque_fallback_claim),
+            ("HOST-02 unmerged active claim with decoys", host02_unmerged_claim),
+            ("unsafe first-slot key retirement with decoys", unsafe_rotation_retirement),
+            ("missing DATA-02 reviewed dependencies with decoys", missing_data02_dependencies),
             ("malformed Markdown", malformed_markdown),
             ("missing parser input", unreadable_input),
         )
