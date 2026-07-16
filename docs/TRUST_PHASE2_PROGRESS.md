@@ -148,9 +148,9 @@ findings. Independent review is still required before merge.
 
 **Current integrated P2-HOST-02 candidate validation:** daemon format and
 strict all-target Clippy pass; all 159 daemon tests pass; server Ruff and all
-143 server tests pass; web lint, typecheck, all 48 unit tests, 68 Playwright
+149 server tests pass; web lint, typecheck, all 48 unit tests, 68 Playwright
 tests with retries disabled (3 opt-in audits skipped), and the production build
-pass. `SPAWN_E2E_PORT=43831 scripts/test-all.sh` also passes the full repeatable
+pass. `SPAWN_E2E_PORT=43947 scripts/test-all.sh` also passes the full repeatable
 matrix, including prebuilt install, HTTP, Redis, PostgreSQL owner recovery,
 login, daemon lifecycle, live-browser, and service-manager smokes. No
 P2-HOST-02 worker process remains afterward.
