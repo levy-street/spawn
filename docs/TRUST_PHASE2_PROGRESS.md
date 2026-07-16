@@ -141,7 +141,7 @@ rapid write-churn shutdown, and distinct-host isolation regressions cover these
 findings. Independent review is still required before merge.
 
 **Current integrated P2-HOST-02 candidate validation:** daemon format and
-strict all-target Clippy pass; all 156 daemon tests pass; server Ruff and all
+strict all-target Clippy pass; all 159 daemon tests pass; server Ruff and all
 143 server tests pass; web lint, typecheck, all 48 unit tests, 68 Playwright
 tests with retries disabled (3 opt-in audits skipped), and the production build
 pass. `SPAWN_E2E_PORT=43831 scripts/test-all.sh` also passes the full repeatable

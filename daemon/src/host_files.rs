@@ -7,8 +7,10 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -19,8 +21,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
-#[cfg(test)]
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -127,7 +127,127 @@ pub struct PendingWrite {
 pub(crate) struct WriteSessionGuard {
     pub cancelled: CancellationToken,
     pub closed: Arc<AtomicBool>,
-    pub commit_fence: Arc<Mutex<()>>,
+    pub operations: Arc<HostFileOperations>,
+}
+
+pub(crate) struct HostFileOperations {
+    closed: Arc<AtomicBool>,
+    effect_fence: StdMutex<()>,
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+struct HostFileOperationPermit {
+    operations: Arc<HostFileOperations>,
+}
+
+impl HostFileOperations {
+    pub(crate) fn new(closed: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            closed,
+            effect_fence: StdMutex::new(()),
+            active: AtomicUsize::new(0),
+            idle: Notify::new(),
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn admit(self: &Arc<Self>) -> FsResult<HostFileOperationPermit> {
+        if self.cancelled() {
+            return Err(cancelled_error());
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let permit = HostFileOperationPermit {
+            operations: Arc::clone(self),
+        };
+        if self.cancelled() {
+            drop(permit);
+            return Err(cancelled_error());
+        }
+        Ok(permit)
+    }
+
+    fn admit_cleanup(self: &Arc<Self>) -> HostFileOperationPermit {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        HostFileOperationPermit {
+            operations: Arc::clone(self),
+        }
+    }
+
+    pub(crate) async fn cleanup_write(self: &Arc<Self>, write: PendingWrite) {
+        let permit = self.admit_cleanup();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            drop(write);
+        })
+        .await;
+    }
+
+    pub(crate) fn schedule_write_cleanup(self: &Arc<Self>, write: PendingWrite) {
+        let permit = self.admit_cleanup();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            drop(write);
+        });
+    }
+
+    fn effect<T>(&self, effect: impl FnOnce() -> FsResult<T>) -> FsResult<T> {
+        let _fence = self
+            .effect_fence
+            .lock()
+            .map_err(|_| FsError::new("io_error", "filesystem effect fence is poisoned"))?;
+        if self.cancelled() {
+            return Err(cancelled_error());
+        }
+        // This check is the mutation's linearization point. Close publishes
+        // `closed` before waiting for operations: a closure that reaches this
+        // point first may finish its already-admitted syscall, while every
+        // closure that was still queued or stalled must fail without effects.
+        effect()
+    }
+
+    pub(crate) async fn wait_for_idle_until(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.active.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+}
+
+impl Drop for HostFileOperationPermit {
+    fn drop(&mut self) {
+        if self.operations.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.operations.idle.notify_one();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum HostOperationKind {
+    List,
+    Stat,
+    Read,
+    Mkdir,
+    Rename,
+    Remove,
+    WriteBegin,
+    WriteCommit,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl HostOperationKind {
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +256,40 @@ struct WritePause {
     armed: AtomicBool,
     entered: Notify,
     release: Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct BlockingPause {
+    armed: AtomicBool,
+    entered: Notify,
+    finished: Notify,
+    released: StdMutex<bool>,
+    release: Condvar,
+}
+
+#[cfg(test)]
+impl BlockingPause {
+    fn arm(&self) {
+        *self.released.lock().expect("blocking pause lock") = false;
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn pause_if_armed(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.entered.notify_one();
+        let mut released = self.released.lock().expect("blocking pause lock");
+        while !*released {
+            released = self.release.wait(released).expect("blocking pause wait");
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("blocking pause lock") = true;
+        self.release.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -174,13 +328,29 @@ impl WritePause {
 #[derive(Debug, Default)]
 pub(crate) struct WriteLifecycleTestHooks {
     begin_after_create: WritePause,
-    finish_before_commit: WritePause,
     shutdown_started: Notify,
-    shutdown_complete: Notify,
+    shutdown_returned: Notify,
+    blocking: [BlockingPause; 8],
 }
 
 #[cfg(test)]
 impl WriteLifecycleTestHooks {
+    pub(crate) fn arm_blocking(&self, kind: HostOperationKind) {
+        self.blocking[kind.index()].arm();
+    }
+
+    pub(crate) async fn wait_blocking_entered(&self, kind: HostOperationKind) {
+        self.blocking[kind.index()].entered.notified().await;
+    }
+
+    pub(crate) fn release_blocking(&self, kind: HostOperationKind) {
+        self.blocking[kind.index()].release();
+    }
+
+    pub(crate) async fn wait_blocking_finished(&self, kind: HostOperationKind) {
+        self.blocking[kind.index()].finished.notified().await;
+    }
+
     pub(crate) fn arm_begin_after_create(&self) {
         self.begin_after_create.arm();
     }
@@ -193,20 +363,8 @@ impl WriteLifecycleTestHooks {
         self.begin_after_create.release();
     }
 
-    pub(crate) fn arm_finish_before_commit(&self) {
-        self.finish_before_commit.arm();
-    }
-
-    pub(crate) async fn wait_finish_before_commit(&self) {
-        self.finish_before_commit.wait_until_entered().await;
-    }
-
-    pub(crate) fn release_finish_before_commit(&self) {
-        self.finish_before_commit.release();
-    }
-
-    pub(crate) async fn wait_shutdown_complete(&self) {
-        self.shutdown_complete.notified().await;
+    pub(crate) async fn wait_shutdown_returned(&self) {
+        self.shutdown_returned.notified().await;
     }
 
     pub(crate) async fn wait_shutdown_started(&self) {
@@ -217,8 +375,8 @@ impl WriteLifecycleTestHooks {
         self.shutdown_started.notify_one();
     }
 
-    pub(crate) fn notify_shutdown_complete(&self) {
-        self.shutdown_complete.notify_one();
+    pub(crate) fn notify_shutdown_returned(&self) {
+        self.shutdown_returned.notify_one();
     }
 }
 
@@ -251,6 +409,46 @@ impl HostFileService {
     #[cfg(test)]
     pub(crate) fn write_lifecycle_test_hooks(&self) -> Arc<WriteLifecycleTestHooks> {
         Arc::clone(&self.write_lifecycle_hooks)
+    }
+
+    async fn run_blocking<T, F>(
+        &self,
+        operations: Arc<HostFileOperations>,
+        kind: HostOperationKind,
+        operation: F,
+    ) -> FsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&HostFileOperations) -> FsResult<T> + Send + 'static,
+    {
+        #[cfg(not(test))]
+        let _ = kind;
+        let permit = operations.admit()?;
+        #[cfg(test)]
+        let hooks = Arc::clone(&self.write_lifecycle_hooks);
+        let operation_context = Arc::clone(&operations);
+        let result = tokio::task::spawn_blocking(move || {
+            // The permit is deliberately owned by the blocking closure, not
+            // its async JoinHandle. Aborting the waiter cannot detach the
+            // underlying filesystem job from session accounting.
+            let _permit = permit;
+            #[cfg(test)]
+            hooks.blocking[kind.index()].pause_if_armed();
+            let result = if operation_context.cancelled() {
+                Err(cancelled_error())
+            } else {
+                operation(&operation_context)
+            };
+            #[cfg(test)]
+            hooks.blocking[kind.index()].finished.notify_one();
+            result
+        })
+        .await
+        .map_err(join_error)?;
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
+        result
     }
 
     pub fn home_dir(&self) -> String {
@@ -327,15 +525,39 @@ impl HostFileService {
         Ok((self.open_dir_components(parents)?, name.clone()))
     }
 
+    #[cfg(test)]
     pub async fn list(&self, input: &str, cursor: usize) -> FsResult<DirectoryPage> {
-        let service = self.clone();
-        let input = input.to_string();
-        tokio::task::spawn_blocking(move || service.list_sync(&input, cursor))
-            .await
-            .map_err(join_error)?
+        self.list_in_session(
+            input,
+            cursor,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
     }
 
-    fn list_sync(&self, input: &str, cursor: usize) -> FsResult<DirectoryPage> {
+    pub(crate) async fn list_in_session(
+        &self,
+        input: &str,
+        cursor: usize,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<DirectoryPage> {
+        let service = self.clone();
+        let input = input.to_string();
+        self.run_blocking(operations, HostOperationKind::List, move |operations| {
+            service.list_sync(&input, cursor, operations)
+        })
+        .await
+    }
+
+    fn list_sync(
+        &self,
+        input: &str,
+        cursor: usize,
+        operations: &HostFileOperations,
+    ) -> FsResult<DirectoryPage> {
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
         if cursor > MAX_DIRECTORY_ENTRIES {
             return Err(FsError::new("invalid_cursor", "directory cursor is stale"));
         }
@@ -345,6 +567,9 @@ impl HostFileService {
         let mut next_cursor = None;
         let mut truncated = false;
         for (index, entry) in target.entries()?.enumerate() {
+            if operations.cancelled() {
+                return Err(cancelled_error());
+            }
             let entry = entry?;
             if index < cursor {
                 continue;
@@ -403,15 +628,32 @@ impl HostFileService {
         })
     }
 
+    #[cfg(test)]
     pub async fn stat(&self, input: &str) -> FsResult<FileStat> {
-        let service = self.clone();
-        let input = input.to_string();
-        tokio::task::spawn_blocking(move || service.stat_sync(&input))
-            .await
-            .map_err(join_error)?
+        self.stat_in_session(
+            input,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
     }
 
-    fn stat_sync(&self, input: &str) -> FsResult<FileStat> {
+    pub(crate) async fn stat_in_session(
+        &self,
+        input: &str,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<FileStat> {
+        let service = self.clone();
+        let input = input.to_string();
+        self.run_blocking(operations, HostOperationKind::Stat, move |operations| {
+            service.stat_sync(&input, operations)
+        })
+        .await
+    }
+
+    fn stat_sync(&self, input: &str, operations: &HostFileOperations) -> FsResult<FileStat> {
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
         let components = self.relative_components(input)?;
         let (metadata, name) = if components.is_empty() {
             (self.root.dir_metadata()?, "file".to_string())
@@ -430,6 +672,9 @@ impl HostFileService {
         } else {
             "other"
         };
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
         Ok(FileStat {
             path: self
                 .display_path(&components)
@@ -444,23 +689,37 @@ impl HostFileService {
 
     #[cfg(test)]
     pub async fn open_read(&self, input: &str) -> FsResult<ReadStream> {
-        self.open_read_cancellable(input, Arc::new(AtomicBool::new(false)))
-            .await
+        self.open_read_in_session(
+            input,
+            Arc::new(AtomicBool::new(false)),
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
     }
 
-    pub async fn open_read_cancellable(
+    pub(crate) async fn open_read_in_session(
         &self,
         input: &str,
         cancelled: Arc<AtomicBool>,
+        operations: Arc<HostFileOperations>,
     ) -> FsResult<ReadStream> {
         let service = self.clone();
         let input = input.to_string();
-        tokio::task::spawn_blocking(move || service.open_read_sync(&input, &cancelled))
-            .await
-            .map_err(join_error)?
+        self.run_blocking(operations, HostOperationKind::Read, move |operations| {
+            service.open_read_sync(&input, &cancelled, operations)
+        })
+        .await
     }
 
-    fn open_read_sync(&self, input: &str, cancelled: &AtomicBool) -> FsResult<ReadStream> {
+    fn open_read_sync(
+        &self,
+        input: &str,
+        cancelled: &AtomicBool,
+        operations: &HostFileOperations,
+    ) -> FsResult<ReadStream> {
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
         let components = self.relative_components(input)?;
         let (parent, name) = self.open_parent(&components)?;
         let mut options = OpenOptions::new();
@@ -483,7 +742,7 @@ impl HostFileService {
         let mut hasher = Sha256::new();
         let mut length = 0_u64;
         loop {
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.load(Ordering::Acquire) || operations.cancelled() {
                 return Err(FsError::new("cancelled", "file read was cancelled"));
             }
             let read = file.read(&mut buffer)?;
@@ -502,6 +761,9 @@ impl HostFileService {
             return Err(FsError::new("file_changed", "file changed while hashing"));
         }
         file.seek(SeekFrom::Start(0))?;
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
         Ok(ReadStream {
             stat: FileStat {
                 path: self
@@ -522,12 +784,26 @@ impl HostFileService {
         })
     }
 
+    #[cfg(test)]
     pub async fn mkdir(&self, input: &str) -> FsResult<String> {
+        self.mkdir_in_session(
+            input,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    pub(crate) async fn mkdir_in_session(
+        &self,
+        input: &str,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<String> {
         let service = self.clone();
         let input = input.to_string();
-        tokio::task::spawn_blocking(move || service.mkdir_sync(&input))
-            .await
-            .map_err(join_error)?
+        self.run_blocking(operations, HostOperationKind::Mkdir, move |operations| {
+            operations.effect(|| service.mkdir_sync(&input))
+        })
+        .await
     }
 
     fn mkdir_sync(&self, input: &str) -> FsResult<String> {
@@ -566,14 +842,32 @@ impl HostFileService {
             .into_owned())
     }
 
+    #[cfg(test)]
     pub async fn rename(&self, input: &str, name: &str, overwrite: bool) -> FsResult<String> {
+        self.rename_in_session(
+            input,
+            name,
+            overwrite,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    pub(crate) async fn rename_in_session(
+        &self,
+        input: &str,
+        name: &str,
+        overwrite: bool,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<String> {
         validate_name(name)?;
         let service = self.clone();
         let input = input.to_string();
         let name = OsString::from(name);
-        tokio::task::spawn_blocking(move || service.rename_sync(&input, &name, overwrite))
-            .await
-            .map_err(join_error)?
+        self.run_blocking(operations, HostOperationKind::Rename, move |operations| {
+            operations.effect(|| service.rename_sync(&input, &name, overwrite))
+        })
+        .await
     }
 
     fn rename_sync(&self, input: &str, name: &OsStr, overwrite: bool) -> FsResult<String> {
@@ -604,12 +898,28 @@ impl HostFileService {
             .into_owned())
     }
 
+    #[cfg(test)]
     pub async fn remove(&self, input: &str, recursive: bool) -> FsResult<String> {
+        self.remove_in_session(
+            input,
+            recursive,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    pub(crate) async fn remove_in_session(
+        &self,
+        input: &str,
+        recursive: bool,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<String> {
         let service = self.clone();
         let input = input.to_string();
-        tokio::task::spawn_blocking(move || service.remove_sync(&input, recursive))
-            .await
-            .map_err(join_error)?
+        self.run_blocking(operations, HostOperationKind::Remove, move |operations| {
+            operations.effect(|| service.remove_sync(&input, recursive))
+        })
+        .await
     }
 
     fn remove_sync(&self, input: &str, recursive: bool) -> FsResult<String> {
@@ -654,6 +964,7 @@ impl HostFileService {
             expected_sha256,
             overwrite,
             None,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
         )
         .await
     }
@@ -668,6 +979,7 @@ impl HostFileService {
         expected_sha256: &str,
         overwrite: bool,
         cancelled: CancellationToken,
+        operations: Arc<HostFileOperations>,
     ) -> FsResult<PendingWrite> {
         self.begin_write_inner(
             request_id,
@@ -677,6 +989,7 @@ impl HostFileService {
             expected_sha256,
             overwrite,
             Some(cancelled),
+            operations,
         )
         .await
     }
@@ -691,6 +1004,7 @@ impl HostFileService {
         expected_sha256: &str,
         overwrite: bool,
         cancelled: Option<CancellationToken>,
+        operations: Arc<HostFileOperations>,
     ) -> FsResult<PendingWrite> {
         if cancelled
             .as_ref()
@@ -698,6 +1012,60 @@ impl HostFileService {
         {
             return Err(FsError::new("cancelled", "file write was cancelled"));
         }
+        let service = self.clone();
+        let request_id = request_id.to_string();
+        let dir = dir.to_string();
+        let name = name.to_string();
+        let expected_sha256 = expected_sha256.to_string();
+        let cleanup_operations = Arc::clone(&operations);
+        let write = self
+            .run_blocking(
+                operations,
+                HostOperationKind::WriteBegin,
+                move |operations| {
+                    operations.effect(|| {
+                        service.begin_write_sync(
+                            request_id,
+                            &dir,
+                            &name,
+                            expected_length,
+                            &expected_sha256,
+                            overwrite,
+                        )
+                    })
+                },
+            )
+            .await?;
+        #[cfg(test)]
+        if !write
+            .write_lifecycle_hooks
+            .begin_after_create
+            .pause_if_armed(cancelled.as_ref())
+            .await
+        {
+            cleanup_operations.cleanup_write(write).await;
+            return Err(cancelled_error());
+        }
+        if cancelled
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            cleanup_operations.cleanup_write(write).await;
+            return Err(cancelled_error());
+        }
+        Ok(write)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_write_sync(
+        &self,
+        request_id: String,
+        dir: &str,
+        name: &str,
+        expected_length: u64,
+        expected_sha256: &str,
+        overwrite: bool,
+    ) -> FsResult<PendingWrite> {
         validate_name(name)?;
         if expected_length > MAX_FILE_BYTES {
             return Err(FsError::new(
@@ -734,7 +1102,7 @@ impl HostFileService {
             .into_std();
         let mut destination_components = components;
         destination_components.push(destination_name.clone());
-        let write = PendingWrite {
+        Ok(PendingWrite {
             stream_id,
             request_id,
             parent,
@@ -752,25 +1120,7 @@ impl HostFileService {
             temporary_owned: true,
             #[cfg(test)]
             write_lifecycle_hooks: Arc::clone(&self.write_lifecycle_hooks),
-        };
-        #[cfg(test)]
-        if !write
-            .write_lifecycle_hooks
-            .begin_after_create
-            .pause_if_armed(cancelled.as_ref())
-            .await
-        {
-            write.abort().await;
-            return Err(FsError::new("cancelled", "file write was cancelled"));
-        }
-        if cancelled
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            write.abort().await;
-            return Err(FsError::new("cancelled", "file write was cancelled"));
-        }
-        Ok(write)
+        })
     }
 }
 
@@ -821,8 +1171,6 @@ impl PendingWrite {
     }
 
     async fn finish_inner(mut self, guard: Option<WriteSessionGuard>) -> FsResult<String> {
-        #[cfg(test)]
-        let write_lifecycle_hooks = Arc::clone(&self.write_lifecycle_hooks);
         if self.received != self.expected_length {
             return Err(FsError::new(
                 "length_mismatch",
@@ -868,30 +1216,41 @@ impl PendingWrite {
         if let Err(error) = sync {
             return Err(error.into());
         }
-        #[cfg(test)]
-        if !write_lifecycle_hooks
-            .finish_before_commit
-            .pause_if_armed(guard.as_ref().map(|guard| &guard.cancelled))
-            .await
-        {
-            return Err(FsError::new("cancelled", "file write was cancelled"));
-        }
-        let _commit_guard = if let Some(guard) = guard.as_ref() {
-            let commit_guard = tokio::select! {
-                biased;
-                _ = guard.cancelled.cancelled() => {
-                    return Err(FsError::new("cancelled", "file write was cancelled"));
-                }
-                commit_guard = guard.commit_fence.lock() => commit_guard,
-            };
+        if let Some(guard) = guard {
             if guard.cancelled.is_cancelled() || guard.closed.load(Ordering::Acquire) {
-                drop(commit_guard);
-                return Err(FsError::new("cancelled", "file write was cancelled"));
+                return Err(cancelled_error());
             }
-            Some(commit_guard)
-        } else {
-            None
-        };
+            let permit = guard.operations.admit()?;
+            let operations = Arc::clone(&guard.operations);
+            let cancelled = guard.cancelled;
+            #[cfg(test)]
+            let hooks = Arc::clone(&self.write_lifecycle_hooks);
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                #[cfg(test)]
+                hooks.blocking[HostOperationKind::WriteCommit.index()].pause_if_armed();
+                let result = if cancelled.is_cancelled() || operations.cancelled() {
+                    Err(cancelled_error())
+                } else {
+                    operations.effect(|| self.commit_sync())
+                };
+                #[cfg(test)]
+                hooks.blocking[HostOperationKind::WriteCommit.index()]
+                    .finished
+                    .notify_one();
+                result
+            })
+            .await
+            .map_err(join_error)?;
+            if guard.closed.load(Ordering::Acquire) {
+                return Err(cancelled_error());
+            }
+            return result;
+        }
+        self.commit_sync()
+    }
+
+    fn commit_sync(mut self) -> FsResult<String> {
         drop(self.file.take());
         let commit = if self.overwrite {
             if let Ok(metadata) = self.parent.symlink_metadata(&self.destination_name) {
@@ -923,8 +1282,6 @@ impl PendingWrite {
         sync_directory(&self.parent)?;
         Ok(self.destination_display.to_string_lossy().into_owned())
     }
-
-    pub async fn abort(self) {}
 }
 
 impl Drop for PendingWrite {
@@ -976,6 +1333,10 @@ fn symlink_error() -> FsError {
 
 fn join_error(error: tokio::task::JoinError) -> FsError {
     FsError::new("io_error", format!("filesystem task failed: {error}"))
+}
+
+fn cancelled_error() -> FsError {
+    FsError::new("cancelled", "filesystem operation was cancelled")
 }
 
 fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {

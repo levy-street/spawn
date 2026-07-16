@@ -17,7 +17,8 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
 use crate::host_files::{
-    HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES, STREAM_CHUNK_BYTES,
+    HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
+    STREAM_CHUNK_BYTES,
 };
 use crate::pty::WsOutbound;
 use crate::rtc::{send_host_status, HostRtcBinding};
@@ -158,7 +159,7 @@ struct Context {
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
-    commit_fence: Arc<Mutex<()>>,
+    file_operations: Arc<HostFileOperations>,
     cleanup_tx: mpsc::Sender<WriteCleanup>,
     arrivals: Arc<StdMutex<ArrivalArbiter>>,
     closed: Arc<AtomicBool>,
@@ -231,6 +232,9 @@ impl Context {
     }
 
     async fn send(&self, value: Value) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
         let encoded = value.to_string();
         encoded.len() <= MAX_FRAME_BYTES && self.dc.send_text(encoded).await.is_ok()
     }
@@ -346,7 +350,11 @@ impl Context {
                         .error(request_id, "invalid_cursor", "cursor is too large")
                         .await;
                 };
-                match self.files.list(path, cursor).await {
+                match self
+                    .files
+                    .list_in_session(path, cursor, Arc::clone(&self.file_operations))
+                    .await
+                {
                     Ok(mut page) => loop {
                         let Ok(result) = serde_json::to_value(&page) else {
                             return false;
@@ -382,7 +390,11 @@ impl Context {
                         .error(request_id, "invalid_request", "path is required")
                         .await;
                 };
-                match self.files.stat(path).await {
+                match self
+                    .files
+                    .stat_in_session(path, Arc::clone(&self.file_operations))
+                    .await
+                {
                     Ok(stat) => match serde_json::to_value(stat) {
                         Ok(result) => self.response(request_id, result).await,
                         Err(_) => false,
@@ -396,7 +408,11 @@ impl Context {
                         .error(request_id, "invalid_request", "path is required")
                         .await;
                 };
-                match self.files.mkdir(path).await {
+                match self
+                    .files
+                    .mkdir_in_session(path, Arc::clone(&self.file_operations))
+                    .await
+                {
                     Ok(path) => self.response(request_id, json!({"path": path})).await,
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
@@ -411,7 +427,11 @@ impl Context {
                         .await;
                 };
                 let overwrite = payload_bool(payload, "overwrite").unwrap_or(false);
-                match self.files.rename(path, name, overwrite).await {
+                match self
+                    .files
+                    .rename_in_session(path, name, overwrite, Arc::clone(&self.file_operations))
+                    .await
+                {
                     Ok(path) => self.response(request_id, json!({"path": path})).await,
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
@@ -423,7 +443,11 @@ impl Context {
                         .await;
                 };
                 let recursive = payload_bool(payload, "recursive").unwrap_or(false);
-                match self.files.remove(path, recursive).await {
+                match self
+                    .files
+                    .remove_in_session(path, recursive, Arc::clone(&self.file_operations))
+                    .await
+                {
                     Ok(path) => self.response(request_id, json!({"path": path})).await,
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
@@ -538,6 +562,7 @@ impl Context {
                 sha256,
                 overwrite,
                 self.shutdown.clone(),
+                Arc::clone(&self.file_operations),
             )
             .await
         {
@@ -551,14 +576,14 @@ impl Context {
                 if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
                     drop(state);
                     if let Some(write) = slot.pending.lock().await.take() {
-                        write.abort().await;
+                        self.file_operations.cleanup_write(write).await;
                     }
                     return true;
                 }
                 if state.cancelled_request_ids.remove(request_id) {
                     drop(state);
                     if let Some(write) = slot.pending.lock().await.take() {
-                        write.abort().await;
+                        self.file_operations.cleanup_write(write).await;
                     }
                     return self
                         .error(request_id, "cancelled", "file write was cancelled")
@@ -567,7 +592,7 @@ impl Context {
                 if state.writes.len() >= MAX_WRITE_STREAMS {
                     drop(state);
                     if let Some(write) = slot.pending.lock().await.take() {
-                        write.abort().await;
+                        self.file_operations.cleanup_write(write).await;
                     }
                     return self
                         .error(
@@ -622,7 +647,7 @@ impl Context {
                 .write_requests
                 .remove(&write.request_id);
         }
-        write.abort().await;
+        self.file_operations.cleanup_write(write).await;
         true
     }
 
@@ -715,7 +740,11 @@ impl Context {
     async fn send_read(&self, request_id: &str, path: &str, cancelled: Arc<AtomicBool>) -> bool {
         let mut stream = match self
             .files
-            .open_read_cancellable(path, Arc::clone(&cancelled))
+            .open_read_in_session(
+                path,
+                Arc::clone(&cancelled),
+                Arc::clone(&self.file_operations),
+            )
             .await
         {
             Ok(stream) => stream,
@@ -1028,7 +1057,7 @@ impl Context {
             state.write_requests.remove(&write.request_id);
             let remembered = Self::remember_finished_write(&mut state, stream_id);
             drop(state);
-            write.abort().await;
+            self.file_operations.cleanup_write(write).await;
             if !remembered {
                 return false;
             }
@@ -1082,7 +1111,7 @@ impl Context {
         let sent = if length != Some(write.expected_length)
             || sha256 != Some(write.expected_sha256.as_str())
         {
-            write.abort().await;
+            self.file_operations.cleanup_write(write).await;
             self.stream_error(
                 stream_id,
                 "declaration_mismatch",
@@ -1094,7 +1123,7 @@ impl Context {
             let guard = WriteSessionGuard {
                 cancelled: slot.cancelled.clone(),
                 closed: Arc::clone(&self.closed),
-                commit_fence: Arc::clone(&self.commit_fence),
+                operations: Arc::clone(&self.file_operations),
             };
             match write.finish_guarded(guard).await {
                 Ok(path) => {
@@ -1236,29 +1265,32 @@ impl Context {
     }
 
     async fn abort_all(&self) {
+        let deadline = tokio::time::Instant::now() + session_close_timeout();
         self.closed.store(true, Ordering::Release);
         self.shutdown.cancel();
         #[cfg(test)]
         self.files
             .write_lifecycle_test_hooks()
             .notify_shutdown_started();
-        let (reads, writes) = {
-            let mut state = self.state.lock().await;
-            let reads = state
-                .reads
-                .drain()
-                .map(|(_, read)| read)
-                .collect::<Vec<_>>();
-            for request in state.read_requests.drain().map(|(_, request)| request) {
-                request.store(true, Ordering::Release);
+        let (reads, writes) = match tokio::time::timeout_at(deadline, self.state.lock()).await {
+            Ok(mut state) => {
+                let reads = state
+                    .reads
+                    .drain()
+                    .map(|(_, read)| read)
+                    .collect::<Vec<_>>();
+                for request in state.read_requests.drain().map(|(_, request)| request) {
+                    request.store(true, Ordering::Release);
+                }
+                state.write_requests.clear();
+                let writes = state
+                    .writes
+                    .drain()
+                    .map(|(_, write)| write)
+                    .collect::<Vec<_>>();
+                (reads, writes)
             }
-            state.write_requests.clear();
-            let writes = state
-                .writes
-                .drain()
-                .map(|(_, write)| write)
-                .collect::<Vec<_>>();
-            (reads, writes)
+            Err(_) => (Vec::new(), Vec::new()),
         };
         for read in reads {
             let _ = read.try_send(ReadSignal::Cancel);
@@ -1266,40 +1298,40 @@ impl Context {
         for write in &writes {
             write.cancelled.cancel();
         }
-        // `closed` is published before this fence is acquired. A write that
-        // has not already entered the commit critical section must observe it
-        // and abort; acquiring the fence also drains a commit already in that
-        // section before session cleanup can complete.
-        let commit_guard = self.commit_fence.lock().await;
-        drop(commit_guard);
         for write in writes {
-            if let Some(write) = write.pending.lock().await.take() {
-                write.abort().await;
+            if let Ok(mut pending) = tokio::time::timeout_at(deadline, write.pending.lock()).await {
+                if let Some(write) = pending.take() {
+                    self.file_operations.schedule_write_cleanup(write);
+                }
             }
         }
         // Do not hold the registry mutex while awaiting children. Task
         // creation rechecks shutdown after taking the mutex, so no task can
         // be published into the replacement set once shutdown starts.
-        let mut tasks = {
-            let mut registered = self.background_tasks.lock().await;
-            std::mem::take(&mut *registered)
+        let tasks = match tokio::time::timeout_at(deadline, self.background_tasks.lock()).await {
+            Ok(mut registered) => Some(std::mem::take(&mut *registered)),
+            Err(_) => None,
         };
-        let join_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !tasks.is_empty() {
-            match tokio::time::timeout_at(join_deadline, tasks.join_next()).await {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    break;
+        let drain_tasks = async move {
+            if let Some(mut tasks) = tasks {
+                while !tasks.is_empty() {
+                    match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return,
+                        Err(_) => {
+                            tasks.abort_all();
+                            return;
+                        }
+                    }
                 }
             }
-        }
+        };
+        let drain_operations = self.file_operations.wait_for_idle_until(deadline);
+        let _ = tokio::join!(drain_tasks, drain_operations);
         #[cfg(test)]
         self.files
             .write_lifecycle_test_hooks()
-            .notify_shutdown_complete();
+            .notify_shutdown_returned();
     }
 }
 
@@ -1430,13 +1462,14 @@ pub(crate) fn install(
                 return;
             }
             let (cleanup_tx, cleanup_rx) = mpsc::channel(MAX_WRITE_STREAMS);
+            let file_operations = HostFileOperations::new(Arc::clone(&closed));
             let context = Context {
                 dc: Arc::clone(&dc),
                 files,
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),
-                commit_fence: Arc::new(Mutex::new(())),
+                file_operations,
                 cleanup_tx,
                 arrivals,
                 closed,
@@ -1573,6 +1606,14 @@ fn write_reaper_interval() -> Duration {
         Duration::from_millis(20)
     } else {
         Duration::from_secs(1)
+    }
+}
+
+fn session_close_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(2)
     }
 }
 

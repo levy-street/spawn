@@ -2555,7 +2555,7 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_files::STREAM_CHUNK_BYTES;
+    use crate::host_files::{HostOperationKind, STREAM_CHUNK_BYTES};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
     use std::path::Path;
@@ -5248,7 +5248,7 @@ mod tests {
             .await
             .expect("host write shutdown did not start");
         hooks.release_begin_after_create();
-        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_complete())
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_returned())
             .await
             .expect("host write shutdown did not terminate");
         close.await.unwrap().unwrap();
@@ -5289,7 +5289,7 @@ mod tests {
         .await;
         let stream_id = write["result"]["stream_id"].as_str().unwrap();
 
-        hooks.arm_finish_before_commit();
+        hooks.arm_blocking(HostOperationKind::WriteCommit);
         channel
             .send_text(
                 json!({
@@ -5303,25 +5303,163 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), hooks.wait_finish_before_commit())
-            .await
-            .expect("write finish did not pause before commit");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_entered(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write finish did not pause before commit");
 
         let closing_channel = Arc::clone(&channel);
         let close = tokio::spawn(async move { closing_channel.close().await });
         tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
             .await
             .expect("host write shutdown did not start");
-        hooks.release_finish_before_commit();
-        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_complete())
+        tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
             .await
             .expect("host write shutdown did not terminate");
+        hooks.release_blocking(HostOperationKind::WriteCommit);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hooks.wait_blocking_finished(HostOperationKind::WriteCommit),
+        )
+        .await
+        .expect("write commit operation did not finish");
         close.await.unwrap().unwrap();
 
         assert!(!root.path().join("must-not-commit.bin").exists());
         assert_no_upload_temporaries(root.path());
         close_test_peer(&browser_pc).await;
         close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_blocking_host_operations_cannot_outlive_close_with_effects() {
+        let cases = [
+            (
+                HostOperationKind::List,
+                "list",
+                "stalled-list",
+                "fs.list",
+                json!({"path": "~", "cursor": 0}),
+            ),
+            (
+                HostOperationKind::Read,
+                "read",
+                "stalled-read",
+                "fs.read",
+                json!({"path": "read.txt"}),
+            ),
+            (
+                HostOperationKind::Mkdir,
+                "mkdir",
+                "stalled-mkdir",
+                "fs.mkdir",
+                json!({"path": "new-dir"}),
+            ),
+            (
+                HostOperationKind::Rename,
+                "rename",
+                "stalled-rename",
+                "fs.rename",
+                json!({"path": "source.txt", "name": "renamed.txt", "overwrite": false}),
+            ),
+            (
+                HostOperationKind::Remove,
+                "remove",
+                "stalled-remove",
+                "fs.remove",
+                json!({"path": "victim.txt", "recursive": false}),
+            ),
+            (
+                HostOperationKind::WriteBegin,
+                "write",
+                "stalled-write",
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": "blocked-write.bin",
+                    "length": 0,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "overwrite": false,
+                }),
+            ),
+        ];
+
+        for (kind, label, request_id, operation, payload) in cases {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("read.txt"), b"read")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("source.txt"), b"source")
+                .await
+                .unwrap();
+            tokio::fs::write(root.path().join("victim.txt"), b"victim")
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let hooks = files.write_lifecycle_test_hooks();
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "1".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("blocking-close-{label}")).await;
+
+            hooks.arm_blocking(kind);
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "request",
+                        "request_id": request_id,
+                        "operation": operation,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_entered(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} did not enter its blocking operation"));
+
+            let closing_channel = Arc::clone(&channel);
+            let close = tokio::spawn(async move { closing_channel.close().await });
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+                .await
+                .unwrap_or_else(|_| panic!("{label} shutdown did not start"));
+            tokio::time::timeout(Duration::from_millis(500), hooks.wait_shutdown_returned())
+                .await
+                .unwrap_or_else(|_| panic!("{label} shutdown exceeded its absolute deadline"));
+
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            assert!(!root.path().join("blocked-write.bin").exists(), "{label}");
+            assert_no_upload_temporaries(root.path());
+
+            hooks.release_blocking(kind);
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_finished(kind))
+                .await
+                .unwrap_or_else(|_| panic!("{label} blocking operation did not finish"));
+            close.await.unwrap().unwrap();
+            assert!(
+                messages.try_recv().is_err(),
+                "{label} published after close"
+            );
+            assert!(!root.path().join("new-dir").exists(), "{label}");
+            assert!(root.path().join("source.txt").exists(), "{label}");
+            assert!(!root.path().join("renamed.txt").exists(), "{label}");
+            assert!(root.path().join("victim.txt").exists(), "{label}");
+            assert!(!root.path().join("blocked-write.bin").exists(), "{label}");
+            assert_no_upload_temporaries(root.path());
+            close_test_peer(&browser_pc).await;
+            close_test_peer(&daemon_pc).await;
+        }
     }
 
     #[tokio::test]
