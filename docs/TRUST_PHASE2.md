@@ -246,16 +246,19 @@ server↔daemon frames. The daemon keeps a local launch manifest so restart does
 not require server plaintext. Pre-launch and host-scoped detailed errors travel
 back on `spawn.host.ctl`; the server receives only a stable lifecycle code.
 
-Before implementation, choose and threat-model the durable endpoint store:
+P2-DATA-01 selects a **per-host endpoint-local canonical store**. The normative
+decision is `docs/DURABLE_SENSITIVE_DATA.md`: `spawnd` owns independently keyed
+AEAD object envelopes, exact-revision conflict semantics, local restart
+manifests, fail-closed compatibility, and passphrase-encrypted export/import.
+The browser copies presets/skills only between online hosts over two host
+channels. Account recovery does not recover a lost endpoint, and no protected
+server sync queue exists. Opaque client-encrypted server blobs are deferred,
+not an allowed Phase 2 fallback.
 
-1. endpoint-local canonical storage (simpler, with a documented temporary
-   cross-device/cross-host synchronization regression), or
-2. opaque client-encrypted server blobs with versioned AEAD envelopes and a
-   recovery/key-distribution design in which the server never receives keys.
-
-The second option still leaks object identifiers, ciphertext sizes, version
-counts, and create/update/access timing/patterns. Its design and UI must disclose
-that metadata and test that no key or plaintext reaches server logs/telemetry.
+P2-DATA-02 must follow that ADR's migration states, quotas, authenticated
+metadata, rotation/revocation/deletion rules, rollback limitations,
+observability contract, and falsifiable gates. It must not claim that this
+documentation implements the store.
 
 The security invariant is non-negotiable: no plaintext `Agent.env`,
 `Skill.content`, or `Preset.env_template` remains server-readable. Existing

@@ -1,10 +1,9 @@
 # Interaction Surface Matrix
 
-Spawn exposes the same host and agent controls through the browser UI, REST API,
-typed web helpers, and the daemon wire protocol. REST is the source of truth for
-user-facing semantics; browser flows call into the same route or shared control
-helpers where possible. (The MCP tool surface and `/mcp` endpoint were removed
-entirely — see docs/TRUST.md.)
+This table records the current compatibility surface. It is not permission to
+keep a protected REST/server frame. The Phase 2 target makes REST the disclosed
+metadata plane and the DataChannels the protected-content plane. (The MCP tool
+surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md.)
 
 | Capability | Browser UI | REST | Web helper | Daemon frame |
 | --- | --- | --- | --- | --- |
@@ -24,6 +23,26 @@ entirely — see docs/TRUST.md.)
 | Resize/scroll/redraw terminal | terminal page display owner | `/resize`, `/scroll`, `/redraw` | `agents.resize/scroll/redraw` | `agent.resize`, `agent.scroll`, `agent.redraw` |
 | Capture terminal snapshot | terminal reconnect/history | `POST /api/agents/{id}/snapshot` | `agents.snapshot` | `agent.snapshot` request/result |
 | Upload file/image to agent cwd | terminal upload/drop/paste | `/upload`, `/upload-file` | `agents.upload/uploadFile` | `agent.upload` request/result |
+
+## Approved durable protected-data target (P2-DATA-01)
+
+This target is a design contract only; P2-DATA-02 has not implemented it. The
+per-host endpoint store and exact failure/migration semantics are specified in
+`DURABLE_SENSITIVE_DATA.md`.
+
+| Capability | Server metadata plane | Browser ↔ endpoint plane | Offline behavior |
+| --- | --- | --- | --- |
+| create/restart agent | reserve/update agent ID, host/preset relationship, neutral or explicit name, lifecycle only | resolve and commit exact `agent_manifest`, then launch over `spawn.host.ctl` | metadata remains visible; launch/restart is unavailable while host is offline |
+| edit/use preset | ID, owner, name, description/kind only | exact-revision `preset_values` read/write on each selected host | no protected server cache or queued sync |
+| edit/use skill | ID, owner, name, description/default flag and grant IDs only | exact-revision `skill_body` read/write/materialization on each selected host | no body is returned; launch fails closed if a referenced revision is absent |
+| tool target/policy | allowed enabled flag, IDs, coarse timestamps and content-free status | executable/install target, endpoint execution policy, versions/output/detail | unattended endpoint policy may run locally; server cannot reconstruct a missing target |
+| copy preset/skill across hosts | no content operation | browser streams source host → browser → destination host over two authenticated host channels | both hosts must be online |
+| export/import/recover | no key or archive endpoint | bounded passphrase-encrypted archive over `spawn.host.ctl` | account/password recovery alone cannot recover a lost host |
+| delete/wipe | metadata deletion/revocation only | revisioned tombstone/object crypto-delete; explicit local store wipe | server revocation cannot prove an offline endpoint was erased |
+
+There is deliberately no server helper that accepts protected values, opaque
+Phase 2 sync blob, recovery key, or plaintext fallback. Old clients get a
+content-free upgrade failure after cutover.
 
 Intentional differences:
 

@@ -115,6 +115,23 @@ P2-AGENT-02 remains planned: daemon WebSocket `0x01` output mirroring and
 `0x02` input still exist, so this checkpoint alone does not stop the server
 seeing terminal content and does not satisfy Phase 2.
 
+**P2-DATA-01 design checkpoint (implemented, independent review pending):**
+`docs/DURABLE_SENSITIVE_DATA.md` selects a per-host endpoint-local canonical
+store. It explicitly rejects an opaque client-encrypted server store as the
+Phase 2 canonical source and forbids server key escrow, plaintext fallback,
+dual-write, browser-only canonical storage, and last-write-wins. The design
+covers the AEAD/key hierarchy, browser and endpoint trust, multi-device/host
+regressions, offline daemon restart, account recovery and encrypted
+export/import, CAS/replay/rollback semantics and limitations, migration,
+rotation/revocation/deletion, quotas, authenticated metadata, observability,
+compatibility failures, and hand-offs to P2-DATA-02/P2-HOST-03B/P2-PURGE-01.
+Ten falsifiable acceptance gates are defined.
+
+This checkpoint is documentation only. No endpoint store, protected-data
+DataChannel operation, migration, server-column clearing, deployment, or purge
+has occurred, and P2-DATA-02 remains blocked until the decision passes review
+and is merged.
+
 ## Remaining sequence
 
 1. Independently review and merge per-agent `spawn.ctl` plus the mandatory
@@ -127,8 +144,11 @@ seeing terminal content and does not satisfy Phase 2.
    parallel E2E path for interactive installer detail. Cross-host bytes stream
    through the trusted browser, not the server. Keep the legacy tool route until
    its endpoint-owned durable targets exist; this wave is not the final tool cut.
-4. Move full launch manifests, `Agent.env`, preset environment/install/tool
-   targets, and skill bodies to the approved endpoint-owned/encrypted store.
+4. Implement the approved per-host endpoint-local store, then move full launch
+   manifests, `Agent.env`, preset environment/install/tool targets, and skill
+   bodies into it over `spawn.host.ctl`. Preserve the explicit offline-host and
+   cross-host-sync regressions in `DURABLE_SENSITIVE_DATA.md`; do not introduce
+   a protected server queue as a convenience fallback.
    Stop cwd-derived default names, then make the interactive E2E tool path
    mandatory, remove its legacy server route, finish unattended tool migration,
    and replace free-form server-visible daemon errors with E2E details.

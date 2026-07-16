@@ -1,6 +1,6 @@
 # Trust Phase 2 — tracked task schedule
 
-Last updated: 2026-07-15. Governing model: `docs/TRUST.md`. Build sequence and
+Last updated: 2026-07-16. Governing model: `docs/TRUST.md`. Build sequence and
 purge runbook: `docs/TRUST_PHASE2.md`.
 
 This is the execution ledger for the trust-model review. It distinguishes
@@ -95,8 +95,8 @@ protocol is already reviewed and stable.
 | P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
 | P2-TERM-01 | PLANNED | Move agent uploads to chunked `spawn.ctl`; remove REST/WS `bytes_b64` upload legs | P2-AGENT-01, QUAL-04 | Large-file, cancellation, retry, path-ack confidentiality, and bounded-memory tests pass |
 | P2-TERM-02 | PLANNED | Remove REST/WS input/snapshot/resize/scroll/redraw/display-control surfaces and migrate test clients to RTC endpoint harness | P2-AGENT-01, GATE-02 | No server schema/frame carries PTY/snapshot/viewport data or event timing; compatibility response is content-free and time-bounded |
-| P2-DATA-01 | PLANNED | Approve endpoint-local versus opaque client-encrypted durable store for launch manifests, preset operational values/tool targets, and skill bodies | P2-HOST-01 | Threat model covers keys/recovery, multi-device, offline restart, rollback, migration, and ciphertext identifier/size/version/access leakage; server never has decryption keys |
-| P2-DATA-02 | BLOCKED | Move `cwd`, `argv`, `env`, preset default-command/install/environment values, tool targets, and skill bodies over `spawn.host.ctl`; store daemon restart manifest locally; stop cwd-derived names | P2-DATA-01 | Create/restart/preset/skill/tool flows work after plaintext reads are disabled; neutral default name used; legacy derived names scrubbed/reclassified; only disclosed metadata or opaque ciphertext remains |
+| P2-DATA-01 | ACTIVE — DESIGN IMPLEMENTED, REVIEW PENDING | Approve the per-host endpoint-local canonical store in `DURABLE_SENSITIVE_DATA.md`; explicitly defer opaque client-encrypted server blobs | P2-HOST-01 | Independent review accepts the key hierarchy/ownership, browser/endpoint trust, recovery/export/import, multi-device/host and offline behavior, rollback/replay limits, migration/cutover, revocation/rotation/deletion, quotas/conflicts, observability, compatibility failures, leakage comparison, rejected alternatives, and ten falsifiable gates; server never receives a store/recovery key |
+| P2-DATA-02 | BLOCKED | Implement the selected store; move `cwd`, `argv`, `env`, preset default-command/install/environment values, tool targets, and skill bodies over `spawn.host.ctl`; store exact daemon restart manifests locally; stop cwd-derived names | P2-DATA-01 | Create/restart/preset/skill/tool/export/import/conflict flows work after plaintext reads are disabled; offline daemon restart uses the committed manifest; neutral default name used; legacy derived names scrubbed/reclassified; only disclosed metadata remains server-side; ADR adversarial gates pass |
 | P2-ERROR-01 | BLOCKED | Replace free-form daemon error/status/exit details with stable server-visible codes and E2E agent/host/pre-launch detail; remove server forwarding/logging | P2-AGENT-01, P2-HOST-01, P2-DATA-02 | Injected cwd/file/tool errors reach browser E2E, while server frames/logs/telemetry contain only codes and disclosed lifecycle metadata |
 | P2-PURGE-01 | BLOCKED | Inventory, migrate, close/drain ingress, restart processes, and purge transcripts, DB/derived names, Redis, memory/queues/swap/core, logs/observability, WAL/AOF, backups, replicas, raw blocks, and snapshots | P2-TMUX-01, P2-AGENT-02, P2-HOST-02, P2-HOST-03B, P2-TERM-01, P2-TERM-02, P2-DATA-02, P2-ERROR-01 | Two-operator evidence follows the eight-step runbook; process/observability and oldest-backup checks find no recoverable plaintext; no content rollback path remains |
 | P2-AUDIT-01 | BLOCKED | Final adversarial server audit and Phase 2 claim gate | P2-PURGE-01 | Code/route/frame/schema inventory; server memory/queue/swap/core/disk/DB/Redis/log/observability scans; backup evidence; TURN-only tests; ciphertext and retained-metadata disclosure all pass |
@@ -158,8 +158,9 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
    at this checkpoint.
 3. **Wave 2:** P2-AGENT-02/P2-TERM-01/P2-TERM-02 on the agent protocol while
    P2-HOST-02 and P2-HOST-03A implement separate host-channel operations
-   (rebasing/serializing shared route edits before merge). P2-DATA-01 design
-   review may run alongside them once P2-HOST-01 fixes the transport boundary.
+   (rebasing/serializing shared route edits before merge). P2-DATA-01's selected
+   endpoint-local design is implemented in documentation and awaits independent
+   review/merge; it adds no runtime store or Phase 2 claim.
 4. **Wave 3:** P2-DATA-02 after its design pass, then P2-HOST-03B and
    P2-ERROR-01 in parallel once durable preset/tool targets exist.
 5. **Wave 4 (serial change window):** P2-PURGE-01, then P2-AUDIT-01. Historical

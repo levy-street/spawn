@@ -23,9 +23,11 @@
 - **Stack**: Python 3.13, FastAPI, SQLAlchemy 2.0 + Alembic, asyncpg,
   Pydantic v2, argon2 for password hashing, PyJWT for short-lived tokens,
   redis-py for pubsub.
-- **State**: Postgres for durable state (users, hosts, agents, presets,
-  audit). Redis for pub/sub between WS workers (so a frontend connected to
-  worker A can receive PTY bytes from a daemon connected to worker B).
+- **State**: Postgres currently holds durable user/host/agent/preset/skill
+  records, including protected launch/preset/skill fields that Phase 2 must
+  remove. The target Postgres state is disclosed registry/lifecycle metadata
+  only. Redis coordinates signaling/connection ownership between WS workers;
+  it is not a protected-data store.
 - **Public surface**:
   - HTTP/JSON REST under `/api/...`
   - `/ws/daemon` — daemon WebSocket
@@ -70,6 +72,12 @@
   replay/scratch, and retained bookkeeping; this is not a durable transcript
   archive. Browsers fetch history over
   the DataChannel at attach. The server keeps no copy.
+- **Durable protected state (approved target, not implemented)**: `spawnd`
+  owns one independently keyed, endpoint-local canonical store for launch and
+  restart manifests, preset/tool operational values, and skill bodies. It is
+  available after daemon restart and exposed only over `spawn.host.ctl`.
+  `DURABLE_SENSITIVE_DATA.md` defines its envelope, recovery, conflicts,
+  quotas, migration, and accepted offline/cross-host regressions.
 
 ### `spawn-web` — Next.js 15 PWA
 
@@ -121,6 +129,8 @@
 
 ## Data model
 
+The SQL below is the current server-readable shape, not the Phase 2 target:
+
 ```sql
 users(id, email, password_hash, created_at)
 hosts(id, owner_user_id, name, os, arch, version, status, last_seen_at)
@@ -132,6 +142,19 @@ agents(id, owner_user_id, host_id, preset_id|null, cwd, argv jsonb, env jsonb,
 device_codes(device_code, user_code, host_name, status, user_id|null,
              expires_at)
 ```
+
+After P2-DATA-02, Postgres retains the IDs/ownership, names/descriptions,
+grants, policy/lifecycle fields, and neutral/explicit labels allowed by
+`TRUST.md`, but not `cwd`, `argv`, `env`, preset default/install/environment
+values, tool executable targets, or skill bodies. Those values are versioned
+AEAD objects in the per-host store selected by
+`DURABLE_SENSITIVE_DATA.md`. Built-in operational preset values move to a
+versioned daemon-local catalog; their IDs/names/kinds may remain disclosed.
+
+This split is intentionally non-atomic across the server metadata plane and
+endpoint content plane. The browser binds both by stable ID, while protected
+writes use exact endpoint revisions. Missing/offline endpoint values fail
+closed; the server never fills the gap from a cache.
 
 ## Wire protocol (summary — see `proto/README.md` for full)
 

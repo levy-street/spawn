@@ -39,7 +39,7 @@ states which guarantee it delivers.
 | **Host endpoint** (`spawnd` + workers) | session workers, PTYs, encrypted bounded replay state, host identity key | everything on its own host (it is the user's machine) |
 | **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and agents it connects to |
 | **TURN relay** | nothing durable | ciphertext, peer IPs, traffic volume/timing |
-| **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | disclosed metadata only, including coarse activity, unattended-update, and encrypted-blob access timing (see "What the server still sees") |
+| **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | disclosed metadata only, including coarse activity and unattended-update state; it also observes endpoint connection and traffic timing (see "What the server still sees") |
 
 ## Why the cryptography already works in our favor
 
@@ -76,24 +76,23 @@ Adversaries and what they get, once the migration is complete:
 
 | Adversary | Can | Cannot |
 |-----------|-----|--------|
-| **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection/signaling timing, user-input/meaningful-output times, unattended-update metadata, and opaque-blob sizes/access patterns; refuse service; delete accounts | read PTY data, transcripts, host or agent file data, viewport controls, tool details, env vars, skill bodies, MCP credentials |
-| **Malicious control-plane operator** (or compromised server) | everything above; record DTLS/TURN traffic and durable opaque blobs; alter signaling or operator-hosted client code; attempt key-substitution MITM at pairing or signaling time | passively decrypt recorded DTLS traffic when the negotiated suite provides forward secrecy and endpoint/session keys remain uncompromised; decrypt durable opaque blobs without their endpoint-held data/recovery keys. Phase 3 makes signaling substitution detectable only to trusted/verifiable endpoint code; it does not constrain hostile hosted JavaScript |
+| **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection/signaling timing and volume, user-input/meaningful-output times, and unattended-update metadata; refuse service; delete accounts | read PTY data, transcripts, host or agent file data, viewport controls, tool details, env vars, skill bodies, MCP credentials |
+| **Malicious control-plane operator** (or compromised server) | everything above; record DTLS/TURN traffic; alter signaling or operator-hosted client code; attempt key-substitution MITM at pairing or signaling time | passively decrypt recorded DTLS traffic when the negotiated suite provides forward secrecy and endpoint/session keys remain uncompromised; obtain the endpoint-local protected-store keys from server persistence. Phase 3 makes signaling substitution detectable only to trusted/verifiable endpoint code; it does not constrain hostile hosted JavaScript |
 | **Network attacker (on-path)** | observe/black-hole encrypted flows, learn peer IPs | read or modify session content (DTLS), impersonate either peer |
 | **TURN operator** | observe ciphertext volume/timing and peer IPs | decrypt anything |
 | **Malicious co-tenant** | attack the API surface | reach another user's daemons or agents (all REST + WS paths filter by `owner_user_id`; daemon tokens are host-scoped) |
 | **Attacker with the user's browser device** | full access as that user | — out of scope; this is device security |
 | **Compromised host daemon** | everything on that host | other hosts' sessions (per-host tokens and keys) |
 
-Past-session confidentiality has two distinct cases; it is not based on
-ciphertext being absent. A control plane, TURN operator, or network
-observer can record ephemeral-session DTLS ciphertext. Its resistance to later
-decryption depends on the negotiated cipher suite's forward-secrecy properties
-and on endpoint/session key material not being compromised. Optional durable
-opaque blobs are intentionally stored ciphertext: their confidentiality depends
-on the reviewed AEAD envelope plus endpoint key generation, distribution,
-recovery, rotation, and destruction. Compromise of an endpoint or its recovery
-keys can therefore expose the affected blobs and is not prevented by the server
-being unable to decrypt them on its own.
+Past-session confidentiality is not based on ciphertext being absent. A control
+plane, TURN operator, or network observer can record ephemeral-session DTLS
+ciphertext. Its resistance to later decryption depends on the negotiated cipher
+suite's forward-secrecy properties and on endpoint/session key material not
+being compromised. Phase 2 does not add a durable server-side ciphertext
+archive: restart manifests, preset operational values, and skill bodies are
+canonical on the host endpoint under `docs/DURABLE_SENSITIVE_DATA.md`, while
+the live worker replay remains separately bounded and ephemeral-keyed. A later
+optional opaque backup would need its own reviewed key/recovery threat model.
 
 Explicitly **in scope**: protecting user content from spawn's own
 infrastructure and anyone who compromises or compels it.
@@ -113,9 +112,10 @@ lifecycle status; preset and skill names/descriptions; exit codes; presence;
 connection and signaling timing; IP addresses; and per-agent timestamps for
 meaningful output and user input. For unattended tool updates it may also keep
 the enabled policy, host/preset identifiers, check/update/result timestamps,
-and content-free success/failure/exit-code status. If opaque endpoint-encrypted
-blobs are selected, the server also learns object identifiers, ciphertext size,
-version count, and create/update/access timing and patterns. Activity frames
+and content-free success/failure/exit-code status. The selected endpoint-local
+durable store does not expose its object sizes, revisions, or store-access log
+to the server, although signaling/TURN and metadata API traffic still disclose
+connection timing and approximate transfer volume. Activity frames
 contain no terminal bytes and are throttled, but their timing is behavioral
 metadata and can reveal when a person or agent is active. Self-hosting is the
 answer for users for whom this metadata is itself sensitive.
@@ -132,10 +132,10 @@ answer for users for whom this metadata is itself sensitive.
 | REST terminal input and snapshots | `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
 | Terminal geometry and viewport actions | REST plus `/ws/browser` resize/scroll/redraw/display-control paths; `agent.resize`/`scroll`/`redraw` | per-agent `spawn.ctl`; server sees neither dimensions, deltas, nor event timing |
 | Agent `env` (may contain real secrets) | `agent.create`, persisted in `agents.env` | sent E2E at spawn time; never stored server-readably |
-| Preset environment templates | `presets.env_template`, merged into agent `env` | endpoint-owned or client-encrypted; values sent E2E at spawn time |
-| Launch paths/arguments and preset commands | `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | endpoint-owned or client-encrypted; launch manifest sent E2E |
+| Preset environment templates | `presets.env_template`, merged into agent `env` | canonical in the selected per-host endpoint store; values sent E2E at spawn time |
+| Launch paths/arguments and preset commands | `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | canonical per-host launch manifest sent over `spawn.host.ctl` |
 | Default agent names derived from `cwd` | `_default_agent_name` copies the working-directory basename into `agents.name` | explicit user metadata or neutral ID-based default; legacy derived names scrubbed |
-| Skill bodies | `agent.create`, `skills` table | endpoint-owned or client-encrypted at rest; decrypted only at endpoints |
+| Skill bodies | `agent.create`, `skills` table | canonical in the selected per-host endpoint store; decrypted only at endpoints |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | REST host-file routes plus `host.fs.*` server↔daemon frames | host-scoped `spawn.host.ctl` DataChannel |
 | Cross-host file transfer | server reads the source and forwards its bytes to the destination | browser streams source host → browser → destination host over two host channels |
@@ -244,11 +244,12 @@ What moves where, and the regressions we accept:
   server cannot implement a content-returning compatibility REST proxy without
   violating the model.
 - **Launch manifests, preset environment values, and skill bodies** → delivered
-  over `spawn.host.ctl` and retained only at endpoints or as opaque
-  endpoint-encrypted blobs. The migration must establish a working endpoint
-  copy before clearing the current plaintext database fields. If opaque blobs
-  are selected, the feature and threat model disclose their identifier, size,
-  version-count, and access-timing leakage.
+  over `spawn.host.ctl` and retained in a per-host endpoint-local canonical
+  store. The store/key/recovery/conflict/migration decision is normative in
+  `docs/DURABLE_SENSITIVE_DATA.md`. The browser copies values directly between
+  online hosts; the server is not a sync queue. The migration must establish
+  and restart-test a working endpoint copy before clearing the current
+  plaintext database fields.
   Default agent names become neutral and ID-based unless the user supplies an
   explicit metadata label; cwd-derived legacy names are scrubbed.
 - **The spawn MCP surface** — *resolved: cut entirely (2026-07-09).* The
@@ -284,15 +285,17 @@ worthless:
 2. **First-contact key substitution** until L2 verification lands.
 3. **Metadata.** The control plane necessarily learns who owns which hosts,
    when they connect, coarse meaningful-output/user-input times, and the
-   unattended-update metadata listed above. If it stores opaque encrypted
-   blobs, their size, versions, and access patterns also leak. TURN learns IP
-   pairs and volumes. We do not claim metadata privacy; self-host if that
-   matters.
-4. **Durable ciphertext keys.** If opaque endpoint-encrypted blobs are used,
-   confidentiality and availability depend on endpoint key/recovery design.
-   Key compromise can expose retained versions; key loss or destruction can
-   make them unrecoverable. Rotation does not erase old ciphertext unless old
-   keys and recoverable copies are also retired.
+   unattended-update metadata listed above. The selected endpoint-local store
+   avoids durable server-side object/version/access metadata, but its E2E
+   transfers still reveal timing and approximate volume. TURN learns IP pairs
+   and volumes. We do not claim metadata privacy; self-host if that matters.
+4. **Endpoint durable-store keys.** Confidentiality and availability depend on
+   the per-host key, recovery export, rotation, and destruction design in
+   `DURABLE_SENSITIVE_DATA.md`. Key compromise can expose retained local
+   versions; key loss without an export makes them unrecoverable. A fallback
+   key file stored beside the database does not protect a stolen full-disk
+   image. Rotation does not erase old ciphertext unless old wrappers, backups,
+   and keys are also destroyed.
 5. **Endpoint compromise** is out of scope and undiminished: an agent
    with your credentials running on your machine is exactly as dangerous
    as it is without spawn.
@@ -387,10 +390,11 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   paths.
 - Move `env`, `Preset.env_template`, `Preset.install`, `cwd`, `argv`, skill
   bodies, and detailed launch errors out of server-readable persistence and
-  transport. REST creates only the metadata row and a neutral default name; the
-  launch manifest travels E2E over the host channel. Scrub cwd-derived legacy
-  names. (The `/mcp` question is already resolved: the whole MCP surface was cut
-  on 2026-07-09.)
+  transport into the selected per-host store in
+  `DURABLE_SENSITIVE_DATA.md`. REST creates only the metadata row and a neutral
+  default name; the launch manifest travels E2E over the host channel. Scrub
+  cwd-derived legacy names. (The `/mcp` question is already resolved: the whole
+  MCP surface was cut on 2026-07-09.)
 - After all replacement paths are live and compatibility traffic is disabled,
   execute and verify the plaintext purge for transcript files, database rows,
   cwd-derived labels, legacy Redis ring keys, process memory/queues/swap/core,

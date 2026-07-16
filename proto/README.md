@@ -659,6 +659,68 @@ outstanding request ID. Filesystem/tool/launch operations and their bounded
 chunk streams are added by later trust Phase 2 tasks; the transport root
 currently advertises only `ping`.
 
+### Approved P2-DATA-02 store contract (not implemented)
+
+P2-DATA-01 selected the per-host endpoint-local canonical store in
+`docs/DURABLE_SENSITIVE_DATA.md`. This subsection constrains the later wire
+implementation; it does not advertise a runtime capability today.
+
+An implementation-ready daemon adds a separately negotiated
+`private-store-v1` capability to the existing `spawn.host.ctl` hello. Until
+both endpoints advertise it, every protected store/create/restart request fails
+with `upgrade_required`; the browser must not retry through REST or a daemon
+WebSocket frame.
+
+The operation families are:
+
+```text
+private.list         object_type, authenticated cursor, limit (max 256)
+private.get          object_type, object_id, optional revision
+private.put.begin    object_type, object_id, expected_revision,
+                     total_bytes, sha256
+private.delete       object_type, object_id, expected_revision
+private.export       selected object IDs or whole-store selection
+private.import.begin archive length/hash and explicit preview/commit phase
+agent.launch         agent_id, committed manifest revision, geometry
+agent.restart        agent_id, committed manifest revision, geometry
+```
+
+`object_type` is one of `agent_manifest`, `preset_values`, or `skill_body`.
+The exact resolved restart manifest uses the `agent_manifest` type; there is no
+terminal transcript/history type. Built-in operational preset values come from
+the daemon-local catalog rather than a server frame.
+
+Protected bodies are never placed in server REST/WS JSON. On the DataChannel,
+`put`/`get`/export/import use request-bound bounded binary chunks rather than
+one unbounded JSON allocation. The begin message declares aggregate length and
+SHA-256; the final chunk must match both before the daemon atomically commits.
+Control messages remain below 16 KiB. The ADR caps object sizes, concurrent
+streams, buffered plaintext, and progress time. Cancel, timeout, disconnect,
+hash mismatch, quota failure, or AEAD failure preserves the previous revision
+and erases the partial temporary value.
+
+Create requires `expected_revision:0`; update and delete require the exact
+current unsigned 64-bit revision. A successful mutation returns the committed
+revision. Stale revisions return E2E `revision_conflict`. Identical retries with
+the same random request ID return the original result; reuse with different
+authenticated bytes returns `request_id_reused`. Responses remain bound to the
+host/session/account/protocol/request/object tuple. There is no timestamp or
+server-order last-write-wins rule.
+
+Human-readable conflicts, paths, commands, values, integrity failures, and
+recovery diagnostics exist only in these E2E responses. Server-visible paths
+receive stable lifecycle/result codes only. Store keys, wrapped DEKs, recovery
+passphrases, plaintext/ciphertext bodies, hashes, sizes, and revisions are never
+copied into a server frame or telemetry event. Host/TURN traffic timing and
+volume remain disclosed traffic-analysis metadata.
+
+The metadata reservation and endpoint write are two explicit planes, not a
+distributed transaction. Launch is allowed only after the exact manifest
+revision commits locally. If metadata reservation or endpoint commit fails, the
+browser reports/compensates without a plaintext server fallback. Missing key,
+unknown envelope/schema, missing referenced preset/skill revision, corruption,
+or offline host fails closed as defined by the ADR.
+
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
