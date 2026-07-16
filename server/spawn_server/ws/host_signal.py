@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,7 @@ HOST_CONTROL_PROTOCOL = "spawn.host.ctl"
 HOST_CONTROL_VERSION = 1
 HOST_RTC_SESSION_TTL_SECONDS = 60
 RTC_CONNECTED_SESSION_TTL_SECONDS = 24 * 60 * 60
+RTC_BINDING_TOMBSTONE_TTL_SECONDS = 5 * 60
 HOST_DAEMON_PRESENCE_TTL_SECONDS = 90
 MAX_HOST_RTC_SESSIONS_PER_BROWSER = 8
 MAX_HOST_RTC_SESSIONS_PER_HOST = 64
@@ -82,6 +84,18 @@ def valid_daemon_connection_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
+def valid_rtc_binding_nonce(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def new_rtc_binding_nonce() -> str:
+    return uuid.uuid4().hex
+
+
 @dataclass(frozen=True)
 class HostPresenceOwner:
     daemon_connection_id: str
@@ -130,6 +144,7 @@ class RtcSignalDispatch:
     host_id: str
     session_connection_id: str
     session_generation: int
+    binding_nonce: str
     dispatch_connection_id: str
     dispatch_generation: int
     signal: dict[str, Any]
@@ -178,6 +193,7 @@ def encode_rtc_signal_dispatch(dispatch: RtcSignalDispatch) -> bytes:
             "host_id": dispatch.host_id,
             "session_connection_id": dispatch.session_connection_id,
             "session_generation": dispatch.session_generation,
+            "binding_nonce": dispatch.binding_nonce,
             "dispatch_connection_id": dispatch.dispatch_connection_id,
             "dispatch_generation": dispatch.dispatch_generation,
             "signal": dispatch.signal,
@@ -201,6 +217,7 @@ def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
     host_id = value.get("host_id")
     session_connection_id = value.get("session_connection_id")
     session_generation = value.get("session_generation")
+    binding_nonce = value.get("binding_nonce")
     dispatch_connection_id = value.get("dispatch_connection_id")
     dispatch_generation = value.get("dispatch_generation")
     signal = value.get("signal")
@@ -216,6 +233,7 @@ def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
         or isinstance(session_generation, bool)
         or session_generation < 1
         or session_generation > MAX_SAFE_FENCING_GENERATION
+        or not valid_rtc_binding_nonce(binding_nonce)
         or not isinstance(dispatch_generation, int)
         or isinstance(dispatch_generation, bool)
         or dispatch_generation < 1
@@ -227,6 +245,7 @@ def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
         host_id,
         session_connection_id,
         session_generation,
+        binding_nonce,
         dispatch_connection_id,
         dispatch_generation,
         signal,
@@ -299,6 +318,7 @@ class RedisBrowserConn:
     channel: str
     daemon_connection_id: str
     daemon_generation: int
+    binding_nonce: str
 
     @property
     def route_id(self) -> str:
@@ -309,6 +329,7 @@ class RedisBrowserConn:
             host_id=self.host_id,
             session_connection_id=self.daemon_connection_id,
             session_generation=self.daemon_generation,
+            binding_nonce=self.binding_nonce,
             dispatch_connection_id=owner.daemon_connection_id,
             dispatch_generation=owner.generation,
             signal=payload,

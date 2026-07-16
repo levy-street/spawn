@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 
 from spawn_server import auth
@@ -1128,7 +1129,7 @@ async def test_started_publish_failure_fences_without_broker_deadlock(client, mo
     await asyncio.wait_for(other_task, timeout=1)
 
 
-async def test_upload_error_resolves_exact_distributed_request_and_publishes_event(client):
+async def test_upload_error_resolves_exact_request_and_legacy_reply_is_isolated(client):
     from spawn_server.redis import agent_event_channel
 
     user_id, _ = await _signup(client, "ws-daemon-upload-error@example.com")
@@ -1163,22 +1164,36 @@ async def test_upload_error_resolves_exact_distributed_request_and_publishes_eve
         item for item in _sent_json(ws) if item.get("type") == "agent.upload"
     ][-1]
 
+    error = {
+        "type": "error",
+        "agent_id": agent_id,
+        "code": "upload_failed",
+        "message": "disk full",
+        "request_id": request["request_id"],
+        "client_id": "upload-error-client",
+    }
+    async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as events:
+        ws.queue_text(error)
+        assert await request_task == error
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(anext(events), timeout=0.05)
+
+    # A reply from an old daemon cannot satisfy a new request by reusing its
+    # client id. It is exposed only on the explicitly legacy event path and
+    # carries no correlatable client identity.
     async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as events:
         error = {
             "type": "error",
             "agent_id": agent_id,
             "code": "upload_failed",
             "message": "disk full",
-            "request_id": request["request_id"],
             "client_id": "upload-error-client",
         }
         ws.queue_text(error)
-        assert await request_task == error
         event = json.loads(await asyncio.wait_for(anext(events), timeout=1))
         assert event == {
-            "type": "upload.error",
+            "type": "upload.legacy_error",
             "message": "disk full",
-            "client_id": "upload-error-client",
         }
 
     ws.queue_disconnect()
@@ -1370,6 +1385,7 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         channel=browser_signal_channel("a" * 32),
         daemon_connection_id=live_daemon.id,
         daemon_generation=live_daemon.host_generation,
+        binding_nonce="a" * 32,
     )
     assert await broker.register_rtc_session(
         "rtc-daemon-1",
@@ -1379,24 +1395,28 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         scope_id=agent_id,
         protocol="spawn.pty",
         protocol_version=1,
+        binding_nonce="a" * 32,
     )
 
     expected_signals = [
         {
             "type": "rtc.answer",
             "session_id": "rtc-daemon-1",
+            "binding_nonce": "a" * 32,
             "agent_id": agent_id,
             "sdp": "v=0\r\n",
         },
         {
             "type": "rtc.candidate",
             "session_id": "rtc-daemon-1",
+            "binding_nonce": "a" * 32,
             "agent_id": agent_id,
             "candidate": {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"},
         },
         {
             "type": "rtc.status",
             "session_id": "rtc-daemon-1",
+            "binding_nonce": "a" * 32,
             "agent_id": agent_id,
             "status": "connected",
         },

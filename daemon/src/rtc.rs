@@ -65,6 +65,7 @@ struct RtcBinding {
     scope: RtcScope,
     protocol: String,
     protocol_version: u16,
+    binding_nonce: Option<String>,
 }
 
 impl RtcBinding {
@@ -74,13 +75,23 @@ impl RtcBinding {
         scope_id: Option<Uuid>,
         protocol: Option<&str>,
         protocol_version: Option<u16>,
+        binding_nonce: Option<String>,
     ) -> Option<Self> {
+        if binding_nonce.as_deref().is_some_and(|nonce| {
+            nonce.len() != 32
+                || !nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return None;
+        }
         match (agent_id, scope_type, scope_id, protocol, protocol_version) {
             // Legacy agent signaling remains accepted during the v1 rollout.
             (Some(agent_id), None, None, None, None) => Some(Self {
                 scope: RtcScope::Agent(agent_id),
                 protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
+                binding_nonce,
             }),
             (Some(agent_id), Some("agent"), Some(scope_id), Some(protocol), Some(version))
                 if agent_id == scope_id
@@ -91,6 +102,7 @@ impl RtcBinding {
                     scope: RtcScope::Agent(agent_id),
                     protocol: protocol.to_string(),
                     protocol_version: version,
+                    binding_nonce,
                 })
             }
             (None, Some("host"), Some(host_id), Some(protocol), Some(version))
@@ -100,6 +112,7 @@ impl RtcBinding {
                     scope: RtcScope::Host(host_id),
                     protocol: protocol.to_string(),
                     protocol_version: version,
+                    binding_nonce,
                 })
             }
             _ => None,
@@ -148,6 +161,7 @@ fn accept_first_host_channel(accepted: &AtomicBool) -> bool {
 
 pub struct RtcOfferSignal {
     pub session_id: String,
+    pub binding_nonce: Option<String>,
     pub agent_id: Option<Uuid>,
     pub scope_type: Option<String>,
     pub scope_id: Option<Uuid>,
@@ -160,6 +174,7 @@ pub struct RtcOfferSignal {
 
 pub struct RtcCandidateSignal {
     pub session_id: String,
+    pub binding_nonce: Option<String>,
     pub agent_id: Option<Uuid>,
     pub scope_type: Option<String>,
     pub scope_id: Option<Uuid>,
@@ -170,6 +185,7 @@ pub struct RtcCandidateSignal {
 
 pub struct RtcCloseSignal {
     pub session_id: String,
+    pub binding_nonce: Option<String>,
     pub agent_id: Option<Uuid>,
     pub scope_type: Option<String>,
     pub scope_id: Option<Uuid>,
@@ -217,6 +233,7 @@ impl RtcSessions {
             offer.scope_id,
             offer.protocol.as_deref(),
             offer.protocol_version,
+            offer.binding_nonce,
         ) else {
             tracing::warn!(session_id = %offer.session_id, "rejecting unbound rtc offer metadata");
             return;
@@ -440,6 +457,7 @@ impl RtcSessions {
             signal.scope_id,
             signal.protocol.as_deref(),
             signal.protocol_version,
+            signal.binding_nonce,
         ) else {
             tracing::debug!(session_id = %signal.session_id, "ignoring rtc candidate with invalid binding");
             return;
@@ -478,6 +496,7 @@ impl RtcSessions {
             signal.scope_id,
             signal.protocol.as_deref(),
             signal.protocol_version,
+            signal.binding_nonce,
         ) else {
             return;
         };
@@ -583,6 +602,7 @@ fn install_data_channel_handler(
                 install_host_control_channel(dc, session_id, binding, out_tx);
                 return;
             }
+            let binding_nonce = binding.binding_nonce.clone();
             let RtcScope::Agent(agent_id) = binding.scope else {
                 return;
             };
@@ -590,6 +610,7 @@ fn install_data_channel_handler(
                 scope: RtcScope::Agent(agent_id),
                 protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
+                binding_nonce,
             };
 
             let input_registry = registry.clone();
@@ -851,6 +872,7 @@ fn rtc_answer_frame(session_id: String, binding: &RtcBinding, sdp: String) -> Ou
     let (agent_id, scope_type, scope_id, protocol, protocol_version) = rtc_frame_binding(binding);
     Outbound::RtcAnswer {
         session_id,
+        binding_nonce: binding.binding_nonce.clone(),
         agent_id,
         scope_type,
         scope_id,
@@ -864,6 +886,7 @@ fn rtc_candidate_frame(session_id: String, binding: &RtcBinding, candidate: Valu
     let (agent_id, scope_type, scope_id, protocol, protocol_version) = rtc_frame_binding(binding);
     Outbound::RtcCandidate {
         session_id,
+        binding_nonce: binding.binding_nonce.clone(),
         agent_id,
         scope_type,
         scope_id,
@@ -882,6 +905,7 @@ fn rtc_status_frame(
     let (agent_id, scope_type, scope_id, protocol, protocol_version) = rtc_frame_binding(binding);
     Outbound::RtcStatus {
         session_id,
+        binding_nonce: binding.binding_nonce.clone(),
         agent_id,
         scope_type,
         scope_id,
@@ -1002,11 +1026,12 @@ mod tests {
         let agent_id = Uuid::new_v4();
         let host_id = Uuid::new_v4();
         assert_eq!(
-            RtcBinding::from_signal(Some(agent_id), None, None, None, None),
+            RtcBinding::from_signal(Some(agent_id), None, None, None, None, None),
             Some(RtcBinding {
                 scope: RtcScope::Agent(agent_id),
                 protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
+                binding_nonce: None,
             })
         );
         let host = RtcBinding::from_signal(
@@ -1015,6 +1040,7 @@ mod tests {
             Some(host_id),
             Some(HOST_CONTROL_LABEL),
             Some(RTC_PROTOCOL_VERSION),
+            None,
         )
         .unwrap();
         assert_eq!(host.scope, RtcScope::Host(host_id));
@@ -1026,6 +1052,7 @@ mod tests {
             Some(host_id),
             Some(HOST_CONTROL_LABEL),
             Some(RTC_PROTOCOL_VERSION),
+            None,
         )
         .is_none());
         assert!(RtcBinding::from_signal(
@@ -1034,6 +1061,7 @@ mod tests {
             Some(host_id),
             Some(AGENT_DATA_CHANNEL_LABEL),
             Some(RTC_PROTOCOL_VERSION),
+            None,
         )
         .is_none());
         assert!(RtcBinding::from_signal(
@@ -1042,6 +1070,16 @@ mod tests {
             Some(host_id),
             Some(HOST_CONTROL_LABEL),
             Some(2),
+            None,
+        )
+        .is_none());
+        assert!(RtcBinding::from_signal(
+            None,
+            Some("host"),
+            Some(host_id),
+            Some(HOST_CONTROL_LABEL),
+            Some(RTC_PROTOCOL_VERSION),
+            Some("not-a-valid-binding-nonce".to_string()),
         )
         .is_none());
     }
@@ -1117,6 +1155,7 @@ mod tests {
             scope: RtcScope::Host(host_id),
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
+            binding_nonce: Some("a".repeat(32)),
         };
         let host_json = serde_json::to_value(rtc_status_frame(
             "host-session".into(),
@@ -1129,6 +1168,7 @@ mod tests {
         assert_eq!(host_json["scope_id"], host_id.to_string());
         assert_eq!(host_json["protocol"], HOST_CONTROL_LABEL);
         assert_eq!(host_json["protocol_version"], RTC_PROTOCOL_VERSION);
+        assert_eq!(host_json["binding_nonce"], "a".repeat(32));
         assert!(host_json.get("agent_id").is_none());
 
         let agent_id = Uuid::new_v4();
@@ -1136,6 +1176,7 @@ mod tests {
             scope: RtcScope::Agent(agent_id),
             protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
+            binding_nonce: Some("b".repeat(32)),
         };
         let agent_json = serde_json::to_value(rtc_status_frame(
             "agent-session".into(),
@@ -1145,6 +1186,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(agent_json["agent_id"], agent_id.to_string());
+        assert_eq!(agent_json["binding_nonce"], "b".repeat(32));
         assert!(agent_json.get("scope_type").is_none());
     }
 
@@ -1167,11 +1209,13 @@ mod tests {
             scope: RtcScope::Host(Uuid::new_v4()),
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
+            binding_nonce: None,
         };
         let agent = RtcBinding {
             scope: RtcScope::Agent(Uuid::new_v4()),
             protocol: AGENT_DATA_CHANNEL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
+            binding_nonce: None,
         };
         let mut host_bindings = vec![host.clone(); MAX_HOST_RTC_PEERS - 1];
         assert!(rtc_capacity_available(host_bindings.iter(), &host));
@@ -1238,6 +1282,7 @@ mod tests {
             scope: RtcScope::Host(host_id),
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
+            binding_nonce: None,
         };
         let (out_tx, _out_rx) = mpsc::channel(4);
         install_data_channel_handler(

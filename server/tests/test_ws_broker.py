@@ -826,6 +826,80 @@ async def test_upload_result_uses_server_request_identity_not_reusable_client_id
 
 
 @pytest.mark.asyncio
+async def test_delayed_upload_result_cannot_alias_reused_client_id(app):
+    broker = Broker()
+    daemon = DaemonConn(
+        host_id="host-upload-reuse",
+        user_id="user-1",
+        websocket=FakeWS(),  # type: ignore[arg-type]
+    )
+    await _accept_owner(broker, daemon)
+
+    first = asyncio.create_task(
+        broker.request_upload(
+            "agent-1",
+            daemon,
+            payload={"type": "agent.upload", "client_id": "same-client"},
+            client_id="same-client",
+            timeout=0.01,
+        )
+    )
+    await asyncio.sleep(0)
+    first_request = json.loads(daemon.websocket.sent_text[-1])["request_id"]
+    assert await first is None
+
+    second = asyncio.create_task(
+        broker.request_upload(
+            "agent-1",
+            daemon,
+            payload={"type": "agent.upload", "client_id": "same-client"},
+            client_id="same-client",
+            timeout=1,
+        )
+    )
+    await asyncio.sleep(0)
+    second_request = json.loads(daemon.websocket.sent_text[-1])["request_id"]
+    assert second_request != first_request
+
+    stale_result = {
+        "type": "agent.uploaded",
+        "request_id": first_request,
+        "client_id": "same-client",
+        "path": "/tmp/stale",
+    }
+    assert (
+        await broker.resolve_upload(
+            "agent-1",
+            first_request,
+            stale_result,
+            daemon=daemon,
+            expected_host_generation=1,
+        )
+        is UploadResolution.RESOLVED
+    )
+    await asyncio.sleep(0.02)
+    assert not second.done()
+
+    current_result = {
+        "type": "agent.uploaded",
+        "request_id": second_request,
+        "client_id": "same-client",
+        "path": "/tmp/current",
+    }
+    assert (
+        await broker.resolve_upload(
+            "agent-1",
+            second_request,
+            current_result,
+            daemon=daemon,
+            expected_host_generation=1,
+        )
+        is UploadResolution.RESOLVED
+    )
+    assert await second == current_result
+
+
+@pytest.mark.asyncio
 async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(app):
     from spawn_server.redis import get_backend
     from spawn_server.ws.host_signal import (
@@ -852,6 +926,7 @@ async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(a
         channel=channel,
         daemon_connection_id=daemon.id,
         daemon_generation=1,
+        binding_nonce="d" * 32,
     )
     assert await broker.register_rtc_session(
         "rtc-exact-publish",
@@ -861,6 +936,7 @@ async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(a
         scope_id=daemon.host_id,
         protocol="spawn.host.ctl",
         protocol_version=1,
+        binding_nonce="d" * 32,
         ttl_seconds=60,
     )
     binding = await broker.rtc_session_for("rtc-exact-publish", daemon=daemon)
@@ -893,15 +969,59 @@ async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(a
     assert binding.expires_at != float("inf")
 
 
+@pytest.mark.asyncio
+async def test_rtc_binding_nonce_is_immutable_across_session_id_reuse(app):
+    broker = Broker()
+    daemon = DaemonConn(
+        "rtc-nonce-host",
+        "owner",
+        FakeWS(),  # type: ignore[arg-type]
+        host_generation=1,
+    )
+    await _accept_owner(broker, daemon)
+    browser = HostBrowserConn("owner", daemon.host_id, FakeWS())  # type: ignore[arg-type]
+    assert await broker.register_rtc_session(
+        "reused-session",
+        browser,
+        daemon=daemon,
+        scope_type="host",
+        scope_id=daemon.host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        binding_nonce="1" * 32,
+    )
+    first = await broker.rtc_session_for("reused-session")
+    assert first is not None and first.nonce == "1" * 32
+    await broker.unregister_rtc_session("reused-session", browser)
+
+    assert await broker.register_rtc_session(
+        "reused-session",
+        browser,
+        daemon=daemon,
+        scope_type="host",
+        scope_id=daemon.host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        binding_nonce="2" * 32,
+    )
+    second = await broker.rtc_session_for("reused-session")
+    assert second is not None and second.nonce == "2" * 32
+    assert await broker.mark_rtc_session_connected("reused-session", first) is None
+    assert await broker.rtc_session_for("reused-session") is second
+
+
 def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     from spawn_server.ws.host_signal import (
         MAX_HOST_SIGNAL_ENVELOPE_BYTES,
         HostOwnerRevocation,
         HostSignalEnvelope,
+        RtcSignalDispatch,
         decode_host_owner_revocation,
         decode_host_signal,
+        decode_rtc_signal_dispatch,
         encode_host_owner_revocation,
         encode_host_signal,
+        encode_rtc_signal_dispatch,
     )
 
     response_channel = f"spawn:rtc:browser:{'b' * 32}"
@@ -934,3 +1054,21 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
                 signal={"value": "x" * MAX_HOST_SIGNAL_ENVELOPE_BYTES},
             )
         )
+
+    dispatch = RtcSignalDispatch(
+        host_id="host-1",
+        session_connection_id="a" * 32,
+        session_generation=1,
+        binding_nonce="c" * 32,
+        dispatch_connection_id="a" * 32,
+        dispatch_generation=1,
+        signal={"type": "rtc.status", "binding_nonce": "c" * 32},
+    )
+    encoded_dispatch = encode_rtc_signal_dispatch(dispatch)
+    assert decode_rtc_signal_dispatch(encoded_dispatch) == dispatch
+    assert (
+        decode_rtc_signal_dispatch(
+            encoded_dispatch.replace(b'"binding_nonce":"cccccccccccccccccccccccccccccccc",', b"")
+        )
+        is None
+    )

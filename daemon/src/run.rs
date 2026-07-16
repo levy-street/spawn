@@ -415,6 +415,7 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcOffer {
                     session_id,
+                    binding_nonce,
                     agent_id,
                     scope_type,
                     scope_id,
@@ -428,6 +429,7 @@ async fn dispatch_loop(
                         .handle_offer(
                             RtcOfferSignal {
                                 session_id,
+                                binding_nonce,
                                 agent_id,
                                 scope_type,
                                 scope_id,
@@ -444,6 +446,7 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcCandidate {
                     session_id,
+                    binding_nonce,
                     agent_id,
                     scope_type,
                     scope_id,
@@ -454,6 +457,7 @@ async fn dispatch_loop(
                     rtc_sessions
                         .handle_candidate(RtcCandidateSignal {
                             session_id,
+                            binding_nonce,
                             agent_id,
                             scope_type,
                             scope_id,
@@ -465,6 +469,7 @@ async fn dispatch_loop(
                 }
                 Inbound::RtcClose {
                     session_id,
+                    binding_nonce,
                     agent_id,
                     scope_type,
                     scope_id,
@@ -474,6 +479,7 @@ async fn dispatch_loop(
                     rtc_sessions
                         .close_bound(RtcCloseSignal {
                             session_id,
+                            binding_nonce,
                             agent_id,
                             scope_type,
                             scope_id,

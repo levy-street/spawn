@@ -11,12 +11,17 @@ from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Host
-from spawn_server.ws.broker import get_broker
+from spawn_server.ws.broker import HostBrowserConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.host import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
     MAX_SIGNAL_FRAME_BYTES,
+    BrowserRtcSession,
+    _binding_identity,
+    _forward_if_exact_binding,
+    _prune_sessions,
+    _retire_binding,
     host_ws,
 )
 
@@ -55,6 +60,44 @@ class FakeWebSocket:
 
     def queue_disconnect(self) -> None:
         self._incoming.put_nowait({"type": "websocket.disconnect"})
+
+
+async def test_connected_dispatch_cas_cannot_extend_reused_session_identity():
+    socket = FakeWebSocket()
+    conn = HostBrowserConn("owner", "host-1", socket)  # type: ignore[arg-type]
+    lock = asyncio.Lock()
+    retired: dict[tuple[str, str, int, str], float] = {}
+    first = BrowserRtcSession("reused", "a" * 32, 1, "1" * 32, 1000)
+    sessions = {"reused": first}
+
+    # Model the exact await boundary in the signal pump: A was captured, then
+    # close/reconnect installed B before A reacquired the sessions lock.
+    async with lock:
+        sessions.pop("reused")
+        _retire_binding(retired, first, 10)
+        second = BrowserRtcSession("reused", "a" * 32, 1, "2" * 32, float("inf"))
+        sessions["reused"] = second
+
+    assert not await _forward_if_exact_binding(
+        conn,
+        {
+            "type": "rtc.status",
+            "session_id": "reused",
+            "binding_nonce": first.nonce,
+            "status": "connected",
+        },
+        first,
+        sessions,
+        retired,
+        lock,
+        connected=True,
+    )
+    assert sessions["reused"] is second
+    assert sessions["reused"].expires_at == float("inf")
+    assert socket.sent_text == []
+
+    _prune_sessions(sessions, retired, 10 + 5 * 60 + 1)
+    assert _binding_identity(first) not in retired
 
 
 async def _signup(client, email: str) -> tuple[str, str]:
@@ -145,6 +188,7 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     assert offer["session_id"] == "zero-agent-session"
     assert "agent_id" not in offer
     assert {key: offer[key] for key in _metadata(host_id)} == _metadata(host_id)
+    assert len(offer["binding_nonce"]) == 32
 
     # Host-control payload-shaped JSON is not a signaling frame and is never
     # forwarded to the daemon websocket.
@@ -166,6 +210,7 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     assert _json_messages(daemon_socket)[-1] == {
         "type": "rtc.close",
         "session_id": "zero-agent-session",
+        "binding_nonce": offer["binding_nonce"],
         **_metadata(host_id),
     }
     assert await broker.rtc_session_for("zero-agent-session") is None
@@ -281,11 +326,16 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
     await _wait_until(
         lambda: any(message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket))
     )
+    offer = [
+        message for message in _json_messages(daemon_socket) if message.get("type") == "rtc.offer"
+    ][-1]
+    binding_nonce = offer["binding_nonce"]
 
     daemon_socket.queue_text(
         {
             "type": "rtc.answer",
             "session_id": "wrong-session",
+            "binding_nonce": binding_nonce,
             "sdp": "v=0\r\nwrong",
             **_metadata(host_id),
         }
@@ -297,6 +347,7 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
         {
             "type": "rtc.answer",
             "session_id": "bound-answer",
+            "binding_nonce": binding_nonce,
             "sdp": "v=0\r\nanswer",
             **_metadata(host_id),
         }
@@ -310,6 +361,7 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
     assert answer == {
         "type": "rtc.answer",
         "session_id": "bound-answer",
+        "binding_nonce": binding_nonce,
         "sdp": "v=0\r\nanswer",
         **_metadata(host_id),
     }
@@ -318,6 +370,7 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
         {
             "type": "rtc.status",
             "session_id": "bound-answer",
+            "binding_nonce": binding_nonce,
             "status": "failed",
             "message": "secret endpoint path must not transit",
             **_metadata(host_id),
@@ -337,6 +390,7 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
         {
             "type": "rtc.status",
             "session_id": "bound-answer",
+            "binding_nonce": binding_nonce,
             "status": "secret-endpoint-status",
             **_metadata(host_id),
         }
@@ -428,10 +482,14 @@ async def test_new_daemon_claim_actively_revokes_established_old_worker_session(
     await _wait_until(
         lambda: any(message.get("type") == "rtc.offer" for message in _json_messages(old_socket))
     )
+    old_offer = [
+        message for message in _json_messages(old_socket) if message.get("type") == "rtc.offer"
+    ][-1]
     old_socket.queue_text(
         {
             "type": "rtc.status",
             "session_id": "established-old-owner",
+            "binding_nonce": old_offer["binding_nonce"],
             "status": "connected",
             **_metadata(host_id),
         }

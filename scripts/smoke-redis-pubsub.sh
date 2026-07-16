@@ -491,9 +491,11 @@ async def main() -> None:
             assert unavailable.host_id == host_id
             assert unavailable.session_connection_id == old_owner
             assert unavailable.session_generation == 1
+            assert unavailable.binding_nonce == "d" * 32
             assert unavailable.dispatch_connection_id != old_owner
             assert unavailable.dispatch_generation == 2
             assert unavailable.signal["session_id"] == session_id
+            assert unavailable.signal["binding_nonce"] == "d" * 32
             assert any(
                 frame.get("type") == "rtc.close" and frame.get("session_id") == session_id
                 for frame in frames
@@ -576,9 +578,11 @@ established_file = Path(os.environ["SPAWN_REDIS_SMOKE_ESTABLISHED"])
 
 
 def signal(session_id: str) -> dict[str, object]:
+    binding_nonce = "d" * 32 if session_id == "redis-established-session" else "e" * 32
     return {
         "type": "rtc.offer",
         "session_id": session_id,
+        "binding_nonce": binding_nonce,
         "scope_type": "host",
         "scope_id": host_id,
         "protocol": HOST_CONTROL_PROTOCOL,

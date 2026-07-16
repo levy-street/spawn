@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -23,6 +23,7 @@ from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
     MAX_HOST_RTC_SESSIONS_PER_BROWSER,
+    RTC_BINDING_TOMBSTONE_TTL_SECONDS,
     RTC_CONNECTED_SESSION_TTL_SECONDS,
     HostPresenceOwner,
     HostSignalEnvelope,
@@ -34,6 +35,7 @@ from .host_signal import (
     host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
+    new_rtc_binding_nonce,
     receive_with_signal_pump,
     wait_for_signal_pump,
 )
@@ -51,6 +53,7 @@ class BrowserRtcSession:
     session_id: str
     daemon_connection_id: str
     daemon_generation: int
+    nonce: str
     expires_at: float
 
 
@@ -88,11 +91,84 @@ def _signal_payload(
     }
 
 
-def _prune_sessions(sessions: dict[str, BrowserRtcSession], now: float) -> None:
+def _binding_identity(binding: BrowserRtcSession) -> tuple[str, str, int, str]:
+    return (
+        binding.session_id,
+        binding.daemon_connection_id,
+        binding.daemon_generation,
+        binding.nonce,
+    )
+
+
+def _retire_binding(
+    retired: dict[tuple[str, str, int, str], float],
+    binding: BrowserRtcSession,
+    now: float,
+) -> None:
+    retired[_binding_identity(binding)] = now + RTC_BINDING_TOMBSTONE_TTL_SECONDS
+
+
+def _prune_sessions(
+    sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
+    now: float,
+) -> None:
     for session_id in [
         session_id for session_id, binding in sessions.items() if binding.expires_at <= now
     ]:
-        sessions.pop(session_id, None)
+        binding = sessions.pop(session_id, None)
+        if binding is not None:
+            _retire_binding(retired, binding, now)
+    for identity in [
+        identity for identity, expires_at in retired.items() if expires_at <= now
+    ]:
+        retired.pop(identity, None)
+
+
+async def _forward_if_exact_binding(
+    conn: HostBrowserConn,
+    signal: dict[str, object],
+    binding: BrowserRtcSession,
+    sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
+    sessions_lock: asyncio.Lock,
+    *,
+    connected: bool = False,
+    retire: bool = False,
+) -> bool:
+    """CAS the captured identity and keep it stable through browser delivery."""
+    async with sessions_lock:
+        now = time.monotonic()
+        _prune_sessions(sessions, retired, now)
+        if (
+            sessions.get(binding.session_id) is not binding
+            or _binding_identity(binding) in retired
+        ):
+            return False
+        if retire:
+            sessions.pop(binding.session_id, None)
+            _retire_binding(retired, binding, now)
+        elif connected:
+            sessions[binding.session_id] = replace(
+                binding,
+                expires_at=now + RTC_CONNECTED_SESSION_TTL_SECONDS,
+            )
+        await conn.send_text(signal)
+        return True
+
+
+async def _retire_if_exact_binding(
+    binding: BrowserRtcSession,
+    sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
+    sessions_lock: asyncio.Lock,
+) -> bool:
+    async with sessions_lock:
+        if sessions.get(binding.session_id) is not binding:
+            return False
+        sessions.pop(binding.session_id, None)
+        _retire_binding(retired, binding, time.monotonic())
+        return True
 
 
 async def _send_status(
@@ -125,6 +201,7 @@ async def _pump_browser_signals(
     host_id: str,
     channel: str,
     sessions: dict[str, BrowserRtcSession],
+    retired: dict[tuple[str, str, int, str], float],
     sessions_lock: asyncio.Lock,
     ready: asyncio.Event,
 ) -> None:
@@ -141,13 +218,15 @@ async def _pump_browser_signals(
             if session_id is None:
                 continue
             async with sessions_lock:
-                _prune_sessions(sessions, time.monotonic())
+                _prune_sessions(sessions, retired, time.monotonic())
                 binding = sessions.get(session_id)
                 if binding is None:
                     continue
             if not (
                 dispatch.session_connection_id == binding.daemon_connection_id
                 and dispatch.session_generation == binding.daemon_generation
+                and dispatch.binding_nonce == binding.nonce
+                and signal.get("binding_nonce") == binding.nonce
             ):
                 continue
             frame_type = signal.get("type")
@@ -173,20 +252,20 @@ async def _pump_browser_signals(
                     or dispatch.dispatch_generation <= binding.daemon_generation
                 ):
                     continue
-                async with sessions_lock:
-                    sessions.pop(session_id, None)
-            elif frame_type == "rtc.status" and signal.get("status") == "connected":
-                async with sessions_lock:
-                    current = sessions.get(session_id)
-                    if current is None:
-                        continue
-                    sessions[session_id] = BrowserRtcSession(
-                        session_id=current.session_id,
-                        daemon_connection_id=current.daemon_connection_id,
-                        daemon_generation=current.daemon_generation,
-                        expires_at=time.monotonic() + RTC_CONNECTED_SESSION_TTL_SECONDS,
-                    )
-            await conn.send_text(signal)
+            status_value = signal.get("status") if frame_type == "rtc.status" else None
+            await _forward_if_exact_binding(
+                conn,
+                signal,
+                binding,
+                sessions,
+                retired,
+                sessions_lock,
+                connected=dispatch_is_session_owner and status_value == "connected",
+                retire=(
+                    not dispatch_is_session_owner
+                    or status_value in {"failed", "unavailable"}
+                ),
+            )
 
 
 async def _publish_signal(
@@ -238,6 +317,7 @@ async def host_ws(
     conn = HostBrowserConn(user_id=user.id, host_id=host_id, websocket=websocket)
     response_channel = browser_signal_channel(conn.id)
     sessions: dict[str, BrowserRtcSession] = {}
+    retired: dict[tuple[str, str, int, str], float] = {}
     sessions_lock = asyncio.Lock()
     pump_ready = asyncio.Event()
     pump_task = asyncio.create_task(
@@ -246,6 +326,7 @@ async def host_ws(
             host_id,
             response_channel,
             sessions,
+            retired,
             sessions_lock,
             pump_ready,
         )
@@ -312,7 +393,7 @@ async def host_ws(
                 daemon_connection_id = daemon_owner.daemon_connection_id
                 now = time.monotonic()
                 async with sessions_lock:
-                    _prune_sessions(sessions, now)
+                    _prune_sessions(sessions, retired, now)
                     if session_id in sessions or len(sessions) >= MAX_HOST_RTC_SESSIONS_PER_BROWSER:
                         binding = None
                     else:
@@ -320,6 +401,7 @@ async def host_ws(
                             session_id=session_id,
                             daemon_connection_id=daemon_connection_id,
                             daemon_generation=daemon_owner.generation,
+                            nonce=new_rtc_binding_nonce(),
                             expires_at=now + HOST_RTC_SESSION_TTL_SECONDS,
                         )
                         sessions[session_id] = binding
@@ -327,8 +409,9 @@ async def host_ws(
                     await _send_status(conn, host_id, session_id, "failed")
                     continue
                 if not await _binding_is_current_owner(host_id, binding):
-                    async with sessions_lock:
-                        sessions.pop(session_id, None)
+                    await _retire_if_exact_binding(
+                        binding, sessions, retired, sessions_lock
+                    )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
                 published = await _publish_signal(
@@ -339,48 +422,65 @@ async def host_ws(
                         "rtc.offer",
                         session_id,
                         host_id,
+                        binding_nonce=binding.nonce,
                         sdp=sdp,
                         ice_servers=ice_servers,
                         ice_transport_policy=transport_policy,
                     ),
                 )
                 if not published:
-                    async with sessions_lock:
-                        sessions.pop(session_id, None)
+                    await _retire_if_exact_binding(
+                        binding, sessions, retired, sessions_lock
+                    )
                     await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.candidate":
                 candidate = _valid_rtc_candidate(obj.get("candidate"))
                 async with sessions_lock:
-                    _prune_sessions(sessions, time.monotonic())
+                    _prune_sessions(sessions, retired, time.monotonic())
                     binding = sessions.get(session_id)
                 if candidate is None or binding is None:
                     continue
                 if not await _binding_is_current_owner(host_id, binding):
-                    async with sessions_lock:
-                        sessions.pop(session_id, None)
+                    await _retire_if_exact_binding(
+                        binding, sessions, retired, sessions_lock
+                    )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
                 published = await _publish_signal(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload("rtc.candidate", session_id, host_id, candidate=candidate),
+                    _signal_payload(
+                        "rtc.candidate",
+                        session_id,
+                        host_id,
+                        binding_nonce=binding.nonce,
+                        candidate=candidate,
+                    ),
                 )
                 if not published:
-                    async with sessions_lock:
-                        sessions.pop(session_id, None)
+                    await _retire_if_exact_binding(
+                        binding, sessions, retired, sessions_lock
+                    )
                     await _send_status(conn, host_id, session_id, "unavailable")
 
             elif frame_type == "rtc.close":
                 async with sessions_lock:
                     binding = sessions.pop(session_id, None)
+                    if binding is not None:
+                        _retire_binding(retired, binding, time.monotonic())
                 if binding is not None and await _binding_is_current_owner(host_id, binding):
                     await _publish_signal(
                         host_id,
                         response_channel,
                         binding,
-                        _signal_payload("rtc.close", session_id, host_id),
+                        _signal_payload(
+                            "rtc.close",
+                            session_id,
+                            host_id,
+                            binding_nonce=binding.nonce,
+                        ),
                     )
     except WebSocketDisconnect:
         pass
@@ -390,6 +490,9 @@ async def host_ws(
         async with sessions_lock:
             remaining = list(sessions.values())
             sessions.clear()
+            now = time.monotonic()
+            for binding in remaining:
+                _retire_binding(retired, binding, now)
         for binding in remaining:
             try:
                 if not await _binding_is_current_owner(host_id, binding):
@@ -398,7 +501,12 @@ async def host_ws(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload("rtc.close", binding.session_id, host_id),
+                    _signal_payload(
+                        "rtc.close",
+                        binding.session_id,
+                        host_id,
+                        binding_nonce=binding.nonce,
+                    ),
                 )
             except Exception:
                 pass

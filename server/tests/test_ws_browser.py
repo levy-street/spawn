@@ -381,6 +381,9 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         lambda: any(json.loads(item).get("type") == "agent.upload" for item in daemon_ws.sent_text)
     )
     upload = [json.loads(item) for item in daemon_ws.sent_text if json.loads(item).get("type") == "agent.upload"][-1]
+    request_id = upload.pop("request_id")
+    assert isinstance(request_id, str)
+    assert request_id != "client-1"
     assert upload == {
         "type": "agent.upload",
         "agent_id": agent_id,
@@ -392,6 +395,26 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "paste": False,
         "destination": "cwd",
         "client_id": "client-1",
+    }
+    result = {
+        "type": "agent.uploaded",
+        "agent_id": agent_id,
+        "request_id": request_id,
+        "client_id": "client-1",
+        "path": "/repo/note.txt",
+    }
+    assert await broker.resolve_upload(
+        agent_id,
+        request_id,
+        result,
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
+    await _wait_until(lambda: bool(_messages_of_type(ws, "upload.saved")))
+    assert _messages_of_type(ws, "upload.saved")[-1] == {
+        "type": "upload.saved",
+        "client_id": "client-1",
+        "path": "/repo/note.txt",
     }
 
     ws.queue_text({"type": "redraw"})
@@ -414,6 +437,7 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "type": "rtc.offer",
         "session_id": "rtc-browser-1",
         "agent_id": agent_id,
+        "binding_nonce": offer["binding_nonce"],
         "sdp": "v=0\r\n",
         "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
     }
@@ -432,6 +456,7 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         "type": "rtc.candidate",
         "session_id": "rtc-browser-1",
         "agent_id": agent_id,
+        "binding_nonce": offer["binding_nonce"],
         "candidate": candidate,
     }
 
@@ -443,6 +468,94 @@ async def test_browser_ws_forwards_input_resize_scroll_snapshot_and_upload_to_da
         expiry_task.cancel()
     await asyncio.gather(*expiry_tasks, return_exceptions=True)
     await broker.unregister_daemon(daemon)
+
+
+async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, monkeypatch):
+    monkeypatch.setattr("spawn_server.ws.browser.BROWSER_UPLOAD_TIMEOUT_SECONDS", 0.03)
+    user_id, token = await _signup(client, "ws-browser-upload-results@example.com")
+    host_id, agent_id = await _create_host_and_agent(user_id)
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None, cols=80, rows=24)  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
+
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    await broker.register_daemon(daemon)
+    await _accept_daemon(daemon)
+    await broker.attach_agent_to_daemon(agent_id, daemon)
+
+    body = base64.b64encode(b"body").decode("ascii")
+    ws.queue_text(
+        {
+            "type": "upload",
+            "name": "error.txt",
+            "mime_type": "text/plain",
+            "bytes_b64": body,
+            "destination": "cwd",
+            "client_id": "upload-error",
+        }
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "agent.upload"
+            and message.get("client_id") == "upload-error"
+            for message in (json.loads(item) for item in daemon_ws.sent_text)
+        )
+    )
+    request = [
+        json.loads(item)
+        for item in daemon_ws.sent_text
+        if json.loads(item).get("client_id") == "upload-error"
+    ][-1]
+    error = {
+        "type": "error",
+        "code": "upload_failed",
+        "message": "disk full",
+        "request_id": request["request_id"],
+        "client_id": "upload-error",
+    }
+    await broker.resolve_upload(
+        agent_id,
+        request["request_id"],
+        error,
+        daemon=daemon,
+        expected_host_generation=daemon.host_generation,
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("client_id") == "upload-error"
+            for message in _messages_of_type(ws, "upload.error")
+        )
+    )
+    assert _messages_of_type(ws, "upload.error")[-1] == {
+        "type": "upload.error",
+        "client_id": "upload-error",
+        "message": "disk full",
+    }
+
+    ws.queue_text(
+        {
+            "type": "upload",
+            "name": "timeout.txt",
+            "mime_type": "text/plain",
+            "bytes_b64": body,
+            "destination": "cwd",
+            "client_id": "upload-timeout",
+        }
+    )
+    await _wait_until(
+        lambda: any(
+            message.get("client_id") == "upload-timeout"
+            and message.get("message") == "Upload timed out."
+            for message in _messages_of_type(ws, "upload.error")
+        )
+    )
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
 
 
 async def test_browser_ws_fans_out_live_bytes_and_isolates_agents(client):

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -37,6 +38,7 @@ from .host_signal import (
     host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
+    new_rtc_binding_nonce,
 )
 
 router = APIRouter()
@@ -57,6 +59,7 @@ INITIAL_SNAPSHOT_TIMEOUT = 3.0
 TRANSCRIPT_FALLBACK_MAX_BYTES = 512 * 1024
 AGENT_RTC_PROTOCOL = "spawn.pty"
 AGENT_RTC_PROTOCOL_VERSION = 1
+BROWSER_UPLOAD_TIMEOUT_SECONDS = 30.0
 
 
 async def _touch_agent_input(agent_id: str) -> None:
@@ -376,8 +379,8 @@ async def browser_ws(
                     if not isinstance(event, dict) or event.get("type") not in {
                         "agent.status",
                         "agent.exit",
-                        "upload.saved",
-                        "upload.error",
+                        "upload.legacy_saved",
+                        "upload.legacy_error",
                     }:
                         continue
                     try:
@@ -411,6 +414,8 @@ async def browser_ws(
                     if not (
                         dispatch.session_connection_id == route.daemon_connection_id
                         and dispatch.session_generation == route.daemon_generation
+                        and dispatch.binding_nonce == route.binding_nonce
+                        and signal.get("binding_nonce") == binding.nonce
                     ):
                         continue
                     dispatch_is_session_owner = (
@@ -448,10 +453,19 @@ async def browser_ws(
                             )
                             if connected is None:
                                 continue
+                            binding = connected
                         elif status_value in {"failed", "unavailable"}:
                             await broker.unregister_rtc_session(session_id, route)
                             rtc_routes.pop(session_id, None)
                     else:
+                        continue
+                    terminal_status = frame_type == "rtc.status" and signal.get("status") in {
+                        "failed",
+                        "unavailable",
+                    }
+                    if not terminal_status and not (
+                        await broker.rtc_session_is_current(binding)
+                    ):
                         continue
                     await conn.send_text(signal)
         except Exception as e:  # noqa: BLE001
@@ -637,10 +651,10 @@ async def browser_ws(
                         await conn.send_text({"type": "upload.error", "message": str(e)})
                         continue
                     client_id = obj.get("client_id")
-                    if isinstance(client_id, str):
+                    if isinstance(client_id, str) and client_id:
                         client_id = client_id[:MAX_UPLOAD_CLIENT_ID_LENGTH]
                     else:
-                        client_id = None
+                        client_id = f"upload-{uuid.uuid4().hex}"
 
                     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
                         host_id
@@ -651,8 +665,10 @@ async def browser_ws(
                         )
                         continue
                     try:
-                        await daemon.send_text(
-                            {
+                        result = await broker.request_upload(
+                            agent_id,
+                            daemon,
+                            payload={
                                 "type": "agent.upload",
                                 "agent_id": agent_id,
                                 "cwd": agent_cwd,
@@ -663,13 +679,50 @@ async def browser_ws(
                                 "paste": bool(obj.get("paste", True)),
                                 "destination": destination,
                                 "client_id": client_id,
-                            }
+                            },
+                            client_id=client_id,
+                            timeout=BROWSER_UPLOAD_TIMEOUT_SECONDS,
                         )
+                        if result is None:
+                            await conn.send_text(
+                                {
+                                    "type": "upload.error",
+                                    "client_id": client_id,
+                                    "message": "Upload timed out.",
+                                }
+                            )
+                        elif result.get("type") == "error":
+                            await conn.send_text(
+                                {
+                                    "type": "upload.error",
+                                    "client_id": client_id,
+                                    "message": result.get("message") or "Image upload failed.",
+                                }
+                            )
+                        else:
+                            path = result.get("path")
+                            if isinstance(path, str):
+                                await conn.send_text(
+                                    {
+                                        "type": "upload.saved",
+                                        "client_id": client_id,
+                                        "path": path,
+                                    }
+                                )
+                            else:
+                                await conn.send_text(
+                                    {
+                                        "type": "upload.error",
+                                        "client_id": client_id,
+                                        "message": "Upload returned an invalid response.",
+                                    }
+                                )
                     except Exception as e:
                         log.warning("upload forward failed: %s", e)
                         await conn.send_text(
                             {
                                 "type": "upload.error",
+                                "client_id": client_id,
                                 "message": "Upload could not reach the daemon.",
                             }
                         )
@@ -712,12 +765,14 @@ async def browser_ws(
                             }
                         )
                         continue
+                    binding_nonce = new_rtc_binding_nonce()
                     route = RedisBrowserConn(
                         user_id=user.id,
                         host_id=host_id,
                         channel=rtc_response_channel,
                         daemon_connection_id=daemon.id,
                         daemon_generation=generation,
+                        binding_nonce=binding_nonce,
                     )
                     registered = await broker.register_rtc_session(
                         session_id,
@@ -727,6 +782,7 @@ async def browser_ws(
                         scope_id=agent_id,
                         protocol=AGENT_RTC_PROTOCOL,
                         protocol_version=AGENT_RTC_PROTOCOL_VERSION,
+                        binding_nonce=binding_nonce,
                         ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
                     )
                     if not registered:
@@ -749,6 +805,7 @@ async def browser_ws(
                             "type": "rtc.offer",
                             "session_id": session_id,
                             "agent_id": agent_id,
+                            "binding_nonce": binding.nonce,
                             "sdp": sdp,
                             "ice_servers": ice_servers_for_session(
                                 get_settings(), label=user.id
@@ -791,6 +848,7 @@ async def browser_ws(
                             "type": "rtc.candidate",
                             "session_id": session_id,
                             "agent_id": agent_id,
+                            "binding_nonce": binding.nonce,
                             "candidate": candidate,
                         },
                     )
@@ -811,6 +869,7 @@ async def browser_ws(
                             "type": "rtc.close",
                             "session_id": session_id,
                             "agent_id": agent_id,
+                            "binding_nonce": binding.nonce,
                         },
                     )
     except WebSocketDisconnect:
@@ -847,6 +906,7 @@ async def browser_ws(
                     "type": "rtc.close",
                     "session_id": binding.session_id,
                     "agent_id": agent_id,
+                    "binding_nonce": binding.nonce,
                 },
             )
         await broker.detach_browser(conn)

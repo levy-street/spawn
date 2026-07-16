@@ -40,6 +40,7 @@ from .host_signal import (
     host_presence_key,
     host_signal_channel,
     receive_with_signal_pump,
+    valid_rtc_binding_nonce,
     wait_for_signal_pump,
 )
 
@@ -497,6 +498,8 @@ def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
     scope_type = binding.scope_type
     if obj.get("session_id") != binding.session_id:
         return False
+    if obj.get("binding_nonce") != binding.nonce:
+        return False
     expected = {
         "scope_type": scope_type,
         "scope_id": binding.scope_id,
@@ -730,6 +733,7 @@ async def _revoke_host_rtc_sessions(conn: DaemonConn) -> None:
             "scope_id": binding.scope_id,
             "protocol": binding.protocol,
             "protocol_version": binding.protocol_version,
+            "binding_nonce": binding.nonce,
             "status": "unavailable",
         }
         try:
@@ -757,6 +761,7 @@ async def _revoke_host_rtc_sessions(conn: DaemonConn) -> None:
                     "scope_id": binding.scope_id,
                     "protocol": binding.protocol,
                     "protocol_version": binding.protocol_version,
+                    "binding_nonce": binding.nonce,
                 },
             )
         except Exception:
@@ -805,6 +810,7 @@ async def _expire_host_rtc_binding(
                 "scope_id": binding.scope_id,
                 "protocol": binding.protocol,
                 "protocol_version": binding.protocol_version,
+                "binding_nonce": binding.nonce,
             },
         )
     except Exception:
@@ -839,6 +845,7 @@ async def _process_host_rtc_signal(
             or binding.scope_type != "agent"
             or binding.scope_id != agent_id
             or binding.browser.route_id != envelope.browser_channel
+            or signal.get("binding_nonce") != binding.nonce
         ):
             return True
         frame_type = signal.get("type")
@@ -863,12 +870,16 @@ async def _process_host_rtc_signal(
     if frame_type == "rtc.offer":
         if _valid_rtc_sdp(signal.get("sdp")) is None:
             return True
+        binding_nonce = signal.get("binding_nonce")
+        if not valid_rtc_binding_nonce(binding_nonce):
+            return True
         remote_browser = RedisBrowserConn(
             user_id=conn.user_id,
             host_id=conn.host_id,
             channel=envelope.browser_channel,
             daemon_connection_id=conn.id,
             daemon_generation=generation,
+            binding_nonce=binding_nonce,
         )
         registered = await broker.register_rtc_session(
             session_id,
@@ -878,6 +889,7 @@ async def _process_host_rtc_signal(
             scope_id=conn.host_id,
             protocol=HOST_CONTROL_PROTOCOL,
             protocol_version=HOST_CONTROL_VERSION,
+            binding_nonce=binding_nonce,
             ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
         )
         if not registered:
@@ -891,6 +903,7 @@ async def _process_host_rtc_signal(
                         "scope_id": conn.host_id,
                         "protocol": HOST_CONTROL_PROTOCOL,
                         "protocol_version": HOST_CONTROL_VERSION,
+                        "binding_nonce": binding_nonce,
                         "status": "failed",
                     },
                 )
@@ -917,6 +930,7 @@ async def _process_host_rtc_signal(
         or binding.scope_type != "host"
         or binding.scope_id != conn.host_id
         or binding.browser.route_id != envelope.browser_channel
+        or signal.get("binding_nonce") != binding.nonce
     ):
         return True
     if not await _redis_owner_is_current(conn):
@@ -1439,7 +1453,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 elif ftype == "agent.uploaded":
                     aid = obj.get("agent_id")
                     path = obj.get("path")
-                    client_id = obj.get("client_id")
                     request_id = obj.get("request_id")
                     if aid and isinstance(path, str):
                         durable_owner = False
@@ -1466,12 +1479,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if resolved is UploadResolution.STALE_OWNER:
                             await _fence_superseded_daemon(conn)
                             break
+                        if resolved is UploadResolution.RESOLVED:
+                            continue
                         payload: dict[str, object] = {
-                            "type": "upload.saved",
+                            "type": "upload.legacy_saved",
                             "path": path,
                         }
-                        if isinstance(client_id, str):
-                            payload["client_id"] = client_id
                         if not await _publish_agent_event_if_owner(conn, aid, payload):
                             await _fence_superseded_daemon(conn)
                             break
@@ -1520,6 +1533,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         payload: dict[str, object] = {
                             "type": "rtc.answer",
                             "session_id": session_id,
+                            "binding_nonce": binding.nonce,
                             "sdp": sdp,
                         }
                         if binding.scope_type == "agent":
@@ -1548,6 +1562,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         payload = {
                             "type": "rtc.candidate",
                             "session_id": session_id,
+                            "binding_nonce": binding.nonce,
                             "candidate": candidate,
                         }
                         if binding.scope_type == "agent":
@@ -1585,6 +1600,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         payload = {
                             "type": "rtc.status",
                             "session_id": session_id,
+                            "binding_nonce": binding.nonce,
                             "status": status_value,
                         }
                         if binding.scope_type == "agent":
@@ -1638,13 +1654,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if resolved is UploadResolution.STALE_OWNER:
                             await _fence_superseded_daemon(conn)
                             break
+                        if resolved is UploadResolution.RESOLVED:
+                            continue
                         event: dict[str, object] = {
-                            "type": "upload.error",
+                            "type": "upload.legacy_error",
                             "message": obj.get("message") or "Image upload failed.",
                         }
-                        client_id = obj.get("client_id")
-                        if isinstance(client_id, str):
-                            event["client_id"] = client_id
                         if not await _publish_agent_event_if_owner(
                             conn,
                             aid,

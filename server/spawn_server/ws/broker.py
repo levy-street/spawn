@@ -100,6 +100,9 @@ class RtcSessionBinding:
     scope_id: str
     protocol: str
     protocol_version: int
+    daemon_connection_id: str
+    daemon_generation: int
+    nonce: str
     expires_at: float
 
 
@@ -142,6 +145,7 @@ class Broker:
         self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
         self._display_by_agent: dict[str, _DisplayState] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
+        self._retired_rtc_bindings: dict[tuple[str, str, int, str], float] = {}
         self._lock = asyncio.Lock()
 
     # ---- daemon registration ----
@@ -198,7 +202,9 @@ class Broker:
             if binding.daemon is conn and (include_host or binding.scope_type != "host")
         ]
         for session_id in stale:
-            self._rtc_sessions.pop(session_id, None)
+            binding = self._rtc_sessions.pop(session_id, None)
+            if binding is not None:
+                self._retire_rtc_binding_locked(binding)
 
     async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> DaemonOwnerAcceptance:
         """Atomically expose a fully claimed daemon to local routing.
@@ -345,12 +351,22 @@ class Broker:
         scope_id: str,
         protocol: str,
         protocol_version: int,
+        binding_nonce: str | None = None,
         ttl_seconds: int | None = None,
         now: float | None = None,
     ) -> bool:
         async with self._lock:
             now = time.monotonic() if now is None else now
             self._prune_expired_rtc_sessions_locked(now)
+            generation = daemon.host_generation if daemon.host_generation is not None else 0
+            from .host_signal import new_rtc_binding_nonce, valid_rtc_binding_nonce
+
+            nonce = binding_nonce or new_rtc_binding_nonce()
+            if not valid_rtc_binding_nonce(nonce):
+                return False
+            route_nonce = getattr(conn, "binding_nonce", nonce)
+            if route_nonce != nonce:
+                return False
             if session_id in self._rtc_sessions:
                 return False
             if scope_type == "host":
@@ -385,6 +401,9 @@ class Broker:
                 scope_id=scope_id,
                 protocol=protocol,
                 protocol_version=protocol_version,
+                daemon_connection_id=daemon.id,
+                daemon_generation=generation,
+                nonce=nonce,
                 expires_at=float("inf") if ttl_seconds is None else now + ttl_seconds,
             )
             return True
@@ -398,6 +417,7 @@ class Broker:
             current = self._rtc_sessions.get(session_id)
             if current is not None and (conn is None or current.browser is conn):
                 self._rtc_sessions.pop(session_id, None)
+                self._retire_rtc_binding_locked(current)
 
     async def unregister_rtc_sessions_for(
         self, conn: BrowserConn | HostBrowserConn | RedisBrowserConn
@@ -408,8 +428,9 @@ class Broker:
                 for session_id, binding in self._rtc_sessions.items()
                 if binding.browser is conn
             ]
-            for session_id, _ in sessions:
+            for session_id, binding in sessions:
                 self._rtc_sessions.pop(session_id, None)
+                self._retire_rtc_binding_locked(binding)
             return [binding for _, binding in sessions]
 
     async def rtc_session_for(
@@ -432,13 +453,55 @@ class Broker:
             return binding
 
     def _prune_expired_rtc_sessions_locked(self, now: float) -> None:
+        self._prune_rtc_tombstones_locked(now)
         expired = [
             session_id
             for session_id, binding in self._rtc_sessions.items()
             if binding.expires_at <= now
         ]
         for session_id in expired:
-            self._rtc_sessions.pop(session_id, None)
+            binding = self._rtc_sessions.pop(session_id, None)
+            if binding is not None:
+                self._retire_rtc_binding_locked(binding, now=now)
+
+    @staticmethod
+    def _rtc_binding_identity(binding: RtcSessionBinding) -> tuple[str, str, int, str]:
+        return (
+            binding.session_id,
+            binding.daemon_connection_id,
+            binding.daemon_generation,
+            binding.nonce,
+        )
+
+    def _retire_rtc_binding_locked(
+        self, binding: RtcSessionBinding, *, now: float | None = None
+    ) -> None:
+        from .host_signal import RTC_BINDING_TOMBSTONE_TTL_SECONDS
+
+        timestamp = time.monotonic() if now is None else now
+        self._retired_rtc_bindings[self._rtc_binding_identity(binding)] = (
+            timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
+        )
+
+    def _prune_rtc_tombstones_locked(self, now: float) -> None:
+        for identity in [
+            identity
+            for identity, expires_at in self._retired_rtc_bindings.items()
+            if expires_at <= now
+        ]:
+            self._retired_rtc_bindings.pop(identity, None)
+
+    def _rtc_binding_is_current_locked(self, binding: RtcSessionBinding) -> bool:
+        return (
+            self._rtc_sessions.get(binding.session_id) is binding
+            and self._rtc_binding_identity(binding) not in self._retired_rtc_bindings
+        )
+
+    async def rtc_session_is_current(self, binding: RtcSessionBinding) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            self._prune_expired_rtc_sessions_locked(now)
+            return self._rtc_binding_is_current_locked(binding)
 
     async def expire_rtc_session(self, session_id: str, expected: RtcSessionBinding) -> bool:
         async with self._lock:
@@ -446,6 +509,7 @@ class Broker:
             if current is not expected:
                 return False
             self._rtc_sessions.pop(session_id, None)
+            self._retire_rtc_binding_locked(current)
             return True
 
     async def mark_rtc_session_connected(
@@ -456,7 +520,7 @@ class Broker:
 
         async with self._lock:
             current = self._rtc_sessions.get(session_id)
-            if current is not expected:
+            if current is not expected or not self._rtc_binding_is_current_locked(expected):
                 return None
             connected = replace(
                 current,
@@ -818,6 +882,8 @@ class Broker:
         timeout: float = 30.0,
     ) -> dict | None:
         request_id = str(uuid.uuid4())
+        payload["agent_id"] = agent_id
+        payload["client_id"] = client_id
         payload["request_id"] = request_id
         return await self._request_owner_result(
             daemon,

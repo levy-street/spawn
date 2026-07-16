@@ -116,6 +116,8 @@ pub enum Outbound {
     RtcAnswer {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_type: Option<String>,
@@ -131,6 +133,8 @@ pub enum Outbound {
     RtcCandidate {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_type: Option<String>,
@@ -145,6 +149,8 @@ pub enum Outbound {
     #[serde(rename = "rtc.status")]
     RtcStatus {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +304,8 @@ pub enum Inbound {
     RtcOffer {
         session_id: String,
         #[serde(default)]
+        binding_nonce: Option<String>,
+        #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
         scope_type: Option<String>,
@@ -317,6 +325,8 @@ pub enum Inbound {
     RtcCandidate {
         session_id: String,
         #[serde(default)]
+        binding_nonce: Option<String>,
+        #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
         scope_type: Option<String>,
@@ -331,6 +341,8 @@ pub enum Inbound {
     #[serde(rename = "rtc.close")]
     RtcClose {
         session_id: String,
+        #[serde(default)]
+        binding_nonce: Option<String>,
         #[serde(default)]
         agent_id: Option<Uuid>,
         #[serde(default)]
