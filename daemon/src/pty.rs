@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use spawnd::sessiond::wire;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -661,30 +660,49 @@ impl AgentLifecycle {
     pub async fn shutdown(&self, signal: wire::LifecycleSignal) -> Result<()> {
         let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
         let request = wire::encode_lifecycle_request(self.instance_id, signal);
-        tokio::time::timeout_at(deadline, async {
-            let mut stream = UnixStream::connect(&self.socket)
-                .await
-                .map_err(|error| anyhow::anyhow!("worker lifecycle connect failed: {error}"))?;
-            stream
-                .write_all(&request)
-                .await
-                .map_err(|error| anyhow::anyhow!("worker lifecycle request failed: {error}"))?;
-            let mut ack = [0u8; 1];
-            stream
-                .read_exact(&mut ack)
-                .await
-                .map_err(|error| anyhow::anyhow!("worker lifecycle receipt failed: {error}"))?;
-            match ack[0] {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("worker lifecycle delivery deadline exceeded");
+            }
+            if spawnd::sessiond::endpoint::validate_private_socket(&self.socket).is_err() {
+                anyhow::bail!("worker lifecycle endpoint validation failed");
+            }
+            let parent = self
+                .socket
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
+            let client_path = parent.join(format!(
+                ".lifecycle-client-{}-{}.sock",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            let socket = UnixDatagram::bind(&client_path)
+                .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
+            let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
+                .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
+            if socket.connect(&self.socket).is_err() || socket.send(&request).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let mut ack = [0u8; 2];
+            let attempt_deadline = std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            );
+            let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
+            let Ok(Ok(1)) = received else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            return match ack[0] {
                 wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
                 wire::LIFECYCLE_ACK_GONE => anyhow::bail!("agent process already exited"),
                 wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
                     anyhow::bail!("worker lifecycle instance changed")
                 }
                 _ => anyhow::bail!("worker lifecycle delivery failed"),
-            }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("worker lifecycle delivery deadline exceeded"))?
+            };
+        }
     }
 }
 

@@ -9,6 +9,7 @@
 
 pub mod boundary;
 pub mod emulator;
+pub mod endpoint;
 pub mod scrollback;
 pub mod secret;
 pub mod wire;

@@ -24,6 +24,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use spawnd::sessiond::wire;
+use spawnd::sessiond::{endpoint, endpoint::LockAttempt};
 
 use crate::config;
 use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, WorkerHandleParts};
@@ -31,6 +32,23 @@ use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, Wor
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADOPT_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HELLO_FRAME_BYTES: usize = 4 * 1024;
+const MAX_STARTED_FRAME_BYTES: usize = 1024;
+const MAX_LIVE_OUTPUT_FRAME_BYTES: usize = 64 * 1024 + 8;
+const MAX_EXIT_FRAME_BYTES: usize = 4 * 1024;
+const MAX_WORKER_ERROR_FRAME_BYTES: usize = 16 * 1024;
+
+fn worker_frame_limit(frame_type: u8) -> Option<usize> {
+    match frame_type {
+        wire::T_HELLO => Some(MAX_HELLO_FRAME_BYTES),
+        wire::T_STARTED => Some(MAX_STARTED_FRAME_BYTES),
+        wire::T_OUTPUT => Some(MAX_LIVE_OUTPUT_FRAME_BYTES),
+        wire::T_REPLAY => Some(wire::MAX_FRAME_LEN),
+        wire::T_EXIT => Some(MAX_EXIT_FRAME_BYTES),
+        wire::T_ERROR => Some(MAX_WORKER_ERROR_FRAME_BYTES),
+        _ => None,
+    }
+}
 
 /// Process environment is global; worker integration tests that override the
 /// binary/socket paths must serialize with RTC acceptance tests doing the same.
@@ -47,12 +65,7 @@ pub fn worker_dir() -> Result<PathBuf> {
             None => config::config_dir()?.join("workers"),
         },
     };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    endpoint::ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -86,12 +99,10 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     let dir = worker_dir()?;
     let socket = socket_path(&dir, spec.agent_id);
     let logs = log_dir(&dir, spec.agent_id);
-    // A stale socket from a dead worker would race the new one's bind; the
-    // worker unlinks it itself, but clear it here too for a clean connect.
-    if UnixStream::connect(&socket).await.is_err() {
-        let _ = std::fs::remove_file(&socket);
-    }
-
+    let reservation = match endpoint::try_reserve(&socket)? {
+        LockAttempt::Acquired(lock) => lock,
+        LockAttempt::Busy => bail!("worker endpoint is already owned"),
+    };
     let bin = worker_bin();
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--socket")
@@ -100,6 +111,8 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
         .arg(spec.agent_id.to_string())
         .arg("--log-dir")
         .arg(&logs)
+        .arg("--lock-fd")
+        .arg(reservation.raw_fd().to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
@@ -110,18 +123,36 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
         // spawnd. Note: under systemd, spawnd's unit needs KillMode=process
         // for this to survive `systemctl restart` (docs/SESSIOND.md).
         cmd.process_group(0);
+        let lock_fd = reservation.raw_fd();
+        // Clear CLOEXEC only in the post-fork child. The multithreaded
+        // supervisor never exposes this reservation to unrelated concurrent
+        // child launches.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = nix::libc::fcntl(lock_fd, nix::libc::F_GETFD);
+                if flags < 0
+                    || nix::libc::fcntl(lock_fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC)
+                        < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
-    let child = cmd
+    let child_result = cmd
         .spawn()
-        .with_context(|| format!("spawning {}", bin.display()))?;
+        .with_context(|| format!("spawning {}", bin.display()));
+    let child = child_result?;
+    drop(reservation);
     tracing::info!(agent_id = %spec.agent_id, worker_pid = child.id(), "spawned session worker");
 
     let mut stream = connect_with_retry(&socket, CONNECT_TIMEOUT)
         .await
         .context("connecting to session worker")?;
-    let hello = read_hello(&mut stream).await?;
+    let hello = read_hello(&mut stream, spec.agent_id).await?;
     if hello.state != "awaiting_start" {
-        bail!("worker in unexpected state {:?}", hello.state);
+        bail!("worker is not available for a new agent");
     }
 
     let start = wire::StartSpec {
@@ -136,7 +167,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
         .context("sending Start to worker")?;
     let started = tokio::time::timeout(START_TIMEOUT, async {
         loop {
-            match wire::read_frame(&mut stream).await? {
+            match wire::read_frame_limited(&mut stream, worker_frame_limit).await? {
                 Some((wire::T_STARTED, payload)) => {
                     return wire::decode_json::<wire::Started>(&payload)
                 }
@@ -174,12 +205,11 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
     let mut stream = match connect_with_retry(&socket, ADOPT_CONNECT_TIMEOUT).await {
         Ok(s) => s,
         Err(_) => {
-            // Dead socket left by a crashed worker: clean it up.
-            let _ = std::fs::remove_file(&socket);
+            cleanup_crashed_worker_endpoints(&socket);
             return Ok(None);
         }
     };
-    let hello = read_hello(&mut stream).await?;
+    let hello = read_hello(&mut stream, agent_id).await?;
     if hello.state == "awaiting_start" {
         // Orphan that never got its Start; tell it to go away.
         let _ = wire::write_json_frame(
@@ -371,7 +401,7 @@ async fn run_reader(
 ) {
     let mut exit_tx = Some(exit_tx);
     loop {
-        match wire::read_frame(&mut read_half).await {
+        match wire::read_frame_limited(&mut read_half, worker_frame_limit).await {
             Ok(Some((wire::T_OUTPUT, payload))) => {
                 let payload = Zeroizing::new(payload);
                 match wire::decode_output(&payload) {
@@ -464,25 +494,50 @@ async fn connect_with_retry(socket: &std::path::Path, timeout: Duration) -> Resu
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match UnixStream::connect(socket).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e).with_context(|| format!("connecting {}", socket.display()));
+            Ok(stream) => {
+                if endpoint::validate_private_socket(socket).is_ok()
+                    && endpoint::validate_stream_peer(&stream).is_ok()
+                {
+                    return Ok(stream);
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!("worker endpoint validation failed"));
+                }
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!("worker endpoint unreachable"));
+                }
             }
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
-async fn read_hello(stream: &mut UnixStream) -> Result<wire::Hello> {
-    let frame = tokio::time::timeout(CONNECT_TIMEOUT, wire::read_frame(stream))
-        .await
-        .map_err(|_| anyhow!("timed out waiting for worker Hello"))??;
+fn cleanup_crashed_worker_endpoints(socket: &std::path::Path) {
+    let Ok(LockAttempt::Acquired(_lock)) = endpoint::try_reserve(socket) else {
+        return;
+    };
+    let _ = endpoint::remove_stale_socket(socket);
+    let _ = endpoint::remove_stale_socket(&wire::lifecycle_socket_path(socket));
+}
+
+async fn read_hello(stream: &mut UnixStream, expected_agent_id: Uuid) -> Result<wire::Hello> {
+    let frame = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        wire::read_frame_limited(stream, |frame_type| {
+            (frame_type == wire::T_HELLO).then_some(MAX_HELLO_FRAME_BYTES)
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out waiting for worker Hello"))??;
     let Some((wire::T_HELLO, payload)) = frame else {
         bail!("worker did not send Hello first");
     };
     let hello: wire::Hello = wire::decode_json(&payload)?;
+    if hello.agent_id != expected_agent_id {
+        bail!("worker Hello identity validation failed");
+    }
     if hello.version != wire::PROTO_VERSION {
         bail!(
             "worker protocol version {} != supported {}",
@@ -496,6 +551,49 @@ async fn read_hello(stream: &mut UnixStream) -> Result<wire::Hello> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hello_agent_identity_is_validated_before_instance_trust() {
+        let expected = Uuid::new_v4();
+        let received = Uuid::new_v4();
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            wire::write_json_frame(
+                &mut peer,
+                wire::T_HELLO,
+                &wire::Hello {
+                    version: wire::PROTO_VERSION,
+                    agent_id: received,
+                    instance_id: Uuid::new_v4(),
+                    state: "running".into(),
+                    pid: Some(10),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let error = read_hello(&mut client, expected)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "worker Hello identity validation failed");
+        assert!(!error.contains(&received.to_string()));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreachable_endpoint_error_does_not_echo_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let private_name = "private-endpoint-name.sock";
+        let error = connect_with_retry(&dir.path().join(private_name), Duration::from_millis(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "worker endpoint unreachable");
+        assert!(!error.contains(private_name));
+    }
 
     #[test]
     fn replay_wipes_after_successful_send_then_receiver_cancellation() {
@@ -689,6 +787,24 @@ mod tests {
         .await
         .expect("worker launch");
         assert!(launched.pid > 0);
+
+        let duplicate = launch(pty::LaunchSpec {
+            agent_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &env,
+        })
+        .await;
+        let duplicate_error = match duplicate {
+            Ok(_) => panic!("duplicate same-agent launch unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            duplicate_error.to_string(),
+            "worker endpoint is already owned"
+        );
 
         // Keep the forwarder unblocked the way a live WS session would.
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);

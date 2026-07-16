@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 /// The worker lifecycle endpoint accepts exactly one instance token and one
 /// small signal code. No caller-provided string enters its bounded path.
@@ -289,6 +289,17 @@ pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(
 
 /// Read one frame. Returns `Ok(None)` on clean EOF at a frame boundary.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<(u8, Vec<u8>)>> {
+    read_frame_limited(r, |_| Some(MAX_FRAME_LEN)).await
+}
+
+/// Read one frame after applying a type-specific allocation policy to its
+/// five-byte header. A rejected type or length never allocates its declared
+/// payload.
+pub async fn read_frame_limited<R, F>(r: &mut R, limit_for_type: F) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+    F: FnOnce(u8) -> Option<usize>,
+{
     let mut header = [0u8; 5];
     match r.read_exact(&mut header).await {
         Ok(_) => {}
@@ -296,10 +307,13 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<(u8, V
         Err(e) => return Err(e).context("reading frame header"),
     }
     let len = u32::from_le_bytes(header[..4].try_into().expect("checked length")) as usize;
-    if len > MAX_FRAME_LEN {
-        bail!("frame payload too large: {len} bytes");
-    }
     let frame_type = header[4];
+    let Some(limit) = limit_for_type(frame_type) else {
+        bail!("frame type rejected by endpoint policy");
+    };
+    if len > limit {
+        bail!("frame payload rejected by endpoint policy");
+    }
     let mut payload = vec![0u8; len];
     if let Err(error) = r.read_exact(&mut payload).await {
         payload.zeroize();
@@ -416,5 +430,31 @@ mod tests {
             .await
             .unwrap();
         assert!(read_frame(&mut b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn endpoint_limit_rejects_from_header_without_waiting_or_allocating_payload() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[..4].copy_from_slice(&(64_u32 * 1024 + 1).to_le_bytes());
+        header[4] = T_INPUT;
+        a.write_all(&header).await.unwrap();
+        let error = read_frame_limited(&mut b, |frame_type| {
+            (frame_type == T_INPUT).then_some(64 * 1024)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "frame payload rejected by endpoint policy");
+
+        let (mut a, mut b) = tokio::io::duplex(64);
+        header[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[4] = 0xFF;
+        a.write_all(&header).await.unwrap();
+        let error = read_frame_limited(&mut b, |_| None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "frame type rejected by endpoint policy");
     }
 }

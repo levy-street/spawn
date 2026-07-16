@@ -80,8 +80,9 @@ spawnd (host supervisor, one per host)
  │    ├── agent process (session leader on the PTY slave)
  │    ├── headless checkpoint emulator (grid state only, no scrollback)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
+ │    ├── lifetime flock: $WORKER_DIR/<agent-id>.lock
  │    ├── supervisor listener: $WORKER_DIR/<agent-id>.sock
- │    └── lifecycle listener: $WORKER_DIR/<agent-id>.lifecycle.sock
+ │    └── lifecycle datagram: $WORKER_DIR/<agent-id>.lifecycle.sock
  └── spawn-worker --agent-id B …
 ```
 
@@ -111,10 +112,21 @@ spawnd (host supervisor, one per host)
 
 ```
 workers/
+  <agent-id>.lock          # lifetime exclusive reservation (0600)
   <agent-id>.sock          # ordinary supervisor listener
-  <agent-id>.lifecycle.sock # fixed-size TERM/KILL listener
+  <agent-id>.lifecycle.sock # atomic fixed-size TERM/KILL datagrams
   <agent-id>.scrollback/   # 0700; seg-00000001.log … (ciphertext only, 0600)
 ```
+
+The directory is ownership-checked and forced to `0700`; failure is fatal.
+Both sockets and the reservation are ownership-checked and forced to `0600`.
+`spawnd` acquires the per-agent flock before it spawns a worker and exposes the
+locked fd only in that post-fork child. The worker holds it for its lifetime.
+Duplicate creates therefore fail before a second worker is spawned. A lock
+released by a crash authorizes stale-socket recovery; no code unlinks an
+endpoint while the lock says a worker may still own it. Each endpoint cleanup
+also compares the socket's recorded device/inode identity, so a delayed old
+cleanup cannot unlink a replacement at the same pathname.
 
 Preferring `XDG_RUNTIME_DIR` puts sockets and ciphertext on tmpfs where
 available: gone on reboot, never on spinning rust. That is a feature — the
@@ -133,7 +145,7 @@ scrollback key is process-ephemeral anyway (§7).
 
 `len` counts the payload only; `MAX_FRAME_LEN` = 32 MiB (replay dominates and
 is capped far below this by the scrollback budget). Structured payloads are
-JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 3`, checked at
+JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 4`, checked at
 adoption time from `Hello.version` — a version-skewed worker is refused, not
 guessed at.
 
@@ -152,22 +164,34 @@ guessed at.
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?: TERM\|KILL}` | compatibility command; current spawnd lifecycle delivery uses the independent endpoint below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
 
-Connection semantics: the worker serves **one live connection**; a newly
-accepted connection displaces the previous one (frames from displaced
-connections are dropped by generation tag). That is exactly the semantics
-adoption needs — a restarted spawnd connects and simply wins. Unknown frame
-types are ignored (forward compatibility); oversized frames are a hard error.
+Connection semantics: the worker serves **one live supervisor connection**.
+It validates the candidate peer's effective UID and sends that candidate its
+`Hello`; only then does it close the old writer, abort and await the old reader,
+and install one new reader. Thus only one task/fd can feed the bounded command
+queue. Generation tags also discard anything the old peer queued immediately
+before cancellation. A restarted spawnd connects and wins without leaving a
+stale reader able to flood the worker. `spawnd` verifies that
+`Hello.agent_id` matches the agent implied by the socket path before trusting
+the instance token. Unknown frame types are rejected. The five-byte header is
+parsed before allocation and a strict per-type cap is applied (`T_INPUT` is at
+most 64 KiB; fixed commands require their exact size); a command never inherits
+the generic 32 MiB replay ceiling.
 
 Lifecycle timers: a worker that never receives `Start` exits after 120 s; a
 worker whose agent exited lingers 60 s to deliver `T_EXIT` to a reconnecting
 spawnd, then cleans up regardless. On exit the worker deletes its scrollback
 (the key dies with it anyway), unlinks its socket, and terminates.
 
-The lifecycle socket is a separate adoptable IPC path, not another command in
-the ordinary frame queue. A request is exactly 17 bytes: the 16-byte random
-`Hello.instance_id` plus a one-byte `TERM`/`KILL` enum. The worker replies with
-one content-free status byte only after the signal syscall. It rejects stale
-instance IDs, unknown codes, and partial requests. The worker retains the
+The lifecycle socket is a separate adoptable **Unix datagram** IPC path, not
+another command in the ordinary frame queue. A request is one atomic datagram
+of exactly 17 bytes: the 16-byte random `Hello.instance_id` plus a one-byte
+`TERM`/`KILL` enum. The worker replies with one content-free status-byte
+datagram only after the signal syscall. It rejects stale instance IDs, unknown
+codes, and non-exact datagrams. There are no accepted stream fds or per-request
+tasks for partial peers to retain: one task, one fixed 18-byte receive buffer,
+and the bounded kernel datagram queue are the complete server-side resource
+surface. The client retries idempotent delivery within one absolute two-second
+deadline, so a datagram flood cannot reserve all lifecycle capacity. The worker retains the
 unreaped portable-pty `Child` handle behind the same lock used by its exit
 monitor; while holding that stable ownership it validates the child and calls
 `killpg` only. `ESRCH` means safely gone. There is deliberately no fallback to
@@ -190,11 +214,12 @@ browser: xterm.js — the user-facing terminal renderer and scrollback owner
 
 `pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
 routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
-`replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown opens
+`replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
+short-lived `0600` datagram endpoint in the same private directory and sends to
 the separate worker-owned lifecycle socket with the instance ID captured from
-the same `Hello`; one absolute deadline covers connect, the fixed-size request,
-and acknowledgement. It therefore cannot sit behind queued or partially
-written PTY input. Registry delivery also revalidates the immutable
+the same `Hello`; one absolute deadline covers validation, fixed-size delivery,
+retries, and acknowledgement. It therefore cannot sit behind queued or
+partially written PTY input. Registry delivery also revalidates the immutable
 generation+lifecycle pair while holding the generation-transition lock.
 Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
 does not hold a local agent PTY, a child process handle, or a backend
@@ -438,10 +463,11 @@ socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
 PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
 queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 ordinary
 worker commands; each input command is capped at 64 KiB before spawnd copies
-the caller's slice. The worker's separate lifecycle listener accepts only a
-fixed 17-byte request and is independent of the ordinary socket task, so
-TERM/KILL cannot be starved by the ordinary queue or a stalled worker socket. The
-forwarder serves bounded direct-viewer sinks first, then offers output without
+the caller's slice. The worker's separate lifecycle datagram endpoint accepts
+only one atomic fixed 17-byte request into one fixed buffer and is independent
+of the ordinary socket task, so TERM/KILL cannot be starved by the ordinary
+queue, partial stream peers, or a stalled worker socket. The forwarder serves
+bounded direct-viewer sinks first, then offers output without
 blocking to the bounded legacy-WS mirror. A full or absent legacy mirror is
 detached instead of accumulating plaintext, while a lagging direct viewer is
 disconnected. Either transport reconnects and re-seeds from the worker replay
@@ -452,17 +478,17 @@ described in §6.2, including checkpoint and framing charges.
 
 | Event | Outcome |
 |---|---|
-| **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, unlinks its socket, exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit; spawnd additionally reaps via `socket_live` probes. |
-| **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`; the stale socket is cleaned up on next probe. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, and adopts from the `Hello` (instance identity, state, pid, geometry), then derives the independent lifecycle socket — no persistent supervisor state or fd handoff. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
+| **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
+| **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
+| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, verifies `Hello.agent_id`, and adopts from the `Hello` (instance identity, state, pid, geometry), then derives the independent lifecycle socket — no persistent supervisor state. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; a mismatched worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak. Old workers drain away as their agents exit. |
 | **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
 | **Host reboot** | workers and agents die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
 
-Why no fd/socket handoff: the classic reason to pass fds (the supervisor owns
-the PTY) doesn't apply — the **worker** owns the PTY and its listener, and
-survives on its own. Adoption-by-reconnect is strictly simpler and has no
-handoff window to get wrong.
+The only launch-time fd inheritance is the already-locked reservation, exposed
+to that one post-fork child and immediately restored to close-on-exec inside
+the worker. PTY and socket fds are never handed off: the **worker** owns them
+and survives on its own. Adoption-by-reconnect has no listener handoff window.
 
 ## 11. Worker-only cutover
 

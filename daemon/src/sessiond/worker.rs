@@ -22,16 +22,18 @@
 //! multiplexer.
 
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixListener;
+use tokio::net::{UnixDatagram, UnixListener};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -63,8 +65,9 @@ const CONNECTION_FRAME_QUEUE_DEPTH: usize = 1;
 /// Bound input waiting for a child that has stopped reading its PTY.
 const PTY_INPUT_QUEUE_DEPTH: usize = 32;
 const MAX_START_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PTY_INPUT_FRAME_BYTES: usize = 256 * 1024;
-const MAX_JSON_COMMAND_FRAME_BYTES: usize = 16 * 1024;
+const MAX_PTY_INPUT_FRAME_BYTES: usize = 64 * 1024;
+const MAX_SHUTDOWN_FRAME_BYTES: usize = 64;
+const SUPERVISOR_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 type WipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
@@ -130,16 +133,30 @@ fn pty_output_channel() -> (mpsc::Sender<PlaintextChunk>, mpsc::Receiver<Plainte
     mpsc::channel(PTY_OUTPUT_QUEUE_DEPTH)
 }
 
-fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
+fn inbound_frame_limit(frame_type: u8) -> Option<usize> {
     match frame_type {
-        wire::T_START => len <= MAX_START_FRAME_BYTES,
-        wire::T_INPUT => len <= MAX_PTY_INPUT_FRAME_BYTES,
-        wire::T_RESIZE => len == 4,
-        wire::T_REDRAW => len == 0,
-        wire::T_REPLAY_REQ => len == 4,
-        wire::T_SHUTDOWN => len <= MAX_JSON_COMMAND_FRAME_BYTES,
-        _ => len <= MAX_JSON_COMMAND_FRAME_BYTES,
+        wire::T_START => Some(MAX_START_FRAME_BYTES),
+        wire::T_INPUT => Some(MAX_PTY_INPUT_FRAME_BYTES),
+        wire::T_RESIZE => Some(4),
+        wire::T_REDRAW => Some(0),
+        wire::T_REPLAY_REQ => Some(4),
+        wire::T_SHUTDOWN => Some(MAX_SHUTDOWN_FRAME_BYTES),
+        _ => None,
     }
+}
+
+fn inbound_frame_size_exact(frame_type: u8, len: usize) -> bool {
+    match frame_type {
+        wire::T_RESIZE | wire::T_REPLAY_REQ => len == 4,
+        wire::T_REDRAW => len == 0,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
+    inbound_frame_limit(frame_type).is_some_and(|limit| len <= limit)
+        && inbound_frame_size_exact(frame_type, len)
 }
 
 #[derive(Default)]
@@ -217,6 +234,7 @@ pub struct WorkerArgs {
     pub log_dir: PathBuf,
     pub segment_bytes: u64,
     pub max_log_bytes: u64,
+    pub lock_fd: Option<RawFd>,
 }
 
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs> {
@@ -225,6 +243,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
     let mut log_dir = None;
     let mut segment_bytes = super::scrollback::DEFAULT_SEGMENT_BYTES;
     let mut max_log_bytes = super::scrollback::DEFAULT_MAX_LOG_BYTES;
+    let mut lock_fd = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| -> Result<String> {
             args.next()
@@ -238,6 +257,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--segment-bytes" => segment_bytes = value("--segment-bytes")?.parse()?,
             "--max-log-bytes" => max_log_bytes = value("--max-log-bytes")?.parse()?,
+            "--lock-fd" => lock_fd = Some(value("--lock-fd")?.parse()?),
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -247,6 +267,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
         log_dir: log_dir.context("--log-dir is required")?,
         segment_bytes,
         max_log_bytes,
+        lock_fd,
     })
 }
 
@@ -330,22 +351,31 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut emulator: Option<Emulator> = None;
     let mut gate = CheckpointGate::default();
 
-    if let Some(parent) = args.socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    let parent = args
+        .socket
+        .parent()
+        .context("worker socket has no parent directory")?;
+    super::endpoint::ensure_private_dir(parent)?;
+    let _endpoint_lock = match args.lock_fd {
+        Some(fd) => {
+            // SAFETY: production launch passes an owned descriptor inherited
+            // across exec. Identity and lock ownership are revalidated before
+            // either endpoint is touched.
+            unsafe { super::endpoint::WorkerLock::from_inherited(fd, &args.socket) }?
         }
-    }
-    let _ = std::fs::remove_file(&args.socket);
+        None => match super::endpoint::try_reserve(&args.socket)? {
+            super::endpoint::LockAttempt::Acquired(lock) => lock,
+            super::endpoint::LockAttempt::Busy => bail!("worker endpoint is already owned"),
+        },
+    };
     let lifecycle_socket = wire::lifecycle_socket_path(&args.socket);
-    let _ = std::fs::remove_file(&lifecycle_socket);
-    let listener = UnixListener::bind(&args.socket)
-        .with_context(|| format!("binding {}", args.socket.display()))?;
-    let lifecycle_listener = UnixListener::bind(&lifecycle_socket)
-        .with_context(|| format!("binding {}", lifecycle_socket.display()))?;
+    super::endpoint::remove_stale_socket(&args.socket)?;
+    super::endpoint::remove_stale_socket(&lifecycle_socket)?;
+    let listener = UnixListener::bind(&args.socket).context("binding ordinary worker endpoint")?;
+    let ordinary_identity = super::endpoint::secure_bound_socket(&args.socket)?;
+    let lifecycle_listener =
+        UnixDatagram::bind(&lifecycle_socket).context("binding lifecycle worker endpoint")?;
+    let lifecycle_identity = super::endpoint::secure_bound_socket(&lifecycle_socket)?;
     let instance_id = Uuid::new_v4();
     let child_state = Arc::new(Mutex::new(ChildState::AwaitingStart));
     let lifecycle_task = tokio::spawn(run_lifecycle_listener(
@@ -365,6 +395,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut state = State::AwaitingStart;
     let mut pty: Option<Pty> = None;
     let mut conn_write: Option<OwnedWriteHalf> = None;
+    let mut conn_reader: Option<JoinHandle<()>> = None;
     let mut generation: u64 = 0;
     let mut pty_open = false;
     let mut exit_reported = false;
@@ -390,7 +421,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accepting connection")?;
-                generation += 1;
+                if super::endpoint::validate_stream_peer(&stream).is_err() {
+                    tracing::warn!("rejecting worker supervisor with invalid peer ownership");
+                    continue;
+                }
                 let (read_half, mut write_half) = stream.into_split();
                 let hello = wire::Hello {
                     version: wire::PROTO_VERSION,
@@ -405,7 +439,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     cols: pty.as_ref().map(|p| p.size.lock().unwrap().0).unwrap_or(0),
                     rows: pty.as_ref().map(|p| p.size.lock().unwrap().1).unwrap_or(0),
                 };
-                if wire::write_json_frame(&mut write_half, wire::T_HELLO, &hello).await.is_err() {
+                let hello_sent = tokio::time::timeout(
+                    SUPERVISOR_HELLO_TIMEOUT,
+                    wire::write_json_frame(&mut write_half, wire::T_HELLO, &hello),
+                )
+                .await;
+                if !matches!(hello_sent, Ok(Ok(()))) {
                     continue;
                 }
                 // If the agent already exited, deliver Exit immediately.
@@ -415,8 +454,13 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     let _ = write_half.shutdown().await;
                     break;
                 }
+                // The candidate is now authenticated and has accepted its
+                // Hello. Fully close and await the previous connection before
+                // allowing the new reader to feed the command queue.
+                close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
+                generation = generation.wrapping_add(1);
                 conn_write = Some(write_half);
-                spawn_conn_reader(read_half, generation, frame_tx.clone());
+                conn_reader = Some(spawn_conn_reader(read_half, generation, frame_tx.clone()));
                 tracing::debug!(generation, "connection accepted");
             }
 
@@ -426,7 +470,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 }
                 let Some((frame_type, payload)) = conn_frame.frame.take() else {
                     tracing::debug!("connection closed by peer");
-                    conn_write = None;
+                    close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
                     continue;
                 };
                 match handle_frame(
@@ -573,15 +617,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    if let Some(mut w) = conn_write.take() {
-        let _ = w.shutdown().await;
-    }
+    close_supervisor_connection(&mut conn_write, &mut conn_reader).await;
     if let Some(log) = log {
         log.destroy();
     }
     lifecycle_task.abort();
-    let _ = std::fs::remove_file(&args.socket);
-    let _ = std::fs::remove_file(&lifecycle_socket);
+    let _ = lifecycle_task.await;
+    ordinary_identity.cleanup()?;
+    lifecycle_identity.cleanup()?;
     Ok(())
 }
 
@@ -737,18 +780,31 @@ fn state_name(state: &State) -> &'static str {
     }
 }
 
+async fn close_supervisor_connection(
+    writer: &mut Option<OwnedWriteHalf>,
+    reader: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(mut writer) = writer.take() {
+        let _ = writer.shutdown().await;
+    }
+    if let Some(reader) = reader.take() {
+        reader.abort();
+        let _ = reader.await;
+    }
+}
+
 fn spawn_conn_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     generation: u64,
     frame_tx: mpsc::Sender<ConnFrame>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match wire::read_frame(&mut read_half).await {
+            match wire::read_frame_limited(&mut read_half, inbound_frame_limit).await {
                 Ok(Some(frame)) => {
                     let (frame_type, payload) = frame;
                     let payload = PlaintextChunk::new(payload);
-                    if !inbound_frame_size_allowed(frame_type, payload.len()) {
+                    if !inbound_frame_size_exact(frame_type, payload.len()) {
                         tracing::warn!(
                             frame_type,
                             payload_len = payload.len(),
@@ -784,7 +840,7 @@ fn spawn_conn_reader(
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_pty(
@@ -978,34 +1034,41 @@ async fn monitor_child_exit(child_state: SharedChild, exit_tx: oneshot::Sender<w
 }
 
 async fn run_lifecycle_listener(
-    listener: UnixListener,
+    socket: UnixDatagram,
     instance_id: Uuid,
     child_state: SharedChild,
     agent_id: Uuid,
 ) {
+    // One fixed buffer and one task serve atomic datagrams. Partial writers
+    // cannot retain a connection, handler slot, fd, or allocation, and the
+    // kernel receive queue provides the hard resource bound under floods.
+    let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN + 1];
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let Ok((len, peer)) = socket.recv_from(&mut request).await else {
             break;
         };
-        let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN];
-        let ack =
-            match tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut request))
-                .await
-            {
-                Ok(Ok(_)) => match wire::decode_lifecycle_request(&request) {
-                    Ok((requested_instance, _)) if requested_instance != instance_id => {
-                        wire::LIFECYCLE_ACK_WRONG_INSTANCE
-                    }
-                    Ok((_, signal)) => match signal_owned_child(&child_state, signal) {
-                        LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
-                        LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
-                        LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
-                    },
-                    Err(_) => wire::LIFECYCLE_ACK_FAILED,
+        let ack = if len != wire::LIFECYCLE_REQUEST_LEN {
+            wire::LIFECYCLE_ACK_FAILED
+        } else {
+            let exact: &[u8; wire::LIFECYCLE_REQUEST_LEN] = request[..len]
+                .try_into()
+                .expect("validated lifecycle datagram length");
+            match wire::decode_lifecycle_request(exact) {
+                Ok((requested_instance, _)) if requested_instance != instance_id => {
+                    wire::LIFECYCLE_ACK_WRONG_INSTANCE
+                }
+                Ok((_, signal)) => match signal_owned_child(&child_state, signal) {
+                    LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
+                    LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
+                    LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
                 },
-                _ => wire::LIFECYCLE_ACK_FAILED,
-            };
-        if stream.write_all(&[ack]).await.is_err() {
+                Err(_) => wire::LIFECYCLE_ACK_FAILED,
+            }
+        };
+        let Some(peer_path) = peer.as_pathname() else {
+            continue;
+        };
+        if socket.try_send_to(&[ack], peer_path).is_err() {
             tracing::debug!(%agent_id, "lifecycle requester closed before acknowledgement");
         }
     }
@@ -1155,7 +1218,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("agent.lifecycle.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = UnixDatagram::bind(&socket).unwrap();
         let child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("while :; do sleep 1; done")
@@ -1175,16 +1238,17 @@ mod tests {
             Uuid::new_v4(),
         ));
 
-        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        stream
-            .write_all(&wire::encode_lifecycle_request(
-                Uuid::new_v4(),
-                wire::LifecycleSignal::Kill,
-            ))
+        let client_path = dir.path().join("client.sock");
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client
+            .send_to(
+                &wire::encode_lifecycle_request(Uuid::new_v4(), wire::LifecycleSignal::Kill),
+                &socket,
+            )
             .await
             .unwrap();
         let mut ack = [0u8; 1];
-        stream.read_exact(&mut ack).await.unwrap();
+        client.recv(&mut ack).await.unwrap();
         assert_eq!(ack[0], wire::LIFECYCLE_ACK_WRONG_INSTANCE);
 
         {
@@ -1205,5 +1269,99 @@ mod tests {
             };
         owned.wait().expect("reap worker-owned sentinel");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_datagrams_remain_fair_under_replenished_partial_flood() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = dir.path().join("agent.lifecycle.sock");
+        let listener = UnixDatagram::bind(&server_path).unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("signal-resistant child");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let instance = Uuid::new_v4();
+        let server = tokio::spawn(run_lifecycle_listener(
+            listener,
+            instance,
+            Arc::clone(&child_state),
+            Uuid::new_v4(),
+        ));
+
+        let attacker_path = dir.path().join("attacker.sock");
+        let attacker = UnixDatagram::bind(&attacker_path).unwrap();
+        let attack_server = server_path.clone();
+        let flood = tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + Duration::from_millis(750);
+            while tokio::time::Instant::now() < until {
+                let _ = attacker.try_send_to(&[0xAA], &attack_server);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let client_path = dir.path().join("legitimate.sock");
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client.connect(&server_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        async fn deliver(client: &UnixDatagram, request: &[u8; wire::LIFECYCLE_REQUEST_LEN]) -> u8 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                assert!(tokio::time::Instant::now() < deadline, "delivery starved");
+                if client.send(request).await.is_ok() {
+                    let mut ack = [0u8; 2];
+                    if let Ok(Ok(1)) =
+                        tokio::time::timeout(Duration::from_millis(100), client.recv(&mut ack))
+                            .await
+                    {
+                        return ack[0];
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert_eq!(
+            deliver(
+                &client,
+                &wire::encode_lifecycle_request(instance, wire::LifecycleSignal::Term),
+            )
+            .await,
+            wire::LIFECYCLE_ACK_DELIVERED
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut state = child_state.lock().unwrap();
+            let ChildState::Running { child, .. } = &mut *state else {
+                panic!("TERM changed stable child ownership");
+            };
+            assert!(child.try_wait().unwrap().is_none(), "TERM was not ignored");
+        }
+        assert_eq!(
+            deliver(
+                &client,
+                &wire::encode_lifecycle_request(instance, wire::LifecycleSignal::Kill),
+            )
+            .await,
+            wire::LIFECYCLE_ACK_DELIVERED
+        );
+
+        let mut owned =
+            match std::mem::replace(&mut *child_state.lock().unwrap(), ChildState::Exited) {
+                ChildState::Running { child, .. } => child,
+                _ => panic!("missing stable child after KILL"),
+            };
+        owned.wait().expect("reap killed child");
+        flood.await.unwrap();
+        server.abort();
     }
 }

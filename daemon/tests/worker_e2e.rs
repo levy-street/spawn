@@ -17,6 +17,26 @@ use spawnd::sessiond::wire;
 const WORKER_BIN: &str = env!("CARGO_BIN_EXE_spawn-worker");
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn worker_command(socket: &Path, agent_id: Uuid, log_dir: &Path) -> Command {
+    let mut command = Command::new(WORKER_BIN);
+    command
+        .arg("--socket")
+        .arg(socket)
+        .arg("--agent-id")
+        .arg(agent_id.to_string())
+        .arg("--log-dir")
+        .arg(log_dir)
+        .arg("--segment-bytes")
+        .arg("4096")
+        .arg("--max-log-bytes")
+        .arg("65536")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
 struct WorkerFixture {
     child: Child,
     socket: PathBuf,
@@ -28,21 +48,7 @@ impl WorkerFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("agent.sock");
         let log_dir = dir.path().join("scrollback");
-        let child = Command::new(WORKER_BIN)
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--agent-id")
-            .arg(Uuid::new_v4().to_string())
-            .arg("--log-dir")
-            .arg(&log_dir)
-            .arg("--segment-bytes")
-            .arg("4096")
-            .arg("--max-log-bytes")
-            .arg("65536")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
+        let child = worker_command(&socket, Uuid::new_v4(), &log_dir)
             .spawn()
             .expect("spawning spawn-worker");
         Self {
@@ -55,6 +61,166 @@ impl WorkerFixture {
     async fn connect(&self) -> UnixStream {
         connect_with_retry(&self.socket).await
     }
+}
+
+#[tokio::test]
+async fn duplicate_worker_is_rejected_and_crash_stale_endpoints_recover() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("agent.sock");
+    let lifecycle = wire::lifecycle_socket_path(&socket);
+    let logs = dir.path().join("scrollback");
+    let agent_id = Uuid::new_v4();
+    let mut first = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let mut first_conn = connect_with_retry(&socket).await;
+    let first_hello = expect_hello(&mut first_conn, "awaiting_start").await;
+    assert_eq!(first_hello.agent_id, agent_id);
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for endpoint in [&socket, &lifecycle] {
+        assert_eq!(
+            std::fs::metadata(endpoint).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let mut duplicate = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let duplicate_status = tokio::time::timeout(Duration::from_secs(3), duplicate.wait())
+        .await
+        .expect("duplicate worker did not reject promptly")
+        .unwrap();
+    assert!(!duplicate_status.success());
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "owner worker was displaced"
+    );
+
+    // SIGKILL bypasses the worker's identity-guarded normal cleanup, leaving
+    // both socket inodes behind. Releasing the lifetime flock lets exactly one
+    // replacement recover them safely.
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+    assert!(socket.exists());
+    assert!(lifecycle.exists());
+    drop(first_conn);
+
+    let mut replacement = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let mut replacement_conn = connect_with_retry(&socket).await;
+    let replacement_hello = expect_hello(&mut replacement_conn, "awaiting_start").await;
+    assert_eq!(replacement_hello.agent_id, agent_id);
+    assert_ne!(replacement_hello.instance_id, first_hello.instance_id);
+    wire::write_json_frame(
+        &mut replacement_conn,
+        wire::T_SHUTDOWN,
+        &wire::Shutdown { signal: None },
+    )
+    .await
+    .unwrap();
+    let status = tokio::time::timeout(STEP_TIMEOUT, replacement.wait())
+        .await
+        .expect("replacement did not exit")
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn supervisor_replacement_and_oversized_headers_keep_resources_bounded() {
+    fn fd_count(pid: u32) -> usize {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .count()
+    }
+
+    fn rss_kib(pid: u32) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    let mut fixture = WorkerFixture::launch().await;
+    let worker_pid = fixture.child.id().expect("worker pid");
+    let mut current = fixture.connect().await;
+    expect_hello(&mut current, "awaiting_start").await;
+    wire::write_json_frame(
+        &mut current,
+        wire::T_START,
+        &start_spec(&["/bin/sh", "-c", "cat"]),
+    )
+    .await
+    .unwrap();
+    let (frame_type, _) = read_frame(&mut current).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    let baseline_fds = fd_count(worker_pid);
+    let baseline_rss = rss_kib(worker_pid);
+    let mut oldest_stale = Some(current);
+
+    let mut current = fixture.connect().await;
+    expect_hello(&mut current, "running").await;
+    for _ in 0..200 {
+        let mut bad = fixture.connect().await;
+        expect_hello(&mut bad, "running").await;
+        let mut header = [0u8; 5];
+        header[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[4] = wire::T_INPUT;
+        use tokio::io::AsyncWriteExt;
+        bad.write_all(&header).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), wire::read_frame(&mut bad))
+            .await
+            .expect("oversized-header peer retained a worker task/fd");
+        assert!(closed.is_err() || closed.unwrap().is_none());
+
+        let mut replacement = fixture.connect().await;
+        expect_hello(&mut replacement, "running").await;
+        current = replacement;
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if let Some(stale) = oldest_stale.as_mut() {
+        let _ = wire::write_frame(stale, wire::T_INPUT, b"stale-peer-marker\n").await;
+    }
+    wire::write_frame(&mut current, wire::T_INPUT, b"current-peer-marker\n")
+        .await
+        .unwrap();
+    let output = collect_output_until(&mut current, b"current-peer-marker").await;
+    assert!(
+        !output
+            .windows(b"stale-peer-marker".len())
+            .any(|window| window == b"stale-peer-marker"),
+        "cancelled supervisor reader still fed commands"
+    );
+
+    assert!(
+        fd_count(worker_pid) <= baseline_fds + 3,
+        "supervisor replacement leaked worker fds"
+    );
+    assert!(
+        rss_kib(worker_pid) <= baseline_rss + 16 * 1024,
+        "oversized headers or replacement tasks grew worker memory without bound"
+    );
+
+    wire::write_json_frame(
+        &mut current,
+        wire::T_SHUTDOWN,
+        &wire::Shutdown {
+            signal: Some(wire::LifecycleSignal::Term),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(STEP_TIMEOUT, fixture.child.wait())
+        .await
+        .expect("worker cleanup timed out")
+        .unwrap();
+    drop(oldest_stale.take());
 }
 
 async fn connect_with_retry(socket: &Path) -> UnixStream {
