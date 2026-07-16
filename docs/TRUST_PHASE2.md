@@ -209,7 +209,9 @@ is restricted to stable content-free values.
   destination overwrite semantics. Filesystem calls are capability-rooted and
   no-follow for every component, no-clobber commits use a single atomic rename,
   directory pages have daemon and browser retention ceilings, and ACK/cancel
-  dispatch cannot wait behind a long sender. The first source/destination
+  dispatch cannot wait behind a long sender. Arrival-ordered, bounded expiring
+  cancellation tombstones drain only frames that preceded a fast cancel, and a
+  single tracked session reaper replaces per-write cleanup sleepers. The first source/destination
   timeout, error, cancellation, or peer loss aborts and cleans up both streams.
 - Add a parallel E2E request/response path for interactive tool checks/installs,
   including commands, paths, installed/latest versions, stdout/stderr, and

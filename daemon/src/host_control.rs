@@ -1,15 +1,15 @@
 //! End-to-end host file protocol carried by `spawn.host.ctl`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -33,13 +33,53 @@ const STREAM_WINDOW_CHUNKS: u64 = 8;
 const STREAM_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WRITE_STREAMS: usize = 8;
+const MAX_STREAM_TOMBSTONES: usize = 4096;
+
+struct QueuedFrame {
+    arrival_order: u64,
+    value: Value,
+}
+
+enum CancelledWrite {
+    Cancelling {
+        cancel_order: u64,
+        ready: Arc<Notify>,
+        expires_at: Instant,
+    },
+    Ready {
+        cancel_order: u64,
+        next_sequence: u64,
+        received: u64,
+        expected_length: u64,
+        expected_sha256: String,
+        expires_at: Instant,
+    },
+}
+
+impl CancelledWrite {
+    fn cancel_order(&self) -> u64 {
+        match self {
+            Self::Cancelling { cancel_order, .. } | Self::Ready { cancel_order, .. } => {
+                *cancel_order
+            }
+        }
+    }
+
+    fn expires_at(&self) -> Instant {
+        match self {
+            Self::Cancelling { expires_at, .. } | Self::Ready { expires_at, .. } => *expires_at,
+        }
+    }
+}
 
 #[derive(Default)]
 struct State {
     writes: HashMap<String, Arc<Mutex<Option<PendingWrite>>>>,
     write_requests: HashMap<String, String>,
+    cancelled_writes: HashMap<String, CancelledWrite>,
+    finished_write_ids: HashMap<String, Instant>,
     reads: HashMap<String, mpsc::Sender<ReadSignal>>,
-    finished_read_ids: HashSet<String>,
+    finished_read_ids: HashMap<String, Instant>,
     read_requests: HashMap<String, Arc<AtomicBool>>,
     cancelled_request_ids: HashSet<String>,
     seen_request_ids: HashSet<String>,
@@ -56,11 +96,51 @@ struct Context {
     files: Arc<HostFileService>,
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
-    read_tasks: Arc<Mutex<JoinSet<()>>>,
+    background_tasks: Arc<Mutex<JoinSet<()>>>,
     closed: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Context {
+    fn prune_tombstones(state: &mut State) {
+        let now = Instant::now();
+        state
+            .cancelled_writes
+            .retain(|_, tombstone| tombstone.expires_at() > now);
+        state
+            .finished_write_ids
+            .retain(|_, expires_at| *expires_at > now);
+        state
+            .finished_read_ids
+            .retain(|_, expires_at| *expires_at > now);
+    }
+
+    fn remember_finished_read(state: &mut State, stream_id: &str) -> bool {
+        Self::prune_tombstones(state);
+        if !state.finished_read_ids.contains_key(stream_id)
+            && state.finished_read_ids.len() >= MAX_STREAM_TOMBSTONES
+        {
+            return false;
+        }
+        state
+            .finished_read_ids
+            .insert(stream_id.to_string(), tombstone_deadline());
+        true
+    }
+
+    fn remember_finished_write(state: &mut State, stream_id: &str) -> bool {
+        Self::prune_tombstones(state);
+        if !state.finished_write_ids.contains_key(stream_id)
+            && state.finished_write_ids.len() >= MAX_STREAM_TOMBSTONES
+        {
+            return false;
+        }
+        state
+            .finished_write_ids
+            .insert(stream_id.to_string(), tombstone_deadline());
+        true
+    }
+
     async fn send(&self, value: Value) -> bool {
         let encoded = value.to_string();
         encoded.len() <= MAX_FRAME_BYTES && self.dc.send_text(encoded).await.is_ok()
@@ -108,16 +188,17 @@ impl Context {
         state.seen_request_ids.insert(request_id.to_string())
     }
 
-    async fn finish_read(&self, stream_id: &str) {
+    async fn finish_read(&self, stream_id: &str) -> bool {
         let mut state = self.state.lock().await;
         state.reads.remove(stream_id);
-        if state.finished_read_ids.len() >= MAX_SEEN_REQUESTS {
-            state.finished_read_ids.clear();
-        }
-        state.finished_read_ids.insert(stream_id.to_string());
+        Self::remember_finished_read(&mut state, stream_id)
     }
 
-    async fn handle_normal(&self, value: Value) -> bool {
+    async fn handle_normal(&self, frame: QueuedFrame) -> bool {
+        let QueuedFrame {
+            arrival_order,
+            value,
+        } = frame;
         let Some(object) = value.as_object() else {
             return false;
         };
@@ -126,13 +207,17 @@ impl Context {
         }
         match object.get("type").and_then(Value::as_str) {
             Some("request") => self.handle_request(object).await,
-            Some("stream.chunk") => self.handle_stream_chunk(object).await,
-            Some("stream.end") => self.handle_stream_end(object).await,
+            Some("stream.chunk") => self.handle_stream_chunk(object, arrival_order).await,
+            Some("stream.end") => self.handle_stream_end(object, arrival_order).await,
             _ => false,
         }
     }
 
-    async fn handle_fast(&self, value: Value) -> bool {
+    async fn handle_fast(&self, frame: QueuedFrame) -> bool {
+        let QueuedFrame {
+            arrival_order,
+            value,
+        } = frame;
         let Some(object) = value.as_object() else {
             return false;
         };
@@ -141,7 +226,7 @@ impl Context {
         }
         match object.get("type").and_then(Value::as_str) {
             Some("stream.ack") => self.handle_stream_ack(object).await,
-            Some("stream.cancel") => self.handle_stream_cancel(object).await,
+            Some("stream.cancel") => self.handle_stream_cancel(object, arrival_order).await,
             Some("cancel") => self.handle_request_cancel(object).await,
             _ => false,
         }
@@ -306,7 +391,7 @@ impl Context {
                 let _ = context.dc.close().await;
             }
         };
-        let mut tasks = self.read_tasks.lock().await;
+        let mut tasks = self.background_tasks.lock().await;
         while tasks.try_join_next().is_some() {}
         tasks.spawn(task);
         true
@@ -383,7 +468,6 @@ impl Context {
                     .insert(request_id.to_string(), stream_id.clone());
                 state.writes.insert(stream_id.clone(), slot);
                 drop(state);
-                self.spawn_write_cleanup(stream_id.clone());
                 self.response(request_id, json!({"stream_id": stream_id}))
                     .await
             }
@@ -391,40 +475,62 @@ impl Context {
         }
     }
 
-    fn spawn_write_cleanup(&self, stream_id: String) {
-        let context = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(WRITE_IDLE_TIMEOUT).await;
-                let slot = context.state.lock().await.writes.get(&stream_id).cloned();
-                let Some(slot) = slot else {
-                    break;
-                };
-                let stale_write = {
-                    let mut write = slot.lock().await;
-                    if write
-                        .as_ref()
-                        .is_some_and(|write| write.idle_for() >= WRITE_IDLE_TIMEOUT)
-                    {
-                        write.take()
-                    } else {
+    async fn run_write_reaper(self) {
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                _ = tokio::time::sleep(write_reaper_interval()) => {}
+            }
+            let streams = self
+                .state
+                .lock()
+                .await
+                .writes
+                .iter()
+                .map(|(stream_id, slot)| (stream_id.clone(), Arc::clone(slot)))
+                .collect::<Vec<_>>();
+            for (stream_id, slot) in streams {
+                let mut write_guard = slot.lock().await;
+                if write_guard
+                    .as_ref()
+                    .is_none_or(|write| write.idle_for() < WRITE_IDLE_TIMEOUT)
+                {
+                    continue;
+                }
+                let removed = {
+                    let mut state = self.state.lock().await;
+                    let same = state
+                        .writes
+                        .get(&stream_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &slot));
+                    if !same || !Self::remember_finished_write(&mut state, &stream_id) {
                         None
+                    } else {
+                        state.writes.remove(&stream_id);
+                        write_guard.take()
                     }
                 };
-                if let Some(write) = stale_write {
-                    let mut state = context.state.lock().await;
-                    state.writes.remove(&stream_id);
-                    state.write_requests.remove(&write.request_id);
-                    drop(state);
-                    write.abort().await;
-                    break;
-                }
-                if slot.lock().await.is_none() {
-                    context.state.lock().await.writes.remove(&stream_id);
-                    break;
+                let Some(write) = removed else {
+                    continue;
+                };
+                drop(write_guard);
+                self.state
+                    .lock()
+                    .await
+                    .write_requests
+                    .remove(&write.request_id);
+                write.abort().await;
+                if !self
+                    .stream_error(&stream_id, "stream_timeout", "file write timed out")
+                    .await
+                {
+                    let _ = self.dc.close().await;
+                    return;
                 }
             }
-        });
+            let mut state = self.state.lock().await;
+            Self::prune_tombstones(&mut state);
+        }
     }
 
     async fn send_read(&self, request_id: &str, path: &str, cancelled: Arc<AtomicBool>) -> bool {
@@ -462,7 +568,7 @@ impl Context {
             )
             .await
         {
-            self.finish_read(&stream_id).await;
+            let _ = self.finish_read(&stream_id).await;
             return false;
         }
 
@@ -473,8 +579,7 @@ impl Context {
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
         loop {
             if cancelled.load(Ordering::Acquire) {
-                self.finish_read(&stream_id).await;
-                return true;
+                return self.finish_read(&stream_id).await;
             }
             while let Ok(signal) = signal_rx.try_recv() {
                 match signal {
@@ -482,11 +587,10 @@ impl Context {
                         acknowledged = value;
                     }
                     ReadSignal::Cancel => {
-                        self.finish_read(&stream_id).await;
-                        return true;
+                        return self.finish_read(&stream_id).await;
                     }
                     ReadSignal::Ack(_) => {
-                        self.finish_read(&stream_id).await;
+                        let _ = self.finish_read(&stream_id).await;
                         return false;
                     }
                 }
@@ -494,7 +598,9 @@ impl Context {
             let read = match stream.file.read(&mut buffer).await {
                 Ok(read) => read,
                 Err(error) => {
-                    self.finish_read(&stream_id).await;
+                    if !self.finish_read(&stream_id).await {
+                        return false;
+                    }
                     return self
                         .stream_error(&stream_id, "io_error", &error.to_string())
                         .await;
@@ -527,15 +633,16 @@ impl Context {
                         acknowledged = value;
                     }
                     Ok(Some(ReadSignal::Cancel)) => {
-                        self.finish_read(&stream_id).await;
-                        return true;
+                        return self.finish_read(&stream_id).await;
                     }
                     Ok(Some(ReadSignal::Ack(_))) | Ok(None) => {
-                        self.finish_read(&stream_id).await;
+                        let _ = self.finish_read(&stream_id).await;
                         return false;
                     }
                     Err(_) => {
-                        self.finish_read(&stream_id).await;
+                        if !self.finish_read(&stream_id).await {
+                            return false;
+                        }
                         return self
                             .stream_error(
                                 &stream_id,
@@ -546,14 +653,15 @@ impl Context {
                     }
                 }
                 if cancelled.load(Ordering::Acquire) {
-                    self.finish_read(&stream_id).await;
-                    return true;
+                    return self.finish_read(&stream_id).await;
                 }
             }
         }
         let digest = format!("{:x}", actual.finalize());
         if length != stream.stat.size || digest != stream.sha256 {
-            self.finish_read(&stream_id).await;
+            if !self.finish_read(&stream_id).await {
+                return false;
+            }
             return self
                 .stream_error(&stream_id, "file_changed", "file changed during transfer")
                 .await;
@@ -567,11 +675,99 @@ impl Context {
                 "sha256": digest,
             }))
             .await;
-        self.finish_read(&stream_id).await;
-        sent
+        self.finish_read(&stream_id).await && sent
     }
 
-    async fn handle_stream_chunk(&self, object: &Map<String, Value>) -> bool {
+    async fn handle_late_write_chunk(
+        &self,
+        stream_id: &str,
+        arrival_order: u64,
+        sequence: u64,
+        byte_len: usize,
+    ) -> Option<bool> {
+        loop {
+            let wait = {
+                let mut state = self.state.lock().await;
+                Self::prune_tombstones(&mut state);
+                if state.finished_write_ids.contains_key(stream_id) {
+                    return Some(false);
+                }
+                let tombstone = state.cancelled_writes.get_mut(stream_id)?;
+                if arrival_order >= tombstone.cancel_order() {
+                    return Some(false);
+                }
+                match tombstone {
+                    CancelledWrite::Cancelling { ready, .. } => Some(Arc::clone(ready)),
+                    CancelledWrite::Ready {
+                        next_sequence,
+                        received,
+                        expected_length,
+                        ..
+                    } => {
+                        let next_received = received.saturating_add(byte_len as u64);
+                        if sequence != *next_sequence || next_received > *expected_length {
+                            return Some(false);
+                        }
+                        *next_sequence = next_sequence.saturating_add(1);
+                        *received = next_received;
+                        return Some(true);
+                    }
+                }
+            };
+            let Some(ready) = wait else {
+                return Some(false);
+            };
+            ready.notified().await;
+        }
+    }
+
+    async fn handle_late_write_end(
+        &self,
+        stream_id: &str,
+        arrival_order: u64,
+        length: Option<u64>,
+        sha256: Option<&str>,
+    ) -> Option<bool> {
+        loop {
+            let wait = {
+                let mut state = self.state.lock().await;
+                Self::prune_tombstones(&mut state);
+                if state.finished_write_ids.contains_key(stream_id) {
+                    return Some(false);
+                }
+                let tombstone = state.cancelled_writes.get(stream_id)?;
+                if arrival_order >= tombstone.cancel_order() {
+                    return Some(false);
+                }
+                match tombstone {
+                    CancelledWrite::Cancelling { ready, .. } => Some(Arc::clone(ready)),
+                    CancelledWrite::Ready {
+                        received,
+                        expected_length,
+                        expected_sha256,
+                        ..
+                    } => {
+                        let valid = length == Some(*expected_length)
+                            && *received == *expected_length
+                            && sha256 == Some(expected_sha256.as_str());
+                        if valid {
+                            state.cancelled_writes.remove(stream_id);
+                            if !Self::remember_finished_write(&mut state, stream_id) {
+                                return Some(false);
+                            }
+                        }
+                        return Some(valid);
+                    }
+                }
+            };
+            let Some(ready) = wait else {
+                return Some(false);
+            };
+            ready.notified().await;
+        }
+    }
+
+    async fn handle_stream_chunk(&self, object: &Map<String, Value>, arrival_order: u64) -> bool {
         let (Some(stream_id), Some(sequence), Some(encoded)) = (
             valid_id(object.get("stream_id")),
             object.get("sequence").and_then(Value::as_u64),
@@ -583,13 +779,26 @@ impl Context {
             Ok(bytes) if !bytes.is_empty() && bytes.len() <= STREAM_CHUNK_BYTES => bytes,
             _ => return false,
         };
+        if let Some(handled) = self
+            .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+            .await
+        {
+            return handled;
+        }
         let slot = self.state.lock().await.writes.get(stream_id).cloned();
         let Some(slot) = slot else {
-            return false;
+            return self
+                .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                .await
+                .unwrap_or(false);
         };
         let mut write_guard = slot.lock().await;
         let Some(active) = write_guard.as_mut() else {
-            return false;
+            drop(write_guard);
+            return self
+                .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                .await
+                .unwrap_or(false);
         };
         if let Err(error) = active.append(sequence, &bytes).await {
             let write = write_guard.take().expect("active write exists");
@@ -597,8 +806,12 @@ impl Context {
             let mut state = self.state.lock().await;
             state.writes.remove(stream_id);
             state.write_requests.remove(&write.request_id);
+            let remembered = Self::remember_finished_write(&mut state, stream_id);
             drop(state);
             write.abort().await;
+            if !remembered {
+                return false;
+            }
             return self
                 .stream_error(stream_id, error.code, &error.detail)
                 .await;
@@ -606,13 +819,33 @@ impl Context {
         true
     }
 
-    async fn handle_stream_end(&self, object: &Map<String, Value>) -> bool {
+    async fn handle_stream_end(&self, object: &Map<String, Value>, arrival_order: u64) -> bool {
         let Some(stream_id) = valid_id(object.get("stream_id")) else {
             return false;
         };
-        let slot = self.state.lock().await.writes.remove(stream_id);
+        let length = object.get("length").and_then(Value::as_u64);
+        let sha256 = object.get("sha256").and_then(Value::as_str);
+        if let Some(handled) = self
+            .handle_late_write_end(stream_id, arrival_order, length, sha256)
+            .await
+        {
+            return handled;
+        }
+        let slot = {
+            let mut state = self.state.lock().await;
+            if state.writes.contains_key(stream_id)
+                && Self::remember_finished_write(&mut state, stream_id)
+            {
+                state.writes.remove(stream_id)
+            } else {
+                None
+            }
+        };
         let Some(slot) = slot else {
-            return false;
+            return self
+                .handle_late_write_end(stream_id, arrival_order, length, sha256)
+                .await
+                .unwrap_or(false);
         };
         let write = slot.lock().await.take();
         let Some(write) = write else {
@@ -623,9 +856,7 @@ impl Context {
             .await
             .write_requests
             .remove(&write.request_id);
-        if object.get("length").and_then(Value::as_u64) != Some(write.expected_length)
-            || object.get("sha256").and_then(Value::as_str) != Some(write.expected_sha256.as_str())
-        {
+        if length != Some(write.expected_length) || sha256 != Some(write.expected_sha256.as_str()) {
             write.abort().await;
             return self
                 .stream_error(
@@ -665,7 +896,7 @@ impl Context {
             let state = self.state.lock().await;
             (
                 state.reads.get(stream_id).cloned(),
-                state.finished_read_ids.contains(stream_id),
+                state.finished_read_ids.contains_key(stream_id),
             )
         };
         let Some(sender) = sender else {
@@ -674,39 +905,74 @@ impl Context {
         sender.try_send(ReadSignal::Ack(sequence)).is_ok()
     }
 
-    async fn handle_stream_cancel(&self, object: &Map<String, Value>) -> bool {
+    async fn handle_stream_cancel(&self, object: &Map<String, Value>, arrival_order: u64) -> bool {
         let Some(stream_id) = valid_id(object.get("stream_id")) else {
             return false;
         };
-        if let Some(slot) = self.state.lock().await.writes.remove(stream_id) {
-            if let Some(write) = slot.lock().await.take() {
-                self.state
-                    .lock()
-                    .await
-                    .write_requests
-                    .remove(&write.request_id);
-                write.abort().await;
-            }
-        }
-        let read = {
+        let (write, read, known) = {
             let mut state = self.state.lock().await;
-            let read = state.reads.remove(stream_id);
-            if read.is_some() {
-                if state.finished_read_ids.len() >= MAX_SEEN_REQUESTS {
-                    state.finished_read_ids.clear();
+            Self::prune_tombstones(&mut state);
+            let known = state.cancelled_writes.contains_key(stream_id)
+                || state.finished_write_ids.contains_key(stream_id)
+                || state.finished_read_ids.contains_key(stream_id);
+            let write = if known {
+                None
+            } else if state.writes.contains_key(stream_id) {
+                if state.cancelled_writes.len() >= MAX_STREAM_TOMBSTONES {
+                    return false;
                 }
-                state.finished_read_ids.insert(stream_id.to_string());
+                let ready = Arc::new(Notify::new());
+                state.cancelled_writes.insert(
+                    stream_id.to_string(),
+                    CancelledWrite::Cancelling {
+                        cancel_order: arrival_order,
+                        ready,
+                        expires_at: tombstone_deadline(),
+                    },
+                );
+                state.writes.remove(stream_id)
+            } else {
+                None
+            };
+            let read = state.reads.remove(stream_id);
+            if read.is_some() && !Self::remember_finished_read(&mut state, stream_id) {
+                return false;
             }
-            read
+            (write, read, known)
         };
+        if let Some(slot) = write {
+            let write = slot.lock().await.take();
+            let Some(write) = write else {
+                return false;
+            };
+            let ready = {
+                let mut state = self.state.lock().await;
+                state.write_requests.remove(&write.request_id);
+                let ready = match state.cancelled_writes.get(stream_id) {
+                    Some(CancelledWrite::Cancelling { ready, .. }) => Arc::clone(ready),
+                    _ => return false,
+                };
+                state.cancelled_writes.insert(
+                    stream_id.to_string(),
+                    CancelledWrite::Ready {
+                        cancel_order: arrival_order,
+                        next_sequence: write.next_sequence,
+                        received: write.received,
+                        expected_length: write.expected_length,
+                        expected_sha256: write.expected_sha256.clone(),
+                        expires_at: tombstone_deadline(),
+                    },
+                );
+                ready
+            };
+            ready.notify_one();
+            write.abort().await;
+            return true;
+        }
         if let Some(read) = read {
             return read.try_send(ReadSignal::Cancel).is_ok();
         }
-        self.state
-            .lock()
-            .await
-            .finished_read_ids
-            .contains(stream_id)
+        known
     }
 
     async fn handle_request_cancel(&self, object: &Map<String, Value>) -> bool {
@@ -741,6 +1007,7 @@ impl Context {
 
     async fn abort_all(&self) {
         self.closed.store(true, Ordering::Release);
+        self.shutdown.cancel();
         let (reads, writes) = {
             let mut state = self.state.lock().await;
             let reads = state
@@ -767,7 +1034,7 @@ impl Context {
                 write.abort().await;
             }
         }
-        let mut tasks = self.read_tasks.lock().await;
+        let mut tasks = self.background_tasks.lock().await;
         while !tasks.is_empty() {
             match tokio::time::timeout(Duration::from_secs(2), tasks.join_next()).await {
                 Ok(Some(_)) => {}
@@ -817,8 +1084,10 @@ pub(crate) fn install(
     let message_dc = Arc::clone(&dc);
     let context_slot = Arc::new(Mutex::new(None::<Context>));
     let shutdown = CancellationToken::new();
-    let (normal_tx, mut normal_rx) = mpsc::channel::<Value>(MAX_NORMAL_QUEUE);
-    let (fast_tx, mut fast_rx) = mpsc::channel::<Value>(MAX_FAST_QUEUE);
+    let context_shutdown = shutdown.child_token();
+    let arrival_order = Arc::new(AtomicU64::new(0));
+    let (normal_tx, mut normal_rx) = mpsc::channel::<QueuedFrame>(MAX_NORMAL_QUEUE);
+    let (fast_tx, mut fast_rx) = mpsc::channel::<QueuedFrame>(MAX_FAST_QUEUE);
 
     let normal_context = Arc::clone(&context_slot);
     let normal_dc = Arc::clone(&dc);
@@ -870,6 +1139,7 @@ pub(crate) fn install(
         let dc = Arc::clone(&message_dc);
         let normal_tx = normal_tx.clone();
         let fast_tx = fast_tx.clone();
+        let arrival_order = Arc::clone(&arrival_order);
         Box::pin(async move {
             if !message.is_string || message.data.is_empty() || message.data.len() > MAX_FRAME_BYTES
             {
@@ -886,10 +1156,22 @@ pub(crate) fn install(
                     Some("stream.ack" | "stream.cancel" | "cancel")
                 )
             });
+            let Ok(order) =
+                arrival_order.fetch_update(Ordering::AcqRel, Ordering::Acquire, |order| {
+                    order.checked_add(1)
+                })
+            else {
+                close_later(dc);
+                return;
+            };
+            let frame = QueuedFrame {
+                arrival_order: order,
+                value,
+            };
             let queued = if fast {
-                fast_tx.try_send(value)
+                fast_tx.try_send(frame)
             } else {
-                normal_tx.try_send(value)
+                normal_tx.try_send(frame)
             };
             if queued.is_err() {
                 close_later(dc);
@@ -899,6 +1181,7 @@ pub(crate) fn install(
 
     let open_dc = Arc::clone(&dc);
     let open_context = Arc::clone(&context_slot);
+    let open_shutdown = context_shutdown;
     dc.on_open(Box::new(move || {
         let dc = Arc::clone(&open_dc);
         let context_slot = Arc::clone(&open_context);
@@ -906,6 +1189,7 @@ pub(crate) fn install(
         let session_id = session_id.clone();
         let binding = binding.clone();
         let files = files_override.clone();
+        let shutdown = open_shutdown.clone();
         Box::pin(async move {
             let files = match files {
                 Some(files) => files,
@@ -917,14 +1201,21 @@ pub(crate) fn install(
                     }
                 },
             };
-            *context_slot.lock().await = Some(Context {
+            let context = Context {
                 dc: Arc::clone(&dc),
                 files,
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
-                read_tasks: Arc::new(Mutex::new(JoinSet::new())),
+                background_tasks: Arc::new(Mutex::new(JoinSet::new())),
                 closed: Arc::new(AtomicBool::new(false)),
-            });
+                shutdown,
+            };
+            context
+                .background_tasks
+                .lock()
+                .await
+                .spawn(context.clone().run_write_reaper());
+            *context_slot.lock().await = Some(context);
             let hello = json!({
                 "version": VERSION,
                 "type": "hello",
@@ -941,6 +1232,7 @@ pub(crate) fn install(
                     "normal_queue": MAX_NORMAL_QUEUE,
                     "fast_queue": MAX_FAST_QUEUE,
                     "long_tasks": MAX_LONG_TASKS,
+                    "write_reapers": 1,
                 }
             });
             if dc.send_text(hello.to_string()).await.is_ok() {
@@ -977,4 +1269,21 @@ fn stream_ack_timeout() -> Duration {
     } else {
         STREAM_ACK_TIMEOUT
     }
+}
+
+fn write_reaper_interval() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(20)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+fn tombstone_deadline() -> Instant {
+    let lifetime = if cfg!(test) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(120)
+    };
+    Instant::now() + lifetime
 }

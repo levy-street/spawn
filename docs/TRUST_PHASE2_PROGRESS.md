@@ -106,6 +106,16 @@ ACK/cancel dispatch, explicit bounded directory pages/UI retention, bilateral
 abort cleanup, and real distinct-host paired-channel coverage. It remains
 `ACTIVE` until the independent re-review passes and the result is merged.
 
+The next re-review confirmed those six corrections but found three additional
+cancel/lifecycle races: active-write cancel fell through to channel close,
+split fast/normal queues could reorder cancellation ahead of earlier frames on
+both endpoints, and per-write cleanup sleepers were untracked. The subsequent
+candidate returns handled cancellation, stamps frames before queue routing and
+uses bounded expiring cutoff tombstones on daemon/browser, and owns one tracked
+session reaper that drains at close. Paired-channel backlog/reuse and rapid
+write-churn shutdown regressions cover these corrections; independent review
+is still required before merge.
+
 P2-AGENT-01 and P2-TMUX-01 subsequently passed independent review and were
 integrated on `master` through `1f66d2d`; the P2-HOST-02 candidate includes
 that worker-only checkpoint and must retain its guard through re-review.

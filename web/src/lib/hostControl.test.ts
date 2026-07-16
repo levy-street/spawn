@@ -689,6 +689,84 @@ describe("HostControlClient", () => {
     client.close();
   });
 
+  test("accepts only the bounded late read window after cancellation and keeps the channel usable", async () => {
+    const { client, pc } = await readyClient();
+    const reading = client.readFile("/private/late.txt");
+    const request = JSON.parse(pc.channel.sent.at(-1));
+    const sha256 = "9c56cc51b374c3ba189210d5b6d4bf57790d351c96c47c02190ecf1e430635ab";
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          stream_id: "late-read",
+          path: "/private/late.txt",
+          name: "late.txt",
+          length: 8,
+          sha256,
+        },
+      }),
+    );
+    const read = await reading;
+    await read.stream.cancel("destination failed");
+    expect(framesOf(pc.channel, "stream.cancel")).toContainEqual(
+      expect.objectContaining({ stream_id: "late-read" }),
+    );
+
+    for (const [sequence, byte] of [..."abcdefgh"].entries()) {
+      pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "stream.chunk",
+          stream_id: "late-read",
+          sequence,
+          bytes_b64: btoa(byte),
+        }),
+      );
+    }
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.end",
+        stream_id: "late-read",
+        length: 8,
+        sha256,
+      }),
+    );
+    expect(pc.channel.closed).toBe(false);
+
+    const ping = client.ping();
+    const pingRequest = JSON.parse(pc.channel.sent.at(-1));
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: pingRequest.request_id,
+        ok: true,
+        result: { pong: true },
+      }),
+    );
+    await expect(ping).resolves.toEqual({ pong: true });
+    client.close();
+  });
+
+  test("still closes on an unknown or replayed stream after cancellation drain", async () => {
+    const { client, pc } = await readyClient();
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "unknown-stream",
+        sequence: 0,
+        bytes_b64: btoa("x"),
+      }),
+    );
+    expect(pc.channel.closed).toBe(true);
+    client.close();
+  });
+
   test("declares and commits a chunked verified write", async () => {
     const { client, pc } = await readyClient();
     const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";

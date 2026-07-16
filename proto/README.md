@@ -587,7 +587,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -637,6 +637,16 @@ frames use their own 64-frame queue. Hash/send jobs run outside the callback
 under an eight-task semaphore, so a sender waiting for its window cannot block
 its own ACK or cancellation. It hashes before and during the read; a mutation
 produces `stream.error` rather than a valid end.
+
+Every received frame is stamped with a session-local arrival ordinal before it
+enters either queue. A fast cancellation records that cutoff, so an earlier
+ordered chunk/end already waiting in the normal queue is validated and drained
+without resurrecting the cancelled write; a later, duplicate, unknown, or
+cross-session frame still fails closed. The browser applies the equivalent
+bounded tombstone to at most the eight already-authorized read chunks and their
+terminal frame. Tombstones expire and have fixed session-local cardinality
+limits. Completed/cancelled writes are maintained by one session-owned reaper,
+not one sleeper task per stream; it is tracked and drained on channel close.
 Writes start with `fs.write.begin` payload
 `{dir,name,length,sha256,overwrite?}`, then the browser sends the same chunk and
 end shapes. The daemon rejects wrong sequence/length/hash, writes a unique temp

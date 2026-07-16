@@ -11,9 +11,12 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 500;
 const STREAM_CHUNK_BYTES = 8 * 1024;
+const STREAM_WINDOW_CHUNKS = 8;
 const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
 const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
+const MAX_STREAM_TOMBSTONES = 256;
+const STREAM_TOMBSTONE_TTL_MS = 120_000;
 export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
 export class HostControlError extends Error {
@@ -77,6 +80,16 @@ interface IncomingStream {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+interface CancelledIncomingStream {
+  nextSequence: number;
+  maxSequenceExclusive: number;
+  received: number;
+  expectedLength: number;
+  expectedSha256: string;
+  hash: Sha256;
+  expiresAt: number;
+}
+
 interface OutgoingStream {
   resolve: (path: string) => void;
   reject: (error: Error) => void;
@@ -133,6 +146,7 @@ export class HostControlClient {
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
+  private cancelledIncomingStreams = new Map<string, CancelledIncomingStream>();
   private outgoingStreams = new Map<string, OutgoingStream>();
   private listeners = new Set<(state: HostControlState) => void>();
 
@@ -372,6 +386,10 @@ export class HostControlClient {
         cancel: () => {
           const current = this.incomingStreams.get(streamId);
           if (current) clearTimeout(current.timer);
+          if (current && !this.rememberIncomingCancellation(streamId, current)) {
+            this.failRtc();
+            return;
+          }
           this.incomingStreams.delete(streamId);
           this.cancelStream(streamId);
         },
@@ -800,11 +818,17 @@ export class HostControlClient {
       }
       if (message.type === "stream.chunk") {
         const incoming = this.incomingStreams.get(message.stream_id);
-        if (
-          !incoming ||
-          message.sequence !== incoming.nextSequence ||
-          typeof message.bytes_b64 !== "string"
-        ) {
+        if (!incoming) {
+          const accepted = this.acceptCancelledIncomingChunk(
+            message.stream_id,
+            message.sequence,
+            message.bytes_b64,
+          );
+          if (accepted === true) return;
+          this.failRtc(sessionId);
+          return;
+        }
+        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {
           this.failRtc(sessionId);
           return;
         }
@@ -833,6 +857,12 @@ export class HostControlClient {
       if (message.type === "stream.end") {
         const incoming = this.incomingStreams.get(message.stream_id);
         if (!incoming) {
+          const accepted = this.acceptCancelledIncomingEnd(
+            message.stream_id,
+            message.length,
+            message.sha256,
+          );
+          if (accepted === true) return;
           this.failRtc(sessionId);
           return;
         }
@@ -876,6 +906,8 @@ export class HostControlClient {
           incoming.controller.error(error);
           return;
         }
+        this.pruneIncomingTombstones();
+        if (this.cancelledIncomingStreams.delete(message.stream_id)) return;
         const outgoing = this.outgoingStreams.get(message.stream_id);
         if (outgoing) {
           this.outgoingStreams.delete(message.stream_id);
@@ -973,10 +1005,92 @@ export class HostControlClient {
     }
   }
 
+  private pruneIncomingTombstones(): void {
+    const now = Date.now();
+    for (const [streamId, tombstone] of this.cancelledIncomingStreams) {
+      if (tombstone.expiresAt <= now) this.cancelledIncomingStreams.delete(streamId);
+    }
+  }
+
+  private rememberIncomingCancellation(streamId: string, incoming: IncomingStream): boolean {
+    this.pruneIncomingTombstones();
+    if (
+      !this.cancelledIncomingStreams.has(streamId) &&
+      this.cancelledIncomingStreams.size >= MAX_STREAM_TOMBSTONES
+    ) {
+      return false;
+    }
+    this.cancelledIncomingStreams.set(streamId, {
+      nextSequence: incoming.nextSequence,
+      maxSequenceExclusive: incoming.acknowledged + STREAM_WINDOW_CHUNKS,
+      received: incoming.received,
+      expectedLength: incoming.expectedLength,
+      expectedSha256: incoming.expectedSha256,
+      hash: incoming.hash,
+      expiresAt: Date.now() + STREAM_TOMBSTONE_TTL_MS,
+    });
+    return true;
+  }
+
+  private acceptCancelledIncomingChunk(
+    streamId: string,
+    sequence: unknown,
+    encoded: unknown,
+  ): boolean | null {
+    this.pruneIncomingTombstones();
+    const tombstone = this.cancelledIncomingStreams.get(streamId);
+    if (!tombstone) return null;
+    if (
+      sequence !== tombstone.nextSequence ||
+      tombstone.nextSequence >= tombstone.maxSequenceExclusive ||
+      typeof encoded !== "string"
+    ) {
+      return false;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = base64ToBytes(encoded);
+    } catch {
+      return false;
+    }
+    if (
+      bytes.byteLength === 0 ||
+      bytes.byteLength > STREAM_CHUNK_BYTES ||
+      tombstone.received + bytes.byteLength > tombstone.expectedLength
+    ) {
+      return false;
+    }
+    tombstone.nextSequence += 1;
+    tombstone.received += bytes.byteLength;
+    tombstone.hash.update(bytes);
+    return true;
+  }
+
+  private acceptCancelledIncomingEnd(
+    streamId: string,
+    length: unknown,
+    sha256: unknown,
+  ): boolean | null {
+    this.pruneIncomingTombstones();
+    const tombstone = this.cancelledIncomingStreams.get(streamId);
+    if (!tombstone) return null;
+    this.cancelledIncomingStreams.delete(streamId);
+    return (
+      length === tombstone.expectedLength &&
+      tombstone.received === tombstone.expectedLength &&
+      sha256 === tombstone.expectedSha256 &&
+      tombstone.hash.digestHex() === tombstone.expectedSha256
+    );
+  }
+
   private resetIncomingTimeout(streamId: string, incoming: IncomingStream): void {
     clearTimeout(incoming.timer);
     incoming.timer = setTimeout(() => {
       if (this.incomingStreams.get(streamId) !== incoming) return;
+      if (!this.rememberIncomingCancellation(streamId, incoming)) {
+        this.failRtc();
+        return;
+      }
       this.incomingStreams.delete(streamId);
       this.cancelStream(streamId);
       incoming.controller.error(new HostControlError("stream_timeout", "File read timed out"));
@@ -1058,6 +1172,7 @@ export class HostControlClient {
       clearTimeout(incoming.timer);
       incoming.controller.error(streamError);
     }
+    this.cancelledIncomingStreams.clear();
     for (const [streamId, outgoing] of this.outgoingStreams) {
       this.outgoingStreams.delete(streamId);
       clearTimeout(outgoing.timer);

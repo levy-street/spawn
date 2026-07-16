@@ -3672,6 +3672,7 @@ mod tests {
         assert_eq!(hello["limits"]["normal_queue"], 64);
         assert_eq!(hello["limits"]["fast_queue"], 64);
         assert_eq!(hello["limits"]["long_tasks"], 8);
+        assert_eq!(hello["limits"]["write_reapers"], 1);
         assert_eq!(hello["limits"]["directory_entries"], 1024);
         assert!(
             tokio::time::timeout(Duration::from_millis(250), messages_rx.recv())
@@ -3774,6 +3775,126 @@ mod tests {
                 .unwrap(),
             upload,
         );
+
+        let cancelled_write = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-active-write-cancel",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "cancelled-write.bin",
+                "length": 2,
+                "sha256": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let cancelled_write_id = cancelled_write["result"]["stream_id"].as_str().unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": cancelled_write_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"a"),
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": cancelled_write_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let after_active_cancel = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-after-active-write-cancel",
+            "ping",
+            json!({}),
+        )
+        .await;
+        assert_eq!(after_active_cancel["result"]["pong"], true);
+        assert!(!file_root.path().join("cancelled-write.bin").exists());
+
+        let backlog_bytes = vec![b'z'; 24];
+        let backlog_hash = format!("{:x}", Sha256::digest(&backlog_bytes));
+        let backlog_write = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-backlog-write-cancel",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "backlog-write.bin",
+                "length": backlog_bytes.len(),
+                "sha256": backlog_hash,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let backlog_stream_id = backlog_write["result"]["stream_id"].as_str().unwrap();
+        for (sequence, byte) in backlog_bytes.iter().enumerate() {
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.chunk",
+                        "stream_id": backlog_stream_id,
+                        "sequence": sequence,
+                        "bytes_b64": STANDARD.encode([*byte]),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": backlog_stream_id,
+                    "length": backlog_bytes.len(),
+                    "sha256": backlog_hash,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.cancel",
+                    "stream_id": backlog_stream_id,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut after_backlog_cancel = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-after-backlog-cancel",
+            "ping",
+            json!({}),
+        )
+        .await;
+        while after_backlog_cancel["request_id"] != "e2e-after-backlog-cancel" {
+            after_backlog_cancel = receive_host_control(&mut messages_rx).await.1;
+        }
+        assert_eq!(after_backlog_cancel["result"]["pong"], true);
 
         let read_started = request_host_control(
             accepted_channel,
@@ -3950,6 +4071,55 @@ mod tests {
         }
         assert!(!file_root.path().join("renamed.txt").exists());
         assert!(!file_root.path().join("folder").exists());
+
+        let empty_hash = format!("{:x}", Sha256::digest([]));
+        for index in 0..64 {
+            let request_id = format!("e2e-write-churn-{index}");
+            let name = format!("write-churn-{index}.bin");
+            let started = request_host_control(
+                accepted_channel,
+                &mut messages_rx,
+                &request_id,
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": name,
+                    "length": 0,
+                    "sha256": empty_hash,
+                    "overwrite": false,
+                }),
+            )
+            .await;
+            let stream_id = started["result"]["stream_id"].as_str().unwrap();
+            accepted_channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.end",
+                        "stream_id": stream_id,
+                        "length": 0,
+                        "sha256": empty_hash,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let (_, committed) = receive_host_control(&mut messages_rx).await;
+            assert_eq!(committed["type"], "stream.committed");
+            assert_eq!(committed["stream_id"], stream_id);
+        }
+        assert_eq!(
+            std::fs::read_dir(file_root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".spawn-upload-"))
+                .count(),
+            0,
+            "rapid write churn must not retain upload temporaries",
+        );
 
         let closing = request_host_control(
             accepted_channel,
