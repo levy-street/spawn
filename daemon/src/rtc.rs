@@ -1444,6 +1444,21 @@ mod tests {
         ctl_messages: mpsc::Receiver<(bool, Vec<u8>)>,
     }
 
+    async fn close_test_peer(pc: &Arc<RTCPeerConnection>) {
+        if let Err(error) = pc.close().await {
+            // The server peer is closed first in these cleanup paths.  The
+            // webrtc crate can race the corresponding SCTP shutdown and report
+            // this specific reset error even though the remote close already
+            // completed successfully.
+            assert!(
+                error
+                    .to_string()
+                    .contains("sending reset packet in non-Established state"),
+                "closing RTC test peer failed: {error}"
+            );
+        }
+    }
+
     async fn connect_rtc_session(
         sessions: &RtcSessions,
         registry: &AgentRegistry,
@@ -1873,12 +1888,12 @@ mod tests {
             }
         }
         sessions.close("rtc-second", "generation", agent_id).await;
-        second.pc.close().await.unwrap();
+        close_test_peer(&second.pc).await;
         assert_eq!(sessions.resident_session_count().await, 1);
 
         sessions.close("rtc-real", "generation", agent_id).await;
         assert_eq!(sessions.resident_session_count().await, 0);
-        client.pc.close().await.unwrap();
+        close_test_peer(&client.pc).await;
         tokio::time::timeout(Duration::from_secs(3), async {
             while sessions.controls.contains_viewer(agent_id, &viewer).await
                 || control.direct_sink_offset(&viewer).await.is_some()
@@ -1910,7 +1925,7 @@ mod tests {
         .expect("stalled RTC PTY viewer was not disconnected");
         stall_gate.notify_one();
         sessions.close("rtc-stalled", "generation", agent_id).await;
-        stalled.pc.close().await.unwrap();
+        close_test_peer(&stalled.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
         worker.abort();
     }
@@ -2005,9 +2020,9 @@ mod tests {
         }
 
         sessions.close("worker-second", "launch", agent_id).await;
-        second.pc.close().await.unwrap();
+        close_test_peer(&second.pc).await;
         sessions.close("worker-first", "launch", agent_id).await;
-        first.pc.close().await.unwrap();
+        close_test_peer(&first.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
 
         // Simulate a supervisor restart: invalidate and drain the old RTC
@@ -2051,7 +2066,7 @@ mod tests {
             "adopted replay lost pre-adoption output"
         );
         sessions.close("worker-adopted", "adopt", agent_id).await;
-        reconnected.pc.close().await.unwrap();
+        close_test_peer(&reconnected.pc).await;
 
         // Stall the first outbound PTY send, then drive real worker output
         // until the bounded direct queue evicts this RTC viewer. The earlier
@@ -2107,7 +2122,7 @@ mod tests {
         .expect("real worker stalled viewer was not evicted");
         stall_gate.notify_one();
         sessions.close("worker-stalled", "adopt", agent_id).await;
-        stalled.pc.close().await.unwrap();
+        close_test_peer(&stalled.pc).await;
 
         let mut catchup =
             connect_rtc_session(&sessions, &registry, agent_id, "worker-catchup", "adopt").await;
@@ -2149,7 +2164,7 @@ mod tests {
             );
         }
         assert_eq!(sessions.resident_session_count().await, 0);
-        catchup.pc.close().await.unwrap();
+        close_test_peer(&catchup.pc).await;
 
         // A fresh signaling attempt after exit fails before any peer can be
         // inserted for the now-tombstoned generation.
