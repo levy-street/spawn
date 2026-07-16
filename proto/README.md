@@ -520,6 +520,11 @@ UUID and binds every response/chunk to its caller:
 {"version":1,"kind":"request","request_id":"uuid","operation":"redraw"}
 ```
 
+History and snapshot currently support styled terminal replay only
+(`plain:false`). A `plain:true` request fails closed with
+`error.code="plain_replay_unsupported"`; the daemon does not relabel ANSI replay
+as plain text.
+
 The daemon clamps the protocol surface by rejecting, rather than silently
 changing, invalid values: history/snapshot is 1–10,000 lines, geometry is
 20–400 columns by 5–200 rows, and scroll is a non-zero delta from -200 to 200.
@@ -552,8 +557,13 @@ Each binary chunk is at most 48 KiB of payload:
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
-The worker replay source is capped at 8 MiB; the control envelope retains a
-12 MiB hard rejection ceiling.
+The worker uses an 8 MiB conservative total resource charge by default. It
+includes exact ciphertext/framing bytes, twice the complete replay
+representation, and retained log/path bookkeeping. Replay returns only whole
+segments and fails if the newest complete segment does not fit the requested
+response budget. An append/checkpoint admission failure disables replay for
+that live worker rather than returning partial history; live PTY forwarding
+continues. The control envelope retains a separate 12 MiB hard rejection ceiling.
 
 `spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
 between them. Replay metadata therefore carries `pty_offset`, the exact

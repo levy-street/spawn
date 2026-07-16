@@ -53,7 +53,8 @@
   - `spawnd logout` — wipes stored token.
   - `spawnd status` — prints connection / agent state.
 - **Process model**: each agent runs inside a mandatory per-agent
-  `spawn-worker`, which owns its PTY and encrypted-at-rest bounded scrollback.
+  `spawn-worker`, which owns its PTY, plaintext current-screen checkpoint grid,
+  and encrypted-at-rest resource-budgeted scrollback.
   Workers survive `spawnd` crashes/restarts and are adopted over Unix sockets;
   see `SESSIOND.md` and the cutover ADR in `TMUX_REMOVAL.md`.
 - **Agent environment**: the daemon launches the agent under the host user's
@@ -64,8 +65,10 @@
   On reconnect, sends a `register` frame with `existing_agents: [...]` so the
   server resyncs its routing map without killing session workers.
 - **Data ownership (target, TRUST.md Phase 2)**: the live worker is the source
-  of bounded replay, using encrypted-at-rest rolling segments and an ephemeral
-  key; this is not a durable transcript archive. Browsers fetch history over
+  of resource-budgeted replay, using encrypted-at-rest rolling segments and an
+  ephemeral key. The conservative total charge covers ciphertext/framing,
+  replay/scratch, and retained bookkeeping; this is not a durable transcript
+  archive. Browsers fetch history over
   the DataChannel at attach. The server keeps no copy.
 
 ### `spawn-web` — Next.js 15 PWA

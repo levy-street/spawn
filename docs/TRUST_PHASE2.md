@@ -107,12 +107,16 @@ server-bound `rtc_session_id` correlation collapses once both live and
 backfill use the peer connection. An endpoint-only PTY byte anchor remains
 necessary: separate ordered DataChannels do not share a total order.
 
-This increment reuses the worker's actual bounded history; it does not add a
-durable daemon transcript archive. The worker keeps an encrypted-at-rest
-rolling log with an 8 MiB plaintext default, deletes whole oldest segments
-beyond the budget, and retains its key only in the live worker process.
-Acceptance covers its retention boundary, replay after `spawnd` restart/adoption,
-and history becoming unavailable after the underlying worker exits.
+This increment reuses the worker's actual resource-budgeted history; it does
+not add a durable daemon transcript archive. The worker keeps an
+encrypted-at-rest rolling log with an 8 MiB conservative total resource charge
+by default: exact ciphertext/framing, twice the replay representation, and
+retained log/path bookkeeping. It removes whole oldest segments before new
+admission and rejects a checkpoint that cannot fit by itself. The key remains
+only in the live worker process. An append/checkpoint admission failure destroys
+and disables replay while live output continues. Acceptance covers its
+retention boundary, replay after `spawnd` restart/adoption, and history becoming
+unavailable after the underlying worker exits.
 Browser-side history beyond those bounds is not a server backup and is outside
 the reconnect guarantee.
 

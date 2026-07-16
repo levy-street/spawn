@@ -40,26 +40,31 @@ everything else.
    touches the control plane: the worker protocol runs on a unix socket in a
    `0700` directory on the user's own host; live PTY bytes leave the host
    only over WebRTC DataChannels (DTLS peer-to-peer; TURN relays ciphertext).
-2. **Terminal emulation for rendering lives in the browser.** xterm.js in
-   `web/` is the only emulator whose grid a human ever sees. The worker holds
-   a *headless checkpoint emulator* (`sessiond/emulator.rs`, alacritty's
-   `Term` core plus an owned ANSI serializer) fed from the PTY read path —
-   used exclusively to synthesize segment checkpoints and never in the live
-   byte path. This is a deliberate revision of the original "workers are byte
-   pipes" rule: the byte-pipe design needed a SIGWINCH jiggle to provoke
-   checkpoint repaints from the app, which disturbed the agent, stacked
-   duplicate frames into scrollback on every rotation, and made checkpoint
-   quality depend on each app's WINCH behavior. The emulator's fidelity is a
-   tested contract (`feed → serialize → re-feed ⇒ identical state`), not an
-   assumption.
+2. **User-facing terminal rendering lives in the browser.** xterm.js in
+   `web/` owns the grid a human sees. The worker also holds a *headless
+   checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
+   an owned ANSI serializer) fed from the PTY read path. Its current primary
+   and alternate-screen grids are plaintext state resident for the worker's
+   lifetime, bounded by the active terminal geometry; it keeps no deep
+   scrollback. It is used to synthesize encrypted segment checkpoints and
+   never transforms the live forwarded bytes. This is a deliberate revision
+   of the original "workers are byte pipes" rule: the byte-pipe design needed
+   a SIGWINCH jiggle to provoke checkpoint repaints from the app, which
+   disturbed the agent, stacked duplicate frames into scrollback on every
+   rotation, and made checkpoint quality depend on each app's WINCH behavior.
+   The emulator's fidelity is a tested contract (`feed → serialize → re-feed
+   ⇒ identical state`), not an assumption.
 3. **Raw PTY bytes in the live path, end-to-end.** Live output is forwarded
    byte-for-byte, unparsed. Scrollback is the raw output stream plus typed
-   CHECKPOINT/RESIZE records; replay is "feed the same bytes to the same
-   emulator, opening from a serialized screen at a known geometry."
+   CHECKPOINT records containing geometry and serialized screen state; replay
+   is "feed the same bytes to the same emulator, opening from a serialized
+   screen at a known geometry."
 4. **One process per agent.** Crash isolation, per-agent keys, per-agent
    lifecycle, no shared mux server.
-5. **Honest crypto claims.** Encrypted-at-rest scrollback minimizes plaintext
-   *residency*; it does not and cannot mean "encrypted before DRAM" (§6.3).
+5. **Honest crypto claims.** Encrypted-at-rest scrollback protects the segment
+   files. It does not mean "encrypted before DRAM": the PTY path, checkpoint
+   grid, checkpoint serialization, replay, and forwarding all require
+   plaintext in host memory (§6.3).
 
 ## 3. Process model
 
@@ -91,9 +96,10 @@ spawnd (host supervisor, one per host)
   upgraded, or being restarted leaves workers and their agents running.
   Deployment note: under systemd, spawnd's unit needs `KillMode=process`
   or workers get killed with the cgroup on `systemctl restart`.
-- Worker runtime cost is small by construction (a tokio runtime pinned to 2
-  threads, two blocking PTY I/O threads, no grid state), so "a fleet of
-  workers" scales with agent count the way `cat` would.
+- Worker runtime cost is scoped per agent: a tokio runtime pinned to 2 threads,
+  two blocking PTY I/O threads, and headless primary/alternate screen grids
+  whose size follows the current terminal geometry. It does not retain a
+  session-length plaintext grid history.
 
 ### Filesystem layout
 
@@ -137,7 +143,7 @@ guessed at.
 | `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); forces a log checkpoint at the new geometry |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
-| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = total output bytes logged at capture |
+| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = cumulative lifetime output bytes logged at capture, including output no longer retained |
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?}` | signal the agent's process group (TERM/KILL/INT/HUP/QUIT) |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
@@ -165,7 +171,7 @@ spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
 spawnd: per-agent outbox → forwarder ──→ DataChannel direct sinks (per viewer)
                                     └──→ WS sink (legacy v1 relay only)
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
-browser: xterm.js — the only terminal emulator in the system
+browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
 `pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
@@ -201,21 +207,40 @@ u32 LE ciphertext_len | u8 kind | u64 LE seq | ciphertext (AEAD, 16-byte tag)
   spliced between kinds without detection. Any authentication or sequence
   failure **fails the whole replay closed** (and zeroizes the partial
   plaintext) rather than returning a best-effort screen.
-- **Kinds**: `OUTPUT` (raw PTY bytes) and `CHECKPOINT` (empty marker record
-  opening every segment; §8.1).
+- **Kinds**: `OUTPUT` (raw PTY bytes) and `CHECKPOINT` (geometry plus an
+  emulator-serialized ANSI repaint opening every segment; §8.1). The
+  checkpoint payload is encrypted like output and its disk/replay footprint is
+  charged to the same total resource budget.
 
 ### 6.2 Encrypt-on-read, bounded growth
 
-Output is encrypted **the moment it leaves the PTY read path** — the worker's
-main loop logs the chunk first, then forwards it live, then zeroizes the
-buffer. Plaintext is never written to disk (unit-tested by grepping segment
-files for a marker; `plaintext_never_hits_disk`).
+Each output chunk is fed into the checkpoint emulator and then encrypted before
+any scrollback write. The worker subsequently forwards the same plaintext
+chunk live and wipes its owned buffer. This is an encrypt-before-disk property,
+not encryption at the PTY/DRAM boundary. Plaintext is never written to segment
+files (unit-tested by grepping them for a marker;
+`plaintext_never_hits_disk`).
 
-Growth is bounded by two knobs (`--segment-bytes`, default 256 KiB plaintext
-per segment; `--max-log-bytes`, default 8 MiB total): when the budget is
-exceeded, whole oldest segments are unlinked — never partial records, never
-the newest segment. Replay cost is therefore O(budget), not O(session
-lifetime).
+Growth is controlled by two knobs. `--segment-bytes` defaults to 256 KiB of
+additional charged record bytes beyond the segment checkpoint before rotation
+is due. `--max-log-bytes` defaults to an 8 MiB conservative total scrollback
+resource budget. Operators/tests may lower that value; values above the
+compiled 8 MiB upper bound are rejected. The charge includes exact retained
+ciphertext and record framing, twice each segment's replay representation (one
+returned buffer plus one decryption/framing scratch allowance), and the log's
+retained `Vec`/path bookkeeping. Before admitting a record the log removes
+whole oldest segments; it never returns a partial segment. A checkpoint that
+cannot fit by itself is rejected before its file is created. If an append or
+checkpoint cannot preserve those invariants, the worker destroys and disables
+its replay log but continues live output; subsequent replay is unavailable
+rather than partial or over-budget.
+
+The 8 MiB value is therefore neither "8 MiB of plaintext output" nor an exact
+measurement of process RSS. It is a hard ceiling on this deliberately
+conservative charge model, including checkpoint/grid serialization in replay
+form and bounded transient replay plaintext. The live emulator grid is a
+separate, geometry-bounded resident allocation (§6.3). The `spawn.ctl` layer
+also retains its independent 12 MiB response rejection ceiling.
 
 ### 6.3 Memory hygiene — what is and isn't guaranteed
 
@@ -227,26 +252,37 @@ lifetime).
   **zeroized on drop**. mlock failure (e.g. `RLIMIT_MEMLOCK=0` containers) is
   logged, not fatal: the at-rest encryption stands; only the key's
   swap-residency guarantee weakens.
-- Plaintext PTY buffers are zeroized after each hop: the worker's read chunks
-  after log+forward, the PTY reader/writer thread scratch buffers, stdin
-  chunks after write, replay buffers (worker side) after send.
+- Owned plaintext is explicitly wiped on drop across the implemented handoff:
+  worker PTY read chunks and reader/writer scratch, queued input and worker
+  frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
+  owned `OutputChunk` bytes are wiped on drop, and direct RTC PTY/control send
+  source buffers use zeroizing guards. Direct-viewer queues are bounded.
 
 **Not covered — stated plainly, per TRUST.md's "honest inventory" ethos:**
 - Plaintext **must** transit worker memory: kernel PTY buffers → userspace
   read buffer → AEAD input. There is no such thing as "encrypted before
   DRAM" on this path, and we do not claim it.
+- The headless emulator retains semantic plaintext for the current primary and
+  alternate screen, cursor, modes, and auxiliary terminal state for the
+  worker's lifetime. That state scales with terminal geometry and has no deep
+  history, but it is not transient. A serialized checkpoint and decrypted
+  replay are additional transient plaintext buffers. The scrollback admission
+  charge accounts conservatively for retained disk records, the returned
+  replay, and decryption/framing scratch within its 8 MiB default; the
+  control-channel response ceiling is an independent outer bound.
 - Kernel-side copies (PTY line discipline, unix socket buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
-- spawnd itself handles plaintext in flight (outbox → DataChannel). Those
-  buffers are not currently zeroized; they are transient. Phase-2 hardening
-  can extend `wipe` discipline into the forwarder if it proves worth the
-  churn.
-- The guarantee is **minimal plaintext residency on the user's own host** —
-  the same host where the agent itself runs in plaintext by definition. The
-  threat this addresses is *disk* residue (backups, stolen disks, forensic
-  carving, swap, core dumps), not a live root-level attacker on the host,
-  which TRUST.md places out of scope (a compromised host sees everything
-  regardless).
+- spawnd still handles plaintext in flight (outbox → WS mirror/DataChannel).
+  The shared outbox and pending legacy WS mirror remain unbounded, and copies
+  inside unix/WebRTC/DTLS stacks are not covered by the owned-buffer wiping.
+  The implementation therefore does not claim a global hard bound or complete
+  zeroization of in-flight plaintext memory yet.
+- The guarantee here is **ciphertext-only scrollback segment files on the
+  user's own host**, with best-effort wiping of transient buffers — not the
+  absence of plaintext host memory. The threat this addresses is *disk*
+  residue (backups, stolen disks, forensic carving, swap, core dumps), not a
+  live root-level attacker on the host, which TRUST.md places out of scope (a
+  compromised host sees everything regardless).
 
 ## 7. Key management for scrollback-at-rest
 
@@ -283,18 +319,19 @@ geometry** (replacing the active segment in place when it holds no output
 yet, so resize storms rewrite one small file instead of growing the log);
 every segment is therefore single-geometry and self-contained.
 
-Replay returns the newest run of whole segments fitting the caller's budget
-as a **self-describing stream of geometry-tagged chunks**: each included
-segment contributes `CSI 8 ; rows ; cols t` + its checkpoint repaint + its
+Replay selects the newest run of whole segments whose complete replay
+representation fits the caller's `max_bytes`. If the newest complete segment
+does not fit, replay fails instead of returning a partial segment. The result
+is a **self-describing stream of geometry-tagged chunks**: each included
+segment contributes `CSI 8 ; rows ; cols t`, its checkpoint repaint, and its
 output. Checkpoint repaints are idempotent (leading `?1049l`, full-row
-painting, no ED), so mid-stream chunks converge rather than duplicate, and
-the final chunk alone reconstructs the current screen at the current
-geometry. The browser exploits both properties (`parseExactReplay` in
-`Terminal.tsx`): the **live terminal is seeded from the final chunk with
-zero resize calls** — it is fit-sized and must never be geometry-walked —
-while the display-only scrollback overlay renders every chunk at its own
-geometry via sequenced `term.resize()` (xterm.js parses but does not
-implement CSI 8 t itself).
+painting, no ED), so mid-stream chunks converge rather than duplicate, and the
+final chunk alone reconstructs the current screen at the current geometry. The
+browser exploits both properties (`parseExactReplay` in `Terminal.tsx`): the
+**live terminal is seeded from the final chunk with zero resize calls** — it is
+fit-sized and must never be geometry-walked — while the display-only scrollback
+overlay renders every chunk at its own geometry via sequenced `term.resize()`
+(xterm.js parses but does not implement CSI 8 t itself).
 
 The original design used checkpoint *markers* plus a SIGWINCH jiggle to
 provoke repaints from the app. That was retired: it duplicated full frames in
@@ -327,12 +364,18 @@ provoke.
 ### 8.3 Replay and viewer seeding
 
 `T_REPLAY_REQ(max_bytes)` → `T_REPLAY(watermark ‖ bytes)`. The watermark is
-the cumulative count of output bytes logged at capture time. spawnd's
+the cumulative lifetime count of output bytes logged at capture time; it is a
+monotonic source coordinate, not the size of the retained replay tail. spawnd's
 snapshot handler (`handle_agent_snapshot`, worker branch) samples the
 requesting viewer's DataChannel byte offset *before* issuing the replay;
 because the worker logs before forwarding, everything counted at that offset
 is guaranteed to be covered by the replay, and the browser can drop already
 seen live bytes deterministically using `dc_offset`.
+
+`spawn.ctl` history/snapshot exposes this as styled terminal replay only:
+clients send `plain:false`. A `plain:true` request fails closed with
+`plain_replay_unsupported`; ANSI checkpoint/output bytes are never mislabeled
+as plain text.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
@@ -357,11 +400,16 @@ is accepted from whichever peer the control model lets type. There is no
 daemon-side copy-mode or per-keystroke subprocess check. Client-side
 scrollback/selection lives in xterm.js.
 
-**Flow control / backpressure — current, honest status.** The worker→spawnd
-socket write applies natural backpressure to the worker's forwarding loop
-(logging is unaffected). The spawnd outbox is unbounded, but each direct viewer
-sink is bounded; a lagging viewer is disconnected and must reconnect/re-seed
-from the worker replay watermark. The replay log itself remains budgeted.
+**Flow control / backpressure — current, honest status.** The PTY reader's
+handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
+each. The worker logs and forwards each chunk it consumes. If the supervisor
+socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
+PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
+queue. Downstream, the shared spawnd outbox is still unbounded, but each direct
+viewer sink is bounded; a lagging viewer is disconnected and must
+reconnect/re-seed from the worker replay watermark. The replay log uses the
+conservative total resource budget described in §6.2, including checkpoint
+and framing charges.
 
 ## 10. Crash isolation, restart, upgrades
 
@@ -403,24 +451,26 @@ the same checkpoint. They are absent from daemon runtime structs as well.
 |---|---|---|---|---|
 | Language | Rust | Rust | Rust | Rust |
 | Model | one daemon, N named sessions | one mux server, own client protocol | one server per session group, plugin runtime | **one process per agent** |
-| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core); live path is raw bytes, rendering is xterm.js only** |
+| Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core, plaintext current-screen grids); live path is raw bytes, user-facing rendering is xterm.js** |
 | Reattach story | replays restore buffer | grid sync | grid sync | encrypted geometry-tagged byte replay opening with an emulator-serialized checkpoint (the iTerm2 restoration model, encrypted at rest) |
-| Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key, zeroized buffers** |
+| Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key; transient owned replay buffers wiped, plaintext current grids disclosed above** |
 | Crash blast radius | all sessions in daemon | all clients of the mux | session group | one agent |
 | Remote transport | ssh | ssh/TLS, own protocol | ssh | WebRTC DataChannel (already existed; unchanged) |
 
 shpool is the closest relative — it also concluded that "session persistence
 without a multiplexer" is the right shape, and its restore-buffer replay is
 the plaintext cousin of our checkpoint replay. We diverge where the operator
-model demands it: per-agent process isolation, encryption at rest, and
-refusing to host any grid state outside the browser. wezterm/zellij solve a
-different problem (rich multiplexing UX) at the cost of being the second
-emulator in the pipe — exactly what §1 is eliminating.
+model demands it: per-agent process isolation, encryption at rest, and keeping
+the worker's plaintext grid state to the current checkpoint screens rather
+than a user-facing or deep-history multiplexer. wezterm/zellij solve a
+different problem (rich multiplexing UX) with a server-side renderer in the
+live path — exactly what §1 is eliminating.
 
 ## 13. Testability
 
-The browser is the only terminal emulator (§2), so terminal-correctness
-testing splits cleanly into two independently-testable layers:
+The browser is the only user-facing terminal renderer, while the worker has a
+headless checkpoint emulator (§2). Terminal-correctness testing therefore
+splits into two independently-testable layers:
 
 **Byte-transport correctness (this design).** The worker/backend guarantee is
 byte-exactness, tested without any emulator: wire framing round-trips and

@@ -246,7 +246,10 @@ test("pane kebab exposes agent actions and restarts the agent", async ({ page })
 
 test("waiting agents surface an attention badge on the screen tab", async ({ page }) => {
   await mockAuthenticatedApi(page, {
-    agents: [agent({ name: "alpha", activity_state: "waiting", activity_label: "Awaiting input" }), agentB],
+    agents: [
+      agent({ name: "alpha", activity_state: "waiting", activity_label: "Awaiting input" }),
+      agentB,
+    ],
     screens: [screen()],
   });
   await page.goto(`/screens/${SCREEN_ID}`);

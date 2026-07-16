@@ -228,7 +228,14 @@ user_token="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 host_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["host_id"])' <<<"$creds")"
 
 printf '%s\n' "smoke-local-browser-live: starting spawnd for host $host_id"
-HOME="$daemon_home" \
+env \
+  -u SPAWN_ACCESS_TOKEN \
+  -u SPAWN_DAEMON_TOKEN \
+  -u SPAWN_HOST_ID \
+  -u SPAWN_SERVER_URL \
+  -u XDG_CONFIG_HOME \
+  HOME="$daemon_home" \
+  SPAWN_CONFIG_DIR="$daemon_home/.config/spawn" \
   SPAWN_DISABLE_KEYRING=1 \
   SPAWND_WORKER_DIR="$worker_dir" \
   daemon/target/debug/spawnd --server "$base_url" run \
@@ -341,13 +348,21 @@ try {
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible({ timeout: 15_000 });
 
   await page.goto(`${webUrl}/agents`);
-  await page.getByRole("button", { name: "New agent" }).click();
-  await expect(page.locator("#agent-host")).not.toHaveValue("", { timeout: 15_000 });
-  await page.locator("#agent-preset").selectOption("");
+  await page
+    .getByRole("main")
+    .getByRole("link", { name: "New agent", exact: true })
+    .click();
+  await expect(page.getByRole("button", { name: /browser-live-host/ })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+    { timeout: 15_000 },
+  );
+  await page.getByRole("button", { name: "Shell shell", exact: true }).click();
   await page.getByLabel("Name").fill("browser live");
-  await page.locator("#agent-cwd").fill(agentCwd);
-  await page.locator("#agent-argv").fill(command);
-  await page.getByRole("button", { name: "Spawn" }).click();
+  await page.getByRole("combobox", { name: "Directory" }).fill(agentCwd);
+  await page.getByRole("button", { name: "Advanced options" }).click();
+  await page.getByLabel("Custom command").fill(command);
+  await page.getByRole("button", { name: "Spawn agent" }).click();
 
   const agentLink = page.getByRole("link", { name: /browser live/i }).first();
   await expect(agentLink).toBeVisible({ timeout: 20_000 });
@@ -441,10 +456,12 @@ try {
   const secondPage = await page.context().newPage();
   await secondPage.goto(`${webUrl}/agents/${agentId}`);
   await expect(secondPage.getByLabel("Agent terminal")).toBeVisible({ timeout: 20_000 });
-  await expect(secondPage.getByRole("button", { name: "Take control" })).toBeVisible({
+  // A newly opened active terminal claims control automatically. The original
+  // viewer becomes dimmed and may explicitly reclaim it.
+  await expect(page.getByRole("button", { name: "Take control" })).toBeVisible({
     timeout: 20_000,
   });
-  await secondPage.getByRole("button", { name: "Take control" }).click();
+  await expect(secondPage.getByRole("button", { name: "Take control" })).toHaveCount(0);
   await secondPage.getByLabel("Agent terminal").click();
   await secondPage.keyboard.type("second");
   await secondPage.keyboard.press("Enter");

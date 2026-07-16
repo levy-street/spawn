@@ -192,13 +192,18 @@ pinned key; browsers refuse sessions with unpinned keys at L1+.
 
 What moves where, and the regressions we accept:
 
-- **Scrollback/replay** → endpoint-owned, bounded worker history rather than
-  a new durable transcript archive. Worker replay uses its encrypted-at-rest rolling log: the
-  default plaintext budget is 8 MiB, whole oldest segments are deleted, and
-  the non-persisted key dies with the worker. The browser fetches the available
-  tail over the DataChannel at attach. A `spawnd` restart can adopt a surviving
-  worker and recover only that retained history; once the worker and its
-  history are gone, replay is unavailable. Server
+- **Scrollback/replay** → endpoint-owned, resource-budgeted worker history
+  rather than a new durable transcript archive. Worker replay uses its
+  encrypted-at-rest rolling log: the default 8 MiB conservative total charge
+  covers exact retained ciphertext/framing, twice the replay representation
+  (return plus scratch allowance), and retained log/path bookkeeping. Whole
+  oldest segments are deleted before admitting new records; a checkpoint that
+  cannot fit by itself is rejected. An admission/checkpoint failure disables
+  and destroys replay for that live worker rather than retaining partial or
+  over-budget history. The non-persisted key dies with the worker. The browser
+  fetches the available tail over the DataChannel at attach. A `spawnd` restart
+  can adopt a surviving worker and recover only that retained history; once the
+  worker and its history are gone, replay is unavailable. Server
   `transcript.py` and the content pubsub path are deleted; any historical Redis
   ring keys are purged.
 - **Offline history** → **accepted regression.** Today the server can
@@ -370,8 +375,9 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   operations exist without a running agent.
 - Use the existing bounded endpoint replay source instead of adding a new
   durable transcript archive: the worker's encrypted rolling scrollback (8 MiB
-  plaintext default, oldest whole segments removed, key held
-  only by the live worker). Browser requests the retained tail over
+  conservative total resource charge by default, whole oldest segments
+  removed before new admission, key held only by the live worker). Browser
+  requests the retained tail over
   `spawn.ctl`; daemon restart/adoption, rotation/retention boundaries, and loss
   after worker exit are acceptance-tested and disclosed.
 - Delete `server/spawn_server/transcript.py`, the content Redis pubsub path, and

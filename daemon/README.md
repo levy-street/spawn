@@ -75,8 +75,9 @@ bytes`, with `0x01` for output (daemon→server) and `0x02` for input
 ## Process model
 
 Each agent runs in a `spawn-worker` process which owns the PTY, encrypted
-bounded replay log, and checkpoint emulator. `spawnd` communicates with it over
-a mode-600 Unix socket. On `Ctrl-C`, `spawnd` closes the WS but does not stop
+resource-budgeted replay log, and plaintext headless checkpoint emulator
+(current screen grids only, no deep history). `spawnd` communicates with it
+over a mode-600 Unix socket. On `Ctrl-C`, `spawnd` closes the WS but does not stop
 workers; the next supervisor discovers and adopts their sockets.
 
 There is one mandatory backend and no environment or per-agent escape hatch.

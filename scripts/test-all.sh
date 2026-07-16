@@ -19,6 +19,7 @@ if [[ -n "$non_executable_scripts" ]]; then
 fi
 
 printf '%s\n' "== worker-only daemon guard =="
+scripts/check-worker-only-daemon.sh --self-test
 scripts/check-worker-only-daemon.sh
 
 printf '%s\n' "== daemon tests =="

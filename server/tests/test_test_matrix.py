@@ -43,6 +43,7 @@ def test_test_all_runs_required_local_smoke_matrix():
         "smoke-local-daemon.sh",
         "smoke-local-browser-live.sh",
         "smoke-service-manager.sh",
+        "check-worker-only-daemon.sh --self-test",
         "bun run test:e2e",
         "bun run build",
         "git diff --check",
