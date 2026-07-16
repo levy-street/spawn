@@ -26,7 +26,6 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use zeroize::Zeroizing;
 
 use crate::agent_ctl::{
     self, AgentControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
@@ -798,7 +797,6 @@ fn install_data_channel_handler(
                                 chunk = direct.receiver.recv() => chunk,
                             };
                             let Some(chunk) = chunk else { break };
-                            let chunk = Zeroizing::new(chunk);
                             #[cfg(test)]
                             if let Some(gate) = pty_send_gate.take() {
                                 gate.notified().await;
@@ -881,7 +879,7 @@ fn install_control_data_channel(
                 },
                 _ = &mut close_rx => None,
             };
-            let Some(message) = message else {
+            let Some(mut message) = message else {
                 break;
             };
             let _callback = send_fence.read().await;
@@ -889,11 +887,10 @@ fn install_control_data_channel(
                 break;
             }
             let send = async {
-                match message {
-                    ControlOutbound::Text(text) => send_dc.send_text(text).await,
+                match &mut message {
+                    ControlOutbound::Text(text) => send_dc.send_text(std::mem::take(text)).await,
                     ControlOutbound::Binary(bytes) => {
-                        let bytes = Zeroizing::new(bytes);
-                        send_dc.send(&Bytes::copy_from_slice(&bytes)).await
+                        send_dc.send(&Bytes::copy_from_slice(bytes)).await
                     }
                 }
             };
@@ -1417,9 +1414,9 @@ mod tests {
     fn insert_test_worker(
         registry: &AgentRegistry,
         agent_id: Uuid,
-    ) -> (AgentBinding, mpsc::UnboundedReceiver<crate::pty::WorkerCmd>) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (outbox_tx, _outbox_rx) = mpsc::unbounded_channel();
+    ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
             cmd_tx,
@@ -1542,10 +1539,11 @@ mod tests {
                     _ => unreachable!(),
                 },
                 outbound = out_rx.recv() => {
-                    let WsOutbound::Json(json) = outbound.expect("RTC signaling closed") else {
+                    let outbound = outbound.expect("RTC signaling closed");
+                    let WsOutbound::Json(json) = &outbound else {
                         continue;
                     };
-                    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                    let value: serde_json::Value = serde_json::from_str(json).unwrap();
                     match value["type"].as_str() {
                         Some("rtc.answer") => {
                             let sdp = value["sdp"].as_str().expect("answer SDP").to_string();
@@ -2182,10 +2180,11 @@ mod tests {
                 status_tx,
             )
             .await;
-        let WsOutbound::Json(status) = status_rx.recv().await.expect("post-exit status") else {
+        let status_message = status_rx.recv().await.expect("post-exit status");
+        let WsOutbound::Json(status) = &status_message else {
             panic!("unexpected binary post-exit status");
         };
-        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        let status: serde_json::Value = serde_json::from_str(status).unwrap();
         assert_eq!(status["type"], "rtc.status");
         assert_eq!(status["status"], "failed");
         assert_eq!(sessions.resident_session_count().await, 0);
@@ -2308,11 +2307,11 @@ mod tests {
         assert_eq!(sessions.resident_session_count().await, 0);
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let WsOutbound::Json(json) = out_rx.recv().await.expect("status channel closed")
-                else {
+                let message = out_rx.recv().await.expect("status channel closed");
+                let WsOutbound::Json(json) = &message else {
                     continue;
                 };
-                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                let value: serde_json::Value = serde_json::from_str(json).unwrap();
                 if value["type"] == "rtc.status" {
                     break value;
                 }
@@ -2506,12 +2505,13 @@ mod tests {
             *writes.lock().unwrap(),
             vec![b"first secret".to_vec(), b"second secret".to_vec()]
         );
-        let WsOutbound::Json(json) = out_rx.try_recv().unwrap() else {
+        let activity_message = out_rx.try_recv().unwrap();
+        let WsOutbound::Json(json) = &activity_message else {
             panic!("expected content-free input activity JSON")
         };
         assert_eq!(
             json,
-            format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
         );
         assert!(!json.contains("secret"));
         assert!(out_rx.try_recv().is_err());

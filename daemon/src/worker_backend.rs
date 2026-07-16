@@ -229,11 +229,11 @@ pub fn discover_ids() -> Vec<Uuid> {
 /// outbox → forwarder, a command channel for stdin/resize/replay/shutdown,
 /// and an exit oneshot.
 fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) -> pty::Launched {
-    let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<pty::OutputChunk>();
+    let (outbox_tx, outbox_rx) = mpsc::channel::<pty::OutputChunk>(pty::WORKER_OUTPUT_QUEUE_DEPTH);
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
 
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WorkerCmd>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(pty::WORKER_COMMAND_QUEUE_DEPTH);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
     let (read_half, write_half) = stream.into_split();
@@ -273,15 +273,15 @@ fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) 
     }
 }
 
-type PendingReplays = std::sync::Arc<
-    std::sync::Mutex<std::collections::VecDeque<oneshot::Sender<Result<(u64, Vec<u8>)>>>>,
->;
+type ReplayWaiter = oneshot::Sender<Result<(u64, Vec<u8>)>>;
+type PendingReplays = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ReplayWaiter>>>;
+const MAX_PENDING_REPLAYS: usize = 8;
 
 /// cmd channel → framed writes. Ends when the handle (and its cmd_tx) is
 /// dropped, which also closes the worker connection's write side.
 async fn run_writer(
     mut write_half: tokio::net::unix::OwnedWriteHalf,
-    mut cmd_rx: mpsc::UnboundedReceiver<WorkerCmd>,
+    mut cmd_rx: mpsc::Receiver<WorkerCmd>,
     pending: PendingReplays,
     alive: Arc<AtomicBool>,
     agent_id: Uuid,
@@ -291,9 +291,8 @@ async fn run_writer(
             break;
         }
         let res = match cmd {
-            WorkerCmd::Input(mut bytes) => {
+            WorkerCmd::Input(bytes) => {
                 let result = wire::write_frame(&mut write_half, wire::T_INPUT, &bytes).await;
-                bytes.zeroize();
                 result
             }
             WorkerCmd::Resize { cols, rows } => {
@@ -305,7 +304,10 @@ async fn run_writer(
                 .await
             }
             WorkerCmd::Replay { max_bytes, resp } => {
-                pending.lock().expect("pending lock").push_back(resp);
+                if let Err(resp) = enqueue_pending_replay(&pending, resp) {
+                    let _ = resp.send(Err(anyhow!("too many pending worker replay requests")));
+                    continue;
+                }
                 wire::write_frame(
                     &mut write_half,
                     wire::T_REPLAY_REQ,
@@ -332,6 +334,18 @@ async fn run_writer(
     fail_pending_replays(&pending);
 }
 
+fn enqueue_pending_replay(
+    pending: &PendingReplays,
+    resp: ReplayWaiter,
+) -> std::result::Result<(), ReplayWaiter> {
+    let mut waiters = pending.lock().expect("pending lock");
+    if waiters.len() >= MAX_PENDING_REPLAYS {
+        return Err(resp);
+    }
+    waiters.push_back(resp);
+    Ok(())
+}
+
 fn fail_pending_replays(pending: &PendingReplays) {
     let mut pending = pending.lock().expect("pending lock");
     while let Some(waiter) = pending.pop_front() {
@@ -342,7 +356,7 @@ fn fail_pending_replays(pending: &PendingReplays) {
 /// framed reads → outbox (output), replay responses, exit report.
 async fn run_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
-    outbox_tx: mpsc::UnboundedSender<pty::OutputChunk>,
+    outbox_tx: mpsc::Sender<pty::OutputChunk>,
     control: ForwarderControl,
     exit_tx: oneshot::Sender<ExitReason>,
     pending: PendingReplays,
@@ -361,7 +375,7 @@ async fn run_reader(
                             watermark,
                             &control,
                         );
-                        if outbox_tx.send(chunk).is_err() {
+                        if outbox_tx.send(chunk).await.is_err() {
                             break;
                         }
                     }
@@ -375,11 +389,16 @@ async fn run_reader(
                 let payload = Zeroizing::new(payload);
                 let waiter = pending.lock().expect("pending lock").pop_front();
                 if let Some(waiter) = waiter {
-                    let result = wire::decode_replay(&payload).map(|(watermark, bytes)| {
-                        let _ = outbox_tx.send(pty::OutputChunk::source_barrier(watermark));
-                        (watermark, bytes.to_vec())
-                    });
-                    let _ = waiter.send(result);
+                    let result = match wire::decode_replay(&payload) {
+                        Ok((watermark, bytes)) => {
+                            let replay = bytes.to_vec();
+                            let barrier = pty::OutputChunk::source_barrier(watermark);
+                            let _ = outbox_tx.send(barrier).await;
+                            Ok((watermark, replay))
+                        }
+                        Err(error) => Err(error),
+                    };
+                    send_replay_result(waiter, result);
                 }
             }
             Ok(Some((wire::T_EXIT, payload))) => {
@@ -430,6 +449,21 @@ async fn run_reader(
     fail_pending_replays(&pending);
 }
 
+fn send_replay_result(
+    waiter: oneshot::Sender<Result<(u64, Vec<u8>)>>,
+    result: Result<(u64, Vec<u8>)>,
+) {
+    if let Err(mut rejected) = waiter.send(result) {
+        wipe_replay_result(&mut rejected);
+    }
+}
+
+fn wipe_replay_result(result: &mut Result<(u64, Vec<u8>)>) {
+    if let Ok((_, bytes)) = result {
+        bytes.zeroize();
+    }
+}
+
 async fn connect_with_retry(socket: &std::path::Path, timeout: Duration) -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -467,6 +501,69 @@ async fn read_hello(stream: &mut UnixStream) -> Result<wire::Hello> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rejected_replay_result_is_zeroized() {
+        let mut result = Ok((7, b"decrypted replay bytes".to_vec()));
+        wipe_replay_result(&mut result);
+        let Ok((_, bytes)) = result else {
+            unreachable!()
+        };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_socket_caps_and_rejects_fast_input() {
+        let agent_id = Uuid::new_v4();
+        let (daemon_stream, worker_stream) = UnixStream::pair().expect("unix pair");
+        let (read_half, write_half) = daemon_stream.into_split();
+        drop(read_half);
+        let (cmd_tx, cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let capacity_probe = cmd_tx.clone();
+        let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = tokio::spawn(run_writer(
+            write_half,
+            cmd_rx,
+            Default::default(),
+            Arc::clone(&alive),
+            agent_id,
+        ));
+        let handle = AgentHandle::new_worker(WorkerHandleParts {
+            agent_id,
+            cmd_tx,
+            alive,
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: ForwarderControl::new(),
+        });
+
+        let input = vec![b'i'; pty::MAX_WORKER_INPUT_BYTES];
+        let mut rejected = None;
+        for _ in 0..10_000 {
+            if let Err(error) = handle.write_stdin(&input) {
+                rejected = Some(error);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let rejected = rejected.expect("stalled worker input never reached the bounded queue");
+        assert!(rejected.to_string().contains("queue full"));
+        assert_eq!(
+            capacity_probe.max_capacity(),
+            pty::WORKER_COMMAND_QUEUE_DEPTH
+        );
+        assert_eq!(capacity_probe.capacity(), 0);
+
+        drop(handle);
+        drop(capacity_probe);
+        drop(worker_stream);
+        tokio::time::timeout(Duration::from_secs(3), writer)
+            .await
+            .expect("stalled writer did not stop")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn worker_output_emits_content_free_activity_without_status_filtering() {
         let agent_id = Uuid::new_v4();
@@ -476,7 +573,7 @@ mod tests {
         let control = ForwarderControl::new();
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
-        let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox_tx, outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let forwarder = tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
         let (exit_tx, _exit_rx) = oneshot::channel();
         let reader = tokio::spawn(run_reader(
@@ -520,7 +617,10 @@ mod tests {
             .expect("worker bin path")
     }
 
-    async fn collect_direct_until(rx: &mut mpsc::Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
+    async fn collect_direct_until(
+        rx: &mut mpsc::Receiver<pty::DirectPayload>,
+        needle: &[u8],
+    ) -> Vec<u8> {
         let mut acc = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {

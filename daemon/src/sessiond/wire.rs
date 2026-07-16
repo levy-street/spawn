@@ -71,7 +71,8 @@ impl Drop for StartSpec {
     fn drop(&mut self) {
         self.cwd.zeroize();
         self.argv.zeroize();
-        for value in self.env.values_mut() {
+        for (mut key, mut value) in std::mem::take(&mut self.env) {
+            key.zeroize();
             value.zeroize();
         }
     }

@@ -36,10 +36,12 @@ everything else.
 
 ## 2. Design principles
 
-1. **The server never sees content** (TRUST.md, the principle). Nothing here
-   touches the control plane: the worker protocol runs on a unix socket in a
-   `0700` directory on the user's own host; live PTY bytes leave the host
-   only over WebRTC DataChannels (DTLS peer-to-peer; TURN relays ciphertext).
+1. **The server-never-sees-content model is the target, not this checkpoint's
+   current claim** (TRUST.md). The new worker protocol itself stays on a unix
+   socket in a `0700` directory, and the browser's low-latency copy travels over
+   WebRTC DataChannels. Until P2-AGENT-02, however, spawnd also mirrors every
+   normally connected agent's output over daemon WS `0x01`; the control plane
+   can relay and persist that plaintext even when the browser negotiated v2.
 2. **User-facing terminal rendering lives in the browser.** xterm.js in
    `web/` owns the grid a human sees. The worker also holds a *headless
    checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
@@ -70,7 +72,7 @@ everything else.
 
 ```
 spawnd (host supervisor, one per host)
- ├── ws/rtc: control plane WS (signaling only) + WebRTC peer connections
+ ├── ws/rtc: signaling/control + legacy PTY mirror; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
@@ -168,8 +170,8 @@ agent process
 spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
   ▼ T_OUTPUT (unix socket, 0700 dir, same host)
-spawnd: per-agent outbox → forwarder ──→ DataChannel direct sinks (per viewer)
-                                    └──→ WS sink (legacy v1 relay only)
+spawnd: bounded per-agent outbox → forwarder ──→ DataChannel direct sinks
+                                            └──→ bounded daemon WS mirror
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
 browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
@@ -179,12 +181,13 @@ routing. `AgentHandle` has one implementation: `write_stdin`, `resize`,
 `replay`, and `shutdown` dispatch `WorkerCmd`s over the worker socket. `spawnd`
 does not hold a local agent PTY or a backend discriminator.
 
-Control-plane exposure of this path: **nothing**. The unix socket never
-crosses a machine boundary. Live bytes cross machines only inside DTLS.
-Legacy snapshot responses can still ride the browser WS as `agent.snapshot`
-JSON (base64), while P2-AGENT-01 adds `spawn.ctl` replay with a stream-position
-watermark. P2-AGENT-02 must remove the remaining server content legs before
-Phase 2 is true.
+The unix-socket hop adds no control-plane exposure, but the complete live path
+still does: until P2-AGENT-02, spawnd sends daemon WS `0x01` output for the
+legacy relay/transcript path for v1 and v2 browser sessions alike. Legacy
+snapshot responses can also ride browser WS as `agent.snapshot` JSON (base64).
+P2-AGENT-01 adds `spawn.ctl` replay with a stream-position watermark; it does
+not cut either legacy content leg. P2-AGENT-02 must remove them before Phase 2
+is true.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -228,12 +231,15 @@ resource budget. Operators/tests may lower that value; values above the
 compiled 8 MiB upper bound are rejected. The charge includes exact retained
 ciphertext and record framing, twice each segment's replay representation (one
 returned buffer plus one decryption/framing scratch allowance), and the log's
-retained `Vec`/path bookkeeping. Before admitting a record the log removes
+retained `Vec`/path bookkeeping, actual allocated file/directory blocks with
+safe floors, and conservative inode/directory-entry overhead. A hard 128-file
+cap plus ring-reused filenames bounds live inodes and directory growth under
+one-byte-output/resize adversaries. Before admitting a record the log removes
 whole oldest segments; it never returns a partial segment. A checkpoint that
-cannot fit by itself is rejected before its file is created. If an append or
-checkpoint cannot preserve those invariants, the worker destroys and disables
-its replay log but continues live output; subsequent replay is unavailable
-rather than partial or over-budget.
+fails conservative preflight is rejected before its file is created. If an
+append or checkpoint cannot preserve those invariants, the worker destroys and
+disables its replay log but continues live output; subsequent replay is
+unavailable rather than partial or over-budget.
 
 The 8 MiB value is therefore neither "8 MiB of plaintext output" nor an exact
 measurement of process RSS. It is a hard ceiling on this deliberately
@@ -272,11 +278,13 @@ also retains its independent 12 MiB response rejection ceiling.
   control-channel response ceiling is an independent outer bound.
 - Kernel-side copies (PTY line discipline, unix socket buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
-- spawnd still handles plaintext in flight (outbox → WS mirror/DataChannel).
-  The shared outbox and pending legacy WS mirror remain unbounded, and copies
-  inside unix/WebRTC/DTLS stacks are not covered by the owned-buffer wiping.
-  The implementation therefore does not claim a global hard bound or complete
-  zeroization of in-flight plaintext memory yet.
+- spawnd still handles plaintext in flight (worker socket → bounded outbox →
+  WS mirror/DataChannel). The outbox, worker-command channel, direct-viewer
+  queues, control responses, and WS session sink are bounded; a missing/full
+  legacy mirror is detached and discarded while direct viewers continue, and
+  reconnect catch-up comes from worker replay. Owned queued payloads wipe on
+  drop. Copies inside kernel unix/WebRTC/DTLS stacks are not owned or wiped by
+  this code, so this is not a claim of complete system-wide zeroization.
 - The guarantee here is **ciphertext-only scrollback segment files on the
   user's own host**, with best-effort wiping of transient buffers — not the
   absence of plaintext host memory. The threat this addresses is *disk*
@@ -405,11 +413,14 @@ handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
 each. The worker logs and forwards each chunk it consumes. If the supervisor
 socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
 PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
-queue. Downstream, the shared spawnd outbox is still unbounded, but each direct
-viewer sink is bounded; a lagging viewer is disconnected and must
-reconnect/re-seed from the worker replay watermark. The replay log uses the
-conservative total resource budget described in §6.2, including checkpoint
-and framing charges.
+queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 worker
+commands; each input command is capped at 64 KiB. The forwarder serves bounded
+direct-viewer sinks first, then offers output without blocking to the bounded
+legacy-WS mirror. A full or absent legacy mirror is detached instead of
+accumulating plaintext, while a lagging direct viewer is disconnected. Either
+transport reconnects and re-seeds from the worker replay watermark. The replay
+log uses the conservative total resource budget described in §6.2, including
+checkpoint and framing charges.
 
 ## 10. Crash isolation, restart, upgrades
 
@@ -514,7 +525,7 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 | TRUST.md phase | sessiond contribution |
 |---|---|
-| **Phase 1** (shipped) — DataChannel-only PTY | worker backend plugs into the same forwarder/direct-sink pipeline; no new server exposure. The unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server) from the path |
+| **Phase 1** (shipped) — DataChannel-only PTY | worker backend adds no exposure beyond the existing legacy mirror: its unix-socket hop is intra-host and strictly *removes* a plaintext holder (tmux server). Normally connected output still mirrors through daemon WS until P2-AGENT-02 removes that leg |
 | **Phase 2** — daemon-owned data, server stores deleted | this is the enabling work: scrollback/history/snapshot become daemon-owned artifacts (encrypted, at that) with a watermarked raw-byte replay primitive ready to move from WS-JSON onto a DataChannel history stream; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc` on the way to E2E `agent.create` |
 | **Phase 3** — signed signaling | orthogonal to sessiond (signaling-layer); nothing here assumes server-trusted introductions |
 | **Phase 4 / Later** — open source; encrypted transcript backup | worker is self-contained and auditable (`daemon/src/sessiond/` has no control-plane deps); device-key-sealed backup slots in as a separate artifact per §7 |
@@ -525,11 +536,9 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
   disconnect-on-stall and replay-based catch-up; future work may add adaptive
   queue sizing and transport telemetry.
 - **History over DataChannel review** (Phase 2): `spawn.ctl` now carries
-  connect history and snapshots from both backends using request-bound chunks
+  worker-backed connect history and snapshots using request-bound chunks
   and explicit PTY byte anchors; independent review and the later removal of
   the legacy base64-WS leg remain before the cut is complete.
-- **spawnd-side plaintext hygiene**: extend zeroize discipline into the
-  outbox/forwarder if profiling shows the buffers are long-lived.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed
   streams via the harness.
 - **Worker resource limits**: per-worker RLIMIT/cgroup knobs if agents start

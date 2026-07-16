@@ -178,10 +178,12 @@ pub async fn run_sender_loop(
     mut stream_tx: futures_util::stream::SplitSink<WsStream, Message>,
     mut rx: mpsc::Receiver<WsOutbound>,
 ) {
-    while let Some(out) = rx.recv().await {
-        let res = match out {
-            WsOutbound::Json(s) => stream_tx.send(Message::Text(s)).await,
-            WsOutbound::Binary(b) => stream_tx.send(Message::Binary(b)).await,
+    while let Some(mut out) = rx.recv().await {
+        let res = match &mut out {
+            WsOutbound::Json(text) => stream_tx.send(Message::Text(std::mem::take(text))).await,
+            WsOutbound::Binary(bytes) => {
+                stream_tx.send(Message::Binary(std::mem::take(bytes))).await
+            }
         };
         if let Err(e) = res {
             tracing::warn!(error = %e, "ws send error; sender loop exiting");

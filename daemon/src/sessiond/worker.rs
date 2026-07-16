@@ -710,6 +710,7 @@ fn spawn_conn_reader(
             match wire::read_frame(&mut read_half).await {
                 Ok(Some(frame)) => {
                     let (frame_type, payload) = frame;
+                    let payload = PlaintextChunk::new(payload);
                     if !inbound_frame_size_allowed(frame_type, payload.len()) {
                         tracing::warn!(
                             frame_type,
@@ -727,7 +728,7 @@ fn spawn_conn_reader(
                     if frame_tx
                         .send(ConnFrame {
                             generation,
-                            frame: Some((frame_type, PlaintextChunk::new(payload))),
+                            frame: Some((frame_type, payload)),
                         })
                         .await
                         .is_err()

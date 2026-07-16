@@ -17,11 +17,14 @@
 //! a consumer may seed a live terminal from the final chunk alone.
 //!
 //! Growth is bounded by one conservative resource budget. It charges exact
-//! ciphertext/framing bytes, twice the replay representation (returned bytes
-//! plus decryption/framing scratch), and retained segment/path bookkeeping.
-//! Whole oldest segments are deleted; a checkpoint that cannot fit by itself
-//! is rejected before a file is created, and replay never returns a partial
-//! segment.
+//! ciphertext/framing bytes, actual allocated file/directory blocks with safe
+//! floors and metadata overhead, twice the replay representation (returned
+//! bytes plus decryption/framing scratch), and retained segment/path
+//! bookkeeping. Segment filenames occupy a fixed ring and a hard count cap
+//! bounds inodes and directory growth even under tiny-output resize storms.
+//! Whole oldest segments are deleted; a checkpoint that fails conservative
+//! preflight is rejected before a file is created, and replay never returns a
+//! partial segment.
 //!
 //! Key model: the key is generated per worker process, lives only in locked
 //! worker memory (`secret::SecretBytes`), and is never persisted. A worker
@@ -46,6 +49,13 @@ use super::secret;
 pub const DEFAULT_SEGMENT_BYTES: u64 = 256 * 1024;
 /// Total scrollback resource budget across all segments.
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard inode/file-count bound independent of the byte budget.
+pub const MAX_SEGMENTS: usize = 128;
+
+const ALLOCATION_FLOOR_BYTES: u64 = 4 * 1024;
+const FILE_METADATA_CHARGE_BYTES: u64 = 1024;
+const DIRECTORY_METADATA_CHARGE_BYTES: u64 = 1024;
+const SEGMENT_PHYSICAL_FLOOR: u64 = ALLOCATION_FLOOR_BYTES + FILE_METADATA_CHARGE_BYTES;
 
 pub const KIND_OUTPUT: u8 = 1;
 pub const KIND_CHECKPOINT: u8 = 2;
@@ -80,6 +90,9 @@ struct Segment {
     /// Disk + twice replay bytes. The second replay copy covers the largest
     /// transient during decrypt/framing without pretending plaintext is absent.
     record_charge: u64,
+    /// Allocated file blocks (not logical length), with an allocation floor and
+    /// conservative inode/directory-entry overhead.
+    physical_charge: u64,
     /// Rotation threshold: checkpoint charge plus configured segment charge.
     rotate_at: u64,
 }
@@ -179,15 +192,20 @@ impl ScrollbackLog {
         let record_charge = record_charge(disk_bytes, replay_bytes)?;
         self.trim_for_additional(record_charge, false)?;
         self.append_record(KIND_OUTPUT, plaintext)?;
-        let seg = self
-            .segments
-            .last_mut()
-            .context("scrollback has no active segment")?;
-        seg.disk_bytes += disk_bytes;
-        seg.replay_bytes += replay_bytes;
-        seg.record_charge += record_charge;
+        let due = {
+            let seg = self
+                .segments
+                .last_mut()
+                .context("scrollback has no active segment")?;
+            seg.disk_bytes += disk_bytes;
+            seg.replay_bytes += replay_bytes;
+            seg.record_charge += record_charge;
+            seg.physical_charge = segment_physical_charge(&seg.path)?;
+            seg.record_charge >= seg.rotate_at
+        };
         self.total_logged += plaintext.len() as u64;
-        Ok(seg.record_charge >= seg.rotate_at)
+        self.trim_to_budget()?;
+        Ok(due)
     }
 
     /// Record a PTY geometry change by checkpointing at the new geometry:
@@ -363,6 +381,21 @@ impl ScrollbackLog {
             .sum()
     }
 
+    /// Actual allocated file/directory blocks where the platform exposes
+    /// them, otherwise logical length rounded to a conservative block floor.
+    pub fn allocated_disk_bytes(&self) -> u64 {
+        allocated_path_bytes(&self.dir)
+            .unwrap_or(ALLOCATION_FLOOR_BYTES)
+            .saturating_add(
+                self.segments
+                    .iter()
+                    .map(|segment| {
+                        allocated_path_bytes(&segment.path).unwrap_or(ALLOCATION_FLOOR_BYTES)
+                    })
+                    .sum::<u64>(),
+            )
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -371,6 +404,8 @@ impl ScrollbackLog {
     pub fn budget_bytes(&self) -> u64 {
         self.fixed_memory_charge()
             .saturating_add(self.segments.iter().map(|s| s.record_charge).sum::<u64>())
+            .saturating_add(self.segments.iter().map(|s| s.physical_charge).sum::<u64>())
+            .saturating_add(directory_physical_charge(&self.dir))
             .saturating_add(self.segment_memory_charge())
     }
 
@@ -387,6 +422,14 @@ impl ScrollbackLog {
         let path = self.dir.join(segment_name(index));
         let (disk_bytes, replay_bytes, checkpoint_charge) =
             self.validate_checkpoint(checkpoint, index)?;
+
+        // Reuse a fixed filename ring and unlink the oldest file before its
+        // slot is reused. This bounds both live inodes and directory entries.
+        while self.segments.len() >= MAX_SEGMENTS {
+            let oldest = self.segments[0].path.clone();
+            unlink_segment(&oldest)?;
+            self.segments.remove(0);
+        }
 
         let mut payload = Zeroizing::new(Vec::with_capacity(4 + checkpoint.state.len()));
         payload.extend_from_slice(&checkpoint.cols.to_le_bytes());
@@ -422,6 +465,14 @@ impl ScrollbackLog {
             return Err(error);
         }
         record.zeroize();
+        let physical_charge = match segment_physical_charge(&path) {
+            Ok(charge) => charge,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
         if let Some(active) = self.active.as_mut() {
             active.flush().ok();
         }
@@ -432,6 +483,7 @@ impl ScrollbackLog {
             disk_bytes,
             replay_bytes,
             record_charge: checkpoint_charge,
+            physical_charge,
             rotate_at: checkpoint_charge.saturating_add(self.segment_bytes),
         });
         self.seq = self
@@ -445,7 +497,7 @@ impl ScrollbackLog {
     fn trim_to_budget(&mut self) -> Result<()> {
         while self.segments.len() > 1 {
             self.segments.shrink_to_fit();
-            if self.budget_bytes() <= self.max_bytes {
+            if self.segments.len() <= MAX_SEGMENTS && self.budget_bytes() <= self.max_bytes {
                 break;
             }
             let path = self.segments[0].path.clone();
@@ -453,6 +505,9 @@ impl ScrollbackLog {
             self.segments.remove(0);
         }
         self.segments.shrink_to_fit();
+        if self.segments.len() > MAX_SEGMENTS {
+            bail!("scrollback retained more than {MAX_SEGMENTS} segments");
+        }
         if self.budget_bytes() > self.max_bytes {
             bail!(
                 "newest scrollback segment requires {} bytes, exceeding total budget {}",
@@ -502,8 +557,10 @@ impl ScrollbackLog {
         let path = self.dir.join(segment_name(index));
         let minimum = self
             .fixed_memory_charge()
+            .saturating_add(directory_physical_charge(&self.dir))
             .saturating_add(std::mem::size_of::<Segment>() as u64)
             .saturating_add(path_heap_charge(&path))
+            .saturating_add(SEGMENT_PHYSICAL_FLOOR)
             .saturating_add(charge);
         if minimum > self.max_bytes {
             bail!(
@@ -575,6 +632,35 @@ fn path_heap_charge(path: &Path) -> u64 {
     bytes.next_power_of_two() as u64
 }
 
+fn segment_physical_charge(path: &Path) -> Result<u64> {
+    Ok(allocated_path_bytes(path)?
+        .max(ALLOCATION_FLOOR_BYTES)
+        .saturating_add(FILE_METADATA_CHARGE_BYTES))
+}
+
+fn directory_physical_charge(path: &Path) -> u64 {
+    allocated_path_bytes(path)
+        .unwrap_or(ALLOCATION_FLOOR_BYTES)
+        .max(ALLOCATION_FLOOR_BYTES)
+        .saturating_add(DIRECTORY_METADATA_CHARGE_BYTES)
+}
+
+#[cfg(unix)]
+fn allocated_path_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(metadata.blocks().saturating_mul(512))
+}
+
+#[cfg(not(unix))]
+fn allocated_path_bytes(path: &Path) -> Result<u64> {
+    let len = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    Ok(len.div_ceil(ALLOCATION_FLOOR_BYTES) * ALLOCATION_FLOOR_BYTES)
+}
+
 fn unlink_segment(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -612,7 +698,7 @@ fn encrypt_record(
 const SEGMENT_PREFIX: &str = "seg-";
 
 fn segment_name(index: u64) -> String {
-    format!("{SEGMENT_PREFIX}{index:08}.log")
+    format!("{SEGMENT_PREFIX}{:08}.log", index % MAX_SEGMENTS as u64)
 }
 
 fn nonce_for(seq: u64) -> [u8; 12] {
@@ -698,7 +784,7 @@ mod tests {
             dir.path(),
             &key,
             1024,
-            8 * 1024,
+            16 * 1024,
             Checkpoint {
                 cols: 120,
                 rows: 40,
@@ -814,8 +900,10 @@ mod tests {
     #[test]
     fn rotation_bounds_growth_and_keeps_replay_coherent() {
         let dir = tempdir().unwrap();
-        // 1 KiB segments, 3 KiB budget.
-        let mut log = new_log(dir.path(), 1024, 3 * 1024);
+        // 1 KiB record target with enough total budget for several physically
+        // allocated segment files.
+        let max = 32 * 1024;
+        let mut log = new_log(dir.path(), 1024, max);
         let chunk = vec![b'x'; 512];
         let mut appended = 0u64;
         for _ in 0..32 {
@@ -825,8 +913,9 @@ mod tests {
             appended += chunk.len() as u64;
         }
         assert_eq!(log.total_logged(), appended);
-        assert!(log.budget_bytes() <= 3 * 1024);
-        assert!(log.disk_bytes() <= 3 * 1024);
+        assert!(log.budget_bytes() <= max);
+        assert!(log.disk_bytes() <= max);
+        assert!(log.allocated_disk_bytes() <= max);
         assert!(log.segment_count() >= 1);
         // Only segment files that are tracked exist on disk.
         let on_disk = fs::read_dir(dir.path()).unwrap().count();
@@ -837,7 +926,7 @@ mod tests {
         let retained_output = replay.iter().filter(|&&b| b == b'x').count() as u64;
         let expected_len = marker().len() as u64 * log.segment_count() as u64 + retained_output;
         assert_eq!(replay.len() as u64, expected_len);
-        assert!(replay.len() as u64 <= 3 * 1024);
+        assert!(replay.len() as u64 <= max);
     }
 
     #[test]
@@ -890,7 +979,7 @@ mod tests {
     fn stale_segments_from_previous_run_are_unlinked() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("seg-00000042.log"), b"dead ciphertext").unwrap();
-        let log = new_log(dir.path(), 1024, 4096);
+        let log = new_log(dir.path(), 1024, 16 * 1024);
         assert_eq!(log.segment_count(), 1);
         assert!(!dir.path().join("seg-00000042.log").exists());
     }
@@ -898,7 +987,8 @@ mod tests {
     #[test]
     fn oversized_checkpoint_is_rejected_without_partial_replay() {
         let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 256, 2048);
+        let max = 16 * 1024;
+        let mut log = new_log(dir.path(), 256, max);
         log.append_output(b"still-valid").unwrap();
         let before = log.replay(1024).unwrap();
         let files_before = fs::read_dir(dir.path()).unwrap().count();
@@ -913,7 +1003,7 @@ mod tests {
             .is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), files_before);
         assert_eq!(log.replay(1024).unwrap(), before);
-        assert!(log.budget_bytes() <= 2048);
+        assert!(log.budget_bytes() <= max);
     }
 
     #[test]
@@ -989,5 +1079,43 @@ mod tests {
         assert!(replay.len() < super::super::wire::MAX_FRAME_LEN - 8);
         assert!(log.disk_bytes().saturating_add(2 * replay.len() as u64) <= max);
         state.zeroize();
+    }
+
+    #[test]
+    fn tiny_output_resize_adversary_bounds_files_blocks_and_replay() {
+        let dir = tempdir().unwrap();
+        let max = DEFAULT_MAX_LOG_BYTES;
+        let mut log = new_log(dir.path(), 1, max);
+
+        for index in 0..4096u16 {
+            let byte = b'a' + (index % 26) as u8;
+            log.append_output(&[byte]).unwrap();
+            log.resize_checkpoint(&Checkpoint {
+                cols: 80 + index % 2,
+                rows: 24 + (index / 2) % 2,
+                state: b"S",
+            })
+            .unwrap();
+            if index % 127 == 0 {
+                assert!(log.segment_count() <= MAX_SEGMENTS);
+                assert!(log.budget_bytes() <= max);
+                assert!(log.allocated_disk_bytes() <= max);
+            }
+        }
+
+        let on_disk = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(on_disk, log.segment_count());
+        assert!(on_disk <= MAX_SEGMENTS);
+        assert!(log.allocated_disk_bytes() > 0);
+        assert!(log.allocated_disk_bytes() <= log.budget_bytes());
+        assert!(log.budget_bytes() <= max);
+        assert_eq!(log.total_logged(), 4096);
+
+        let replay = log.replay(u64::MAX).unwrap();
+        assert!(!replay.is_empty());
+        assert!(replay
+            .windows(1)
+            .any(|window| window[0].is_ascii_lowercase()));
+        assert!(replay.len() as u64 <= max);
     }
 }

@@ -31,6 +31,15 @@ const CHUNK_KIND_REPLAY: u8 = 1;
 const CHUNK_HEADER_LEN: usize = 4 + 1 + 1 + 2 + 16 + 4;
 const CHUNK_FLAG_LAST: u16 = 1;
 
+#[cfg(test)]
+type ControlWipeProbe = Box<dyn Fn(&[u8])>;
+
+#[cfg(test)]
+thread_local! {
+    static CONTROL_WIPE_PROBE: std::cell::RefCell<Option<ControlWipeProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlOutbound {
     Text(String),
@@ -43,6 +52,21 @@ impl ControlOutbound {
             Self::Text(text) => text.zeroize(),
             Self::Binary(bytes) => bytes.zeroize(),
         }
+    }
+}
+
+impl Drop for ControlOutbound {
+    fn drop(&mut self) {
+        self.wipe();
+        #[cfg(test)]
+        CONTROL_WIPE_PROBE.with(|slot| {
+            if let Some(probe) = slot.borrow_mut().take() {
+                match self {
+                    Self::Text(text) => probe(text.as_bytes()),
+                    Self::Binary(bytes) => probe(bytes),
+                }
+            }
+        });
     }
 }
 
@@ -643,20 +667,16 @@ mod tests {
     }
 
     #[test]
-    fn rejected_outbound_messages_are_wipeable() {
-        let mut binary = ControlOutbound::Binary(b"replay plaintext".to_vec());
-        binary.wipe();
-        let ControlOutbound::Binary(bytes) = binary else {
-            unreachable!()
-        };
-        assert!(bytes.iter().all(|byte| *byte == 0));
-
-        let mut text = ControlOutbound::Text("protected error detail".to_string());
-        text.wipe();
-        let ControlOutbound::Text(text) = text else {
-            unreachable!()
-        };
-        assert!(text.as_bytes().iter().all(|byte| *byte == 0));
+    fn outbound_messages_wipe_automatically_on_drop() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        CONTROL_WIPE_PROBE.with(|slot| {
+            let observed = std::sync::Arc::clone(&observed);
+            *slot.borrow_mut() = Some(Box::new(move |bytes| {
+                observed.lock().unwrap().extend_from_slice(bytes);
+            }));
+        });
+        drop(ControlOutbound::Binary(b"replay plaintext".to_vec()));
+        assert!(observed.lock().unwrap().iter().all(|byte| *byte == 0));
     }
 
     #[tokio::test]
@@ -667,12 +687,14 @@ mod tests {
         send_replay(&tx, id, "snapshot", false, Some(42), bytes.clone())
             .await
             .unwrap();
-        let ControlOutbound::Text(metadata) = rx.recv().await.unwrap() else {
+        let metadata_message = rx.recv().await.unwrap();
+        let ControlOutbound::Text(metadata) = &metadata_message else {
             panic!("expected metadata")
         };
         assert!(metadata.contains("\"chunks\":2"));
         for (sequence, expected_len) in [(0_u32, CHUNK_PAYLOAD_BYTES), (1, 3)] {
-            let ControlOutbound::Binary(frame) = rx.recv().await.unwrap() else {
+            let frame_message = rx.recv().await.unwrap();
+            let ControlOutbound::Binary(frame) = &frame_message else {
                 panic!("expected binary chunk")
             };
             assert_eq!(&frame[..4], CHUNK_MAGIC);

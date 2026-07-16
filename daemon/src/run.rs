@@ -200,10 +200,10 @@ async fn serve_one_connection(
         }
     };
 
-    // Tear down this session. Clearing the per-agent sinks first parks the
-    // forwarders on `notified()` until the next session installs new ones —
-    // PTY bytes accumulate in their outboxes in the meantime, so nothing is
-    // lost. We just abort the IO tasks (rather than awaiting graceful exit)
+    // Tear down this session. Clearing the per-agent sinks first stops the
+    // legacy mirror; forwarders continue draining bounded worker output into
+    // direct viewers, and a reconnect catches up from worker replay. We just
+    // abort the IO tasks (rather than awaiting graceful exit)
     // because `stream_tx.close()` against a half-dead remote can hang on
     // the final TCP write, AND because the `select!` above may have already
     // consumed one task to completion (re-awaiting a finished JoinHandle
