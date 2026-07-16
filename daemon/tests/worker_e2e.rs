@@ -210,7 +210,7 @@ async fn worker_runs_command_streams_output_and_replays_on_reattach() {
         &mut conn,
         wire::T_SHUTDOWN,
         &wire::Shutdown {
-            signal: Some("TERM".into()),
+            signal: Some(wire::LifecycleSignal::Term),
         },
     )
     .await

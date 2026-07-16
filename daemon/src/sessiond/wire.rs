@@ -1,4 +1,5 @@
-//! Framed protocol between `spawnd` and a session worker over a unix socket.
+//! Framed protocol between `spawnd` and a session worker over its ordinary
+//! unix socket, plus the fixed-size independent lifecycle request format.
 //!
 //! ```text
 //! +-----------+------+-----------------+
@@ -13,12 +14,20 @@
 //! never crosses a machine boundary and never touches the control plane.
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
+
+/// The worker lifecycle endpoint accepts exactly one instance token and one
+/// small signal code. No caller-provided string enters its bounded path.
+pub const LIFECYCLE_REQUEST_LEN: usize = 17;
+pub const LIFECYCLE_ACK_DELIVERED: u8 = 0;
+pub const LIFECYCLE_ACK_GONE: u8 = 1;
+pub const LIFECYCLE_ACK_WRONG_INSTANCE: u8 = 2;
+pub const LIFECYCLE_ACK_FAILED: u8 = 3;
 
 /// Upper bound on a single frame payload. Replay responses dominate; they are
 /// capped well below this by the scrollback budget.
@@ -46,6 +55,10 @@ pub const T_SHUTDOWN: u8 = 0x0B;
 pub struct Hello {
     pub version: u32,
     pub agent_id: Uuid,
+    /// Random identity of this exact worker process. Lifecycle requests carry
+    /// it so a stale supervisor can never signal a replacement at the same
+    /// filesystem path.
+    pub instance_id: Uuid,
     /// "awaiting_start" | "running" | "exited"
     pub state: String,
     #[serde(default)]
@@ -91,10 +104,89 @@ pub struct ExitInfo {
     pub signal: Option<String>,
 }
 
+/// Signals accepted from the control plane and by the private worker
+/// lifecycle endpoint. Keeping the set deliberately small makes every queued
+/// request a fixed-size, content-free value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum LifecycleSignal {
+    #[serde(rename = "TERM")]
+    Term,
+    #[serde(rename = "KILL")]
+    Kill,
+}
+
+impl LifecycleSignal {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Term => 1,
+            Self::Kill => 2,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Term),
+            2 => Ok(Self::Kill),
+            _ => bail!("unsupported lifecycle signal code"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LifecycleSignal {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SignalVisitor;
+
+        impl de::Visitor<'_> for SignalVisitor {
+            type Value = LifecycleSignal;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("TERM or KILL")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "TERM" | "SIGTERM" => Ok(LifecycleSignal::Term),
+                    "KILL" | "SIGKILL" => Ok(LifecycleSignal::Kill),
+                    _ => Err(E::custom("unsupported lifecycle signal")),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(SignalVisitor)
+    }
+}
+
+pub fn encode_lifecycle_request(
+    instance_id: Uuid,
+    signal: LifecycleSignal,
+) -> [u8; LIFECYCLE_REQUEST_LEN] {
+    let mut request = [0; LIFECYCLE_REQUEST_LEN];
+    request[..16].copy_from_slice(instance_id.as_bytes());
+    request[16] = signal.code();
+    request
+}
+
+pub fn decode_lifecycle_request(
+    request: &[u8; LIFECYCLE_REQUEST_LEN],
+) -> Result<(Uuid, LifecycleSignal)> {
+    let instance_id = Uuid::from_bytes(request[..16].try_into().expect("fixed request length"));
+    Ok((instance_id, LifecycleSignal::from_code(request[16])?))
+}
+
+pub fn lifecycle_socket_path(socket: &std::path::Path) -> std::path::PathBuf {
+    socket.with_extension("lifecycle.sock")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shutdown {
     #[serde(default)]
-    pub signal: Option<String>,
+    pub signal: Option<LifecycleSignal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +376,33 @@ mod tests {
         assert_eq!(watermark, 42);
         assert_eq!(bytes, b"\xf0\x9f\x98\x80\x1b[31m");
         assert!(decode_output(&buf[..7]).is_err());
+    }
+
+    #[test]
+    fn lifecycle_request_is_fixed_size_and_signal_errors_are_content_free() {
+        let instance = Uuid::new_v4();
+        for signal in [LifecycleSignal::Term, LifecycleSignal::Kill] {
+            let request = encode_lifecycle_request(instance, signal);
+            assert_eq!(request.len(), LIFECYCLE_REQUEST_LEN);
+            assert_eq!(
+                decode_lifecycle_request(&request).unwrap(),
+                (instance, signal)
+            );
+        }
+
+        let unknown = "private-unknown-signal-value";
+        let error = serde_json::from_str::<LifecycleSignal>(&format!("\"{unknown}\""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unsupported lifecycle signal at line 1 column 30");
+        assert!(!error.contains(unknown));
+
+        let oversized = "x".repeat(128 * 1024);
+        let error = serde_json::from_str::<LifecycleSignal>(&format!("\"{oversized}\""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("unsupported lifecycle signal at line 1 column "));
+        assert!(!error.contains(&oversized));
     }
 
     #[tokio::test]

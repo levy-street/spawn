@@ -1418,12 +1418,14 @@ mod tests {
         agent_id: Uuid,
     ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(crate::pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
             cmd_tx,
-            lifecycle_tx,
+            lifecycle: crate::pty::AgentLifecycle::new(
+                std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                Uuid::new_v4(),
+            ),
             alive: Arc::new(AtomicBool::new(true)),
             cols: 80,
             rows: 24,
@@ -2141,9 +2143,11 @@ mod tests {
         }
         assert!(caught_up, "replay did not catch up the evicted viewer");
 
-        let lifecycle = registry.lifecycle_for(agent_id).expect("agent lifecycle");
-        lifecycle
-            .shutdown(Some("KILL".to_string()))
+        let lifecycle = registry
+            .lifecycle_snapshot(agent_id)
+            .expect("agent lifecycle");
+        registry
+            .shutdown_if_current(&lifecycle, spawnd::sessiond::wire::LifecycleSignal::Kill)
             .await
             .expect("KILL delivery");
         let reason = tokio::time::timeout(Duration::from_secs(15), adopted_exit_rx)
@@ -2555,5 +2559,43 @@ mod tests {
 
         assert_eq!(write_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_rtc_input_is_rejected_before_copy_and_does_not_suppress_output() {
+        let agent_id = Uuid::new_v4();
+        let control = crate::pty::ForwarderControl::new();
+        let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
+            agent_id,
+            cmd_tx,
+            lifecycle: crate::pty::AgentLifecycle::new(
+                std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                Uuid::new_v4(),
+            ),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: control.clone(),
+        });
+        let (activity_tx, mut activity_rx) = mpsc::channel(2);
+        let oversized = vec![b'x'; crate::pty::MAX_WORKER_INPUT_BYTES + 1];
+
+        assert!(forward_data_channel_input(
+            agent_id,
+            false,
+            &oversized,
+            &control,
+            &activity_tx,
+            |bytes| handle.write_stdin(bytes),
+        )
+        .is_err());
+        assert_eq!(handle.input_copy_count(), 0);
+        assert!(activity_rx.try_recv().is_err());
+        assert!(
+            crate::pty::OutputChunk::classify(b"genuine output".to_vec(), &control).is_activity()
+        );
     }
 }

@@ -176,7 +176,22 @@ mod tests {
             r#"{"type":"agent.kill","agent_id":"00000000-0000-0000-0000-000000000002","signal":"TERM"}"#,
         )
         .unwrap();
-        assert!(matches!(kill, Inbound::AgentKill { .. }));
+        assert!(matches!(
+            kill,
+            Inbound::AgentKill {
+                signal: Some(spawnd::sessiond::wire::LifecycleSignal::Term),
+                ..
+            }
+        ));
+
+        let private_unknown = "private-signal-content";
+        let error = serde_json::from_str::<Inbound>(&format!(
+            r#"{{"type":"agent.kill","agent_id":"00000000-0000-0000-0000-000000000002","signal":"{private_unknown}"}}"#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unsupported lifecycle signal"));
+        assert!(!error.contains(private_unknown));
 
         let resize: Inbound = serde_json::from_str(
             r#"{"type":"agent.resize","agent_id":"00000000-0000-0000-0000-000000000003","cols":80,"rows":24}"#,

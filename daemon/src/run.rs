@@ -2119,25 +2119,30 @@ async fn handle_agent_restart(
     let agent_id = create.agent_id;
     tracing::info!(%agent_id, argv = ?create.argv, "agent.restart");
 
-    // Invalidate the current generation and drain its RTC peers before
-    // stopping the worker. Offers captured before restart revalidate while
-    // holding this same transition guard, so they cannot insert after the
-    // close scan.
+    // Hold the generation transition across every lifecycle delivery. This
+    // lets each TERM/KILL revalidate the exact atomic lifecycle snapshot and
+    // prevents replacement from linearizing between validation and the
+    // worker-owned signal syscall.
     let transition = registry.lock_generation_transition(agent_id).await;
-    let current = registry.binding_for(agent_id);
-    let removed =
-        current.and_then(|binding| registry.remove_if_generation(agent_id, binding.generation()));
-    if let Some(binding) = current {
+    let current = registry.lifecycle_snapshot(agent_id);
+    if let Some(snapshot) = &current {
+        let binding = snapshot.binding();
         rtc_sessions
             .close_for_agent(agent_id, binding.generation())
             .await;
-    }
-    drop(transition);
-    if let Some(handle) = removed {
-        handle.control.clear_sink().await;
+        if let Some(control) = registry.control_for_binding(binding) {
+            control.clear_sink().await;
+        }
         // Lifecycle delivery bypasses the potentially saturated worker input
         // socket. Check each result and deterministically escalate to KILL.
-        let term_result = handle.shutdown(Some("TERM".into())).await;
+        let term_result = if registry.is_current(binding) {
+            snapshot
+                .lifecycle()
+                .shutdown(spawnd::sessiond::wire::LifecycleSignal::Term)
+                .await
+        } else {
+            Err(anyhow!("stale agent lifecycle generation"))
+        };
         if let Err(error) = &term_result {
             tracing::warn!(%agent_id, %error, "restart TERM delivery failed; escalating now");
         }
@@ -2148,13 +2153,23 @@ async fn handle_agent_restart(
             }
             if !kill_attempted && (attempt == 15 || term_result.is_err()) {
                 kill_attempted = true;
-                if let Err(error) = handle.shutdown(Some("KILL".into())).await {
+                let kill_result = if registry.is_current(binding) {
+                    snapshot
+                        .lifecycle()
+                        .shutdown(spawnd::sessiond::wire::LifecycleSignal::Kill)
+                        .await
+                } else {
+                    Err(anyhow!("stale agent lifecycle generation"))
+                };
+                if let Err(error) = kill_result {
                     tracing::error!(%agent_id, %error, "restart KILL delivery failed");
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let _ = registry.remove_if_generation(agent_id, binding.generation());
     }
+    drop(transition);
 
     if worker_backend::socket_exists(agent_id) {
         send_pty_text(
@@ -2171,7 +2186,7 @@ async fn handle_agent_restart(
 
 async fn handle_agent_kill(
     agent_id: Uuid,
-    signal: Option<String>,
+    signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
@@ -2181,7 +2196,7 @@ async fn handle_agent_kill(
     if !registry.contains(agent_id) {
         let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
     }
-    let Some(binding) = registry.binding_for(agent_id) else {
+    let Some(snapshot) = registry.lifecycle_snapshot(agent_id) else {
         send_error(
             out_tx,
             Some(agent_id),
@@ -2191,17 +2206,16 @@ async fn handle_agent_kill(
         .await;
         return;
     };
-    let lifecycle = registry
-        .lifecycle_for(agent_id)
-        .expect("binding and lifecycle are stored atomically");
-    let requested = signal.unwrap_or_else(|| "TERM".to_string());
-    let requested_name = requested.trim_start_matches("SIG");
-    if let Err(error) = lifecycle.shutdown(Some(requested.clone())).await {
-        tracing::warn!(%agent_id, signal = %requested, %error, "agent signal delivery failed");
-        let final_error = if requested_name == "KILL" {
+    let requested = signal.unwrap_or(spawnd::sessiond::wire::LifecycleSignal::Term);
+    if let Err(error) = registry.shutdown_if_current(&snapshot, requested).await {
+        tracing::warn!(%agent_id, %error, "agent signal delivery failed");
+        let final_error = if requested == spawnd::sessiond::wire::LifecycleSignal::Kill {
             error
         } else {
-            match lifecycle.shutdown(Some("KILL".to_string())).await {
+            match registry
+                .shutdown_if_current(&snapshot, spawnd::sessiond::wire::LifecycleSignal::Kill)
+                .await
+            {
                 Ok(()) => return,
                 Err(kill_error) => kill_error,
             }
@@ -2213,16 +2227,17 @@ async fn handle_agent_kill(
             &final_error.context("lifecycle delivery failed after escalation"),
         )
         .await;
-    } else if requested_name == "TERM" {
+    } else if requested == spawnd::sessiond::wire::LifecycleSignal::Term {
         // TERM is graceful but bounded. Fence the delayed escalation to this
         // exact backend generation so a fast restart cannot be killed.
         let registry = registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(1500)).await;
-            if registry.is_current(binding) {
-                if let Err(error) = lifecycle.shutdown(Some("KILL".to_string())).await {
-                    tracing::warn!(%agent_id, %error, "delayed agent KILL delivery failed");
-                }
+            if let Err(error) = registry
+                .shutdown_if_current(&snapshot, spawnd::sessiond::wire::LifecycleSignal::Kill)
+                .await
+            {
+                tracing::warn!(%agent_id, %error, "delayed agent KILL delivery failed");
             }
         });
     }

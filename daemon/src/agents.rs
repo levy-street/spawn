@@ -11,6 +11,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::pty::{AgentHandle, AgentLifecycle, ForwarderControl};
+use spawnd::sessiond::wire::LifecycleSignal;
 
 #[derive(Default, Clone)]
 pub struct AgentRegistry {
@@ -43,6 +44,26 @@ struct RegistryEntry {
 pub struct AgentBinding {
     agent_id: Uuid,
     generation: u64,
+}
+
+/// One immutable lifecycle capability paired with the exact registry
+/// generation from which it was read. The pair is cloned under one registry
+/// lock, preventing an old binding from ever being combined with a
+/// replacement worker's lifecycle endpoint.
+#[derive(Clone)]
+pub struct AgentLifecycleSnapshot {
+    binding: AgentBinding,
+    lifecycle: AgentLifecycle,
+}
+
+impl AgentLifecycleSnapshot {
+    pub fn binding(&self) -> AgentBinding {
+        self.binding
+    }
+
+    pub fn lifecycle(&self) -> &AgentLifecycle {
+        &self.lifecycle
+    }
 }
 
 impl AgentBinding {
@@ -195,9 +216,29 @@ impl AgentRegistry {
         guard.get(&id).map(|entry| entry.handle.control.clone())
     }
 
-    pub fn lifecycle_for(&self, id: Uuid) -> Option<AgentLifecycle> {
+    pub fn lifecycle_snapshot(&self, id: Uuid) -> Option<AgentLifecycleSnapshot> {
         let guard = self.inner.lock().expect("agents lock");
-        guard.get(&id).map(|entry| entry.handle.lifecycle())
+        guard.get(&id).map(|entry| AgentLifecycleSnapshot {
+            binding: AgentBinding::new(id, entry.generation),
+            lifecycle: entry.handle.lifecycle(),
+        })
+    }
+
+    /// Deliver only while the snapshot is still the current generation. The
+    /// transition guard prevents remove/replace from linearizing between the
+    /// revalidation and the acknowledged worker-owned lifecycle syscall.
+    pub async fn shutdown_if_current(
+        &self,
+        snapshot: &AgentLifecycleSnapshot,
+        signal: LifecycleSignal,
+    ) -> anyhow::Result<()> {
+        let _transition = self
+            .lock_generation_transition(snapshot.binding.agent_id())
+            .await;
+        if !self.is_current(snapshot.binding) {
+            anyhow::bail!("stale agent lifecycle generation");
+        }
+        snapshot.lifecycle.shutdown(signal).await
     }
 
     /// Snapshot the per-agent forwarder controls so a WS session can
@@ -209,5 +250,77 @@ impl AgentRegistry {
             .iter()
             .map(|(id, entry)| (*id, entry.handle.control.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pty::{self, WorkerHandleParts};
+    use std::path::PathBuf;
+    use tokio::net::UnixListener;
+    use tokio::sync::mpsc;
+
+    fn test_handle(agent_id: Uuid, lifecycle_socket: PathBuf) -> AgentHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        AgentHandle::new_worker(WorkerHandleParts {
+            agent_id,
+            cmd_tx,
+            lifecycle: AgentLifecycle::new(lifecycle_socket, Uuid::new_v4()),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: ForwarderControl::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn removed_or_replaced_snapshot_cannot_reach_new_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::new_v4();
+        let lifecycle_socket = dir.path().join("agent.lifecycle.sock");
+        let registry = AgentRegistry::new();
+
+        let old_generation = registry.insert(test_handle(agent_id, lifecycle_socket.clone()));
+        let old = registry
+            .lifecycle_snapshot(agent_id)
+            .expect("old atomic snapshot");
+        assert_eq!(old.binding().generation(), old_generation);
+
+        registry
+            .remove_if_generation(agent_id, old_generation)
+            .expect("remove old generation");
+        let new_generation = registry.insert(test_handle(agent_id, lifecycle_socket.clone()));
+        assert_ne!(new_generation, old_generation);
+
+        // A replacement worker may already own the same filesystem path. The
+        // stale registry snapshot must fail before opening that endpoint.
+        let listener = UnixListener::bind(&lifecycle_socket).unwrap();
+        let error = registry
+            .shutdown_if_current(&old, LifecycleSignal::Kill)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("stale agent lifecycle generation"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+
+        let removed = registry
+            .remove_if_generation(agent_id, new_generation)
+            .expect("remove replacement");
+        drop(removed);
+        let removed_error = registry
+            .shutdown_if_current(&old, LifecycleSignal::Term)
+            .await
+            .unwrap_err();
+        assert!(removed_error
+            .to_string()
+            .contains("stale agent lifecycle generation"));
     }
 }

@@ -373,6 +373,9 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
 
 {"type": "agent.kill", "agent_id": "uuid", "signal": "TERM"}
 
+`agent.kill.signal` is optional and accepts only `TERM` or `KILL`; omitted
+means `TERM`. Other values are rejected before lifecycle dispatch.
+
 {"type": "agent.resize", "agent_id": "uuid", "cols": 120, "rows": 32}
 
 {"type": "agent.scroll", "agent_id": "uuid", "lines": -8}

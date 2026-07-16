@@ -210,7 +210,7 @@ pub enum Inbound {
     AgentKill {
         agent_id: Uuid,
         #[serde(default)]
-        signal: Option<String>,
+        signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
     },
     #[serde(rename = "agent.resize")]
     AgentResize {

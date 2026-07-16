@@ -7,8 +7,8 @@
 //!   protocol,
 //! - bridges worker output into the per-agent outbox → forwarder →
 //!   {WS sink, DataChannel direct sinks} pipeline,
-//! - delivers TERM/KILL through an independent bounded host-signal task so
-//!   lifecycle cannot be starved by the worker input socket,
+//! - delivers fixed-size TERM/KILL requests through the worker's independent
+//!   lifecycle socket, where stable child ownership guards the signal,
 //! - adopts already-running workers after a restart by scanning the socket
 //!   directory (the worker greets every connection with `Hello`).
 
@@ -26,9 +26,7 @@ use zeroize::Zeroizing;
 use spawnd::sessiond::wire;
 
 use crate::config;
-use crate::pty::{
-    self, AgentHandle, ExitReason, ForwarderControl, LifecycleRequest, WorkerCmd, WorkerHandleParts,
-};
+use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, WorkerHandleParts};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADOPT_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -159,6 +157,8 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
         started.pid,
         spec.cols,
         spec.rows,
+        wire::lifecycle_socket_path(&socket),
+        hello.instance_id,
         stream,
     ))
 }
@@ -196,6 +196,8 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
         hello.pid.unwrap_or(0),
         hello.cols.max(1),
         hello.rows.max(1),
+        wire::lifecycle_socket_path(&socket),
+        hello.instance_id,
         stream,
     )))
 }
@@ -232,26 +234,25 @@ pub fn discover_ids() -> Vec<Uuid> {
 /// Wire a connected worker stream into the standard per-agent plumbing:
 /// outbox → forwarder, a command channel for stdin/resize/replay, a separate
 /// acknowledged lifecycle channel, and an exit oneshot.
-fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) -> pty::Launched {
+fn assemble(
+    agent_id: Uuid,
+    pid: u32,
+    cols: u16,
+    rows: u16,
+    lifecycle_socket: PathBuf,
+    lifecycle_instance: Uuid,
+    stream: UnixStream,
+) -> pty::Launched {
     let (outbox_tx, outbox_rx) = mpsc::channel::<pty::OutputChunk>(pty::WORKER_OUTPUT_QUEUE_DEPTH);
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(pty::WORKER_COMMAND_QUEUE_DEPTH);
-    let (lifecycle_tx, lifecycle_rx) =
-        mpsc::channel::<LifecycleRequest>(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
     let (read_half, write_half) = stream.into_split();
     let pending: PendingReplays = Default::default();
     let alive = Arc::new(AtomicBool::new(true));
-
-    tokio::spawn(run_lifecycle(
-        pid,
-        lifecycle_rx,
-        Arc::clone(&alive),
-        agent_id,
-    ));
 
     tokio::spawn(run_writer(
         write_half,
@@ -273,7 +274,7 @@ fn assemble(agent_id: Uuid, pid: u32, cols: u16, rows: u16, stream: UnixStream) 
     let handle = AgentHandle::new_worker(WorkerHandleParts {
         agent_id,
         cmd_tx,
-        lifecycle_tx,
+        lifecycle: pty::AgentLifecycle::new(lifecycle_socket, lifecycle_instance),
         alive,
         cols,
         rows,
@@ -337,54 +338,6 @@ async fn run_writer(
     }
     // Fail any replay waiters still queued.
     fail_pending_replays(&pending);
-}
-
-/// Lifecycle delivery is deliberately independent of the normal framed
-/// command writer. A saturated input queue or blocked worker socket therefore
-/// cannot prevent TERM/KILL from reaching the agent process group.
-async fn run_lifecycle(
-    pid: u32,
-    mut lifecycle_rx: mpsc::Receiver<LifecycleRequest>,
-    alive: Arc<AtomicBool>,
-    agent_id: Uuid,
-) {
-    while let Some(request) = lifecycle_rx.recv().await {
-        if !alive.load(Ordering::Acquire) {
-            let _ = request
-                .delivered
-                .send(Err("worker connection gone".to_string()));
-            continue;
-        }
-        let result = signal_agent_process_group(pid, request.signal.as_deref())
-            .map_err(|error| error.to_string());
-        if let Err(error) = &result {
-            tracing::warn!(%agent_id, pid, %error, "agent lifecycle signal failed");
-        }
-        let _ = request.delivered.send(result);
-    }
-}
-
-fn signal_agent_process_group(pid: u32, signal: Option<&str>) -> Result<()> {
-    use nix::sys::signal::{kill, killpg, Signal};
-    use nix::unistd::Pid;
-
-    let signal = match signal.unwrap_or("TERM").trim_start_matches("SIG") {
-        "KILL" => Signal::SIGKILL,
-        "INT" => Signal::SIGINT,
-        "HUP" => Signal::SIGHUP,
-        "QUIT" => Signal::SIGQUIT,
-        _ => Signal::SIGTERM,
-    };
-    let pid = i32::try_from(pid).context("agent pid exceeds i32")?;
-    if pid <= 1 {
-        bail!("refusing to signal invalid agent pid {pid}");
-    }
-    let pid = Pid::from_raw(pid);
-    // portable-pty makes the child a session leader, so pgid == pid. Retain
-    // the worker's direct-pid fallback for platforms where that setup races.
-    killpg(pid, signal)
-        .or_else(|_| kill(pid, signal))
-        .context("signaling agent process group")
 }
 
 fn enqueue_pending_replay(
@@ -573,7 +526,6 @@ mod tests {
         let (read_half, write_half) = daemon_stream.into_split();
         drop(read_half);
         let (cmd_tx, cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
         let capacity_probe = cmd_tx.clone();
         let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let alive = Arc::new(AtomicBool::new(true));
@@ -587,7 +539,10 @@ mod tests {
         let handle = AgentHandle::new_worker(WorkerHandleParts {
             agent_id,
             cmd_tx,
-            lifecycle_tx,
+            lifecycle: pty::AgentLifecycle::new(
+                PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                Uuid::new_v4(),
+            ),
             alive,
             cols: 80,
             rows: 24,
@@ -619,85 +574,6 @@ mod tests {
             .await
             .expect("stalled writer did not stop")
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn priority_lifecycle_bypasses_32_queued_inputs_and_completes_restart_escalation() {
-        use std::io::BufRead;
-        use std::os::unix::process::CommandExt;
-
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("trap '' TERM; echo ready; while :; do sleep 1; done")
-            .process_group(0)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn signal-ignoring agent");
-        let pid = child.id();
-        let mut ready = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .expect("agent readiness");
-        assert_eq!(ready.trim(), "ready");
-
-        let (cmd_tx, _stalled_cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
-        for _ in 0..pty::WORKER_COMMAND_QUEUE_DEPTH {
-            cmd_tx
-                .try_send(WorkerCmd::Input(pty::DirectPayload::new(vec![
-                    b'i';
-                    pty::MAX_WORKER_INPUT_BYTES
-                ])))
-                .unwrap();
-        }
-        assert_eq!(cmd_tx.capacity(), 0);
-
-        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(pty::WORKER_LIFECYCLE_QUEUE_DEPTH);
-        let alive = Arc::new(AtomicBool::new(true));
-        let lifecycle_task = tokio::spawn(run_lifecycle(
-            pid,
-            lifecycle_rx,
-            Arc::clone(&alive),
-            Uuid::new_v4(),
-        ));
-        let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let handle = AgentHandle::new_worker(WorkerHandleParts {
-            agent_id: Uuid::new_v4(),
-            cmd_tx,
-            lifecycle_tx,
-            alive,
-            cols: 80,
-            rows: 24,
-            outbox_tx,
-            control: ForwarderControl::new(),
-        });
-
-        handle
-            .shutdown(Some("TERM".to_string()))
-            .await
-            .expect("TERM bypassed stalled input");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            child.try_wait().expect("TERM status").is_none(),
-            "signal-ignoring agent unexpectedly exited on TERM"
-        );
-
-        handle
-            .shutdown(Some("KILL".to_string()))
-            .await
-            .expect("KILL bypassed stalled input");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if child.try_wait().expect("KILL status").is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("restart escalation timed out");
-
-        drop(handle);
-        lifecycle_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -782,7 +658,7 @@ mod tests {
     /// DataChannel path uses: launch → forwarder → direct sink, stdin via the
     /// handle, replay, drop-handle-then-adopt, shutdown → exit_rx.
     #[tokio::test]
-    async fn worker_launch_adopt_and_shutdown_roundtrip() {
+    async fn worker_launch_adopt_and_priority_shutdown_roundtrip() {
         let _env_lock = WORKER_TEST_ENV_LOCK.lock().await;
         let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
         let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
@@ -895,13 +771,38 @@ mod tests {
         adopted.handle.write_stdin(b"ping-2\n").expect("stdin");
         collect_direct_until(&mut direct.receiver, b"ping-2").await;
 
+        // Model the exact saturated spawnd ordinary-command boundary while
+        // retaining the real adopted worker's independent lifecycle
+        // capability. No command receiver is polled during TERM/KILL.
+        let (stalled_cmd_tx, _stalled_cmd_rx) = mpsc::channel(pty::WORKER_COMMAND_QUEUE_DEPTH);
+        for _ in 0..pty::WORKER_COMMAND_QUEUE_DEPTH {
+            stalled_cmd_tx
+                .try_send(WorkerCmd::Input(pty::DirectPayload::new(vec![
+                    b'i';
+                    pty::MAX_WORKER_INPUT_BYTES
+                ])))
+                .expect("fill ordinary command queue");
+        }
+        assert_eq!(stalled_cmd_tx.capacity(), 0);
+        let (priority_outbox, _priority_outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let priority_handle = AgentHandle::new_worker(WorkerHandleParts {
+            agent_id,
+            cmd_tx: stalled_cmd_tx,
+            lifecycle: adopted.handle.lifecycle(),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx: priority_outbox,
+            control: ForwarderControl::new(),
+        });
+
         // Restart shutdown must not probe by connecting: a probe would become
         // the worker's current supervisor generation and fence this TERM.
         // The agent ignores TERM, so the independent lifecycle path must
         // remain usable for KILL escalation even if ordinary commands stall.
-        adopted
-            .handle
-            .shutdown(Some("TERM".into()))
+        let lifecycle = priority_handle.lifecycle();
+        lifecycle
+            .shutdown(wire::LifecycleSignal::Term)
             .await
             .expect("TERM delivery");
         let mut exit_rx = adopted.exit_rx;
@@ -912,9 +813,8 @@ mod tests {
             "TERM unexpectedly stopped the signal-ignoring test agent"
         );
         assert!(socket_exists(agent_id));
-        adopted
-            .handle
-            .shutdown(Some("KILL".into()))
+        lifecycle
+            .shutdown(wire::LifecycleSignal::Kill)
             .await
             .expect("KILL delivery");
         let reason = tokio::time::timeout(Duration::from_secs(15), exit_rx)

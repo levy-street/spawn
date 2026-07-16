@@ -9,12 +9,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use spawnd::sessiond::wire;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -141,7 +145,6 @@ pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
 pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
 pub const WORKER_OUTPUT_QUEUE_DEPTH: usize = 32;
 pub const WORKER_COMMAND_QUEUE_DEPTH: usize = 32;
-pub const WORKER_LIFECYCLE_QUEUE_DEPTH: usize = 2;
 pub const MAX_WORKER_INPUT_BYTES: usize = 64 * 1024;
 const LIFECYCLE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -179,6 +182,11 @@ impl OutputChunk {
             activity: decision.activity,
             idle_resolution,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_activity(&self) -> bool {
+        self.activity
     }
 
     pub(crate) fn classify_at_source(
@@ -636,39 +644,47 @@ pub enum WorkerCmd {
     },
 }
 
-/// Lifecycle signals bypass the normal worker command/socket queue. The
-/// receiver acknowledges only after the host signal syscall completes.
-#[derive(Debug)]
-pub(crate) struct LifecycleRequest {
-    pub signal: Option<String>,
-    pub delivered: oneshot::Sender<std::result::Result<(), String>>,
-}
-
 #[derive(Clone)]
 pub struct AgentLifecycle {
-    tx: mpsc::Sender<LifecycleRequest>,
-    alive: Arc<AtomicBool>,
+    socket: PathBuf,
+    instance_id: Uuid,
 }
 
 impl AgentLifecycle {
-    pub async fn shutdown(&self, signal: Option<String>) -> Result<()> {
-        if !self.alive.load(Ordering::Acquire) {
-            anyhow::bail!("worker connection gone");
+    pub(crate) fn new(socket: PathBuf, instance_id: Uuid) -> Self {
+        Self {
+            socket,
+            instance_id,
         }
+    }
+
+    pub async fn shutdown(&self, signal: wire::LifecycleSignal) -> Result<()> {
         let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
-        let (delivered, receipt) = oneshot::channel();
-        tokio::time::timeout_at(
-            deadline,
-            self.tx.send(LifecycleRequest { signal, delivered }),
-        )
+        let request = wire::encode_lifecycle_request(self.instance_id, signal);
+        tokio::time::timeout_at(deadline, async {
+            let mut stream = UnixStream::connect(&self.socket)
+                .await
+                .map_err(|error| anyhow::anyhow!("worker lifecycle connect failed: {error}"))?;
+            stream
+                .write_all(&request)
+                .await
+                .map_err(|error| anyhow::anyhow!("worker lifecycle request failed: {error}"))?;
+            let mut ack = [0u8; 1];
+            stream
+                .read_exact(&mut ack)
+                .await
+                .map_err(|error| anyhow::anyhow!("worker lifecycle receipt failed: {error}"))?;
+            match ack[0] {
+                wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
+                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("agent process already exited"),
+                wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
+                    anyhow::bail!("worker lifecycle instance changed")
+                }
+                _ => anyhow::bail!("worker lifecycle delivery failed"),
+            }
+        })
         .await
-        .map_err(|_| anyhow::anyhow!("worker lifecycle queue deadline exceeded"))?
-        .map_err(|_| anyhow::anyhow!("worker lifecycle channel closed"))?;
-        tokio::time::timeout_at(deadline, receipt)
-            .await
-            .map_err(|_| anyhow::anyhow!("worker lifecycle delivery deadline exceeded"))?
-            .map_err(|_| anyhow::anyhow!("worker lifecycle delivery task closed"))?
-            .map_err(anyhow::Error::msg)
+        .map_err(|_| anyhow::anyhow!("worker lifecycle delivery deadline exceeded"))?
     }
 }
 
@@ -686,13 +702,15 @@ pub struct AgentHandle {
     cmd_tx: mpsc::Sender<WorkerCmd>,
     lifecycle: AgentLifecycle,
     alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    input_copies: Arc<AtomicU64>,
 }
 
 /// Everything `worker_backend` needs to assemble a worker-backed handle.
 pub struct WorkerHandleParts {
     pub agent_id: Uuid,
     pub cmd_tx: mpsc::Sender<WorkerCmd>,
-    pub lifecycle_tx: mpsc::Sender<LifecycleRequest>,
+    pub lifecycle: AgentLifecycle,
     pub alive: Arc<AtomicBool>,
     pub cols: u16,
     pub rows: u16,
@@ -708,25 +726,36 @@ impl AgentHandle {
             outbox_tx: parts.outbox_tx,
             control: parts.control,
             cmd_tx: parts.cmd_tx,
-            lifecycle: AgentLifecycle {
-                tx: parts.lifecycle_tx,
-                alive: Arc::clone(&parts.alive),
-            },
+            lifecycle: parts.lifecycle,
             alive: parts.alive,
+            #[cfg(test)]
+            input_copies: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {
+        self.validate_input(bytes.len())?;
+        #[cfg(test)]
+        self.input_copies.fetch_add(1, Ordering::Relaxed);
         self.write_stdin_owned(DirectPayload::new(bytes.to_vec()))
     }
 
     pub(crate) fn write_stdin_owned(&self, bytes: DirectPayload) -> Result<()> {
+        self.validate_input(bytes.len())?;
+        self.enqueue_input(bytes)
+    }
+
+    fn validate_input(&self, len: usize) -> Result<()> {
         if !self.alive.load(Ordering::Acquire) {
             anyhow::bail!("worker connection gone");
         }
-        if bytes.len() > MAX_WORKER_INPUT_BYTES {
+        if len > MAX_WORKER_INPUT_BYTES {
             anyhow::bail!("worker input exceeds {MAX_WORKER_INPUT_BYTES} byte limit");
         }
+        Ok(())
+    }
+
+    fn enqueue_input(&self, bytes: DirectPayload) -> Result<()> {
         self.cmd_tx
             .try_send(WorkerCmd::Input(bytes))
             .map_err(|error| match error {
@@ -767,8 +796,9 @@ impl AgentHandle {
         self.lifecycle.clone()
     }
 
-    pub async fn shutdown(&self, signal: Option<String>) -> Result<()> {
-        self.lifecycle.shutdown(signal).await
+    #[cfg(test)]
+    pub(crate) fn input_copy_count(&self) -> u64 {
+        self.input_copies.load(Ordering::Relaxed)
     }
 
     /// Request decrypted scrollback replay from the owning worker.
@@ -907,12 +937,14 @@ mod tests {
         cmd_tx: mpsc::Sender<WorkerCmd>,
         alive: Arc<AtomicBool>,
     ) -> AgentHandle {
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(WORKER_LIFECYCLE_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         AgentHandle::new_worker(WorkerHandleParts {
             agent_id: Uuid::new_v4(),
             cmd_tx,
-            lifecycle_tx,
+            lifecycle: AgentLifecycle::new(
+                PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                Uuid::new_v4(),
+            ),
             alive,
             cols: 80,
             rows: 24,

@@ -2,7 +2,8 @@
 //!
 //! Lifecycle:
 //! 1. `spawn-worker --socket <p> --agent-id <uuid> --log-dir <p>` binds the
-//!    unix socket and waits for the supervising `spawnd` to connect.
+//!    ordinary unix socket and an independent lifecycle socket, then waits
+//!    for the supervising `spawnd` to connect.
 //! 2. Every accepted connection is greeted with a `Hello` frame carrying the
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
@@ -26,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use tokio::io::AsyncWriteExt;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -278,8 +279,23 @@ struct Pty {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     input_tx: mpsc::Sender<PlaintextChunk>,
     pid: u32,
+    child: SharedChild,
     /// Desired size; jiggles always restore to this.
     size: Arc<Mutex<(u16, u16)>>,
+}
+
+type SharedChild = Arc<Mutex<ChildState>>;
+
+/// The unreaped child handle is the stable process identity. Lifecycle
+/// signaling and the exit monitor both hold this same lock, so the PID cannot
+/// be reused between validation and `killpg` and reaping cannot race a signal.
+enum ChildState {
+    AwaitingStart,
+    Running {
+        child: Box<dyn Child + Send + Sync>,
+        pid: u32,
+    },
+    Exited,
 }
 
 /// Frames from the *current* connection's reader task, tagged with the
@@ -324,8 +340,20 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(&args.socket);
+    let lifecycle_socket = wire::lifecycle_socket_path(&args.socket);
+    let _ = std::fs::remove_file(&lifecycle_socket);
     let listener = UnixListener::bind(&args.socket)
         .with_context(|| format!("binding {}", args.socket.display()))?;
+    let lifecycle_listener = UnixListener::bind(&lifecycle_socket)
+        .with_context(|| format!("binding {}", lifecycle_socket.display()))?;
+    let instance_id = Uuid::new_v4();
+    let child_state = Arc::new(Mutex::new(ChildState::AwaitingStart));
+    let lifecycle_task = tokio::spawn(run_lifecycle_listener(
+        lifecycle_listener,
+        instance_id,
+        Arc::clone(&child_state),
+        args.agent_id,
+    ));
     tracing::info!(agent_id = %args.agent_id, socket = %args.socket.display(), "worker listening");
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<ConnFrame>(CONNECTION_FRAME_QUEUE_DEPTH);
@@ -367,6 +395,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 let hello = wire::Hello {
                     version: wire::PROTO_VERSION,
                     agent_id: args.agent_id,
+                    instance_id,
                     state: match &state {
                         State::AwaitingStart => "awaiting_start".into(),
                         State::Running => "running".into(),
@@ -412,6 +441,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &setup,
                     &mut pty_tx,
                     &mut exit_tx,
+                    &child_state,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => pty_open = true,
@@ -549,7 +579,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if let Some(log) = log {
         log.destroy();
     }
+    lifecycle_task.abort();
     let _ = std::fs::remove_file(&args.socket);
+    let _ = std::fs::remove_file(&lifecycle_socket);
     Ok(())
 }
 
@@ -572,6 +604,7 @@ async fn handle_frame(
     setup: &LogSetup,
     pty_tx: &mut Option<mpsc::Sender<PlaintextChunk>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
+    child_state: &SharedChild,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
@@ -599,7 +632,8 @@ async fn handle_frame(
             *emulator = Some(emu);
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
-            let started = spawn_pty(&spec, out_tx, ex_tx).context("spawning agent PTY")?;
+            let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
+                .context("spawning agent PTY")?;
             let pid = started.pid;
             *pty = Some(started);
             *state = State::Running;
@@ -671,11 +705,14 @@ async fn handle_frame(
             Ok(LoopAction::Continue)
         }
         wire::T_SHUTDOWN => {
-            let shutdown: wire::Shutdown =
-                wire::decode_json(&payload).unwrap_or(wire::Shutdown { signal: None });
+            let shutdown: wire::Shutdown = wire::decode_json(&payload)?;
             match pty {
                 Some(p) => {
-                    signal_child(p.pid, shutdown.signal.as_deref());
+                    let signal = shutdown.signal.unwrap_or(wire::LifecycleSignal::Term);
+                    match signal_owned_child(&p.child, signal) {
+                        LifecycleOutcome::Delivered | LifecycleOutcome::Gone => {}
+                        LifecycleOutcome::Failed => bail!("worker lifecycle delivery failed"),
+                    }
                     // PTY EOF will drive Exit reporting and cleanup.
                     Ok(LoopAction::Continue)
                 }
@@ -754,6 +791,7 @@ fn spawn_pty(
     spec: &wire::StartSpec,
     out_tx: mpsc::Sender<PlaintextChunk>,
     exit_tx: oneshot::Sender<wire::ExitInfo>,
+    child_state: SharedChild,
 ) -> Result<Pty> {
     if spec.argv.is_empty() {
         bail!("argv is empty");
@@ -778,12 +816,25 @@ fn spawn_pty(
     }
     cmd.cwd(&spec.cwd);
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .context("spawning agent in PTY")?;
     let pid = child.process_id().unwrap_or(0);
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        bail!("agent PTY returned an invalid process id");
+    }
     drop(pair.slave);
+
+    {
+        let mut state = child_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child state lock poisoned"))?;
+        if !matches!(*state, ChildState::AwaitingStart) {
+            bail!("agent child state is already occupied");
+        }
+        *state = ChildState::Running { child, pid };
+    }
 
     let mut reader = pair
         .master
@@ -803,7 +854,9 @@ fn spawn_pty(
         }
     });
 
-    // Blocking reader thread: PTY output -> async loop.
+    // Blocking reader thread: PTY output -> async loop. Child reaping is
+    // intentionally separate so it can share stable ownership with the
+    // independent lifecycle listener.
     std::thread::spawn(move || {
         let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
         loop {
@@ -820,23 +873,16 @@ fn spawn_pty(
         }
         buf.zeroize();
         drop(out_tx); // closes the channel: signals PTY EOF to the main loop
-        let info = match child.wait() {
-            Ok(status) => wire::ExitInfo {
-                exit_code: Some(status.exit_code() as i32),
-                signal: None,
-            },
-            Err(_) => wire::ExitInfo {
-                exit_code: None,
-                signal: Some("wait_failed".into()),
-            },
-        };
-        let _ = exit_tx.send(info);
     });
+
+    let monitor_child = Arc::clone(&child_state);
+    tokio::spawn(monitor_child_exit(monitor_child, exit_tx));
 
     Ok(Pty {
         master: Arc::new(Mutex::new(pair.master)),
         input_tx,
         pid,
+        child: child_state,
         size: Arc::new(Mutex::new((spec.cols, spec.rows))),
     })
 }
@@ -852,21 +898,116 @@ fn resize_master(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, cols: u16, rows
     }
 }
 
-fn signal_child(pid: u32, signal: Option<&str>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleOutcome {
+    Delivered,
+    Gone,
+    Failed,
+}
+
+fn signal_owned_child(
+    child_state: &SharedChild,
+    signal: wire::LifecycleSignal,
+) -> LifecycleOutcome {
+    use nix::errno::Errno;
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
-    let sig = match signal.unwrap_or("TERM").trim_start_matches("SIG") {
-        "KILL" => Signal::SIGKILL,
-        "INT" => Signal::SIGINT,
-        "HUP" => Signal::SIGHUP,
-        "QUIT" => Signal::SIGQUIT,
-        _ => Signal::SIGTERM,
+    let Ok(mut state) = child_state.lock() else {
+        return LifecycleOutcome::Failed;
     };
-    let pid = Pid::from_raw(pid as i32);
-    // The PTY child is a session leader (setsid by the PTY layer), so its
-    // pgid == pid; fall back to a direct kill if killpg fails.
-    if killpg(pid, sig).is_err() {
-        let _ = nix::sys::signal::kill(pid, sig);
+    let ChildState::Running { child, pid } = &mut *state else {
+        return LifecycleOutcome::Gone;
+    };
+    if child.process_id() != Some(*pid) {
+        return LifecycleOutcome::Failed;
+    }
+    let signal = match signal {
+        wire::LifecycleSignal::Term => Signal::SIGTERM,
+        wire::LifecycleSignal::Kill => Signal::SIGKILL,
+    };
+    // portable-pty makes this child a session leader, so pgid == pid. The
+    // unreaped Child remains locked across validation and this syscall: the
+    // numeric identity cannot be recycled. ESRCH is a safe already-gone
+    // result. Never fall back to signalling the bare numeric PID.
+    match killpg(Pid::from_raw(*pid as i32), signal) {
+        Ok(()) => LifecycleOutcome::Delivered,
+        Err(Errno::ESRCH) => LifecycleOutcome::Gone,
+        Err(error) => {
+            tracing::warn!(pid = *pid, %error, "agent process-group signal failed");
+            LifecycleOutcome::Failed
+        }
+    }
+}
+
+async fn monitor_child_exit(child_state: SharedChild, exit_tx: oneshot::Sender<wire::ExitInfo>) {
+    loop {
+        let info = match child_state.lock() {
+            Err(_) => Some(wire::ExitInfo {
+                exit_code: None,
+                signal: Some("wait_failed".into()),
+            }),
+            Ok(mut state) => match &mut *state {
+                ChildState::Running { child, .. } => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let info = wire::ExitInfo {
+                            exit_code: Some(status.exit_code() as i32),
+                            signal: None,
+                        };
+                        *state = ChildState::Exited;
+                        Some(info)
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        *state = ChildState::Exited;
+                        Some(wire::ExitInfo {
+                            exit_code: None,
+                            signal: Some("wait_failed".into()),
+                        })
+                    }
+                },
+                ChildState::Exited => return,
+                ChildState::AwaitingStart => None,
+            },
+        };
+        if let Some(info) = info {
+            let _ = exit_tx.send(info);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_lifecycle_listener(
+    listener: UnixListener,
+    instance_id: Uuid,
+    child_state: SharedChild,
+    agent_id: Uuid,
+) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN];
+        let ack =
+            match tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut request))
+                .await
+            {
+                Ok(Ok(_)) => match wire::decode_lifecycle_request(&request) {
+                    Ok((requested_instance, _)) if requested_instance != instance_id => {
+                        wire::LIFECYCLE_ACK_WRONG_INSTANCE
+                    }
+                    Ok((_, signal)) => match signal_owned_child(&child_state, signal) {
+                        LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
+                        LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
+                        LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
+                    },
+                    Err(_) => wire::LIFECYCLE_ACK_FAILED,
+                },
+                _ => wire::LIFECYCLE_ACK_FAILED,
+            };
+        if stream.write_all(&[ack]).await.is_err() {
+            tracing::debug!(%agent_id, "lifecycle requester closed before acknowledgement");
+        }
     }
 }
 
@@ -959,5 +1100,110 @@ mod tests {
         tx.try_send(PlaintextChunk::new(vec![0x5a; PTY_READ_CHUNK_BYTES]))
             .unwrap();
         assert_eq!(tx.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn exited_child_identity_cannot_signal_an_unrelated_process_after_pid_churn() {
+        use std::os::unix::process::CommandExt;
+
+        let child = std::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("short-lived child");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let monitor_state = Arc::clone(&child_state);
+        tokio::spawn(monitor_child_exit(monitor_state, exit_tx));
+        tokio::time::timeout(Duration::from_secs(3), exit_rx)
+            .await
+            .expect("child reap timed out")
+            .expect("exit monitor dropped");
+
+        // Exercise allocator/PID churn after the stable child was reaped.
+        for _ in 0..128 {
+            std::process::Command::new("/bin/true")
+                .status()
+                .expect("pid churn child");
+        }
+        let mut unrelated = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("unrelated sentinel");
+
+        assert_eq!(
+            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            LifecycleOutcome::Gone
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            unrelated.try_wait().expect("sentinel status").is_none(),
+            "late KILL reached an unrelated process"
+        );
+        unrelated.kill().expect("clean sentinel");
+        unrelated.wait().expect("reap sentinel");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_listener_rejects_a_stale_worker_instance_without_signaling() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.lifecycle.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("worker-owned sentinel");
+        let pid = child.id();
+        let child_state = Arc::new(Mutex::new(ChildState::Running {
+            child: Box::new(child),
+            pid,
+        }));
+        let current_instance = Uuid::new_v4();
+        let task = tokio::spawn(run_lifecycle_listener(
+            listener,
+            current_instance,
+            Arc::clone(&child_state),
+            Uuid::new_v4(),
+        ));
+
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(&wire::encode_lifecycle_request(
+                Uuid::new_v4(),
+                wire::LifecycleSignal::Kill,
+            ))
+            .await
+            .unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).await.unwrap();
+        assert_eq!(ack[0], wire::LIFECYCLE_ACK_WRONG_INSTANCE);
+
+        {
+            let mut state = child_state.lock().unwrap();
+            let ChildState::Running { child, .. } = &mut *state else {
+                panic!("stale instance changed child state");
+            };
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        assert_eq!(
+            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            LifecycleOutcome::Delivered
+        );
+        let mut owned =
+            match std::mem::replace(&mut *child_state.lock().unwrap(), ChildState::Exited) {
+                ChildState::Running { child, .. } => child,
+                _ => panic!("missing owned child"),
+            };
+        owned.wait().expect("reap worker-owned sentinel");
+        task.abort();
     }
 }
