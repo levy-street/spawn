@@ -92,6 +92,16 @@ export interface AgentCtlUploadResult {
   sha256: string;
 }
 
+export class DirectAgentUploadError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "DirectAgentUploadError";
+    this.code = code;
+  }
+}
+
 export interface AnchoredPtySlice {
   bytes: Uint8Array | null;
   anchor: number | null;
@@ -409,11 +419,15 @@ export function parseAgentCtlUploadResponse(
 ):
   | { kind: "ready"; nextSequence: number; receivedBytes: number }
   | { kind: "complete"; result: AgentCtlUploadResult }
-  | { kind: "error"; message: string }
+  | { kind: "error"; code: string; message: string }
   | null {
   if (response.request_id !== expected.uploadId) return null;
   if (!response.ok) {
-    return { kind: "error", message: response.error?.detail || "Upload failed." };
+    return {
+      kind: "error",
+      code: response.error?.code || "upload_failed",
+      message: response.error?.detail || "Upload failed.",
+    };
   }
   if (
     response.operation === "upload_start" &&

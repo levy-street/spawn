@@ -232,19 +232,37 @@ or old peers fail closed. Server routes, schemas, broker waiters, browser and
 daemon upload frames, and web API helpers are removed. Legacy frames close
 without logging names, paths, errors, or payloads.
 
-**Current integrated P2-TERM-01 candidate validation:** strict daemon format
-and all-target Clippy pass; all daemon all-target tests pass (60 library, 107
-daemon, 8 worker E2E); full server Ruff and all 134 server tests pass; web lint,
-TypeScript, all 55 unit tests, 68 retry-free browser tests (3 opt-in audits
-skipped), the direct chunked-upload browser test, and the production build
-pass. With `SPAWN_E2E_PORT=44192`, `scripts/test-all.sh` also passes all
-repeatable checks plus installer, HTTP, real-Redis, PostgreSQL/Redis
-owner-recovery, login, daemon, live-browser direct upload, and service-manager
-smokes. Semantic integration includes current `master` at P2-HOST-02
-`4e7c89b`; its accepted host-control/filesystem implementation remains
-byte-identical, the combined host/upload adversarial suites pass, and only the
-required shared source/docs deletions differ. Independent review is still
-required before acceptance or merge.
+The current correction series requires both agent DataChannels to be ordered
+and fully reliable. Upload preparation, write/sync, link, unlink, and directory
+sync are owned blocking operations with tracked permits; session/generation
+teardown uses one absolute deadline and keeps per-viewer/global capacity charged
+until real descriptor/temp cleanup finishes. Successful final linking records
+the completion cache before fallible unlink/fsync cleanup. Post-link cleanup
+failure, or browser timeout/abort/disconnect after final chunk dispatch, is the
+stable `outcome_unknown` result and is never retried automatically. Remove,
+unmount, and RTC-generation replacement abort browser uploads, send best-effort
+`upload_cancel`, and cannot resurrect UI state from late completion.
+
+**Current P2-TERM-01 correction validation (review still pending):** 18 focused
+daemon upload tests pass, including partial resume/conflict, global-64 and
+completed-cache-128/TTL pressure, prepare/sync/commit/cleanup stalls, retained
+capacity, cancellation races, and injected post-link unlink/fsync failure with
+idempotent reconciliation. The real-peer gate rejects unordered,
+packet-lifetime-limited, and retransmit-limited `spawn.pty` and `spawn.ctl`
+channels without resident state. TypeScript and the browser protocol unit suite
+pass; focused browser tests cover declared reliability, large multi-chunk
+transfer, non-immediate `bufferedAmount` drain, Remove-driven cancellation, and
+lost final acknowledgement without retry. The broad production-source upload
+guard and its adversarial self-test pass. Strict daemon format and all-target
+Clippy pass; all 60 library, 115 daemon, and 8 worker-E2E tests pass; server Ruff
+and all 134 server tests pass; web lint, all 55 unit tests, 71 Playwright tests
+(3 opt-in audits skipped), and the production build pass.
+`SPAWN_E2E_PORT=45271 scripts/test-all.sh` passes the full repeatable matrix,
+including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
+daemon lifecycle, live-browser, and service-manager smokes. Current-master
+mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base
+and the simulated merge tree equals the candidate tree. Independent re-review
+is still required before acceptance or merge.
 
 This is still a source checkpoint: it is not merged or deployed, does not purge
 historical copies, and does not complete Phase 2. Offline history is now an

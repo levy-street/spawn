@@ -86,6 +86,7 @@ type PendingAttachment = {
   previewUrl: string;
   promptText: string | null;
   status: PendingAttachmentStatus;
+  controller: AbortController;
 };
 
 export interface TerminalHandle {
@@ -857,6 +858,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         attachments
           .filter((attachment) => attachment.id === id)
           .forEach((attachment) => {
+            attachment.controller.abort();
             URL.revokeObjectURL(attachment.previewUrl);
           });
         return next;
@@ -1004,6 +1006,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         ? pendingAttachmentsRef.current.find((attachment) => attachment.id === clientId)?.id
         : pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
       if (!targetId) {
+        // A removed/unmounted attachment owns an aborted generation. Ignore a
+        // completion that raced cancellation instead of resurrecting UI state.
+        if (clientId) return;
         showUploadStatus(`Uploaded ${compactPath(path)}`);
         termRef.current?.focus();
         return;
@@ -1484,6 +1489,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheRefreshTimerRef.current = null;
       }
       pendingAttachmentsRef.current.forEach((attachment) => {
+        attachment.controller.abort();
         URL.revokeObjectURL(attachment.previewUrl);
       });
       pendingAttachmentsRef.current = [];
@@ -2406,6 +2412,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           continue;
         }
         const clientId = makeClientId();
+        const controller = new AbortController();
         const previewUrl = URL.createObjectURL(file);
         updatePendingAttachments((attachments) => [
           ...attachments,
@@ -2415,6 +2422,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             previewUrl,
             promptText: null,
             status: "uploading",
+            controller,
           },
         ]);
         try {
@@ -2423,10 +2431,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             name: file.name || defaultImageName(file),
             mimeType: mimeTypeForFile(file),
             destination: "attachments",
+            signal: controller.signal,
           });
+          if (controller.signal.aborted) continue;
           sent += 1;
           handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
+          if (controller.signal.aborted) continue;
           showUploadStatus(
             error instanceof Error && error.message
               ? error.message

@@ -18,6 +18,8 @@ async function openTerminalWithMockSocket(
     noChannels?: boolean;
     noReady?: boolean;
     autoSnapshot?: boolean;
+    uploadFinalAction?: "complete" | "disconnect" | "hold";
+    stallUploadBackpressure?: boolean;
   } = {},
 ) {
   const messages: Array<string | Buffer> = [];
@@ -34,6 +36,8 @@ async function openTerminalWithMockSocket(
     openChannels: !options.noChannels,
     sendReady: !options.noReady,
     autoSnapshot: options.autoSnapshot,
+    uploadFinalAction: options.uploadFinalAction,
+    stallUploadBackpressure: options.stallUploadBackpressure,
     onUpload: (upload) => {
       uploads.push(upload);
     },
@@ -251,6 +255,28 @@ test("terminal sends resize and chunked uploads over direct DataChannels", async
   const { messages, uploads } = await openTerminalWithMockSocket(page);
 
   await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const test = (
+          window as unknown as {
+            __spawnRtcTest?: {
+              channelReliability: (label: string) => {
+                ordered: boolean;
+                maxPacketLifeTime: number | null;
+                maxRetransmits: number | null;
+              } | null;
+            };
+          }
+        ).__spawnRtcTest;
+        return [test?.channelReliability("spawn.pty"), test?.channelReliability("spawn.ctl")];
+      }),
+    )
+    .toEqual([
+      { ordered: true, maxPacketLifeTime: null, maxRetransmits: null },
+      { ordered: true, maxPacketLifeTime: null, maxRetransmits: null },
+    ]);
+
+  await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
     .toBe(true);
 
@@ -278,6 +304,82 @@ test("terminal sends resize and chunked uploads over direct DataChannels", async
       agent_generation: 1,
     });
   await expect(page.getByText("Uploaded /Users/tester/projects/spawn/note.txt")).toBeVisible();
+});
+
+test("lost final upload acknowledgement is outcome_unknown and is never retried", async ({
+  page,
+}) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "disconnect",
+  });
+
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({ name: "maybe.txt", mimeType: "text/plain", buffer: Buffer.from("published") });
+
+  await expect.poll(() => uploads).toHaveLength(1);
+  await expect(page.getByText(/may have been published/i)).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+});
+
+test("multi-chunk upload waits for real bufferedAmount drain", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  const bytes = Buffer.alloc(100_000, 0x5a);
+
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({ name: "large.bin", mimeType: "application/octet-stream", buffer: bytes });
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "upload_start"))
+    .toMatchObject({ name: "large.bin", total_bytes: bytes.length, chunks: 3 });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { releaseUploadBackpressure: () => void } }
+    ).__spawnRtcTest.releaseUploadBackpressure();
+  });
+  await expect.poll(() => uploads.at(-1)?.bytes.length).toBe(bytes.length);
+  expect(uploads.at(-1)?.bytes.equals(bytes)).toBe(true);
+});
+
+test("removing an uploading attachment aborts it and sends upload_cancel", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(
+      new File([new Uint8Array(100_000).fill(0x31)], "cancel.png", { type: "image/png" }),
+    );
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove cancel.png" })).toBeVisible();
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_start"))
+    .toBe(true);
+  await page.getByRole("button", { name: "Remove cancel.png" }).click();
+  await expect(page.getByRole("button", { name: "Remove cancel.png" })).toHaveCount(0);
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { releaseUploadBackpressure: () => void } }
+    ).__spawnRtcTest.releaseUploadBackpressure();
+  });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
 });
 
 test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({

@@ -170,6 +170,26 @@ describe("spawn.ctl browser protocol", () => {
       ),
       null,
     );
+    assert.deepEqual(
+      parseAgentCtlUploadResponse(
+        {
+          version: 1,
+          kind: "response",
+          request_id: uploadId,
+          ok: false,
+          error: {
+            code: "outcome_unknown",
+            detail: "reconcile before retrying",
+          },
+        },
+        start,
+      ),
+      {
+        kind: "error",
+        code: "outcome_unknown",
+        message: "reconcile before retrying",
+      },
+    );
   });
 
   test("decodes request-bound chunks and verifies complete response length", () => {

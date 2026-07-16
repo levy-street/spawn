@@ -12,6 +12,8 @@ export async function installAgentRtcMock(
     openChannels?: boolean;
     sendReady?: boolean;
     autoSnapshot?: boolean;
+    uploadFinalAction?: "complete" | "disconnect" | "hold";
+    stallUploadBackpressure?: boolean;
     onPtyInput?: (bytes: Buffer) => void | Promise<void>;
     onUpload?: (upload: {
       name: string;
@@ -40,7 +42,16 @@ export async function installAgentRtcMock(
     },
   );
   await page.addInitScript(
-    ({ history, secondHistory, control, openChannels, sendReady, autoSnapshot }) => {
+    ({
+      history,
+      secondHistory,
+      control,
+      openChannels,
+      sendReady,
+      autoSnapshot,
+      uploadFinalAction,
+      stallUploadBackpressure,
+    }) => {
       const encoder = new TextEncoder();
       const state = {
         history,
@@ -49,6 +60,8 @@ export async function installAgentRtcMock(
         openChannels,
         sendReady,
         autoSnapshot,
+        uploadFinalAction,
+        stallUploadBackpressure,
         connections: 0,
         activePtyChannel: null as FakeDataChannel | null,
         channels: new Map<string, FakeDataChannel>(),
@@ -115,6 +128,9 @@ export async function installAgentRtcMock(
 
       class FakeDataChannel {
         label: string;
+        ordered: boolean;
+        maxPacketLifeTime: number | null;
+        maxRetransmits: number | null;
         readyState: RTCDataChannelState = "connecting";
         binaryType = "arraybuffer";
         bufferedAmount = 0;
@@ -123,12 +139,26 @@ export async function installAgentRtcMock(
         onclose: (() => void) | null = null;
         onerror: (() => void) | null = null;
         onmessage: ((event: MessageEvent) => void) | null = null;
+        listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
 
-        addEventListener() {}
-        removeEventListener() {}
+        addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+          const listeners =
+            this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+          listeners.add(listener);
+          this.listeners.set(type, listeners);
+        }
+        removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+          this.listeners.get(type)?.delete(listener);
+        }
 
-        constructor(label: string) {
+        constructor(label: string, init?: RTCDataChannelInit) {
           this.label = label;
+          this.ordered = init?.ordered ?? true;
+          this.maxPacketLifeTime = init?.maxPacketLifeTime ?? null;
+          this.maxRetransmits = init?.maxRetransmits ?? null;
+          if (label === "spawn.ctl" && state.stallUploadBackpressure) {
+            this.bufferedAmount = 2 * 1024 * 1024;
+          }
           state.channels.set(label, this);
           if (label === "spawn.pty") state.ptyChannels.push(this);
         }
@@ -205,6 +235,11 @@ export async function installAgentRtcMock(
               String(upload.request.destination),
               btoa(binary),
             );
+            if (state.uploadFinalAction === "disconnect") {
+              queueMicrotask(() => this.close());
+              return;
+            }
+            if (state.uploadFinalAction === "hold") return;
             queueMicrotask(() =>
               this.receive(
                 JSON.stringify({
@@ -336,6 +371,16 @@ export async function installAgentRtcMock(
         receive(data: string | ArrayBuffer) {
           this.onmessage?.(new MessageEvent("message", { data }));
         }
+
+        drainBufferedAmount() {
+          this.bufferedAmount = 0;
+          const event = new Event("bufferedamountlow");
+          for (const listener of this.listeners.get("bufferedamountlow") ?? []) {
+            if (typeof listener === "function") listener(event);
+            else listener.handleEvent(event);
+          }
+          this.listeners.delete("bufferedamountlow");
+        }
       }
 
       class FakePeerConnection {
@@ -352,8 +397,8 @@ export async function installAgentRtcMock(
           state.connections += 1;
         }
 
-        createDataChannel(label: string) {
-          const channel = new FakeDataChannel(label);
+        createDataChannel(label: string, init?: RTCDataChannelInit) {
+          const channel = new FakeDataChannel(label, init);
           this.channels.push(channel);
           return channel as unknown as RTCDataChannel;
         }
@@ -400,6 +445,12 @@ export async function installAgentRtcMock(
             sendPty: (text: string, connectionIndex?: number) => boolean;
             replyReplay: (text: string) => void;
             setControl: (next: typeof control) => void;
+            channelReliability: (label: string) => {
+              ordered: boolean;
+              maxPacketLifeTime: number | null;
+              maxRetransmits: number | null;
+            } | null;
+            releaseUploadBackpressure: () => void;
           };
         }
       ).__spawnRtcTest = {
@@ -430,6 +481,19 @@ export async function installAgentRtcMock(
               JSON.stringify({ version: 1, kind: "event", event: "display_state", ...next }),
             );
         },
+        channelReliability(label) {
+          const channel = state.channels.get(label);
+          return channel
+            ? {
+                ordered: channel.ordered,
+                maxPacketLifeTime: channel.maxPacketLifeTime,
+                maxRetransmits: channel.maxRetransmits,
+              }
+            : null;
+        },
+        releaseUploadBackpressure() {
+          state.channels.get("spawn.ctl")?.drainBufferedAmount();
+        },
       };
     },
     {
@@ -439,6 +503,8 @@ export async function installAgentRtcMock(
       openChannels: options.openChannels ?? true,
       sendReady: options.sendReady ?? true,
       autoSnapshot: options.autoSnapshot ?? false,
+      uploadFinalAction: options.uploadFinalAction ?? "complete",
+      stallUploadBackpressure: options.stallUploadBackpressure ?? false,
     },
   );
 }

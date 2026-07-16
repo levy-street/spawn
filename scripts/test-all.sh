@@ -29,6 +29,7 @@ printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
 
 printf '%s\n' "== no server agent upload guard =="
+scripts/check-no-server-agent-upload.sh --self-test
 scripts/check-no-server-agent-upload.sh
 
 printf '%s\n' "== daemon tests =="

@@ -39,6 +39,7 @@ use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
 use crate::upload::{
     UploadChunkOutcome, UploadChunkRequest, UploadHub, UploadManifest, UploadStartOutcome,
+    UPLOAD_CLOSE_TIMEOUT,
 };
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
@@ -53,6 +54,15 @@ const HOST_CONTROL_MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_RTC_PEERS: usize = 128;
 const MAX_HOST_RTC_PEERS: usize = 64;
 const MAX_SAFE_SIGNAL_GENERATION: u64 = 9_007_199_254_740_991;
+
+fn upload_teardown_deadline() -> tokio::time::Instant {
+    let timeout = if cfg!(test) {
+        Duration::from_millis(100)
+    } else {
+        UPLOAD_CLOSE_TIMEOUT
+    };
+    tokio::time::Instant::now() + timeout
+}
 
 /// Peer connections that never reach `Connected` within this window are
 /// reaped. Closing is the daemon's own defense: `rtc.close` delivery from the
@@ -1063,6 +1073,10 @@ impl RtcSessions {
     /// using the same UUID is deliberately not matched.
     pub async fn close_for_agent(&self, agent_id: Uuid, agent_generation: u64) {
         let agent = AgentBinding::new(agent_id, agent_generation);
+        let upload_deadline = upload_teardown_deadline();
+        // Publish cancellation before transport/fence draining. Every later
+        // upload cleanup wait for this generation shares this one deadline.
+        self.uploads.remove_generation_now(agent);
         let closer = self.agent_closer(agent).await;
         let _closing = closer.lock().await;
         let closing = {
@@ -1077,7 +1091,8 @@ impl RtcSessions {
         };
         for (session_id, peer) in closing {
             let pc = Arc::clone(&peer.pc);
-            self.deactivate_peer(&session_id, peer).await;
+            self.deactivate_peer_until(&session_id, peer, upload_deadline)
+                .await;
             let mut peers = self.peers.lock().await;
             if peers
                 .get(&session_id)
@@ -1095,26 +1110,37 @@ impl RtcSessions {
             self.controls.remove_agent(agent_id).await;
         }
         drop(peers);
-        self.uploads.remove_generation(agent).await;
+        self.uploads
+            .remove_generation_until(agent, upload_deadline)
+            .await;
     }
 
     async fn deactivate_peer(&self, session_id: &str, peer: RtcPeer) {
+        self.deactivate_peer_until(session_id, peer, upload_teardown_deadline())
+            .await;
+    }
+
+    async fn deactivate_peer_until(
+        &self,
+        session_id: &str,
+        peer: RtcPeer,
+        upload_deadline: tokio::time::Instant,
+    ) {
         peer.channels.stop();
         peer.active.store(false, Ordering::Release);
-        // Closing first is transport cancellation: it wakes bounded WebRTC
-        // sends and control replies. State teardown happens only after both
-        // lifecycle writers have drained every admitted effect callback.
+        let upload_session_id = viewer_id(session_id, &peer.generation);
+        self.uploads
+            .cancel_session_now(peer.agent, &upload_session_id);
+        // Closing transports wakes bounded WebRTC sends and control replies.
+        // Upload cancellation was already published, so a stalled blocking
+        // filesystem closure cannot delay that signal.
         let _ = peer.pc.close().await;
         let _lifecycle = peer.channels.fail().await;
         let _drained = peer.fence.write().await;
-        peer.control
-            .remove_direct_sink(&viewer_id(session_id, &peer.generation))
-            .await;
-        self.controls
-            .unregister_session(&viewer_id(session_id, &peer.generation))
-            .await;
+        peer.control.remove_direct_sink(&upload_session_id).await;
+        self.controls.unregister_session(&upload_session_id).await;
         self.uploads
-            .cancel_session(peer.agent, &viewer_id(session_id, &peer.generation))
+            .cancel_session_until(peer.agent, &upload_session_id, upload_deadline)
             .await;
     }
 
@@ -1309,8 +1335,11 @@ fn install_data_channel_handler(
                 &binding.signaling.session_id,
                 &binding.signaling.generation,
             );
-            if !dc.ordered() {
-                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unordered rtc data channel");
+            let reliable = dc.ordered()
+                && dc.max_packet_lifetime().is_none()
+                && dc.max_retransmits().is_none();
+            if !reliable {
+                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unreliable rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
                     &binding.signaling.session_id,
@@ -1856,11 +1885,7 @@ fn install_control_data_channel(
                             Err(error) => {
                                 agent_ctl::send_error(
                                     &sender,
-                                    &ProtocolError::new(
-                                        Some(upload_id),
-                                        "upload_failed",
-                                        &error.to_string(),
-                                    ),
+                                    &ProtocolError::new(Some(upload_id), error.code, &error.detail),
                                 )
                                 .await;
                             }
@@ -2246,9 +2271,7 @@ async fn execute_control_request(
                     },
                 )
                 .await
-                .map_err(|error| {
-                    ProtocolError::new(Some(request_id), "upload_failed", &error.to_string())
-                })?;
+                .map_err(|error| ProtocolError::new(Some(request_id), error.code, &error.detail))?;
             if !effect.valid() || !registry.is_current(agent) {
                 let _ = uploads
                     .cancel(agent, session_id, upload_capability, request_id)
@@ -2283,9 +2306,7 @@ async fn execute_control_request(
             uploads
                 .cancel(agent, session_id, upload_capability, upload_id)
                 .await
-                .map_err(|error| {
-                    ProtocolError::new(Some(request_id), "upload_failed", &error.to_string())
-                })?;
+                .map_err(|error| ProtocolError::new(Some(request_id), error.code, &error.detail))?;
             if !effect.valid() || !registry.is_current(agent) {
                 return Ok(());
             }
@@ -2950,6 +2971,8 @@ mod tests {
     struct TestAgentChannel {
         label: &'static str,
         ordered: bool,
+        max_packet_life_time: Option<u16>,
+        max_retransmits: Option<u16>,
         close_on_open: bool,
     }
 
@@ -2958,6 +2981,8 @@ mod tests {
             Self {
                 label,
                 ordered: true,
+                max_packet_life_time: None,
+                max_retransmits: None,
                 close_on_open: false,
             }
         }
@@ -3196,6 +3221,8 @@ mod tests {
                     Some(
                         webrtc::data_channel::data_channel_init::RTCDataChannelInit {
                             ordered: Some(spec.ordered),
+                            max_packet_life_time: spec.max_packet_life_time,
+                            max_retransmits: spec.max_retransmits,
                             ..Default::default()
                         },
                     ),
@@ -3756,12 +3783,47 @@ mod tests {
             },
             TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
-        let unordered = [
+        let unordered_pty = [
             TestAgentChannel {
                 ordered: false,
                 ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
             },
             TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let unordered_ctl = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel {
+                ordered: false,
+                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+            },
+        ];
+        let lifetime_pty = [
+            TestAgentChannel {
+                max_packet_life_time: Some(1),
+                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+            },
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let lifetime_ctl = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel {
+                max_packet_life_time: Some(1),
+                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+            },
+        ];
+        let retransmits_pty = [
+            TestAgentChannel {
+                max_retransmits: Some(1),
+                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+            },
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let retransmits_ctl = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel {
+                max_retransmits: Some(1),
+                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+            },
         ];
 
         tokio::join!(
@@ -3779,7 +3841,12 @@ mod tests {
             assert_real_agent_channels_fail_closed("duplicate-ctl", &duplicate_ctl, None),
             assert_real_agent_channels_fail_closed("unknown", &unknown, None),
             assert_real_agent_channels_fail_closed("early-close", &early_close, None),
-            assert_real_agent_channels_fail_closed("unordered", &unordered, None),
+            assert_real_agent_channels_fail_closed("unordered-pty", &unordered_pty, None),
+            assert_real_agent_channels_fail_closed("unordered-ctl", &unordered_ctl, None),
+            assert_real_agent_channels_fail_closed("lifetime-pty", &lifetime_pty, None),
+            assert_real_agent_channels_fail_closed("lifetime-ctl", &lifetime_ctl, None),
+            assert_real_agent_channels_fail_closed("retransmits-pty", &retransmits_pty, None),
+            assert_real_agent_channels_fail_closed("retransmits-ctl", &retransmits_ctl, None),
         );
     }
 

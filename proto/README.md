@@ -408,7 +408,9 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
 The terminal data plane is two mandatory WebRTC DataChannels negotiated over
 the content-free WebSocket signaling plane.
 
-- The browser creates ordered DataChannels named `spawn.pty` and `spawn.ctl`.
+- The browser creates fully reliable ordered DataChannels named `spawn.pty`
+  and `spawn.ctl` (no packet-lifetime or retransmit limit). The daemon verifies
+  all three properties for both labels before admitting either channel.
 - Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
 - DataChannel messages are raw binary PTY bytes:
   - browser → daemon: stdin bytes for the authorized agent
@@ -491,14 +493,22 @@ generation, and the fixed endpoint limits:
 ```
 
 The browser hashes before sending, applies SCTP buffered-amount backpressure,
-and retries a stable upload UUID a bounded number of times. The daemon admits
+and retries only the pre-effect `upload_start` exchange with a stable upload
+UUID a bounded number of times. It never retries after dispatching the final
+chunk. A timeout, abort, or disconnect after that dispatch is stable
+`outcome_unknown`; best-effort cancellation cannot downgrade it, and the user
+must reconcile the destination before retrying. The daemon admits
 at most 20 MiB per upload, 48 KiB per chunk, four active uploads per viewer,
 and 64 active uploads globally. A retry with the identical manifest resumes at
 the acknowledged sequence or returns the cached completion; reuse with a
 different manifest fails. Chunks must be ordered with exact lengths and final
 flag. Length, SHA-256, capability, backend generation, framing, and destination
 checks all fail closed. Cancellation, channel loss, backend replacement, and
-malformed chunks remove private temporary files.
+malformed chunks remove private temporary files. Preparation, writes, sync,
+commit, unlink, and directory sync run in owned blocking operations. A single
+absolute teardown deadline bounds waiting, while operation permits and the
+per-viewer/global admission charge remain held until descriptor/temp cleanup
+actually completes; timed-out cleanup stays tracked and cannot publish later.
 
 The retained worker cwd is a canonical absolute capability root. The endpoint
 opens it and its attachment directories component-by-component without
@@ -510,6 +520,14 @@ WebSockets have no agent-upload content or acknowledgement leg. Workers older
 than private worker protocol version 5 lack the retained cwd capability and are
 rejected for adoption rather than enabling a server or path fallback.
 
+Successful no-clobber link creation is the upload publication point. The
+daemon records the completed stable ID immediately, before temporary unlink and
+directory fsync, so a lost acknowledgement reconciles to the same result and
+cannot duplicate the file. Any later unlink/fsync failure is
+`error.code="outcome_unknown"`; callers must not infer rollback or retry the
+effect. Definite pre-publication validation, hash, write, or sync failures keep
+their request-bound stable error code.
+
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
 The worker uses an 8 MiB conservative total resource charge by default. It
@@ -520,7 +538,7 @@ response budget. An append/checkpoint admission failure disables replay for
 that live worker rather than returning partial history; live PTY forwarding
 continues. The control envelope retains a separate 12 MiB hard rejection ceiling.
 
-`spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
+`spawn.pty` and `spawn.ctl` are each fully reliable and ordered, but there is no total order
 between them. Replay metadata therefore carries `pty_offset`, the exact
 per-viewer `spawn.pty` byte boundary represented by the replay. Worker output
 and replay share the worker's durable watermark, translated through the
