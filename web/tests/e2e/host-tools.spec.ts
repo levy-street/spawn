@@ -139,17 +139,108 @@ test("install cancel is reachable and late success requires reconciliation", asy
       installed: true,
       path: "/private/bin/codex",
       version: "codex 1.2.4",
+      latest_version: "1.2.4",
+      update_available: false,
     },
   });
   await expect(page.getByText(/codex: outcome unknown/)).toBeVisible();
   await expect(
     page.getByText(
-      "Check the tool status before retrying. This install is never retried automatically.",
+      "Check now must return a definitive status before install or update is enabled. This install is never retried automatically.",
       { exact: true },
     ),
   ).toBeVisible();
   await expect(page.getByText("late success must not replace cancelled UI state")).toHaveCount(0);
   expect(installs).toHaveLength(1);
+});
+
+test("outcome unknown survives navigation and only a definitive Check now unlocks retry", async ({
+  page,
+}) => {
+  let checkCalls = 0;
+  const installs: unknown[] = [];
+  page.on("dialog", (dialog) => dialog.accept());
+  await mockAuthenticatedApi(page, {
+    toolTargets: [
+      {
+        preset_id: PRESET_ID,
+        preset_name: "codex",
+        agent_kind: "codex",
+        auto_update: false,
+        last_checked_at: null,
+        last_auto_update_at: null,
+      },
+    ],
+    toolCheck: () => {
+      checkCalls += 1;
+      return {
+        tools: [
+          {
+            target_id: PRESET_ID,
+            tool: "codex",
+            command: ["codex"],
+            ...(checkCalls === 2
+              ? {
+                  installed: true,
+                  path: "/private/bin/codex",
+                  version: "codex 1.2.4",
+                }
+              : { installed: false }),
+          },
+        ],
+      };
+    },
+    toolInstall: (_hostId, payload) => {
+      installs.push(payload);
+      return {
+        target_id: PRESET_ID,
+        tool: "codex",
+        command: ["codex"],
+        install_argv: ["npm", "install", "--global", "@openai/codex"],
+        outcome: "unknown",
+        success: false,
+        exit_code: 0,
+        stdout: "typed reconciliation output",
+        stderr: "",
+        output_truncated: false,
+        error: "installer exited zero but version reconciliation failed",
+        status: {
+          target_id: PRESET_ID,
+          tool: "codex",
+          command: ["codex"],
+          installed: false,
+          error: "version command exited with code 7",
+        },
+      };
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}`);
+  await page.getByRole("button", { name: "Install" }).click();
+  await expect(page.getByText("typed reconciliation output")).toBeVisible();
+  await expect(page.getByText("reconciliation required")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Install" })).toBeDisabled();
+  expect(installs).toHaveLength(1);
+
+  await page.getByRole("link", { name: "All hosts" }).click();
+  await page.locator(`a[href="/hosts/${HOST_ID}"]`).click();
+  await expect(page.getByText("typed reconciliation output")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Install" })).toBeDisabled();
+  expect(installs).toHaveLength(1);
+
+  await page.getByRole("button", { name: "Check now" }).click();
+  await expect(
+    page.getByText(/Check now failed: Endpoint did not return a definitive tool status/),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Install" })).toBeDisabled();
+  await expect(page.getByText("reconciliation required")).toBeVisible();
+
+  await page.getByRole("button", { name: "Check now" }).click();
+  await expect(page.getByText("reconciliation required")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Install" })).toBeEnabled();
+  await expect(page.getByText("typed reconciliation output")).toHaveCount(0);
+  expect(installs).toHaveLength(1);
+  expect(checkCalls).toBe(3);
 });
 
 test("built-in Aider metadata uses its canonical endpoint kind", async ({ page }) => {

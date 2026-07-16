@@ -29,12 +29,28 @@ interface VisibleResult {
   cancelled?: boolean;
 }
 
+interface ReconciliationEntry extends VisibleResult {
+  targetId: string;
+}
+
+type ReconciliationMap = Record<string, ReconciliationEntry>;
+
 const TOOL_CHECK_BATCH_SIZE = 8;
 
 export function HostToolsPanel({ host }: { host: Host }) {
   const qc = useQueryClient();
   const { client, state } = useHostControl(host.id, host.status === "online");
   const [lastResult, setLastResult] = useState<VisibleResult | null>(null);
+  const reconciliationKey = ["host-tool-reconciliation", host.id] as const;
+  const reconciliationQ = useQuery<ReconciliationMap>({
+    queryKey: reconciliationKey,
+    queryFn: async () => ({}),
+    initialData: {},
+    enabled: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: Number.POSITIVE_INFINITY,
+  });
+  const reconciliationByTarget = reconciliationQ.data;
   const installAbortRef = useRef<{
     controller: AbortController;
     client: typeof client;
@@ -95,12 +111,18 @@ export function HostToolsPanel({ host }: { host: Host }) {
     },
     onSuccess: (result, { tool, controller }) => {
       if (controller.signal.aborted) {
-        setLastResult({
+        const unknown: ReconciliationEntry = {
+          targetId: tool.preset_id,
           name: tool.preset_name,
           code: "outcome_unknown",
           outcomeUnknown: true,
           error: "Cancellation raced completion. Check the tool status before retrying.",
-        });
+        };
+        qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => ({
+          ...current,
+          [tool.preset_id]: unknown,
+        }));
+        setLastResult(unknown);
         return;
       }
       setLastResult({ name: tool.preset_name, result });
@@ -109,7 +131,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
     onError: (err, { tool }) => {
       const uncertain = err instanceof HostControlError ? err.data : undefined;
       const code = err instanceof HostControlError ? err.code : undefined;
-      setLastResult({
+      const visible: VisibleResult = {
         name: tool.preset_name,
         result: isInstallResult(uncertain) ? uncertain : undefined,
         error: err instanceof Error ? err.message : String(err),
@@ -117,10 +139,68 @@ export function HostToolsPanel({ host }: { host: Host }) {
         outcomeUnknown: code === "outcome_unknown",
         cancelled:
           code === "cancelled" || (err instanceof DOMException && err.name === "AbortError"),
-      });
+      };
+      if (visible.outcomeUnknown) {
+        const unknown: ReconciliationEntry = {
+          ...visible,
+          targetId: tool.preset_id,
+        };
+        qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => ({
+          ...current,
+          [tool.preset_id]: unknown,
+        }));
+        setLastResult(unknown);
+      } else {
+        setLastResult(visible);
+      }
     },
     onSettled: (_result, _error, { controller }) => {
       if (installAbortRef.current?.controller === controller) installAbortRef.current = null;
+    },
+  });
+  const reconcileM = useMutation({
+    mutationFn: async (tool: ToolRow) => {
+      if (!client || !isInteractiveToolKind(tool.agent_kind)) {
+        throw new HostControlError(
+          "unsupported_tool",
+          "Tool is not supported by the endpoint policy",
+        );
+      }
+      const [status] = await client.checkTools([
+        { target_id: tool.preset_id, tool: tool.agent_kind },
+      ]);
+      if (!status || !isDefinitiveReconciliation(status)) {
+        throw new HostControlError(
+          "reconciliation_failed",
+          status?.error ?? "Endpoint did not return a definitive tool status",
+          status,
+        );
+      }
+      return status;
+    },
+    onSuccess: (status, tool) => {
+      qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => {
+        const next = { ...current };
+        delete next[tool.preset_id];
+        return next;
+      });
+      qc.setQueryData<{ tools: ToolRow[] }>(["host-tools", host.id], (current) =>
+        current
+          ? {
+              tools: current.tools.map((row) =>
+                row.preset_id === tool.preset_id ? { ...row, status } : row,
+              ),
+            }
+          : current,
+      );
+      setLastResult(null);
+    },
+    onError: (error, tool) => {
+      const existing = reconciliationByTarget[tool.preset_id];
+      setLastResult({
+        ...(existing ?? { name: tool.preset_name, outcomeUnknown: true }),
+        error: `Check now failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
     },
   });
   const policyM = useMutation({
@@ -145,8 +225,9 @@ export function HostToolsPanel({ host }: { host: Host }) {
     );
   }
 
-  const installingId = installM.variables?.tool.preset_id;
+  const installingId = installM.isPending ? installM.variables?.tool.preset_id : undefined;
   const tools = toolsQ.data?.tools ?? [];
+  const visibleResult = lastResult ?? Object.values(reconciliationByTarget)[0] ?? null;
 
   return (
     <div className="overflow-hidden rounded-xl border border-border">
@@ -199,6 +280,9 @@ export function HostToolsPanel({ host }: { host: Host }) {
                     </Badge>
                   )}
                   {!tool.supported && <Badge variant="outline">unsupported policy</Badge>}
+                  {reconciliationByTarget[tool.preset_id] && (
+                    <Badge variant="warning">reconciliation required</Badge>
+                  )}
                   {tool.supported && !tool.status?.installed && (
                     <Badge variant="outline">not installed</Badge>
                   )}
@@ -217,10 +301,17 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 <input
                   type="checkbox"
                   checked={tool.auto_update}
-                  disabled={!tool.supported || tool.agent_kind === "shell" || policyM.isPending}
-                  onChange={(event) =>
-                    policyM.mutate({ tool, autoUpdate: event.currentTarget.checked })
+                  disabled={
+                    !tool.supported ||
+                    tool.agent_kind === "shell" ||
+                    policyM.isPending ||
+                    (Boolean(reconciliationByTarget[tool.preset_id]) && !tool.auto_update)
                   }
+                  onChange={(event) => {
+                    const autoUpdate = event.currentTarget.checked;
+                    if (reconciliationByTarget[tool.preset_id] && autoUpdate) return;
+                    policyM.mutate({ tool, autoUpdate });
+                  }}
                 />
                 Auto update (legacy)
               </label>
@@ -230,8 +321,14 @@ export function HostToolsPanel({ host }: { host: Host }) {
                 }
                 size="sm"
                 className="shrink-0"
-                disabled={!tool.supported || tool.agent_kind === "shell" || installM.isPending}
+                disabled={
+                  !tool.supported ||
+                  tool.agent_kind === "shell" ||
+                  installM.isPending ||
+                  Boolean(reconciliationByTarget[tool.preset_id])
+                }
                 onClick={() => {
+                  if (reconciliationByTarget[tool.preset_id]) return;
                   if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
                     setLastResult(null);
                     const controller = new AbortController();
@@ -248,6 +345,19 @@ export function HostToolsPanel({ host }: { host: Host }) {
                     ? "Update"
                     : "Install"}
               </Button>
+              {reconciliationByTarget[tool.preset_id] && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  disabled={reconcileM.isPending}
+                  onClick={() => reconcileM.mutate(tool)}
+                >
+                  {reconcileM.isPending && reconcileM.variables?.preset_id === tool.preset_id
+                    ? "Checking..."
+                    : "Check now"}
+                </Button>
+              )}
               {installingId === tool.preset_id && installM.isPending && (
                 <Button
                   variant="outline"
@@ -272,32 +382,33 @@ export function HostToolsPanel({ host }: { host: Host }) {
         </ul>
       )}
 
-      {lastResult && (
+      {visibleResult && (
         <div className="border-t border-border px-4 py-3">
           <div
-            className={`mb-2 text-sm ${lastResult.result?.success ? "text-emerald-400" : lastResult.outcomeUnknown ? "text-amber-400" : "text-destructive"}`}
+            className={`mb-2 text-sm ${visibleResult.result?.success ? "text-emerald-400" : visibleResult.outcomeUnknown ? "text-amber-400" : "text-destructive"}`}
           >
-            {lastResult.name}:{" "}
-            {lastResult.result?.success
+            {visibleResult.name}:{" "}
+            {visibleResult.result?.success
               ? "completed"
-              : lastResult.outcomeUnknown || lastResult.result
+              : visibleResult.outcomeUnknown || visibleResult.result
                 ? "outcome unknown"
-                : lastResult.cancelled
+                : visibleResult.cancelled
                   ? "cancelled"
                   : "failed"}
-            {lastResult.error ? ` · ${lastResult.error}` : ""}
+            {visibleResult.error ? ` · ${visibleResult.error}` : ""}
           </div>
-          {lastResult.outcomeUnknown && (
+          {visibleResult.outcomeUnknown && (
             <div className="mb-2 text-xs text-amber-300">
-              Check the tool status before retrying. This install is never retried automatically.
+              Check now must return a definitive status before install or update is enabled. This
+              install is never retried automatically.
             </div>
           )}
-          {(lastResult.result?.stdout || lastResult.result?.stderr) && (
+          {(visibleResult.result?.stdout || visibleResult.result?.stderr) && (
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs">
-              {lastResult.result.stdout}
-              {lastResult.result.stdout && lastResult.result.stderr ? "\n" : ""}
-              {lastResult.result.stderr}
-              {lastResult.result.output_truncated ? "\n[output truncated by endpoint]" : ""}
+              {visibleResult.result.stdout}
+              {visibleResult.result.stdout && visibleResult.result.stderr ? "\n" : ""}
+              {visibleResult.result.stderr}
+              {visibleResult.result.output_truncated ? "\n[output truncated by endpoint]" : ""}
             </pre>
           )}
         </div>
@@ -323,5 +434,16 @@ function isInstallResult(value: unknown): value is HostToolInstallResult {
     "outcome" in value &&
     ((value as { outcome?: unknown }).outcome === "succeeded" ||
       (value as { outcome?: unknown }).outcome === "unknown")
+  );
+}
+
+function isDefinitiveReconciliation(status: HostToolStatus): boolean {
+  if (status.error) return false;
+  if (!status.installed) return true;
+  return (
+    typeof status.path === "string" &&
+    typeof status.version === "string" &&
+    typeof status.latest_version === "string" &&
+    typeof status.update_available === "boolean"
   );
 }

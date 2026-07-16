@@ -1320,11 +1320,8 @@ describe("HostControlClient", () => {
               target_id: "preset-1",
               tool: "codex",
               command: ["codex"],
-              installed: true,
-              path: "/private/bin/codex",
-              version: "codex 1.2.3",
+              installed: false,
               latest_version: "1.2.4",
-              update_available: true,
               error: "endpoint-only detail",
             },
           ],
@@ -1332,7 +1329,7 @@ describe("HostControlClient", () => {
       }),
     );
     await expect(checking).resolves.toEqual([
-      expect.objectContaining({ path: "/private/bin/codex", version: "codex 1.2.3" }),
+      expect.objectContaining({ installed: false, error: "endpoint-only detail" }),
     ]);
     client.close();
   });
@@ -1343,6 +1340,7 @@ describe("HostControlClient", () => {
       { path: "../../server" },
       { version: "v".repeat(241) },
       { error: "e".repeat(513) },
+      { error: "installed status cannot also be errored" },
       { unexpected_detail: "must fail closed" },
     ]) {
       const endpoint = await readyClient({ reconnectBaseDelayMs: 1000 });
@@ -1411,6 +1409,64 @@ describe("HostControlClient", () => {
       expect(endpoint.pc.channel.closed).toBe(true);
       endpoint.client.close();
     }
+
+    for (const ambiguousStatus of [
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "codex 1.0",
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "codex 1.0",
+        latest_version: "1.1",
+        update_available: true,
+      },
+      {
+        installed: true,
+        path: "/bin/codex",
+        version: "codex 1.0",
+        latest_version: "1.0",
+        update_available: false,
+        error: "ambiguous installed error",
+      },
+    ]) {
+      const endpoint = await readyClient({ reconnectBaseDelayMs: 1000 });
+      const installing = endpoint.client
+        .installTool({ target_id: "preset-1", tool: "codex" })
+        .catch((error) => error);
+      const request = JSON.parse(endpoint.pc.channel.sent.at(-1));
+      endpoint.pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: request.request_id,
+          ok: true,
+          result: {
+            target_id: "preset-1",
+            tool: "codex",
+            command: ["codex"],
+            install_argv: ["npm", "install", "--global", "@openai/codex"],
+            outcome: "succeeded",
+            success: true,
+            exit_code: 0,
+            stdout: "",
+            stderr: "",
+            output_truncated: false,
+            status: {
+              target_id: "preset-1",
+              tool: "codex",
+              command: ["codex"],
+              ...ambiguousStatus,
+            },
+          },
+        }),
+      );
+      expect((await installing).code).toBe("invalid_response");
+      expect(endpoint.pc.channel.closed).toBe(true);
+      endpoint.client.close();
+    }
   });
 
   test("surfaces protected install output and unknown outcomes without retrying", async () => {
@@ -1437,6 +1493,16 @@ describe("HostControlClient", () => {
           stderr: "endpoint stderr secret",
           output_truncated: false,
           error: "installer may have partially changed endpoint state",
+          status: {
+            target_id: "preset-1",
+            tool: "codex",
+            command: ["codex"],
+            installed: true,
+            path: "/bin/codex",
+            version: "codex 1.0",
+            latest_version: "1.1",
+            update_available: true,
+          },
         },
       }),
     );
@@ -1445,6 +1511,7 @@ describe("HostControlClient", () => {
       data: {
         stdout: "endpoint stdout secret",
         stderr: "endpoint stderr secret",
+        status: expect.objectContaining({ installed: true, update_available: true }),
       },
     });
     expect(

@@ -1515,8 +1515,12 @@ function parseToolStatus(value: unknown, expected: HostToolTargetRef): HostToolS
   }
   if (
     (typeof value.path === "string" && !value.path.startsWith("/")) ||
-    (value.installed && typeof value.path !== "string") ||
-    (!value.installed && (value.path != null || value.version != null))
+    (value.installed &&
+      (typeof value.path !== "string" ||
+        typeof value.version !== "string" ||
+        value.error != null)) ||
+    (!value.installed &&
+      (value.path != null || value.version != null || value.update_available != null))
   ) {
     return null;
   }
@@ -1573,8 +1577,13 @@ function parseToolInstallResult(
   if (
     (value.status !== undefined && value.status !== null && status === null) ||
     (value.outcome === "succeeded" &&
-      (!value.success || !status?.installed || value.exit_code !== 0 || value.error != null)) ||
-    (value.outcome === "unknown" && (value.success || status?.installed === true))
+      (!value.success ||
+        !status?.installed ||
+        typeof status.latest_version !== "string" ||
+        status.update_available !== false ||
+        value.exit_code !== 0 ||
+        value.error != null)) ||
+    (value.outcome === "unknown" && (value.success || typeof value.error !== "string"))
   ) {
     return null;
   }

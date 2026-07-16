@@ -206,9 +206,21 @@ cancels and drains every started sibling. The browser exposes an explicit
 cancel action, preserves structured endpoint error codes/data, treats a lost
 post-spawn cancellation acknowledgement or late success as
 `outcome_unknown`, ignores protected late output, and directs the user to
-check status before any manual retry. Built-in policy is keyed by canonical
-disclosed `agent_kind`; in particular, preset `aider-sonnet` maps to `aider`
-at both endpoint and browser boundaries and unknown kinds fail closed.
+check status before any manual retry. An unknown outcome is retained in typed,
+per-host/target browser query state across navigation and component remounts;
+install/update and enabling legacy auto-update stay locked until an explicit
+`Check now` returns one definitive, error-free status. Built-in policy is keyed
+by canonical disclosed `agent_kind`; in particular, preset `aider-sonnet` maps
+to `aider` at both endpoint and browser boundaries and unknown kinds fail
+closed.
+
+Installer exit zero is not success by itself. The endpoint acknowledges
+success only after a bounded direct-argv reconciliation positively observes a
+recognizable installed version, a latest-version expectation, and no remaining
+update. Nonzero/timeout/cancel/session-close probes and ambiguous or
+contradictory statuses return structured `outcome_unknown`. Tool execution
+uses the daemon service environment plus fixed user-bin conventions; it does
+not invoke or depend on a login shell to discover `PATH`.
 
 The old REST `/tools` and `/install` endpoints, server `host.tools.*` frames,
 plaintext durable preset install/default-command target, and unattended update
@@ -216,20 +228,22 @@ path remain deliberately retained for P2-HOST-03B. Therefore this parallel
 interactive path does not complete the tool migration or Phase 2. A
 tracked-plus-unignored production source inventory guard rejects server use of
 the new E2E operation names, metadata helper/route/schema expansion, UI use or
-aliasing of the legacy interactive helpers, browser/endpoint shell fallbacks,
-moved operation names, protected logging, and canonical-policy drift. Its exact
-HOST-03B allowlist, required lifecycle/UI sentinels, tool-failure handling, and
-adversarial `--self-test` run from `scripts/test-all.sh`.
+aliasing of the legacy interactive helpers, computed routes/operations,
+browser/endpoint shell fallbacks (including generically named dependencies),
+moved operation names, login-shell probing, protected logging, and
+canonical-policy drift. Its exact HOST-03B literal/count and protected-field
+inventories, required lifecycle/reconciliation UI sentinels, tool-failure
+handling, and adversarial `--self-test` run from `scripts/test-all.sh`.
 
 **Current P2-HOST-03A candidate validation:** daemon format and strict
-all-target Clippy pass; all 183 daemon tests pass (60 library, 115 supervisor,
+all-target Clippy pass; all 190 daemon tests pass (60 library, 122 supervisor,
 8 worker E2E). Server Ruff and all 150 server tests pass. Web lint, typecheck,
-all 60 unit tests, a retry-free Playwright run with 71 passing tests and 3
+all 60 unit tests, a retry-free Playwright run with 72 passing tests and 3
 opt-in audits skipped, and the production build pass. The focused endpoint
-tool suite has 14 adversarial tests, the browser host-control suite has 37,
+tool suite has 21 adversarial tests, the browser host-control suite has 37,
 the paired zero-agent host channel covers bounded close with independently
 owned late tool cleanup, and the metadata-only server regression passes.
-`SPAWN_E2E_PORT=43985 scripts/test-all.sh` passes the complete repeatable
+`SPAWN_E2E_PORT=44017 scripts/test-all.sh` passes the complete repeatable
 matrix, including the adversarial boundary self-test plus prebuilt install,
 HTTP, Redis, PostgreSQL owner recovery, login, daemon lifecycle, live-browser,
 and service-manager smokes. No review pass or merge is claimed by this

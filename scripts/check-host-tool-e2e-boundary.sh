@@ -252,19 +252,57 @@ for relative, tree in server_trees.items():
 if found_tool_symbols != allowed_tool_symbols:
     die("reviewed server legacy tool symbol inventory changed")
 
-allowed_legacy_string_scopes = {
-    "server/spawn_server/ws/owner_dispatch.py": {"<module>"},
-    "server/spawn_server/ws/broker.py": {
-        "request_tool_check", "resolve_tool_check", "request_tool_install", "resolve_tool_install",
-    },
-    "server/spawn_server/ws/daemon.py": {"daemon_ws"},
+expected_legacy_strings = Counter({
+    ("server/spawn_server/ws/broker.py", "request_tool_check", "host.tools.check"): 1,
+    ("server/spawn_server/ws/broker.py", "request_tool_check", "host.tools.check_result"): 1,
+    ("server/spawn_server/ws/broker.py", "request_tool_install", "host.tools.install"): 1,
+    ("server/spawn_server/ws/broker.py", "request_tool_install", "host.tools.install_result"): 1,
+    ("server/spawn_server/ws/broker.py", "resolve_tool_check", "host.tools.check_result"): 1,
+    ("server/spawn_server/ws/broker.py", "resolve_tool_install", "host.tools.install_result"): 1,
+    ("server/spawn_server/ws/daemon.py", "daemon_ws", "host.tools.check_result"): 1,
+    ("server/spawn_server/ws/daemon.py", "daemon_ws", "host.tools.install_result"): 1,
+    ("server/spawn_server/ws/owner_dispatch.py", "<module>", "host.tools.check_result"): 1,
+    ("server/spawn_server/ws/owner_dispatch.py", "<module>", "host.tools.install_result"): 1,
+})
+
+# These are the complete server-side reads of fields capable of reconstructing
+# protected tool commands/results. Inventorying the access itself (not helper
+# names) prevents a generic relay/helper from bypassing the allowlist.
+protected_server_attributes = {
+    "command", "default_argv", "install", "last_auto_update_error", "output",
+    "path", "payload", "stderr", "stdout", "version",
 }
+expected_server_attribute_reads = Counter({
+    ("server/spawn_server/presets.py", "seed_builtin_presets", "install"): 2,
+    ("server/spawn_server/routes/agents.py", "_dispatch_agent_launch", "install"): 1,
+    ("server/spawn_server/routes/agents.py", "create_agent", "default_argv"): 1,
+    ("server/spawn_server/routes/device.py", "device_poll", "version"): 1,
+    ("server/spawn_server/routes/device.py", "device_start", "version"): 1,
+    (hosts_relative, "_merge_tool_policy", "last_auto_update_error"): 2,
+    (hosts_relative, "_preset_to_tool_target", "default_argv"): 1,
+    (hosts_relative, "_preset_to_tool_target", "install"): 1,
+    (hosts_relative, "_run_auto_update", "last_auto_update_error"): 1,
+    (hosts_relative, "_should_auto_update", "install"): 1,
+    (hosts_relative, "_to_out", "version"): 1,
+    (hosts_relative, "install_host_tool", "install"): 1,
+    (hosts_relative, "list_host_tools", "last_auto_update_error"): 1,
+    (hosts_relative, "patch_host_tool_policy", "last_auto_update_error"): 1,
+    (hosts_relative, "run_auto_update_checks_once", "last_auto_update_error"): 1,
+    ("server/spawn_server/routes/presets.py", "create_preset", "default_argv"): 1,
+    ("server/spawn_server/routes/presets.py", "create_preset", "install"): 1,
+    ("server/spawn_server/routes/presets.py", "update_preset", "default_argv"): 2,
+    ("server/spawn_server/routes/presets.py", "update_preset", "install"): 2,
+    ("server/spawn_server/ws/broker.py", "_request_owner_result", "payload"): 1,
+    ("server/spawn_server/ws/owner_dispatch.py", "encode_owner_result", "payload"): 1,
+})
 
 
 class LegacyStringVisitor(ast.NodeVisitor):
     def __init__(self, relative: str) -> None:
         self.relative = relative
         self.scope = ["<module>"]
+        self.legacy = Counter()
+        self.protected_attributes = Counter()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.scope.append(node.name)
@@ -275,31 +313,73 @@ class LegacyStringVisitor(ast.NodeVisitor):
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str) and node.value.startswith("host.tools."):
-            if self.scope[-1] not in allowed_legacy_string_scopes.get(self.relative, set()):
-                die(f"legacy server tool frame escaped its HOST-03B scope at {self.relative}:{node.lineno}")
+            self.legacy[(self.relative, self.scope[-1], node.value)] += 1
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in protected_server_attributes:
+            self.protected_attributes[(self.relative, self.scope[-1], node.attr)] += 1
+        self.generic_visit(node)
 
 
+found_legacy_strings = Counter()
+found_server_attribute_reads = Counter()
 for relative, tree in server_trees.items():
-    LegacyStringVisitor(relative).visit(tree)
+    visitor = LegacyStringVisitor(relative)
+    visitor.visit(tree)
+    found_legacy_strings.update(visitor.legacy)
+    found_server_attribute_reads.update(visitor.protected_attributes)
+if found_legacy_strings != expected_legacy_strings:
+    die(f"exact legacy server tool frame inventory changed: {found_legacy_strings!r}")
+if found_server_attribute_reads != expected_server_attribute_reads:
+    die(f"protected server field access inventory changed: {found_server_attribute_reads!r}")
 
 
 # Browser production has one public-metadata call and direct E2E check/install calls.
 panel_relative = "web/src/components/hosts/HostToolsPanel.tsx"
 control_relative = "web/src/lib/hostControl.ts"
 api_relative = "web/src/lib/api.ts"
-for needle in ("hosts.toolTargets(", "client.checkTools(", "client.installTool("):
-    require_count(panel_relative, needle)
+for needle, expected in (
+    ("hosts.toolTargets(", 1),
+    ("client.checkTools(", 2),
+    ("client.installTool(", 1),
+):
+    require_count(panel_relative, needle, expected)
 for relative, source in sources.items():
     if not relative.startswith("web/src/"):
         continue
-    if re.search(r"\bhosts\s*\.\s*(?:tools|installTool)\s*\(", source):
-        die(f"browser production calls a HOST-03B content helper in {relative}")
-    if re.search(r"\bhosts\s*\[\s*['\"](?:tools|installTool)['\"]\s*\]", source):
-        die(f"browser production aliases a HOST-03B content helper in {relative}")
+    if re.search(r"\bhosts\s*\.\s*(?:tools|installTool)\b", source):
+        die(f"browser production references a HOST-03B content helper in {relative}")
+    if re.search(r"\bhosts\s*\[", source):
+        die(f"browser production uses an unreviewed computed hosts helper in {relative}")
     if re.search(r"\{[^}]*\b(?:tools|installTool)\b[^}]*\}\s*=\s*hosts\b", source, re.S):
         die(f"browser production destructures a HOST-03B content helper in {relative}")
-    if relative != control_relative and re.search(r"['\"]tool\.(?:check|install)['\"]", source):
-        die(f"endpoint-only tool operation moved outside hostControl.ts into {relative}")
+
+
+def string_literal_stream(source: str) -> str:
+    # Joining lexical string fragments catches property/route/operation names
+    # assembled with concatenation, arrays, templates, or computed brackets.
+    fragments: list[str] = []
+    for match in re.finditer(r'''(?s)(["'])(.*?)(?<!\\)\1|`(.*?)`''', source):
+        fragments.append(match.group(2) if match.group(1) else match.group(3))
+    return "".join(fragments)
+
+
+web_literal_streams = {
+    relative: string_literal_stream(source)
+    for relative, source in sources.items()
+    if relative.startswith("web/src/")
+}
+for relative, stream in web_literal_streams.items():
+    if relative != control_relative and ("tool.check" in stream or "tool.install" in stream):
+        die(f"endpoint-only computed tool operation moved outside hostControl.ts into {relative}")
+
+control_operations = Counter(
+    operation
+    for operation in ("tool.check", "tool.install")
+    for _ in range(web_literal_streams[control_relative].count(operation))
+)
+if control_operations != Counter({"tool.check": 1, "tool.install": 4}):
+    die(f"hostControl.ts exact endpoint operation inventory changed: {control_operations!r}")
 
 legacy_routes = {
     "/tools`": 1,
@@ -315,6 +395,17 @@ for suffix, expected in legacy_routes.items():
     ]
     if occurrences != [api_relative] * expected:
         die(f"HOST-03B browser route {suffix!r} escaped its exact api.ts allowlist: {occurrences}")
+for relative, stream in web_literal_streams.items():
+    sensitive_host_routes = sum(
+        "tool" in segment
+        for segment in stream.split("/api/hosts")[1:]
+    )
+    expected = 4 if relative == api_relative else 0
+    if sensitive_host_routes != expected:
+        die(
+            f"computed browser host-tool route inventory changed in {relative}: "
+            f"expected {expected}, found {sensitive_host_routes}"
+        )
 all_web = "\n".join(source for relative, source in sources.items() if relative.startswith("web/src/"))
 if all_web.count("/tool-targets`") != 1 or sources[api_relative].count("/tool-targets`") != 1:
     die("public tool metadata route must occur exactly once in api.ts")
@@ -322,22 +413,28 @@ if all_web.count("/tool-targets`") != 1 or sources[api_relative].count("/tool-ta
 for relative, source in sources.items():
     if not relative.startswith("web/src/"):
         continue
-    sensitive = re.search(r"host.?tool|tool\.(?:check|install)|TOOL_(?:COMMANDS|INSTALL_ARGV)", source, re.I)
-    if not sensitive:
-        continue
     if re.search(r"['\"](?:ba)?sh['\"]\s*,\s*['\"]-c['\"]", source, re.S):
-        die(f"browser tool path contains shell evaluation in {relative}")
+        die(f"browser production contains shell evaluation in {relative}")
     if re.search(r"\b(?:eval|Function)\s*\(", source):
-        die(f"browser tool path contains dynamic evaluation in {relative}")
+        die(f"browser production contains dynamic evaluation in {relative}")
 
 require_count(control_relative, "async checkTools(")
 require_count(control_relative, "async installTool(")
 require_count(control_relative, '"tool.check",')
-if sources[control_relative].count('"tool.install"') < 4:
-    die("hostControl.ts lost the bound install operation/cancellation sentinels")
 require_count(control_relative, "TOOL_CANCEL_RESPONSE_TIMEOUT_MS", 2)
 require_count(panel_relative, "new AbortController()")
-require_count(panel_relative, "Check the tool status before retrying", 2)
+for needle, expected in (
+    ('"host-tool-reconciliation"', 1),
+    ("gcTime: Number.POSITIVE_INFINITY", 1),
+    ("qc.setQueryData<ReconciliationMap>(reconciliationKey", 3),
+    ("Check now must return a definitive status", 1),
+    ("Boolean(reconciliationByTarget[tool.preset_id])", 2),
+    ("if (reconciliationByTarget[tool.preset_id]) return", 1),
+    ("isDefinitiveReconciliation(status)", 1),
+    ('typeof status.latest_version === "string"', 1),
+    ('typeof status.update_available === "boolean"', 1),
+):
+    require_count(panel_relative, needle, expected)
 
 command_block = re.search(
     r"const TOOL_COMMANDS = \{(?P<body>.*?)\} as const;", sources[control_relative], re.S
@@ -442,33 +539,54 @@ def rust_production_source(source: str) -> str:
     return source
 
 
+daemon_shell_evals = Counter()
+daemon_login_shell_symbols = Counter()
 for relative, source in sources.items():
     if not relative.startswith("daemon/src/") or not relative.endswith(".rs"):
         continue
     production = rust_production_source(source)
     if relative != host_control_relative and re.search(r"['\"]tool\.(?:check|install)['\"]", production):
         die(f"endpoint operation dispatch moved outside host_control.rs into {relative}")
-    sensitivity_source = re.sub(r"^\s*mod\s+host_tools\s*;\s*$", "", production, flags=re.M)
-    sensitive = re.search(
-        r"HostTool|host_tool|tool\.(?:check|install)|TOOL_", sensitivity_source
-    )
-    if not sensitive:
-        continue
     shell_evals = re.findall(
         r"Command\s*::\s*new\s*\(\s*['\"](?:ba)?sh['\"]\s*,?\s*\).*?\.arg\s*\(\s*['\"]-c['\"]\s*,?\s*\)",
         production,
         re.S,
     )
-    if relative == "daemon/src/run.rs":
-        # HOST-03B compatibility: the old server-mediated check/install and
-        # auto-update runner remain until their separate retirement task.
-        if len(shell_evals) != 2 or production.count("async fn run_shell_capture(") != 1:
-            die("HOST-03B daemon shell compatibility scope changed in daemon/src/run.rs")
+    if shell_evals:
+        daemon_shell_evals[relative] += len(shell_evals)
+    for symbol in (
+        "resolved_command_env", "shell_path_entries", "probe_shell_path", "candidate_shells",
+    ):
+        count = len(re.findall(rf"\b{symbol}\b", production))
+        if count:
+            daemon_login_shell_symbols[(relative, symbol)] += count
+    sensitivity_source = re.sub(r"^\s*mod\s+host_tools\s*;\s*$", "", production, flags=re.M)
+    sensitive = re.search(r"HostTool|host_tool|tool\.(?:check|install)|TOOL_", sensitivity_source)
+    if not sensitive:
         continue
-    if shell_evals or re.search(r"\b(?:run_shell|shell_command|eval_command)\b", production):
-        die(f"endpoint tool path contains shell evaluation in {relative}")
-    if re.search(r"\b(?:tracing::|println!|eprintln!)", production):
+    if re.search(r"\b(?:run_shell|shell_command|eval_command)\b", production):
+        die(f"endpoint tool path delegates to shell evaluation in {relative}")
+    if relative != "daemon/src/run.rs" and re.search(
+        r"\b(?:tracing::|println!|eprintln!)", production
+    ):
         die(f"endpoint tool path logs protected detail in {relative}")
+
+# The only production shell evaluation is the exact HOST-03B compatibility
+# runner. Scanning every Rust file prevents a generic dependency/helper from
+# bypassing a name-based host-tool check.
+if daemon_shell_evals != Counter({"daemon/src/run.rs": 2}):
+    die(f"daemon production shell evaluation inventory changed: {daemon_shell_evals!r}")
+expected_login_shell_symbols = Counter({
+    ("daemon/src/run.rs", "resolved_command_env"): 3,
+    ("daemon/src/run.rs", "shell_path_entries"): 2,
+    ("daemon/src/run.rs", "probe_shell_path"): 2,
+    ("daemon/src/run.rs", "candidate_shells"): 2,
+})
+if daemon_login_shell_symbols != expected_login_shell_symbols:
+    die(f"daemon login-shell dependency inventory changed: {daemon_login_shell_symbols!r}")
+run_production = rust_production_source(sources["daemon/src/run.rs"])
+if run_production.count("async fn run_shell_capture(") != 1:
+    die("HOST-03B daemon shell compatibility scope changed in daemon/src/run.rs")
 
 policy_source = sources[host_tools_relative].split("fn policy_for", 1)[0]
 daemon_tools = re.findall(r"\btool:\s*['\"]([^'\"]+)['\"]", policy_source)
@@ -483,6 +601,20 @@ for needle in (
     require_count(host_tools_relative, needle)
 for needle in ("wait_for_idle_until", "child.wait().await"):
     require_present(host_tools_relative, needle)
+host_tools_production = rust_production_source(sources[host_tools_relative])
+for forbidden in (
+    "resolved_command_env", "shell_path_entries", "probe_shell_path", "candidate_shells",
+):
+    if forbidden in host_tools_production:
+        die(f"endpoint host-tools path regained a login-shell dependency: {forbidden}")
+for needle in (
+    "fn endpoint_command_env()",
+    "status.error.is_none()",
+    "status.version.is_some()",
+    "status.latest_version.is_some()",
+    "status.update_available == Some(false)",
+):
+    require_count(host_tools_relative, needle)
 for needle in (
     "tool_operations: Arc<HostToolOperations>",
     "tool_operations.wait_for_idle_until(deadline)",
@@ -545,6 +677,29 @@ Path(sys.argv[1]).write_text('''async def leak_tool_metadata(preset, log, Respon
 PY
   expect_rejected server-moved-helper
 
+  new_case server-generic-helper
+  python3 - "$case_dir/server/spawn_server/routes/relay.py" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''def relay(value):
+    return {"argv": value.default_argv, "installer": value.install}
+''')
+PY
+  expect_rejected server-generic-helper
+
+  new_case server-extra-allowed-literal
+  python3 - "$case_dir/server/spawn_server/ws/broker.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text().replace(
+    '"type": "host.tools.install",',
+    '"duplicate": "host.tools.install",\n                "type": "host.tools.install",',
+    1,
+))
+PY
+  expect_rejected server-extra-allowed-literal
+
   new_case server-extra-route
   python3 - "$case_dir/server/spawn_server/routes/hosts.py" <<'PY'
 from pathlib import Path
@@ -564,15 +719,41 @@ PY
     >"$case_dir/web/src/lib/hostToolFallback.ts"
   expect_rejected web-legacy-alias
 
+  new_case web-direct-property-alias
+  printf '%s\n' 'export const relay = hosts.installTool;' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-direct-property-alias
+
+  new_case web-computed-property-alias
+  printf '%s\n' 'export const relay = hosts["install" + "Tool"];' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-computed-property-alias
+
   new_case web-legacy-route
   printf '%s\n' 'export const hostToolFallback = (id: string) => fetch(`/api/hosts/${id}/tools`);' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
   expect_rejected web-legacy-route
 
+  new_case web-computed-route
+  printf '%s\n' \
+    'export const relay = (id: string) => fetch(["/api/hosts/", id, "/to", "ols"].join(""));' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-computed-route
+
+  new_case web-computed-operation
+  printf '%s\n' 'export const relay = "tool." + "install";' \
+    >"$case_dir/web/src/lib/relay.ts"
+  expect_rejected web-computed-operation
+
   new_case web-shell-fallback
   printf '%s\n' 'export const hostToolFallback = () => spawn(["sh", "-c", "npm install"])' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
   expect_rejected web-shell-fallback
+
+  new_case web-generic-shell-helper
+  printf '%s\n' 'export const run = () => spawn(["sh", "-c", "echo unsafe"])' \
+    >"$case_dir/web/src/lib/worker.ts"
+  expect_rejected web-generic-shell-helper
 
   new_case daemon-multiline-shell
   python3 - "$case_dir/daemon/src/host_tool_fallback.rs" <<'PY'
@@ -590,6 +771,29 @@ Path(sys.argv[1]).write_text('''fn host_tool_fallback() {
 PY
   expect_rejected daemon-multiline-shell
 
+  new_case daemon-generic-shell-helper
+  python3 - "$case_dir/daemon/src/helpers.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''fn run() {
+    Command::new("sh").arg("-c");
+}
+''')
+PY
+  expect_rejected daemon-generic-shell-helper
+
+  new_case daemon-login-shell-dependency
+  printf '%s\n' \
+    'async fn load_environment() { let _ = crate::run::resolved_command_env().await; }' \
+    >>"$case_dir/daemon/src/host_tools.rs"
+  expect_rejected daemon-login-shell-dependency
+
+  new_case daemon-generic-login-shell-dependency
+  printf '%s\n' \
+    'async fn load_environment() { let _ = crate::run::resolved_command_env().await; }' \
+    >"$case_dir/daemon/src/helpers.rs"
+  expect_rejected daemon-generic-login-shell-dependency
+
   new_case missing-sentinel
   python3 - "$case_dir/web/src/components/hosts/HostToolsPanel.tsx" <<'PY'
 from pathlib import Path
@@ -598,6 +802,15 @@ p = Path(sys.argv[1])
 p.write_text(p.read_text().replace("client.installTool(", "client['installTool'](", 1))
 PY
   expect_rejected missing-sentinel
+
+  new_case missing-reconciliation-sentinel
+  python3 - "$case_dir/web/src/components/hosts/HostToolsPanel.tsx" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text().replace('"host-tool-reconciliation"', '"temporary-result"', 1))
+PY
+  expect_rejected missing-reconciliation-sentinel
 
   new_case rg-failure
   fake_rg="$temp/rg-broken"

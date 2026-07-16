@@ -367,7 +367,7 @@ impl HostToolService {
         let service = Arc::clone(self);
         let operation_cancelled = cancelled.clone();
         self.run_owned(session_operations, session_permit, cancelled, async move {
-            let env = Arc::new(crate::run::resolved_command_env().await);
+            let env = Arc::new(endpoint_command_env());
             service
                 .check_inner(targets, env, operation_cancelled, shutdown)
                 .await
@@ -431,7 +431,7 @@ impl HostToolService {
         let service = Arc::clone(self);
         let operation_cancelled = cancelled.clone();
         self.run_owned(session_operations, session_permit, cancelled, async move {
-            let env = crate::run::resolved_command_env().await;
+            let env = endpoint_command_env();
             service
                 .install_with_env(target, &env, operation_cancelled, shutdown)
                 .await
@@ -472,6 +472,18 @@ impl HostToolService {
         env: &BTreeMap<String, String>,
         cancelled: CancellationToken,
         shutdown: CancellationToken,
+    ) -> Result<ToolInstallResult, ToolError> {
+        self.install_with_env_and_check_timeout(target, env, cancelled, shutdown, CHECK_TIMEOUT)
+            .await
+    }
+
+    async fn install_with_env_and_check_timeout(
+        self: &Arc<Self>,
+        target: ToolTarget,
+        env: &BTreeMap<String, String>,
+        cancelled: CancellationToken,
+        shutdown: CancellationToken,
+        reconciliation_timeout: Duration,
     ) -> Result<ToolInstallResult, ToolError> {
         let policy = policy_for(&target.tool).ok_or_else(|| {
             ToolError::new("unsupported_tool", "tool is not in the endpoint policy")
@@ -531,15 +543,26 @@ impl HostToolService {
             return Ok(result);
         }
 
-        match self.check_one(target, env, &cancelled, &shutdown).await {
-            Ok(status) if status.installed => {
+        match self
+            .check_one_with_timeout(target, env, &cancelled, &shutdown, reconciliation_timeout)
+            .await
+        {
+            Ok(status)
+                if status.installed
+                    && status.error.is_none()
+                    && status.version.is_some()
+                    && status.latest_version.is_some()
+                    && status.update_available == Some(false) =>
+            {
                 result.outcome = "succeeded";
                 result.success = true;
                 result.status = Some(status);
             }
             Ok(status) => {
-                result.error =
-                    Some("installer exited successfully but the tool is not resolvable".into());
+                result.error = Some(
+                    "installer exited successfully but endpoint reconciliation did not positively observe the required version"
+                        .into(),
+                );
                 result.status = Some(status);
             }
             Err(error) => result.error = Some(error.detail),
@@ -571,6 +594,18 @@ impl HostToolService {
         cancelled: &CancellationToken,
         shutdown: &CancellationToken,
     ) -> Result<ToolStatus, ToolError> {
+        self.check_one_with_timeout(target, env, cancelled, shutdown, CHECK_TIMEOUT)
+            .await
+    }
+
+    async fn check_one_with_timeout(
+        &self,
+        target: ToolTarget,
+        env: &BTreeMap<String, String>,
+        cancelled: &CancellationToken,
+        shutdown: &CancellationToken,
+        check_timeout: Duration,
+    ) -> Result<ToolStatus, ToolError> {
         let policy = policy_for(&target.tool).ok_or_else(|| {
             ToolError::new("unsupported_tool", "tool is not in the endpoint policy")
         })?;
@@ -584,7 +619,7 @@ impl HostToolService {
                 path: None,
                 version: None,
                 latest_version: self
-                    .latest_version(policy.latest, env, cancelled, shutdown)
+                    .latest_version(policy.latest, env, cancelled, shutdown, check_timeout)
                     .await,
                 update_available: None,
                 error: None,
@@ -596,7 +631,7 @@ impl HostToolService {
             &path,
             policy.version_args,
             env,
-            CHECK_TIMEOUT,
+            check_timeout,
             ProgramCancellation {
                 request: cancelled,
                 shutdown,
@@ -605,21 +640,36 @@ impl HostToolService {
         .await?;
         let version = first_meaningful_line(&capture.stdout.text)
             .or_else(|| first_meaningful_line(&capture.stderr.text));
-        let error = if capture.status.is_some_and(|status| status.success()) {
-            capture.failure
+        let error = if let Some(failure) = capture.failure {
+            Some(failure)
+        } else if !capture.status.is_some_and(|status| status.success()) {
+            Some(format!(
+                "version command exited with code {}",
+                capture
+                    .status
+                    .and_then(|status| status.code())
+                    .map_or_else(|| "unknown".into(), |code| code.to_string())
+            ))
+        } else if version.as_deref().and_then(numeric_version).is_none() {
+            Some("version command did not report a recognizable version".into())
         } else {
-            Some(capture.failure.unwrap_or_else(|| {
-                format!(
-                    "version command exited with code {}",
-                    capture
-                        .status
-                        .and_then(|status| status.code())
-                        .map_or_else(|| "unknown".into(), |code| code.to_string())
-                )
-            }))
+            None
         };
+        if let Some(error) = error {
+            return Ok(ToolStatus {
+                target_id: target.target_id,
+                tool: target.tool,
+                command,
+                installed: false,
+                path: None,
+                version: None,
+                latest_version: None,
+                update_available: None,
+                error: Some(bounded(error, MAX_DETAIL_BYTES)),
+            });
+        }
         let latest_version = self
-            .latest_version(policy.latest, env, cancelled, shutdown)
+            .latest_version(policy.latest, env, cancelled, shutdown, check_timeout)
             .await;
         let update_available = match (version.as_deref(), latest_version.as_deref()) {
             (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
@@ -634,7 +684,7 @@ impl HostToolService {
             version,
             latest_version,
             update_available,
-            error: error.map(|detail| bounded(detail, MAX_DETAIL_BYTES)),
+            error: None,
         })
     }
 
@@ -644,6 +694,7 @@ impl HostToolService {
         env: &BTreeMap<String, String>,
         cancelled: &CancellationToken,
         shutdown: &CancellationToken,
+        timeout: Duration,
     ) -> Option<String> {
         let (program, args, pip_package) = match policy? {
             LatestPolicy::Npm(package) => ("npm", vec!["view", package, "version"], None),
@@ -660,7 +711,7 @@ impl HostToolService {
             &path,
             &args,
             env,
-            CHECK_TIMEOUT,
+            timeout,
             ProgramCancellation {
                 request: cancelled,
                 shutdown,
@@ -689,6 +740,42 @@ impl Drop for InstallClaim {
             installing.remove(self.tool);
         }
     }
+}
+
+fn endpoint_command_env() -> BTreeMap<String, String> {
+    endpoint_command_env_from(std::env::vars().collect())
+}
+
+fn endpoint_command_env_from(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.remove("NO_COLOR");
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+    env.entry("CLICOLOR".into()).or_insert_with(|| "1".into());
+
+    // Interactive tool policy must never source a login/interactive shell.
+    // Prepend only fixed, endpoint-local user-bin conventions to the service
+    // PATH, preserving its existing entries without executing a probe.
+    let mut preferred = Vec::new();
+    if let Some(home) = env.get("HOME").filter(|value| !value.is_empty()) {
+        let home = PathBuf::from(home);
+        preferred.extend([
+            home.join(".local/bin"),
+            home.join("bin"),
+            home.join(".bun/bin"),
+            home.join(".cargo/bin"),
+        ]);
+    }
+    preferred.extend(
+        env.get("PATH")
+            .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let mut seen = HashSet::new();
+    preferred.retain(|entry| !entry.as_os_str().is_empty() && seen.insert(entry.clone()));
+    if let Ok(path) = std::env::join_paths(preferred) {
+        env.insert("PATH".into(), path.to_string_lossy().into_owned());
+    }
+    env
 }
 
 fn validate_target(target: &ToolTarget) -> Result<(), ToolError> {
@@ -1117,6 +1204,20 @@ mod tests {
         ])
     }
 
+    #[cfg(unix)]
+    async fn wait_for_nonempty_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(path)
+                .ok()
+                .is_none_or(|contents| contents.trim().is_empty())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process marker was not written");
+    }
+
     #[test]
     fn payloads_reject_arbitrary_execution_fields_and_invalid_targets() {
         assert!(HostToolService::parse_check(&json!({
@@ -1165,6 +1266,29 @@ mod tests {
             &HostToolService::shared(),
             &HostToolService::shared()
         ));
+    }
+
+    #[test]
+    fn endpoint_tool_env_never_invokes_or_depends_on_a_login_shell() {
+        let source = BTreeMap::from([
+            ("HOME".into(), "/home/endpoint".into()),
+            ("PATH".into(), "/service/bin:/usr/bin".into()),
+            ("SHELL".into(), "/tmp/stalled-profile-shell".into()),
+            ("NO_COLOR".into(), "1".into()),
+        ]);
+        let env = endpoint_command_env_from(source);
+        assert_eq!(
+            env.get("SHELL").map(String::as_str),
+            Some("/tmp/stalled-profile-shell")
+        );
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert!(!env.contains_key("NO_COLOR"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(
+                "/home/endpoint/.local/bin:/home/endpoint/bin:/home/endpoint/.bun/bin:/home/endpoint/.cargo/bin:/service/bin:/usr/bin"
+            )
+        );
     }
 
     #[tokio::test]
@@ -1495,6 +1619,100 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_large_output_checks_obey_one_process_cap_and_reap_descendants_on_close() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let markers = dir.path().join("markers");
+        std::fs::create_dir(&markers).expect("marker directory");
+        let large_output = "x".repeat(OUTPUT_TAIL_BYTES * 4);
+        executable(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '{large_output}'; printf '%s' $$ > '{markers}/parent-'$$; \
+                 /bin/sh -c 'printf \"%s\" $$ > {markers}/child-$$; while :; do :; done' & \
+                 while :; do :; done",
+                markers = markers.display(),
+            ),
+        );
+        let service = HostToolService::new();
+        let shutdown = CancellationToken::new();
+        let check = {
+            let service = Arc::clone(&service);
+            let env = Arc::new(test_env(dir.path()));
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                service
+                    .check_inner(
+                        (0..MAX_TARGETS)
+                            .map(|index| ToolTarget {
+                                target_id: format!("target-{index}"),
+                                tool: "codex".into(),
+                            })
+                            .collect(),
+                        env,
+                        CancellationToken::new(),
+                        shutdown,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let names = std::fs::read_dir(&markers)
+                    .expect("marker entries")
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if names
+                    .iter()
+                    .filter(|name| name.starts_with("parent-"))
+                    .count()
+                    == MAX_PROCESSES
+                    && names
+                        .iter()
+                        .filter(|name| name.starts_with("child-"))
+                        .count()
+                        == MAX_PROCESSES
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admitted process set did not reach its fixed cap");
+        assert_eq!(service.processes.available_permits(), 0);
+        shutdown.cancel();
+        let error = check
+            .await
+            .expect("check task")
+            .expect_err("queued checks must observe session close");
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(service.processes.available_permits(), MAX_PROCESSES);
+
+        let markers = std::fs::read_dir(&markers)
+            .expect("marker entries")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers
+                .iter()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("parent-"))
+                .count(),
+            MAX_PROCESSES,
+            "queued targets escaped process admission"
+        );
+        for marker in markers {
+            let pid = std::fs::read_to_string(marker.path()).expect("recorded pid");
+            assert!(
+                !Path::new("/proc").join(pid.trim()).exists(),
+                "tool process or descendant remained after session close"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn slow_process_group_times_out_and_is_reaped_within_a_bound() {
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "slow", "while :; do :; done");
@@ -1630,6 +1848,211 @@ mod tests {
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.stdout, "private stdout");
         assert_eq!(result.stderr, "private stderr");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_exit_zero_with_nonzero_version_probe_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(dir.path(), "npm", "printf installed");
+        executable(
+            dir.path(),
+            "codex",
+            "printf 'private version failure' >&2; exit 7",
+        );
+        let result = HostToolService::new()
+            .install_with_env(
+                ToolTarget {
+                    target_id: "preset-1".into(),
+                    tool: "codex".into(),
+                },
+                &test_env(dir.path()),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("structured outcome");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.outcome, "unknown");
+        assert!(!result.success);
+        let status = result.status.expect("failed reconciliation status");
+        assert!(!status.installed);
+        assert!(status.path.is_none());
+        assert!(status.version.is_none());
+        assert!(status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains('7')));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_exit_zero_with_version_timeout_is_unknown_and_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("version-pid");
+        executable(dir.path(), "npm", "printf installed");
+        executable(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
+            ),
+        );
+        let result = HostToolService::new()
+            .install_with_env_and_check_timeout(
+                ToolTarget {
+                    target_id: "preset-1".into(),
+                    tool: "codex".into(),
+                },
+                &test_env(dir.path()),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                Duration::from_millis(20),
+            )
+            .await
+            .expect("structured outcome");
+        assert_eq!(result.outcome, "unknown");
+        assert!(!result.success);
+        assert!(result
+            .status
+            .as_ref()
+            .and_then(|status| status.error.as_deref())
+            .is_some_and(|error| error.contains("timed out")));
+        let pid = std::fs::read_to_string(&pid_file).expect("version pid");
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_exit_zero_with_cancelled_version_probe_is_unknown_and_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("version-pid");
+        executable(dir.path(), "npm", "printf installed");
+        executable(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
+            ),
+        );
+        let service = HostToolService::new();
+        let cancelled = CancellationToken::new();
+        let task = {
+            let service = Arc::clone(&service);
+            let env = test_env(dir.path());
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                service
+                    .install_with_env(
+                        ToolTarget {
+                            target_id: "preset-1".into(),
+                            tool: "codex".into(),
+                        },
+                        &env,
+                        cancelled,
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        wait_for_nonempty_file(&pid_file).await;
+        cancelled.cancel();
+        let result = task
+            .await
+            .expect("install task")
+            .expect("structured outcome");
+        assert_eq!(result.outcome, "unknown");
+        assert!(!result.success);
+        assert!(result
+            .status
+            .as_ref()
+            .and_then(|status| status.error.as_deref())
+            .is_some_and(|error| error.contains("cancelled")));
+        let pid = std::fs::read_to_string(&pid_file).expect("version pid");
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_exit_zero_with_session_close_during_version_is_unknown_and_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("version-pid");
+        executable(dir.path(), "npm", "printf installed");
+        executable(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
+            ),
+        );
+        let service = HostToolService::new();
+        let shutdown = CancellationToken::new();
+        let task = {
+            let service = Arc::clone(&service);
+            let env = test_env(dir.path());
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                service
+                    .install_with_env(
+                        ToolTarget {
+                            target_id: "preset-1".into(),
+                            tool: "codex".into(),
+                        },
+                        &env,
+                        CancellationToken::new(),
+                        shutdown,
+                    )
+                    .await
+            })
+        };
+        wait_for_nonempty_file(&pid_file).await;
+        shutdown.cancel();
+        let result = task
+            .await
+            .expect("install task")
+            .expect("structured outcome");
+        assert_eq!(result.outcome, "unknown");
+        assert!(!result.success);
+        assert!(result
+            .status
+            .as_ref()
+            .and_then(|status| status.error.as_deref())
+            .is_some_and(|error| error.contains("session closed")));
+        let pid = std::fs::read_to_string(&pid_file).expect("version pid");
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_exit_zero_without_observed_latest_expectation_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(
+            dir.path(),
+            "npm",
+            "if [ \"$1\" = view ]; then printf '1.2.4'; else printf installed; fi",
+        );
+        executable(dir.path(), "codex", "printf 'codex 1.2.3'");
+        let result = HostToolService::new()
+            .install_with_env(
+                ToolTarget {
+                    target_id: "preset-1".into(),
+                    tool: "codex".into(),
+                },
+                &test_env(dir.path()),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("structured outcome");
+        assert_eq!(result.outcome, "unknown");
+        assert!(!result.success);
+        assert_eq!(
+            result.status.and_then(|status| status.update_available),
+            Some(true)
+        );
     }
 
     #[cfg(unix)]
