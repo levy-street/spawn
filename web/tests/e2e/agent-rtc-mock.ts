@@ -10,6 +10,7 @@ export async function installAgentRtcMock(
     secondHistory?: string;
     control?: { owner: boolean; cols: number; rows: number; viewers: number };
     openChannels?: boolean;
+    sendReady?: boolean;
     autoSnapshot?: boolean;
     onPtyInput?: (bytes: Buffer) => void | Promise<void>;
   } = {},
@@ -22,13 +23,14 @@ export async function installAgentRtcMock(
     }
   });
   await page.addInitScript(
-    ({ history, secondHistory, control, openChannels, autoSnapshot }) => {
+    ({ history, secondHistory, control, openChannels, sendReady, autoSnapshot }) => {
       const encoder = new TextEncoder();
       const state = {
         history,
         secondHistory,
         control,
         openChannels,
+        sendReady,
         autoSnapshot,
         connections: 0,
         activePtyChannel: null as FakeDataChannel | null,
@@ -172,6 +174,15 @@ export async function installAgentRtcMock(
           this.readyState = "open";
           this.onopen?.();
           if (this.label === "spawn.ctl") {
+            if (state.sendReady) {
+              this.receive(
+                JSON.stringify({
+                  version: 1,
+                  kind: "event",
+                  event: "ready",
+                }),
+              );
+            }
             this.receive(
               JSON.stringify({
                 version: 1,
@@ -287,6 +298,7 @@ export async function installAgentRtcMock(
       secondHistory: options.secondHistory ?? "after reconnect\r\n",
       control: options.control ?? { owner: true, cols: 100, rows: 30, viewers: 1 },
       openChannels: options.openChannels ?? true,
+      sendReady: options.sendReady ?? true,
       autoSnapshot: options.autoSnapshot ?? false,
     },
   );

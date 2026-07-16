@@ -231,9 +231,14 @@ struct AgentChannelState {
 struct RequiredAgentChannels {
     state: Mutex<AgentChannelState>,
     changed: Notify,
+    ready: AtomicBool,
 }
 
 impl RequiredAgentChannels {
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
     async fn register(&self, channel: AgentChannel) -> bool {
         let mut state = self.state.lock().await;
         let seen = match channel {
@@ -242,6 +247,7 @@ impl RequiredAgentChannels {
         };
         if *seen {
             state.failed = true;
+            self.ready.store(false, Ordering::Release);
             self.changed.notify_waiters();
             return false;
         }
@@ -255,11 +261,20 @@ impl RequiredAgentChannels {
             AgentChannel::Pty => state.pty_open = true,
             AgentChannel::Control => state.control_open = true,
         }
+        if !state.failed && state.pty_open && state.control_open {
+            self.ready.store(true, Ordering::Release);
+        }
         self.changed.notify_waiters();
     }
 
     async fn fail(&self) {
-        self.state.lock().await.failed = true;
+        // Close the effect gate before any viewer/sink teardown. Store again
+        // under the state lock so a concurrent final mark_open cannot reopen
+        // the gate between the first store and the failed-state transition.
+        self.ready.store(false, Ordering::Release);
+        let mut state = self.state.lock().await;
+        state.failed = true;
+        self.ready.store(false, Ordering::Release);
         self.changed.notify_waiters();
     }
 
@@ -271,7 +286,7 @@ impl RequiredAgentChannels {
                 if state.failed {
                     return false;
                 }
-                if state.pty_open && state.control_open {
+                if self.ready() {
                     return true;
                 }
             }
@@ -1168,14 +1183,24 @@ fn install_data_channel_handler(
             let input_out_tx = out_tx.clone();
             let input_active = Arc::clone(&active);
             let input_fence = Arc::clone(&fence);
+            let input_channels = Arc::clone(&channels);
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
                 let out_tx = input_out_tx.clone();
                 let active = Arc::clone(&input_active);
                 let fence = Arc::clone(&input_fence);
+                let channels = Arc::clone(&input_channels);
                 Box::pin(async move {
+                    // Never queue partial-peer input waiting for its missing
+                    // counterpart. It is dropped before touching the worker.
+                    if !channels.ready() {
+                        return;
+                    }
                     let _callback = fence.read().await;
-                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                    if !channels.ready()
+                        || !active.load(Ordering::Acquire)
+                        || !registry.is_current(agent)
+                    {
                         return;
                     }
                     let result = forward_bound_data_channel_input(
@@ -1375,8 +1400,8 @@ fn install_data_channel_handler(
                 let session_id = close_session_id.clone();
                 let generation = close_generation.clone();
                 Box::pin(async move {
-                    control.remove_direct_sink(&viewer_id).await;
                     channels.fail().await;
+                    control.remove_direct_sink(&viewer_id).await;
                     sessions.schedule_close_if_same(&session_id, &generation, &pc);
                 })
             }));
@@ -1468,6 +1493,7 @@ fn install_control_data_channel(
     let message_session_id = session_id.clone();
     let message_active = Arc::clone(&active);
     let message_fence = Arc::clone(&fence);
+    let message_channels = Arc::clone(&channels);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let registry = message_registry.clone();
         let controls = message_controls.clone();
@@ -1477,14 +1503,20 @@ fn install_control_data_channel(
         let request_lock = request_lock.clone();
         let active = Arc::clone(&message_active);
         let fence = Arc::clone(&message_fence);
+        let channels = Arc::clone(&message_channels);
         Box::pin(async move {
+            // A lone control channel is not a session. Drop its frames rather
+            // than buffering requests during the required-channel timeout.
+            if !channels.ready() {
+                return;
+            }
             let _callback = fence.read().await;
-            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !channels.ready() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 controls.unregister(agent_id, &session_id).await;
                 return;
             }
             let _guard = request_lock.lock().await;
-            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !channels.ready() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 return;
             }
             if !msg.is_string {
@@ -1555,7 +1587,7 @@ fn install_control_data_channel(
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
         let session_id = open_session_id.clone();
-        let _sender = open_sender.clone();
+        let sender = open_sender.clone();
         let display_sender = open_display_sender.clone();
         let active = Arc::clone(&open_active);
         let registry = open_registry.clone();
@@ -1578,8 +1610,14 @@ fn install_control_data_channel(
             controls
                 .register(agent_id, session_id.clone(), display_sender)
                 .await;
-            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !channels.ready() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 controls.unregister(agent_id, &session_id).await;
+                return;
+            }
+            if agent_ctl::send_ready(&sender).await.is_err() {
+                channels.fail().await;
+                controls.unregister(agent_id, &session_id).await;
+                sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
             }
         })
     }));
@@ -1597,8 +1635,8 @@ fn install_control_data_channel(
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
-            controls.unregister(agent_id, &session_id).await;
             channels.fail().await;
+            controls.unregister(agent_id, &session_id).await;
             sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
         })
     }));
@@ -2229,6 +2267,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum PartialPeerProbe {
+        PtyInput,
+        ControlRequests,
+    }
+
     async fn close_test_peer(pc: &Arc<RTCPeerConnection>) {
         if let Err(error) = pc.close().await {
             // The server peer is closed first in these cleanup paths.  The
@@ -2288,9 +2332,9 @@ mod tests {
                 let _ = message_tx.send(message.data.to_vec()).await;
             })
         }));
-        let (ctl_message_tx, ctl_messages) = mpsc::channel::<(bool, Vec<u8>)>(256);
+        let (ctl_wire_tx, mut ctl_wire_rx) = mpsc::channel::<(bool, Vec<u8>)>(256);
         ctl.on_message(Box::new(move |message| {
-            let message_tx = ctl_message_tx.clone();
+            let message_tx = ctl_wire_tx.clone();
             Box::pin(async move {
                 let _ = message_tx
                     .send((message.is_string, message.data.to_vec()))
@@ -2361,6 +2405,42 @@ mod tests {
             }
         }
         assert!(answer_set);
+        let mut pending_ctl_messages = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = ctl_wire_rx.recv().await.expect("spawn.ctl closed");
+                if !message.0 {
+                    pending_ctl_messages.push(message);
+                    continue;
+                }
+                let value: serde_json::Value =
+                    serde_json::from_slice(&message.1).expect("spawn.ctl readiness JSON");
+                if value["version"] == agent_ctl::PROTOCOL_VERSION
+                    && value["kind"] == "event"
+                    && value["event"] == "ready"
+                {
+                    break;
+                }
+                pending_ctl_messages.push(message);
+            }
+        })
+        .await
+        .expect("server RTC readiness event timed out");
+        let (ctl_message_tx, ctl_messages) = mpsc::channel(256);
+        for message in pending_ctl_messages {
+            ctl_message_tx
+                .send(message)
+                .await
+                .expect("spawn.ctl readiness backlog receiver");
+        }
+        tokio::spawn(async move {
+            while let Some(message) = ctl_wire_rx.recv().await {
+                if ctl_message_tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         RtcTestClient {
             pc,
             pty,
@@ -2373,13 +2453,14 @@ mod tests {
     async fn assert_real_agent_channels_fail_closed(
         case: &'static str,
         specs: &[TestAgentChannel],
+        probe: Option<PartialPeerProbe>,
     ) {
         let agent_id = Uuid::new_v4();
         let session_id = format!("invalid-{case}-{}", Uuid::new_v4());
         let generation = "generation";
         let viewer = viewer_id(&session_id, generation);
         let registry = AgentRegistry::new();
-        let (agent, _worker_commands) = insert_test_worker(&registry, agent_id);
+        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
         let control = registry.control_for_binding(agent).expect("worker control");
         let sessions = RtcSessions::new();
 
@@ -2392,6 +2473,8 @@ mod tests {
                 .unwrap(),
         );
         let mut channels = Vec::new();
+        let (probe_tx, mut probe_rx) = mpsc::channel(1);
+        let (partial_response_tx, mut partial_response_rx) = mpsc::channel(256);
         for spec in specs {
             let dc = pc
                 .create_data_channel(
@@ -2405,17 +2488,72 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if spec.close_on_open {
-                let close_dc = Arc::clone(&dc);
-                dc.on_open(Box::new(move || {
-                    let dc = Arc::clone(&close_dc);
-                    Box::pin(async move {
+            let open_dc = Arc::clone(&dc);
+            let open_probe_tx = probe_tx.clone();
+            let channel_probe = match (probe, spec.label) {
+                (Some(PartialPeerProbe::PtyInput), PTY_DATA_CHANNEL_LABEL) => {
+                    Some(PartialPeerProbe::PtyInput)
+                }
+                (Some(PartialPeerProbe::ControlRequests), CONTROL_DATA_CHANNEL_LABEL) => {
+                    Some(PartialPeerProbe::ControlRequests)
+                }
+                _ => None,
+            };
+            let close_on_open = spec.close_on_open;
+            dc.on_open(Box::new(move || {
+                let dc = Arc::clone(&open_dc);
+                let probe_tx = open_probe_tx.clone();
+                Box::pin(async move {
+                    match channel_probe {
+                        Some(PartialPeerProbe::PtyInput) => {
+                            // A partial peer may flood its one open channel.
+                            // Every frame must be dropped, never queued until
+                            // the missing counterpart appears.
+                            for _ in 0..128 {
+                                dc.send(&Bytes::from_static(b"pre-ready-pty-input"))
+                                    .await
+                                    .expect("send partial-peer PTY input");
+                            }
+                            let _ = probe_tx.send(()).await;
+                        }
+                        Some(PartialPeerProbe::ControlRequests) => {
+                            for _ in 0..32 {
+                                for (operation, parameters) in [
+                                    ("take_control", r#","cols":101,"rows":31"#),
+                                    ("resize", r#","cols":102,"rows":32"#),
+                                    ("scroll", r#","lines":-2"#),
+                                    ("redraw", ""),
+                                ] {
+                                    dc.send_text(format!(
+                                        r#"{{"version":1,"kind":"request","request_id":"{}","operation":"{operation}"{parameters}}}"#,
+                                        Uuid::new_v4(),
+                                    ))
+                                    .await
+                                    .expect("send partial-peer control request");
+                                }
+                            }
+                            let _ = probe_tx.send(()).await;
+                        }
+                        None => {}
+                    }
+                    if close_on_open {
                         let _ = dc.close().await;
-                    })
-                }));
-            }
+                    }
+                })
+            }));
+            let message_tx = partial_response_tx.clone();
+            dc.on_message(Box::new(move |message| {
+                let message_tx = message_tx.clone();
+                Box::pin(async move {
+                    let _ = message_tx
+                        .send((message.is_string, message.data.to_vec()))
+                        .await;
+                })
+            }));
             channels.push(dc);
         }
+        drop(probe_tx);
+        drop(partial_response_tx);
 
         let offer = pc.create_offer(None).await.unwrap();
         let mut gathered = pc.gathering_complete_promise().await;
@@ -2436,12 +2574,60 @@ mod tests {
 
         let mut answer_set = false;
         let mut pending_candidates = Vec::new();
+        let mut probe_checked = probe.is_none();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if sessions.resident_session_count().await == 0 {
                     break;
                 }
                 tokio::select! {
+                    sent = probe_rx.recv(), if !probe_checked => {
+                        sent.unwrap_or_else(|| panic!("{case}: partial-peer probe channel closed"));
+                        // Give the remote callbacks a sustained scheduling
+                        // window. No worker command or display state may be
+                        // created anywhere within the missing-channel grace.
+                        for _ in 0..20 {
+                            assert!(
+                                matches!(
+                                    worker_commands.try_recv(),
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                                ),
+                                "{case}: pre-ready frame reached the worker"
+                            );
+                            assert!(
+                                matches!(
+                                    partial_response_rx.try_recv(),
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                                ),
+                                "{case}: pre-ready frame produced a channel response"
+                            );
+                            assert!(
+                                !sessions.controls.contains_viewer(agent_id, &viewer).await,
+                                "{case}: pre-ready control frame registered a viewer"
+                            );
+                            assert!(
+                                !sessions.controls.is_owner(agent_id, &viewer).await,
+                                "{case}: pre-ready control frame changed display ownership"
+                            );
+                            assert_eq!(
+                                sessions.controls.retained_counts().await,
+                                (0, 0),
+                                "{case}: pre-ready control state was retained"
+                            );
+                            assert_eq!(
+                                control.direct_sink_offset(&viewer).await,
+                                None,
+                                "{case}: partial peer installed a direct sink"
+                            );
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        assert_eq!(
+                            sessions.resident_session_count().await,
+                            1,
+                            "{case}: partial peer closed before the required-channel timeout"
+                        );
+                        probe_checked = true;
+                    }
                     outbound = out_rx.recv() => {
                         let Some(outbound) = outbound else {
                             tokio::task::yield_now().await;
@@ -2480,6 +2666,24 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("{case}: invalid RTC peer remained resident"));
 
+        assert!(probe_checked, "{case}: partial-peer probe never ran");
+        if probe.is_some() {
+            assert!(
+                matches!(
+                    worker_commands.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "{case}: partial-peer frame reached the worker during cleanup"
+            );
+            assert!(
+                matches!(
+                    partial_response_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "{case}: partial-peer frame produced a response during cleanup"
+            );
+        }
+
         assert!(
             !sessions.controls.contains_viewer(agent_id, &viewer).await,
             "{case}: invalid RTC viewer remained registered"
@@ -2488,6 +2692,11 @@ mod tests {
             control.direct_sink_offset(&viewer).await,
             None,
             "{case}: invalid RTC direct sink remained registered"
+        );
+        assert_eq!(
+            sessions.controls.retained_counts().await,
+            (0, 0),
+            "{case}: invalid RTC control state remained retained"
         );
         close_test_peer(&pc).await;
         drop(channels);
@@ -2662,13 +2871,21 @@ mod tests {
         ];
 
         tokio::join!(
-            assert_real_agent_channels_fail_closed("missing-pty", &missing_pty),
-            assert_real_agent_channels_fail_closed("missing-ctl", &missing_ctl),
-            assert_real_agent_channels_fail_closed("duplicate-pty", &duplicate_pty),
-            assert_real_agent_channels_fail_closed("duplicate-ctl", &duplicate_ctl),
-            assert_real_agent_channels_fail_closed("unknown", &unknown),
-            assert_real_agent_channels_fail_closed("early-close", &early_close),
-            assert_real_agent_channels_fail_closed("unordered", &unordered),
+            assert_real_agent_channels_fail_closed(
+                "missing-pty",
+                &missing_pty,
+                Some(PartialPeerProbe::ControlRequests),
+            ),
+            assert_real_agent_channels_fail_closed(
+                "missing-ctl",
+                &missing_ctl,
+                Some(PartialPeerProbe::PtyInput),
+            ),
+            assert_real_agent_channels_fail_closed("duplicate-pty", &duplicate_pty, None),
+            assert_real_agent_channels_fail_closed("duplicate-ctl", &duplicate_ctl, None),
+            assert_real_agent_channels_fail_closed("unknown", &unknown, None),
+            assert_real_agent_channels_fail_closed("early-close", &early_close, None),
+            assert_real_agent_channels_fail_closed("unordered", &unordered, None),
         );
     }
 
@@ -2703,27 +2920,11 @@ mod tests {
         let mut client =
             connect_rtc_session(&sessions, &registry, agent_id, "rtc-real", "generation").await;
         assert_eq!(sessions.resident_session_count().await, 1);
-        let plain_request_id = Uuid::new_v4();
-        let plain_request_id_text = plain_request_id.to_string();
         client
-            .ctl
-            .send_text(format!(
-                r#"{{"version":1,"kind":"request","request_id":"{plain_request_id}","operation":"history","lines":400,"plain":true}}"#
-            ))
+            .pty
+            .send(&Bytes::from_static(b"endpoint-input"))
             .await
             .unwrap();
-        let plain_error = loop {
-            let value = next_ctl_json(&mut client.ctl_messages).await;
-            if value.get("request_id").and_then(|id| id.as_str())
-                == Some(plain_request_id_text.as_str())
-            {
-                break value;
-            }
-        };
-        assert_eq!(plain_error["request_id"], plain_request_id.to_string());
-        assert_eq!(plain_error["ok"], false);
-        assert_eq!(plain_error["error"]["code"], "plain_replay_unsupported");
-
         let request_id = Uuid::new_v4();
         client
             .ctl
@@ -2769,6 +2970,34 @@ mod tests {
         assert_eq!(&replay_chunk[..4], b"SPCT");
         assert_eq!(replay_chunk[4], agent_ctl::PROTOCOL_VERSION);
         assert_eq!(&replay_chunk[28..], replay_bytes);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
+                .await
+                .expect("first spawn.pty input timed out")
+                .expect("worker command channel closed"),
+            b"endpoint-input"
+        );
+
+        let plain_request_id = Uuid::new_v4();
+        let plain_request_id_text = plain_request_id.to_string();
+        client
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{plain_request_id}","operation":"history","lines":400,"plain":true}}"#
+            ))
+            .await
+            .unwrap();
+        let plain_error = loop {
+            let value = next_ctl_json(&mut client.ctl_messages).await;
+            if value.get("request_id").and_then(|id| id.as_str())
+                == Some(plain_request_id_text.as_str())
+            {
+                break value;
+            }
+        };
+        assert_eq!(plain_error["request_id"], plain_request_id.to_string());
+        assert_eq!(plain_error["ok"], false);
+        assert_eq!(plain_error["error"]["code"], "plain_replay_unsupported");
 
         let live = b"live-after-replay\r\n";
         control.route_direct_for_test(live).await;
@@ -2779,19 +3008,6 @@ mod tests {
                 .expect("spawn.pty closed"),
             live
         );
-        client
-            .pty
-            .send(&Bytes::from_static(b"endpoint-input"))
-            .await
-            .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
-                .await
-                .expect("spawn.pty input timed out")
-                .expect("worker command channel closed"),
-            b"endpoint-input"
-        );
-
         let mut second =
             connect_rtc_session(&sessions, &registry, agent_id, "rtc-second", "generation").await;
         assert_eq!(sessions.resident_session_count().await, 2);

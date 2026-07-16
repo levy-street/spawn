@@ -16,6 +16,7 @@ async function openTerminalWithMockSocket(
     reconnect?: boolean;
     secondHistory?: string;
     noChannels?: boolean;
+    noReady?: boolean;
     autoSnapshot?: boolean;
   } = {},
 ) {
@@ -25,6 +26,7 @@ async function openTerminalWithMockSocket(
     history: options.history,
     secondHistory: options.secondHistory,
     openChannels: !options.noChannels,
+    sendReady: !options.noReady,
     autoSnapshot: options.autoSnapshot,
   });
   await mockAuthenticatedApi(page, { agents: [agent()] });
@@ -298,6 +300,25 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
   // No DataChannel exists in the mock, so input is queued client-side; the
   // relay path must never carry it.
   expect(binaryText(messages)).toBe("");
+});
+
+test("spawn.v2 holds endpoint effects until the daemon readiness event", async ({ page }) => {
+  const { messages } = await openTerminalWithMockSocket(page, { noReady: true });
+
+  await page.waitForFunction(() => {
+    return (
+      window as unknown as {
+        __spawnRtcTest?: { ptyReady: () => boolean };
+      }
+    ).__spawnRtcTest?.ptyReady();
+  });
+  await page.getByLabel("Agent terminal").click();
+  await page.keyboard.type("queued until ready");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(300);
+
+  expect(binaryText(messages)).toBe("");
+  expect(jsonMessages(messages).some((message) => message?.kind === "request")).toBe(false);
 });
 
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {

@@ -14,7 +14,15 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
 - Agent terminals require two ordered WebRTC DataChannels: `spawn.pty` carries
   PTY bytes and `spawn.ctl` carries request-bound history/snapshot plus
   resize/display ownership. Missing, duplicate, closed, unknown, or unordered
-  channels fail closed, with no server-content fallback.
+  channels fail closed, with no server-content fallback. Neither channel's
+  message handler may affect the worker or viewer state until one shared gate
+  has observed both required channels open successfully; pre-ready frames are
+  dropped rather than buffered through the counterpart timeout. Once that gate
+  and control-viewer registration succeed, the daemon emits the bounded
+  `spawn.ctl` v1 `{"kind":"event","event":"ready"}` acknowledgement. The
+  browser holds input and control requests in its existing bounded,
+  generation-scoped queues until that event and tears down/retries the RTC
+  attempt if readiness plus initial replay do not complete within 10 seconds.
 - The daemon control socket requires `spawn.control.v2`; the browser agent
   socket requires `spawn.v2`. Both are text/JSON-only signaling, disclosed
   lifecycle, and still-pending upload/launch control. Binary terminal frames,

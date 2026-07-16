@@ -120,12 +120,15 @@ binary fallback, and REST input/resize/scroll/redraw/snapshot routes are gone.
 Both `spawn.pty` and `spawn.ctl` are required for an agent RTC peer. Old
 clients and daemons receive only `protocol.required` then close. Strict binding
 tuples and `scripts/check-no-server-terminal-content.sh` fail closed against a
-content path returning.
+content path returning. The daemon acknowledges the shared two-channel gate
+with a `spawn.ctl` v1 `ready` event; browsers keep PTY input and control
+requests in bounded generation-scoped queues until that event, then fail the
+RTC attempt on the existing 10-second connection/bootstrap deadline.
 
 **Current P2-AGENT-02 review-candidate validation:** strict daemon format and
 Clippy pass; all 140 daemon tests pass; server Ruff and all 146 server tests
-pass; web lint, all 30 unit tests, 67 browser tests (3 opt-in audits skipped),
-and the production build pass. `SPAWN_E2E_PORT=3717 scripts/test-all.sh` passes
+pass; web lint, all 30 unit tests, 68 browser tests (3 opt-in audits skipped),
+and the production build pass. `SPAWN_E2E_PORT=3791 scripts/test-all.sh` passes
 all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
 daemon, live-browser, and service-manager smokes.
 

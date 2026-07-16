@@ -44,7 +44,12 @@ describe("spawn.ctl browser protocol", () => {
     assert.equal(makeAgentCtlRequest(id, "redraw", circular), null);
   });
 
-  test("parses display events and rejects other protocol versions", () => {
+  test("parses readiness and display events and rejects other protocol versions", () => {
+    assert.deepEqual(parseAgentCtlText('{"version":1,"kind":"event","event":"ready"}'), {
+      version: 1,
+      kind: "event",
+      event: "ready",
+    });
     assert.deepEqual(
       parseAgentCtlText(
         '{"version":1,"kind":"event","event":"display_state","owner":true,"cols":120,"rows":32,"viewers":2}',

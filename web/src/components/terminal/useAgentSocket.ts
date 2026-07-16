@@ -133,8 +133,8 @@ export function useAgentSocket({
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
   const [v2, setV2] = useState(false);
-  // True while the spawn.pty DataChannel is open — on v2 this IS the live
-  // terminal path, so callers surface it as connection state.
+  // True after both DataChannels are open, the daemon has acknowledged their
+  // shared readiness gate, and the initial replay has completed.
   const [dcOpen, setDcOpen] = useState(false);
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
   const wsRef = useRef<WebSocket | null>(null);
@@ -340,6 +340,8 @@ export function useAgentSocket({
       }> = [];
       let pendingBootstrapPtyBytes = 0;
       let bootstrapDone = false;
+      let bootstrapStarted = false;
+      let serverReady = false;
       let bootstrapPtyAnchor: number | null = null;
       let initialHistoryRequestId: string | null = null;
       let offerSent = false;
@@ -394,6 +396,7 @@ export function useAgentSocket({
           current.open ||
           !current.ptyOpen ||
           !current.ctlOpen ||
+          !serverReady ||
           !bootstrapDone
         ) {
           return;
@@ -472,6 +475,45 @@ export function useAgentSocket({
         }
       };
 
+      const startBootstrap = () => {
+        const current = rtcRef.current;
+        if (
+          bootstrapStarted ||
+          !serverReady ||
+          !isCurrentRtcGeneration() ||
+          !current.ptyOpen ||
+          !current.ctlOpen
+        ) {
+          return;
+        }
+        bootstrapStarted = true;
+        initialHistoryRequestId = newAgentCtlRequestId();
+        const size = initialSizeRef.current;
+        const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
+          lines: 400,
+          plain: false,
+          ...(size ? { cols: size.cols, rows: size.rows } : {}),
+        });
+        if (!historyText || !requests.register(initialHistoryRequestId, "history")) {
+          finishBootstrap(new Uint8Array(), 0);
+        } else {
+          try {
+            ctlDc.send(historyText);
+          } catch {
+            requests.cancel(initialHistoryRequestId);
+            cleanupRtc(true, true, rtcGeneration);
+            return;
+          }
+        }
+        try {
+          for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
+        } catch {
+          cleanupRtc(true, true, rtcGeneration);
+          return;
+        }
+        markReady();
+      };
+
       const sendControl = (
         operation: AgentCtlOperation,
         parameters: Record<string, unknown> = {},
@@ -480,10 +522,11 @@ export function useAgentSocket({
         const requestId = newAgentCtlRequestId();
         const text = makeAgentCtlRequest(requestId, operation, parameters);
         if (!text) return false;
-        if (ctlDc.readyState !== "open" && pendingControlTexts.length >= 128) return false;
+        const canSend = serverReady && ctlDc.readyState === "open";
+        if (!canSend && pendingControlTexts.length >= 128) return false;
         if (!requests.register(requestId, operation)) return false;
         try {
-          if (ctlDc.readyState === "open") {
+          if (canSend) {
             ctlDc.send(text);
           } else {
             pendingControlTexts.push(text);
@@ -541,6 +584,7 @@ export function useAgentSocket({
         const current = rtcRef.current;
         if (!isCurrentRtcGeneration()) return;
         rtcRef.current = { ...current, ptyOpen: true };
+        startBootstrap();
         markReady();
       };
       ptyDc.onclose = () => {
@@ -582,30 +626,7 @@ export function useAgentSocket({
           if (!isCurrentRtcGeneration()) return;
           const current = rtcRef.current;
           rtcRef.current = { ...current, ctlOpen: true };
-          initialHistoryRequestId = newAgentCtlRequestId();
-          const size = initialSizeRef.current;
-          const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
-            lines: 400,
-            plain: false,
-            ...(size ? { cols: size.cols, rows: size.rows } : {}),
-          });
-          if (!historyText || !requests.register(initialHistoryRequestId, "history")) {
-            finishBootstrap(new Uint8Array(), 0);
-          } else {
-            try {
-              ctlDc.send(historyText);
-            } catch {
-              requests.cancel(initialHistoryRequestId);
-              cleanupRtc(true, true, rtcGeneration);
-              return;
-            }
-          }
-          try {
-            for (const text of pendingControlTexts.splice(0)) ctlDc.send(text);
-          } catch {
-            cleanupRtc(true, true, rtcGeneration);
-            return;
-          }
+          startBootstrap();
           markReady();
         };
         ctlDc.onclose = () => {
@@ -646,6 +667,11 @@ export function useAgentSocket({
               const message = parseAgentCtlText(decoded);
               if (!message) return;
               if (message.kind === "event") {
+                if (message.event === "ready") {
+                  serverReady = true;
+                  startBootstrap();
+                  return;
+                }
                 currentHandlers()?.onDisplayControl?.({
                   owner: message.owner,
                   cols: message.cols,
