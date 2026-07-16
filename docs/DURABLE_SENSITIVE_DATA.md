@@ -22,6 +22,14 @@ The following values are local to the host that uses them:
 | `preset_values` | default argv, environment template, install command, executable/tool target, and endpoint execution policy | preset ID, name, description/agent kind; the unattended enabled flag and content-free timestamps/status allowed by `TRUST.md` |
 | `skill_body` | body and body format/version | skill ID, name, description, enabled-by-default flag |
 
+The endpoint also owns an internal, encrypted **mutation reconciliation
+journal**. It is not a fourth user object and has no server representation. It
+retains the authenticated request fingerprint, affected object/revision or
+tool target reference, effect boundary, and last definitive result for a
+mutation whose acknowledgement or external side effect is uncertain. Its
+`outcome_unknown` records survive daemon and browser restarts so a disconnect
+cannot silently become a duplicate launch, install, import, or protected write.
+
 There is no Phase 2 durable PTY transcript or terminal-history object. The
 worker's bounded encrypted replay remains a separate live-worker artifact with
 an ephemeral key. A later optional transcript backup, if built, requires a new
@@ -34,6 +42,37 @@ Opaque client-encrypted server blobs are **not selected** for Phase 2. They may
 be reconsidered as an optional synchronization/backup layer after endpoint
 identity, recovery, and independently trusted client delivery exist. Such a
 layer cannot silently replace the endpoint-local canonical copy.
+
+Reconsideration requires a separate reviewed design with independently
+provisioned and verifiable browser/device keys; authenticated host identities;
+multi-device enrollment, recovery, revocation, and lost-device behavior; an
+account root/recovery secret unavailable to the server; anti-rollback version
+semantics; a hostile hosted-JavaScript answer; and explicit approval of
+identifier, size, version, and access-pattern leakage. Until those prerequisites
+are implemented and tested, no server ciphertext schema/API or server-held
+decrypt/recovery key is permitted.
+
+### Exact retained server metadata
+
+P2-DATA-02 may retain only the disclosed registry and lifecycle fields needed
+to address the endpoint plane:
+
+- account/owner, host, agent, preset, skill, and grant IDs and relationships;
+- explicit user labels or neutral names, preset/skill descriptions and kinds,
+  lifecycle state, exit code, and coarse lifecycle/activity timestamps already
+  allowed by `TRUST.md`;
+- the unattended-policy enabled flag plus content-free check/update/result
+  codes and coarse timestamps; and
+- the monotonic per-account/per-host migration state and content-free aggregate
+  migration counts needed to prove cutover.
+
+It may not retain protected values, plaintext digests, exact protected sizes,
+local object existence/revisions/key epochs, request fingerprints or IDs,
+reconciliation-record presence/detail, detailed tool errors, or a protected
+sync queue. An `outcome_unknown` state is learned and resolved through the live
+host channel; ordinary server metadata remains whatever lifecycle state was
+already disclosed and must not be treated as proof that the protected effect
+succeeded or failed.
 
 ### Consequences we accept
 
@@ -88,18 +127,31 @@ only through a superseding ADR with equivalent tests.
   files. Symlinks and wrong-owner paths are rejected.
 - SQLite provides atomic compare-and-swap writes. Only already-encrypted
   envelopes, authenticated non-secret metadata, revisions, tombstones, and a
-  bounded idempotency journal enter SQLite/WAL. SQLite never receives a
-  decrypted JSON/CBOR field.
+  bounded idempotency/reconciliation journal enter SQLite/WAL. SQLite never
+  receives a decrypted JSON/CBOR field. Envelope rows, immutable revision rows,
+  object-head CAS, request result, reconciliation state, and generation/tag are
+  committed in one SQLite transaction.
+- DATA-02 must use a durability mode whose committed transactions survive the
+  supported power-loss model (WAL with full synchronous durability or an
+  equivalently tested setting), fsync the containing directory for newly
+  created/replaced files, and verify crash recovery after truncating each write
+  boundary. Corrupt pages/envelopes are quarantined; recovery never edits the
+  only copy in place.
 - The credential record also holds `store_uuid`, the latest committed store
   generation, and an HMAC state tag over the canonical set of object heads,
-  envelope hashes, and tombstones. A mutation first commits generation `n` and
-  its tag in SQLite, then advances the credential anchor; no later write is
-  accepted until the anchor succeeds. On restart, database=anchor is normal;
+  envelope hashes, tombstones, settled request results, and unresolved
+  reconciliation heads. Every durable journal transition advances the
+  generation. A mutation first commits generation `n` and its tag in SQLite,
+  then advances the credential anchor; no later write is accepted until the
+  anchor succeeds. On restart, database=anchor is normal;
   database=anchor+1 is accepted only after its tag verifies (crash between the
   two writes) and advances the anchor; database older than the anchor, more
   than one generation ahead, or tag-mismatched fails as `data_rollback`/
   `data_integrity`. This detects a database-only rollback when the credential
-  anchor survives without pretending the two stores are transactional.
+  anchor survives without pretending the two stores are transactional. An
+  anchor-advance failure leaves a durable local recovery marker and blocks all
+  later writes until the exact committed generation is authenticated and the
+  anchor is advanced; it is never papered over by a new mutation.
 - Serialization is deterministic canonical CBOR. Limits are checked before
   allocation and again after serialization. Temporary plaintext buffers and
   keys are excluded from core dumps/locked where supported and zeroized on
@@ -111,12 +163,16 @@ only through a superseding ADR with equivalent tests.
 1. Each host store has a random 256-bit **store master key** and random
    `store_uuid`. The master key is independent of the account password, daemon
    bearer token, WebRTC identity key, server secrets, and other hosts.
-2. The master key is stored in the OS credential store when available. For an
-   unattended/headless installation without one, Spawn may use a separately
-   created local `0600` key file in the private state directory, but must label
-   that protection mode in local diagnostics. This fallback protects the
-   control-plane boundary and supports crypto-erasure; it does not protect a
-   disk image that contains both the database and key file.
+2. The master key and anchor record are stored in an OS credential facility
+   only when DATA-02 proves that facility can unlock non-interactively under the
+   actual daemon service account after boot, logout, and offline restart. A
+   desktop session prompt or an unavailable login keyring is not a supported
+   daemon dependency. For an unattended/headless installation without such a
+   facility, Spawn may use a separately created local `0600` key/anchor file in
+   the private state directory, but must label that protection mode in local
+   diagnostics. This fallback protects the control-plane boundary and supports
+   crypto-erasure; it does not protect a disk image that contains both the
+   database and key file.
 3. Every object revision gets a fresh random 256-bit data-encryption key (DEK)
    and nonce. The canonical plaintext is sealed with XChaCha20-Poly1305. The
    DEK is separately wrapped by the current master-key epoch with
@@ -127,9 +183,16 @@ only through a superseding ADR with equivalent tests.
    `spawn/private-store/idempotency/v1`. They authenticate the store state and
    bounded local retry journal; neither is used as an encryption key.
 5. Keys and decrypted objects exist only in daemon memory for the minimum
-   operation. Browsers receive plaintext only inside the endpoint-to-endpoint
-   DTLS session. Workers receive only the launch/materialization values they
+   operation. Browsers receive plaintext only inside the authenticated
+   browser-to-endpoint DTLS session. Workers receive only the
+   launch/materialization values they
    require over the existing private local worker channel.
+
+The three public object types above and the daemon-internal
+`internal_reconciliation` envelope use the same revision-key/envelope rules.
+The internal type is not listable through ordinary object APIs and never
+appears in server metadata; it is exposed only through the bounded authorized
+reconciliation operations.
 
 The AEAD additional authenticated data is the canonical tuple:
 
@@ -153,16 +216,26 @@ key destruction. It does not change the declared trust in the user's host.
   hashes or deterministic ciphertexts of protected values.
 - Each object starts at revision 1 and increments a checked unsigned 64-bit
   revision. Create requires `expected_revision=0`; update/delete requires the
-  exact current revision. Exhaustion fails closed.
+  exact current revision. Exhaustion fails closed. A committed revision is
+  immutable; the mutable head only points at a revision or tombstone. Historical
+  revisions referenced by a launch manifest, active import/export, or unresolved
+  reconciliation entry cannot be garbage-collected. Unreferenced history may be
+  removed only by an explicit bounded retention policy that never changes the
+  current head or resurrects an ID.
 - There is no timestamp ordering and no last-write-wins. A stale write returns
   an E2E `revision_conflict` with the current revision. The browser must fetch,
   compare, and make the user choose which value to keep.
 - A request ID is at least 128 random bits. The daemon durably retains a
-  bounded mapping from `(session owner, operation, request_id)` to an
-  authenticated request fingerprint and result. An identical retry returns the
-  original result; reuse with different bytes returns `request_id_reused`.
-  The journal is capped at 4,096 entries and 24 hours, with active launch/write
-  requests protected from eviction.
+  bounded mapping from `(authorized account principal, host, operation,
+  request_id)` to an authenticated request fingerprint and result. The
+  principal is stable across reconnects and is not an ephemeral WebRTC session
+  ID. An identical retry returns the original result; reuse with different
+  bytes returns `request_id_reused`. Settled results are capped at 4,096 entries
+  and retained for at least 24 hours. Pending or `outcome_unknown` entries are
+  never age/LRU-evicted; their separate cap blocks new affected mutations until
+  the user reconciles them. After a settled entry expires, a late retry is not
+  treated as fresh authority: it must re-read the current revision/state and
+  obtain a new request ID and explicit user action.
 - Delete writes a revisioned tombstone before deleting the wrapped DEK and
   ciphertext. An ID cannot be recreated. Tombstones contain no protected value
   and remain for the life of that store lineage, preventing stale retry/copy
@@ -173,7 +246,9 @@ key destruction. It does not change the declared trust in the user's host.
   `store_uuid`. Restoring an older whole-store backup is an explicit recovery
   action: the daemon is stopped, the user confirms the rollback, a new
   `store_uuid` and master-key epoch are created, and every imported object gets
-  a new lineage/revision. Silent rollback is forbidden.
+  a new lineage/revision. All traffic bound to the old lineage is rejected, so
+  compacted tombstones cannot be bypassed by replay. Silent rollback is
+  forbidden.
 
 The endpoint can detect protocol replay, stale writes, database-only rollback
 when its credential anchor survives, and ordinary stale imports. A
@@ -182,6 +257,37 @@ internally consistent older snapshot cannot be distinguished without an
 external monotonic anchor. That limitation is disclosed; Spawn does not claim
 rollback detection against an attacker who controls the trusted endpoint and
 all of its backups.
+
+### Ambiguous-effect reconciliation
+
+Store-only mutations make the encrypted revision, head CAS, request result, and
+generation durable in one transaction. A same-ID retry after a lost
+acknowledgement therefore returns the recorded result. It never performs the
+write twice. SQLite recovery yields either the old head or the atomically
+committed head/result. If integrity/anchor checks cannot authenticate either
+state, the daemon returns `data_integrity`, blocks the object, and does not
+invent an `outcome_unknown` record from untrusted state.
+
+Operations with effects outside SQLite—launch, installer/package-manager work,
+and future host mutations—record `prepared`, then durably cross an
+`effect_started` boundary before invocation. A disconnect or crash after that
+boundary leaves an encrypted `outcome_unknown` record containing the exact
+target reference and safe reconciliation method. Neither the browser nor daemon
+automatically repeats the effect. A later browser, including a different device,
+enumerates bounded unresolved records over `spawn.host.ctl` and performs the
+operation-specific definitive check: worker identity/state for launch; a direct
+executable/version/latest check for tool installation; or exact object
+revision/request lookup for store changes. Only a conclusive check or explicit
+user acknowledgement records `committed`/`not_applied` and releases the lock.
+
+Browser storage may retain only disclosed IDs and a hint that reconciliation is
+needed; it is not authoritative and its loss cannot remove the endpoint lock.
+Protected target, command, output, and error detail remain encrypted locally
+and E2E. Unresolved records survive daemon restart, native same-host backup, and
+same-lineage restore. Cross-host import does not transfer an external side
+effect to the destination; it reports the source ambiguity in preview and
+requires acknowledgement before rebinding objects under the destination's new
+lineage.
 
 ### Launch resolution
 
@@ -214,9 +320,13 @@ P2-DATA-02 may lower these limits but must not raise them without review:
 | canonical agent/restart manifest | 512 KiB |
 | canonical preset/tool value | 128 KiB |
 | one canonical skill body | 256 KiB, preserving the current 65,535-character API ceiling at worst-case UTF-8 width |
-| live objects per store | 10,000 |
+| live object heads per store | 10,000 |
+| encrypted current/history revision payload | 256 MiB total; referenced revisions are counted and never evicted |
 | tombstones per store | 20,000; exceeding the cap blocks new IDs rather than evicting replay protection |
-| encrypted database payload | 256 MiB by default; operator may lower it |
+| unresolved reconciliation records | 256; reaching the cap blocks new external-effect mutations, never evicts ambiguity |
+| settled idempotency results | 4,096, retained at least 24 hours |
+| encrypted database payload | 256 MiB by default, inclusive of envelopes/journals; operator may lower it |
+| encrypted export archive | 512 MiB |
 | concurrent protected write/import streams | 4 |
 | buffered plaintext across all streams | 1 MiB |
 | one list page | 256 object heads with a daemon-authenticated cursor; no eager full inventory |
@@ -229,6 +339,13 @@ partially visible object. Temporary files are bounded, `0600`, and atomically
 renamed only after verification. Backpressure pauses reads instead of growing
 queues. Repeated quota failures expose only a stable content-free code to the
 server and bounded local/E2E detail.
+
+Automatic eviction may remove only expired settled request results and
+unreferenced historical object revisions under the documented retention rule.
+It may never remove a current head, tombstone, referenced revision, unresolved
+reconciliation record, or active stream. Reaching those caps is an explicit
+availability failure with an E2E remediation path, not permission to weaken
+replay/ambiguity protection.
 
 The authenticated user can still exhaust their own host quota or delete their
 own data; availability against a malicious authorized endpoint is out of scope.
@@ -244,8 +361,10 @@ store.
 
 The supported recovery artifact is an explicit streamed export created on the
 host and delivered to the requesting browser over `spawn.host.ctl`. It contains
-the store/object versions, IDs, revisions, tombstones, and protected values in
-one authenticated archive encrypted under a user-supplied recovery passphrase.
+the format/store lineage, object IDs, current and referenced immutable
+revisions, tombstones, protected values, and same-host unresolved reconciliation
+records in one authenticated archive encrypted under a user-supplied recovery
+passphrase. Settled request-result history need not be exported.
 Version 1 uses Argon2id with a random salt (64 MiB, 3 iterations, parallelism
 1) to derive an archive key, then XChaCha20-Poly1305 with a random nonce. An
 import rejects different/out-of-range KDF parameters before allocating. The
@@ -269,12 +388,28 @@ session; browsers do not need a shared durable data key. A new device therefore
 does not require key fan-out, but it gains no offline copy. Browser IndexedDB,
 service-worker caches, analytics, and error reports must not persist protected
 values. Browser memory is cleared on disconnect/logout on a best-effort basis.
+Two devices see the same endpoint heads and unresolved-record inventory; exact
+CAS makes at most one racing write succeed. A browser that missed an
+acknowledgement must reconcile by request ID/current revision, not infer success
+from server lifecycle metadata.
 
 A native host backup containing both the store and local fallback key is
 decryptable by whoever can restore that trusted endpoint. A backup containing
-only the encrypted database is not recoverable. Operators must choose either a
-platform backup that includes credential-store recovery or the explicit
-passphrase export and document its retention.
+only the encrypted database is not recoverable. Copying SQLite and its
+credential anchor independently can capture the generation gap and is not a
+supported backup: use the passphrase export or a daemon-quiesced, read-back
+verified snapshot of the database/WAL plus key/anchor. Restore validates the
+pair before exposing a head. Restoring an older pair requires the explicit new
+lineage/re-encryption flow above. Operators must choose a platform backup that
+can restore the credential facility consistently or the explicit export and
+document its retention.
+
+Host re-registration, account ownership change, or token rotation never
+silently rebinds a store: the AAD/account/host binding fails closed. A lost host
+can be replaced only from a retained export or reconfiguration; server metadata
+cannot reconstruct it. Cross-host import creates a new lineage and excludes the
+source host's external side effects after presenting unresolved records for
+explicit acknowledgement.
 
 ## Rotation, revocation, deletion, and purge
 
@@ -307,11 +442,22 @@ passphrase export and document its retention.
 Migration is per account and host, and has four fail-closed states recorded as
 disclosed metadata: `legacy`, `copying`, `endpoint_verified`, `scrubbed`.
 
-1. **Inventory without content.** Record row/object counts and byte totals for
+The state is monotonic and CAS-protected. `legacy` is the old server-readable
+authority. `copying` freezes protected writes and allows only the bounded
+migration reader to consume legacy fields; normal create/edit/restart/tool/skill
+operations are disabled, so there is no dual-read or dual-write. On entry to
+`endpoint_verified`, all protected reads/writes switch to the endpoint and the
+server ingress/egress paths are disabled before scrubbing starts. `scrubbed`
+means the fields/routes are gone and historical purge is in progress/complete.
+Rollback to `legacy` is permitted only from `copying`, before endpoint-only
+ingress is cut; later failure is repaired by roll-forward or endpoint restore.
+
+1. **Inventory without content.** Record row/object counts for
    agent manifests, preset values/tool targets, skill bodies, derived names,
-   and detailed tool errors. Flag values above the new per-object limits for
-   explicit user remediation/export; never truncate them. Do not record values
-   or unkeyed plaintext hashes.
+   and detailed tool errors. The migration reader may measure a value only to
+   enforce the endpoint limit and returns a content-free oversized count for
+   explicit user remediation/export; it does not retain per-object or aggregate
+   byte totals. Never truncate values or record plaintext/unkeyed hashes.
 2. **Upgrade and freeze.** Require a P2-DATA-capable daemon/browser. Freeze
    legacy protected-value edits for the account. Old clients receive a stable
    `upgrade_required`; no dual-write or plaintext fallback is allowed.
@@ -326,10 +472,12 @@ disclosed metadata: `legacy`, `copying`, `endpoint_verified`, `scrubbed`.
    run tool-target checks from the endpoint copy. Missing/offline hosts block
    purge unless the user explicitly retires them or exports/reimports their
    data.
-5. **Cut ingress.** Switch create/edit/restart/tool/skill flows to endpoint-only
-   operations. Stop cwd-derived names and reject all legacy frames/routes that
-   could write or return protected values. Restart/drain server workers as
-   required by the P2-PURGE-01 runbook.
+5. **Cut ingress.** Atomically enter `endpoint_verified`, switch
+   create/edit/restart/tool/skill flows to endpoint-only operations, and set a
+   schema/config sentinel that makes old binaries fail startup rather than
+   serve legacy fields. Stop cwd-derived names and reject all legacy
+   frames/routes that could write or return protected values. Restart/drain
+   server workers as required by the P2-PURGE-01 runbook.
 6. **Scrub, then drop.** In one staged migration, replace protected fields with
    null/empty compatibility values only after endpoint verification; scrub
    conservatively derived agent names and detailed tool errors; then remove the
@@ -338,9 +486,12 @@ disclosed metadata: `legacy`, `copying`, `endpoint_verified`, `scrubbed`.
    verifies the oldest remaining backup. Binary/config rollback may not restore
    a plaintext server store.
 
-If any verification fails, remain frozen or return to `legacy` before scrub.
-After `scrubbed`, failure remediation is endpoint restore/import or a corrected
-roll-forward—never server plaintext restoration.
+If any verification fails while `copying`, remain frozen or explicitly return
+to `legacy` before the endpoint-only cut. After `endpoint_verified`, failure
+remediation is endpoint restore/import or a corrected roll-forward—never server
+plaintext restoration. An offline host blocks that host's transition unless
+the user explicitly retires it or accepts loss after export; one online host's
+success cannot be used as evidence for another host.
 
 ## Observability contract
 
@@ -349,7 +500,9 @@ code, host/agent/preset/skill IDs already disclosed as metadata where needed,
 bounded counts, duration, and coarse lifecycle timestamps. Prefer request IDs
 hashed with a process-local telemetry key. Do not log protected payload sizes
 unless the size class is already explicitly disclosed; this endpoint-local
-design does not add server-side object size/version/access metadata.
+design does not add server-side object size/version/access metadata. It also
+does not add reconciliation request IDs, targets, record counts/presence, or
+outcome detail to server logs, metrics, traces, crash reports, or metadata rows.
 
 Daemon logs/metrics must not include plaintext, plaintext digests, ciphertext,
 keys, nonces, wrapped keys, passphrases, paths, argv/env, commands, skill text,
@@ -377,6 +530,8 @@ length, key epoch, or read log. It does not claim traffic-analysis resistance.
 | corrupt/tag-invalid object | quarantine ciphertext, return E2E `data_integrity`, do not launch or substitute defaults |
 | newer schema/algorithm | refuse writes and request an upgrade; never guess |
 | stale revision/replayed request | conflict or idempotent original result as specified above |
+| lost acknowledgement or uncertain external effect | durable endpoint `outcome_unknown`; block retry until operation-specific reconciliation proves applied/not-applied or the user explicitly acknowledges uncertainty |
+| credential anchor advance failure | preserve the committed generation, refuse later writes, and repair only by authenticated one-generation recovery |
 | missing preset/skill revision | E2E error and no launch/tool execution |
 | quota/timeout/cancel/disconnect | abort atomically, erase temporary plaintext, preserve previous revision |
 | endpoint copy unavailable after server scrub | recovery import or explicit reconfiguration; never restore the server field |
@@ -402,28 +557,44 @@ of assuming it.
    protected server read. Removing the key makes the operation fail closed.
 4. AEAD mutation, wrong object/host/account binding, truncated stream, unknown
    version, stale expected revision, request replay with changed bytes, and
-   partial database rollback all fail without changing the current object.
+   partial database/journal rollback all fail without changing the current
+   object or clearing an unresolved-effect lock. Power loss at every
+   SQLite/anchor transition recovers only the old or committed generation.
 5. Two browsers racing writes get exactly one commit and one conflict. Two
    online hosts can copy a preset/skill through the browser; an offline
    destination creates no server-held queue. Cross-account and cross-host
-   attempts return no object or existence oracle.
+   attempts return no object or existence oracle. A second browser can enumerate
+   and reconcile a first browser's endpoint-durable `outcome_unknown` record;
+   closing the first tab or restarting the daemon cannot unlock an automatic
+   retry.
 6. Quota, concurrency, timeout, cancel, disconnect, and oversized declarations
    keep memory/disk within the stated bounds and leave no readable partial
    value. Previous revisions remain usable after aborted replacement.
 7. Export/import uses a wrong-passphrase failure oracle no richer than
-   authentication failure, preserves tombstones/conflicts, and requires
-   explicit lineage change before rollback or cross-host rebinding.
+   authentication failure, preserves current/referenced revisions,
+   tombstones/conflicts and same-host unresolved reconciliation, and requires
+   explicit lineage change before rollback or cross-host rebinding. A
+   database-only, key-only, or generation-split native restore fails closed.
 8. Routine and compromise rotations survive interruption and prove the stated
    distinction between rewrap and full reseal. Wipe makes the store
    unrecoverable without a retained native backup/export and does not claim an
    offline remote wipe succeeded.
 9. Migration counts match, endpoint read-back and daemon restart/launch/preset/
    skill/tool exercises pass, old clients are rejected, neutral agent names are
-   used, and the legacy fields remain empty after a binary rollback attempt.
+   used, no state performs dual-read/write, and the legacy fields remain empty
+   after an old-binary/config rollback attempt.
 10. An inventory guard fails CI if a protected server model/schema/route/frame,
     cwd-derived label, free-form server-visible error, or built-in operational
     preset value is reintroduced after cutover. P2-PURGE-01 separately verifies
     disks, observability, replicas, and the oldest retained backup.
+
+These gates are owned as follows: DATA-02 must produce gates 1–9 plus the CI
+inventory fixture before merge; HOST-03B must additionally inject lost
+acknowledgement/crash at every installer effect boundary and prove direct
+version/latest reconciliation before deleting the legacy tool route; PURGE-01
+must independently run gate 10 and verify scrub/purge evidence for every
+retained server metadata field and historical medium. Documentation or a green
+unit test that never observes the server boundary is not substitute evidence.
 
 ## Rejected alternatives
 
@@ -442,10 +613,19 @@ of assuming it.
 
 ## Dependency hand-off
 
+P2-HOST-02's reviewed host-scoped filesystem boundary is already merged and is
+an input to this design. The current P2-TERM-01 upload and P2-HOST-03A
+interactive-installer candidates are still independently review-pending; their
+browser retry/ambiguity behavior is not evidence that this ADR's durable
+reconciliation store exists. DATA-02 and HOST-03B must integrate the reviewed
+versions and satisfy the gates below without reviving the removed server paths.
+
 - **P2-DATA-02** implements this store, host-channel operations, endpoint-only
-  create/edit/restart flows, migration, neutral naming, and server schema cuts.
+  create/edit/restart flows, durable reconciliation journal, migration, neutral
+  naming, and server schema cuts.
 - **P2-HOST-03B** may remove legacy interactive/unattended tool routes only
-  after endpoint preset/tool values and policy are durable and tested here.
+  after endpoint preset/tool values, policy, and external-effect reconciliation
+  are durable and tested here.
 - **P2-PURGE-01** treats endpoint verification as the prerequisite for deleting
   server plaintext, then proves the old database/log/backup copies are gone.
 - **P3-IDENTITY-01** closes malicious signaling substitution for trusted or

@@ -708,6 +708,9 @@ private.put.begin    object_type, object_id, expected_revision,
 private.delete       object_type, object_id, expected_revision
 private.export       selected object IDs or whole-store selection
 private.import.begin archive length/hash and explicit preview/commit phase
+private.reconcile.list authenticated cursor, limit (max 256)
+private.reconcile.get  request_id
+private.reconcile.ack  request_id, expected_record_revision, resolution
 agent.launch         agent_id, committed manifest revision, geometry
 agent.restart        agent_id, committed manifest revision, geometry
 ```
@@ -733,6 +736,17 @@ the same random request ID return the original result; reuse with different
 authenticated bytes returns `request_id_reused`. Responses remain bound to the
 host/session/account/protocol/request/object tuple. There is no timestamp or
 server-order last-write-wins rule.
+
+The endpoint, not the browser or server, durably owns unresolved mutation
+records. A store-only mutation commits its head/result/journal atomically.
+Launch, installer, and other external effects cross a durable `effect_started`
+boundary; loss of the acknowledgement thereafter yields `outcome_unknown` and
+locks a duplicate mutation. `private.reconcile.*` lets any later authorized
+browser inspect the bounded endpoint inventory and resolve it using exact
+revision/worker/version state or explicit acknowledgement. Protected target,
+command, output, and error detail stays E2E. Closing a tab, reconnecting with a
+new WebRTC session, or expiring a settled idempotency entry cannot erase an
+unresolved endpoint record or authorize automatic retry.
 
 Human-readable conflicts, paths, commands, values, integrity failures, and
 recovery diagnostics exist only in these E2E responses. Server-visible paths

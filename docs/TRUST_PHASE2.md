@@ -259,6 +259,9 @@ P2-DATA-01 selects a **per-host endpoint-local canonical store**. The normative
 decision is `docs/DURABLE_SENSITIVE_DATA.md`: `spawnd` owns independently keyed
 AEAD object envelopes, exact-revision conflict semantics, local restart
 manifests, fail-closed compatibility, and passphrase-encrypted export/import.
+It also requires endpoint-durable `outcome_unknown` reconciliation for
+mutations whose acknowledgement or external effect is ambiguous; browser or
+server lifecycle state cannot authorize an automatic retry.
 The browser copies presets/skills only between online hosts over two host
 channels. Account recovery does not recover a lost endpoint, and no protected
 server sync queue exists. Opaque client-encrypted server blobs are deferred,

@@ -10,7 +10,7 @@ A security audit found that the server **saw protected content**: even for v2
 (DataChannel) clients the daemon mirrored PTY output to the server as plaintext
 (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
 transited the server. The reviewed P2-AGENT-02/P2-TERM-02 cut now removes that
-agent-terminal path. The current P2-HOST-02 review candidate also removes host
+agent-terminal path. The reviewed P2-HOST-02 cut also removes host
 paths/files/transfers from the server, while installer output, agent uploads,
 launch values, preset environment templates, and skill bodies still have
 server-readable paths or stores. Signaling is unsigned (server can MITM the
@@ -41,6 +41,8 @@ DataChannel). Goal of this work ("Tier 2"):
 | `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
 | `1f66d2d` | P2-AGENT-01, P2-TMUX-01, P2-HOST-01 | Integrated the independently reviewed per-agent control root, worker-only/tmux-removal cutover, and host-scoped control root plus their hardening series on `master`. |
 | `5722288` | P2-AGENT-02, P2-TERM-02 | Integrated the independently reviewed server-terminal relay removal, mandatory two-channel agent RTC gate, strict v2 signaling, and bounded lifecycle teardown series on `master`. |
+| `22c1f0c` | QUAL-FLAKE-01 | Integrated the independently reviewed task-ownership, bounded cleanup, and current-generation host-ping stability corrections. |
+| `4e7c89b` | P2-HOST-02 | Integrated the independently reviewed capability-rooted host filesystem migration, bounded browser-mediated transfer, cancellation/effect-boundary handling, and server path removal. |
 
 ### Increment 1 detail (the keystone)
 
@@ -106,77 +108,14 @@ local-daemon cleanup is bounded and tied to stable process identities, and the
 persistent-agent smoke waits on an owner-authorized, content-free
 current-generation `host.ping`/`host.pong` exchange.
 
-P2-HOST-02 now has an integrated implementation candidate on its isolated
-review branch: host home/list/stat/read/write/mkdir/rename/remove, browser
+P2-HOST-02 passed independent review and is integrated on `master` at
+`4e7c89b`. Host home/list/stat/read/write/mkdir/rename/remove, browser
 download/upload, and browser-mediated cross-host transfer use bounded,
-hash-and-length-checked DataChannel streams. Registration `home_dir`, filesystem
-REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
-are removed in that branch. This is **IMPLEMENTED, REVIEW PENDING**, not an
-integrated or `DONE` claim.
-
-The first P2-HOST-02 review rejected the candidate for path-resolution races,
-serial DataChannel read deadlock, check-then-rename clobbering, incomplete
-bilateral transfer aborts, unbounded directory aggregation, and inadequate
-two-host isolation coverage. The revised candidate uses a held capability root
-and no-follow directory handles, atomic no-replace rename, separate bounded
-ACK/cancel dispatch, explicit bounded directory pages/UI retention, bilateral
-abort cleanup, and real distinct-host paired-channel coverage.
-
-The next review found three cancel/lifecycle races: active-write cancel fell
-through to channel close, split fast/normal queues could reorder cancellation
-ahead of earlier frames on both endpoints, and per-write cleanup sleepers were
-untracked. Corrections return handled cancellation, stamp frames before queue
-routing, use bounded expiring cutoff tombstones on daemon and browser, and own
-one tracked session reaper that drains at close.
-
-The following review found that stamping alone was insufficient: the fast
-consumer still published the write-cancel cutoff too late, cancellation could
-wait on an active file-write lock and its disk cleanup, and the browser could
-accept a new read declaration that reused a cancelled stream ID. The current
-candidate synchronously assigns each arrival ordinal and publishes stream
-cancel cutoffs in one short per-session arbiter critical section before queue
-routing. Any later write chunk/end fails closed even while the fast consumer is
-backlogged. Active writes have cancellation tokens; fast cancel removes and
-tombstones the stream, signals its token, and enqueues bounded cleanup without
-waiting for file I/O. One tracked session maintenance task owns cleanup and
-idle reaping, and cancelled temporary files are dropped and unlinked without a
-pointless flush. Browser read declarations reject active and tombstoned IDs.
-Forced fast-delay cancel-then-chunk/end, stalled-write ACK/cancel survival,
-prompt cleanup, browser declaration replay, paired-channel backlog/reuse,
-rapid write-churn shutdown, and distinct-host isolation regressions cover these
-findings. Independent review is still required before merge.
-
-The latest review made the close/effect boundary explicit. A mutation that
-passes the session effect fence may finish after peer close, so lost
-acknowledgements for dispatched mkdir/rename/remove operations and writes after
-`stream.end` now surface as stable `outcome_unknown`, never as proof of
-rollback; the browser does not retry and must reconcile endpoint state first.
-Deterministic tests pause both before and after effect authorization, prove the
-single close deadline, cancel and drain every claimed DataChannel send before
-that deadline, make any late-polled callback take cancellation before
-`send_text`, suppress new sends after close, and verify write-temp cleanup.
-Host control also rejects
-unordered or partially reliable
-DataChannels, suppresses hello/connected publication when close wins the open
-race, and bounds the deliberately external close invoker with a tested hard
-deadline. A session-owned temporary registry now exists before upload-temp
-creation. Its per-temp claim lets close remove unpublished and pre-commit temps
-without waiting behind unrelated linearized mutations; already-linearized
-commits retain the conservative `outcome_unknown` rule. Cleanup syscalls run in
-accounted blocking closures and cannot extend the single close deadline, even
-when an unlink itself stalls.
-
-**Current integrated P2-HOST-02 candidate validation:** daemon format and
-strict all-target Clippy pass; all 169 daemon tests pass; server Ruff and all
-149 server tests pass; web lint, typecheck, all 54 unit tests, 68 Playwright
-tests with retries disabled (3 opt-in audits skipped), and the production build
-pass. `SPAWN_E2E_PORT=43957 scripts/test-all.sh` also passes the full repeatable
-matrix, including prebuilt install, HTTP, Redis, PostgreSQL owner recovery,
-login, daemon lifecycle, live-browser, and service-manager smokes. No
-P2-HOST-02 worker process remains afterward.
-
-The P2-HOST-02 candidate includes the reviewed worker-only and agent relay
-checkpoints and must retain both source guards through review.
+capability-rooted host DataChannels. Registration `home_dir`, filesystem REST
+routes, server broker waiters/result schemas, and daemon `host.fs.*` frames are
+removed. Its conservative `outcome_unknown` effect boundary and no-automatic-
+retry rule are inputs to P2-DATA-01; the durable cross-restart reconciliation
+journal remains DATA-02 work and is not claimed by HOST-02.
 
 **P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
@@ -231,8 +170,10 @@ covers the AEAD/key hierarchy, browser and endpoint trust, multi-device/host
 regressions, offline daemon restart, account recovery and encrypted
 export/import, CAS/replay/rollback semantics and limitations, migration,
 rotation/revocation/deletion, quotas, authenticated metadata, observability,
-compatibility failures, and hand-offs to P2-DATA-02/P2-HOST-03B/P2-PURGE-01.
-Ten falsifiable acceptance gates are defined.
+compatibility failures, endpoint-durable `outcome_unknown` reconciliation,
+exact retained server metadata, and hand-offs to
+P2-DATA-02/P2-HOST-03B/P2-PURGE-01. Ten falsifiable acceptance gates are
+defined.
 
 This checkpoint is documentation only. No endpoint store, protected-data
 DataChannel operation, migration, server-column clearing, deployment, or purge

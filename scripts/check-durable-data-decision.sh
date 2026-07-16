@@ -45,6 +45,33 @@ grep -Fq \
   'Status: **proposed for independent review; runtime not implemented**.' \
   "$adr"
 
+required_decisions=(
+  '### Exact retained server metadata'
+  '### Ambiguous-effect reconciliation'
+  'outcome_unknown'
+  'database=anchor+1'
+  'unresolved reconciliation records'
+  'There is no account-password or server-mediated key recovery.'
+  'no dual-read or dual-write'
+  'old binaries fail startup'
+  'HOST-03B must additionally inject lost'
+  'P2-PURGE-01 still inventories and destroys the historical server database'
+)
+
+for decision in "${required_decisions[@]}"; do
+  if ! grep -Fq "$decision" "$adr"; then
+    printf 'durable protected-data ADR lost required decision: %s\n' "$decision" >&2
+    exit 1
+  fi
+done
+
+for protected in cwd argv env 'install/default command' 'tool target' 'skill body'; do
+  if ! grep -Fq "$protected" "$adr"; then
+    printf 'durable protected-data ADR lost protected-value coverage: %s\n' "$protected" >&2
+    exit 1
+  fi
+done
+
 for doc in \
   docs/DESIGN.md \
   docs/INTERFACE_MATRIX.md \
@@ -58,6 +85,18 @@ for doc in \
     exit 1
   fi
 done
+
+if ! grep -Fq \
+  'P2-HOST-02 | DONE — REVIEWED, MERGED (`4e7c89b`)' \
+  docs/TRUST_PHASE2_TASKS.md; then
+  printf '%s\n' 'durable-data schedule regressed the reviewed HOST-02 dependency' >&2
+  exit 1
+fi
+
+if ! grep -Fq 'does not advertise a runtime capability today.' proto/README.md; then
+  printf '%s\n' 'protocol docs overclaim the unimplemented durable store' >&2
+  exit 1
+fi
 
 ambiguous_target="$({
   rg -n \
