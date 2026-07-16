@@ -32,7 +32,6 @@ also accepts `Bearer` for API testing).
 |--------|-----------------------|------------------------------------------|
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
-| GET    | `/api/hosts/{id}/dirs`| list host directories, optional `?path=` |
 | GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
 | POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
@@ -49,8 +48,7 @@ Host shape:
   "version": "0.1.0",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
-  "agent_count": 2,
-  "home_dir": "/home/me|null"
+  "agent_count": 2
 }
 ```
 
@@ -183,7 +181,6 @@ Agent IDs are big-endian 16-byte UUIDs.
  "os": "linux",
  "arch": "x86_64",
  "version": "0.1.0",
- "home_dir": "/home/me",
  "existing_agents": ["uuid", ...]}
 
 {"type": "host.heartbeat"}
@@ -247,31 +244,6 @@ Host `rtc.candidate` and `rtc.status` frames carry the identical tuple. Host
 status values are content-free codes; endpoint error detail is not placed on
 the signaling websocket.
 
-{"type": "host.fs.list_result",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "home_dir": "/home/me",
- "parent": "/home/me",
- "entries": [{"name": "foo",
-              "path": "/home/me/projects/foo",
-              "is_dir": true,
-              "size": null,
-              "modified_at": 1750000000}],
- "error": null}
-
-{"type": "host.fs.read_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "a.txt",
- "size": 2,
- "bytes_b64": "aGk=",
- "error": null}
-
-{"type": "host.fs.op_result",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "error": null}
-
 {"type": "host.tools.check_result",
  "request_id": "uuid",
  "tools": [{
@@ -313,36 +285,6 @@ the signaling websocket.
 {"type": "registered", "host_id": "uuid"}
 
 {"type": "host.heartbeat"}
-
-{"type": "host.fs.list",
- "request_id": "uuid",
- "path": "/home/me/projects",
- "include_files": false}
-
-{"type": "host.fs.read",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt"}
-
-{"type": "host.fs.write",
- "request_id": "uuid",
- "dir": "/home/me/projects",
- "name": "a.txt",
- "bytes_b64": "aGk=",
- "overwrite": false}
-
-{"type": "host.fs.mkdir",
- "request_id": "uuid",
- "path": "/home/me/projects/new-dir"}
-
-{"type": "host.fs.rename",
- "request_id": "uuid",
- "path": "/home/me/projects/a.txt",
- "name": "b.txt"}
-
-{"type": "host.fs.remove",
- "request_id": "uuid",
- "path": "/home/me/projects/old",
- "recursive": false}
 
 {"type": "host.tools.check",
  "request_id": "uuid",
@@ -538,7 +480,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping"]}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -548,9 +490,44 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Filesystem/tool/launch operations and their bounded
-chunk streams are added by later trust Phase 2 tasks; the transport root
-currently advertises only `ping`.
+outstanding request ID. Request IDs may not be reused within a host session;
+the daemon closes rather than evicting its bounded replay set.
+
+Host filesystem paths and detailed errors exist only in this DataChannel.
+`fs.home`, `fs.stat`, `fs.mkdir`, `fs.rename`, and `fs.remove` use ordinary
+request/response envelopes. `fs.list` accepts `{path?, cursor?}` and returns at
+most 96 sorted entries plus `next_cursor`; the browser follows pages. Entries
+contain `name`, `path`, `kind`, `is_dir`, optional `size`, and optional
+`modified_at`. The daemon confines all operations to its canonical home root,
+rejects `..`, paths outside that root, and every symlink component, and refuses
+to rename/remove the root. `overwrite` defaults false.
+
+Reads start with:
+
+```json
+{"version":1,"type":"request","request_id":"r","operation":"fs.read","payload":{"path":"~/a.txt"}}
+{"version":1,"type":"response","request_id":"r","ok":true,"result":{"stream_id":"s","path":"/home/me/a.txt","name":"a.txt","length":2,"sha256":"...64 hex..."}}
+{"version":1,"type":"stream.chunk","stream_id":"s","sequence":0,"bytes_b64":"aGk="}
+{"version":1,"type":"stream.ack","stream_id":"s","sequence":1}
+{"version":1,"type":"stream.end","stream_id":"s","length":2,"sha256":"...64 hex..."}
+```
+
+The daemon permits at most eight unacknowledged 8 KiB chunks. It hashes before
+and during the read; a mutation produces `stream.error` rather than a valid end.
+Writes start with `fs.write.begin` payload
+`{dir,name,length,sha256,overwrite?}`, then the browser sends the same chunk and
+end shapes. The daemon rejects wrong sequence/length/hash, writes a unique temp
+file, flushes and fsyncs it, atomically renames it, and fsyncs the parent before
+`stream.committed`. Timeout, cancellation, peer loss, or integrity failure
+removes the temp file. Files are capped at 512 MiB.
+
+For cross-host transfer, the browser opens two independently authorized host
+sessions and pumps the source read stream into the destination write stream;
+it neither buffers the whole file nor sends any path, metadata, error, or byte
+through the signaling server. Failure aborts both streams. The former REST
+`/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
+Browser downloads stream to a native file destination when supported; the
+object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 
 ## Versioning
 

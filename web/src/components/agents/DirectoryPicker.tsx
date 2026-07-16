@@ -6,7 +6,8 @@ import { useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { type Host, hosts } from "@/lib/api";
+import { useHostControl } from "@/hooks/useHostControl";
+import type { Host } from "@/lib/api";
 import {
   normalizeCwdForHost,
   parentDir,
@@ -25,20 +26,26 @@ export function DirectoryPicker({
   onChange: (value: string) => void;
   disabled?: boolean;
 }) {
-  const homeDir = host?.home_dir?.trim() || "/";
+  const { client, state } = useHostControl(host?.id ?? null, host?.status === "online");
+  const homeQ = useQuery({
+    queryKey: ["host-home", host?.id],
+    queryFn: () => client!.home(),
+    enabled: state === "ready" && client !== null,
+  });
+  const homeDir = homeQ.data?.home_dir.trim() || "~";
   const resolved = normalizeCwdForHost(value, homeDir);
   const suggestion = splitForDirectorySuggestions(value, homeDir);
   const dirsQ = useQuery({
     queryKey: ["host-dirs", host?.id, suggestion.base],
-    queryFn: () => hosts.dirs(host!.id, suggestion.base),
-    enabled: Boolean(host?.id && host.status === "online"),
+    queryFn: () => client!.list(suggestion.base),
+    enabled: state === "ready" && client !== null,
     staleTime: 5_000,
   });
   const listId = `agent-cwd-options-${host?.id ?? "none"}`;
   const entries = useMemo(() => {
     const prefix = suggestion.prefix.toLowerCase();
-    return (dirsQ.data?.entries ?? []).filter((entry) =>
-      entry.name.toLowerCase().startsWith(prefix),
+    return (dirsQ.data?.entries ?? []).filter(
+      (entry) => entry.is_dir && entry.name.toLowerCase().startsWith(prefix),
     );
   }, [dirsQ.data?.entries, suggestion.prefix]);
   const parent = dirsQ.data?.parent ?? parentDir(resolved);
@@ -114,7 +121,6 @@ export function DirectoryPicker({
           <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground">
             <span className="min-w-0 truncate font-mono">{suggestion.base}</span>
             {dirsQ.isError && <span className="shrink-0 text-destructive">Could not load</span>}
-            {dirsQ.data?.error && <span className="shrink-0">New path</span>}
           </div>
           <div className="max-h-44 overflow-auto p-1">
             {parent && parent !== suggestion.base && (
@@ -142,7 +148,7 @@ export function DirectoryPicker({
             ))}
             {!dirsQ.isFetching && entries.length === 0 && (
               <div className="px-2 py-2 text-sm text-muted-foreground">
-                {dirsQ.data?.error ? "No existing directory at this path." : "No matching folders."}
+                {dirsQ.isError ? "No existing directory at this path." : "No matching folders."}
               </div>
             )}
           </div>

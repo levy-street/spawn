@@ -21,8 +21,6 @@ OWNER_RESULT_KINDS = frozenset(
     {
         "agent.snapshot",
         "agent.uploaded",
-        "host.fs.list_result",
-        "host.fs.result",
         "host.tools.check_result",
         "host.tools.install_result",
     }

@@ -9,10 +9,12 @@ use uuid::Uuid;
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 /// Cap for explorer fs.read / fs.write payloads (raw bytes, pre-base64).
+#[cfg(test)]
 pub const MAX_FS_BYTES: usize = 32 * 1024 * 1024;
 
 /// Save raw bytes into `dir` under a sanitized `name`. When `overwrite` is
 /// false a free `name-N.ext` variant is chosen instead of clobbering.
+#[cfg(test)]
 pub async fn save_file_in_dir(
     dir: &Path,
     name: &str,

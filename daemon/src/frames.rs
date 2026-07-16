@@ -101,13 +101,12 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             version: "0.1.0".into(),
-            home_dir: Some("/home/me".into()),
             existing_agents: vec![],
         };
         let s = serde_json::to_string(&frame).unwrap();
         assert!(s.contains("\"type\":\"register\""));
         assert!(s.contains("\"host_name\":\"host\""));
-        assert!(s.contains("\"home_dir\":\"/home/me\""));
+        assert!(!s.contains("home_dir"));
     }
 
     #[test]
@@ -257,125 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn host_fs_frames_parse_and_serialize() {
-        use crate::proto::{HostDirEntry, Inbound, Outbound};
+    fn retired_server_host_fs_frames_are_rejected() {
+        use crate::proto::Inbound;
 
-        let list: Inbound =
-            serde_json::from_str(r#"{"type":"host.fs.list","request_id":"req-1","path":"~/src"}"#)
-                .unwrap();
-        match list {
-            Inbound::HostFsList {
-                request_id,
-                path,
-                include_files,
-            } => {
-                assert_eq!(request_id, "req-1");
-                assert_eq!(path.as_deref(), Some("~/src"));
-                assert!(!include_files);
-            }
-            _ => panic!("expected HostFsList"),
+        for frame in [
+            r#"{"type":"host.fs.list","request_id":"r1","path":"secret"}"#,
+            r#"{"type":"host.fs.read","request_id":"r2","path":"secret"}"#,
+            r#"{"type":"host.fs.write","request_id":"r3","bytes_b64":"c2VjcmV0"}"#,
+        ] {
+            assert!(serde_json::from_str::<Inbound>(frame).is_err());
         }
-
-        let result = Outbound::HostFsListResult {
-            request_id: "req-1".into(),
-            path: "/home/me".into(),
-            home_dir: Some("/home/me".into()),
-            parent: Some("/home".into()),
-            entries: vec![HostDirEntry {
-                name: "src".into(),
-                path: "/home/me/src".into(),
-                is_dir: Some(true),
-                size: None,
-                modified_at: Some(1_750_000_000),
-            }],
-            error: None,
-        };
-        let s = serde_json::to_string(&result).unwrap();
-        assert!(s.contains("\"type\":\"host.fs.list_result\""));
-        assert!(s.contains("\"request_id\":\"req-1\""));
-        assert!(s.contains("\"path\":\"/home/me/src\""));
-        assert!(s.contains("\"is_dir\":true"));
-    }
-
-    #[test]
-    fn host_fs_explorer_frames_parse_and_serialize() {
-        use crate::proto::{Inbound, Outbound};
-
-        let list: Inbound = serde_json::from_str(
-            r#"{"type":"host.fs.list","request_id":"r1","path":"~","include_files":true}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            list,
-            Inbound::HostFsList {
-                include_files: true,
-                ..
-            }
-        ));
-
-        let read: Inbound =
-            serde_json::from_str(r#"{"type":"host.fs.read","request_id":"r2","path":"~/a.txt"}"#)
-                .unwrap();
-        assert!(matches!(read, Inbound::HostFsRead { .. }));
-
-        let write: Inbound = serde_json::from_str(
-            r#"{"type":"host.fs.write","request_id":"r3","dir":"~/src","name":"a.txt","bytes_b64":"aGk="}"#,
-        )
-        .unwrap();
-        match write {
-            Inbound::HostFsWrite {
-                overwrite, name, ..
-            } => {
-                assert!(!overwrite);
-                assert_eq!(name, "a.txt");
-            }
-            _ => panic!("expected HostFsWrite"),
-        }
-
-        let mkdir: Inbound =
-            serde_json::from_str(r#"{"type":"host.fs.mkdir","request_id":"r4","path":"~/new"}"#)
-                .unwrap();
-        assert!(matches!(mkdir, Inbound::HostFsMkdir { .. }));
-
-        let rename: Inbound = serde_json::from_str(
-            r#"{"type":"host.fs.rename","request_id":"r6","path":"~/old.txt","name":"new.txt"}"#,
-        )
-        .unwrap();
-        match rename {
-            Inbound::HostFsRename { name, .. } => assert_eq!(name, "new.txt"),
-            _ => panic!("expected HostFsRename"),
-        }
-
-        let remove: Inbound = serde_json::from_str(
-            r#"{"type":"host.fs.remove","request_id":"r5","path":"~/old","recursive":true}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            remove,
-            Inbound::HostFsRemove {
-                recursive: true,
-                ..
-            }
-        ));
-
-        let read_result = Outbound::HostFsReadResult {
-            request_id: "r2".into(),
-            path: "/home/me/a.txt".into(),
-            name: Some("a.txt".into()),
-            size: Some(2),
-            bytes_b64: Some("aGk=".into()),
-            error: None,
-        };
-        let s = serde_json::to_string(&read_result).unwrap();
-        assert!(s.contains("\"type\":\"host.fs.read_result\""));
-
-        let op_result = Outbound::HostFsOpResult {
-            request_id: "r3".into(),
-            path: Some("/home/me/src/a.txt".into()),
-            error: None,
-        };
-        let s = serde_json::to_string(&op_result).unwrap();
-        assert!(s.contains("\"type\":\"host.fs.op_result\""));
     }
 
     #[test]

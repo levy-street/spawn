@@ -5,15 +5,18 @@
 //! bypass the server relay path while the daemon still mirrors output to the
 //! server websocket for transcripts and fallback viewers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -30,6 +33,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::agents::AgentRegistry;
+use crate::host_files::{HostFileService, PendingWrite, STREAM_CHUNK_BYTES};
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::WsOutbound;
 use crate::tmux;
@@ -40,6 +44,11 @@ const RTC_PROTOCOL_VERSION: u16 = 1;
 const HOST_CONTROL_MAX_FRAME_BYTES: usize = 16 * 1024;
 const HOST_CONTROL_MAX_REQUEST_ID_BYTES: usize = 128;
 const HOST_CONTROL_MAX_IN_FLIGHT: usize = 32;
+const HOST_CONTROL_MAX_SEEN_REQUESTS: usize = 4096;
+const HOST_STREAM_WINDOW_CHUNKS: u64 = 8;
+const HOST_STREAM_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const HOST_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HOST_MAX_WRITE_STREAMS: usize = 8;
 const MAX_RTC_PEERS: usize = 128;
 const MAX_HOST_RTC_PEERS: usize = 64;
 
@@ -360,6 +369,7 @@ impl RtcSessions {
             registry,
             out_tx.clone(),
             Arc::new(AtomicBool::new(false)),
+            None,
         );
         self.install_reaper(&pc, offer.session_id.clone(), offer.binding.id());
 
@@ -579,6 +589,7 @@ fn install_data_channel_handler(
     registry: AgentRegistry,
     out_tx: mpsc::Sender<WsOutbound>,
     host_channel_accepted: Arc<AtomicBool>,
+    host_files: Option<Arc<HostFileService>>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let session_id = session_id.clone();
@@ -586,6 +597,7 @@ fn install_data_channel_handler(
         let registry = registry.clone();
         let out_tx = out_tx.clone();
         let host_channel_accepted = Arc::clone(&host_channel_accepted);
+        let host_files = host_files.clone();
         Box::pin(async move {
             if dc.label() != binding.data_channel_label() {
                 tracing::warn!(scope_id = %binding.id(), label = %dc.label(), "rejecting data channel for wrong rtc scope");
@@ -599,7 +611,7 @@ fn install_data_channel_handler(
                     let _ = dc.close().await;
                     return;
                 }
-                install_host_control_channel(dc, session_id, binding, out_tx);
+                install_host_control_channel(dc, session_id, binding, out_tx, host_files);
                 return;
             }
             let binding_nonce = binding.binding_nonce.clone();
@@ -710,11 +722,615 @@ fn install_data_channel_handler(
     }));
 }
 
+#[cfg(test)]
 enum HostControlAction {
     Reply(String),
     Close,
 }
 
+#[derive(Default)]
+struct HostControlState {
+    writes: HashMap<String, PendingWrite>,
+    reads: HashMap<String, Arc<ReadFlow>>,
+    read_requests: HashMap<String, Arc<AtomicBool>>,
+    seen_request_ids: HashSet<String>,
+}
+
+#[derive(Default)]
+struct ReadFlow {
+    acknowledged: std::sync::atomic::AtomicU64,
+    sent: std::sync::atomic::AtomicU64,
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Clone)]
+struct HostControlContext {
+    dc: Arc<RTCDataChannel>,
+    files: Arc<HostFileService>,
+    state: Arc<Mutex<HostControlState>>,
+}
+
+impl HostControlContext {
+    async fn send_value(&self, value: Value) -> bool {
+        let encoded = value.to_string();
+        if encoded.len() > HOST_CONTROL_MAX_FRAME_BYTES {
+            return false;
+        }
+        self.dc.send_text(encoded).await.is_ok()
+    }
+
+    async fn response(&self, request_id: &str, result: Value) -> bool {
+        self.send_value(json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "response",
+            "request_id": request_id,
+            "ok": true,
+            "result": result,
+        }))
+        .await
+    }
+
+    async fn error(&self, request_id: &str, code: &str, detail: &str) -> bool {
+        self.send_value(json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "response",
+            "request_id": request_id,
+            "ok": false,
+            "error": {"code": code, "detail": detail},
+        }))
+        .await
+    }
+
+    async fn stream_error(&self, stream_id: &str, code: &str, detail: &str) -> bool {
+        self.send_value(json!({
+            "version": RTC_PROTOCOL_VERSION,
+            "type": "stream.error",
+            "stream_id": stream_id,
+            "error": {"code": code, "detail": detail},
+        }))
+        .await
+    }
+
+    async fn mark_request(&self, request_id: &str) -> bool {
+        let mut state = self.state.lock().await;
+        if state.seen_request_ids.contains(request_id) {
+            return false;
+        }
+        if state.seen_request_ids.len() >= HOST_CONTROL_MAX_SEEN_REQUESTS {
+            // Bound replay state for long-lived browser tabs. Closing forces a
+            // fresh, independently bound RTC session instead of forgetting
+            // old request identities and accepting a replay on this one.
+            return false;
+        }
+        state.seen_request_ids.insert(request_id.to_string())
+    }
+
+    async fn handle(&self, value: Value) -> bool {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        if object.get("version").and_then(Value::as_u64) != Some(u64::from(RTC_PROTOCOL_VERSION)) {
+            return false;
+        }
+        match object.get("type").and_then(Value::as_str) {
+            Some("request") => self.handle_request(object).await,
+            Some("stream.chunk") => self.handle_stream_chunk(object).await,
+            Some("stream.end") => self.handle_stream_end(object).await,
+            Some("stream.ack") => self.handle_stream_ack(object).await,
+            Some("stream.cancel") => self.handle_stream_cancel(object).await,
+            Some("cancel") => self.handle_request_cancel(object).await,
+            _ => false,
+        }
+    }
+
+    async fn handle_request(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let Some(request_id) = valid_control_id(object.get("request_id")) else {
+            return false;
+        };
+        if !self.mark_request(request_id).await {
+            return false;
+        }
+        let Some(operation) = object.get("operation").and_then(Value::as_str) else {
+            return false;
+        };
+        let payload = object.get("payload").and_then(Value::as_object);
+        match operation {
+            "ping" => self.response(request_id, json!({"pong": true})).await,
+            "fs.home" => {
+                self.response(request_id, json!({"home_dir": self.files.home_dir()}))
+                    .await
+            }
+            "fs.list" => {
+                let path = payload_string(payload, "path").unwrap_or("~");
+                let cursor = payload_u64(payload, "cursor").unwrap_or(0);
+                let Ok(cursor) = usize::try_from(cursor) else {
+                    return self
+                        .error(request_id, "invalid_cursor", "cursor is too large")
+                        .await;
+                };
+                match self.files.list(path, cursor).await {
+                    Ok(mut page) => loop {
+                        let Ok(result) = serde_json::to_value(&page) else {
+                            return false;
+                        };
+                        let envelope = json!({
+                            "version": RTC_PROTOCOL_VERSION,
+                            "type": "response",
+                            "request_id": request_id,
+                            "ok": true,
+                            "result": result,
+                        });
+                        if envelope.to_string().len() <= HOST_CONTROL_MAX_FRAME_BYTES {
+                            break self.send_value(envelope).await;
+                        }
+                        if page.entries.len() <= 1 {
+                            break self
+                                .error(
+                                    request_id,
+                                    "entry_too_large",
+                                    "directory entry exceeds the control frame limit",
+                                )
+                                .await;
+                        }
+                        page.entries.pop();
+                        page.next_cursor = Some(cursor.saturating_add(page.entries.len()));
+                    },
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            "fs.stat" => {
+                let Some(path) = payload_string(payload, "path") else {
+                    return self
+                        .error(request_id, "invalid_request", "path is required")
+                        .await;
+                };
+                match self.files.stat(path).await {
+                    Ok(stat) => match serde_json::to_value(stat) {
+                        Ok(result) => self.response(request_id, result).await,
+                        Err(_) => false,
+                    },
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            "fs.mkdir" => {
+                let Some(path) = payload_string(payload, "path") else {
+                    return self
+                        .error(request_id, "invalid_request", "path is required")
+                        .await;
+                };
+                match self.files.mkdir(path).await {
+                    Ok(path) => self.response(request_id, json!({"path": path})).await,
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            "fs.rename" => {
+                let (Some(path), Some(name)) = (
+                    payload_string(payload, "path"),
+                    payload_string(payload, "name"),
+                ) else {
+                    return self
+                        .error(request_id, "invalid_request", "path and name are required")
+                        .await;
+                };
+                let overwrite = payload_bool(payload, "overwrite").unwrap_or(false);
+                match self.files.rename(path, name, overwrite).await {
+                    Ok(path) => self.response(request_id, json!({"path": path})).await,
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            "fs.remove" => {
+                let Some(path) = payload_string(payload, "path") else {
+                    return self
+                        .error(request_id, "invalid_request", "path is required")
+                        .await;
+                };
+                let recursive = payload_bool(payload, "recursive").unwrap_or(false);
+                match self.files.remove(path, recursive).await {
+                    Ok(path) => self.response(request_id, json!({"path": path})).await,
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            "fs.read" => {
+                let Some(path) = payload_string(payload, "path") else {
+                    return self
+                        .error(request_id, "invalid_request", "path is required")
+                        .await;
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                self.state
+                    .lock()
+                    .await
+                    .read_requests
+                    .insert(request_id.to_string(), Arc::clone(&cancelled));
+                let sent = self.send_read(request_id, path, &cancelled).await;
+                self.state.lock().await.read_requests.remove(request_id);
+                sent
+            }
+            "fs.write.begin" => {
+                let (Some(dir), Some(name), Some(length), Some(sha256)) = (
+                    payload_string(payload, "dir"),
+                    payload_string(payload, "name"),
+                    payload_u64(payload, "length"),
+                    payload_string(payload, "sha256"),
+                ) else {
+                    return self
+                        .error(
+                            request_id,
+                            "invalid_request",
+                            "write declaration is incomplete",
+                        )
+                        .await;
+                };
+                let overwrite = payload_bool(payload, "overwrite").unwrap_or(false);
+                if self.state.lock().await.writes.len() >= HOST_MAX_WRITE_STREAMS {
+                    return self
+                        .error(
+                            request_id,
+                            "too_many_streams",
+                            "too many pending write streams",
+                        )
+                        .await;
+                }
+                match self
+                    .files
+                    .begin_write(request_id.to_string(), dir, name, length, sha256, overwrite)
+                    .await
+                {
+                    Ok(write) => {
+                        let stream_id = write.stream_id.clone();
+                        let mut state = self.state.lock().await;
+                        if state.writes.len() >= HOST_MAX_WRITE_STREAMS {
+                            drop(state);
+                            write.abort().await;
+                            return self
+                                .error(
+                                    request_id,
+                                    "too_many_streams",
+                                    "too many pending write streams",
+                                )
+                                .await;
+                        }
+                        state.writes.insert(stream_id.clone(), write);
+                        drop(state);
+                        let cleanup = self.clone();
+                        let cleanup_stream_id = stream_id.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(HOST_WRITE_IDLE_TIMEOUT).await;
+                                let (exists, stale_write) = {
+                                    let mut state = cleanup.state.lock().await;
+                                    let exists = state.writes.contains_key(&cleanup_stream_id);
+                                    let stale =
+                                        state.writes.get(&cleanup_stream_id).is_some_and(|write| {
+                                            write.idle_for() >= HOST_WRITE_IDLE_TIMEOUT
+                                        });
+                                    let write = stale
+                                        .then(|| state.writes.remove(&cleanup_stream_id))
+                                        .flatten();
+                                    (exists, write)
+                                };
+                                if let Some(write) = stale_write {
+                                    write.abort().await;
+                                    break;
+                                }
+                                if !exists {
+                                    break;
+                                }
+                            }
+                        });
+                        self.response(request_id, json!({"stream_id": stream_id}))
+                            .await
+                    }
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
+            _ => {
+                self.error(
+                    request_id,
+                    "unsupported_operation",
+                    "operation is not supported",
+                )
+                .await
+            }
+        }
+    }
+
+    async fn send_read(&self, request_id: &str, path: &str, cancelled: &AtomicBool) -> bool {
+        let mut stream = match self.files.open_read_cancellable(path, cancelled).await {
+            Ok(stream) => stream,
+            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+        };
+        let stream_id = Uuid::new_v4().to_string();
+        let flow = Arc::new(ReadFlow::default());
+        self.state
+            .lock()
+            .await
+            .reads
+            .insert(stream_id.clone(), Arc::clone(&flow));
+        let stat = &stream.stat;
+        if !self
+            .response(
+                request_id,
+                json!({
+                    "stream_id": stream_id,
+                    "path": stat.path,
+                    "name": stat.name,
+                    "length": stat.size,
+                    "sha256": stream.sha256,
+                }),
+            )
+            .await
+        {
+            self.state.lock().await.reads.remove(&stream_id);
+            return false;
+        }
+        let mut sequence = 0_u64;
+        let mut length = 0_u64;
+        let mut actual = Sha256::new();
+        let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+        loop {
+            if flow.cancelled.load(Ordering::Acquire) {
+                self.state.lock().await.reads.remove(&stream_id);
+                return true;
+            }
+            let read = match stream.file.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) => {
+                    self.state.lock().await.reads.remove(&stream_id);
+                    return self
+                        .stream_error(&stream_id, "io_error", &error.to_string())
+                        .await;
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            length = length.saturating_add(read as u64);
+            actual.update(&buffer[..read]);
+            if !self
+                .send_value(json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": stream_id,
+                    "sequence": sequence,
+                    "bytes_b64": STANDARD.encode(&buffer[..read]),
+                }))
+                .await
+            {
+                return false;
+            }
+            sequence = sequence.saturating_add(1);
+            flow.sent.store(sequence, Ordering::Release);
+            if sequence.saturating_sub(flow.acknowledged.load(Ordering::Acquire))
+                >= HOST_STREAM_WINDOW_CHUNKS
+            {
+                let wait = async {
+                    loop {
+                        if flow.cancelled.load(Ordering::Acquire)
+                            || sequence.saturating_sub(flow.acknowledged.load(Ordering::Acquire))
+                                < HOST_STREAM_WINDOW_CHUNKS
+                        {
+                            break;
+                        }
+                        flow.notify.notified().await;
+                    }
+                };
+                if tokio::time::timeout(HOST_STREAM_ACK_TIMEOUT, wait)
+                    .await
+                    .is_err()
+                    || flow.cancelled.load(Ordering::Acquire)
+                {
+                    self.state.lock().await.reads.remove(&stream_id);
+                    return self
+                        .stream_error(
+                            &stream_id,
+                            "stream_timeout",
+                            "stream acknowledgement timed out",
+                        )
+                        .await;
+                }
+            }
+        }
+        let digest = format!("{:x}", actual.finalize());
+        if length != stream.stat.size || digest != stream.sha256 {
+            self.state.lock().await.reads.remove(&stream_id);
+            return self
+                .stream_error(&stream_id, "file_changed", "file changed during transfer")
+                .await;
+        }
+        let sent = self
+            .send_value(json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.end",
+                "stream_id": stream_id,
+                "length": length,
+                "sha256": digest,
+            }))
+            .await;
+        self.state.lock().await.reads.remove(&stream_id);
+        sent
+    }
+
+    async fn handle_stream_chunk(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let (Some(stream_id), Some(sequence), Some(encoded)) = (
+            valid_control_id(object.get("stream_id")),
+            object.get("sequence").and_then(Value::as_u64),
+            object.get("bytes_b64").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        let bytes = match STANDARD.decode(encoded) {
+            Ok(bytes) if bytes.len() <= STREAM_CHUNK_BYTES => bytes,
+            _ => return false,
+        };
+        let mut state = self.state.lock().await;
+        let Some(write) = state.writes.get_mut(stream_id) else {
+            return false;
+        };
+        if let Err(error) = write.append(sequence, &bytes).await {
+            let write = state.writes.remove(stream_id).expect("write exists");
+            drop(state);
+            write.abort().await;
+            return self
+                .stream_error(stream_id, error.code, &error.detail)
+                .await;
+        }
+        true
+    }
+
+    async fn handle_stream_end(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let Some(stream_id) = valid_control_id(object.get("stream_id")) else {
+            return false;
+        };
+        let write = self.state.lock().await.writes.remove(stream_id);
+        let Some(write) = write else {
+            return false;
+        };
+        if object.get("length").and_then(Value::as_u64) != Some(write.expected_length)
+            || object.get("sha256").and_then(Value::as_str) != Some(write.expected_sha256.as_str())
+        {
+            write.abort().await;
+            return self
+                .stream_error(
+                    stream_id,
+                    "declaration_mismatch",
+                    "stream end does not match its write declaration",
+                )
+                .await;
+        }
+        let request_id = write.request_id.clone();
+        match write.finish().await {
+            Ok(path) => {
+                self.send_value(json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.committed",
+                    "stream_id": stream_id,
+                    "request_id": request_id,
+                    "path": path,
+                }))
+                .await
+            }
+            Err(error) => {
+                self.stream_error(stream_id, error.code, &error.detail)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_stream_ack(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let (Some(stream_id), Some(sequence)) = (
+            valid_control_id(object.get("stream_id")),
+            object.get("sequence").and_then(Value::as_u64),
+        ) else {
+            return false;
+        };
+        let flow = self.state.lock().await.reads.get(stream_id).cloned();
+        let Some(flow) = flow else {
+            return false;
+        };
+        let current = flow.acknowledged.load(Ordering::Acquire);
+        if sequence < current || sequence > flow.sent.load(Ordering::Acquire) {
+            return false;
+        }
+        flow.acknowledged.store(sequence, Ordering::Release);
+        flow.notify.notify_waiters();
+        true
+    }
+
+    async fn handle_stream_cancel(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let Some(stream_id) = valid_control_id(object.get("stream_id")) else {
+            return false;
+        };
+        if let Some(write) = self.state.lock().await.writes.remove(stream_id) {
+            write.abort().await;
+        }
+        if let Some(read) = self.state.lock().await.reads.remove(stream_id) {
+            read.cancelled.store(true, Ordering::Release);
+            read.notify.notify_waiters();
+        }
+        true
+    }
+
+    async fn handle_request_cancel(&self, object: &serde_json::Map<String, Value>) -> bool {
+        let Some(request_id) = valid_control_id(object.get("request_id")) else {
+            return false;
+        };
+        if let Some(read) = self
+            .state
+            .lock()
+            .await
+            .read_requests
+            .get(request_id)
+            .cloned()
+        {
+            read.store(true, Ordering::Release);
+        }
+        let stream_id = {
+            let state = self.state.lock().await;
+            state.writes.iter().find_map(|(stream_id, write)| {
+                (write.request_id == request_id).then(|| stream_id.clone())
+            })
+        };
+        if let Some(stream_id) = stream_id {
+            if let Some(write) = self.state.lock().await.writes.remove(&stream_id) {
+                write.abort().await;
+            }
+        }
+        true
+    }
+
+    async fn abort_all(&self) {
+        let writes = {
+            let mut state = self.state.lock().await;
+            for read in state.reads.drain().map(|(_, read)| read) {
+                read.cancelled.store(true, Ordering::Release);
+                read.notify.notify_waiters();
+            }
+            for request in state.read_requests.drain().map(|(_, request)| request) {
+                request.store(true, Ordering::Release);
+            }
+            state
+                .writes
+                .drain()
+                .map(|(_, write)| write)
+                .collect::<Vec<_>>()
+        };
+        for write in writes {
+            write.abort().await;
+        }
+    }
+}
+
+fn valid_control_id(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|id| {
+        !id.is_empty()
+            && id.len() <= HOST_CONTROL_MAX_REQUEST_ID_BYTES
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn payload_string<'a>(
+    payload: Option<&'a serde_json::Map<String, Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    payload?
+        .get(key)?
+        .as_str()
+        .filter(|value| value.len() <= 4096)
+}
+
+fn payload_u64(payload: Option<&serde_json::Map<String, Value>>, key: &str) -> Option<u64> {
+    payload?.get(key)?.as_u64()
+}
+
+fn payload_bool(payload: Option<&serde_json::Map<String, Value>>, key: &str) -> Option<bool> {
+    payload?.get(key)?.as_bool()
+}
+
+#[cfg(test)]
 fn host_control_response(data: &[u8], is_string: bool) -> HostControlAction {
     if !is_string || data.is_empty() || data.len() > HOST_CONTROL_MAX_FRAME_BYTES {
         return HostControlAction::Close;
@@ -768,47 +1384,96 @@ fn install_host_control_channel(
     session_id: String,
     binding: RtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
+    files_override: Option<Arc<HostFileService>>,
 ) {
     let message_dc = Arc::clone(&dc);
     let in_flight = Arc::new(Semaphore::new(HOST_CONTROL_MAX_IN_FLIGHT));
+    let context_slot = Arc::new(Mutex::new(None::<HostControlContext>));
+    let message_context = Arc::clone(&context_slot);
     dc.on_message(Box::new(move |message: DataChannelMessage| {
         let dc = Arc::clone(&message_dc);
         let in_flight = Arc::clone(&in_flight);
+        let context_slot = Arc::clone(&message_context);
         Box::pin(async move {
             let Ok(_permit) = in_flight.try_acquire_owned() else {
                 let _ = dc.close().await;
                 return;
             };
-            match host_control_response(&message.data, message.is_string) {
-                HostControlAction::Reply(response) => {
-                    if dc.send_text(response).await.is_err() {
-                        let _ = dc.close().await;
-                    }
-                }
-                HostControlAction::Close => {
-                    let _ = dc.close().await;
-                }
+            if !message.is_string
+                || message.data.is_empty()
+                || message.data.len() > HOST_CONTROL_MAX_FRAME_BYTES
+            {
+                let _ = dc.close().await;
+                return;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&message.data) else {
+                let _ = dc.close().await;
+                return;
+            };
+            let Some(context) = context_slot.lock().await.clone() else {
+                let _ = dc.close().await;
+                return;
+            };
+            if !context.handle(value).await {
+                let _ = dc.close().await;
             }
         })
     }));
 
     let open_dc = Arc::clone(&dc);
+    let open_context = Arc::clone(&context_slot);
+    let open_files = files_override;
     dc.on_open(Box::new(move || {
         let dc = Arc::clone(&open_dc);
+        let context_slot = Arc::clone(&open_context);
         let out_tx = out_tx.clone();
         let session_id = session_id.clone();
         let binding = binding.clone();
+        let files = open_files.clone();
         Box::pin(async move {
+            let files = match files {
+                Some(files) => files,
+                None => match HostFileService::discover().await {
+                    Ok(files) => Arc::new(files),
+                    Err(_) => {
+                        let _ = dc.close().await;
+                        return;
+                    }
+                },
+            };
+            *context_slot.lock().await = Some(HostControlContext {
+                dc: Arc::clone(&dc),
+                files,
+                state: Arc::new(Mutex::new(HostControlState::default())),
+            });
             let hello = json!({
                 "version": RTC_PROTOCOL_VERSION,
                 "type": "hello",
                 "protocol": HOST_CONTROL_LABEL,
-                "capabilities": ["ping"]
+                "capabilities": [
+                    "ping", "fs.home", "fs.list", "fs.stat", "fs.read",
+                    "fs.write.begin", "fs.mkdir", "fs.rename", "fs.remove"
+                ],
+                "limits": {
+                    "frame_bytes": HOST_CONTROL_MAX_FRAME_BYTES,
+                    "chunk_bytes": STREAM_CHUNK_BYTES,
+                    "file_bytes": crate::host_files::MAX_FILE_BYTES
+                }
             });
             if dc.send_text(hello.to_string()).await.is_ok() {
                 send_status(&out_tx, session_id, &binding, "connected", None).await;
             } else {
                 let _ = dc.close().await;
+            }
+        })
+    }));
+
+    let close_context = Arc::clone(&context_slot);
+    dc.on_close(Box::new(move || {
+        let context_slot = Arc::clone(&close_context);
+        Box::pin(async move {
+            if let Some(context) = context_slot.lock().await.take() {
+                context.abort_all().await;
             }
         })
     }));
@@ -948,6 +1613,37 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn receive_control(messages: &mut mpsc::Receiver<(usize, String)>) -> (usize, Value) {
+        let (index, encoded) = tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("host control response timed out")
+            .expect("host control channel closed before response");
+        (index, serde_json::from_str(&encoded).unwrap())
+    }
+
+    async fn request_control(
+        channel: &RTCDataChannel,
+        messages: &mut mpsc::Receiver<(usize, String)>,
+        request_id: &str,
+        operation: &str,
+        payload: Value,
+    ) -> Value {
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": request_id,
+                    "operation": operation,
+                    "payload": payload
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        receive_control(messages).await.1
+    }
 
     #[test]
     fn rtc_binary_input_writes_and_emits_one_throttled_content_free_signal() {
@@ -1242,7 +1938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_agent_host_control_data_channel_exchanges_hello_and_ping() {
+    async fn zero_agent_host_files_round_trip_over_paired_data_channel() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -1264,7 +1960,7 @@ mod tests {
             .create_data_channel(HOST_CONTROL_LABEL, None)
             .await
             .unwrap();
-        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(4);
+        let (messages_tx, mut messages_rx) = mpsc::channel::<(usize, String)>(32);
         for (index, data_channel) in [(0, &channel), (1, &extra_channel)] {
             let messages_tx = messages_tx.clone();
             data_channel.on_message(Box::new(move |message: DataChannelMessage| {
@@ -1285,6 +1981,11 @@ mod tests {
             binding_nonce: None,
         };
         let (out_tx, _out_rx) = mpsc::channel(4);
+        let file_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(file_root.path().join("source.txt"), b"source body")
+            .await
+            .unwrap();
+        let files = Arc::new(HostFileService::rooted_at(file_root.path()).await.unwrap());
         install_data_channel_handler(
             &daemon_pc,
             "host-e2e".to_string(),
@@ -1292,6 +1993,7 @@ mod tests {
             AgentRegistry::new(),
             out_tx,
             Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&files)),
         );
 
         let offer = browser_pc.create_offer(None).await.unwrap();
@@ -1349,6 +2051,162 @@ mod tests {
         let response: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["request_id"], "e2e-ping");
         assert_eq!(response["result"]["pong"], true);
+
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-list",
+                    "operation": "fs.list",
+                    "payload": {"path": "~", "cursor": 0}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (index, listing) = receive_control(&mut messages_rx).await;
+        assert_eq!(index, accepted_index);
+        assert_eq!(listing["request_id"], "e2e-list");
+        assert_eq!(listing["result"]["home_dir"], files.home_dir());
+        assert_eq!(listing["result"]["entries"][0]["name"], "source.txt");
+
+        let upload = b"uploaded through the paired data channel";
+        let upload_hash = format!("{:x}", Sha256::digest(upload));
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-write",
+                    "operation": "fs.write.begin",
+                    "payload": {
+                        "dir": "~",
+                        "name": "uploaded.txt",
+                        "length": upload.len(),
+                        "sha256": upload_hash,
+                        "overwrite": false
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, write_started) = receive_control(&mut messages_rx).await;
+        let write_stream_id = write_started["result"]["stream_id"].as_str().unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": write_stream_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(upload)
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": write_stream_id,
+                    "length": upload.len(),
+                    "sha256": upload_hash
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, committed) = receive_control(&mut messages_rx).await;
+        assert_eq!(committed["type"], "stream.committed");
+        assert_eq!(
+            tokio::fs::read(file_root.path().join("uploaded.txt"))
+                .await
+                .unwrap(),
+            upload
+        );
+
+        accepted_channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "e2e-read",
+                    "operation": "fs.read",
+                    "payload": {"path": "uploaded.txt"}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_, read_started) = receive_control(&mut messages_rx).await;
+        assert_eq!(read_started["request_id"], "e2e-read");
+        assert_eq!(read_started["result"]["length"], upload.len());
+        assert_eq!(read_started["result"]["sha256"], upload_hash);
+        let read_stream_id = read_started["result"]["stream_id"].as_str().unwrap();
+        let (_, chunk) = receive_control(&mut messages_rx).await;
+        assert_eq!(chunk["stream_id"], read_stream_id);
+        assert_eq!(
+            STANDARD
+                .decode(chunk["bytes_b64"].as_str().unwrap())
+                .unwrap(),
+            upload
+        );
+        let (_, ended) = receive_control(&mut messages_rx).await;
+        assert_eq!(ended["type"], "stream.end");
+        assert_eq!(ended["length"], upload.len());
+        assert_eq!(ended["sha256"], upload_hash);
+
+        let made = request_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-mkdir",
+            "fs.mkdir",
+            json!({"path": "folder"}),
+        )
+        .await;
+        assert_eq!(made["ok"], true);
+        let renamed = request_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-rename",
+            "fs.rename",
+            json!({"path": "uploaded.txt", "name": "renamed.txt"}),
+        )
+        .await;
+        assert!(renamed["result"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("renamed.txt"));
+        let stat = request_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-stat",
+            "fs.stat",
+            json!({"path": "renamed.txt"}),
+        )
+        .await;
+        assert_eq!(stat["result"]["kind"], "file");
+        assert_eq!(stat["result"]["size"], upload.len());
+        for (request_id, path) in [
+            ("e2e-remove-file", "renamed.txt"),
+            ("e2e-remove-directory", "folder"),
+        ] {
+            let removed = request_control(
+                accepted_channel,
+                &mut messages_rx,
+                request_id,
+                "fs.remove",
+                json!({"path": path, "recursive": false}),
+            )
+            .await;
+            assert_eq!(removed["ok"], true);
+        }
+        assert!(!file_root.path().join("renamed.txt").exists());
+        assert!(!file_root.path().join("folder").exists());
 
         browser_pc.close().await.unwrap();
         daemon_pc.close().await.unwrap();

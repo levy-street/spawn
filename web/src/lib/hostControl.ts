@@ -1,3 +1,4 @@
+import { hashStream, Sha256 } from "@/lib/sha256";
 import { buildHostWsUrl } from "@/lib/ws";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
@@ -9,6 +10,50 @@ const MAX_PENDING_REQUESTS = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 500;
+const STREAM_CHUNK_BYTES = 8 * 1024;
+const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
+const STREAM_TIMEOUT_MS = 60_000;
+const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
+
+export class HostControlError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly detail?: string,
+  ) {
+    super(detail || code);
+    this.name = "HostControlError";
+  }
+}
+
+export interface HostDirEntry {
+  name: string;
+  path: string;
+  kind: "file" | "directory" | "symlink" | "other";
+  is_dir: boolean;
+  size?: number | null;
+  modified_at?: number | null;
+}
+
+export interface HostDirList {
+  path: string;
+  home_dir: string;
+  parent?: string | null;
+  entries: HostDirEntry[];
+  next_cursor?: number | null;
+}
+
+export interface HostFileOp {
+  path?: string | null;
+}
+
+export interface HostReadStream {
+  streamId: string;
+  path: string;
+  name: string;
+  length: number;
+  sha256: string;
+  stream: ReadableStream<Uint8Array>;
+}
 
 export type HostControlState = "idle" | "connecting" | "open" | "ready" | "closed" | "error";
 
@@ -17,6 +62,23 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   removeAbort?: () => void;
+}
+
+interface IncomingStream {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  nextSequence: number;
+  acknowledged: number;
+  received: number;
+  expectedLength: number;
+  expectedSha256: string;
+  hash: Sha256;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+interface OutgoingStream {
+  resolve: (path: string) => void;
+  reject: (error: Error) => void;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 interface SignalMetadata {
@@ -66,6 +128,8 @@ export class HostControlClient {
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
+  private incomingStreams = new Map<string, IncomingStream>();
+  private outgoingStreams = new Map<string, OutgoingStream>();
   private listeners = new Set<(state: HostControlState) => void>();
 
   constructor(
@@ -87,6 +151,30 @@ export class HostControlClient {
     if (!this.stopped) return;
     this.stopped = false;
     this.openWebSocket();
+  }
+
+  waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<void> {
+    if (this.state === "ready") return Promise.resolve();
+    this.connect();
+    return new Promise((resolve, reject) => {
+      let unsubscribe = () => {};
+      let settled = false;
+      const timer = setTimeout(
+        () => {
+          unsubscribe();
+          reject(new HostControlError("connect_timeout", "Host control connection timed out"));
+        },
+        Math.max(1, timeoutMs),
+      );
+      unsubscribe = this.subscribe((state) => {
+        if (state !== "ready") return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve();
+      });
+      if (settled) unsubscribe();
+    });
   }
 
   close(): void {
@@ -170,6 +258,276 @@ export class HostControlClient {
 
   ping(options?: HostControlRequestOptions): Promise<{ pong: true }> {
     return this.request<{ pong: true }>("ping", undefined, options);
+  }
+
+  home(options?: HostControlRequestOptions): Promise<{ home_dir: string }> {
+    return this.request<{ home_dir: string }>("fs.home", undefined, options);
+  }
+
+  async list(path?: string, options?: HostControlRequestOptions): Promise<HostDirList> {
+    let cursor: number | null = 0;
+    let result: HostDirList | null = null;
+    const entries: HostDirEntry[] = [];
+    do {
+      const page: HostDirList = await this.request<HostDirList>(
+        "fs.list",
+        { ...(path ? { path } : {}), cursor },
+        options,
+      );
+      result ??= page;
+      entries.push(...page.entries);
+      cursor = typeof page.next_cursor === "number" ? page.next_cursor : null;
+    } while (cursor !== null);
+    if (!result) throw new HostControlError("invalid_response", "Host returned no directory page");
+    return { ...result, entries, next_cursor: null };
+  }
+
+  mkdir(path: string, options?: HostControlRequestOptions): Promise<HostFileOp> {
+    return this.request<HostFileOp>("fs.mkdir", { path }, options);
+  }
+
+  rename(
+    path: string,
+    name: string,
+    overwrite = false,
+    options?: HostControlRequestOptions,
+  ): Promise<HostFileOp> {
+    return this.request<HostFileOp>("fs.rename", { path, name, overwrite }, options);
+  }
+
+  remove(
+    path: string,
+    recursive = false,
+    options?: HostControlRequestOptions,
+  ): Promise<HostFileOp> {
+    return this.request<HostFileOp>("fs.remove", { path, recursive }, options);
+  }
+
+  async readFile(path: string, options?: HostControlRequestOptions): Promise<HostReadStream> {
+    const declaration = await this.request<{
+      stream_id: string;
+      path: string;
+      name: string;
+      length: number;
+      sha256: string;
+    }>("fs.read", { path }, options);
+    const { stream_id: streamId, length, sha256 } = declaration;
+    if (
+      typeof streamId !== "string" ||
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      !/^[0-9a-f]{64}$/.test(sha256) ||
+      this.incomingStreams.has(streamId)
+    ) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid read stream");
+    }
+    let state: IncomingStream | undefined;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        start: (controller) => {
+          state = {
+            controller,
+            nextSequence: 0,
+            acknowledged: 0,
+            received: 0,
+            expectedLength: length,
+            expectedSha256: sha256,
+            hash: new Sha256(),
+          };
+          this.incomingStreams.set(streamId, state);
+          this.resetIncomingTimeout(streamId, state);
+        },
+        pull: () => {
+          const current = this.incomingStreams.get(streamId);
+          if (!current || current.acknowledged >= current.nextSequence) return;
+          current.acknowledged += 1;
+          this.sendStreamFrame("stream.ack", streamId, { sequence: current.acknowledged });
+        },
+        cancel: () => {
+          const current = this.incomingStreams.get(streamId);
+          if (current) clearTimeout(current.timer);
+          this.incomingStreams.delete(streamId);
+          this.cancelStream(streamId);
+        },
+      },
+      { highWaterMark: 4 },
+    );
+    if (!state) throw new HostControlError("stream_failed", "Could not initialize file stream");
+    return {
+      streamId,
+      path: declaration.path,
+      name: declaration.name,
+      length,
+      sha256,
+      stream,
+    };
+  }
+
+  async downloadFile(path: string, options?: HostControlRequestOptions): Promise<Blob> {
+    const read = await this.readFile(path, options);
+    if (read.length > FALLBACK_DOWNLOAD_MEMORY_LIMIT) {
+      await read.stream.cancel("native streaming download unavailable");
+      throw new HostControlError(
+        "streaming_download_required",
+        "This browser must provide a streaming file destination for downloads over 32 MiB",
+      );
+    }
+    return new Response(read.stream, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(read.length),
+      },
+    }).blob();
+  }
+
+  async saveFileToBrowser(path: string, suggestedName: string): Promise<void> {
+    const picker = (
+      window as unknown as {
+        showSaveFilePicker?: (options: { suggestedName: string }) => Promise<{
+          createWritable: () => Promise<WritableStream<Uint8Array>>;
+        }>;
+      }
+    ).showSaveFilePicker;
+    if (picker) {
+      // Invoke the picker before any network await so the browser still sees
+      // this as part of the user's click gesture.
+      const handle = await picker({ suggestedName });
+      const read = await this.readFile(path);
+      const writable = await handle.createWritable();
+      await read.stream.pipeTo(writable);
+      return;
+    }
+    const blob = await this.downloadFile(path);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = suggestedName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async uploadFile(
+    file: File,
+    options: { dir: string; overwrite?: boolean; signal?: AbortSignal },
+  ): Promise<HostFileOp> {
+    const sha256 = await hashStream(file.stream());
+    const path = await this.writeStream(
+      file.stream(),
+      {
+        dir: options.dir,
+        name: file.name || "file",
+        length: file.size,
+        sha256,
+        overwrite: options.overwrite,
+      },
+      options.signal,
+    );
+    return { path };
+  }
+
+  async writeStream(
+    stream: ReadableStream<Uint8Array>,
+    declaration: {
+      dir: string;
+      name: string;
+      length: number;
+      sha256: string;
+      overwrite?: boolean;
+    },
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const begin = await this.request<{ stream_id: string }>("fs.write.begin", declaration, {
+      signal,
+      timeoutMs: STREAM_TIMEOUT_MS,
+    });
+    const streamId = begin.stream_id;
+    if (typeof streamId !== "string" || this.outgoingStreams.has(streamId)) {
+      throw new HostControlError("invalid_response", "Host returned an invalid write stream");
+    }
+    const committed = new Promise<string>((resolve, reject) => {
+      const pending = { resolve, reject };
+      this.outgoingStreams.set(streamId, pending);
+      this.resetOutgoingTimeout(streamId, pending);
+    });
+    const reader = stream.getReader();
+    const abort = () => {
+      this.cancelStream(streamId);
+      const pending = this.outgoingStreams.get(streamId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.outgoingStreams.delete(streamId);
+        pending.reject(new DOMException("Host file write aborted", "AbortError"));
+      }
+      void reader.cancel();
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    let sequence = 0;
+    let sent = 0;
+    try {
+      for (;;) {
+        if (signal?.aborted) throw new DOMException("Host file write aborted", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        for (let offset = 0; offset < value.byteLength; offset += STREAM_CHUNK_BYTES) {
+          const chunk = value.subarray(offset, offset + STREAM_CHUNK_BYTES);
+          sent += chunk.byteLength;
+          if (sent > declaration.length) {
+            throw new HostControlError("length_mismatch", "Input exceeds declared length");
+          }
+          await this.waitForWritable(signal);
+          this.sendStreamFrame("stream.chunk", streamId, {
+            sequence,
+            bytes_b64: bytesToBase64(chunk),
+          });
+          const pending = this.outgoingStreams.get(streamId);
+          if (pending) this.resetOutgoingTimeout(streamId, pending);
+          sequence += 1;
+        }
+      }
+      if (sent !== declaration.length) {
+        throw new HostControlError("length_mismatch", "Input does not match declared length");
+      }
+      this.sendStreamFrame("stream.end", streamId, {
+        length: declaration.length,
+        sha256: declaration.sha256,
+      });
+      return await committed;
+    } catch (error) {
+      abort();
+      void committed.catch(() => {});
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      reader.releaseLock();
+    }
+  }
+
+  async transferFileTo(
+    destination: HostControlClient,
+    path: string,
+    destDir: string,
+    overwrite = false,
+    signal?: AbortSignal,
+  ): Promise<HostFileOp> {
+    const source = await this.readFile(path, { signal, timeoutMs: STREAM_TIMEOUT_MS });
+    try {
+      const destinationPath = await destination.writeStream(
+        source.stream,
+        {
+          dir: destDir,
+          name: source.name,
+          length: source.length,
+          sha256: source.sha256,
+          overwrite,
+        },
+        signal,
+      );
+      return { path: destinationPath };
+    } catch (error) {
+      await source.stream.cancel(error).catch(() => {});
+      throw error;
+    }
   }
 
   private openWebSocket(): void {
@@ -361,7 +719,13 @@ export class HostControlClient {
       request_id?: string;
       ok?: boolean;
       result?: unknown;
-      error?: { code?: string };
+      error?: { code?: string; detail?: string };
+      stream_id?: string;
+      sequence?: number;
+      bytes_b64?: string;
+      length?: number;
+      sha256?: string;
+      path?: string;
     };
     if (message.version !== HOST_CONTROL_VERSION) {
       this.failRtc(sessionId);
@@ -373,11 +737,113 @@ export class HostControlClient {
       this.setState("ready");
       return;
     }
+    if (message.type?.startsWith("stream.")) {
+      if (typeof message.stream_id !== "string") {
+        this.failRtc(sessionId);
+        return;
+      }
+      if (message.type === "stream.chunk") {
+        const incoming = this.incomingStreams.get(message.stream_id);
+        if (
+          !incoming ||
+          message.sequence !== incoming.nextSequence ||
+          typeof message.bytes_b64 !== "string"
+        ) {
+          this.failRtc(sessionId);
+          return;
+        }
+        let bytes: Uint8Array;
+        try {
+          bytes = base64ToBytes(message.bytes_b64);
+        } catch {
+          this.failRtc(sessionId);
+          return;
+        }
+        if (
+          bytes.byteLength === 0 ||
+          bytes.byteLength > STREAM_CHUNK_BYTES ||
+          incoming.received + bytes.byteLength > incoming.expectedLength
+        ) {
+          this.failRtc(sessionId);
+          return;
+        }
+        incoming.nextSequence += 1;
+        incoming.received += bytes.byteLength;
+        incoming.hash.update(bytes);
+        incoming.controller.enqueue(bytes);
+        this.resetIncomingTimeout(message.stream_id, incoming);
+        return;
+      }
+      if (message.type === "stream.end") {
+        const incoming = this.incomingStreams.get(message.stream_id);
+        if (!incoming) {
+          this.failRtc(sessionId);
+          return;
+        }
+        this.incomingStreams.delete(message.stream_id);
+        clearTimeout(incoming.timer);
+        const digest = incoming.hash.digestHex();
+        if (
+          message.length !== incoming.expectedLength ||
+          incoming.received !== incoming.expectedLength ||
+          message.sha256 !== incoming.expectedSha256 ||
+          digest !== incoming.expectedSha256
+        ) {
+          incoming.controller.error(
+            new HostControlError("integrity_mismatch", "Host file stream failed integrity checks"),
+          );
+        } else {
+          incoming.controller.close();
+        }
+        return;
+      }
+      if (message.type === "stream.committed") {
+        const outgoing = this.outgoingStreams.get(message.stream_id);
+        if (!outgoing || typeof message.path !== "string") {
+          this.failRtc(sessionId);
+          return;
+        }
+        this.outgoingStreams.delete(message.stream_id);
+        clearTimeout(outgoing.timer);
+        outgoing.resolve(message.path);
+        return;
+      }
+      if (message.type === "stream.error") {
+        const error = new HostControlError(
+          message.error?.code ?? "stream_failed",
+          message.error?.detail,
+        );
+        const incoming = this.incomingStreams.get(message.stream_id);
+        if (incoming) {
+          this.incomingStreams.delete(message.stream_id);
+          clearTimeout(incoming.timer);
+          incoming.controller.error(error);
+          return;
+        }
+        const outgoing = this.outgoingStreams.get(message.stream_id);
+        if (outgoing) {
+          this.outgoingStreams.delete(message.stream_id);
+          clearTimeout(outgoing.timer);
+          outgoing.reject(error);
+          return;
+        }
+        this.failRtc(sessionId);
+        return;
+      }
+      this.failRtc(sessionId);
+      return;
+    }
     if (message.type !== "response" || typeof message.request_id !== "string") return;
     const pending = this.finishPending(message.request_id);
     if (!pending) return;
     if (message.ok) pending.resolve(message.result);
-    else pending.reject(new Error(message.error?.code ?? "Host control request failed"));
+    else
+      pending.reject(
+        new HostControlError(
+          message.error?.code ?? "request_failed",
+          message.error?.detail ?? "Host control request failed",
+        ),
+      );
   }
 
   private sendSignal(
@@ -421,6 +887,78 @@ export class HostControlClient {
     }
   }
 
+  private sendStreamFrame(
+    type: "stream.chunk" | "stream.end" | "stream.cancel" | "stream.ack",
+    streamId: string,
+    values: Record<string, unknown> = {},
+  ): void {
+    const channel = this.channel;
+    if (channel?.readyState !== "open") {
+      throw new HostControlError("connection_closed", "Host control channel is not open");
+    }
+    const frame = JSON.stringify({
+      version: HOST_CONTROL_VERSION,
+      type,
+      stream_id: streamId,
+      ...values,
+    });
+    if (new TextEncoder().encode(frame).byteLength > MAX_CONTROL_FRAME_BYTES) {
+      throw new HostControlError("frame_too_large", "Host stream frame exceeds the limit");
+    }
+    channel.send(frame);
+  }
+
+  private cancelStream(streamId: string): void {
+    try {
+      this.sendStreamFrame("stream.cancel", streamId);
+    } catch {
+      // Best effort: local cancellation and cleanup must still settle even if
+      // the DataChannel was lost at the same moment.
+    }
+  }
+
+  private resetIncomingTimeout(streamId: string, incoming: IncomingStream): void {
+    clearTimeout(incoming.timer);
+    incoming.timer = setTimeout(() => {
+      if (this.incomingStreams.get(streamId) !== incoming) return;
+      this.incomingStreams.delete(streamId);
+      this.cancelStream(streamId);
+      incoming.controller.error(new HostControlError("stream_timeout", "File read timed out"));
+    }, STREAM_TIMEOUT_MS);
+  }
+
+  private resetOutgoingTimeout(streamId: string, outgoing: OutgoingStream): void {
+    clearTimeout(outgoing.timer);
+    outgoing.timer = setTimeout(() => {
+      if (this.outgoingStreams.get(streamId) !== outgoing) return;
+      this.outgoingStreams.delete(streamId);
+      this.cancelStream(streamId);
+      outgoing.reject(new HostControlError("stream_timeout", "File write timed out"));
+    }, STREAM_TIMEOUT_MS);
+  }
+
+  private async waitForWritable(signal?: AbortSignal): Promise<void> {
+    for (;;) {
+      const channel = this.channel;
+      if (channel?.readyState !== "open") {
+        throw new HostControlError("connection_closed", "Host control channel is not open");
+      }
+      if (channel.bufferedAmount <= STREAM_BUFFERED_HIGH_WATER) return;
+      if (signal?.aborted) throw new DOMException("Host file write aborted", "AbortError");
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, 10);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new DOMException("Host file write aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+  }
+
   private finishPending(requestId: string): PendingRequest | undefined {
     const pending = this.pending.get(requestId);
     if (!pending) return undefined;
@@ -458,6 +996,17 @@ export class HostControlClient {
       pc.close();
     }
     this.rejectPending(new Error("Host control session ended"));
+    const streamError = new HostControlError("connection_closed", "Host control session ended");
+    for (const [streamId, incoming] of this.incomingStreams) {
+      this.incomingStreams.delete(streamId);
+      clearTimeout(incoming.timer);
+      incoming.controller.error(streamError);
+    }
+    for (const [streamId, outgoing] of this.outgoingStreams) {
+      this.outgoingStreams.delete(streamId);
+      clearTimeout(outgoing.timer);
+      outgoing.reject(streamError);
+    }
     if (!this.stopped && this.state === "ready") this.setState("open");
   }
 
@@ -521,4 +1070,21 @@ export class HostControlClient {
     this.state = state;
     for (const listener of this.listeners) listener(state);
   }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += 1) {
+    binary += String.fromCharCode(bytes[offset]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let offset = 0; offset < binary.length; offset += 1) {
+    bytes[offset] = binary.charCodeAt(offset);
+  }
+  return bytes;
 }

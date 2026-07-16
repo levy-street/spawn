@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
+import { useHostControl } from "@/hooks/useHostControl";
 import type { AgentKind } from "@/lib/agents";
 import { ApiError, agents, hosts, presets, screens, skills as skillApi } from "@/lib/api";
 import { normalizeCommandText, parseArgv } from "@/lib/argv";
@@ -54,6 +55,12 @@ export function NewAgentForm({
   const [error, setError] = useState<string | null>(null);
   const [lastAutoCwd, setLastAutoCwd] = useState("");
   const [presetTouched, setPresetTouched] = useState(false);
+  const { client: hostControl, state: hostControlState } = useHostControl(hostId || null);
+  const homeQ = useQuery({
+    queryKey: ["host-home", hostId],
+    queryFn: () => hostControl!.home(),
+    enabled: hostControlState === "ready" && hostControl !== null,
+  });
 
   const m = useMutation({
     mutationFn: agents.create,
@@ -99,7 +106,7 @@ export function NewAgentForm({
     [presetsQ.data],
   );
   const selectedHost = hostOptions.find((h) => h.id === hostId);
-  const selectedHostHomeDir = selectedHost?.home_dir ?? "/";
+  const selectedHostHomeDir = homeQ.data?.home_dir;
   const selectedPreset = presetOptions.find((p) => p.id === presetId);
   const skillOptions = skillsQ.data ?? [];
 
@@ -119,7 +126,8 @@ export function NewAgentForm({
 
   useEffect(() => {
     if (!hostId) return;
-    const nextCwd = withTrailingSlash(selectedHostHomeDir.trim() || "/");
+    if (!selectedHostHomeDir) return;
+    const nextCwd = withTrailingSlash(selectedHostHomeDir.trim());
     if (!cwd.trim() || cwd === lastAutoCwd) {
       setCwd(nextCwd);
       setLastAutoCwd(nextCwd);
@@ -131,6 +139,10 @@ export function NewAgentForm({
     setError(null);
     if (!hostId) {
       setError("Choose a host.");
+      return;
+    }
+    if (!selectedHostHomeDir) {
+      setError("Connect to the host before choosing a directory.");
       return;
     }
     let argvArr: string[] | undefined;
@@ -207,10 +219,7 @@ export function NewAgentForm({
                 </span>
                 <span className="min-w-0">
                   <span className="block truncate text-sm font-medium">{h.name}</span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {h.status}
-                    {h.home_dir ? ` · ${h.home_dir}` : ""}
-                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">{h.status}</span>
                 </span>
               </button>
             );

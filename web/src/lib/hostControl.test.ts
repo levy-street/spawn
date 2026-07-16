@@ -7,6 +7,7 @@ class FakeDataChannel {
   label: string;
   readyState = "open";
   sent: string[] = [];
+  bufferedAmount = 0;
   closed = false;
   onopen = null;
   onmessage = null;
@@ -541,5 +542,187 @@ describe("HostControlClient", () => {
     await expect(client.request("hard-cap")).rejects.toThrow("Too many pending");
     client.close();
     await Promise.all(pending);
+  });
+
+  test("streams a verified file with bounded acknowledgement flow", async () => {
+    const { client, pc } = await readyClient();
+    const opening = client.readFile("/private/notes.txt");
+    const request = JSON.parse(pc.channel.sent.at(-1));
+    const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          stream_id: "read-stream",
+          path: "/private/notes.txt",
+          name: "notes.txt",
+          length: 5,
+          sha256,
+        },
+      }),
+    );
+    const read = await opening;
+    const reader = read.stream.getReader();
+    const next = reader.read();
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "read-stream",
+        sequence: 0,
+        bytes_b64: btoa("hello"),
+      }),
+    );
+    expect(new TextDecoder().decode((await next).value)).toBe("hello");
+    await Promise.resolve();
+    expect(pc.channel.sent.map((frame) => JSON.parse(frame))).toContainEqual(
+      expect.objectContaining({ type: "stream.ack", stream_id: "read-stream", sequence: 1 }),
+    );
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.end",
+        stream_id: "read-stream",
+        length: 5,
+        sha256,
+      }),
+    );
+    expect((await reader.read()).done).toBe(true);
+    client.close();
+  });
+
+  test("declares and commits a chunked verified write", async () => {
+    const { client, pc } = await readyClient();
+    const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const writing = client.writeStream(new Blob(["hello"]).stream(), {
+      dir: "/private",
+      name: "notes.txt",
+      length: 5,
+      sha256,
+    });
+    const begin = JSON.parse(pc.channel.sent.at(-1));
+    expect(begin).toMatchObject({ operation: "fs.write.begin" });
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: begin.request_id,
+        ok: true,
+        result: { stream_id: "write-stream" },
+      }),
+    );
+    await Bun.sleep(2);
+    const frames = pc.channel.sent.map((frame) => JSON.parse(frame));
+    expect(frames).toContainEqual(
+      expect.objectContaining({
+        type: "stream.chunk",
+        stream_id: "write-stream",
+        sequence: 0,
+        bytes_b64: btoa("hello"),
+      }),
+    );
+    expect(frames).toContainEqual(
+      expect.objectContaining({ type: "stream.end", stream_id: "write-stream" }),
+    );
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.committed",
+        stream_id: "write-stream",
+        path: "/private/notes.txt",
+      }),
+    );
+    await expect(writing).resolves.toBe("/private/notes.txt");
+    client.close();
+  });
+
+  test("pumps cross-host bytes through two independent host sessions", async () => {
+    const source = await readyClient();
+    const destination = await readyClient();
+    const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const transferring = source.client.transferFileTo(
+      destination.client,
+      "/source/notes.txt",
+      "/destination",
+    );
+    const readRequest = JSON.parse(source.pc.channel.sent.at(-1));
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: readRequest.request_id,
+        ok: true,
+        result: {
+          stream_id: "source-stream",
+          path: "/source/notes.txt",
+          name: "notes.txt",
+          length: 5,
+          sha256,
+        },
+      }),
+    );
+    await Bun.sleep(1);
+    const writeRequest = destination.pc.channel.sent
+      .map((frame) => JSON.parse(frame))
+      .find((frame) => frame.operation === "fs.write.begin");
+    expect(writeRequest.payload).toMatchObject({
+      dir: "/destination",
+      name: "notes.txt",
+      length: 5,
+      sha256,
+    });
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: writeRequest.request_id,
+        ok: true,
+        result: { stream_id: "destination-stream" },
+      }),
+    );
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "source-stream",
+        sequence: 0,
+        bytes_b64: btoa("hello"),
+      }),
+    );
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.end",
+        stream_id: "source-stream",
+        length: 5,
+        sha256,
+      }),
+    );
+    await Bun.sleep(2);
+    const destinationFrames = destination.pc.channel.sent.map((frame) => JSON.parse(frame));
+    expect(destinationFrames).toContainEqual(
+      expect.objectContaining({
+        type: "stream.chunk",
+        stream_id: "destination-stream",
+        bytes_b64: btoa("hello"),
+      }),
+    );
+    expect(destinationFrames).toContainEqual(
+      expect.objectContaining({ type: "stream.end", stream_id: "destination-stream" }),
+    );
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.committed",
+        stream_id: "destination-stream",
+        path: "/destination/notes.txt",
+      }),
+    );
+    await expect(transferring).resolves.toEqual({ path: "/destination/notes.txt" });
+    source.client.close();
+    destination.client.close();
   });
 });

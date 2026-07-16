@@ -36,7 +36,9 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { ApiError, type HostDirEntry, hosts } from "@/lib/api";
+import { useHostControl } from "@/hooks/useHostControl";
+import { ApiError, hosts } from "@/lib/api";
+import { HostControlClient, type HostDirEntry } from "@/lib/hostControl";
 import { cn } from "@/lib/utils";
 
 /**
@@ -114,17 +116,21 @@ export function FileExplorer({
   const [dropDir, setDropDir] = useState<string | null>(null);
   const uploadDirRef = useRef<string | null>(null);
   const initialAppliedRef = useRef(false);
+  const { client: hostControl, state: hostControlState } = useHostControl(hostId);
+  const controlReady = hostControlState === "ready" && hostControl !== null;
 
   const rootQ = useQuery({
     queryKey: ["host-files", hostId, rootPath ?? ""],
-    queryFn: () => hosts.files(hostId, rootPath),
+    queryFn: () => hostControl!.list(rootPath),
+    enabled: controlReady,
   });
   const resolvedRoot = rootQ.data?.path ?? rootPath ?? null;
 
   const childQs = useQueries({
     queries: expanded.map((path) => ({
       queryKey: ["host-files", hostId, path],
-      queryFn: () => hosts.files(hostId, path),
+      queryFn: () => hostControl!.list(path),
+      enabled: controlReady,
     })),
   });
   const listings = useMemo(() => {
@@ -203,7 +209,8 @@ export function FileExplorer({
       setUploadingCount((n) => n + files.length);
       for (const file of files) {
         try {
-          const result = await hosts.uploadFile(hostId, file, { dir });
+          if (!hostControl) throw new Error("Host control channel is not ready");
+          const result = await hostControl.uploadFile(file, { dir });
           setStatus(`Uploaded ${result.path ?? file.name}`);
         } catch (err) {
           setStatus(`${file.name || "File"}: ${errorMessage(err)}`);
@@ -213,12 +220,12 @@ export function FileExplorer({
       }
       refreshDir(dir);
     },
-    [hostId, refreshDir],
+    [hostControl, refreshDir],
   );
 
   const mkdirM = useMutation({
     mutationFn: ({ dir, name }: { dir: string; name: string }) =>
-      hosts.mkdir(hostId, `${dir}/${name}`),
+      hostControl?.mkdir(`${dir}/${name}`) ?? Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { dir }) => {
       setCreatingIn(null);
       setFolderDraft("");
@@ -230,7 +237,7 @@ export function FileExplorer({
 
   const renameM = useMutation({
     mutationFn: ({ entry, name }: { entry: HostDirEntry; name: string; parentDir: string }) =>
-      hosts.renameFile(hostId, { path: entry.path, name }),
+      hostControl?.rename(entry.path, name) ?? Promise.reject(new Error("Host is not connected")),
     onSuccess: (result, { entry, parentDir }) => {
       setRenaming(null);
       if (result.path) {
@@ -256,7 +263,8 @@ export function FileExplorer({
 
   const deleteM = useMutation({
     mutationFn: ({ entry }: { entry: HostDirEntry; parentDir: string }) =>
-      hosts.deleteFile(hostId, { path: entry.path, recursive: entry.is_dir === true }),
+      hostControl?.remove(entry.path, entry.is_dir === true) ??
+      Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { entry, parentDir }) => {
       setStatus(`Deleted ${entry.name}`);
       setExpanded((cur) => cur.filter((p) => p !== entry.path && !p.startsWith(`${entry.path}/`)));
@@ -275,12 +283,23 @@ export function FileExplorer({
       entry: HostDirEntry;
       destHostId: string;
       destDir: string;
-    }) =>
-      hosts.transferFile(hostId, {
-        path: entry.path,
-        dest_host_id: destHostId,
-        dest_dir: destDir,
-      }),
+    }) => {
+      if (!hostControl) throw new Error("Source host is not connected");
+      return (async () => {
+        const destination = new HostControlClient(destHostId);
+        try {
+          await destination.waitUntilReady();
+          const home = await destination.home();
+          return await hostControl.transferFileTo(
+            destination,
+            entry.path,
+            destDir === "~" ? home.home_dir : destDir,
+          );
+        } finally {
+          destination.close();
+        }
+      })();
+    },
     onSuccess: (result) => setStatus(`Sent to ${result.path ?? "destination host"}`),
     onError: (err) => setStatus(errorMessage(err)),
   });
@@ -289,19 +308,14 @@ export function FileExplorer({
     async (entry: HostDirEntry) => {
       setStatus(`Downloading ${entry.name}...`);
       try {
-        const blob = await hosts.downloadFile(hostId, entry.path);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = entry.name;
-        a.click();
-        URL.revokeObjectURL(url);
+        if (!hostControl) throw new Error("Host control channel is not ready");
+        await hostControl.saveFileToBrowser(entry.path, entry.name);
         setStatus(null);
       } catch (err) {
         setStatus(`${entry.name}: ${errorMessage(err)}`);
       }
     },
-    [hostId],
+    [hostControl],
   );
 
   const relativePath = useCallback(
@@ -458,7 +472,7 @@ export function FileExplorer({
                 transferM.mutate({
                   entry,
                   destHostId: other.id,
-                  destDir: other.home_dir ?? "~",
+                  destDir: "~",
                 })
               }
             >
@@ -569,11 +583,6 @@ export function FileExplorer({
         {rootQ.error && (
           <p className="px-3 py-2 text-xs text-destructive" role="alert">
             {errorMessage(rootQ.error)}
-          </p>
-        )}
-        {rootQ.data?.error && (
-          <p className="px-3 py-2 text-xs text-destructive" role="alert">
-            {rootQ.data.error}
           </p>
         )}
         {!rootBusy && rows.length === 0 && creatingIn === null && !rootQ.error && (

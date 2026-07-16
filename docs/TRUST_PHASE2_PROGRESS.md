@@ -87,11 +87,14 @@ output leg still exists (it persists the transcript and feeds the v1 pubsub
 relay), so the server still receives all PTY output. The server no longer needs
 those bytes for activity, which is the precondition for cutting the mirror.
 
-Wave 1 is now active in parallel worktrees: P2-AGENT-01 is implementing the
-per-agent `spawn.ctl` root and P2-HOST-01 the independent host-scoped
-`spawn.host.ctl` root. At this checkpoint no Wave 1 transport code has passed
-review or been integrated on `master`. The detailed status/dependencies are in
-`TRUST_PHASE2_TASKS.md`.
+The independent host-scoped `spawn.host.ctl` root (P2-HOST-01) is reviewed and
+integrated through `a808fb3`. P2-HOST-02 now has an implementation on its
+isolated review branch: host home/list/stat/read/write/mkdir/rename/remove,
+browser download/upload, and browser-mediated cross-host transfer use bounded,
+hash-and-length-checked DataChannel streams. Registration `home_dir`, filesystem
+REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
+are removed in that branch. This is **implementation-complete, review-pending**,
+not an integrated or `DONE` claim. P2-AGENT-01 remains on its independent track.
 
 ## Remaining sequence
 

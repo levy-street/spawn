@@ -17,6 +17,7 @@ mod cli;
 mod config;
 mod creds;
 mod frames;
+mod host_files;
 mod login;
 mod proto;
 mod pty;
