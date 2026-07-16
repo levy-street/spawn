@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -181,6 +182,17 @@ def _daemon_messages_of_type(
         for item in (json.loads(payload) for payload in ws.sent_text)
         if item.get("type") == frame_type
     ]
+
+
+def _agent_rtc_frame(agent_id: str, **fields: object) -> dict[str, object]:
+    return {
+        "agent_id": agent_id,
+        "scope_type": "agent",
+        "scope_id": agent_id,
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+        **fields,
+    }
 
 
 async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(client):
@@ -386,17 +398,56 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         await wait_for_signal_pump(signal_task, signal_ready)
 
         # v2 offers without a browser-generated binding identity fail closed.
-        ws.queue_text({"type": "rtc.offer", "session_id": session_id, "sdp": "v=0\r\n"})
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id, type="rtc.offer", session_id=session_id, sdp="v=0\r\n"
+            )
+        )
         await asyncio.sleep(0.02)
         assert not _daemon_messages_of_type(daemon_ws, "rtc.offer")
 
+        valid_tuple = _agent_rtc_frame(
+            agent_id,
+            type="rtc.offer",
+            session_id=session_id,
+            binding_nonce=nonce_a,
+            sdp="v=0\r\ntuple-check",
+        )
+        invalid_tuples = []
+        for field in (
+            "agent_id",
+            "scope_type",
+            "scope_id",
+            "protocol",
+            "protocol_version",
+        ):
+            missing = dict(valid_tuple)
+            missing.pop(field)
+            invalid_tuples.append(missing)
+        for field, value in (
+            ("agent_id", str(uuid.uuid4())),
+            ("scope_type", "host"),
+            ("scope_id", str(uuid.uuid4())),
+            ("protocol", "spawn.ctl"),
+            ("protocol_version", 1),
+        ):
+            mismatched = dict(valid_tuple)
+            mismatched[field] = value
+            invalid_tuples.append(mismatched)
+        for invalid in invalid_tuples:
+            ws.queue_text(invalid)
+        await asyncio.sleep(0.02)
+        assert not _daemon_messages_of_type(daemon_ws, "rtc.offer")
+        assert await broker.rtc_session_for(session_id) is None
+
         ws.queue_text(
-            {
-                "type": "rtc.offer",
-                "session_id": session_id,
-                "binding_nonce": nonce_a,
-                "sdp": "v=0\r\nA",
-            }
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce_a,
+                sdp="v=0\r\nA",
+            )
         )
         await _wait_until(
             lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 1
@@ -410,7 +461,12 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert first_offer["protocol_version"] == 2
 
         ws.queue_text(
-            {"type": "rtc.close", "session_id": session_id, "binding_nonce": nonce_a}
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.close",
+                session_id=session_id,
+                binding_nonce=nonce_a,
+            )
         )
         await _wait_until(
             lambda: bool(_daemon_messages_of_type(daemon_ws, "rtc.close"))
@@ -424,12 +480,13 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
             ]
         )
         ws.queue_text(
-            {
-                "type": "rtc.offer",
-                "session_id": session_id,
-                "binding_nonce": nonce_a,
-                "sdp": "v=0\r\nretired-A",
-            }
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce_a,
+                sdp="v=0\r\nretired-A",
+            )
         )
         await _wait_until(
             lambda: any(
@@ -452,12 +509,13 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert await broker.rtc_session_for(session_id) is None
 
         ws.queue_text(
-            {
-                "type": "rtc.offer",
-                "session_id": session_id,
-                "binding_nonce": nonce_b,
-                "sdp": "v=0\r\nB",
-            }
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce_b,
+                sdp="v=0\r\nB",
+            )
         )
         await _wait_until(
             lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 2
@@ -469,15 +527,67 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         before_close_count = len(_daemon_messages_of_type(daemon_ws, "rtc.close"))
         candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
         ws.queue_text(
-            {
-                "type": "rtc.candidate",
-                "session_id": session_id,
-                "binding_nonce": nonce_a,
-                "candidate": candidate,
-            }
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.candidate",
+                session_id=session_id,
+                binding_nonce=nonce_a,
+                candidate=candidate,
+            )
         )
         ws.queue_text(
-            {"type": "rtc.close", "session_id": session_id, "binding_nonce": nonce_a}
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.close",
+                session_id=session_id,
+                binding_nonce=nonce_a,
+            )
+        )
+        await asyncio.sleep(0.02)
+        assert (
+            len(_daemon_messages_of_type(daemon_ws, "rtc.candidate"))
+            == before_candidate_count
+        )
+        assert len(_daemon_messages_of_type(daemon_ws, "rtc.close")) == before_close_count
+        current = await broker.rtc_session_for(session_id)
+        assert current is not None
+        assert current.nonce == nonce_b
+
+        missing_candidate_tuple = _agent_rtc_frame(
+            agent_id,
+            type="rtc.candidate",
+            session_id=session_id,
+            binding_nonce=nonce_b,
+            candidate=candidate,
+        )
+        missing_candidate_tuple.pop("protocol")
+        ws.queue_text(missing_candidate_tuple)
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.candidate",
+                session_id=session_id,
+                binding_nonce=nonce_b,
+                candidate=candidate,
+                scope_id=str(uuid.uuid4()),
+            )
+        )
+        missing_close_tuple = _agent_rtc_frame(
+            agent_id,
+            type="rtc.close",
+            session_id=session_id,
+            binding_nonce=nonce_b,
+        )
+        missing_close_tuple.pop("agent_id")
+        ws.queue_text(missing_close_tuple)
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.close",
+                session_id=session_id,
+                binding_nonce=nonce_b,
+                protocol_version=1,
+            )
         )
         await asyncio.sleep(0.02)
         assert (
@@ -490,12 +600,13 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert current.nonce == nonce_b
 
         ws.queue_text(
-            {
-                "type": "rtc.candidate",
-                "session_id": session_id,
-                "binding_nonce": nonce_b,
-                "candidate": candidate,
-            }
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.candidate",
+                session_id=session_id,
+                binding_nonce=nonce_b,
+                candidate=candidate,
+            )
         )
         await _wait_until(
             lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.candidate"))

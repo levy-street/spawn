@@ -15,6 +15,7 @@ import {
   slicePtyChunkAfterAnchor,
 } from "@/lib/agent-ctl";
 import {
+  agentRtcTuple,
   buildAgentWsUrl,
   type DisplayControlState,
   parseInbound,
@@ -218,6 +219,7 @@ export function useAgentSocket({
       ws.send(JSON.stringify(msg));
       return true;
     };
+    const boundAgentRtcTuple = agentRtcTuple(agentId);
 
     const clearRtcConnectTimer = () => {
       if (rtcConnectTimer) clearTimeout(rtcConnectTimer);
@@ -243,7 +245,12 @@ export function useAgentSocket({
       clearRtcConnectTimer();
       clearRtcDisconnectedTimer();
       if (signal && sessionId && bindingNonce) {
-        sendJsonOverWs({ type: "rtc.close", session_id: sessionId, binding_nonce: bindingNonce });
+        sendJsonOverWs({
+          type: "rtc.close",
+          session_id: sessionId,
+          binding_nonce: bindingNonce,
+          ...boundAgentRtcTuple,
+        });
       }
       rtcRef.current = {
         agentId: null,
@@ -499,6 +506,7 @@ export function useAgentSocket({
           type: "rtc.candidate",
           session_id: sessionId,
           binding_nonce: bindingNonce,
+          ...boundAgentRtcTuple,
           candidate,
         });
 
@@ -661,6 +669,7 @@ export function useAgentSocket({
             type: "rtc.offer",
             session_id: sessionId,
             binding_nonce: bindingNonce,
+            ...boundAgentRtcTuple,
             sdp: offer.sdp,
           })
         ) {

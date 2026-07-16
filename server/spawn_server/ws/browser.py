@@ -97,6 +97,17 @@ def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     return dict(value)
 
 
+def _valid_browser_agent_rtc_tuple(obj: dict, agent_id: str) -> bool:
+    """Require the browser to bind every signal to the exact direct-PTY tuple."""
+    return (
+        obj.get("agent_id") == agent_id
+        and obj.get("scope_type") == "agent"
+        and obj.get("scope_id") == agent_id
+        and obj.get("protocol") == AGENT_RTC_PROTOCOL
+        and obj.get("protocol_version") == AGENT_RTC_PROTOCOL_VERSION
+    )
+
+
 async def _publish_agent_rtc_signal(
     host_id: str,
     binding: RtcSessionBinding,
@@ -445,24 +456,29 @@ async def browser_ws(
                         )
                 elif ftype == "rtc.offer":
                     proposed_nonce = obj.get("binding_nonce")
-                    if not get_settings().webrtc_enabled:
-                        disabled: dict[str, object] = {
-                            "type": "rtc.status",
-                            "session_id": obj.get("session_id"),
-                            "status": "disabled",
-                            "message": "WebRTC direct terminal transport is disabled.",
-                        }
-                        if valid_rtc_binding_nonce(proposed_nonce):
-                            disabled["binding_nonce"] = proposed_nonce
-                        await conn.send_text(disabled)
-                        continue
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     sdp = _valid_rtc_sdp(obj.get("sdp"))
                     if (
                         session_id is None
                         or sdp is None
                         or not valid_rtc_binding_nonce(proposed_nonce)
+                        or not _valid_browser_agent_rtc_tuple(obj, agent_id)
                     ):
+                        continue
+                    if not get_settings().webrtc_enabled:
+                        disabled: dict[str, object] = {
+                            "type": "rtc.status",
+                            "session_id": session_id,
+                            "agent_id": agent_id,
+                            "binding_nonce": proposed_nonce,
+                            "scope_type": "agent",
+                            "scope_id": agent_id,
+                            "protocol": AGENT_RTC_PROTOCOL,
+                            "protocol_version": AGENT_RTC_PROTOCOL_VERSION,
+                            "status": "disabled",
+                            "message": "WebRTC direct terminal transport is disabled.",
+                        }
+                        await conn.send_text(disabled)
                         continue
                     daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
                         host_id
@@ -575,7 +591,11 @@ async def browser_ws(
                 elif ftype == "rtc.candidate":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     candidate = _valid_rtc_candidate(obj.get("candidate"))
-                    if session_id is None or candidate is None:
+                    if (
+                        session_id is None
+                        or candidate is None
+                        or not _valid_browser_agent_rtc_tuple(obj, agent_id)
+                    ):
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
@@ -609,14 +629,18 @@ async def browser_ws(
                     )
                 elif ftype == "rtc.close":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    if session_id is None:
+                    if session_id is None or not _valid_browser_agent_rtc_tuple(obj, agent_id):
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
                     if route is None or binding is None or binding.browser is not route:
                         continue
                     if (
-                        obj.get("binding_nonce") != binding.nonce
+                        binding.scope_type != "agent"
+                        or binding.scope_id != agent_id
+                        or binding.protocol != AGENT_RTC_PROTOCOL
+                        or binding.protocol_version != AGENT_RTC_PROTOCOL_VERSION
+                        or obj.get("binding_nonce") != binding.nonce
                     ):
                         continue
                     rtc_routes.pop(session_id, None)

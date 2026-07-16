@@ -36,8 +36,9 @@
   `spawn.v2`. The server has no terminal input/output, transcript, history,
   snapshot, viewport, or display-owner relay. Terminal data, history and
   viewport operations travel on mandatory `spawn.pty` + `spawn.ctl` direct
-  channels. Uploads and spawn-time secrets (`env`,
-  skill bodies) travel browser↔daemon over DataChannels. The MCP
+  channels. Agent uploads still cross the server, and launch manifests,
+  preset environment/install/tool values, and skill bodies still have
+  server-readable paths or stores pending P2-TERM-01 and P2-DATA-02. The MCP
   surface (endpoint, managed-server registry, MCP-client OAuth) was
   removed entirely on 2026-07-09 per TRUST.md.
 
@@ -155,11 +156,14 @@ Phases 1–4 of the original scaffold roadmap (skeleton, first agent,
 mobile polish, multi-agent UX) have shipped. The roadmap is now the
 operator-model migration, specified in `TRUST.md`:
 
-1. **TURN + WebRTC-only terminal path** — implemented/review pending: coturn
-   with ephemeral server-minted credentials; WS PTY relay deleted; `spawn.v2`.
-2. **Daemon-owned data** — history/upload/snapshot/fs-listing streams on
-   DataChannels; delete server transcripts and the Redis PTY ring
-   buffer; stop persisting `env` and skill bodies server-side. (The
+1. **TURN + WebRTC-only terminal path** — source implementation under review:
+   coturn with ephemeral server-minted credentials; WS PTY relay deleted;
+   `spawn.v2`.
+2. **Endpoint-owned data** — history and snapshots now use agent
+   DataChannels, and server transcripts plus the Redis PTY ring are deleted.
+   Upload, fs-listing/transfer, launch-manifest, preset, tool-target, and skill
+   migrations remain tracked Phase 2 work; the server still sees those values
+   until their individual cutovers land. (The
    `/mcp` visibility question is resolved: the MCP surface was cut
    entirely on 2026-07-09.)
 3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device

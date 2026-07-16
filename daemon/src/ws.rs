@@ -14,7 +14,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
@@ -96,14 +96,21 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
         other => anyhow::bail!("unsupported ws scheme: {other}"),
     };
 
-    // Verify the server actually accepted our subprotocol (if it sent one).
-    if let Some(sp) = response.headers().get("Sec-WebSocket-Protocol") {
-        if sp.to_str().unwrap_or("") != SUBPROTOCOL {
-            return Err(anyhow!("server selected unexpected subprotocol: {:?}", sp));
-        }
-    }
+    require_selected_subprotocol(response.headers())?;
 
     Ok(stream)
+}
+
+fn require_selected_subprotocol(headers: &HeaderMap) -> Result<()> {
+    let selected = headers
+        .get("Sec-WebSocket-Protocol")
+        .ok_or_else(|| anyhow!("server did not select the required websocket subprotocol"))?
+        .to_str()
+        .context("server selected a malformed websocket subprotocol")?;
+    if selected != SUBPROTOCOL {
+        anyhow::bail!("server did not select the required websocket subprotocol");
+    }
+    Ok(())
 }
 
 fn configure_keepalive(tcp: &TcpStream) -> Result<()> {
@@ -251,6 +258,30 @@ pub fn backoff_for_attempt(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_control_handshake_requires_exact_selected_subprotocol() {
+        let mut headers = HeaderMap::new();
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&["spawn.control.v", "1"].concat()).unwrap(),
+        );
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_bytes(&[0x80]).expect("non-ASCII header value"),
+        );
+        assert!(require_selected_subprotocol(&headers).is_err());
+
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static(SUBPROTOCOL),
+        );
+        require_selected_subprotocol(&headers).expect("exact subprotocol accepted");
+    }
 
     #[test]
     fn binary_frames_fail_closed() {

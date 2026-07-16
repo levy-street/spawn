@@ -182,6 +182,11 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
     .toMatchObject({
       type: "rtc.offer",
       session_id: expect.any(String),
+      agent_id: AGENT_ID,
+      scope_type: "agent",
+      scope_id: AGENT_ID,
+      protocol: "spawn.pty",
+      protocol_version: 2,
       sdp: expect.stringContaining("v=0"),
     });
 });

@@ -1,6 +1,7 @@
 # ADR: mandatory session workers and tmux removal
 
-Status: **accepted for the P2-TMUX-01 cutover checkpoint** (2026-07-15).
+Status: **accepted, independently reviewed, and merged for P2-TMUX-01**
+(`1f66d2d`, 2026-07-15).
 
 ## Decision
 
@@ -21,6 +22,16 @@ Remaining tmux references belong only in historical/migration documentation.
 `scripts/check-worker-only-daemon.sh`, run by `scripts/test-all.sh`, rejects
 reintroduction in daemon code, tests, dependency metadata, selectors, or
 protocol structs.
+
+### Maintenance rule: do not revive tmux
+
+A bug report against the retired tmux backend is not a tmux repair task. Close
+it as obsolete or restate the user-visible behavior against `spawn-worker`.
+Do not add tmux dependencies, commands, socket discovery, adapters, fixtures,
+feature flags, service configuration, or compatibility tests. The normal fix
+path is the worker-only implementation. Any proposal to reverse this decision
+requires a new ADR, an explicit trust-boundary review, and replacement of the
+worker-only source guard; incident response is not an exception.
 
 ## Cutover boundary
 

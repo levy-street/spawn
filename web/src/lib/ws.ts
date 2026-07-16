@@ -104,19 +104,42 @@ export function parseInbound(raw: string): InboundMessage | null {
 
 // ---------- Outbound JSON frame types ----------
 
+export interface AgentRtcTuple {
+  agent_id: string;
+  scope_type: "agent";
+  scope_id: string;
+  protocol: "spawn.pty";
+  protocol_version: 2;
+}
+
+export function agentRtcTuple(agentId: string): AgentRtcTuple {
+  return {
+    agent_id: agentId,
+    scope_type: "agent",
+    scope_id: agentId,
+    protocol: "spawn.pty",
+    protocol_version: 2,
+  };
+}
+
 export type OutboundMessage =
   | { type: "resize"; cols: number; rows: number }
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
   | { type: "snapshot"; lines?: number; plain?: boolean; rtc_session_id?: string }
-  | { type: "rtc.offer"; session_id: string; binding_nonce: string; sdp: string }
-  | {
+  | (AgentRtcTuple & {
+      type: "rtc.offer";
+      session_id: string;
+      binding_nonce: string;
+      sdp: string;
+    })
+  | (AgentRtcTuple & {
       type: "rtc.candidate";
       session_id: string;
       binding_nonce: string;
       candidate: RTCIceCandidateInit;
-    }
-  | { type: "rtc.close"; session_id: string; binding_nonce: string }
+    })
+  | (AgentRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string })
   | {
       type: "upload";
       name: string;

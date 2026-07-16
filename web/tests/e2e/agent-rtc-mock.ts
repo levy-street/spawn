@@ -286,13 +286,23 @@ export function handleAgentRtcSignal(ws: WebSocketRoute, message: string | Buffe
     return;
   }
   if (frame.type !== "rtc.offer") return;
+  const agentId = new URL(ws.url()).searchParams.get("agent_id");
+  if (
+    frame.agent_id !== agentId ||
+    frame.scope_type !== "agent" ||
+    frame.scope_id !== agentId ||
+    frame.protocol !== "spawn.pty" ||
+    frame.protocol_version !== 2
+  ) {
+    return;
+  }
   const binding = {
     session_id: frame.session_id,
     binding_nonce: frame.binding_nonce,
     binding_generation: 1,
-    agent_id: new URL(ws.url()).searchParams.get("agent_id"),
+    agent_id: agentId,
     scope_type: "agent",
-    scope_id: new URL(ws.url()).searchParams.get("agent_id"),
+    scope_id: agentId,
     protocol: "spawn.pty",
     protocol_version: 2,
   };

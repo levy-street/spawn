@@ -57,7 +57,10 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a connected peer that reports `Disconnected` (transient
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
 const REQUIRED_AGENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const REQUIRED_AGENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
 const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
@@ -455,6 +458,7 @@ impl RtcSessions {
         install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
         install_data_channel_handler(
             &pc,
+            self.clone(),
             binding.clone(),
             registry,
             self.controls.clone(),
@@ -798,6 +802,21 @@ impl RtcSessions {
 
     /// Close `pc`, removing its map entry only if the entry still refers to
     /// this same instance (a newer offer may have replaced it).
+    fn schedule_close_if_same(
+        &self,
+        session_id: &str,
+        generation: &str,
+        pc: &Arc<RTCPeerConnection>,
+    ) {
+        let sessions = self.clone();
+        let session_id = session_id.to_string();
+        let generation = generation.to_string();
+        let pc = Arc::clone(pc);
+        tokio::spawn(async move {
+            sessions.close_if_same(&session_id, &generation, &pc).await;
+        });
+    }
+
     async fn close_if_same(&self, session_id: &str, generation: &str, pc: &Arc<RTCPeerConnection>) {
         let agent = {
             let peers = self.peers.lock().await;
@@ -1030,8 +1049,10 @@ fn install_ice_handler(
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
+    sessions: RtcSessions,
     binding: BoundRtcSession,
     registry: AgentRegistry,
     controls: AgentControlHub,
@@ -1043,8 +1064,10 @@ fn install_data_channel_handler(
     {
         let channels = Arc::clone(&channels);
         let pc = Arc::clone(pc);
+        let sessions = sessions.clone();
         let out_tx = out_tx.clone();
         let session_id = binding.signaling.session_id.clone();
+        let generation = binding.signaling.generation.clone();
         let binding_nonce = binding.signaling.binding_nonce.clone();
         let agent_id = binding.signaling.agent_id;
         tokio::spawn(async move {
@@ -1055,14 +1078,14 @@ fn install_data_channel_handler(
                 channels.fail().await;
                 send_status(
                     &out_tx,
-                    session_id,
+                    session_id.clone(),
                     binding_nonce,
                     agent_id,
                     "failed",
                     Some("spawn.pty and spawn.ctl are both required"),
                 )
                 .await;
-                let _ = pc.close().await;
+                sessions.close_if_same(&session_id, &generation, &pc).await;
             }
         });
     }
@@ -1078,19 +1101,35 @@ fn install_data_channel_handler(
         let out_tx = out_tx.clone();
         let channels = Arc::clone(&channels);
         let pc = Arc::clone(&handler_pc);
+        let sessions = sessions.clone();
         Box::pin(async move {
             let viewer_id = viewer_id(
                 &binding.signaling.session_id,
                 &binding.signaling.generation,
             );
+            if !dc.ordered() {
+                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unordered rtc data channel");
+                channels.fail().await;
+                sessions.schedule_close_if_same(
+                    &binding.signaling.session_id,
+                    &binding.signaling.generation,
+                    &pc,
+                );
+                return;
+            }
             if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
                 if !channels.register(AgentChannel::Control).await {
-                    let _ = pc.close().await;
+                    sessions.schedule_close_if_same(
+                        &binding.signaling.session_id,
+                        &binding.signaling.generation,
+                        &pc,
+                    );
                     return;
                 }
                 install_control_data_channel(
                     dc,
                     viewer_id,
+                    binding.signaling.session_id.clone(),
                     binding.agent,
                     registry,
                     controls,
@@ -1098,17 +1137,27 @@ fn install_data_channel_handler(
                     fence,
                     channels,
                     pc,
+                    sessions,
+                    binding.signaling.generation.clone(),
                 );
                 return;
             }
             if dc.label() != PTY_DATA_CHANNEL_LABEL {
                 tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unknown rtc data channel");
                 channels.fail().await;
-                let _ = pc.close().await;
+                sessions.schedule_close_if_same(
+                    &binding.signaling.session_id,
+                    &binding.signaling.generation,
+                    &pc,
+                );
                 return;
             }
             if !channels.register(AgentChannel::Pty).await {
-                let _ = pc.close().await;
+                sessions.schedule_close_if_same(
+                    &binding.signaling.session_id,
+                    &binding.signaling.generation,
+                    &pc,
+                );
                 return;
             }
 
@@ -1155,6 +1204,9 @@ fn install_data_channel_handler(
             let open_control = binding.control.clone();
             let open_channels = Arc::clone(&channels);
             let open_pc = Arc::clone(&pc);
+            let open_sessions = sessions.clone();
+            let open_rtc_session_id = binding.signaling.session_id.clone();
+            let open_generation = binding.signaling.generation.clone();
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
                 let session_id = open_session_id.clone();
@@ -1167,6 +1219,9 @@ fn install_data_channel_handler(
                 let control = open_control.clone();
                 let channels = Arc::clone(&open_channels);
                 let pc = Arc::clone(&open_pc);
+                let sessions = open_sessions.clone();
+                let rtc_session_id = open_rtc_session_id.clone();
+                let generation = open_generation.clone();
                 Box::pin(async move {
                     let _callback = fence.read().await;
                     if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
@@ -1175,7 +1230,7 @@ fn install_data_channel_handler(
                     }
                     channels.mark_open(AgentChannel::Pty).await;
                     if !channels.wait_ready().await {
-                        let _ = pc.close().await;
+                        sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
                         return;
                     }
                     let mut replay_rx = None;
@@ -1308,15 +1363,21 @@ fn install_data_channel_handler(
             let close_viewer_id = viewer_id;
             let close_channels = Arc::clone(&channels);
             let close_pc = Arc::clone(&pc);
+            let close_sessions = sessions;
+            let close_session_id = binding.signaling.session_id.clone();
+            let close_generation = binding.signaling.generation.clone();
             dc.on_close(Box::new(move || {
                 let control = close_control.clone();
                 let viewer_id = close_viewer_id.clone();
                 let channels = Arc::clone(&close_channels);
                 let pc = Arc::clone(&close_pc);
+                let sessions = close_sessions.clone();
+                let session_id = close_session_id.clone();
+                let generation = close_generation.clone();
                 Box::pin(async move {
                     control.remove_direct_sink(&viewer_id).await;
                     channels.fail().await;
-                    let _ = pc.close().await;
+                    sessions.schedule_close_if_same(&session_id, &generation, &pc);
                 })
             }));
         })
@@ -1327,6 +1388,7 @@ fn install_data_channel_handler(
 fn install_control_data_channel(
     dc: Arc<RTCDataChannel>,
     session_id: String,
+    rtc_session_id: String,
     agent: AgentBinding,
     registry: AgentRegistry,
     controls: AgentControlHub,
@@ -1334,6 +1396,8 @@ fn install_control_data_channel(
     fence: Arc<tokio::sync::RwLock<()>>,
     channels: Arc<RequiredAgentChannels>,
     pc: Arc<RTCPeerConnection>,
+    sessions: RtcSessions,
+    generation: String,
 ) {
     let agent_id = agent.agent_id();
     let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
@@ -1485,6 +1549,9 @@ fn install_control_data_channel(
     let open_fence = fence;
     let open_channels = Arc::clone(&channels);
     let open_pc = Arc::clone(&pc);
+    let open_sessions = sessions.clone();
+    let open_rtc_session_id = rtc_session_id.clone();
+    let open_generation = generation.clone();
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
         let session_id = open_session_id.clone();
@@ -1495,6 +1562,9 @@ fn install_control_data_channel(
         let fence = Arc::clone(&open_fence);
         let channels = Arc::clone(&open_channels);
         let pc = Arc::clone(&open_pc);
+        let sessions = open_sessions.clone();
+        let rtc_session_id = open_rtc_session_id.clone();
+        let generation = open_generation.clone();
         Box::pin(async move {
             let _callback = fence.read().await;
             if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
@@ -1502,7 +1572,7 @@ fn install_control_data_channel(
             }
             channels.mark_open(AgentChannel::Control).await;
             if !channels.wait_ready().await {
-                let _ = pc.close().await;
+                sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
                 return;
             }
             controls
@@ -1520,13 +1590,16 @@ fn install_control_data_channel(
         let close_tx = close_tx.clone();
         let channels = Arc::clone(&channels);
         let pc = Arc::clone(&pc);
+        let sessions = sessions.clone();
+        let rtc_session_id = rtc_session_id.clone();
+        let generation = generation.clone();
         Box::pin(async move {
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
             controls.unregister(agent_id, &session_id).await;
             channels.fail().await;
-            let _ = pc.close().await;
+            sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
         })
     }));
 }
@@ -2139,6 +2212,23 @@ mod tests {
         ctl_messages: mpsc::Receiver<(bool, Vec<u8>)>,
     }
 
+    #[derive(Clone, Copy)]
+    struct TestAgentChannel {
+        label: &'static str,
+        ordered: bool,
+        close_on_open: bool,
+    }
+
+    impl TestAgentChannel {
+        const fn ordered(label: &'static str) -> Self {
+            Self {
+                label,
+                ordered: true,
+                close_on_open: false,
+            }
+        }
+    }
+
     async fn close_test_peer(pc: &Arc<RTCPeerConnection>) {
         if let Err(error) = pc.close().await {
             // The server peer is closed first in these cleanup paths.  The
@@ -2280,6 +2370,129 @@ mod tests {
         }
     }
 
+    async fn assert_real_agent_channels_fail_closed(
+        case: &'static str,
+        specs: &[TestAgentChannel],
+    ) {
+        let agent_id = Uuid::new_v4();
+        let session_id = format!("invalid-{case}-{}", Uuid::new_v4());
+        let generation = "generation";
+        let viewer = viewer_id(&session_id, generation);
+        let registry = AgentRegistry::new();
+        let (agent, _worker_commands) = insert_test_worker(&registry, agent_id);
+        let control = registry.control_for_binding(agent).expect("worker control");
+        let sessions = RtcSessions::new();
+
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let mut channels = Vec::new();
+        for spec in specs {
+            let dc = pc
+                .create_data_channel(
+                    spec.label,
+                    Some(
+                        webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                            ordered: Some(spec.ordered),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            if spec.close_on_open {
+                let close_dc = Arc::clone(&dc);
+                dc.on_open(Box::new(move || {
+                    let dc = Arc::clone(&close_dc);
+                    Box::pin(async move {
+                        let _ = dc.close().await;
+                    })
+                }));
+            }
+            channels.push(dc);
+        }
+
+        let offer = pc.create_offer(None).await.unwrap();
+        let mut gathered = pc.gathering_complete_promise().await;
+        pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = pc.local_description().await.unwrap().sdp;
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        sessions
+            .handle_offer(
+                RtcSessionBinding::new(session_id.clone(), generation.to_string(), agent_id),
+                offer_sdp,
+                Vec::new(),
+                registry,
+                out_tx,
+            )
+            .await;
+        assert_eq!(sessions.resident_session_count().await, 1, "{case}");
+
+        let mut answer_set = false;
+        let mut pending_candidates = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if sessions.resident_session_count().await == 0 {
+                    break;
+                }
+                tokio::select! {
+                    outbound = out_rx.recv() => {
+                        let Some(outbound) = outbound else {
+                            tokio::task::yield_now().await;
+                            continue;
+                        };
+                        let value: serde_json::Value =
+                            serde_json::from_str(outbound.as_str()).unwrap();
+                        match value["type"].as_str() {
+                            Some("rtc.answer") => {
+                                let sdp = value["sdp"].as_str().expect("answer SDP").to_string();
+                                pc.set_remote_description(
+                                    RTCSessionDescription::answer(sdp).expect("valid answer SDP")
+                                ).await.unwrap();
+                                answer_set = true;
+                                for candidate in pending_candidates.drain(..) {
+                                    pc.add_ice_candidate(candidate).await.unwrap();
+                                }
+                            }
+                            Some("rtc.candidate") => {
+                                let candidate = serde_json::from_value::<RTCIceCandidateInit>(
+                                    value["candidate"].clone()
+                                ).unwrap();
+                                if answer_set {
+                                    pc.add_ice_candidate(candidate).await.unwrap();
+                                } else {
+                                    pending_candidates.push(candidate);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case}: invalid RTC peer remained resident"));
+
+        assert!(
+            !sessions.controls.contains_viewer(agent_id, &viewer).await,
+            "{case}: invalid RTC viewer remained registered"
+        );
+        assert_eq!(
+            control.direct_sink_offset(&viewer).await,
+            None,
+            "{case}: invalid RTC direct sink remained registered"
+        );
+        close_test_peer(&pc).await;
+        drop(channels);
+    }
+
     async fn next_ctl_json(messages: &mut mpsc::Receiver<(bool, Vec<u8>)>) -> serde_json::Value {
         loop {
             let (is_string, bytes) = tokio::time::timeout(Duration::from_secs(10), messages.recv())
@@ -2412,6 +2625,51 @@ mod tests {
                 String::from_utf8_lossy(needle)
             )
         })
+    }
+
+    #[tokio::test]
+    async fn real_agent_channel_gate_rejects_every_invalid_shape_without_residents() {
+        let missing_pty = [TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)];
+        let missing_ctl = [TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)];
+        let duplicate_pty = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let duplicate_ctl = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let unknown = [
+            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestAgentChannel::ordered("spawn.unknown"),
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let early_close = [
+            TestAgentChannel {
+                close_on_open: true,
+                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+            },
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+        let unordered = [
+            TestAgentChannel {
+                ordered: false,
+                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+            },
+            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+        ];
+
+        tokio::join!(
+            assert_real_agent_channels_fail_closed("missing-pty", &missing_pty),
+            assert_real_agent_channels_fail_closed("missing-ctl", &missing_ctl),
+            assert_real_agent_channels_fail_closed("duplicate-pty", &duplicate_pty),
+            assert_real_agent_channels_fail_closed("duplicate-ctl", &duplicate_ctl),
+            assert_real_agent_channels_fail_closed("unknown", &unknown),
+            assert_real_agent_channels_fail_closed("early-close", &early_close),
+            assert_real_agent_channels_fail_closed("unordered", &unordered),
+        );
     }
 
     #[tokio::test]

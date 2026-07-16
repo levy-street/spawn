@@ -71,7 +71,7 @@ everything else.
 
 ```
 spawnd (host supervisor, one per host)
- ├── ws/rtc: signaling/control + legacy PTY mirror; WebRTC peer connections
+ ├── ws/rtc: content-free signaling/lifecycle; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
@@ -206,12 +206,11 @@ spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
   ▼ T_OUTPUT (unix socket, 0700 dir, same host)
 spawnd: bounded per-agent outbox → forwarder ──→ DataChannel direct sinks
-                                            └──→ bounded daemon WS mirror
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
 browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
-`pty::run_forwarder` and `ForwarderControl` provide the outbox → WS/direct-sink
+`pty::run_forwarder` and `ForwarderControl` provide bounded outbox → direct-sink
 routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
 `replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
 short-lived `0600` datagram endpoint in the same private directory and sends to
@@ -304,11 +303,10 @@ also retains its independent 12 MiB response rejection ceiling.
   worker PTY read chunks and reader/writer scratch, queued input and worker
   frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
   replay result owns a self-wiping payload even while parked in a oneshot; its
-  source bytes wipe on receiver cancellation and normal consumption. Legacy
-  WS input owns and wipes the complete inbound binary frame after copying its
-  payload into the self-wiping worker-input wrapper. `OutputChunk`, WS/control
-  output, and direct-viewer payloads likewise wipe on drop; their queues are
-  bounded.
+  source bytes wipe on receiver cancellation and normal consumption.
+  DataChannel input is copied into the self-wiping worker-input wrapper.
+  `OutputChunk`, control output, and direct-viewer payloads likewise wipe on
+  drop; their queues are bounded.
 
 **Not covered — stated plainly, per TRUST.md's "honest inventory" ethos:**
 - Plaintext **must** transit worker memory: kernel PTY buffers → userspace
@@ -325,9 +323,8 @@ also retains its independent 12 MiB response rejection ceiling.
 - Kernel-side copies (PTY line discipline, unix socket buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
 - spawnd still handles plaintext in flight (worker socket → bounded outbox →
-  WS mirror/DataChannel). The outbox, worker-command channel, direct-viewer
-  queues, control responses, and WS session sink are bounded; a missing/full
-  legacy mirror is detached and discarded while direct viewers continue, and
+  DataChannel). The outbox, worker-command channel, direct-viewer queues, and
+  control responses are bounded; a lagging direct viewer is detached, and
   reconnect catch-up comes from worker replay. Owned queued payloads wipe on
   drop. Copies inside kernel unix/WebRTC/DTLS stacks are not owned or wiped by
   this code, so this is not a claim of complete system-wide zeroization.
@@ -441,12 +438,12 @@ through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
 
 **Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
 sends `T_RESIZE`; the worker applies it to the PTY master and the checkpoint
-emulator, and checkpoints the log at the new geometry. Resize *authority* is a client/server-side
-concern: the display-control feature (commit c43340c) designates one
+emulator, and checkpoints the log at the new geometry. Resize *authority* is
+negotiated endpoint-to-endpoint over `spawn.ctl`: the daemon's display-control
+hub designates one
 controlling viewer whose geometry drives the session while other viewers dim
-— `display.control` frames carry owner + geometry + viewer metadata only (no
-content), so the worker correctly stays a single-size PTY and needs no
-multi-size machinery.
+without sending geometry or viewer timing through the application server. The
+worker therefore stays a single-size PTY and needs no multi-size machinery.
 
 **Multi-viewer.** Fan-out happens in spawnd's forwarder via per-viewer
 DataChannel direct sinks: every viewer gets the same raw byte stream, and input
@@ -465,10 +462,8 @@ the caller's slice. The worker's separate lifecycle datagram endpoint accepts
 only one atomic fixed 17-byte request into one fixed buffer and is independent
 of the ordinary socket task, so TERM/KILL cannot be starved by the ordinary
 queue, partial stream peers, or a stalled worker socket. The forwarder serves
-bounded direct-viewer sinks first, then offers output without
-blocking to the bounded legacy-WS mirror. A full or absent legacy mirror is
-detached instead of accumulating plaintext, while a lagging direct viewer is
-disconnected. Either transport reconnects and re-seeds from the worker replay
+only bounded direct-viewer sinks; a lagging viewer is disconnected instead of
+accumulating plaintext. A new direct connection re-seeds from the worker replay
 watermark. The replay log uses the conservative total resource budget
 described in §6.2, including checkpoint and framing charges.
 

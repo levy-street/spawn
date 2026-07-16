@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildAgentWsUrl, rtcBindingFrameMatches, SPAWN_WS_SUBPROTOCOL } from "./ws";
+import { agentRtcTuple, buildAgentWsUrl, rtcBindingFrameMatches, SPAWN_WS_SUBPROTOCOL } from "./ws";
 
 const AGENT_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -24,6 +24,16 @@ describe("mandatory agent signaling", () => {
     expect(url.searchParams.get("agent_id")).toBe(AGENT_ID);
     expect(url.searchParams.has("cols")).toBe(false);
     expect(url.searchParams.has("rows")).toBe(false);
+  });
+
+  test("binds every browser RTC signal to the exact agent PTY tuple", () => {
+    expect(agentRtcTuple(AGENT_ID)).toEqual({
+      agent_id: AGENT_ID,
+      scope_type: "agent",
+      scope_id: AGENT_ID,
+      protocol: "spawn.pty",
+      protocol_version: 2,
+    });
   });
 });
 

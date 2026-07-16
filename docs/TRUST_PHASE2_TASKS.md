@@ -80,16 +80,17 @@ The reviewed Wave 0 commits were validated together on `master` at `640a2e0`:
 
 ## Phase 2 runtime schedule
 
-The two transport roots, P2-AGENT-01 and P2-HOST-01, may proceed in parallel
-after the immediate gate. Work beneath a root may parallelize only where its
-protocol is already reviewed and stable.
+The two transport roots, P2-AGENT-01 and P2-HOST-01, and the P2-TMUX-01
+worker-only cutover are reviewed and integrated on `master` through `1f66d2d`.
+Work beneath a root may parallelize only where its protocol is reviewed and
+stable.
 
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
-| P2-TMUX-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Worker-only cutover: remove daemon tmux execution/module/backend selector/session-name protocol state and all tmux create/attach/adopt/discover/capture/replay/resize/scroll/copy/repaint paths; remove tmux-only replay/status filtering plus server/web `tmux_session` and `agent.rename`; add fail-closed guard and cutover ADR | P2-AGENT-01 implementation, QUAL-01 | Strict daemon/server/web gates pass; source inventory proves no production tmux execution, escape hatch, API/schema/UI field, or rename frame; real worker launch/adopt/replay/resize/input/shutdown remains covered; operator drain/restart and old-session unavailability are explicit; mergeability review passes |
-| P2-AGENT-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/display ownership to the mandatory worker replay source | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; worker replay retains whole segments under its 8 MiB conservative total charge (ciphertext/framing + twice replay + bookkeeping), becomes unavailable after worker exit, and replays after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; reviewer notes that `0x01` still remains |
+| P2-TMUX-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Worker-only cutover: remove daemon tmux execution/module/backend selector/session-name protocol state and all tmux create/attach/adopt/discover/capture/replay/resize/scroll/copy/repaint paths; remove tmux-only replay/status filtering plus server/web `tmux_session` and `agent.rename`; add fail-closed guard and cutover ADR | P2-AGENT-01 implementation, QUAL-01 | Strict daemon/server/web gates pass; source inventory proves no production tmux execution, escape hatch, API/schema/UI field, or rename frame; real worker launch/adopt/replay/resize/input/shutdown remains covered; operator drain/restart and old-session unavailability are explicit; mergeability review passes |
+| P2-AGENT-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add versioned per-agent `spawn.ctl`; move history/snapshot plus resize/display ownership to the mandatory worker replay source | GATE-02–05, QUAL-01 | Ordering/reconnect/size/error and multi-viewer viewport tests pass; worker replay retains whole segments under its 8 MiB conservative total charge (ciphertext/framing + twice replay + bookkeeping), becomes unavailable after worker exit, and replays after `spawnd` restart/adoption; v2 server sees no history/snapshot/dimensions/deltas/event timing; the remaining `0x01` mirror is assigned to P2-AGENT-02 |
 | P2-AGENT-02 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Retire `spawn.v1`, daemon `0x01` output and `0x02` input, server transcript writes/history forwarding/pubsub relay; require both agent DataChannels and strict v2 signaling tuples | P2-AGENT-01 | All-target daemon compile, server/web suites, mandatory-channel and old-protocol failure tests, no-content guard, offline-history/cutover documentation, and mergeability review pass |
-| P2-HOST-01 | ACTIVE | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
+| P2-HOST-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
 | P2-HOST-02 | PLANNED | Move host list/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to host channel; browser mediates cross-host streaming | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; streaming is bounded and hash/length checked; two-host authorization tests pass |
 | P2-HOST-03A | PLANNED | Add the parallel interactive tool path on `spawn.host.ctl`: commands, paths, installed/latest versions, detailed errors, and stdout/stderr remain E2E while the legacy route is temporarily retained | P2-HOST-01, QUAL-03 | Interactive check/install works with bounded/cancellable requests and no new server content; compatibility route retention is explicit and Phase 2 remains incomplete |
 | P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
@@ -152,11 +153,11 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 
 1. **Wave 0 (complete):** DOC-01, GATE-01–05, and QUAL-01–05 passed
    independent review and are integrated on `master` through `640a2e0`.
-2. **Wave 1 (active):** P2-AGENT-01, its P2-TMUX-01 worker-only cutover, and
-   P2-HOST-01 are being implemented in parallel worktrees. No transport or
-   cutover implementation has yet passed review or been integrated on `master`
-   at this checkpoint.
-3. **Wave 2:** P2-AGENT-02/P2-TERM-01/P2-TERM-02 on the agent protocol while
+2. **Wave 1 (complete):** P2-AGENT-01, its P2-TMUX-01 worker-only cutover, and
+   P2-HOST-01 passed independent review and are integrated on `master` through
+   `1f66d2d`.
+3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 are implemented with review
+   pending; P2-TERM-01 remains planned on the agent protocol while
    P2-HOST-02 and P2-HOST-03A implement separate host-channel operations
    (rebasing/serializing shared route edits before merge). P2-DATA-01 design
    review may run alongside them once P2-HOST-01 fixes the transport boundary.

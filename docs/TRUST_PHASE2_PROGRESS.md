@@ -10,7 +10,8 @@ A security audit found that the server **saw protected content**: even for v2
 (DataChannel) clients the daemon mirrored PTY output to the server as plaintext
 (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
 transited the server. The P2-AGENT-02 implementation checkpoint removes that
-agent-terminal path; its independent review and merge are still pending. Host paths/files/transfers, installer output,
+agent-terminal path; its independent review and merge are still pending. Host
+paths/files/transfers, installer output,
 REST terminal surfaces, launch values, preset environment templates, and skill
 bodies also have server-readable paths or stores. Signaling is unsigned (server
 can MITM the DataChannel). Goal of this work ("Tier 2"):
@@ -38,6 +39,7 @@ can MITM the DataChannel). Goal of this work ("Tier 2"):
 | `aa524d9` | QUAL-05 | Full server suite made hermetic against ambient auth-provider environment and prior migration connection state. |
 | `1bb9fe9`, `775b7d0` | QUAL-02, QUAL-04 | Independently reviewed repository-wide daemon format cleanup and strict Clippy fixes. |
 | `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
+| `1f66d2d` | P2-AGENT-01, P2-TMUX-01, P2-HOST-01 | Integrated the independently reviewed per-agent control root, worker-only/tmux-removal cutover, and host-scoped control root plus their hardening series on `master`. |
 
 ### Increment 1 detail (the keystone)
 
@@ -72,7 +74,7 @@ drift. Those findings are now all corrected, independently reviewed, and
 integrated through `640a2e0`. The originally recorded failures above remain
 historical facts; they should not be rewritten as a passing run.
 
-**Current integrated validation at `640a2e0`:** strict repository-wide daemon
+**Historical integrated validation at `640a2e0`:** strict repository-wide daemon
 format and Clippy checks pass; `cargo test --locked` passes 113 daemon tests;
 full server Ruff passes; the hermetic full server suite passes 128 tests; and
 the real-Redis pub/sub smoke passes.
@@ -87,14 +89,13 @@ Increment 1's output-activity path is **shipped to the dev stack**. It made the
 later mirror cut possible by removing the server's need to inspect terminal
 bytes for activity.
 
-Wave 1 is now active in parallel worktrees: P2-AGENT-01 is implementing the
-per-agent `spawn.ctl` root and P2-HOST-01 the independent host-scoped
-`spawn.host.ctl` root. At this checkpoint no Wave 1 transport code has passed
-review or been integrated on `master`. The detailed status/dependencies are in
-`TRUST_PHASE2_TASKS.md`.
+Wave 1 is complete on `master` through `1f66d2d`: P2-AGENT-01,
+P2-TMUX-01, and P2-HOST-01 passed independent review and were integrated. The
+per-agent `spawn.ctl`, mandatory worker-only backend, and independent
+host-scoped `spawn.host.ctl` roots are therefore established. The detailed
+status/dependencies are in `TRUST_PHASE2_TASKS.md`.
 
-**P2-TMUX-01 cutover checkpoint (implemented, review pending):** the
-P2-AGENT-01 branch now has one mandatory session backend. Production daemon
+**P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
 tmux module, backend selector/env escape hatch, session-name protocol state,
 tmux discovery/attach/capture/copy/repaint paths, exact tmux replay buffer, and
@@ -102,7 +103,7 @@ tmux-status classifier/tests are deleted. `scripts/check-worker-only-daemon.sh`
 guards that boundary in `scripts/test-all.sh`. The decision and operator
 boundary are recorded in `docs/TMUX_REMOVAL.md`.
 
-This is a source checkpoint only: it has not deployed, restarted a service,
+This merged source checkpoint has not deployed, restarted a service,
 signalled a live process, or deleted an external session. Old sessions cannot
 be transparently migrated and are intentionally unavailable to the new daemon.
 Operators must close ingress, drain them under a change window, install both
@@ -121,6 +122,13 @@ clients and daemons receive only `protocol.required` then close. Strict binding
 tuples and `scripts/check-no-server-terminal-content.sh` fail closed against a
 content path returning.
 
+**Current P2-AGENT-02 review-candidate validation:** strict daemon format and
+Clippy pass; all 140 daemon tests pass; server Ruff and all 146 server tests
+pass; web lint, all 27 unit tests, 67 browser tests (3 opt-in audits skipped),
+and the production build pass. `SPAWN_E2E_PORT=3427 scripts/test-all.sh` passes
+all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
+daemon, live-browser, and service-manager smokes.
+
 This is still a source checkpoint: it is not merged or deployed, does not purge
 historical copies, and does not complete Phase 2. Offline history is now an
 explicit non-feature: replay is available only from a live endpoint worker;
@@ -130,27 +138,23 @@ backups, replicas and snapshots remain in P2-PURGE-01 scope.
 
 ## Remaining sequence
 
-1. Independently review and merge per-agent `spawn.ctl` plus the mandatory
-   worker cutover, while the separate host-scoped `spawn.host.ctl` proceeds.
-   Per-agent RTC is not sufficient for file/tool operations on a host with no
-   agent.
-2. Independently review and merge the `spawn.v1`/`0x01`/`0x02` cut and removed
+1. Independently review and merge the `spawn.v1`/`0x01`/`0x02` cut and removed
    terminal/viewport surfaces; then migrate agent uploads, which still use a
    server-visible route.
-3. Move host listings/read/write/transfer onto the host channel and ship a
+2. Move host listings/read/write/transfer onto the host channel and ship a
    parallel E2E path for interactive installer detail. Cross-host bytes stream
    through the trusted browser, not the server. Keep the legacy tool route until
    its endpoint-owned durable targets exist; this wave is not the final tool cut.
-4. Move full launch manifests, `Agent.env`, preset environment/install/tool
+3. Move full launch manifests, `Agent.env`, preset environment/install/tool
    targets, and skill bodies to the approved endpoint-owned/encrypted store.
    Stop cwd-derived default names, then make the interactive E2E tool path
    mandatory, remove its legacy server route, finish unattended tool migration,
    and replace free-form server-visible daemon errors with E2E details.
-5. Only after replacements and endpoint recovery tests pass, drain/restart
+4. Only after replacements and endpoint recovery tests pass, drain/restart
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-6. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
+5. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
    bound to SDP, session, agent-or-host scope, protocol version, sender role, and
    intended peer key. Trusted/verifiable endpoints test fingerprint substitution
    and cross-session/cross-scope replay for both agent- and host-scoped peer

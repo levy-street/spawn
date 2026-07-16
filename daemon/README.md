@@ -37,12 +37,12 @@ spawnd --server https://other run    # override
 ```
 
 This is a foreground service. It connects WSS to `<server>/ws/daemon`,
-registers, and processes `agent.create` / `agent.kill` / `agent.resize`
-frames, multiplexing PTY I/O for any number of concurrent agents over the
-single connection. When the browser and daemon can establish WebRTC, terminal
-input/output also flows over a direct `spawn.pty` DataChannel while the
-websocket remains the control plane and transcript/fallback path. On disconnect
-it reconnects with exponential backoff
+registers, and processes lifecycle, upload, and bound WebRTC-signaling frames.
+Terminal input/output uses the mandatory ordered `spawn.pty` DataChannel;
+history, snapshots, resize, and display ownership use the mandatory ordered
+`spawn.ctl` DataChannel. The WebSocket is a JSON-only control/signaling path,
+not a PTY relay, transcript, or fallback. If either DataChannel is unavailable,
+the terminal fails closed. On disconnect it reconnects with exponential backoff
 (1s, 2s, 4s, … capped at 60s) and re-registers with `existing_agents = […]`
 so the server resyncs its routing map without disturbing running workers.
 
@@ -67,10 +67,11 @@ your OS keyring under service `spawn`, user `daemon`.
 
 ## Wire protocol
 
-The daemon implements the daemon-side of `proto/README.md` (subprotocol
-`spawn.v1`). Binary PTY frames are `u8 kind | 16-byte big-endian uuid |
-bytes`, with `0x01` for output (daemon→server) and `0x02` for input
-(server→daemon).
+The daemon implements the daemon side of `proto/README.md`. `/ws/daemon`
+requires the server to select `spawn.control.v2`; every WebSocket frame is
+JSON. Agent RTC offer/candidate/close messages are bound to the exact agent,
+scope, `spawn.pty` protocol, protocol version, nonce, and daemon generation.
+Binary WebSocket frames and legacy protocol selection fail closed.
 
 ## Process model
 
