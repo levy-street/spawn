@@ -186,11 +186,14 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     Ok(assemble(
         spec.agent_id,
         started.pid,
-        spec.cols,
-        spec.rows,
-        wire::lifecycle_socket_path(&socket),
-        hello.instance_id,
-        stream,
+        WorkerConnection {
+            cwd: started.cwd,
+            cols: spec.cols,
+            rows: spec.rows,
+            lifecycle_socket: wire::lifecycle_socket_path(&socket),
+            lifecycle_instance: hello.instance_id,
+            stream,
+        },
     ))
 }
 
@@ -224,11 +227,16 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
     Ok(Some(assemble(
         agent_id,
         hello.pid.unwrap_or(0),
-        hello.cols.max(1),
-        hello.rows.max(1),
-        wire::lifecycle_socket_path(&socket),
-        hello.instance_id,
-        stream,
+        WorkerConnection {
+            cwd: hello
+                .cwd
+                .context("worker did not retain its cwd capability root")?,
+            cols: hello.cols.max(1),
+            rows: hello.rows.max(1),
+            lifecycle_socket: wire::lifecycle_socket_path(&socket),
+            lifecycle_instance: hello.instance_id,
+            stream,
+        },
     )))
 }
 
@@ -264,15 +272,24 @@ pub fn discover_ids() -> Vec<Uuid> {
 /// Wire a connected worker stream into the standard per-agent plumbing:
 /// outbox → forwarder, a command channel for stdin/resize/replay, a separate
 /// acknowledged lifecycle channel, and an exit oneshot.
-fn assemble(
-    agent_id: Uuid,
-    pid: u32,
+struct WorkerConnection {
+    cwd: String,
     cols: u16,
     rows: u16,
     lifecycle_socket: PathBuf,
     lifecycle_instance: Uuid,
     stream: UnixStream,
-) -> pty::Launched {
+}
+
+fn assemble(agent_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Launched {
+    let WorkerConnection {
+        cwd,
+        cols,
+        rows,
+        lifecycle_socket,
+        lifecycle_instance,
+        stream,
+    } = connection;
     let (outbox_tx, outbox_rx) = mpsc::channel::<pty::OutputChunk>(pty::WORKER_OUTPUT_QUEUE_DEPTH);
     let control = ForwarderControl::new();
     tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
@@ -303,6 +320,7 @@ fn assemble(
 
     let handle = AgentHandle::new_worker(WorkerHandleParts {
         agent_id,
+        cwd,
         cmd_tx,
         lifecycle: pty::AgentLifecycle::new(lifecycle_socket, lifecycle_instance),
         alive,
@@ -569,6 +587,7 @@ mod tests {
                     pid: Some(10),
                     cols: 80,
                     rows: 24,
+                    cwd: Some("/".into()),
                 },
             )
             .await
@@ -636,6 +655,7 @@ mod tests {
         ));
         let handle = AgentHandle::new_worker(WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: pty::AgentLifecycle::new(
                 PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
@@ -899,6 +919,7 @@ mod tests {
         let (priority_outbox, _priority_outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let priority_handle = AgentHandle::new_worker(WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx: stalled_cmd_tx,
             lifecycle: adopted.handle.lifecycle(),
             alive: Arc::new(AtomicBool::new(true)),

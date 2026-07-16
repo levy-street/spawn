@@ -21,6 +21,12 @@ async function openTerminalWithMockSocket(
   } = {},
 ) {
   const messages: Array<string | Buffer> = [];
+  const uploads: Array<{
+    name: string;
+    mimeType: string;
+    destination: "attachments" | "cwd";
+    bytes: Buffer;
+  }> = [];
   await installAgentRtcMock(page, messages, {
     control: options.control,
     history: options.history,
@@ -28,6 +34,9 @@ async function openTerminalWithMockSocket(
     openChannels: !options.noChannels,
     sendReady: !options.noReady,
     autoSnapshot: options.autoSnapshot,
+    onUpload: (upload) => {
+      uploads.push(upload);
+    },
   });
   await mockAuthenticatedApi(page, { agents: [agent()] });
   const sockets: WebSocketRoute[] = [];
@@ -57,7 +66,7 @@ async function openTerminalWithMockSocket(
 
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(page.getByLabel("Agent terminal")).toBeVisible();
-  return { messages, sockets };
+  return { messages, sockets, uploads };
 }
 
 function binaryText(messages: Array<string | Buffer>) {
@@ -238,23 +247,8 @@ test("owner sees additional viewer count", async ({ page }) => {
   await expect(page.getByText("2 viewers")).toBeVisible();
 });
 
-test("terminal sends resize frames and uploads files over REST", async ({ page }) => {
-  const { messages } = await openTerminalWithMockSocket(page);
-  const uploads: Array<Record<string, unknown>> = [];
-  await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
-    const body = route.request().postDataJSON() as Record<string, unknown>;
-    uploads.push(body);
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      json: {
-        agent_id: AGENT_ID,
-        path: "/Users/tester/projects/spawn/note.txt",
-        client_id: String(body.client_id ?? ""),
-        pasted: false,
-      },
-    });
-  });
+test("terminal sends resize and chunked uploads over direct DataChannels", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
 
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
@@ -269,9 +263,19 @@ test("terminal sends resize frames and uploads files over REST", async ({ page }
     .toMatchObject({
       destination: "cwd",
       name: "note.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.from("hello file"),
+    });
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "upload_start"))
+    .toMatchObject({
+      destination: "cwd",
+      name: "note.txt",
       mime_type: "text/plain",
-      bytes_b64: Buffer.from("hello file").toString("base64"),
-      paste: false,
+      total_bytes: 10,
+      chunks: 1,
+      capability: "00112233-4455-4677-8899-aabbccddeeff",
+      agent_generation: 1,
     });
   await expect(page.getByText("Uploaded /Users/tester/projects/spawn/note.txt")).toBeVisible();
 });

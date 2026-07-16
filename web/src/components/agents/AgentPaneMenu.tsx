@@ -113,7 +113,7 @@ export function AgentPaneMenuItems({
           onSelect={() => {
             const handle = getHandle();
             if (!handle) return;
-            runDiagnosticRefresh(handle, agent.id).catch((err) =>
+            runDiagnosticRefresh(handle).catch((err) =>
               onError(`diagnostic refresh: ${String(err)}`),
             );
           }}

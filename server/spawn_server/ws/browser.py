@@ -5,17 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from .. import auth as auth_mod
-from ..agent_control import (
-    MAX_UPLOAD_CLIENT_ID_LENGTH,
-    UploadValidationError,
-    decode_upload,
-    upload_paste_prefix,
-)
 from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Agent, User
@@ -41,24 +34,9 @@ router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
 AGENT_RTC_PROTOCOL = "spawn.pty"
 AGENT_RTC_PROTOCOL_VERSION = 2
-BROWSER_UPLOAD_TIMEOUT_SECONDS = 30.0
 BROWSER_WS_PROTOCOL = "spawn.v2"
 WS_CLOSE_PROTOCOL_REQUIRED = 4003
 WS_CLOSE_CONTENT_FORBIDDEN = 4002
-
-
-def _decode_upload(obj: dict) -> tuple[str, str, str, str | None]:
-    return decode_upload(
-        name=obj.get("name"),
-        mime_type=obj.get("mime_type"),
-        bytes_b64=obj.get("bytes_b64"),
-        destination=obj.get("destination"),
-    )
-
-
-def _decode_image_upload(obj: dict) -> tuple[str, str, str]:
-    name, mime_type, bytes_b64, _destination = _decode_upload(obj)
-    return name, mime_type, bytes_b64
 
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
@@ -197,8 +175,6 @@ async def browser_ws(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="agent not found")
             return
         host_id = agent.host_id
-        agent_cwd = agent.cwd
-        agent_argv = list(agent.argv or [])
         agent_status = agent.status
 
     broker = get_broker()
@@ -230,8 +206,6 @@ async def browser_ws(
                     if not isinstance(event, dict) or event.get("type") not in {
                         "agent.status",
                         "agent.exit",
-                        "upload.legacy_saved",
-                        "upload.legacy_error",
                     }:
                         continue
                     try:
@@ -373,87 +347,12 @@ async def browser_ws(
                     )
                     break
                 if ftype == "upload":
-                    try:
-                        name, mime_type, bytes_b64, destination = _decode_upload(obj)
-                    except UploadValidationError as e:
-                        await conn.send_text({"type": "upload.error", "message": str(e)})
-                        continue
-                    client_id = obj.get("client_id")
-                    if isinstance(client_id, str) and client_id:
-                        client_id = client_id[:MAX_UPLOAD_CLIENT_ID_LENGTH]
-                    else:
-                        client_id = f"upload-{uuid.uuid4().hex}"
-
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
-                        host_id
+                    log.warning("retired server-visible agent upload frame; closing")
+                    await websocket.close(
+                        code=WS_CLOSE_CONTENT_FORBIDDEN,
+                        reason="agent uploads belong on spawn.ctl",
                     )
-                    if daemon is None:
-                        await conn.send_text(
-                            {"type": "upload.error", "message": "No daemon is connected."}
-                        )
-                        continue
-                    try:
-                        result = await broker.request_upload(
-                            agent_id,
-                            daemon,
-                            payload={
-                                "type": "agent.upload",
-                                "agent_id": agent_id,
-                                "cwd": agent_cwd,
-                                "name": name,
-                                "mime_type": mime_type,
-                                "bytes_b64": bytes_b64,
-                                "paste_prefix": upload_paste_prefix(agent_argv),
-                                "paste": bool(obj.get("paste", True)),
-                                "destination": destination,
-                                "client_id": client_id,
-                            },
-                            client_id=client_id,
-                            timeout=BROWSER_UPLOAD_TIMEOUT_SECONDS,
-                        )
-                        if result is None:
-                            await conn.send_text(
-                                {
-                                    "type": "upload.error",
-                                    "client_id": client_id,
-                                    "message": "Upload timed out.",
-                                }
-                            )
-                        elif result.get("type") == "error":
-                            await conn.send_text(
-                                {
-                                    "type": "upload.error",
-                                    "client_id": client_id,
-                                    "message": result.get("message") or "Image upload failed.",
-                                }
-                            )
-                        else:
-                            path = result.get("path")
-                            if isinstance(path, str):
-                                await conn.send_text(
-                                    {
-                                        "type": "upload.saved",
-                                        "client_id": client_id,
-                                        "path": path,
-                                    }
-                                )
-                            else:
-                                await conn.send_text(
-                                    {
-                                        "type": "upload.error",
-                                        "client_id": client_id,
-                                        "message": "Upload returned an invalid response.",
-                                    }
-                                )
-                    except Exception as e:
-                        log.warning("upload forward failed: %s", e)
-                        await conn.send_text(
-                            {
-                                "type": "upload.error",
-                                "client_id": client_id,
-                                "message": "Upload could not reach the daemon.",
-                            }
-                        )
+                    break
                 elif ftype == "rtc.offer":
                     proposed_nonce = obj.get("binding_nonce")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))

@@ -197,11 +197,6 @@ Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `agent.activity` records meaningful PTY output timing, while
 `agent.input_activity` records input timing for the direct WebRTC DataChannel.
 
-{"type": "agent.uploaded",
- "agent_id": "uuid",
- "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
- "client_id": "browser-upload-id"}
-
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-generated-hex",
@@ -386,17 +381,6 @@ detail is not placed on the signaling websocket.
 `agent.kill.signal` is optional and accepts only `TERM` or `KILL`; omitted
 means `TERM`. Other values are rejected before lifecycle dispatch.
 
-{"type": "agent.upload",
- "agent_id": "uuid",
- "cwd": "/home/me/projects/foo",
- "name": "screenshot.png",
- "mime_type": "image/png",
- "bytes_b64": "...",
- "paste_prefix": "@",
- "paste": false,
- "destination": "cwd",
- "client_id": "browser-upload-id"}
-
 {"type": "rtc.offer",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-or-server-generated-hex",
@@ -438,14 +422,7 @@ legacy `generation` spelling is rejected.
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
-provider credentials — each agent CLI authenticates itself on the host.
-Image uploads are saved by the daemon under `<cwd>/.spawn/attachments/` by
-default. When `destination` is `"cwd"`, the upload may be any file type and is
-saved directly under `<cwd>` using a sanitized, non-overwriting filename.
-When `paste` is true or omitted, the saved path is inserted into the agent PTY
-using `paste_prefix`; when `paste` is false, the daemon only reports the saved
-path back to the browser. `client_id` is an optional browser correlation id.
-The server sends
+provider credentials — each agent CLI authenticates itself on the host. The server sends
 `host.heartbeat` acknowledgements for daemon heartbeats so the daemon can
 distinguish healthy idle connections from dead sockets.
 
@@ -455,18 +432,14 @@ distinguish healthy idle connections from dead sockets.
 - Required subprotocol: `spawn.v2`. An old/missing subprotocol receives only
   `{"type":"protocol.required","protocol":"spawn.v2","version":2}` and
   closes with `4003`.
-- This WebSocket is content-free signaling, disclosed lifecycle/status, and
-  the still-pending upload migration. It never sends binary frames and closes
-  with `4002` for a binary frame or terminal viewport/history/snapshot JSON.
+- This WebSocket is content-free signaling plus disclosed lifecycle/status. It
+  never sends binary frames and closes with `4002` for a binary frame or any
+  retired terminal, viewport, history, snapshot, or upload JSON frame.
 - History, snapshots, geometry, scrolling, redraw and display ownership use
-  `spawn.ctl`; terminal bytes use `spawn.pty`. Neither reaches the server.
+  `spawn.ctl`; terminal bytes use `spawn.pty`; agent uploads use the upload
+  stream on `spawn.ctl`. None reaches the server.
 
 ### Browser → server
-
-```json
-{"type": "upload", "name": "screenshot.png", "mime_type": "image/png", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
-{"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
-```
 
 The browser additionally sends
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
@@ -483,9 +456,6 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
-{"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
-{"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
-{"type": "upload.error", "message": "..."}
 {"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "sdp": "v=0..."}
 {"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "candidate": {"candidate": "..."}}
 {"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "status": "connected|failed"}
@@ -527,6 +497,8 @@ UUID and binds every response/chunk to its caller:
 {"version":1,"kind":"request","request_id":"uuid","operation":"take_control","cols":120,"rows":32}
 {"version":1,"kind":"request","request_id":"uuid","operation":"scroll","lines":-8}
 {"version":1,"kind":"request","request_id":"uuid","operation":"redraw"}
+{"version":1,"kind":"request","request_id":"upload-uuid","operation":"upload_start","capability":"ready-capability-uuid","agent_generation":7,"name":"notes.txt","mime_type":"text/plain","destination":"cwd","total_bytes":90000,"chunks":2,"sha256":"64-lowercase-hex-digest"}
+{"version":1,"kind":"request","request_id":"cancel-uuid","operation":"upload_cancel","capability":"ready-capability-uuid","agent_generation":7,"upload_id":"upload-uuid"}
 ```
 
 History and snapshot currently support styled terminal replay only
@@ -563,6 +535,38 @@ Each binary chunk is at most 48 KiB of payload:
 | 4 bytes  | u8 (=1) | u8=1 | u16LE | 16 raw bytes   | u32LE    | bytes   |
 +----------+---------+------+-------+----------------+----------+---------+
 ```
+
+Upload chunks use the same 28-byte header with `kind=2`; the request UUID is
+the stable upload UUID and flag bit 0 is set only on the final chunk. Before
+accepting upload metadata, the daemon's `ready` event gives this control
+channel a fresh unguessable capability, the exact bound agent-backend
+generation, and the fixed endpoint limits:
+
+```json
+{"version":1,"kind":"event","event":"ready","upload_capability":"uuid","agent_generation":7,"upload_max_bytes":20971520,"upload_chunk_bytes":49152}
+{"version":1,"kind":"response","request_id":"upload-uuid","operation":"upload_start","ok":true,"state":"ready","next_sequence":1,"received_bytes":49152}
+{"version":1,"kind":"response","request_id":"upload-uuid","operation":"upload_complete","ok":true,"state":"complete","path":"/endpoint/path/notes.txt","total_bytes":90000,"sha256":"64-lowercase-hex-digest"}
+```
+
+The browser hashes before sending, applies SCTP buffered-amount backpressure,
+and retries a stable upload UUID a bounded number of times. The daemon admits
+at most 20 MiB per upload, 48 KiB per chunk, four active uploads per viewer,
+and 64 active uploads globally. A retry with the identical manifest resumes at
+the acknowledged sequence or returns the cached completion; reuse with a
+different manifest fails. Chunks must be ordered with exact lengths and final
+flag. Length, SHA-256, capability, backend generation, framing, and destination
+checks all fail closed. Cancellation, channel loss, backend replacement, and
+malformed chunks remove private temporary files.
+
+The retained worker cwd is a canonical absolute capability root. The endpoint
+opens it and its attachment directories component-by-component without
+following symlinks, accepts a single relative leaf name only, writes a same-dir
+mode-0600 temporary file, and commits with an atomic no-clobber link. Existing
+regular files and symlinks are never overwritten. The final endpoint path and
+detailed error exist only on `spawn.ctl`; the REST API and both server
+WebSockets have no agent-upload content or acknowledgement leg. Workers older
+than private worker protocol version 5 lack the retained cwd capability and are
+rejected for adoption rather than enabling a server or path fallback.
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.

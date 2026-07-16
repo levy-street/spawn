@@ -178,6 +178,7 @@ impl AgentRegistry {
     }
 
     /// Apply `f` to the handle if it exists. Returns whether it was found.
+    #[cfg(test)]
     pub fn with_handle<F: FnOnce(&AgentHandle)>(&self, id: Uuid, f: F) -> bool {
         let guard = self.inner.lock().expect("agents lock");
         if let Some(entry) = guard.get(&id) {
@@ -209,6 +210,14 @@ impl AgentRegistry {
             .get(&binding.agent_id)
             .filter(|entry| entry.generation == binding.generation)
             .map(|entry| entry.handle.control.clone())
+    }
+
+    pub fn cwd_for_binding(&self, binding: AgentBinding) -> Option<Arc<str>> {
+        let guard = self.inner.lock().expect("agents lock");
+        guard
+            .get(&binding.agent_id)
+            .filter(|entry| entry.generation == binding.generation)
+            .map(|entry| Arc::clone(&entry.handle.cwd))
     }
 
     pub fn lifecycle_snapshot(&self, id: Uuid) -> Option<AgentLifecycleSnapshot> {
@@ -261,6 +270,7 @@ mod tests {
         let (outbox_tx, _outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
         AgentHandle::new_worker(WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: AgentLifecycle::new(lifecycle_socket, Uuid::new_v4()),
             alive: Arc::new(AtomicBool::new(true)),

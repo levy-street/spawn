@@ -13,6 +13,12 @@ export async function installAgentRtcMock(
     sendReady?: boolean;
     autoSnapshot?: boolean;
     onPtyInput?: (bytes: Buffer) => void | Promise<void>;
+    onUpload?: (upload: {
+      name: string;
+      mimeType: string;
+      destination: "attachments" | "cwd";
+      bytes: Buffer;
+    }) => void | Promise<void>;
   } = {},
 ) {
   await page.exposeFunction("__spawnRecordRtcTestMessage", async (label: string, value: string) => {
@@ -22,6 +28,17 @@ export async function installAgentRtcMock(
       await options.onPtyInput?.(capturedValue);
     }
   });
+  await page.exposeFunction(
+    "__spawnRecordRtcTestUpload",
+    async (name: string, mimeType: string, destination: string, value: string) => {
+      await options.onUpload?.({
+        name,
+        mimeType,
+        destination: destination === "cwd" ? "cwd" : "attachments",
+        bytes: Buffer.from(value, "base64"),
+      });
+    },
+  );
   await page.addInitScript(
     ({ history, secondHistory, control, openChannels, sendReady, autoSnapshot }) => {
       const encoder = new TextEncoder();
@@ -37,6 +54,10 @@ export async function installAgentRtcMock(
         channels: new Map<string, FakeDataChannel>(),
         ptyChannels: [] as FakeDataChannel[],
         pendingReplay: [] as Array<{ channel: FakeDataChannel; request: Record<string, unknown> }>,
+        uploads: new Map<
+          string,
+          { request: Record<string, unknown>; nextSequence: number; chunks: Uint8Array[] }
+        >(),
         ptyOffset: 0,
       };
 
@@ -47,6 +68,14 @@ export async function installAgentRtcMock(
           bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
         }
         return bytes;
+      }
+
+      function bytesUuid(bytes: Uint8Array) {
+        const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+          16,
+          20,
+        )}-${hex.slice(20)}`;
       }
 
       function ctlChunk(requestId: string, payload: Uint8Array) {
@@ -88,10 +117,15 @@ export async function installAgentRtcMock(
         label: string;
         readyState: RTCDataChannelState = "connecting";
         binaryType = "arraybuffer";
+        bufferedAmount = 0;
+        bufferedAmountLowThreshold = 0;
         onopen: (() => void) | null = null;
         onclose: (() => void) | null = null;
         onerror: (() => void) | null = null;
         onmessage: ((event: MessageEvent) => void) | null = null;
+
+        addEventListener() {}
+        removeEventListener() {}
 
         constructor(label: string) {
           this.label = label;
@@ -120,7 +154,74 @@ export async function installAgentRtcMock(
             }
           ).__spawnRecordRtcTestMessage(this.label, capture);
 
-          if (this.label !== "spawn.ctl" || typeof value !== "string") return;
+          if (this.label !== "spawn.ctl") return;
+          if (typeof value !== "string") {
+            const bytes =
+              value instanceof ArrayBuffer
+                ? new Uint8Array(value)
+                : ArrayBuffer.isView(value)
+                  ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+                  : new Uint8Array();
+            if (
+              bytes.length < 29 ||
+              String.fromCharCode(...bytes.subarray(0, 4)) !== "SPCT" ||
+              bytes[4] !== 1 ||
+              bytes[5] !== 2
+            ) {
+              return;
+            }
+            const uploadId = bytesUuid(bytes.subarray(8, 24));
+            const upload = state.uploads.get(uploadId);
+            if (!upload) return;
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const sequence = view.getUint32(24, true);
+            if (sequence !== upload.nextSequence) return;
+            upload.chunks.push(bytes.slice(28));
+            upload.nextSequence += 1;
+            if ((view.getUint16(6, true) & 1) === 0) return;
+            const totalBytes = Number(upload.request.total_bytes);
+            const merged = new Uint8Array(totalBytes);
+            let offset = 0;
+            for (const chunk of upload.chunks) {
+              merged.set(chunk, offset);
+              offset += chunk.length;
+            }
+            if (offset !== totalBytes) return;
+            state.uploads.delete(uploadId);
+            let binary = "";
+            for (const byte of merged) binary += String.fromCharCode(byte);
+            void (
+              window as unknown as {
+                __spawnRecordRtcTestUpload: (
+                  name: string,
+                  mimeType: string,
+                  destination: string,
+                  value: string,
+                ) => Promise<void>;
+              }
+            ).__spawnRecordRtcTestUpload(
+              String(upload.request.name),
+              String(upload.request.mime_type),
+              String(upload.request.destination),
+              btoa(binary),
+            );
+            queueMicrotask(() =>
+              this.receive(
+                JSON.stringify({
+                  version: 1,
+                  kind: "response",
+                  request_id: uploadId,
+                  operation: "upload_complete",
+                  ok: true,
+                  state: "complete",
+                  path: `/Users/tester/projects/spawn/${String(upload.request.name)}`,
+                  total_bytes: totalBytes,
+                  sha256: upload.request.sha256,
+                }),
+              ),
+            );
+            return;
+          }
           let request: Record<string, unknown>;
           try {
             request = JSON.parse(value);
@@ -129,7 +230,41 @@ export async function installAgentRtcMock(
           }
           if (request.kind !== "request") return;
           const operation = String(request.operation);
-          if (operation === "history") {
+          if (operation === "upload_start") {
+            const uploadId = String(request.request_id);
+            const existing = state.uploads.get(uploadId);
+            if (!existing) {
+              state.uploads.set(uploadId, { request, nextSequence: 0, chunks: [] });
+            }
+            const active = state.uploads.get(uploadId);
+            queueMicrotask(() =>
+              this.receive(
+                JSON.stringify({
+                  version: 1,
+                  kind: "response",
+                  request_id: uploadId,
+                  operation: "upload_start",
+                  ok: true,
+                  state: "ready",
+                  next_sequence: active?.nextSequence ?? 0,
+                  received_bytes: active?.chunks.reduce((sum, chunk) => sum + chunk.length, 0) ?? 0,
+                }),
+              ),
+            );
+          } else if (operation === "upload_cancel") {
+            state.uploads.delete(String(request.upload_id));
+            queueMicrotask(() =>
+              this.receive(
+                JSON.stringify({
+                  version: 1,
+                  kind: "response",
+                  request_id: request.request_id,
+                  operation,
+                  ok: true,
+                }),
+              ),
+            );
+          } else if (operation === "history") {
             const selected = state.connections === 1 ? state.history : state.secondHistory;
             queueMicrotask(() => replyReplay(this, request, selected));
           } else if (operation === "snapshot") {
@@ -180,6 +315,10 @@ export async function installAgentRtcMock(
                   version: 1,
                   kind: "event",
                   event: "ready",
+                  upload_capability: "00112233-4455-4677-8899-aabbccddeeff",
+                  agent_generation: 1,
+                  upload_max_bytes: 20 * 1024 * 1024,
+                  upload_chunk_bytes: 48 * 1024,
                 }),
               );
             }

@@ -35,7 +35,6 @@ import {
   TERMINAL_THEME,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -101,6 +100,11 @@ export interface TerminalHandle {
   /** Capture diagnostics, force a full refit + reseed, capture again.
    *  Returns the before/after bundle for saving. */
   refreshDiagnostics: () => Promise<Record<string, unknown>>;
+  /** Upload a file directly over the bound spawn.ctl channel. */
+  uploadFile: (
+    file: File,
+    options?: { destination?: "attachments" | "cwd"; uploadId?: string },
+  ) => Promise<{ path: string; uploadId: string }>;
   /** Focus the terminal so keystrokes flow there (raw mode). */
   focus: () => void;
   /** Submit the current terminal draft, appending pending image refs first. */
@@ -1240,10 +1244,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       setExitBanner(`Agent exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
     },
-    onUploadError: (message) => {
-      showUploadStatus(message);
-    },
-    onUploadSaved: handleUploadSaved,
   });
 
   // Stash the socket in a ref so the once-on-mount bootstrap useEffect can
@@ -2418,16 +2418,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           },
         ]);
         try {
-          const bytes_b64 = await fileToBase64(file);
-          const result = await agentsApi.upload(agentId, {
-            client_id: clientId,
+          const result = await socket.uploadFile(file, {
+            uploadId: clientId,
             name: file.name || defaultImageName(file),
-            mime_type: mimeTypeForFile(file),
-            bytes_b64,
-            paste: false,
+            mimeType: mimeTypeForFile(file),
+            destination: "attachments",
           });
           sent += 1;
-          handleUploadSaved(result.path, result.client_id);
+          handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
           showUploadStatus(
             error instanceof Error && error.message
@@ -2445,7 +2443,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         termRef.current?.focus();
       }
     },
-    [agentId, handleUploadSaved, showUploadStatus, updatePendingAttachments],
+    [handleUploadSaved, showUploadStatus, socket, updatePendingAttachments],
   );
 
   const uploadFilesToCwd = useCallback(
@@ -2461,14 +2459,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           continue;
         }
         try {
-          const bytes_b64 = await fileToBase64(file);
-          const result = await agentsApi.upload(agentId, {
-            client_id: makeClientId(),
+          const result = await socket.uploadFile(file, {
+            uploadId: makeClientId(),
             destination: "cwd",
             name: file.name || "file",
-            mime_type: mimeTypeForUpload(file),
-            bytes_b64,
-            paste: false,
+            mimeType: mimeTypeForUpload(file),
           });
           sent += 1;
           showUploadStatus(`Uploaded ${compactPath(result.path)}`);
@@ -2484,7 +2479,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         termRef.current?.focus();
       }
     },
-    [agentId, showUploadStatus],
+    [showUploadStatus, socket],
   );
 
   const pasteFromClipboard = useCallback(async () => {
@@ -2785,6 +2780,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           before,
           after,
         };
+      },
+      uploadFile: async (file, options) => {
+        const result = await socket.uploadFile(file, {
+          name: file.name || "file",
+          mimeType: mimeTypeForUpload(file),
+          destination: options?.destination ?? "attachments",
+          uploadId: options?.uploadId,
+        });
+        return { path: result.path, uploadId: result.uploadId };
       },
       focus: () => termRef.current?.focus(),
       submit: () => {
@@ -3289,13 +3293,4 @@ function compactPath(path: string): string {
   const idx = path.indexOf(marker);
   if (idx === -1) return path;
   return `.spawn/attachments/${path.slice(idx + marker.length)}`;
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
 }

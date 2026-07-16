@@ -7,6 +7,10 @@ export const AGENT_CTL_MAX_REPLAY_CHUNKS = Math.ceil(
   AGENT_CTL_MAX_REPLAY_BYTES / AGENT_CTL_CHUNK_PAYLOAD_BYTES,
 );
 export const AGENT_CTL_MAX_OUTSTANDING_REQUESTS = 128;
+export const AGENT_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+export const AGENT_CTL_UPLOAD_CHUNK_BYTES = 48 * 1024;
+export const AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER = 256 * 1024;
+export const AGENT_CTL_UPLOAD_BUFFER_LOW_WATER = 128 * 1024;
 
 const CHUNK_HEADER_BYTES = 28;
 const CHUNK_MAGIC = [0x53, 0x50, 0x43, 0x54]; // SPCT
@@ -17,7 +21,10 @@ export type AgentCtlOperation =
   | "resize"
   | "scroll"
   | "redraw"
-  | "take_control";
+  | "take_control"
+  | "upload_start"
+  | "upload_cancel"
+  | "upload_complete";
 
 export interface AgentCtlResponse {
   version: number;
@@ -30,6 +37,11 @@ export interface AgentCtlResponse {
   total_bytes?: number;
   chunks?: number;
   error?: { code?: string; detail?: string };
+  state?: "ready" | "complete";
+  next_sequence?: number;
+  received_bytes?: number;
+  path?: string;
+  sha256?: string;
 }
 
 export interface AgentCtlDisplayEvent {
@@ -46,6 +58,10 @@ export interface AgentCtlReadyEvent {
   version: number;
   kind: "event";
   event: "ready";
+  upload_capability: string;
+  agent_generation: number;
+  upload_max_bytes: number;
+  upload_chunk_bytes: number;
 }
 
 export type AgentCtlTextMessage = AgentCtlResponse | AgentCtlDisplayEvent | AgentCtlReadyEvent;
@@ -55,6 +71,25 @@ export interface AgentCtlChunk {
   sequence: number;
   last: boolean;
   payload: Uint8Array;
+}
+
+export interface AgentCtlUploadStart {
+  capability: string;
+  agentGeneration: number;
+  uploadId: string;
+  name: string;
+  mimeType: string;
+  destination: "attachments" | "cwd";
+  totalBytes: number;
+  chunks: number;
+  sha256: string;
+}
+
+export interface AgentCtlUploadResult {
+  uploadId: string;
+  path: string;
+  totalBytes: number;
+  sha256: string;
 }
 
 export interface AnchoredPtySlice {
@@ -276,6 +311,170 @@ export function makeAgentCtlRequest(
   }
 }
 
+export function makeAgentCtlUploadStart(start: AgentCtlUploadStart): string | null {
+  if (
+    !isAgentCtlRequestId(start.capability) ||
+    !isAgentCtlRequestId(start.uploadId) ||
+    !Number.isSafeInteger(start.agentGeneration) ||
+    start.agentGeneration <= 0 ||
+    !Number.isSafeInteger(start.totalBytes) ||
+    start.totalBytes <= 0 ||
+    start.totalBytes > AGENT_CTL_MAX_UPLOAD_BYTES ||
+    start.chunks !== Math.ceil(start.totalBytes / AGENT_CTL_UPLOAD_CHUNK_BYTES) ||
+    start.name.length === 0 ||
+    new TextEncoder().encode(start.name).byteLength > 255 ||
+    start.name === "." ||
+    start.name === ".." ||
+    Array.from(start.name).some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 31 || (code >= 127 && code <= 159);
+    }) ||
+    start.name.includes("/") ||
+    start.name.includes("\\") ||
+    (start.destination !== "attachments" && start.destination !== "cwd") ||
+    start.mimeType.length === 0 ||
+    new TextEncoder().encode(start.mimeType).byteLength > 128 ||
+    !/^[!-~]+$/.test(start.mimeType) ||
+    start.mimeType.includes(";") ||
+    !/^[0-9a-f]{64}$/.test(start.sha256)
+  ) {
+    return null;
+  }
+  return makeAgentCtlRequest(start.uploadId, "upload_start", {
+    capability: start.capability,
+    agent_generation: start.agentGeneration,
+    name: start.name,
+    mime_type: start.mimeType,
+    destination: start.destination,
+    total_bytes: start.totalBytes,
+    chunks: start.chunks,
+    sha256: start.sha256,
+  });
+}
+
+export function makeAgentCtlUploadCancel(
+  requestId: string,
+  uploadId: string,
+  capability: string,
+  agentGeneration: number,
+): string | null {
+  if (
+    !isAgentCtlRequestId(uploadId) ||
+    !isAgentCtlRequestId(capability) ||
+    !Number.isSafeInteger(agentGeneration) ||
+    agentGeneration <= 0
+  ) {
+    return null;
+  }
+  return makeAgentCtlRequest(requestId, "upload_cancel", {
+    capability,
+    agent_generation: agentGeneration,
+    upload_id: uploadId,
+  });
+}
+
+export function encodeAgentCtlUploadChunk(
+  uploadId: string,
+  sequence: number,
+  last: boolean,
+  payload: Uint8Array,
+): Uint8Array | null {
+  if (
+    !isAgentCtlRequestId(uploadId) ||
+    !Number.isSafeInteger(sequence) ||
+    sequence < 0 ||
+    sequence > 0xffff_ffff ||
+    payload.byteLength === 0 ||
+    payload.byteLength > AGENT_CTL_UPLOAD_CHUNK_BYTES
+  ) {
+    return null;
+  }
+  const requestBytes = uuidToBytes(uploadId);
+  if (!requestBytes) return null;
+  const frame = new Uint8Array(CHUNK_HEADER_BYTES + payload.byteLength);
+  frame.set(CHUNK_MAGIC);
+  frame[4] = AGENT_CTL_VERSION;
+  frame[5] = 2;
+  const view = new DataView(frame.buffer);
+  view.setUint16(6, last ? 1 : 0, true);
+  frame.set(requestBytes, 8);
+  view.setUint32(24, sequence, true);
+  frame.set(payload, CHUNK_HEADER_BYTES);
+  return frame;
+}
+
+export function parseAgentCtlUploadResponse(
+  response: AgentCtlResponse,
+  expected: AgentCtlUploadStart,
+):
+  | { kind: "ready"; nextSequence: number; receivedBytes: number }
+  | { kind: "complete"; result: AgentCtlUploadResult }
+  | { kind: "error"; message: string }
+  | null {
+  if (response.request_id !== expected.uploadId) return null;
+  if (!response.ok) {
+    return { kind: "error", message: response.error?.detail || "Upload failed." };
+  }
+  if (
+    response.operation === "upload_start" &&
+    response.state === "ready" &&
+    Number.isSafeInteger(response.next_sequence) &&
+    Number.isSafeInteger(response.received_bytes) &&
+    (response.next_sequence as number) >= 0 &&
+    (response.next_sequence as number) <= expected.chunks &&
+    (response.received_bytes as number) >= 0 &&
+    (response.received_bytes as number) <= expected.totalBytes &&
+    (response.received_bytes as number) ===
+      Math.min(
+        (response.next_sequence as number) * AGENT_CTL_UPLOAD_CHUNK_BYTES,
+        expected.totalBytes,
+      )
+  ) {
+    return {
+      kind: "ready",
+      nextSequence: response.next_sequence as number,
+      receivedBytes: response.received_bytes as number,
+    };
+  }
+  if (
+    response.operation === "upload_complete" &&
+    response.state === "complete" &&
+    typeof response.path === "string" &&
+    response.path.length > 0 &&
+    new TextEncoder().encode(response.path).byteLength <= 4096 &&
+    response.total_bytes === expected.totalBytes &&
+    response.sha256 === expected.sha256
+  ) {
+    return {
+      kind: "complete",
+      result: {
+        uploadId: expected.uploadId,
+        path: response.path,
+        totalBytes: expected.totalBytes,
+        sha256: expected.sha256,
+      },
+    };
+  }
+  return null;
+}
+
+export async function sha256Blob(blob: Blob): Promise<string | null> {
+  if (!globalThis.crypto?.subtle) return null;
+  if (blob.size <= 0 || blob.size > AGENT_CTL_MAX_UPLOAD_BYTES) return null;
+  let buffer: ArrayBuffer | null = null;
+  try {
+    buffer = await blob.arrayBuffer();
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  } catch {
+    return null;
+  } finally {
+    if (buffer) new Uint8Array(buffer).fill(0);
+  }
+}
+
 export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
   if (new TextEncoder().encode(raw).byteLength > AGENT_CTL_MAX_REQUEST_BYTES) return null;
   try {
@@ -291,7 +490,16 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
     ) {
       return value as unknown as AgentCtlResponse;
     }
-    if (value.kind === "event" && value.event === "ready") {
+    if (
+      value.kind === "event" &&
+      value.event === "ready" &&
+      typeof value.upload_capability === "string" &&
+      isAgentCtlRequestId(value.upload_capability) &&
+      Number.isSafeInteger(value.agent_generation) &&
+      (value.agent_generation as number) > 0 &&
+      value.upload_max_bytes === AGENT_CTL_MAX_UPLOAD_BYTES &&
+      value.upload_chunk_bytes === AGENT_CTL_UPLOAD_CHUNK_BYTES
+    ) {
       return value as unknown as AgentCtlReadyEvent;
     }
     if (
@@ -400,6 +608,18 @@ function bytesToUuid(bytes: Uint8Array): string | null {
   )}-${hex.slice(20)}`;
 }
 
+function uuidToBytes(value: string): Uint8Array | null {
+  if (!isAgentCtlRequestId(value)) return null;
+  const hex = value.replaceAll("-", "");
+  const bytes = new Uint8Array(16);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+    if (!Number.isFinite(byte)) return null;
+    bytes[index] = byte;
+  }
+  return bytes;
+}
+
 function isAgentCtlOperation(value: unknown): value is AgentCtlOperation {
   return (
     value === "history" ||
@@ -407,6 +627,9 @@ function isAgentCtlOperation(value: unknown): value is AgentCtlOperation {
     value === "resize" ||
     value === "scroll" ||
     value === "redraw" ||
-    value === "take_control"
+    value === "take_control" ||
+    value === "upload_start" ||
+    value === "upload_cancel" ||
+    value === "upload_complete"
   );
 }

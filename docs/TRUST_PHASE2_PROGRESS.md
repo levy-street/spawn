@@ -132,6 +132,31 @@ and the production build pass. `SPAWN_E2E_PORT=3791 scripts/test-all.sh` passes
 all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
 daemon, live-browser, and service-manager smokes.
 
+**P2-TERM-01 checkpoint (implemented, review pending):** agent upload names,
+bytes, hashes, endpoint paths, cancellation, and detailed results move off both
+REST/WS legs onto bounded kind-2 chunks on the direct `spawn.ctl` DataChannel.
+The stream is bound to a fresh per-channel capability and exact worker-backend
+generation; stable upload UUIDs support bounded resume/idempotency. The daemon
+validates exact chunk order/length/final flag and SHA-256, applies per-viewer and
+global admission limits plus a bounded completion cache, and cleans private
+temporary files on error, cancellation, disconnect, or replacement. The
+worker protocol is version 5 so launched/adopted workers retain a canonical
+local cwd. Upload commits use retained no-follow directory descriptors, mode
+0600 same-directory temporary files, and atomic no-clobber final links; invalid
+or old peers fail closed. Server routes, schemas, broker waiters, browser and
+daemon upload frames, and web API helpers are removed. Legacy frames close
+without logging names, paths, errors, or payloads.
+
+**Current P2-TERM-01 candidate validation:** strict daemon format and Clippy
+pass; all daemon all-target tests pass (60 library, 85 daemon, 8 worker E2E);
+full server Ruff and all 137 server tests pass; web lint, TypeScript, all 31
+unit tests, 68 browser tests (3 opt-in audits skipped), the direct chunked
+upload browser test, and the production build pass. With
+`SPAWN_E2E_PORT=3792`, `scripts/test-all.sh` also passes all repeatable checks
+plus installer, HTTP, real-Redis, PostgreSQL/Redis owner-recovery, login, daemon,
+live-browser direct upload, and service-manager smokes. Concurrent-current-
+master mergeability remains to be recorded before independent review.
+
 This is still a source checkpoint: it is not merged or deployed, does not purge
 historical copies, and does not complete Phase 2. Offline history is now an
 explicit non-feature: replay is available only from a live endpoint worker;
@@ -141,9 +166,9 @@ backups, replicas and snapshots remain in P2-PURGE-01 scope.
 
 ## Remaining sequence
 
-1. Independently review and merge the `spawn.v1`/`0x01`/`0x02` cut and removed
-   terminal/viewport surfaces; then migrate agent uploads, which still use a
-   server-visible route.
+1. Independently review and merge the P2-TERM-01 direct agent-upload candidate,
+   including current-master/concurrent-host merge simulation; do not restore a
+   REST/WS compatibility upload path for old peers.
 2. Move host listings/read/write/transfer onto the host channel and ship a
    parallel E2E path for interactive installer detail. Cross-host bytes stream
    through the trusted browser, not the server. Keep the legacy tool route until

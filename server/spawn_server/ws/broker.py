@@ -7,7 +7,6 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import TYPE_CHECKING
 
 from ..redis import get_backend
@@ -97,12 +96,6 @@ class DaemonOwnerAcceptance:
 
     def __bool__(self) -> bool:
         return self.accepted
-
-
-class UploadResolution(Enum):
-    RESOLVED = "resolved"
-    NO_WAITER = "no_waiter"
-    STALE_OWNER = "stale_owner"
 
 
 class Broker:
@@ -789,49 +782,6 @@ class Broker:
             request_id,
             payload,
         )
-
-    async def request_upload(
-        self,
-        agent_id: str,
-        daemon: DaemonConn,
-        *,
-        payload: dict,
-        client_id: str,
-        timeout: float = 30.0,
-    ) -> dict | None:
-        request_id = str(uuid.uuid4())
-        payload["agent_id"] = agent_id
-        payload["client_id"] = client_id
-        payload["request_id"] = request_id
-        return await self._request_owner_result(
-            daemon,
-            "agent.uploaded",
-            request_id,
-            payload,
-            timeout=timeout,
-        )
-
-    async def resolve_upload(
-        self,
-        agent_id: str,
-        request_id: str | None,
-        payload: dict,
-        *,
-        daemon: DaemonConn | None = None,
-        expected_host_generation: int | None = None,
-    ) -> UploadResolution:
-        if not request_id:
-            return UploadResolution.NO_WAITER
-        if daemon is None:
-            return UploadResolution.STALE_OWNER
-        published = await self._publish_owner_result(
-            daemon,
-            expected_host_generation,
-            "agent.uploaded",
-            request_id,
-            payload,
-        )
-        return UploadResolution.RESOLVED if published else UploadResolution.STALE_OWNER
 
     async def _request_owner_result(
         self,

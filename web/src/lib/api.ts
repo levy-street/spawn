@@ -180,14 +180,6 @@ export const AgentSchema = z.object({
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
-export const AgentUploadResultSchema = z.object({
-  agent_id: z.string().uuid(),
-  path: z.string(),
-  client_id: z.string(),
-  pasted: z.boolean(),
-});
-export type AgentUploadResult = z.infer<typeof AgentUploadResultSchema>;
-
 export const PresetSchema = z.object({
   id: z.string().uuid(),
   owner_user_id: z.string().uuid().nullable(),
@@ -505,55 +497,6 @@ export const agents = {
       body: JSON.stringify(body ?? {}),
       schema: AgentSchema,
     }),
-  upload: (
-    id: string,
-    body: {
-      name?: string;
-      mime_type?: string;
-      bytes_b64: string;
-      paste?: boolean;
-      destination?: "cwd" | null;
-      client_id?: string;
-    },
-  ) =>
-    api(`/api/agents/${id}/upload`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: AgentUploadResultSchema,
-    }),
-  uploadFile: async (
-    id: string,
-    file: File,
-    options?: { paste?: boolean; destination?: "cwd"; client_id?: string },
-  ) => {
-    const body = new FormData();
-    body.set("file", file);
-    if (options?.paste !== undefined) body.set("paste", String(options.paste));
-    if (options?.destination) body.set("destination", options.destination);
-    if (options?.client_id) body.set("client_id", options.client_id);
-    const res = await fetch(`${API_URL}/api/agents/${id}/upload-file`, {
-      method: "POST",
-      credentials: "include",
-      headers: { Accept: "application/json" },
-      body,
-    });
-    if (!res.ok) {
-      let payload: { detail?: unknown; message?: string; code?: string } | undefined;
-      try {
-        payload = await res.json();
-      } catch {
-        // ignore
-      }
-      const detailMsg = typeof payload?.detail === "string" ? payload.detail : undefined;
-      throw new ApiError(
-        res.status,
-        payload?.code ?? `http_${res.status}`,
-        payload?.message ?? detailMsg ?? res.statusText,
-        payload?.detail,
-      );
-    }
-    return AgentUploadResultSchema.parse(await res.json());
-  },
   rename: (id: string, name: string | null) => agents.update(id, { name }),
   pin: (id: string) => agents.update(id, { pinned: true }),
   unpin: (id: string) => agents.update(id, { pinned: false }),

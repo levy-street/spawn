@@ -47,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 portable-pty = "0.8"
 bytes = "1"
 base64 = "0.22"
+sha2 = "0.10"
 webrtc = "0.17"
 
 # session worker: encrypted scrollback at rest + memory hygiene

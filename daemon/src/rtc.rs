@@ -34,6 +34,9 @@ use crate::agent_ctl::{
 use crate::agents::{AgentBinding, AgentRegistry};
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
+use crate::upload::{
+    UploadChunkOutcome, UploadChunkRequest, UploadHub, UploadManifest, UploadStartOutcome,
+};
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
@@ -75,6 +78,7 @@ pub struct RtcSessions {
     registered_host_id: Arc<Mutex<Option<Uuid>>>,
     agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
+    uploads: UploadHub,
     #[cfg(test)]
     peer_insert_attempted: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -1080,6 +1084,8 @@ impl RtcSessions {
         if !peers.values().any(|peer| peer.agent.agent_id() == agent_id) {
             self.controls.remove_agent(agent_id).await;
         }
+        drop(peers);
+        self.uploads.remove_generation(agent).await;
     }
 
     async fn deactivate_peer(&self, session_id: &str, peer: RtcPeer) {
@@ -1096,6 +1102,9 @@ impl RtcSessions {
             .await;
         self.controls
             .unregister_session(&viewer_id(session_id, &peer.generation))
+            .await;
+        self.uploads
+            .cancel_session(peer.agent, &viewer_id(session_id, &peer.generation))
             .await;
     }
 
@@ -1680,6 +1689,8 @@ fn install_control_data_channel(
     generation: String,
 ) {
     let agent_id = agent.agent_id();
+    let upload_capability = Uuid::new_v4();
+    let uploads = sessions.uploads.clone();
     let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
     let (display_sender, mut display_receiver) = tokio::sync::watch::channel(None::<String>);
     let (close_tx, mut close_rx) = oneshot::channel();
@@ -1757,6 +1768,7 @@ fn install_control_data_channel(
     let message_sender = sender.clone();
     let message_display_sender = display_sender.clone();
     let message_session_id = session_id.clone();
+    let message_uploads = uploads.clone();
     #[cfg(test)]
     let message_sessions = sessions.clone();
     #[cfg(test)]
@@ -1770,6 +1782,7 @@ fn install_control_data_channel(
         let sender = message_sender.clone();
         let display_sender = message_display_sender.clone();
         let session_id = message_session_id.clone();
+        let uploads = message_uploads.clone();
         let request_lock = request_lock.clone();
         let active = Arc::clone(&message_active);
         let fence = Arc::clone(&message_fence);
@@ -1795,15 +1808,63 @@ fn install_control_data_channel(
                 return;
             }
             if !msg.is_string {
-                agent_ctl::send_error(
-                    &sender,
-                    &ProtocolError::new(
-                        None,
-                        "unexpected_binary",
-                        "spawn.ctl requests must be JSON text frames",
-                    ),
-                )
-                .await;
+                match agent_ctl::decode_upload_chunk(&msg.data) {
+                    Ok(chunk) => {
+                        let upload_id = chunk.upload_id;
+                        let outcome = uploads
+                            .write_chunk(
+                                agent,
+                                UploadChunkRequest {
+                                    session_id: &session_id,
+                                    capability: upload_capability,
+                                    upload_id,
+                                    sequence: chunk.sequence,
+                                    last: chunk.last,
+                                    bytes: &chunk.payload,
+                                },
+                            )
+                            .await;
+                        if !effect.valid()
+                            || !active.load(Ordering::Acquire)
+                            || !registry.is_current(agent)
+                        {
+                            let _ = uploads
+                                .cancel(agent, &session_id, upload_capability, upload_id)
+                                .await;
+                            return;
+                        }
+                        match outcome {
+                            Ok(UploadChunkOutcome::Pending) => {}
+                            Ok(UploadChunkOutcome::Complete(result)) => {
+                                if let Err(error) =
+                                    agent_ctl::send_upload_complete(&sender, upload_id, &result)
+                                        .await
+                                {
+                                    agent_ctl::send_error(&sender, &error).await;
+                                }
+                            }
+                            Err(error) => {
+                                agent_ctl::send_error(
+                                    &sender,
+                                    &ProtocolError::new(
+                                        Some(upload_id),
+                                        "upload_failed",
+                                        &error.to_string(),
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(upload_id) = error.request_id {
+                            let _ = uploads
+                                .cancel(agent, &session_id, upload_capability, upload_id)
+                                .await;
+                        }
+                        agent_ctl::send_error(&sender, &error).await;
+                    }
+                }
                 return;
             }
             let text = match std::str::from_utf8(&msg.data) {
@@ -1838,13 +1899,17 @@ fn install_control_data_channel(
                         }
                     }
                     handle_control_request(
-                        agent,
-                        &session_id,
+                        ControlRequestContext {
+                            agent,
+                            session_id: &session_id,
+                            registry: &registry,
+                            controls: &controls,
+                            sender: &sender,
+                            effect: &effect,
+                            uploads: &uploads,
+                            upload_capability,
+                        },
                         request,
-                        &registry,
-                        &controls,
-                        &sender,
-                        &effect,
                     )
                     .await;
                 }
@@ -1905,7 +1970,10 @@ fn install_control_data_channel(
             if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
                 return;
             }
-            if agent_ctl::send_ready(&sender).await.is_err() {
+            if agent_ctl::send_ready(&sender, upload_capability, agent.generation())
+                .await
+                .is_err()
+            {
                 channels.stop();
                 active.store(false, Ordering::Release);
                 sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
@@ -1921,26 +1989,40 @@ fn install_control_data_channel(
         let sessions = sessions.clone();
         let rtc_session_id = rtc_session_id.clone();
         let generation = generation.clone();
+        let uploads = uploads.clone();
+        let session_id = session_id.clone();
         Box::pin(async move {
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
             channels.stop();
             active.store(false, Ordering::Release);
+            uploads.cancel_session(agent, &session_id).await;
             sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc);
         })
     }));
 }
 
-async fn handle_control_request(
+#[derive(Clone, Copy)]
+struct ControlRequestContext<'a> {
     agent: AgentBinding,
-    session_id: &str,
-    request: ControlRequest,
-    registry: &AgentRegistry,
-    controls: &AgentControlHub,
-    sender: &ControlSender,
-    effect: &AgentEffectPermit,
-) {
+    session_id: &'a str,
+    registry: &'a AgentRegistry,
+    controls: &'a AgentControlHub,
+    sender: &'a ControlSender,
+    effect: &'a AgentEffectPermit,
+    uploads: &'a UploadHub,
+    upload_capability: Uuid,
+}
+
+async fn handle_control_request(context: ControlRequestContext<'_>, request: ControlRequest) {
+    let ControlRequestContext {
+        agent,
+        controls,
+        sender,
+        effect,
+        ..
+    } = context;
     let agent_id = agent.agent_id();
     let request_id = request.request_id;
     let transaction = controls.transaction(agent_id).await;
@@ -1948,11 +2030,7 @@ async fn handle_control_request(
     if !effect.valid() {
         return;
     }
-    if let Err(mut error) = execute_control_request(
-        agent, session_id, request, registry, controls, sender, effect,
-    )
-    .await
-    {
+    if let Err(mut error) = execute_control_request(context, request).await {
         if error.request_id.is_none() {
             error.request_id = Some(request_id);
         }
@@ -1961,14 +2039,19 @@ async fn handle_control_request(
 }
 
 async fn execute_control_request(
-    agent: AgentBinding,
-    session_id: &str,
+    context: ControlRequestContext<'_>,
     request: ControlRequest,
-    registry: &AgentRegistry,
-    controls: &AgentControlHub,
-    sender: &ControlSender,
-    effect: &AgentEffectPermit,
 ) -> Result<(), ProtocolError> {
+    let ControlRequestContext {
+        agent,
+        session_id,
+        registry,
+        controls,
+        sender,
+        effect,
+        uploads,
+        upload_capability,
+    } = context;
     let agent_id = agent.agent_id();
     if !effect.valid() || !registry.is_current(agent) {
         return Err(ProtocolError::new(
@@ -2104,6 +2187,99 @@ async fn execute_control_request(
             }
             agent_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
+        }
+        ControlOperation::UploadStart {
+            capability,
+            agent_generation,
+            name,
+            mime_type,
+            destination,
+            total_bytes,
+            chunks,
+            sha256,
+        } => {
+            if capability != upload_capability || agent_generation != agent.generation() {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "upload_capability_mismatch",
+                    "upload capability or backend generation does not match this channel",
+                ));
+            }
+            let cwd = registry.cwd_for_binding(agent).ok_or_else(|| {
+                ProtocolError::new(
+                    Some(request_id),
+                    "upload_root_unavailable",
+                    "the bound worker did not provide a local cwd capability",
+                )
+            })?;
+            if !effect.valid() || !registry.is_current(agent) {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "stale_agent_generation",
+                    "the RTC session belongs to a replaced agent backend",
+                ));
+            }
+            let outcome = uploads
+                .start(
+                    agent,
+                    session_id,
+                    upload_capability,
+                    request_id,
+                    &cwd,
+                    UploadManifest {
+                        name,
+                        mime_type,
+                        destination: destination.into(),
+                        total_bytes,
+                        chunks,
+                        sha256,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    ProtocolError::new(Some(request_id), "upload_failed", &error.to_string())
+                })?;
+            if !effect.valid() || !registry.is_current(agent) {
+                let _ = uploads
+                    .cancel(agent, session_id, upload_capability, request_id)
+                    .await;
+                return Ok(());
+            }
+            match outcome {
+                UploadStartOutcome::Ready {
+                    next_sequence,
+                    received_bytes,
+                } => {
+                    agent_ctl::send_upload_ready(sender, request_id, next_sequence, received_bytes)
+                        .await
+                }
+                UploadStartOutcome::Complete(result) => {
+                    agent_ctl::send_upload_complete(sender, request_id, &result).await
+                }
+            }
+        }
+        ControlOperation::UploadCancel {
+            capability,
+            agent_generation,
+            upload_id,
+        } => {
+            if capability != upload_capability || agent_generation != agent.generation() {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "upload_capability_mismatch",
+                    "upload capability or backend generation does not match this channel",
+                ));
+            }
+            uploads
+                .cancel(agent, session_id, upload_capability, upload_id)
+                .await
+                .map_err(|error| {
+                    ProtocolError::new(Some(request_id), "upload_failed", &error.to_string())
+                })?;
+            if !effect.valid() || !registry.is_current(agent) {
+                return Ok(());
+            }
+            agent_ctl::send_ack(sender, request_id, operation_name).await
         }
     }
 }
@@ -2591,6 +2767,7 @@ mod tests {
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: crate::pty::AgentLifecycle::new(
                 std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
@@ -3291,6 +3468,7 @@ mod tests {
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: crate::pty::AgentLifecycle::new(lifecycle_path, Uuid::new_v4()),
             alive: Arc::new(AtomicBool::new(true)),
@@ -4433,19 +4611,51 @@ mod tests {
         channels.mark_open(AgentChannel::Pty).await;
         channels.mark_open(AgentChannel::Control).await;
         let effect = channels.permit().await.expect("ready effect permit");
+        let uploads = UploadHub::default();
         let error = execute_control_request(
-            old,
-            "stale-viewer",
+            ControlRequestContext {
+                agent: old,
+                session_id: "stale-viewer",
+                registry: &registry,
+                controls: &controls,
+                sender: &sender,
+                effect: &effect,
+                uploads: &uploads,
+                upload_capability: Uuid::new_v4(),
+            },
             request,
-            &registry,
-            &controls,
-            &sender,
-            &effect,
         )
         .await
         .expect_err("stale control must fail");
         assert_eq!(error.code, "stale_agent_generation");
         assert!(current_commands.try_recv().is_err());
+
+        let bound_capability = Uuid::new_v4();
+        let wrong_capability = Uuid::new_v4();
+        let upload_request_id = Uuid::new_v4();
+        let upload_request = ControlRequest::decode(&format!(
+            r#"{{"version":1,"kind":"request","request_id":"{upload_request_id}","operation":"upload_start","capability":"{wrong_capability}","agent_generation":{},"name":"note.txt","mime_type":"text/plain","destination":"cwd","total_bytes":1,"chunks":1,"sha256":"{}"}}"#,
+            current.generation(),
+            "00".repeat(32),
+        ))
+        .expect("valid upload request");
+        let error = execute_control_request(
+            ControlRequestContext {
+                agent: current,
+                session_id: "current-viewer",
+                registry: &registry,
+                controls: &controls,
+                sender: &sender,
+                effect: &effect,
+                uploads: &uploads,
+                upload_capability: bound_capability,
+            },
+            upload_request,
+        )
+        .await
+        .expect_err("wrong upload capability must fail before filesystem access");
+        assert_eq!(error.code, "upload_capability_mismatch");
+        assert_eq!(uploads.retained_counts().await, (0, 0));
 
         assert!(!rtc_output_allowed(&registry, old));
         assert!(rtc_output_allowed(&registry, current));
@@ -4768,6 +4978,7 @@ mod tests {
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
         let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
             agent_id,
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: crate::pty::AgentLifecycle::new(
                 std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),

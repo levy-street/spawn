@@ -1153,75 +1153,40 @@ async def test_started_publish_failure_fences_without_broker_deadlock(client, mo
     await asyncio.wait_for(other_task, timeout=1)
 
 
-async def test_upload_error_resolves_exact_request_and_legacy_reply_is_isolated(client):
-    from spawn_server.redis import agent_event_channel
-
-    user_id, _ = await _signup(client, "ws-daemon-upload-error@example.com")
+@pytest.mark.parametrize(
+    ("frame", "reason", "secret"),
+    [
+        (
+            {"type": "agent.uploaded", "path": "/secret/daemon-upload-path"},
+            "agent upload acknowledgements belong on spawn.ctl",
+            "/secret/daemon-upload-path",
+        ),
+        (
+            {
+                "type": "error",
+                "code": "upload_failed",
+                "message": "secret daemon upload failure",
+            },
+            "agent upload errors belong on spawn.ctl",
+            "secret daemon upload failure",
+        ),
+    ],
+)
+async def test_daemon_upload_frames_fail_closed_without_logging_content(
+    client, caplog, frame, reason, secret
+):
+    slug = frame["type"].replace(".", "-")
+    user_id, _ = await _signup(client, f"ws-daemon-retired-{slug}@example.com")
     host_id = await _create_host(user_id)
     agent_id = await _create_agent(user_id, host_id)
     token = auth.issue_daemon_token(host_id, user_id)
 
     ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
-    daemon_task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
     ws.queue_text({"type": "register", "existing_agents": [agent_id]})
-    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
-    conn = get_broker().get_daemon_for_host(host_id)
-    assert conn is not None and conn.host_generation is not None
-
-    request_task = asyncio.create_task(
-        get_broker().request_upload(
-            agent_id,
-            conn,
-            payload={
-                "type": "agent.upload",
-                "agent_id": agent_id,
-                "client_id": "upload-error-client",
-            },
-            client_id="upload-error-client",
-            timeout=1,
-        )
-    )
-    await _wait_until(
-        lambda: any(item.get("type") == "agent.upload" for item in _sent_json(ws))
-    )
-    request = [
-        item for item in _sent_json(ws) if item.get("type") == "agent.upload"
-    ][-1]
-
-    error = {
-        "type": "error",
-        "agent_id": agent_id,
-        "code": "upload_failed",
-        "message": "disk full",
-        "request_id": request["request_id"],
-        "client_id": "upload-error-client",
-    }
-    async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as events:
-        ws.queue_text(error)
-        assert await request_task == error
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(anext(events), timeout=0.05)
-
-    # A reply from an old daemon cannot satisfy a new request by reusing its
-    # client id. It is exposed only on the explicitly legacy event path and
-    # carries no correlatable client identity.
-    async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as events:
-        error = {
-            "type": "error",
-            "agent_id": agent_id,
-            "code": "upload_failed",
-            "message": "disk full",
-            "client_id": "upload-error-client",
-        }
-        ws.queue_text(error)
-        event = json.loads(await asyncio.wait_for(anext(events), timeout=1))
-        assert event == {
-            "type": "upload.legacy_error",
-            "message": "disk full",
-        }
-
-    ws.queue_disconnect()
-    await asyncio.wait_for(daemon_task, timeout=1)
+    ws.queue_text({**frame, "agent_id": agent_id})
+    await daemon_ws(ws, token=None)  # type: ignore[arg-type]
+    assert ws.closed == (4002, reason)
+    assert secret not in caplog.text
 
 
 async def test_fence_closes_before_stalled_rtc_revocation_and_keeps_broker_usable(app):

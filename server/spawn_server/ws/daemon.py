@@ -19,7 +19,7 @@ from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import Agent, Host
 from ..redis import agent_event_channel, get_backend
-from .broker import DaemonConn, RtcSessionBinding, UploadResolution, get_broker
+from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
@@ -1435,43 +1435,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             break
 
                 elif ftype == "agent.uploaded":
-                    aid = obj.get("agent_id")
-                    path = obj.get("path")
-                    request_id = obj.get("request_id")
-                    if aid and isinstance(path, str):
-                        durable_owner = False
-                        agent_authorized = False
-                        async with _bounded_host_ownership_session() as session:
-                            durable_owner = await _lock_durable_host_owner(session, conn)
-                            if durable_owner:
-                                agent = await session.get(Agent, aid)
-                                agent_authorized = agent is not None and agent.host_id == host.id
-                            await session.rollback()
-                        if not durable_owner:
-                            await _fence_superseded_daemon(conn)
-                            break
-                        if not agent_authorized:
-                            log.warning("upload ack for unknown agent=%s", aid)
-                            continue
-                        resolved = await broker.resolve_upload(
-                            aid,
-                            request_id if isinstance(request_id, str) else None,
-                            dict(obj),
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
-                        )
-                        if resolved is UploadResolution.STALE_OWNER:
-                            await _fence_superseded_daemon(conn)
-                            break
-                        if resolved is UploadResolution.RESOLVED:
-                            continue
-                        payload: dict[str, object] = {
-                            "type": "upload.legacy_saved",
-                            "path": path,
-                        }
-                        if not await _publish_agent_event_if_owner(conn, aid, payload):
-                            await _fence_superseded_daemon(conn)
-                            break
+                    log.warning("retired server-visible agent upload acknowledgement; closing")
+                    await websocket.close(
+                        code=WS_CLOSE_CONTENT_FORBIDDEN,
+                        reason="agent upload acknowledgements belong on spawn.ctl",
+                    )
+                    break
 
                 elif ftype == "rtc.answer":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
@@ -1578,46 +1547,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             continue
 
                 elif ftype == "error":
-                    aid = obj.get("agent_id")
-                    if obj.get("code") == "upload_failed" and aid:
-                        durable_owner = False
-                        agent_authorized = False
-                        async with _bounded_host_ownership_session() as session:
-                            durable_owner = await _lock_durable_host_owner(session, conn)
-                            if durable_owner:
-                                agent = await session.get(Agent, aid)
-                                agent_authorized = agent is not None and agent.host_id == host.id
-                            await session.rollback()
-                        if not durable_owner:
-                            await _fence_superseded_daemon(conn)
-                            break
-                        if not agent_authorized:
-                            log.warning("upload error for unknown agent=%s", aid)
-                            continue
-                        request_id = obj.get("request_id")
-                        resolved = await broker.resolve_upload(
-                            aid,
-                            request_id if isinstance(request_id, str) else None,
-                            dict(obj),
-                            daemon=conn,
-                            expected_host_generation=conn.host_generation,
+                    if obj.get("code") == "upload_failed":
+                        log.warning("retired server-visible agent upload error; closing")
+                        await websocket.close(
+                            code=WS_CLOSE_CONTENT_FORBIDDEN,
+                            reason="agent upload errors belong on spawn.ctl",
                         )
-                        if resolved is UploadResolution.STALE_OWNER:
-                            await _fence_superseded_daemon(conn)
-                            break
-                        if resolved is UploadResolution.RESOLVED:
-                            continue
-                        event: dict[str, object] = {
-                            "type": "upload.legacy_error",
-                            "message": obj.get("message") or "Image upload failed.",
-                        }
-                        if not await _publish_agent_event_if_owner(
-                            conn,
-                            aid,
-                            event,
-                        ):
-                            await _fence_superseded_daemon(conn)
-                            break
+                        break
                     log.warning(
                         "daemon error host=%s agent=%s code=%s msg=%s",
                         host.id,
