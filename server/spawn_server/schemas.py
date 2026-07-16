@@ -239,62 +239,11 @@ class AgentCreate(BaseModel):
     argv: list[str] | None = None
     env: dict[str, str] | None = None
     skill_ids: list[str] | None = None
-    cols: int = 120
-    rows: int = 32
     create_cwd: bool = True
 
 
 class AgentRestart(BaseModel):
-    cols: int = 120
-    rows: int = 32
     create_cwd: bool = True
-
-
-class AgentInput(BaseModel):
-    text: str | None = None
-    bytes_b64: str | None = None
-
-
-class AgentInputResult(BaseModel):
-    agent_id: str
-    bytes: int
-
-
-class AgentResize(BaseModel):
-    cols: int = Field(default=120, ge=20, le=400)
-    rows: int = Field(default=32, ge=5, le=200)
-
-
-class AgentResizeResult(BaseModel):
-    agent_id: str
-    cols: int
-    rows: int
-
-
-class AgentScroll(BaseModel):
-    lines: int = Field(ge=-200, le=200)
-
-
-class AgentScrollResult(BaseModel):
-    agent_id: str
-    lines: int
-
-
-class AgentRedrawResult(BaseModel):
-    agent_id: str
-    redraw: bool
-
-
-class AgentSnapshotRequest(BaseModel):
-    lines: int = Field(default=5000, ge=100, le=10000)
-    plain: bool = False
-
-
-class AgentSnapshotOut(BaseModel):
-    agent_id: str
-    bytes_b64: str
-    plain: bool
-    lines: int
 
 
 class AgentUploadRequest(BaseModel):

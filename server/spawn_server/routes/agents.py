@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import agent_control, auth, schemas, transcript
+from .. import agent_control, auth, schemas
 from ..db import get_session
 from ..models import Agent, Host, Preset, User
 from ..ws.broker import get_broker
@@ -144,8 +144,6 @@ async def _dispatch_agent_launch(
     agent: Agent,
     host: Host,
     preset: Preset | None,
-    cols: int,
-    rows: int,
     create_cwd: bool,
     skills: list[dict] | None = None,
 ) -> None:
@@ -166,8 +164,6 @@ async def _dispatch_agent_launch(
                 "env": agent.env,
                 "install": preset.install if preset is not None else None,
                 "skills": skills or [],
-                "cols": cols,
-                "rows": rows,
                 "create_cwd": create_cwd,
             }
         )
@@ -262,8 +258,6 @@ async def create_agent(
         agent=agent,
         host=host,
         preset=preset,
-        cols=body.cols,
-        rows=body.rows,
         create_cwd=body.create_cwd,
         skills=skills,
     )
@@ -309,89 +303,10 @@ async def restart_agent(
         agent=agent,
         host=host,
         preset=preset,
-        cols=body.cols,
-        rows=body.rows,
         create_cwd=body.create_cwd,
         skills=skills,
     )
     return _to_out(agent, host.name)
-
-
-@router.post("/{agent_id}/input", response_model=schemas.AgentInputResult)
-async def input_agent(
-    agent_id: str,
-    body: schemas.AgentInput,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentInputResult:
-    result = await agent_control.send_agent_input(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        text=body.text,
-        bytes_b64=body.bytes_b64,
-    )
-    return schemas.AgentInputResult.model_validate(result)
-
-
-@router.post("/{agent_id}/resize", response_model=schemas.AgentResizeResult)
-async def resize_agent(
-    agent_id: str,
-    body: schemas.AgentResize,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentResizeResult:
-    result = await agent_control.resize_agent(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        cols=body.cols,
-        rows=body.rows,
-    )
-    return schemas.AgentResizeResult.model_validate(result)
-
-
-@router.post("/{agent_id}/scroll", response_model=schemas.AgentScrollResult)
-async def scroll_agent(
-    agent_id: str,
-    body: schemas.AgentScroll,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentScrollResult:
-    result = await agent_control.scroll_agent(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        lines=body.lines,
-    )
-    return schemas.AgentScrollResult.model_validate(result)
-
-
-@router.post("/{agent_id}/redraw", response_model=schemas.AgentRedrawResult)
-async def redraw_agent(
-    agent_id: str,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentRedrawResult:
-    result = await agent_control.redraw_agent(session=session, user=user, agent_id=agent_id)
-    return schemas.AgentRedrawResult.model_validate(result)
-
-
-@router.post("/{agent_id}/snapshot", response_model=schemas.AgentSnapshotOut)
-async def snapshot_agent(
-    agent_id: str,
-    body: schemas.AgentSnapshotRequest,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentSnapshotOut:
-    result = await agent_control.snapshot_agent(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        lines=body.lines,
-        plain=body.plain,
-    )
-    return schemas.AgentSnapshotOut.model_validate(result)
 
 
 @router.post("/{agent_id}/upload", response_model=schemas.AgentUploadOut)
@@ -462,4 +377,3 @@ async def delete_agent(
     await get_broker().detach_agent(agent_id)
     await session.delete(a)
     await session.commit()
-    await transcript.clear(agent_id)

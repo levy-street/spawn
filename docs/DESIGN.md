@@ -22,23 +22,23 @@
 
 - **Stack**: Python 3.13, FastAPI, SQLAlchemy 2.0 + Alembic, asyncpg,
   Pydantic v2, argon2 for password hashing, PyJWT for short-lived tokens,
-  redis-py for pubsub.
+  redis-py for cross-worker presence, signaling, and owner-fenced control results.
 - **State**: Postgres for durable state (users, hosts, agents, presets,
-  audit). Redis for pub/sub between WS workers (so a frontend connected to
-  worker A can receive PTY bytes from a daemon connected to worker B).
+  audit). Redis coordinates presence, WebRTC signaling, and owner-fenced
+  control results between API workers. It never carries terminal content.
 - **Public surface**:
   - HTTP/JSON REST under `/api/...`
   - `/ws/daemon` — daemon WebSocket
   - `/ws/browser` — browser WebSocket (per-agent attach)
-- **Bridge logic (legacy data path — being removed)**: server holds a
-  routing map `agent_id -> daemon_conn` and `agent_id -> {browser_conn,
-  ...}`. PTY output frames from a daemon fan out to subscribed browsers;
-  PTY input from a browser routes to the owning daemon, with on-disk
-  transcripts for replay. Under the operator model (TRUST.md) this whole
-  relay-and-store role is deleted: the server keeps only auth, registry,
-  presence, WebRTC signaling, and TURN credential minting. Terminal
-  data, history, uploads, snapshots, and spawn-time secrets (`env`,
-  skill bodies) travel browser↔daemon over DataChannels. The MCP
+- **Control and signaling**: the server keeps auth, registry, lifecycle,
+  presence, WebRTC signaling, owner fencing, and TURN credential minting.
+  `/ws/daemon` is JSON-only `spawn.control.v2`; `/ws/browser` requires
+  `spawn.v2`. The server has no terminal input/output, transcript, history,
+  snapshot, viewport, or display-owner relay. Terminal data, history and
+  viewport operations travel on mandatory `spawn.pty` + `spawn.ctl` direct
+  channels. Agent uploads still cross the server, and launch manifests,
+  preset environment/install/tool values, and skill bodies still have
+  server-readable paths or stores pending P2-TERM-01 and P2-DATA-02. The MCP
   surface (endpoint, managed-server registry, MCP-client OAuth) was
   removed entirely on 2026-07-09 per TRUST.md.
 
@@ -64,7 +64,7 @@
 - **Reconnect**: on WS disconnect, daemon retries with exponential backoff.
   On reconnect, sends a `register` frame with `existing_agents: [...]` so the
   server resyncs its routing map without killing session workers.
-- **Data ownership (target, TRUST.md Phase 2)**: the live worker is the source
+- **Agent terminal data ownership (P2-AGENT-02 checkpoint)**: the live worker is the source
   of resource-budgeted replay, using encrypted-at-rest rolling segments and an
   ephemeral key. The conservative total charge covers ciphertext/framing,
   replay/scratch, and retained bookkeeping; this is not a durable transcript
@@ -75,7 +75,7 @@
 
 - **Stack**: Next.js 15 App Router, React 19, Tailwind v4, shadcn/ui, Biome,
   Bun. xterm.js + `@xterm/addon-fit` + `@xterm/addon-web-links`. TanStack
-  Query for REST. Native WebSocket for streaming.
+  Query for REST. Native WebSocket for content-free signaling and lifecycle.
 - **Pages**:
   - `/` — dashboard (active agents, recent activity).
   - `/login`, `/signup`, `/device` (device-code approval).
@@ -136,20 +136,19 @@ device_codes(device_code, user_code, host_name, status, user_id|null,
 ## Wire protocol (summary — see `proto/README.md` for full)
 
 - Daemon `/ws/daemon`:
-  - Out: `register`, `host.heartbeat`, `agent.exit`, `rtc.answer`; binary
-    `0x01 <uuid> <bytes>` for PTY output *(legacy relay path)*.
-  - In:  `agent.create`, `agent.kill`, `agent.resize`, `rtc.offer`; binary
-    `0x02 <uuid> <bytes>` for PTY input *(legacy relay path)*.
+  - Subprotocol `spawn.control.v2`, JSON only.
+  - Out: `register`, `host.heartbeat`, content-free `agent.activity` /
+    `agent.input_activity`, lifecycle, and bound `rtc.*` signaling.
+  - In: `agent.create`, `agent.kill`, upload/control operations still awaiting
+    later trust tasks, and bound `rtc.*` signaling.
 - Browser `/ws/browser?agent_id=...`:
-  - Out: text `{type:"resize",cols,rows}`, `rtc.offer`; binary stdin bytes
-    *(legacy)*.
-  - In:  text `{type:"history",bytes_b64}`, `{type:"agent.exit",code}`,
-    `rtc.answer`; binary stdout bytes *(legacy)*.
-- Terminal data plane: WebRTC DataChannel `spawn.pty`, negotiated via the
-  `rtc.*` frames above. Today the WS binary path is the fallback relay
-  and transcript source; under `spawn.v2` (TRUST.md Phase 1) the
-  DataChannel is the only data path and the WS legs carry control +
-  signaling only, with TURN as the reachability fallback.
+  - Mandatory subprotocol `spawn.v2`; text-only auth, disclosed lifecycle,
+    uploads pending migration, TURN config, and bound `rtc.*` signaling.
+  - Binary frames and terminal viewport/history commands fail closed.
+- Terminal data plane: mandatory WebRTC DataChannels `spawn.pty` (bytes) and
+  `spawn.ctl` (history/snapshot/viewport/display ownership), negotiated via
+  the content-free WS signaling plane. TURN is an encrypted reachability
+  fallback, not a server terminal-content fallback.
 
 ## Roadmap
 
@@ -157,11 +156,14 @@ Phases 1–4 of the original scaffold roadmap (skeleton, first agent,
 mobile polish, multi-agent UX) have shipped. The roadmap is now the
 operator-model migration, specified in `TRUST.md`:
 
-1. **TURN + WebRTC-only terminal path** — coturn with ephemeral
-   server-minted credentials; delete the WS PTY relay; `spawn.v2`.
-2. **Daemon-owned data** — history/upload/snapshot/fs-listing streams on
-   DataChannels; delete server transcripts and the Redis PTY ring
-   buffer; stop persisting `env` and skill bodies server-side. (The
+1. **TURN + WebRTC-only terminal path** — source implementation under review:
+   coturn with ephemeral server-minted credentials; WS PTY relay deleted;
+   `spawn.v2`.
+2. **Endpoint-owned data** — history and snapshots now use agent
+   DataChannels, and server transcripts plus the Redis PTY ring are deleted.
+   Upload, fs-listing/transfer, launch-manifest, preset, tool-target, and skill
+   migrations remain tracked Phase 2 work; the server still sees those values
+   until their individual cutovers land. (The
    `/mcp` visibility question is resolved: the MCP surface was cut
    entirely on 2026-07-09.)
 3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device

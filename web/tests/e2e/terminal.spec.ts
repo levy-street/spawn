@@ -1,9 +1,12 @@
 import { devices, expect, type Page, test, type WebSocketRoute } from "@playwright/test";
+import {
+  handleAgentRtcSignal,
+  installAgentRtcMock,
+  replyReplay,
+  sendPty,
+  setDisplayControl,
+} from "./agent-rtc-mock";
 import { AGENT_B_ID, AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
-
-function b64(value: string) {
-  return Buffer.from(value, "utf8").toString("base64");
-}
 
 async function openTerminalWithMockSocket(
   page: Page,
@@ -12,19 +15,21 @@ async function openTerminalWithMockSocket(
     history?: string;
     reconnect?: boolean;
     secondHistory?: string;
-    rtc?: boolean;
-    /** Playwright's WS mock always selects the first offered subprotocol, so
-     *  specs exercising the v1 relay must pin the client to spawn.v1. */
-    v2?: boolean;
+    noChannels?: boolean;
+    noReady?: boolean;
+    autoSnapshot?: boolean;
   } = {},
 ) {
-  if (!options.v2) {
-    await page.addInitScript(() => {
-      (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
-    });
-  }
-  await mockAuthenticatedApi(page, { agents: [agent()] });
   const messages: Array<string | Buffer> = [];
+  await installAgentRtcMock(page, messages, {
+    control: options.control,
+    history: options.history,
+    secondHistory: options.secondHistory,
+    openChannels: !options.noChannels,
+    sendReady: !options.noReady,
+    autoSnapshot: options.autoSnapshot,
+  });
+  await mockAuthenticatedApi(page, { agents: [agent()] });
   const sockets: WebSocketRoute[] = [];
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
@@ -32,31 +37,14 @@ async function openTerminalWithMockSocket(
     const index = sockets.length;
     ws.onMessage((message) => {
       messages.push(message);
+      handleAgentRtcSignal(ws, message);
     });
     ws.send(
       JSON.stringify({
-        type: "display.control",
-        ...(options.control ?? { owner: true, cols: 100, rows: 30, viewers: 1 }),
-      }),
-    );
-    if (options.rtc) {
-      ws.send(
-        JSON.stringify({
-          type: "rtc.config",
-          enabled: true,
-          ice_servers: [],
-          ...(options.v2 ? { binding_nonce_required: true } : {}),
-        }),
-      );
-    }
-    ws.send(
-      JSON.stringify({
-        type: "history",
-        bytes_b64: b64(
-          index === 1
-            ? (options.history ?? "\x1b[31mRED\x1b[0m\n")
-            : (options.secondHistory ?? "after reconnect\n"),
-        ),
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        binding_nonce_required: true,
       }),
     );
     ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
@@ -84,7 +72,10 @@ function jsonMessages(messages: Array<string | Buffer>) {
     .filter((message): message is string => typeof message === "string")
     .map((message) => {
       try {
-        return JSON.parse(message);
+        const parsed = JSON.parse(message);
+        return parsed?.kind === "request" && typeof parsed.operation === "string"
+          ? { ...parsed, ...parsed.parameters, type: parsed.operation }
+          : parsed;
       } catch {
         return null;
       }
@@ -186,13 +177,18 @@ test("terminal sends control keys without waiting for a refresh", async ({ page 
 });
 
 test("terminal attempts direct WebRTC transport when advertised", async ({ page }) => {
-  const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n", rtc: true });
+  const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
 
   await expect
     .poll(() => jsonMessages(messages).find((message) => message?.type === "rtc.offer"))
     .toMatchObject({
       type: "rtc.offer",
       session_id: expect.any(String),
+      agent_id: AGENT_ID,
+      scope_type: "agent",
+      scope_id: AGENT_ID,
+      protocol: "spawn.pty",
+      protocol_version: 2,
       sdp: expect.stringContaining("v=0"),
     });
 });
@@ -216,14 +212,12 @@ test("opening a terminal as viewer claims control automatically", async ({ page 
 
 test("losing control dims the terminal and re-takes from the centered button", async ({ page }) => {
   // Opens as owner (default mock state) — the auto-claim never fires.
-  const { messages, sockets } = await openTerminalWithMockSocket(page, { history: "owner\n" });
+  const { messages } = await openTerminalWithMockSocket(page, { history: "owner\n" });
   await expect(liveTerminalRows(page)).toContainText("owner");
   expect(jsonMessages(messages).some((m) => m?.type === "take_control")).toBe(false);
 
   // Another session steals control: the pane dims with a centered button.
-  sockets[0]?.send(
-    JSON.stringify({ type: "display.control", owner: false, cols: 156, rows: 38, viewers: 2 }),
-  );
+  await setDisplayControl(page, { owner: false, cols: 156, rows: 38, viewers: 2 });
   const button = page.getByRole("button", { name: "Take control" });
   await expect(button).toBeVisible();
   await expect(page.getByText("Another session has control · 156x38 · 2 viewers")).toBeVisible();
@@ -285,7 +279,7 @@ test("terminal sends resize frames and uploads files over REST", async ({ page }
 test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({
   page,
 }) => {
-  const { messages } = await openTerminalWithMockSocket(page, { v2: true, rtc: true });
+  const { messages } = await openTerminalWithMockSocket(page, { noChannels: true });
 
   // Viewport state belongs to spawn.ctl on v2 and must not be observable by
   // the application server. This mock deliberately never opens DataChannels.
@@ -308,6 +302,25 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
   expect(binaryText(messages)).toBe("");
 });
 
+test("spawn.v2 holds endpoint effects until the daemon readiness event", async ({ page }) => {
+  const { messages } = await openTerminalWithMockSocket(page, { noReady: true });
+
+  await page.waitForFunction(() => {
+    return (
+      window as unknown as {
+        __spawnRtcTest?: { ptyReady: () => boolean };
+      }
+    ).__spawnRtcTest?.ptyReady();
+  });
+  await page.getByLabel("Agent terminal").click();
+  await page.keyboard.type("queued until ready");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(300);
+
+  expect(binaryText(messages)).toBe("");
+  expect(jsonMessages(messages).some((message) => message?.kind === "request")).toBe(false);
+});
+
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {
   const { sockets } = await openTerminalWithMockSocket(page, { reconnect: true });
 
@@ -317,8 +330,10 @@ test("terminal reconnect restores a fresh terminal history snapshot", async ({ p
 });
 
 test("previous-agent callbacks remain scoped to the previous terminal", async ({ page }) => {
-  await page.addInitScript(() => {
-    (window as { __spawnForceWsV1?: boolean }).__spawnForceWsV1 = true;
+  const messages: Array<string | Buffer> = [];
+  await installAgentRtcMock(page, messages, {
+    history: "FIRST-AGENT\n",
+    secondHistory: "SECOND-AGENT\n",
   });
   await mockAuthenticatedApi(page, {
     agents: [agent(), agent({ id: AGENT_B_ID, name: "second" })],
@@ -327,10 +342,16 @@ test("previous-agent callbacks remain scoped to the previous terminal", async ({
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     const agentId = new URL(ws.url()).searchParams.get("agent_id") ?? "unknown";
     sockets.set(agentId, ws);
+    ws.onMessage((message) => {
+      messages.push(message);
+      handleAgentRtcSignal(ws, message);
+    });
     ws.send(
       JSON.stringify({
-        type: "history",
-        bytes_b64: b64(agentId === AGENT_ID ? "FIRST-AGENT\n" : "SECOND-AGENT\n"),
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        binding_nonce_required: true,
       }),
     );
     ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
@@ -338,8 +359,7 @@ test("previous-agent callbacks remain scoped to the previous terminal", async ({
 
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(liveTerminalRows(page)).toContainText("FIRST-AGENT");
-  const firstSocket = sockets.get(AGENT_ID);
-  expect(firstSocket).toBeDefined();
+  expect(sockets.get(AGENT_ID)).toBeDefined();
 
   await page.getByRole("link", { name: /second/i }).click();
   await expect(page).toHaveURL(new RegExp(`/agents/${AGENT_B_ID}$`));
@@ -347,16 +367,7 @@ test("previous-agent callbacks remain scoped to the previous terminal", async ({
     .locator('[data-testid="terminal-live-host"]:visible .xterm-rows')
     .last();
   await expect(secondAgentRows).toContainText("SECOND-AGENT");
-  firstSocket?.send(JSON.stringify({ type: "history", bytes_b64: b64("STALE-FIRST-CALLBACK\n") }));
-  firstSocket?.send(
-    JSON.stringify({
-      type: "display.control",
-      owner: false,
-      cols: 222,
-      rows: 88,
-      viewers: 9,
-    }),
-  );
+  await sendPty(page, "STALE-FIRST-CALLBACK\n", 0);
   await page.waitForTimeout(100);
 
   await expect(secondAgentRows).not.toContainText("STALE-FIRST-CALLBACK");
@@ -397,7 +408,7 @@ test("worker replay streams render exactly with geometry markers", async ({ page
 test("terminal scrollback opens from cached snapshots without waiting for a round trip", async ({
   page,
 }) => {
-  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+  const { messages } = await openTerminalWithMockSocket(page, {
     history: longHistory(160),
   });
   const terminal = page.getByLabel("Agent terminal");
@@ -411,16 +422,14 @@ test("terminal scrollback opens from cached snapshots without waiting for a roun
   await expect(overlay.locator(".xterm-rows")).toContainText("history-");
   expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
 
-  sockets[0]?.send(Buffer.from("\x1b[2A\rLIVE-WHILE-SCROLLED"));
+  await sendPty(page, "\x1b[2A\rLIVE-WHILE-SCROLLED");
   await expect(overlay).toBeVisible();
   await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-WHILE-SCROLLED");
 
   const beforeStreamingScroll = await scrollbackOverlayMetrics(page);
-  sockets[0]?.send(
-    Buffer.from(
-      Array.from({ length: 80 }, (_, i) => `STREAMING-${String(i).padStart(2, "0")}`).join("\n") +
-        "\n",
-    ),
+  await sendPty(
+    page,
+    `${Array.from({ length: 80 }, (_, i) => `STREAMING-${String(i).padStart(2, "0")}`).join("\n")}\n`,
   );
   await page.mouse.wheel(0, -600);
   await expect
@@ -449,15 +458,42 @@ test("terminal scrollback opens from cached snapshots without waiting for a roun
 test("terminal reconciles stale live content when returning from a fresh scrollback snapshot", async ({
   page,
 }) => {
-  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+  const { messages } = await openTerminalWithMockSocket(page, {
     history: `${longHistory(160)}WRONG-LIVE-BOTTOM\n`,
   });
   const terminal = page.getByLabel("Agent terminal");
   await expect(terminal).toBeVisible();
   await expect(liveTerminalRows(page)).toContainText("WRONG-LIVE-BOTTOM");
 
-  sockets[0]?.send(Buffer.from("\r\nDIRTY-LIVE-BYTE\n"));
+  // The live terminal has a separate endpoint-backed scrollback overlay, so
+  // its native viewport must always follow the PTY tail. Reproduce the xterm
+  // slow-frame failure deterministically: its scroll element can lag behind
+  // the already-bottomed buffer while a live write is consumed.
+  await page
+    .getByTestId("terminal-live-host")
+    .locator(".xterm-viewport")
+    .evaluate((viewport) => {
+      viewport.scrollTop = Math.max(0, viewport.scrollTop - 40);
+    });
+  await sendPty(page, "\r\nDIRTY-LIVE-BYTE\n");
   await expect(liveTerminalRows(page)).toContainText("DIRTY-LIVE-BYTE");
+  await expect
+    .poll(async () => {
+      const { scrollTop, scrollHeight, clientHeight } = await page
+        .getByTestId("terminal-live-host")
+        .locator(".xterm-viewport")
+        .evaluate((viewport) => ({
+          scrollTop: viewport.scrollTop,
+          scrollHeight: viewport.scrollHeight,
+          clientHeight: viewport.clientHeight,
+        }));
+      const rowHeight = await liveTerminalRows(page)
+        .locator("> div")
+        .first()
+        .evaluate((row) => row.getBoundingClientRect().height);
+      return Math.abs(scrollHeight - clientHeight - scrollTop) / Math.max(1, rowHeight);
+    })
+    .toBeLessThanOrEqual(1);
 
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -300);
@@ -468,13 +504,7 @@ test("terminal reconciles stale live content when returning from a fresh scrollb
   const freshSnapshot = `${Array.from({ length: 160 }, (_, i) => {
     return `RIGHT-SNAPSHOT-${String(i).padStart(3, "0")}`;
   }).join("\n")}\nRIGHT-SNAPSHOT-BOTTOM\n`;
-  sockets[0]?.send(
-    JSON.stringify({
-      type: "snapshot",
-      bytes_b64: b64(freshSnapshot),
-      plain: false,
-    }),
-  );
+  await replyReplay(page, freshSnapshot);
 
   const overlay = page.getByTestId("terminal-scrollback-overlay");
   await expect(overlay).toBeVisible();
@@ -493,10 +523,10 @@ test("exact worker streams skip the live rewrite when closing scrollback", async
   // would replay recently-scrolled lines into a buffer that already has them
   // (the "repeated lines while output generates" bug).
   const history = `\x1b[8;30;100t${longHistory(60)}live-bottom\n$ `;
-  const { messages, sockets } = await openTerminalWithMockSocket(page, { history });
+  const { messages } = await openTerminalWithMockSocket(page, { history });
   await expect(liveTerminalRows(page)).toContainText("live-bottom");
 
-  sockets[0]?.send(Buffer.from("streamed-while-open-001\r\n"));
+  await sendPty(page, "streamed-while-open-001\r\n");
   await expect(liveTerminalRows(page)).toContainText("streamed-while-open-001");
 
   await liveTerminal(page).hover();
@@ -504,14 +534,7 @@ test("exact worker streams skip the live rewrite when closing scrollback", async
   await expect
     .poll(() => jsonMessages(messages).filter((m) => m?.type === "snapshot").length)
     .toBeGreaterThanOrEqual(1);
-  sockets[0]?.send(
-    JSON.stringify({
-      type: "snapshot",
-      bytes_b64: b64(`${history}streamed-while-open-001\r\n`),
-      plain: false,
-      dc_offset: 0,
-    }),
-  );
+  await replyReplay(page, `${history}streamed-while-open-001\r\n`);
   const overlay = page.getByTestId("terminal-scrollback-overlay");
   await expect(overlay).toBeVisible();
 
@@ -527,7 +550,7 @@ test("exact worker streams skip the live rewrite when closing scrollback", async
 test("returning from scrollback over an alternate-screen app leaves the live terminal untouched", async ({
   page,
 }) => {
-  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+  const { messages } = await openTerminalWithMockSocket(page, {
     history: `\x1b[?1049h${longHistory(160).replaceAll("\n", "\r\n")}ALT-SCREEN-LIVE\r\n`,
   });
 
@@ -538,13 +561,7 @@ test("returning from scrollback over an alternate-screen app leaves the live ter
   await expect
     .poll(() => jsonMessages(messages).filter((message) => message?.type === "snapshot").length)
     .toBeGreaterThanOrEqual(1);
-  sockets[0]?.send(
-    JSON.stringify({
-      type: "snapshot",
-      bytes_b64: b64(`${longHistory(160)}FLAT-SNAPSHOT-BOTTOM\n`),
-      plain: false,
-    }),
-  );
+  await replyReplay(page, `${longHistory(160)}FLAT-SNAPSHOT-BOTTOM\n`);
 
   const overlay = page.getByTestId("terminal-scrollback-overlay");
   await expect(overlay).toBeVisible();
@@ -561,7 +578,7 @@ test("returning from scrollback over an alternate-screen app leaves the live ter
 test("resizing invalidates cached scrollback so history re-wraps at the new width", async ({
   page,
 }) => {
-  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+  const { messages } = await openTerminalWithMockSocket(page, {
     history: longHistory(160),
   });
   await expect(liveTerminalRows(page)).toContainText("history-159");
@@ -574,15 +591,48 @@ test("resizing invalidates cached scrollback so history re-wraps at the new widt
   await page.setViewportSize({ width: 700, height: 500 });
   await expect.poll(snapshotCount).toBeGreaterThan(baseline);
 
+  // The resize invalidates the rendered overlay. Send a live chunk only
+  // after its first replacement render has started: it must cross the
+  // reset/write barrier exactly once instead of disappearing in that window.
+  const liveDuringInitialRender = "\x1b[2A\rLIVE-DURING-INITIAL-OVERLAY-RENDER";
+  await page.evaluate((text) => {
+    const overlay = document.querySelector<HTMLElement>(
+      '[data-testid="terminal-scrollback-overlay"]',
+    );
+    const rtc = (
+      window as unknown as {
+        __spawnRtcTest: { sendPty: (value: string) => boolean };
+      }
+    ).__spawnRtcTest;
+    if (!overlay) throw new Error("scrollback overlay is not mounted");
+    const injectWhenBusy = () => {
+      if (overlay.getAttribute("aria-busy") !== "true") return false;
+      if (!rtc.sendPty(text)) throw new Error("RTC mock has no ready spawn.pty channel");
+      overlay.dataset.liveInjectedDuringRender = "true";
+      return true;
+    };
+    if (injectWhenBusy()) return;
+    const observer = new MutationObserver(() => {
+      if (!injectWhenBusy()) return;
+      observer.disconnect();
+    });
+    observer.observe(overlay, { attributes: true, attributeFilter: ["aria-busy"] });
+  }, liveDuringInitialRender);
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -30);
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay).toHaveAttribute("data-live-injected-during-render", "true");
+  await expect(overlay).toHaveAttribute("aria-busy", "false");
+  await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-DURING-INITIAL-OVERLAY-RENDER");
+  const initialRenderText = await overlay.locator(".xterm-rows").innerText();
+  expect(initialRenderText.match(/LIVE-DURING-INITIAL-OVERLAY-RENDER/g)?.length ?? 0).toBe(1);
+
   const rewrapped = `${Array.from({ length: 160 }, (_, i) => {
     return `REWRAPPED-${String(i).padStart(3, "0")}`;
   }).join("\n")}\n`;
-  sockets[0]?.send(JSON.stringify({ type: "snapshot", bytes_b64: b64(rewrapped), plain: false }));
+  await replyReplay(page, rewrapped);
 
-  await liveTerminal(page).hover();
-  await page.mouse.wheel(0, -300);
-  const overlay = page.getByTestId("terminal-scrollback-overlay");
-  await expect(overlay).toBeVisible();
   await expect(overlay.locator(".xterm-rows")).toContainText("REWRAPPED-");
   await expect(overlay.locator(".xterm-rows")).not.toContainText("history-");
 });
@@ -625,7 +675,7 @@ test("scrollback overlay supports mouse text selection and still closes at botto
 test("terminal wheel in alternate screen scrolls locally instead of sending prompt arrows", async ({
   page,
 }) => {
-  const { messages, sockets } = await openTerminalWithMockSocket(page, {
+  const { messages } = await openTerminalWithMockSocket(page, {
     history: `\x1b[?1049h${longHistory(160).replaceAll("\n", "\r\n")}ALT SCREEN\r\n`,
   });
 
@@ -641,13 +691,7 @@ test("terminal wheel in alternate screen scrolls locally instead of sending prom
       lines: 10000,
       plain: false,
     });
-  sockets[0]?.send(
-    JSON.stringify({
-      type: "snapshot",
-      bytes_b64: b64(`${longHistory(160)}ALT SCREEN\n`),
-      plain: false,
-    }),
-  );
+  await replyReplay(page, `${longHistory(160)}ALT SCREEN\n`);
 
   const overlay = page.getByTestId("terminal-scrollback-overlay");
   await expect(overlay).toBeVisible();
@@ -674,7 +718,7 @@ test.describe("mobile terminal touch", () => {
   });
 
   test("touch scrollback opens, stays live, and returns to live input", async ({ page }) => {
-    const { messages, sockets } = await openTerminalWithMockSocket(page, {
+    const { messages } = await openTerminalWithMockSocket(page, {
       history: longHistory(240),
     });
     await expect(page.getByLabel("Agent terminal")).toBeVisible();
@@ -692,32 +736,57 @@ test.describe("mobile terminal touch", () => {
       .toBe(true);
     expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
 
-    sockets[0]?.send(Buffer.from("\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED"));
-    await expect(overlay.locator(".xterm-rows")).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
-
-    await dragTouchInTerminal(page, 0.6, 0.35);
-    await expect(overlay).not.toBeVisible();
+    await sendPty(page, "\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED");
+    await expect(overlay).toBeVisible();
     await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
+    await expect
+      .poll(async () => {
+        const text = await liveTerminalRows(page).innerText();
+        return text.split("MOBILE-LIVE-WHILE-SCROLLED").length - 1;
+      })
+      .toBe(1);
+    await expect(overlay).toHaveAttribute("aria-busy", "false");
+
+    // Advance with bounded full-height touch gestures after the overlay's
+    // render/drain barrier settles. A single flick's momentum is inherently
+    // frame-rate-dependent; every gesture must instead either move the reader
+    // toward the live edge or close the overlay there.
+    for (let attempt = 0; attempt < 6 && (await overlay.isVisible()); attempt += 1) {
+      const before = await scrollbackOverlayMetrics(page);
+      await dragTouchInTerminal(page, 0.9, 0.1);
+      await expect
+        .poll(async () => {
+          if (!(await overlay.isVisible())) return true;
+          const after = await scrollbackOverlayMetrics(page);
+          return after.scrollTop > before.scrollTop + 20;
+        })
+        .toBe(true);
+    }
+    await expect(overlay).not.toBeVisible();
+    await expect
+      .poll(async () => {
+        const text = await liveTerminalRows(page).innerText();
+        return text.split("MOBILE-LIVE-WHILE-SCROLLED").length - 1;
+      })
+      .toBe(1);
   });
 });
 
 test("connection chip opens a details popover", async ({ page }) => {
-  await openTerminalWithMockSocket(page, { v2: true });
+  await openTerminalWithMockSocket(page);
 
   const chip = page.getByRole("button", { name: /Connection details/ });
   await expect(chip).toHaveAttribute(
     "title",
-    /daemon legacy server mirror remains until (?:Phase 2 \/ )?P2-AGENT-02/,
+    /terminal bytes and history are endpoint-to-endpoint/,
   );
-  await expect(chip).not.toHaveAttribute("title", /server never (sees|relays)/i);
   await chip.click();
 
   await expect(page.getByText("Path", { exact: true })).toBeVisible();
   await expect(page.getByText("Round trip", { exact: true })).toBeVisible();
   await expect(
-    page.getByText(/direct WebRTC browser path (active|negotiating); daemon legacy server mirror/),
+    page.getByText(/server receives signaling and disclosed activity only/),
   ).toBeVisible();
-  await expect(page.getByText(/server never (sees|relays)/i)).toHaveCount(0);
 });
 
 // Terminal emulation fidelity in the real renderer. Grid-level behavior is
@@ -749,11 +818,13 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
   await expect(rows).toContainText("LINKTEXT");
   await expect(rows).not.toContainText("example.com");
 
-  const decoration = await rows
-    .locator("span", { hasText: "LINKTEXT" })
-    .first()
-    .evaluate((node) => getComputedStyle(node).textDecorationLine);
-  expect(decoration).toContain("underline");
+  const linkSpan = rows.locator("span", { hasText: "LINKTEXT" }).first();
+  // xterm discovers/decorates links after the row itself paints. Poll the
+  // computed style so parallel renderer pressure cannot sample the brief
+  // undecorated frame while preserving the exact underline requirement.
+  await expect
+    .poll(() => linkSpan.evaluate((node) => getComputedStyle(node).textDecorationLine))
+    .toContain("underline");
   const plainDecoration = await rows
     .locator("span", { hasText: "plain" })
     .first()
@@ -762,18 +833,18 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
 });
 
 test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {
-  const { sockets } = await openTerminalWithMockSocket(page, { history: "ready\r\n" });
+  await openTerminalWithMockSocket(page, { history: "ready\r\n" });
   await page.getByLabel("Agent terminal").click();
 
-  sockets[0]?.send(Buffer.from("\x1b[6 q"));
+  await sendPty(page, "\x1b[6 q");
   await expect(page.getByTestId("terminal-live-host").locator(".xterm-cursor-bar")).toHaveCount(1);
 
-  sockets[0]?.send(Buffer.from("\x1b[4 q"));
+  await sendPty(page, "\x1b[4 q");
   await expect(
     page.getByTestId("terminal-live-host").locator(".xterm-cursor-underline"),
   ).toHaveCount(1);
 
-  sockets[0]?.send(Buffer.from("\x1b[2 q"));
+  await sendPty(page, "\x1b[2 q");
   await expect(page.getByTestId("terminal-live-host").locator(".xterm-cursor-bar")).toHaveCount(0);
   await expect(
     page.getByTestId("terminal-live-host").locator(".xterm-cursor-underline"),
@@ -784,11 +855,11 @@ test.describe("OSC 52 clipboard", () => {
   test.use({ permissions: ["clipboard-read", "clipboard-write"] });
 
   test("agent writes to the system clipboard through OSC 52", async ({ page }) => {
-    const { sockets } = await openTerminalWithMockSocket(page, { history: "ready\r\n" });
+    await openTerminalWithMockSocket(page, { history: "ready\r\n" });
     await page.getByLabel("Agent terminal").click();
 
     const payload = Buffer.from("hello clipboard", "utf8").toString("base64");
-    sockets[0]?.send(Buffer.from(`\x1b]52;c;${payload}\x07`));
+    await sendPty(page, `\x1b]52;c;${payload}\x07`);
 
     await expect
       .poll(async () => page.evaluate(() => navigator.clipboard.readText().catch(() => "")))

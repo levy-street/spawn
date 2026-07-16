@@ -68,12 +68,6 @@ class Settings(BaseSettings):
     turn_secret: str | None = Field(default=None)
     turn_ttl_seconds: int = Field(default=24 * 3600)
 
-    # On-disk transcripts give each agent durable scrollback that survives
-    # server restarts. Default ~32 MB per file × 2 rotated files = ~64 MB
-    # of scrollback per agent before old data is dropped.
-    transcript_dir: str = Field(default="./data/transcripts")
-    transcript_max_bytes_per_file: int = Field(default=32 * 1024 * 1024)
-
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

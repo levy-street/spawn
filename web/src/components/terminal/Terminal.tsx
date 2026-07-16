@@ -20,6 +20,7 @@ import {
   useState,
 } from "react";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
@@ -38,29 +39,26 @@ import { agents as agentsApi } from "@/lib/api";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
-// Defer the deep (10k-line) scrollback warm so connecting to an agent paints
-// the small connect-time history first instead of competing with a multi-MB
-// capture transfer and offscreen render.
+// Defer the deep (10k-line) endpoint replay warm so connecting can paint the
+// small endpoint-provided seed first.
 const SCROLLBACK_WARM_DELAY_MS = 1_200;
-// Server-side captures can time out without a reply; clear the in-flight
+// Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
 // The cache refresh debounces on output, but a continuously-streaming agent
 // would postpone it forever — bound how stale the cache is allowed to get.
 const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
-// Without a DataChannel, snapshots share the relay WebSocket with keystroke
-// echoes: a multi-hundred-KB capture every couple of seconds head-of-line
-// blocks typing on slow links. Refresh far less often and capture fewer
-// lines; opening scrollback still fetches the full depth once.
-const SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS = 5_000;
-const SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS = 20_000;
-const SCROLLBACK_RELAY_CACHE_LINES = 2_000;
+// Before an offset-anchored PTY stream is active, refresh less aggressively;
+// opening scrollback still asks the endpoint for the full depth once.
+const SCROLLBACK_UNANCHORED_REFRESH_DEBOUNCE_MS = 5_000;
+const SCROLLBACK_UNANCHORED_REFRESH_MAX_WAIT_MS = 20_000;
+const SCROLLBACK_UNANCHORED_CACHE_LINES = 2_000;
 // Never re-render the overlay underneath an actively-scrolling user: the
 // reset+rewrite collapses the scroll range mid-gesture and yanks the view.
 const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // Recent live DataChannel chunks kept for replay on top of offset-anchored
-// snapshots. Snapshots travel the slow relay path while live bytes ride the
-// DataChannel, so a fresh capture can lag chunks already rendered locally;
+// snapshots. Replay responses and live bytes use separate mandatory endpoint
+// DataChannels, so a fresh capture can lag chunks already rendered locally;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -260,6 +258,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
+  // Connect-time history is intentionally shallow even when offset-anchored;
+  // opening deep scrollback must still request the endpoint's full capture.
+  const scrollbackCachedSnapshotIsShallowRef = useRef(false);
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderGenerationRef = useRef(0);
   const scrollbackCacheDirtyRef = useRef(true);
@@ -306,11 +307,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
+  const scrollbackPendingLiveWritesRef = useRef(
+    new PostRenderLiveWriteBuffer(SCROLLBACK_DC_REPLAY_BUFFER_BYTES),
+  );
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
   // Whether the live buffer's current seed came from an exact worker stream
-  // (vs the legacy transcript fallback on a degraded connect).
+  // (vs a plain endpoint replay without geometry markers).
   const liveSeedWasExactRef = useRef(false);
   // Last trustworthy reader position (buffer line of the viewport top),
   // recorded only while no rewrite is collapsing the buffer. Rebuilt content
@@ -322,6 +326,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
   const recentDcChunksSizeRef = useRef(0);
   const dcActiveRef = useRef(false);
+  // xterm's reset/seed write is asynchronous. Keep live bytes behind that
+  // barrier so a DataChannel message cannot be consumed and then erased by
+  // the still-running initial replay.
+  const liveSeedWriteInFlightRef = useRef(false);
+  const pendingLiveSeedWritesRef = useRef(
+    new PostRenderLiveWriteBuffer(SCROLLBACK_DC_REPLAY_BUFFER_BYTES),
+  );
+  const liveSeedCoveredOffsetRef = useRef<number | null>(null);
+  const flushPendingLiveSeedWritesRef = useRef<() => void>(() => {});
+  const liveViewportPinFrameRef = useRef<number | null>(null);
+  const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
@@ -517,6 +532,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     scrollbackVisibleRef.current = false;
     scrollbackRenderInFlightRef.current = false;
+    scrollbackPendingLiveWritesRef.current.clear();
+    scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
     scrollbackStableLineRef.current = null;
     scrollbackSnapshotBytesRef.current = null;
     scrollbackOverlayHasSnapshotRef.current = false;
@@ -559,12 +576,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     (bytes: Uint8Array | null, reveal: boolean) => {
       const historyTerm = scrollbackTermRef.current;
       if (!bytes || !historyTerm) return;
+      const renderAlreadyInFlight = scrollbackRenderInFlightRef.current;
       const generation = scrollbackRenderGenerationRef.current + 1;
       scrollbackRenderGenerationRef.current = generation;
       scrollbackRenderInFlightRef.current = true;
-      console.log(
-        `[sbdbg] render start gen=${generation} reveal=${reveal} visible=${scrollbackVisibleRef.current} hasSnap=${scrollbackOverlayHasSnapshotRef.current} restore=${scrollbackRestoreLineRef.current} bytes=${bytes.length}`,
-      );
+      scrollbackOverlayRef.current?.setAttribute("aria-busy", "true");
 
       // A visible re-render must preserve the reader's place even when the
       // idle-gate didn't stage an explicit restore. Measure the distance
@@ -576,7 +592,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackOverlayHasSnapshotRef.current &&
         scrollbackRestoreLineRef.current === null
       ) {
-        if (scrollbackRenderInFlightRef.current) {
+        if (renderAlreadyInFlight) {
           scrollbackRestoreLineRef.current = scrollbackStableLineRef.current;
         } else {
           scrollbackRestoreLineRef.current = historyTerm.buffer.active.viewportY;
@@ -591,10 +607,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // best effort for the overlay; the scheduled refresh converges it.
       // Worker replays are geometry-tagged: each chunk renders at the size
       // its bytes were produced for, and xterm reflows on each transition.
-      const replaySlices = takeDcReplaySlices(bytes) ?? [];
+      const replaySlices = takeDcReplaySlices(bytes);
+      const snapshotOffset = scrollbackSnapshotOffsetsRef.current.get(bytes);
+      const latestOffset = recentDcChunksRef.current.at(-1)?.offsetAfter;
+      let coveredOffset =
+        replaySlices !== null && snapshotOffset !== undefined
+          ? Math.max(snapshotOffset, latestOffset ?? snapshotOffset)
+          : null;
       const ops: SequencedWrite[] = [
         ...overlayWriteOps(decodeUtf8(bytes), { cols, rows }),
-        ...replaySlices.map((slice) => ({ data: slice })),
+        ...(replaySlices ?? []).map((slice) => ({ data: slice })),
       ];
       writeSequenced(historyTerm, ops, () => {
         // Two frames let xterm's renderer settle the viewport height, but
@@ -607,39 +629,74 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           if (scrollbackRenderGenerationRef.current !== generation) return;
           requestAnimationFrame(() => {
             if (scrollbackRenderGenerationRef.current !== generation) return;
-            scrollbackRenderInFlightRef.current = false;
-            scrollbackRenderedSnapshotBytesRef.current = bytes;
-            const overlay = getScrollbackViewport();
-            console.log(
-              `[sbdbg] render done gen=${generation} overlay=${!!overlay} visible=${scrollbackVisibleRef.current}`,
-            );
-            if (!overlay) return;
-            if (!reveal && !scrollbackVisibleRef.current) {
-              historyTerm.scrollToBottom();
-              overlay.scrollTop = maxElementScrollTop(overlay);
-              return;
-            }
-            scrollbackOverlayHasSnapshotRef.current = true;
-            healScrollbackScrollState();
-            const restoreLine = scrollbackRestoreLineRef.current;
-            scrollbackRestoreLineRef.current = null;
-            if (restoreLine !== null) {
-              historyTerm.scrollToLine(restoreLine);
-            } else {
-              historyTerm.scrollToBottom();
-            }
-            const pendingDelta = scrollbackPendingDeltaPxRef.current;
-            const pendingLines = Math.trunc(
-              pendingDelta / Math.max(1, terminalRowHeightRef.current),
-            );
-            if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-            scrollbackPendingDeltaPxRef.current = 0;
-            scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-            scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
-            console.log(
-              `[sbdbg] positioned gen=${generation} st=${Math.round(overlay.scrollTop)} max=${Math.round(maxElementScrollTop(overlay))}`,
-            );
-            updateScrollbackReveal(overlay);
+            const requestConvergedSnapshot = () => {
+              scrollbackRenderInFlightRef.current = false;
+              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
+              scrollbackCacheDirtyRef.current = true;
+              if (scrollbackVisibleRef.current) {
+                requestSnapshotRef.current("overlay");
+              } else {
+                scheduleScrollbackCacheRefreshRef.current(100);
+              }
+            };
+            const finishRender = () => {
+              scrollbackRenderInFlightRef.current = false;
+              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
+              scrollbackRenderedSnapshotBytesRef.current = bytes;
+              const overlay = getScrollbackViewport();
+              if (!overlay) return;
+              if (!reveal && !scrollbackVisibleRef.current) {
+                historyTerm.scrollToBottom();
+                overlay.scrollTop = maxElementScrollTop(overlay);
+                return;
+              }
+              scrollbackOverlayHasSnapshotRef.current = true;
+              healScrollbackScrollState();
+              const restoreLine = scrollbackRestoreLineRef.current;
+              scrollbackRestoreLineRef.current = null;
+              if (restoreLine !== null) {
+                historyTerm.scrollToLine(restoreLine);
+              } else {
+                historyTerm.scrollToBottom();
+              }
+              const pendingDelta = scrollbackPendingDeltaPxRef.current;
+              const pendingLines = Math.trunc(
+                pendingDelta / Math.max(1, terminalRowHeightRef.current),
+              );
+              if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+              scrollbackPendingDeltaPxRef.current = 0;
+              scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+              scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
+              updateScrollbackReveal(overlay);
+            };
+            const drainPendingLiveWrites = () => {
+              if (scrollbackRenderGenerationRef.current !== generation) return;
+              const geometry = lastSizeRef.current;
+              if (
+                replaySlices === null ||
+                historyTerm.cols !== geometry.cols ||
+                historyTerm.rows !== geometry.rows
+              ) {
+                requestConvergedSnapshot();
+                return;
+              }
+              const pending = scrollbackPendingLiveWritesRef.current.drain(coveredOffset, geometry);
+              if (pending.kind === "refresh") {
+                requestConvergedSnapshot();
+                return;
+              }
+              coveredOffset = pending.coveredOffset;
+              if (pending.chunks.length === 0) {
+                finishRender();
+                return;
+              }
+              writeSequenced(
+                historyTerm,
+                pending.chunks.map((data) => ({ data })),
+                drainPendingLiveWrites,
+              );
+            };
+            drainPendingLiveWrites();
           });
         });
       });
@@ -683,22 +740,44 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   prepareScrollbackSnapshotRef.current = prepareScrollbackSnapshot;
 
   const writeScrollbackLiveBytes = useCallback(
-    (bytes: Uint8Array) => {
+    (bytes: Uint8Array, dcOffsetAfter?: number) => {
       const historyTerm = scrollbackTermRef.current;
-      if (!historyTerm || scrollbackRenderedSnapshotBytesRef.current === null) return;
-      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) return;
+      if (!historyTerm) return;
+      const geometry = lastSizeRef.current;
+      const queueForPostRender = () => {
+        scrollbackPendingLiveWritesRef.current.enqueue(bytes, dcOffsetAfter, geometry);
+      };
+      // The first visible render has no completed snapshot yet. Hold bytes
+      // arriving after that render captured its replay slices, then append
+      // them exactly once when the reset/geometry walk reaches its barrier.
+      // A visible overlay waiting for its first snapshot uses the same queue.
+      if (scrollbackRenderedSnapshotBytesRef.current === null) {
+        if (scrollbackRenderInFlightRef.current || scrollbackVisibleRef.current) {
+          queueForPostRender();
+        }
+        return;
+      }
+      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) {
+        queueForPostRender();
+        return;
+      }
       // Warm-cache appends are an optimization and must never write at the
       // wrong geometry. Mid-render, xterm's shared write queue would slot
       // these bytes between the sequenced chunk walk's writes — at whatever
       // historical geometry the walk is passing through. And after an
       // external PTY resize (another window taking control), bytes at the
-      // new width can arrive before this client learns the geometry. In both
-      // cases: drop; the snapshot covering these bytes re-renders shortly.
-      if (scrollbackRenderInFlightRef.current) return;
-      const { cols, rows } = lastSizeRef.current;
-      if (historyTerm.cols !== cols || historyTerm.rows !== rows) {
+      // new width can arrive before this client learns the geometry. Hold a
+      // bounded tail in both cases; drain it at the final geometry or request
+      // a fresh endpoint checkpoint when exact append is impossible.
+      if (scrollbackRenderInFlightRef.current) {
+        queueForPostRender();
+        return;
+      }
+      if (historyTerm.cols !== geometry.cols || historyTerm.rows !== geometry.rows) {
+        queueForPostRender();
         scrollbackCacheDirtyRef.current = true;
-        scheduleScrollbackCacheRefreshRef.current();
+        if (scrollbackVisibleRef.current) requestSnapshotRef.current("overlay");
+        else scheduleScrollbackCacheRefreshRef.current();
         return;
       }
 
@@ -945,6 +1024,41 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [imagePasteMode, removePendingAttachment, showUploadStatus, updatePendingAttachments],
   );
 
+  flushPendingLiveSeedWritesRef.current = () => {
+    const term = termRef.current;
+    if (!term) {
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedWriteInFlightRef.current = false;
+      return;
+    }
+    const geometry = lastSizeRef.current;
+    const pending = pendingLiveSeedWritesRef.current.drain(
+      liveSeedCoveredOffsetRef.current,
+      geometry,
+    );
+    if (pending.kind === "refresh") {
+      liveSeedWriteInFlightRef.current = false;
+      historyReseedPendingRef.current = true;
+      scrollbackCacheDirtyRef.current = true;
+      if (!requestSnapshotRef.current("cache")) {
+        scheduleScrollbackCacheRefreshRef.current(100);
+      }
+      pinLiveViewportToBottomRef.current();
+      return;
+    }
+    liveSeedCoveredOffsetRef.current = pending.coveredOffset;
+    if (pending.chunks.length === 0) {
+      liveSeedWriteInFlightRef.current = false;
+      pinLiveViewportToBottomRef.current();
+      return;
+    }
+    writeSequenced(
+      term,
+      pending.chunks.map((data) => ({ data })),
+      () => flushPendingLiveSeedWritesRef.current(),
+    );
+  };
+
   const socket = useAgentSocket({
     agentId,
     enabled: socketInitialSize !== null,
@@ -962,8 +1076,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           if (evicted) recentDcChunksSizeRef.current -= evicted.bytes.length;
         }
       } else if (dcActiveRef.current) {
-        // Transport fell back to the relay; DataChannel offsets no longer
-        // describe this stream.
+        // An unanchored endpoint replay cannot be ordered by PTY offset.
         dcActiveRef.current = false;
         recentDcChunksRef.current = [];
         recentDcChunksSizeRef.current = 0;
@@ -995,17 +1108,28 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }, 250);
       }
       scheduleScrollbackCacheRefreshRef.current();
-      writeScrollbackLiveBytes(bytes);
-      termRef.current?.write(bytes);
+      writeScrollbackLiveBytes(bytes, dcOffsetAfter);
+      if (liveSeedWriteInFlightRef.current) {
+        pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
+      } else {
+        termRef.current?.write(bytes, () => {
+          pinLiveViewportToBottomRef.current();
+        });
+      }
     },
-    onHistory: (bytes) => {
+    onHistory: (bytes, dcOffset) => {
       const term = termRef.current;
       if (!term) return;
+      if (typeof dcOffset === "number") {
+        scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
+      }
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedCoveredOffsetRef.current = typeof dcOffset === "number" ? dcOffset : null;
+      liveSeedWriteInFlightRef.current = true;
       const exactChunks = parseExactReplay(decodeUtf8(bytes));
       if (exactChunks) exactStreamRef.current = true;
-      // Remember what kind of seed the live buffer got: a degraded connect
-      // can fall back to the server transcript (legacy formatting) even for
-      // worker agents, and a later exact snapshot should heal that.
+      // Remember whether the endpoint seed included exact geometry markers;
+      // a later exact replay can heal a plain seed.
       liveSeedWasExactRef.current = exactChunks !== null;
       const lastChunk = exactChunks?.[exactChunks.length - 1];
       if (lastChunk) {
@@ -1025,6 +1149,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         : containsAlternateBufferSwitch(bytes);
       if (altActive) {
         scrollbackCachedSnapshotBytesRef.current = null;
+        scrollbackCachedSnapshotIsShallowRef.current = false;
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       } else {
@@ -1032,6 +1157,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // scrollback opens instantly, but leave the cache dirty so the full
         // depth is fetched once the terminal is interactive.
         scrollbackCachedSnapshotBytesRef.current = bytes;
+        scrollbackCachedSnapshotIsShallowRef.current = true;
         scrollbackCacheDirtyRef.current = true;
         scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
@@ -1039,6 +1165,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       term.reset();
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
+        flushPendingLiveSeedWritesRef.current();
       });
     },
     onDisplayControl: applyDisplayControl,
@@ -1047,9 +1174,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (snapshotIsExact) {
         exactStreamRef.current = true;
         if (!liveSeedWasExactRef.current) {
-          // The connect-time seed fell back to the legacy transcript (slow
-          // or degraded path) but the stream is provably exact: heal the
-          // live buffer from a proper checkpoint capture.
+          // The connect-time seed was plain, but the endpoint stream is now
+          // provably exact: heal from a proper checkpoint capture.
           historyReseedPendingRef.current = true;
         }
       }
@@ -1060,6 +1186,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
+      scrollbackCachedSnapshotIsShallowRef.current = false;
       if (typeof dcOffset === "number") {
         // Offset-anchored snapshot: renders are made exact by replaying live
         // DataChannel bytes past the capture offset, so the cache converges
@@ -1067,8 +1194,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
         scrollbackCacheDirtyRef.current = false;
       } else {
-        // Snapshots and live PTY bytes travel over different transports (ws
-        // vs WebRTC DataChannel), so arrival order is not capture order. If
+        // Replay and live PTY bytes travel over separate DataChannels, so
+        // arrival order is not capture order. If
         // live bytes arrived since this snapshot was requested, the capture
         // may not contain them — keep the cache dirty and converge with a
         // follow-up refresh rather than risk rolling the live terminal back.
@@ -1078,10 +1205,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheDirtyRef.current = dirty;
         if (dirty) scheduleScrollbackCacheRefreshRef.current();
       }
-      // Reseeds prefer an anchored capture, but a relay-only session (no
-      // DataChannel) can never produce one — accept an unanchored capture
-      // there; syncLive's cache-clean gate guarantees the stream was quiet
-      // around it, so nothing can roll back.
+      // Reseeds prefer an anchored capture. A plain endpoint replay can be
+      // accepted only through the cache-clean gate while the stream is quiet.
       const anchorOk = typeof dcOffset === "number" || !dcActiveRef.current;
       if (historyReseedPendingRef.current && anchorOk && !scrollbackVisibleRef.current) {
         // A width change left seeded history wrapped at the old width;
@@ -1165,11 +1290,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       type: "snapshot",
       lines:
         purpose === "cache" && !dcActiveRef.current
-          ? SCROLLBACK_RELAY_CACHE_LINES
+          ? SCROLLBACK_UNANCHORED_CACHE_LINES
           : purpose === "overlay" && exactStreamRef.current
             ? // Worker replays: reach the full retained log. A TUI's redraw
-              // churn is hundreds of bytes per "line", so the legacy
-              // lines→bytes sizing leaves older transcript out of reach and
+              // churn is hundreds of bytes per "line", so basic
+              // lines-to-bytes sizing leaves older replay out of reach and
               // scrollback dead-ends ("can't scroll") on busy sessions.
               TERMINAL_SNAPSHOT_LINES * 4
             : TERMINAL_SNAPSHOT_LINES,
@@ -1195,10 +1320,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // Debounce on output, but bound the postponement: an agent that streams
       // faster than the debounce window would otherwise starve the refresh
       // forever, leaving the scrollback cache minutes stale.
-      const relayMode = !dcActiveRef.current;
-      const debounce = delayMs ?? (relayMode ? SCROLLBACK_RELAY_REFRESH_DEBOUNCE_MS : 350);
-      const maxWait = relayMode
-        ? SCROLLBACK_RELAY_REFRESH_MAX_WAIT_MS
+      const unanchoredMode = !dcActiveRef.current;
+      const debounce =
+        delayMs ?? (unanchoredMode ? SCROLLBACK_UNANCHORED_REFRESH_DEBOUNCE_MS : 350);
+      const maxWait = unanchoredMode
+        ? SCROLLBACK_UNANCHORED_REFRESH_MAX_WAIT_MS
         : SCROLLBACK_REFRESH_MAX_WAIT_MS;
       const now = Date.now();
       if (scrollbackCacheRefreshDeadlineRef.current === null) {
@@ -1265,7 +1391,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotOffsetsRef.current.get(scrollbackSnapshotBytesRef.current) !== undefined;
       if (
         !scrollbackSnapshotBytesRef.current ||
-        (scrollbackCacheDirtyRef.current && !cachedAnchored)
+        (scrollbackCacheDirtyRef.current &&
+          (!cachedAnchored || scrollbackCachedSnapshotIsShallowRef.current))
       ) {
         requestSnapshot("overlay");
       }
@@ -1374,8 +1501,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      // Keep a large local buffer for transcript replay and non-wheel access.
-      // Wheel/touch scrollback is rendered from fresh daemon snapshots so it
+      // Keep a large local buffer for endpoint replay and non-wheel access.
+      // Wheel/touch scrollback is rendered from fresh worker snapshots so it
       // reflects the current worker checkpoint rather than browser replay artifacts.
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
@@ -1510,6 +1637,37 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const maxScrollTop = (viewport: HTMLElement) => {
       return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    };
+
+    // xterm advances its buffer viewport when output appends at the bottom,
+    // but under a slow render frame its native scroll element can remain one
+    // or two rows behind. Because this UI renders historical navigation in a
+    // separate endpoint-backed overlay, the live terminal must stay pinned to
+    // the current PTY tail. Reconcile after xterm consumes a write and
+    // coalesce streaming chunks to one refresh per animation frame.
+    pinLiveViewportToBottomRef.current = () => {
+      if (liveViewportPinFrameRef.current !== null) return;
+      liveViewportPinFrameRef.current = requestAnimationFrame(() => {
+        if (termRef.current !== term) {
+          liveViewportPinFrameRef.current = null;
+          return;
+        }
+        const reconcile = () => {
+          term.scrollToBottom();
+          const viewport = getViewport();
+          if (viewport) viewport.scrollTop = maxScrollTop(viewport);
+          term.refresh(0, term.rows - 1);
+        };
+        reconcile();
+        // A native scroll event already queued from the slow frame can run
+        // after the first correction and restore the stale scrollTop. Verify
+        // once more on the following frame; streaming writes arriving in
+        // between are coalesced into this same final reconciliation.
+        liveViewportPinFrameRef.current = requestAnimationFrame(() => {
+          liveViewportPinFrameRef.current = null;
+          if (termRef.current === term) reconcile();
+        });
+      });
     };
 
     const alignViewportToRows = () => {
@@ -2210,11 +2368,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (resizeTimer) clearTimeout(resizeTimer);
       onDataDisposableRef.current?.dispose();
       if (uploadStatusTimerRef.current) clearTimeout(uploadStatusTimerRef.current);
+      if (liveViewportPinFrameRef.current !== null) {
+        cancelAnimationFrame(liveViewportPinFrameRef.current);
+        liveViewportPinFrameRef.current = null;
+      }
+      pendingLiveSeedWritesRef.current.clear();
+      liveSeedCoveredOffsetRef.current = null;
+      liveSeedWriteInFlightRef.current = false;
+      scrollbackPendingLiveWritesRef.current.clear();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
       fitTerminalRef.current = () => {};
       layoutTerminalSurfaceRef.current = () => {};
+      pinLiveViewportToBottomRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
@@ -2589,8 +2756,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         } else {
           // At the live edge: drive a fresh authoritative reseed to
           // convergence. The reseed only applies a snapshot that lands "clean"
-          // (no live bytes since it was requested), so on the relay path — no
-          // DataChannel offset to anchor a replay — a single 5s-debounced
+          // (no live bytes since it was requested), so without a PTY offset
+          // anchor a single 5s-debounced
           // request almost never lands inside the window, and the panel looks
           // unrefreshed until a manual scroll. Keep requesting promptly until
           // one converges (or we give up); only clean snapshots apply, so this
@@ -2877,7 +3044,7 @@ type ReplayChunk = { cols: number; rows: number; data: string };
  * Worker-backed agents ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
- * or null when the payload is a legacy transcript rather than worker replay.
+ * or null when the endpoint returned a plain replay without geometry markers.
  * xterm.js does not implement CSI 8 t itself, so the
  * consumer applies each chunk's geometry via term.resize() between writes.
  */
@@ -2933,8 +3100,8 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
 }
 
 /** Sequenced ops for the scrollback overlay (a display-only terminal that is
- *  safe to resize): exact worker replays get per-chunk geometry, legacy
- *  transcripts get the fallback reformat, and both end at `finalSize`. */
+ *  safe to resize): exact worker replays get per-chunk geometry, plain
+ *  endpoint replays get a fallback reformat, and both end at `finalSize`. */
 function overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
@@ -2958,7 +3125,7 @@ function overlayWriteOps(
  *  never be geometry-walked (resizing it reflows the buffer and desyncs it
  *  from its container). Exact worker replays end with a self-contained chunk
  *  — a full idempotent repaint at the current PTY geometry — so the final
- *  chunk alone seeds the screen. Legacy transcript fallback is reformatted. */
+ *  chunk alone seeds the screen. Plain endpoint replay is reformatted. */
 function liveSeedWriteOps(text: string): SequencedWrite[] {
   const exact = parseExactReplay(text);
   if (!exact) {
@@ -2969,7 +3136,7 @@ function liveSeedWriteOps(text: string): SequencedWrite[] {
 
 function formatSnapshotForXterm(input: string): string {
   const normalized = input.replaceAll(/\r\n/g, "\n").replaceAll("\r", "\n");
-  // Legacy snapshots can terminate the final row with a newline; writing it would
+  // Plain snapshots can terminate the final row with a newline; writing it would
   // scroll the terminal one row past the content and desync subsequent
   // app-relative drawing by one row (e.g. input echo landing on the status
   // bar row). Leave the cursor on the last content row instead.
@@ -2990,7 +3157,7 @@ function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // back to the agent after transcript replay can echo fragments like "0;276;0c".
+  // back to the agent after replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

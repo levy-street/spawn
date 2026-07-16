@@ -703,14 +703,10 @@ mod tests {
         )
         .await
         .expect("worker output");
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            pty::WsOutbound::Binary(_)
-        ));
-        assert!(matches!(
-            sink_rx.recv().await.unwrap(),
-            pty::WsOutbound::Json(_)
-        ));
+        let activity = sink_rx.recv().await.unwrap();
+        assert!(activity.as_str().contains("agent.activity"));
+        assert!(!activity.as_str().contains("12:34"));
+        assert!(sink_rx.try_recv().is_err());
 
         drop(worker_stream);
         reader.await.unwrap();

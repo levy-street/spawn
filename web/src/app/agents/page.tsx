@@ -46,70 +46,6 @@ export default function AgentsPage() {
   );
 }
 
-const PREVIEW_LINES = 3;
-const PREVIEW_POLL_MS = 10_000;
-const PREVIEW_FETCH_CHUNK = 6;
-
-// Strip CSI/OSC sequences and control bytes before deciding which lines are
-// blank in a legacy plain snapshot.
-// biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
-const ANSI_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
-// biome-ignore lint/suspicious/noControlCharactersInRegex: terminal output cleanup
-const CONTROL_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
-
-function decodeSnapshotTail(bytesB64: string): string | null {
-  const raw = atob(bytesB64);
-  const bytes = Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
-  const text = new TextDecoder("utf-8", { fatal: false })
-    .decode(bytes)
-    .replace(ANSI_RE, "")
-    .replace(CONTROL_RE, "");
-  const lines = text.split(/\r?\n/).map((line) => line.trimEnd());
-  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  return lines.slice(-PREVIEW_LINES).join("\n");
-}
-
-/**
- * Polls plain-text worker replay tails for running agents via the REST snapshot
- * endpoint. Fetches in small chunks to stay gentle on the daemons; pauses
- * automatically while the tab is hidden (react-query default).
- */
-function useAgentTails(agentList: Agent[]): Record<string, string | null> {
-  const runningIds = useMemo(
-    () =>
-      agentList
-        .filter((a) => a.status === "running" && !isAgentArchived(a))
-        .map((a) => a.id)
-        .sort(),
-    [agentList],
-  );
-
-  const tailsQ = useQuery({
-    queryKey: ["agent-tails", runningIds],
-    enabled: runningIds.length > 0,
-    refetchInterval: PREVIEW_POLL_MS,
-    placeholderData: (previous) => previous,
-    queryFn: async () => {
-      const map: Record<string, string | null> = {};
-      for (let i = 0; i < runningIds.length; i += PREVIEW_FETCH_CHUNK) {
-        const chunk = runningIds.slice(i, i + PREVIEW_FETCH_CHUNK);
-        const results = await Promise.allSettled(
-          chunk.map(async (id) => {
-            const snapshot = await agents.snapshot(id, { lines: 100, plain: true });
-            return [id, decodeSnapshotTail(snapshot.bytes_b64)] as const;
-          }),
-        );
-        for (const result of results) {
-          if (result.status === "fulfilled") map[result.value[0]] = result.value[1];
-        }
-      }
-      return map;
-    },
-  });
-
-  return tailsQ.data ?? {};
-}
-
 function AgentsView() {
   const qc = useQueryClient();
   const [includeArchived, setIncludeArchived] = useState(false);
@@ -119,7 +55,9 @@ function AgentsView() {
     queryFn: () => agents.list({ include_archived: includeArchived }),
     refetchInterval: 5_000,
   });
-  const tails = useAgentTails(q.data ?? []);
+  // Terminal previews are no longer fetched through the server. A future
+  // endpoint-owned preview can populate this without exposing history.
+  const tails: Record<string, string | null> = {};
 
   const invalidateAgents = () => {
     qc.invalidateQueries({ queryKey: ["agents"] });

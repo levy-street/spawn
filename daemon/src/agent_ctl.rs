@@ -256,6 +256,13 @@ struct ReplayResponse<'a> {
     chunks: usize,
 }
 
+#[derive(Serialize)]
+struct ReadyEvent {
+    version: u8,
+    kind: &'static str,
+    event: &'static str,
+}
+
 async fn enqueue(
     sender: &ControlSender,
     message: ControlOutbound,
@@ -319,6 +326,22 @@ pub async fn send_ack(
         )
     })?;
     enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await
+}
+
+pub async fn send_ready(sender: &ControlSender) -> Result<(), ProtocolError> {
+    let event = ReadyEvent {
+        version: PROTOCOL_VERSION,
+        kind: "event",
+        event: "ready",
+    };
+    let text = serde_json::to_string(&event).map_err(|error| {
+        ProtocolError::new(
+            None,
+            "encode_failed",
+            &format!("encoding channel readiness failed: {error}"),
+        )
+    })?;
+    enqueue(sender, ControlOutbound::Text(text), None).await
 }
 
 pub async fn send_replay(
@@ -490,7 +513,7 @@ impl AgentControlHub {
     }
 
     #[cfg(test)]
-    async fn retained_counts(&self) -> (usize, usize) {
+    pub(crate) async fn retained_counts(&self) -> (usize, usize) {
         (
             self.inner.lock().await.len(),
             self.transactions.lock().await.len(),

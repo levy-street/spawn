@@ -20,9 +20,9 @@ see docs/TRUST.md.)
 | List/get/create agents | agents page, sidebar, new-agent form | `/api/agents` | `agents.list/get/create` | `agent.create` |
 | Rename/pin/archive/delete agent | agents page, detail header, sidebar | `PATCH/DELETE /api/agents/{id}` | `agents.update/rename/pin/archive/remove` | metadata update; `agent.kill` for delete |
 | Restart agent | agents page, detail header, sidebar | `POST /api/agents/{id}/restart` | `agents.restart` | `agent.restart` |
-| Terminal input | terminal page | `POST /api/agents/{id}/input` | `agents.input` | binary input frame |
-| Resize/scroll/redraw terminal | terminal page display owner | `/resize`, `/scroll`, `/redraw` | `agents.resize/scroll/redraw` | `agent.resize`, `agent.scroll`, `agent.redraw` |
-| Capture terminal snapshot | terminal reconnect/history | `POST /api/agents/{id}/snapshot` | `agents.snapshot` | `agent.snapshot` request/result |
+| Terminal input | terminal page | none | terminal socket hook | `spawn.pty` DataChannel direct to endpoint |
+| Resize/scroll/redraw/display ownership | terminal page | none | `spawn.ctl` client | versioned `spawn.ctl` request direct to endpoint |
+| History/snapshot replay | terminal reconnect/history | none | `spawn.ctl` client | bounded `spawn.ctl` chunk response direct from worker |
 | Upload file/image to agent cwd | terminal upload/drop/paste | `/upload`, `/upload-file` | `agents.upload/uploadFile` | `agent.upload` request/result |
 
 Intentional differences:
@@ -31,9 +31,9 @@ Intentional differences:
   errors never use REST or the server daemon WebSocket. The browser talks to
   the selected host on its independently bound `spawn.host.ctl` DataChannel;
   cross-host copies are browser-mediated between two such sessions.
-- Browser display ownership is a UI/WebSocket coordination feature. REST
-  exposes the underlying resize, scroll, redraw, snapshot, upload, and input
-  actions but does not model viewer ownership.
+- Browser display ownership, terminal input, viewport control, and replay are
+  endpoint-owned DataChannel features. REST and server WebSockets deliberately
+  expose none of those content-bearing operations.
 - The `spawnd` CLI is host-side daemon administration only: login, status,
   logout, run, install, and service setup. User agent control lives in browser
   and REST.

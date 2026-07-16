@@ -1,10 +1,4 @@
-"""In-process routing map between daemon WS and browser WSs.
-
-Multi-process deploys still work: PTY output is also `publish()`ed to Redis,
-so a browser attached on a different worker receives the bytes via pubsub.
-This module is the *local* fast path plus the registration source of truth
-for which daemon owns which agent on this worker.
-"""
+"""In-process ownership and content-free control/signaling routing."""
 
 from __future__ import annotations
 
@@ -12,7 +6,6 @@ import asyncio
 import json
 import time
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -47,11 +40,6 @@ class DaemonConn:
         async with self.send_lock:
             await self.websocket.send_text(json.dumps(payload))
 
-    async def send_bytes(self, payload: bytes) -> None:
-        async with self.send_lock:
-            await self.websocket.send_bytes(payload)
-
-
 @dataclass(eq=False)
 class BrowserConn:
     user_id: str
@@ -63,10 +51,6 @@ class BrowserConn:
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
             await self.websocket.send_text(json.dumps(payload))
-
-    async def send_bytes(self, payload: bytes) -> None:
-        async with self.send_lock:
-            await self.websocket.send_bytes(payload)
 
     @property
     def route_id(self) -> str:
@@ -120,29 +104,11 @@ class UploadResolution(Enum):
     STALE_OWNER = "stale_owner"
 
 
-@dataclass
-class _DisplayState:
-    owner_conn_id: str | None = None
-    cols: int | None = None
-    rows: int | None = None
-
-
-@dataclass(frozen=True)
-class BrowserDisplayState:
-    owner: bool
-    cols: int | None
-    rows: int | None
-    viewers: int
-    changed: bool = False
-
-
 class Broker:
     def __init__(self) -> None:
         self._daemons_by_host: dict[str, DaemonConn] = {}
         self._accepted_daemon_owners: dict[str, tuple[str, int]] = {}
         self._daemon_by_agent: dict[str, DaemonConn] = {}
-        self._browsers_by_agent: dict[str, set[BrowserConn]] = defaultdict(set)
-        self._display_by_agent: dict[str, _DisplayState] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
         self._retired_rtc_bindings: dict[tuple[str, str, int, str], float] = {}
         self._rtc_tombstone_cleanup_task: asyncio.Task[None] | None = None
@@ -297,49 +263,6 @@ class Broker:
 
     def get_daemon_for_agent(self, agent_id: str) -> DaemonConn | None:
         return self._daemon_by_agent.get(agent_id)
-
-    # ---- browser attach ----
-
-    async def attach_browser(
-        self,
-        conn: BrowserConn,
-        *,
-        cols: int | None = None,
-        rows: int | None = None,
-    ) -> BrowserDisplayState:
-        async with self._lock:
-            browsers = self._browsers_by_agent[conn.agent_id]
-            browsers.add(conn)
-            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
-            self._drop_stale_display_owner_locked(conn.agent_id, state)
-            if state.owner_conn_id is None:
-                state.owner_conn_id = conn.id
-                if cols is not None and rows is not None:
-                    state.cols = cols
-                    state.rows = rows
-            elif state.cols is None and cols is not None and rows is not None:
-                state.cols = cols
-                state.rows = rows
-            return self._browser_display_state_locked(conn, state)
-
-    async def detach_browser(self, conn: BrowserConn) -> BrowserDisplayState | None:
-        async with self._lock:
-            browsers = self._browsers_by_agent.get(conn.agent_id)
-            if browsers is not None:
-                browsers.discard(conn)
-                if not browsers:
-                    self._browsers_by_agent.pop(conn.agent_id, None)
-            state = self._display_by_agent.get(conn.agent_id)
-            if state is None:
-                return None
-            if state.owner_conn_id == conn.id:
-                state.owner_conn_id = None
-            self._drop_stale_display_owner_locked(conn.agent_id, state)
-            self._promote_display_owner_locked(conn.agent_id, state)
-            return self._browser_display_state_locked(conn, state)
-
-    def browsers_for(self, agent_id: str) -> list[BrowserConn]:
-        return list(self._browsers_by_agent.get(agent_id, ()))
 
     async def register_rtc_session(
         self,
@@ -628,135 +551,6 @@ class Broker:
     ) -> BrowserConn | HostBrowserConn | RedisBrowserConn | None:
         binding = await self.rtc_session_for(session_id)
         return binding.browser if binding is not None else None
-
-    async def update_display_size(
-        self,
-        conn: BrowserConn,
-        *,
-        cols: int,
-        rows: int,
-    ) -> BrowserDisplayState | None:
-        async with self._lock:
-            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
-            self._drop_stale_display_owner_locked(conn.agent_id, state)
-            self._promote_display_owner_locked(conn.agent_id, state, preferred=conn)
-            if state.owner_conn_id != conn.id:
-                return None
-            changed = state.cols != cols or state.rows != rows
-            state.cols = cols
-            state.rows = rows
-            return self._browser_display_state_locked(conn, state, changed=changed)
-
-    async def take_display_control(
-        self,
-        conn: BrowserConn,
-        *,
-        cols: int,
-        rows: int,
-    ) -> BrowserDisplayState:
-        async with self._lock:
-            browsers = self._browsers_by_agent[conn.agent_id]
-            browsers.add(conn)
-            state = self._display_by_agent.setdefault(conn.agent_id, _DisplayState())
-            state.owner_conn_id = conn.id
-            state.cols = cols
-            state.rows = rows
-            return self._browser_display_state_locked(conn, state)
-
-    async def display_states_for_agent(
-        self, agent_id: str
-    ) -> list[tuple[BrowserConn, BrowserDisplayState]]:
-        async with self._lock:
-            state = self._display_by_agent.setdefault(agent_id, _DisplayState())
-            self._drop_stale_display_owner_locked(agent_id, state)
-            self._promote_display_owner_locked(agent_id, state)
-            return [
-                (conn, self._browser_display_state_locked(conn, state))
-                for conn in self._browsers_by_agent.get(agent_id, ())
-            ]
-
-    def _drop_stale_display_owner_locked(self, agent_id: str, state: _DisplayState) -> None:
-        if state.owner_conn_id is None:
-            return
-        if any(
-            conn.id == state.owner_conn_id for conn in self._browsers_by_agent.get(agent_id, ())
-        ):
-            return
-        state.owner_conn_id = None
-
-    def _promote_display_owner_locked(
-        self,
-        agent_id: str,
-        state: _DisplayState,
-        *,
-        preferred: BrowserConn | None = None,
-    ) -> None:
-        if state.owner_conn_id is not None:
-            return
-        browsers = self._browsers_by_agent.get(agent_id)
-        if not browsers:
-            return
-        owner = preferred if preferred in browsers else next(iter(browsers))
-        state.owner_conn_id = owner.id
-
-    def _browser_display_state_locked(
-        self, conn: BrowserConn, state: _DisplayState, *, changed: bool = False
-    ) -> BrowserDisplayState:
-        return BrowserDisplayState(
-            owner=state.owner_conn_id == conn.id,
-            cols=state.cols,
-            rows=state.rows,
-            viewers=len(self._browsers_by_agent.get(conn.agent_id, ())),
-            changed=changed,
-        )
-
-    async def request_snapshot(
-        self,
-        agent_id: str,
-        daemon: DaemonConn,
-        *,
-        lines: int = 5000,
-        plain: bool = False,
-        timeout: float = 2.0,
-        rtc_session_id: str | None = None,
-    ) -> dict | None:
-        request_id = str(uuid.uuid4())
-        payload: dict[str, object] = {
-            "type": "agent.snapshot",
-            "request_id": request_id,
-            "agent_id": agent_id,
-            "lines": lines,
-        }
-        if plain:
-            payload["plain"] = True
-        if rtc_session_id:
-            payload["rtc_session_id"] = rtc_session_id
-        return await self._request_owner_result(
-            daemon,
-            "agent.snapshot",
-            request_id,
-            payload,
-            timeout=timeout,
-        )
-
-    async def resolve_snapshot(
-        self,
-        agent_id: str,
-        payload: dict,
-        *,
-        daemon: DaemonConn | None = None,
-        expected_host_generation: int | None = None,
-    ) -> bool:
-        request_id = payload.get("request_id")
-        if not isinstance(request_id, str) or daemon is None:
-            return False
-        return await self._publish_owner_result(
-            daemon,
-            expected_host_generation,
-            "agent.snapshot",
-            request_id,
-            payload,
-        )
 
     async def request_tool_check(
         self,

@@ -38,18 +38,12 @@ function viewFor(info: AgentConnectionInfo): ChipView {
     return { dot: "bg-muted-foreground", label: "connecting", pulse: true, detail: "Connecting…" };
   }
   if (!info.dcOpen) {
-    return info.v2
-      ? {
-          dot: "bg-amber-400",
-          label: "channel…",
-          pulse: true,
-          detail: "Negotiating the direct terminal channel",
-        }
-      : {
-          dot: "bg-muted-foreground",
-          label: "ws relay",
-          detail: "Legacy server relay (spawn.v1)",
-        };
+    return {
+      dot: "bg-amber-400",
+      label: "channel…",
+      pulse: true,
+      detail: "Negotiating the mandatory encrypted terminal channels",
+    };
   }
   const kind = info.kind ?? "direct";
   return {
@@ -71,14 +65,14 @@ export function ConnectionChip({
   if (!info) return null;
   const view = viewFor(info);
   const v2TrustDetail = info.dcOpen
-    ? "spawn.v2 — direct WebRTC browser path active; daemon legacy server mirror remains until Phase 2 / P2-AGENT-02"
-    : "spawn.v2 — direct WebRTC browser path negotiating; daemon legacy server mirror remains until Phase 2 / P2-AGENT-02";
+    ? "spawn.v2 — terminal bytes and history are endpoint-to-endpoint; the server receives signaling and disclosed activity only"
+    : "spawn.v2 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
   const title = [
     view.detail,
     info.rttMs != null ? `round trip ${info.rttMs} ms` : null,
     info.protocol ? `via ${info.protocol}` : null,
     info.dcOpen ? "DataChannel open" : null,
-    info.v2 ? v2TrustDetail : "spawn.v1",
+    v2TrustDetail,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -93,11 +87,9 @@ export function ConnectionChip({
         ? "DataChannel open"
         : info.socketState !== "open"
           ? "disconnected"
-          : info.v2
-            ? "negotiating"
-            : "WS relay",
+          : "negotiating",
     ],
-    ["Protocol", info.v2 ? v2TrustDetail : "spawn.v1 (legacy relay)"],
+    ["Protocol", v2TrustDetail],
   ];
 
   return (

@@ -211,11 +211,6 @@ impl AgentRegistry {
             .map(|entry| entry.handle.control.clone())
     }
 
-    pub fn control_for(&self, id: Uuid) -> Option<ForwarderControl> {
-        let guard = self.inner.lock().expect("agents lock");
-        guard.get(&id).map(|entry| entry.handle.control.clone())
-    }
-
     pub fn lifecycle_snapshot(&self, id: Uuid) -> Option<AgentLifecycleSnapshot> {
         let guard = self.inner.lock().expect("agents lock");
         guard.get(&id).map(|entry| AgentLifecycleSnapshot {

@@ -46,10 +46,7 @@ export function AgentPaneMenuItems({
     qc.invalidateQueries({ queryKey: ["agent", agent.id] });
   };
   const restartM = useMutation({
-    mutationFn: () => {
-      const size = getHandle?.()?.getSize();
-      return agents.restart(agent.id, size ? { ...size, create_cwd: true } : undefined);
-    },
+    mutationFn: () => agents.restart(agent.id, { create_cwd: true }),
     onSuccess: invalidate,
     onError: (err) => onError(String(err)),
   });

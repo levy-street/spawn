@@ -60,10 +60,10 @@ Host shape:
 | GET    | `/api/agents/{id}`   |                                                                                   |
 | POST   | `/api/agents`        | `{name?, host_id, preset_id?, cwd, argv?, env?, skill_ids?, create_cwd?}` — at least one of preset_id or argv |
 | PATCH  | `/api/agents/{id}`   | rename/pin/archive: `{name?, pinned?, archived?}`                                 |
-| POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{cols, rows, create_cwd?}` |
+| POST   | `/api/agents/{id}/restart` | restart the existing agent with its saved cwd/argv/env; optional `{create_cwd?}` |
 | GET    | `/api/agents/{id}/access` | list skill grants for an agent                                               |
 | PATCH  | `/api/agents/{id}/access` | replace grants with `{skill_ids?}`                                          |
-| DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, deletes the agent row + transcript                  |
+| DELETE | `/api/agents/{id}`   | sends `agent.kill` if needed, then deletes the agent row                           |
 
 Agent shape:
 ```json
@@ -156,22 +156,11 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 ## Daemon WebSocket — `/ws/daemon`
 
 - Handshake header: `Authorization: Bearer <daemon_token>`
-- Subprotocol: `spawn.v1`
-- Frames: text frames are JSON, binary frames are PTY data.
-
-### Binary frame layout
-
-```
-+------+--------------+-----------------+
-| kind | agent_id     | payload         |
-| u8   | 16 bytes     | N bytes         |
-+------+--------------+-----------------+
-```
-
-- `kind = 0x01` — PTY output (daemon → server → browsers)
-- `kind = 0x02` — PTY input  (browser → server → daemon)
-
-Agent IDs are big-endian 16-byte UUIDs.
+- Required subprotocol: `spawn.control.v2`
+- Frames: JSON text only. Binary frames close with `4002`; an old/missing
+  subprotocol receives content-free `protocol.required` and closes with `4003`.
+- The retired daemon-WS `0x01` PTY output and `0x02` PTY input layouts are not
+  valid compatibility frames.
 
 ### Daemon → server JSON frames
 
@@ -207,26 +196,28 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
  "client_id": "browser-upload-id"}
 
-{"type": "agent.snapshot",
- "agent_id": "uuid",
- "bytes_b64": "..."}
-
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "sdp": "v=0..."}
 
 {"type": "rtc.candidate",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.status",
  "session_id": "browser-generated-id",
- "binding_nonce": "browser-or-server-generated-hex",
+ "binding_nonce": "browser-generated-hex",
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "status": "connected|failed",
  "message": "optional detail"}
 
@@ -316,8 +307,6 @@ detail is not placed on the signaling websocket.
  "skills": [{"id": "uuid", "name": "spawn-control",
              "description": "House style for agents", "content": "..."}],
  "install": "npm install -g @anthropic-ai/claude-code",
- "cols": 120,
- "rows": 32,
  "create_cwd": true}
 
 {"type": "agent.restart",
@@ -327,22 +316,12 @@ detail is not placed on the signaling websocket.
  "env": {"FOO": "bar"},
  "skills": [],
  "install": "npm install -g @anthropic-ai/claude-code",
- "cols": 120,
- "rows": 32,
  "create_cwd": true}
 
 {"type": "agent.kill", "agent_id": "uuid", "signal": "TERM"}
 
 `agent.kill.signal` is optional and accepts only `TERM` or `KILL`; omitted
 means `TERM`. Other values are rejected before lifecycle dispatch.
-
-{"type": "agent.resize", "agent_id": "uuid", "cols": 120, "rows": 32}
-
-{"type": "agent.scroll", "agent_id": "uuid", "lines": -8}
-
-{"type": "agent.snapshot", "agent_id": "uuid", "lines": 100000}
-
-{"type": "agent.redraw", "agent_id": "uuid"}
 
 {"type": "agent.upload",
  "agent_id": "uuid",
@@ -360,6 +339,8 @@ means `TERM`. Other values are rejected before lifecycle dispatch.
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "sdp": "v=0...",
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
@@ -368,13 +349,17 @@ means `TERM`. Other values are rejected before lifecycle dispatch.
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
  "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2,
  "candidate": {"candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0}}
 
 {"type": "rtc.close",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-or-server-generated-hex",
  "binding_generation": 7,
- "agent_id": "uuid"}
+ "agent_id": "uuid",
+ "scope_type": "agent", "scope_id": "uuid",
+ "protocol": "spawn.pty", "protocol_version": 2}
 ```
 
 For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
@@ -382,10 +367,11 @@ For host-scoped sessions, `rtc.offer`, `rtc.candidate`, and `rtc.close` omit
 `scope_id`, `protocol:"spawn.host.ctl"`, and `protocol_version:1`. A host offer
 also carries `ice_transport_policy:"all|relay"`; when the server supplies only
 TURN URLs both endpoints use `relay` and do not gather direct/STUN candidates.
-Agent signaling additionally carries the selected daemon owner's monotonic
+Agent signaling requires the same full scope/protocol tuple and additionally
+carries the selected daemon owner's monotonic
 `binding_generation`; the daemon combines it with the nonce so frames from an
 older daemon ownership generation cannot affect a replacement session. The
-legacy `generation` spelling is accepted only for rollout compatibility.
+legacy `generation` spelling is rejected.
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
@@ -403,36 +389,23 @@ distinguish healthy idle connections from dead sockets.
 ## Browser WebSocket — `/ws/browser?agent_id=<uuid>`
 
 - Auth: session cookie (or `?token=` for testing).
-- Subprotocol: clients offer `spawn.v2, spawn.v1` in preference order; the
-  server selects `spawn.v2` when WebRTC is enabled, else `spawn.v1`.
-  - **`spawn.v2`** (docs/TRUST.md Phase 1): the WS is control + signaling
-    only. The server never sends binary frames (live PTY output flows over
-    the WebRTC DataChannels exclusively) and closes the socket with code
-    `4002` if the browser sends a binary frame or a terminal viewport/snapshot
-    JSON frame. History, snapshots, geometry, scrolling, redraw and display
-    ownership use `spawn.ctl`; the server does not receive them.
-  - **`spawn.v1`** (legacy): binary frames relay PTY bytes in both
-    directions through the server. Kept for rollout compatibility.
-- On legacy v1 only, `cols` and `rows` may be optional initial browser
-  dimensions. When present,
-  the server resizes the session worker before producing the initial history
-  snapshot.
+- Required subprotocol: `spawn.v2`. An old/missing subprotocol receives only
+  `{"type":"protocol.required","protocol":"spawn.v2","version":2}` and
+  closes with `4003`.
+- This WebSocket is content-free signaling, disclosed lifecycle/status, and
+  the still-pending upload migration. It never sends binary frames and closes
+  with `4002` for a binary frame or terminal viewport/history/snapshot JSON.
+- History, snapshots, geometry, scrolling, redraw and display ownership use
+  `spawn.ctl`; terminal bytes use `spawn.pty`. Neither reaches the server.
 
 ### Browser → server
 
 ```json
-{"type": "resize", "cols": 120, "rows": 32}
-{"type": "scroll", "lines": -8}
 {"type": "upload", "name": "screenshot.png", "mime_type": "image/png", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 {"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
 ```
-Plus raw binary stdin bytes.
 
-`scroll` / `agent.scroll` remains a temporary content-free compatibility no-op.
-Browser UI scrollback is local to xterm and must not mutate daemon-side
-viewport state.
-
-When the server advertises WebRTC support, the browser may additionally send
+The browser additionally sends
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
 The server authorizes the browser against the agent, forwards signaling to the
 owning daemon over `/ws/daemon`, and keeps this websocket open as the
@@ -445,22 +418,20 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
  "enabled": true,
  "binding_nonce_required": true,
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-{"type": "history", "bytes_b64": "..."}    // initial replay buffer
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
 {"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
 {"type": "upload.error", "message": "..."}
-{"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "sdp": "v=0..."}
-{"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "candidate": {"candidate": "..."}}
-{"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "status": "connected|failed"}
+{"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "sdp": "v=0..."}
+{"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "candidate": {"candidate": "..."}}
+{"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "status": "connected|failed"}
 ```
-Plus raw binary stdout bytes.
 
 ## Direct per-agent DataChannels
 
-The low-latency terminal data plane is an optional WebRTC DataChannel layered
-on top of the websocket control plane.
+The terminal data plane is two mandatory WebRTC DataChannels negotiated over
+the content-free WebSocket signaling plane.
 
 - The browser creates ordered DataChannels named `spawn.pty` and `spawn.ctl`.
 - Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
@@ -470,11 +441,9 @@ on top of the websocket control plane.
 - `spawn.ctl` carries the versioned bounded control protocol below. A v2
   terminal is ready only after both channels open and its initial history
   response is applied.
-- Legacy `spawn.v1` keeps the server-relayed binary PTY fallback. The daemon
-  still mirrors output to the server for transcripts until P2-AGENT-02, but
-  a `spawn.v2` browser neither subscribes to nor renders that relay.
-- `SPAWN_WEBRTC_ENABLED` enables the direct path, and
-  `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
+- Missing, duplicate, closed, or unknown agent channels close the peer; there
+  is no server-content fallback.
+- `SPAWN_WEBRTC_ICE_SERVERS` configures the static ICE server list. STUN is
   enough for many LAN/home-network cases; TURN is required for reliable
   fallback across restrictive NATs and mobile/corporate networks.
 - `SPAWN_TURN_URLS` + `SPAWN_TURN_SECRET` (+ `SPAWN_TURN_TTL_SECONDS`) point
@@ -667,10 +636,9 @@ object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
-  negotiates `spawn.v2` (DataChannel-only PTY) with `spawn.v1` as the
-  legacy relay fallback; the daemon WS remains `spawn.v1` until the
-  daemon-owned-data migration (docs/TRUST.md Phase 2). Server SHOULD
-  support both during a rollout window.
+  requires `spawn.v2`; the daemon WS requires `spawn.control.v2`. Older or
+  missing subprotocols receive a content-free protocol-required close. There
+  is deliberately no mixed-version rollout or terminal relay fallback.
 - Host signaling uses `spawn.host.v1`; its DataChannel protocol is separately
   versioned by the mandatory `protocol_version` signaling field and `version`
   envelope field.

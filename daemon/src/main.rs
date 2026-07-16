@@ -16,7 +16,6 @@ mod agents;
 mod cli;
 mod config;
 mod creds;
-mod frames;
 mod host_control;
 mod host_files;
 mod login;
