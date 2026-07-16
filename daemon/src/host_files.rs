@@ -19,6 +19,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -60,6 +64,8 @@ pub type FsResult<T> = Result<T, FsError>;
 pub struct HostFileService {
     root: Arc<Dir>,
     root_display: Arc<PathBuf>,
+    #[cfg(test)]
+    write_lifecycle_hooks: Arc<WriteLifecycleTestHooks>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,7 +110,7 @@ pub struct PendingWrite {
     destination_name: OsString,
     temporary_name: OsString,
     destination_display: PathBuf,
-    pub file: File,
+    file: Option<File>,
     pub expected_length: u64,
     pub expected_sha256: String,
     pub overwrite: bool,
@@ -112,6 +118,108 @@ pub struct PendingWrite {
     pub next_sequence: u64,
     pub hasher: Sha256,
     last_activity: Instant,
+    temporary_owned: bool,
+    #[cfg(test)]
+    write_lifecycle_hooks: Arc<WriteLifecycleTestHooks>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WriteSessionGuard {
+    pub cancelled: CancellationToken,
+    pub closed: Arc<AtomicBool>,
+    pub commit_fence: Arc<Mutex<()>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WritePause {
+    armed: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl WritePause {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pause_if_armed(&self, cancelled: Option<&CancellationToken>) -> bool {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        self.entered.notify_one();
+        if let Some(cancelled) = cancelled {
+            tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => false,
+                _ = self.release.notified() => true,
+            }
+        } else {
+            self.release.notified().await;
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct WriteLifecycleTestHooks {
+    begin_after_create: WritePause,
+    finish_before_commit: WritePause,
+    shutdown_started: Notify,
+    shutdown_complete: Notify,
+}
+
+#[cfg(test)]
+impl WriteLifecycleTestHooks {
+    pub(crate) fn arm_begin_after_create(&self) {
+        self.begin_after_create.arm();
+    }
+
+    pub(crate) async fn wait_begin_after_create(&self) {
+        self.begin_after_create.wait_until_entered().await;
+    }
+
+    pub(crate) fn release_begin_after_create(&self) {
+        self.begin_after_create.release();
+    }
+
+    pub(crate) fn arm_finish_before_commit(&self) {
+        self.finish_before_commit.arm();
+    }
+
+    pub(crate) async fn wait_finish_before_commit(&self) {
+        self.finish_before_commit.wait_until_entered().await;
+    }
+
+    pub(crate) fn release_finish_before_commit(&self) {
+        self.finish_before_commit.release();
+    }
+
+    pub(crate) async fn wait_shutdown_complete(&self) {
+        self.shutdown_complete.notified().await;
+    }
+
+    pub(crate) async fn wait_shutdown_started(&self) {
+        self.shutdown_started.notified().await;
+    }
+
+    pub(crate) fn notify_shutdown_started(&self) {
+        self.shutdown_started.notify_one();
+    }
+
+    pub(crate) fn notify_shutdown_complete(&self) {
+        self.shutdown_complete.notify_one();
+    }
 }
 
 impl HostFileService {
@@ -135,7 +243,14 @@ impl HostFileService {
         Ok(Self {
             root: Arc::new(root),
             root_display: Arc::new(root_display),
+            #[cfg(test)]
+            write_lifecycle_hooks: Arc::new(WriteLifecycleTestHooks::default()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_lifecycle_test_hooks(&self) -> Arc<WriteLifecycleTestHooks> {
+        Arc::clone(&self.write_lifecycle_hooks)
     }
 
     pub fn home_dir(&self) -> String {
@@ -521,6 +636,7 @@ impl HostFileService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn begin_write(
         &self,
         request_id: String,
@@ -530,6 +646,58 @@ impl HostFileService {
         expected_sha256: &str,
         overwrite: bool,
     ) -> FsResult<PendingWrite> {
+        self.begin_write_inner(
+            request_id,
+            dir,
+            name,
+            expected_length,
+            expected_sha256,
+            overwrite,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn begin_write_cancellable(
+        &self,
+        request_id: String,
+        dir: &str,
+        name: &str,
+        expected_length: u64,
+        expected_sha256: &str,
+        overwrite: bool,
+        cancelled: CancellationToken,
+    ) -> FsResult<PendingWrite> {
+        self.begin_write_inner(
+            request_id,
+            dir,
+            name,
+            expected_length,
+            expected_sha256,
+            overwrite,
+            Some(cancelled),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_write_inner(
+        &self,
+        request_id: String,
+        dir: &str,
+        name: &str,
+        expected_length: u64,
+        expected_sha256: &str,
+        overwrite: bool,
+        cancelled: Option<CancellationToken>,
+    ) -> FsResult<PendingWrite> {
+        if cancelled
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(FsError::new("cancelled", "file write was cancelled"));
+        }
         validate_name(name)?;
         if expected_length > MAX_FILE_BYTES {
             return Err(FsError::new(
@@ -566,14 +734,14 @@ impl HostFileService {
             .into_std();
         let mut destination_components = components;
         destination_components.push(destination_name.clone());
-        Ok(PendingWrite {
+        let write = PendingWrite {
             stream_id,
             request_id,
             parent,
             destination_name,
             temporary_name,
             destination_display: self.display_path(&destination_components),
-            file: File::from_std(file),
+            file: Some(File::from_std(file)),
             expected_length,
             expected_sha256: expected_sha256.to_ascii_lowercase(),
             overwrite,
@@ -581,7 +749,28 @@ impl HostFileService {
             next_sequence: 0,
             hasher: Sha256::new(),
             last_activity: Instant::now(),
-        })
+            temporary_owned: true,
+            #[cfg(test)]
+            write_lifecycle_hooks: Arc::clone(&self.write_lifecycle_hooks),
+        };
+        #[cfg(test)]
+        if !write
+            .write_lifecycle_hooks
+            .begin_after_create
+            .pause_if_armed(cancelled.as_ref())
+            .await
+        {
+            write.abort().await;
+            return Err(FsError::new("cancelled", "file write was cancelled"));
+        }
+        if cancelled
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            write.abort().await;
+            return Err(FsError::new("cancelled", "file write was cancelled"));
+        }
+        Ok(write)
     }
 }
 
@@ -606,7 +795,11 @@ impl PendingWrite {
                 "stream exceeds declared length",
             ));
         }
-        self.file.write_all(bytes).await?;
+        self.file
+            .as_mut()
+            .expect("active write retains its temporary file")
+            .write_all(bytes)
+            .await?;
         self.hasher.update(bytes);
         self.received = received;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -618,77 +811,132 @@ impl PendingWrite {
         self.last_activity.elapsed()
     }
 
+    #[cfg(test)]
     pub async fn finish(self) -> FsResult<String> {
-        let PendingWrite {
-            parent,
-            destination_name,
-            temporary_name,
-            destination_display,
-            mut file,
-            expected_length,
-            expected_sha256,
-            overwrite,
-            received,
-            mut hasher,
-            ..
-        } = self;
-        if received != expected_length {
-            drop(file);
-            let _ = parent.remove_file(&temporary_name);
+        self.finish_inner(None).await
+    }
+
+    pub(crate) async fn finish_guarded(self, guard: WriteSessionGuard) -> FsResult<String> {
+        self.finish_inner(Some(guard)).await
+    }
+
+    async fn finish_inner(mut self, guard: Option<WriteSessionGuard>) -> FsResult<String> {
+        #[cfg(test)]
+        let write_lifecycle_hooks = Arc::clone(&self.write_lifecycle_hooks);
+        if self.received != self.expected_length {
             return Err(FsError::new(
                 "length_mismatch",
                 "stream length does not match declaration",
             ));
         }
-        let actual = format!("{:x}", hasher.finalize_reset());
-        if actual != expected_sha256 {
-            drop(file);
-            let _ = parent.remove_file(&temporary_name);
+        let actual = format!("{:x}", self.hasher.finalize_reset());
+        if actual != self.expected_sha256 {
             return Err(FsError::new(
                 "hash_mismatch",
                 "stream SHA-256 does not match declaration",
             ));
         }
-        for result in [file.flush().await, file.sync_all().await] {
-            if let Err(error) = result {
-                drop(file);
-                let _ = parent.remove_file(&temporary_name);
-                return Err(error.into());
+        let flush = if let Some(guard) = guard.as_ref() {
+            tokio::select! {
+                biased;
+                _ = guard.cancelled.cancelled() => {
+                    return Err(FsError::new("cancelled", "file write was cancelled"));
+                }
+                result = self.file.as_mut().expect("write file exists").flush() => result,
             }
+        } else {
+            self.file.as_mut().expect("write file exists").flush().await
+        };
+        if let Err(error) = flush {
+            return Err(error.into());
         }
-        drop(file);
-        let commit = if overwrite {
-            if let Ok(metadata) = parent.symlink_metadata(&destination_name) {
+        let sync = if let Some(guard) = guard.as_ref() {
+            tokio::select! {
+                biased;
+                _ = guard.cancelled.cancelled() => {
+                    return Err(FsError::new("cancelled", "file write was cancelled"));
+                }
+                result = self.file.as_mut().expect("write file exists").sync_all() => result,
+            }
+        } else {
+            self.file
+                .as_mut()
+                .expect("write file exists")
+                .sync_all()
+                .await
+        };
+        if let Err(error) = sync {
+            return Err(error.into());
+        }
+        #[cfg(test)]
+        if !write_lifecycle_hooks
+            .finish_before_commit
+            .pause_if_armed(guard.as_ref().map(|guard| &guard.cancelled))
+            .await
+        {
+            return Err(FsError::new("cancelled", "file write was cancelled"));
+        }
+        let _commit_guard = if let Some(guard) = guard.as_ref() {
+            let commit_guard = tokio::select! {
+                biased;
+                _ = guard.cancelled.cancelled() => {
+                    return Err(FsError::new("cancelled", "file write was cancelled"));
+                }
+                commit_guard = guard.commit_fence.lock() => commit_guard,
+            };
+            if guard.cancelled.is_cancelled() || guard.closed.load(Ordering::Acquire) {
+                drop(commit_guard);
+                return Err(FsError::new("cancelled", "file write was cancelled"));
+            }
+            Some(commit_guard)
+        } else {
+            None
+        };
+        drop(self.file.take());
+        let commit = if self.overwrite {
+            if let Ok(metadata) = self.parent.symlink_metadata(&self.destination_name) {
                 if metadata.file_type().is_symlink() {
                     Err(symlink_error())
                 } else {
-                    renameat(&parent, &temporary_name, &parent, &destination_name)
-                        .map_err(rustix_io_error)
+                    renameat(
+                        &self.parent,
+                        &self.temporary_name,
+                        &self.parent,
+                        &self.destination_name,
+                    )
+                    .map_err(rustix_io_error)
                 }
             } else {
-                renameat(&parent, &temporary_name, &parent, &destination_name)
-                    .map_err(rustix_io_error)
+                renameat(
+                    &self.parent,
+                    &self.temporary_name,
+                    &self.parent,
+                    &self.destination_name,
+                )
+                .map_err(rustix_io_error)
             }
         } else {
-            atomic_rename_noreplace(&parent, &temporary_name, &destination_name)
+            atomic_rename_noreplace(&self.parent, &self.temporary_name, &self.destination_name)
         };
-        if let Err(error) = commit {
-            let _ = parent.remove_file(&temporary_name);
-            return Err(error);
-        }
-        sync_directory(&parent)?;
-        Ok(destination_display.to_string_lossy().into_owned())
+        commit?;
+        self.temporary_owned = false;
+        sync_directory(&self.parent)?;
+        Ok(self.destination_display.to_string_lossy().into_owned())
     }
 
-    pub async fn abort(self) {
-        let PendingWrite {
-            parent,
-            temporary_name,
-            file,
-            ..
-        } = self;
-        drop(file);
-        let _ = parent.remove_file(&temporary_name);
+    pub async fn abort(self) {}
+}
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        // The temporary remains owned until the atomic rename succeeds. This
+        // is the final safety net for cancelled futures and cleanup messages
+        // dropped while a session is shutting down.
+        drop(self.file.take());
+        if self.temporary_owned {
+            let _ = self.parent.remove_file(&self.temporary_name);
+            self.temporary_owned = false;
+        }
     }
 }
 

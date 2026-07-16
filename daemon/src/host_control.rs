@@ -16,7 +16,9 @@ use uuid::Uuid;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
-use crate::host_files::{HostFileService, PendingWrite, MAX_FILE_BYTES, STREAM_CHUNK_BYTES};
+use crate::host_files::{
+    HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES, STREAM_CHUNK_BYTES,
+};
 use crate::pty::WsOutbound;
 use crate::rtc::{send_host_status, HostRtcBinding};
 
@@ -156,6 +158,7 @@ struct Context {
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
+    commit_fence: Arc<Mutex<()>>,
     cleanup_tx: mpsc::Sender<WriteCleanup>,
     arrivals: Arc<StdMutex<ArrivalArbiter>>,
     closed: Arc<AtomicBool>,
@@ -163,6 +166,22 @@ struct Context {
 }
 
 impl Context {
+    async fn spawn_session_task<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return false;
+        }
+        let mut tasks = self.background_tasks.lock().await;
+        if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return false;
+        }
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task);
+        true
+    }
+
     fn arrived_after_cancel(&self, stream_id: &str, arrival_order: u64) -> bool {
         match self.arrivals.lock() {
             Ok(mut arrivals) => arrivals
@@ -452,19 +471,26 @@ impl Context {
         }
         let context = self.clone();
         let request_id = request_id.to_string();
+        let cleanup_request_id = request_id.clone();
         let path = path.to_string();
         let task = async move {
             let _permit = permit;
             let sent = context.send_read(&request_id, &path, cancelled).await;
             context.state.lock().await.read_requests.remove(&request_id);
             if !sent && !context.closed.load(Ordering::Acquire) {
-                let _ = context.dc.close().await;
+                close_later(Arc::clone(&context.dc));
             }
         };
-        let mut tasks = self.background_tasks.lock().await;
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(task);
-        true
+        if self.spawn_session_task(task).await {
+            true
+        } else {
+            self.state
+                .lock()
+                .await
+                .read_requests
+                .remove(&cleanup_request_id);
+            false
+        }
     }
 
     async fn begin_write(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
@@ -504,7 +530,15 @@ impl Context {
         }
         match self
             .files
-            .begin_write(request_id.to_string(), dir, name, length, sha256, overwrite)
+            .begin_write_cancellable(
+                request_id.to_string(),
+                dir,
+                name,
+                length,
+                sha256,
+                overwrite,
+                self.shutdown.clone(),
+            )
             .await
         {
             Ok(write) => {
@@ -514,6 +548,13 @@ impl Context {
                     cancelled: CancellationToken::new(),
                 });
                 let mut state = self.state.lock().await;
+                if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+                    drop(state);
+                    if let Some(write) = slot.pending.lock().await.take() {
+                        write.abort().await;
+                    }
+                    return true;
+                }
                 if state.cancelled_request_ids.remove(request_id) {
                     drop(state);
                     if let Some(write) = slot.pending.lock().await.take() {
@@ -651,7 +692,7 @@ impl Context {
                 cleanup = cleanup_rx.recv() => {
                     let Some(cleanup) = cleanup else { break; };
                     if !self.process_write_cleanup(cleanup).await {
-                        let _ = self.dc.close().await;
+                        close_later(Arc::clone(&self.dc));
                         break;
                     }
                 }
@@ -663,7 +704,7 @@ impl Context {
                 }
                 _ = tokio::time::sleep(write_reaper_interval()) => {
                     if !self.reap_stale_writes().await {
-                        let _ = self.dc.close().await;
+                        close_later(Arc::clone(&self.dc));
                         break;
                     }
                 }
@@ -1018,7 +1059,7 @@ impl Context {
             if state.writes.contains_key(stream_id)
                 && Self::remember_finished_write(&mut state, stream_id)
             {
-                state.writes.remove(stream_id)
+                state.writes.get(stream_id).cloned()
             } else {
                 None
             }
@@ -1038,33 +1079,49 @@ impl Context {
             .await
             .write_requests
             .remove(&write.request_id);
-        if length != Some(write.expected_length) || sha256 != Some(write.expected_sha256.as_str()) {
+        let sent = if length != Some(write.expected_length)
+            || sha256 != Some(write.expected_sha256.as_str())
+        {
             write.abort().await;
-            return self
-                .stream_error(
-                    stream_id,
-                    "declaration_mismatch",
-                    "stream end does not match its write declaration",
-                )
-                .await;
-        }
-        let request_id = write.request_id.clone();
-        match write.finish().await {
-            Ok(path) => {
-                self.send(json!({
-                    "version": VERSION,
-                    "type": "stream.committed",
-                    "stream_id": stream_id,
-                    "request_id": request_id,
-                    "path": path,
-                }))
-                .await
-            }
-            Err(error) => {
-                self.stream_error(stream_id, error.code, &error.detail)
+            self.stream_error(
+                stream_id,
+                "declaration_mismatch",
+                "stream end does not match its write declaration",
+            )
+            .await
+        } else {
+            let request_id = write.request_id.clone();
+            let guard = WriteSessionGuard {
+                cancelled: slot.cancelled.clone(),
+                closed: Arc::clone(&self.closed),
+                commit_fence: Arc::clone(&self.commit_fence),
+            };
+            match write.finish_guarded(guard).await {
+                Ok(path) => {
+                    self.send(json!({
+                        "version": VERSION,
+                        "type": "stream.committed",
+                        "stream_id": stream_id,
+                        "request_id": request_id,
+                        "path": path,
+                    }))
                     .await
+                }
+                Err(error) => {
+                    self.stream_error(stream_id, error.code, &error.detail)
+                        .await
+                }
             }
+        };
+        let mut state = self.state.lock().await;
+        if state
+            .writes
+            .get(stream_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &slot))
+        {
+            state.writes.remove(stream_id);
         }
+        sent
     }
 
     async fn handle_stream_ack(&self, object: &Map<String, Value>) -> bool {
@@ -1181,6 +1238,10 @@ impl Context {
     async fn abort_all(&self) {
         self.closed.store(true, Ordering::Release);
         self.shutdown.cancel();
+        #[cfg(test)]
+        self.files
+            .write_lifecycle_test_hooks()
+            .notify_shutdown_started();
         let (reads, writes) = {
             let mut state = self.state.lock().await;
             let reads = state
@@ -1205,14 +1266,27 @@ impl Context {
         for write in &writes {
             write.cancelled.cancel();
         }
+        // `closed` is published before this fence is acquired. A write that
+        // has not already entered the commit critical section must observe it
+        // and abort; acquiring the fence also drains a commit already in that
+        // section before session cleanup can complete.
+        let commit_guard = self.commit_fence.lock().await;
+        drop(commit_guard);
         for write in writes {
             if let Some(write) = write.pending.lock().await.take() {
                 write.abort().await;
             }
         }
-        let mut tasks = self.background_tasks.lock().await;
+        // Do not hold the registry mutex while awaiting children. Task
+        // creation rechecks shutdown after taking the mutex, so no task can
+        // be published into the replacement set once shutdown starts.
+        let mut tasks = {
+            let mut registered = self.background_tasks.lock().await;
+            std::mem::take(&mut *registered)
+        };
+        let join_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while !tasks.is_empty() {
-            match tokio::time::timeout(Duration::from_secs(2), tasks.join_next()).await {
+            match tokio::time::timeout_at(join_deadline, tasks.join_next()).await {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => {
@@ -1222,6 +1296,10 @@ impl Context {
                 }
             }
         }
+        #[cfg(test)]
+        self.files
+            .write_lifecycle_test_hooks()
+            .notify_shutdown_complete();
     }
 }
 
@@ -1261,72 +1339,25 @@ pub(crate) fn install(
     let context_slot = Arc::new(Mutex::new(None::<Context>));
     let shutdown = CancellationToken::new();
     let context_shutdown = shutdown.child_token();
+    let closed = Arc::new(AtomicBool::new(false));
     let arrivals = Arc::new(StdMutex::new(ArrivalArbiter::default()));
-    let (normal_tx, mut normal_rx) = mpsc::channel::<QueuedFrame>(MAX_NORMAL_QUEUE);
-    let (fast_tx, mut fast_rx) = mpsc::channel::<QueuedFrame>(MAX_FAST_QUEUE);
-
-    let normal_context = Arc::clone(&context_slot);
-    let normal_dc = Arc::clone(&dc);
-    let normal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        loop {
-            let value = tokio::select! {
-                _ = normal_shutdown.cancelled() => break,
-                value = normal_rx.recv() => value,
-            };
-            let Some(value) = value else {
-                break;
-            };
-            let Some(context) = normal_context.lock().await.clone() else {
-                let _ = normal_dc.close().await;
-                break;
-            };
-            if !context.handle_normal(value).await {
-                let _ = normal_dc.close().await;
-                break;
-            }
-        }
-    });
-
-    let fast_context = Arc::clone(&context_slot);
-    let fast_dc = Arc::clone(&dc);
-    let fast_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        loop {
-            let value = tokio::select! {
-                _ = fast_shutdown.cancelled() => break,
-                value = fast_rx.recv() => value,
-            };
-            let Some(value) = value else {
-                break;
-            };
-            let Some(context) = fast_context.lock().await.clone() else {
-                let _ = fast_dc.close().await;
-                break;
-            };
-            #[cfg(test)]
-            if let Some(delay_ms) = value
-                .value
-                .as_object()
-                .and_then(|object| object.get("test_delay_ms"))
-                .and_then(Value::as_u64)
-            {
-                tokio::time::sleep(Duration::from_millis(delay_ms.min(1_000))).await;
-            }
-            if !context.handle_fast(value).await {
-                let _ = fast_dc.close().await;
-                break;
-            }
-        }
-    });
+    let (normal_tx, normal_rx) = mpsc::channel::<QueuedFrame>(MAX_NORMAL_QUEUE);
+    let (fast_tx, fast_rx) = mpsc::channel::<QueuedFrame>(MAX_FAST_QUEUE);
+    let normal_rx = Arc::new(StdMutex::new(Some(normal_rx)));
+    let fast_rx = Arc::new(StdMutex::new(Some(fast_rx)));
 
     let message_arrivals = Arc::clone(&arrivals);
+    let message_closed = Arc::clone(&closed);
     dc.on_message(Box::new(move |message: DataChannelMessage| {
         let dc = Arc::clone(&message_dc);
         let normal_tx = normal_tx.clone();
         let fast_tx = fast_tx.clone();
         let arrivals = Arc::clone(&message_arrivals);
+        let closed = Arc::clone(&message_closed);
         Box::pin(async move {
+            if closed.load(Ordering::Acquire) {
+                return;
+            }
             if !message.is_string || message.data.is_empty() || message.data.len() > MAX_FRAME_BYTES
             {
                 close_later(dc);
@@ -1369,6 +1400,9 @@ pub(crate) fn install(
     let open_context = Arc::clone(&context_slot);
     let open_shutdown = context_shutdown;
     let open_arrivals = Arc::clone(&arrivals);
+    let open_closed = Arc::clone(&closed);
+    let open_normal_rx = Arc::clone(&normal_rx);
+    let open_fast_rx = Arc::clone(&fast_rx);
     dc.on_open(Box::new(move || {
         let dc = Arc::clone(&open_dc);
         let context_slot = Arc::clone(&open_context);
@@ -1378,6 +1412,9 @@ pub(crate) fn install(
         let files = files_override.clone();
         let shutdown = open_shutdown.clone();
         let arrivals = Arc::clone(&open_arrivals);
+        let closed = Arc::clone(&open_closed);
+        let normal_rx = Arc::clone(&open_normal_rx);
+        let fast_rx = Arc::clone(&open_fast_rx);
         Box::pin(async move {
             let files = match files {
                 Some(files) => files,
@@ -1389,6 +1426,9 @@ pub(crate) fn install(
                     }
                 },
             };
+            if closed.load(Ordering::Acquire) || shutdown.is_cancelled() {
+                return;
+            }
             let (cleanup_tx, cleanup_rx) = mpsc::channel(MAX_WRITE_STREAMS);
             let context = Context {
                 dc: Arc::clone(&dc),
@@ -1396,17 +1436,80 @@ pub(crate) fn install(
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),
+                commit_fence: Arc::new(Mutex::new(())),
                 cleanup_tx,
                 arrivals,
-                closed: Arc::new(AtomicBool::new(false)),
+                closed,
                 shutdown,
             };
-            context
-                .background_tasks
+            let mut context_slot = context_slot.lock().await;
+            if context.closed.load(Ordering::Acquire) || context.shutdown.is_cancelled() {
+                return;
+            }
+            let Some(mut normal_rx) = normal_rx
                 .lock()
-                .await
-                .spawn(context.clone().run_write_reaper(cleanup_rx));
-            *context_slot.lock().await = Some(context);
+                .ok()
+                .and_then(|mut receiver| receiver.take())
+            else {
+                drop(context_slot);
+                close_later(Arc::clone(&dc));
+                return;
+            };
+            let Some(mut fast_rx) = fast_rx
+                .lock()
+                .ok()
+                .and_then(|mut receiver| receiver.take())
+            else {
+                drop(context_slot);
+                close_later(Arc::clone(&dc));
+                return;
+            };
+            {
+                let mut tasks = context.background_tasks.lock().await;
+                tasks.spawn(context.clone().run_write_reaper(cleanup_rx));
+                let normal_context = context.clone();
+                tasks.spawn(async move {
+                    loop {
+                        let value = tokio::select! {
+                            _ = normal_context.shutdown.cancelled() => break,
+                            value = normal_rx.recv() => value,
+                        };
+                        let Some(value) = value else { break; };
+                        if !normal_context.handle_normal(value).await {
+                            close_later(Arc::clone(&normal_context.dc));
+                            break;
+                        }
+                    }
+                });
+                let fast_context = context.clone();
+                tasks.spawn(async move {
+                    loop {
+                        let value = tokio::select! {
+                            _ = fast_context.shutdown.cancelled() => break,
+                            value = fast_rx.recv() => value,
+                        };
+                        let Some(value) = value else { break; };
+                        #[cfg(test)]
+                        if let Some(delay_ms) = value
+                            .value
+                            .as_object()
+                            .and_then(|object| object.get("test_delay_ms"))
+                            .and_then(Value::as_u64)
+                        {
+                            tokio::select! {
+                                _ = fast_context.shutdown.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms.min(1_000))) => {}
+                            }
+                        }
+                        if !fast_context.handle_fast(value).await {
+                            close_later(Arc::clone(&fast_context.dc));
+                            break;
+                        }
+                    }
+                });
+            }
+            *context_slot = Some(context);
+            drop(context_slot);
             let hello = json!({
                 "version": VERSION,
                 "type": "hello",
@@ -1436,10 +1539,13 @@ pub(crate) fn install(
 
     let close_context = Arc::clone(&context_slot);
     let close_shutdown = shutdown;
+    let close_closed = Arc::clone(&closed);
     dc.on_close(Box::new(move || {
         let context_slot = Arc::clone(&close_context);
         let shutdown = close_shutdown.clone();
+        let closed = Arc::clone(&close_closed);
         Box::pin(async move {
+            closed.store(true, Ordering::Release);
             shutdown.cancel();
             if let Some(context) = context_slot.lock().await.take() {
                 context.abort_all().await;

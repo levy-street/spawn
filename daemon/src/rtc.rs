@@ -2558,6 +2558,7 @@ mod tests {
     use crate::host_files::STREAM_CHUNK_BYTES;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
+    use std::path::Path;
 
     async fn receive_host_control(
         messages: &mut mpsc::Receiver<(usize, String)>,
@@ -5186,6 +5187,141 @@ mod tests {
         source_daemon.close().await.unwrap();
         destination_browser.close().await.unwrap();
         destination_daemon.close().await.unwrap();
+    }
+
+    fn assert_no_upload_temporaries(root: &Path) {
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".spawn-upload-"))
+                .count(),
+            0,
+            "session shutdown leaked a write temporary",
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_host_channel_during_write_begin_cleans_unpublished_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "e".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, _messages) =
+            paired_host_endpoint(files, binding, "close-during-write-begin").await;
+
+        hooks.arm_begin_after_create();
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": "close-begin",
+                    "operation": "fs.write.begin",
+                    "payload": {
+                        "dir": "~",
+                        "name": "must-not-exist.bin",
+                        "length": 0,
+                        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "overwrite": false,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_begin_after_create())
+            .await
+            .expect("write begin did not pause after temporary creation");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("host write shutdown did not start");
+        hooks.release_begin_after_create();
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_complete())
+            .await
+            .expect("host write shutdown did not terminate");
+        close.await.unwrap().unwrap();
+
+        assert!(!root.path().join("must-not-exist.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
+    }
+
+    #[tokio::test]
+    async fn closing_host_channel_before_write_commit_aborts_finish_and_cleans_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let hooks = files.write_lifecycle_test_hooks();
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "f".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "close-before-write-commit").await;
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "close-finish",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "must-not-commit.bin",
+                "length": 0,
+                "sha256": sha256,
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+        hooks.arm_finish_before_commit();
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_finish_before_commit())
+            .await
+            .expect("write finish did not pause before commit");
+
+        let closing_channel = Arc::clone(&channel);
+        let close = tokio::spawn(async move { closing_channel.close().await });
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_started())
+            .await
+            .expect("host write shutdown did not start");
+        hooks.release_finish_before_commit();
+        tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_complete())
+            .await
+            .expect("host write shutdown did not terminate");
+        close.await.unwrap().unwrap();
+
+        assert!(!root.path().join("must-not-commit.bin").exists());
+        assert_no_upload_temporaries(root.path());
+        close_test_peer(&browser_pc).await;
+        close_test_peer(&daemon_pc).await;
     }
 
     #[tokio::test]
