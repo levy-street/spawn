@@ -725,6 +725,42 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         await _wait_until(
             lambda: bool(_daemon_messages_of_type(daemon_ws, "rtc.close"))
         )
+
+        negotiating_before = len(
+            [
+                message
+                for message in _messages_of_type(ws, "rtc.status")
+                if message.get("status") == "negotiating"
+            ]
+        )
+        ws.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "binding_nonce": nonce_a,
+                "sdp": "v=0\r\nretired-A",
+            }
+        )
+        await _wait_until(
+            lambda: any(
+                message.get("status") == "failed"
+                and message.get("binding_nonce") == nonce_a
+                for message in _messages_of_type(ws, "rtc.status")
+            )
+        )
+        assert len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == 1
+        assert (
+            len(
+                [
+                    message
+                    for message in _messages_of_type(ws, "rtc.status")
+                    if message.get("status") == "negotiating"
+                ]
+            )
+            == negotiating_before
+        )
+        assert await broker.rtc_session_for(session_id) is None
+
         ws.queue_text(
             {
                 "type": "rtc.offer",

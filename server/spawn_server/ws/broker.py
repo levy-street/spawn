@@ -372,6 +372,13 @@ class Broker:
             route_nonce = getattr(conn, "binding_nonce", nonce)
             if route_nonce != nonce:
                 return False
+            identity = (session_id, daemon.id, generation, nonce)
+            # A retired identity is an immutable generation. Reinstalling it
+            # would make delayed frames indistinguishable from current ones,
+            # even if the entry existed only until the caller's follow-up
+            # lookup. Reject it before mutating the live-session map.
+            if identity in self._retired_rtc_bindings:
+                return False
             if (
                 len(self._rtc_sessions) + len(self._retired_rtc_bindings)
                 >= MAX_RTC_BINDING_IDENTITIES

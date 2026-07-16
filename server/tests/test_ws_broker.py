@@ -994,6 +994,20 @@ async def test_rtc_binding_nonce_is_immutable_across_session_id_reuse(app):
     assert first is not None and first.nonce == "1" * 32
     await broker.unregister_rtc_session("reused-session", browser)
 
+    # The exact retired identity can never be made live again. Registration
+    # rejects atomically, so no caller can observe a transient binding.
+    assert not await broker.register_rtc_session(
+        "reused-session",
+        browser,
+        daemon=daemon,
+        scope_type="host",
+        scope_id=daemon.host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        binding_nonce="1" * 32,
+    )
+    assert await broker.rtc_session_for("reused-session") is None
+
     assert await broker.register_rtc_session(
         "reused-session",
         browser,
