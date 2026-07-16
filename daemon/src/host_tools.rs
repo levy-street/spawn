@@ -5,11 +5,15 @@
 //! from the fixed policy below and is resolved against the endpoint's PATH.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -34,6 +38,8 @@ const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SPAWN_BUSY_RETRIES: usize = 3;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 pub(crate) const MAX_PROCESSES: usize = 4;
+#[cfg(target_os = "linux")]
+static TOOL_CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -174,9 +180,15 @@ fn policy_for(tool: &str) -> Option<ToolPolicy> {
 
 pub(crate) struct HostToolService {
     processes: Arc<Semaphore>,
-    installing: StdMutex<HashSet<&'static str>>,
+    install_state: StdMutex<ToolInstallState>,
     operations: Arc<HostToolOperations>,
     lifecycle_hooks: Arc<HostToolLifecycleHooks>,
+}
+
+#[derive(Default)]
+struct ToolInstallState {
+    active: HashSet<&'static str>,
+    reconciliation_required: HashSet<&'static str>,
 }
 
 #[derive(Default)]
@@ -288,7 +300,7 @@ impl HostToolService {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             processes: Arc::new(Semaphore::new(MAX_PROCESSES)),
-            installing: StdMutex::new(HashSet::new()),
+            install_state: StdMutex::new(ToolInstallState::default()),
             operations: HostToolOperations::new(),
             lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
         })
@@ -417,7 +429,13 @@ impl HostToolService {
         if let Some(error) = first_error {
             return Err(error);
         }
-        Ok(ordered.into_iter().flatten().collect())
+        let statuses = ordered.into_iter().flatten().collect::<Vec<_>>();
+        for status in &statuses {
+            if definitive_status(status) {
+                self.clear_reconciliation_if_idle(&status.tool)?;
+            }
+        }
+        Ok(statuses)
     }
 
     pub(crate) async fn install(
@@ -502,7 +520,8 @@ impl HostToolService {
                 format!("endpoint could not resolve allowlisted installer {program}"),
             )
         })?;
-        let capture = run_program_capture(
+        self.require_reconciliation(policy.tool)?;
+        let capture = match run_program_capture(
             Arc::clone(&self.processes),
             Arc::clone(&self.lifecycle_hooks),
             &resolved,
@@ -514,7 +533,14 @@ impl HostToolService {
                 shutdown: &shutdown,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.clear_reconciliation_after_pre_effect_failure(policy.tool)?;
+                return Err(error);
+            }
+        };
         let install_argv = std::iter::once(program.to_string())
             .chain(args.iter().map(|arg| (*arg).to_string()))
             .collect::<Vec<_>>();
@@ -571,20 +597,86 @@ impl HostToolService {
     }
 
     fn claim_install(self: &Arc<Self>, tool: &'static str) -> Result<InstallClaim, ToolError> {
-        let mut installing = self
-            .installing
+        let mut state = self
+            .install_state
             .lock()
             .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
-        if !installing.insert(tool) {
+        if !state.active.insert(tool) {
             return Err(ToolError::new(
                 "tool_busy",
                 "an install for this tool is already active",
+            ));
+        }
+        if state.reconciliation_required.contains(tool) {
+            state.active.remove(tool);
+            return Err(ToolError::new(
+                "reconciliation_required",
+                "a prior interactive install must be reconciled by endpoint check",
             ));
         }
         Ok(InstallClaim {
             tool,
             service: Arc::clone(self),
         })
+    }
+
+    pub(crate) fn claim_legacy_install(
+        self: &Arc<Self>,
+        tool: &str,
+    ) -> Result<Option<InstallClaim>, ToolError> {
+        let Some(policy) = policy_for(tool) else {
+            return Ok(None);
+        };
+        self.claim_install(policy.tool).map(Some)
+    }
+
+    pub(crate) fn claim_legacy_executable_install(
+        self: &Arc<Self>,
+        executable: &str,
+    ) -> Result<Option<InstallClaim>, ToolError> {
+        let Some(policy) = POLICIES
+            .iter()
+            .copied()
+            .find(|policy| policy.executable == executable)
+        else {
+            return Ok(None);
+        };
+        self.claim_install(policy.tool).map(Some)
+    }
+
+    fn require_reconciliation(&self, tool: &'static str) -> Result<(), ToolError> {
+        let mut state = self
+            .install_state
+            .lock()
+            .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
+        state.reconciliation_required.insert(tool);
+        Ok(())
+    }
+
+    fn clear_reconciliation_after_pre_effect_failure(
+        &self,
+        tool: &'static str,
+    ) -> Result<(), ToolError> {
+        let mut state = self
+            .install_state
+            .lock()
+            .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
+        state.reconciliation_required.remove(tool);
+        Ok(())
+    }
+
+    fn clear_reconciliation_if_idle(&self, tool: &str) -> Result<(), ToolError> {
+        let Some(tool) = policy_for(tool).map(|policy| policy.tool) else {
+            return Ok(());
+        };
+        let mut state = self
+            .install_state
+            .lock()
+            .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
+        if !state.active.contains(tool) {
+            state.reconciliation_required.remove(tool);
+        }
+        Ok(())
     }
 
     async fn check_one(
@@ -611,6 +703,15 @@ impl HostToolService {
         })?;
         let command = vec![policy.executable.to_string()];
         let Some(path) = resolve_executable(policy.executable, env) else {
+            let latest_version = match self
+                .latest_version(policy.latest, env, cancelled, shutdown, check_timeout)
+                .await
+            {
+                Ok(latest) => latest,
+                Err(error) => {
+                    return Ok(failed_tool_status(target, command, error.detail));
+                }
+            };
             return Ok(ToolStatus {
                 target_id: target.target_id,
                 tool: target.tool,
@@ -618,9 +719,7 @@ impl HostToolService {
                 installed: false,
                 path: None,
                 version: None,
-                latest_version: self
-                    .latest_version(policy.latest, env, cancelled, shutdown, check_timeout)
-                    .await,
+                latest_version,
                 update_available: None,
                 error: None,
             });
@@ -668,9 +767,15 @@ impl HostToolService {
                 error: Some(bounded(error, MAX_DETAIL_BYTES)),
             });
         }
-        let latest_version = self
+        let latest_version = match self
             .latest_version(policy.latest, env, cancelled, shutdown, check_timeout)
-            .await;
+            .await
+        {
+            Ok(latest) => latest,
+            Err(error) => {
+                return Ok(failed_tool_status(target, command, error.detail));
+            }
+        };
         let update_available = match (version.as_deref(), latest_version.as_deref()) {
             (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
             _ => None,
@@ -695,8 +800,11 @@ impl HostToolService {
         cancelled: &CancellationToken,
         shutdown: &CancellationToken,
         timeout: Duration,
-    ) -> Option<String> {
-        let (program, args, pip_package) = match policy? {
+    ) -> Result<Option<String>, ToolError> {
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
+        let (program, args, pip_package) = match policy {
             LatestPolicy::Npm(package) => ("npm", vec!["view", package, "version"], None),
             LatestPolicy::Pip(package) => (
                 "python3",
@@ -704,7 +812,12 @@ impl HostToolService {
                 Some(package),
             ),
         };
-        let path = resolve_executable(program, env)?;
+        let path = resolve_executable(program, env).ok_or_else(|| {
+            ToolError::new(
+                "probe_unavailable",
+                format!("endpoint could not resolve allowlisted latest-version probe {program}"),
+            )
+        })?;
         let capture = run_program_capture(
             Arc::clone(&self.processes),
             Arc::clone(&self.lifecycle_hooks),
@@ -717,29 +830,91 @@ impl HostToolService {
                 shutdown,
             },
         )
-        .await
-        .ok()?;
-        if !capture.status.is_some_and(|status| status.success()) {
-            return None;
+        .await?;
+        if let Some(failure) = capture.failure {
+            return Err(ToolError::new("probe_failed", failure));
         }
-        match pip_package {
+        if !capture.status.is_some_and(|status| status.success()) {
+            return Err(ToolError::new(
+                "probe_failed",
+                "latest-version probe did not exit successfully",
+            ));
+        }
+        if capture.stdout.truncated || capture.stderr.truncated {
+            return Err(ToolError::new(
+                "probe_failed",
+                "latest-version probe output exceeded the conservative bound",
+            ));
+        }
+        let version = match pip_package {
             Some(package) => parse_pip_latest_version(package, &capture.stdout.text),
             None => first_meaningful_line(&capture.stdout.text),
+        };
+        if version.as_deref().and_then(numeric_version).is_none() {
+            return Err(ToolError::new(
+                "probe_failed",
+                "latest-version probe did not report a recognizable version",
+            ));
         }
+        Ok(version)
     }
 }
 
-struct InstallClaim {
+fn failed_tool_status(target: ToolTarget, command: Vec<String>, detail: String) -> ToolStatus {
+    ToolStatus {
+        target_id: target.target_id,
+        tool: target.tool,
+        command,
+        installed: false,
+        path: None,
+        version: None,
+        latest_version: None,
+        update_available: None,
+        error: Some(bounded(detail, MAX_DETAIL_BYTES)),
+    }
+}
+
+pub(crate) struct InstallClaim {
     tool: &'static str,
     service: Arc<HostToolService>,
 }
 
+impl InstallClaim {
+    /// Mark the point immediately before a compatibility installer may begin
+    /// changing endpoint state. Once marked, no install path may retry this
+    /// tool until an independent endpoint-owned check observes a definitive
+    /// status. This remains true even if the legacy acknowledgement is lost.
+    pub(crate) fn mark_effect_started(&self) -> Result<(), ToolError> {
+        self.service.require_reconciliation(self.tool)
+    }
+
+    /// A launch failure proven to have happened before the compatibility
+    /// process existed cannot have changed tool state.
+    pub(crate) fn clear_pre_effect_failure(&self) -> Result<(), ToolError> {
+        self.service
+            .clear_reconciliation_after_pre_effect_failure(self.tool)
+    }
+}
+
 impl Drop for InstallClaim {
     fn drop(&mut self) {
-        if let Ok(mut installing) = self.service.installing.lock() {
-            installing.remove(self.tool);
+        if let Ok(mut state) = self.service.install_state.lock() {
+            state.active.remove(self.tool);
         }
     }
+}
+
+fn definitive_status(status: &ToolStatus) -> bool {
+    if status.error.is_some() {
+        return false;
+    }
+    if !status.installed {
+        return true;
+    }
+    status.path.is_some()
+        && status.version.is_some()
+        && status.latest_version.is_some()
+        && status.update_available.is_some()
 }
 
 fn endpoint_command_env() -> BTreeMap<String, String> {
@@ -867,6 +1042,272 @@ struct ProgramCapture {
     failure: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+struct ToolContainment {
+    path: PathBuf,
+    cleaned: bool,
+    reap_pids: HashSet<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl ToolContainment {
+    fn create() -> Result<Self, ToolError> {
+        static SUBREAPER: OnceLock<Result<(), String>> = OnceLock::new();
+        if let Err(error) = SUBREAPER.get_or_init(|| {
+            nix::sys::prctl::set_child_subreaper(true)
+                .map_err(|failure| format!("cannot enable endpoint child subreaping: {failure}"))
+        }) {
+            return Err(ToolError::new("containment_unavailable", error.clone()));
+        }
+        let membership = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("endpoint cannot read its cgroup membership: {error}"),
+            )
+        })?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .filter(|value| value.starts_with('/') && !value.contains(".."))
+            .ok_or_else(|| {
+                ToolError::new(
+                    "containment_unavailable",
+                    "endpoint is not running in a reviewed cgroup v2 hierarchy",
+                )
+            })?;
+        let parent = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        for _ in 0..16 {
+            let sequence = TOOL_CGROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!("spawn-tool-{}-{sequence}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    let containment = Self {
+                        path,
+                        cleaned: false,
+                        reap_pids: HashSet::new(),
+                    };
+                    containment.validate_files()?;
+                    return Ok(containment);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(ToolError::new(
+                        "containment_unavailable",
+                        format!("endpoint cannot create a delegated tool cgroup: {error}"),
+                    ));
+                }
+            }
+        }
+        Err(ToolError::new(
+            "containment_unavailable",
+            "endpoint could not allocate a unique delegated tool cgroup",
+        ))
+    }
+
+    fn validate_files(&self) -> Result<(), ToolError> {
+        for name in [
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.freeze",
+            "cgroup.events",
+        ] {
+            let path = self.path.join(name);
+            if !path.is_file() {
+                return Err(ToolError::new(
+                    "containment_unavailable",
+                    format!("delegated tool cgroup is missing {name}"),
+                ));
+            }
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(self.path.join("cgroup.kill"))
+            .map_err(|error| {
+                ToolError::new(
+                    "containment_unavailable",
+                    format!("delegated tool cgroup cannot be killed: {error}"),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn membership_file(&self) -> Result<File, ToolError> {
+        OpenOptions::new()
+            .write(true)
+            .open(self.path.join("cgroup.procs"))
+            .map_err(|error| {
+                ToolError::new(
+                    "containment_unavailable",
+                    format!("delegated tool cgroup cannot admit a child: {error}"),
+                )
+            })
+    }
+
+    fn attach(&self, command: &mut Command) -> Result<(), ToolError> {
+        use std::os::fd::AsRawFd;
+
+        let membership = self.membership_file()?;
+        unsafe {
+            command.pre_exec(move || {
+                let bytes = b"0\n";
+                let written = nix::libc::write(
+                    membership.as_raw_fd(),
+                    bytes.as_ptr().cast::<nix::libc::c_void>(),
+                    bytes.len(),
+                );
+                if written == bytes.len() as isize {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn event(&self, name: &str) -> Result<bool, String> {
+        let events = std::fs::read_to_string(self.path.join("cgroup.events"))
+            .map_err(|error| format!("cannot read tool containment state: {error}"))?;
+        events
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .map(|value| value == "1")
+            .ok_or_else(|| format!("tool containment state omitted {name}"))
+    }
+
+    fn populated(&self) -> Result<bool, String> {
+        self.event("populated")
+    }
+
+    fn kill_now(&self) -> Result<(), String> {
+        std::fs::write(self.path.join("cgroup.kill"), b"1\n")
+            .map_err(|error| format!("cannot kill tool containment: {error}"))
+    }
+
+    async fn kill_if_populated(&mut self) -> Result<bool, String> {
+        let populated = self.populated()?;
+        if populated {
+            std::fs::write(self.path.join("cgroup.freeze"), b"1\n")
+                .map_err(|error| format!("cannot freeze tool containment: {error}"))?;
+            while !self.event("frozen")? {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            inventory_cgroup_pids(&self.path, &mut self.reap_pids)?;
+            self.kill_now()?;
+        }
+        Ok(populated)
+    }
+
+    async fn settle(&mut self) -> Result<(), String> {
+        let _ = self.kill_if_populated().await?;
+        loop {
+            if !self.populated()? {
+                break;
+            }
+            self.kill_now()?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for pid in self.reap_pids.drain() {
+            let pid = nix::unistd::Pid::from_raw(pid);
+            loop {
+                match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Ok(_) | Err(nix::errno::Errno::ECHILD) => break,
+                    Err(error) => {
+                        return Err(format!("cannot reap contained tool process: {error}"));
+                    }
+                }
+            }
+        }
+        remove_cgroup_tree(&self.path)?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inventory_cgroup_pids(path: &Path, pids: &mut HashSet<i32>) -> Result<(), String> {
+    let procs = std::fs::read_to_string(path.join("cgroup.procs"))
+        .map_err(|error| format!("cannot inventory contained tool processes: {error}"))?;
+    pids.extend(procs.lines().filter_map(|value| value.parse::<i32>().ok()));
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| format!("cannot enumerate nested tool containment: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect nested containment: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect nested containment entry: {error}"))?;
+        if file_type.is_dir() {
+            inventory_cgroup_pids(&entry.path(), pids)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ToolContainment {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let _ = self.kill_now();
+        if self.populated() == Ok(false) && remove_cgroup_tree(&self.path).is_ok() {
+            self.cleaned = true;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_cgroup_tree(path: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| format!("cannot enumerate tool containment: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect tool containment: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect tool containment entry: {error}"))?;
+        if file_type.is_dir() {
+            remove_cgroup_tree(&entry.path())?;
+        }
+    }
+    std::fs::remove_dir(path)
+        .map_err(|error| format!("cannot remove empty tool containment: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+struct ToolContainment;
+
+#[cfg(not(target_os = "linux"))]
+impl ToolContainment {
+    fn create() -> Result<Self, ToolError> {
+        Err(ToolError::new(
+            "containment_unavailable",
+            "interactive tool execution requires reviewed Linux cgroup v2 containment",
+        ))
+    }
+
+    fn attach(&self, _command: &mut Command) -> Result<(), ToolError> {
+        Err(ToolError::new(
+            "containment_unavailable",
+            "interactive tool execution requires reviewed Linux cgroup v2 containment",
+        ))
+    }
+
+    fn kill_now(&self) -> Result<(), String> {
+        Err("tool containment is unavailable".into())
+    }
+
+    async fn kill_if_populated(&mut self) -> Result<bool, String> {
+        Err("tool containment is unavailable".into())
+    }
+
+    async fn settle(&mut self) -> Result<(), String> {
+        Err("tool containment is unavailable".into())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ProgramCancellation<'a> {
     request: &'a CancellationToken,
@@ -891,7 +1332,8 @@ async fn run_program_capture(
         return Err(ToolError::new("cancelled", "tool operation was cancelled"));
     }
     let mut spawn_attempt = 0;
-    let mut child = loop {
+    let (mut child, mut containment) = loop {
+        let mut containment = ToolContainment::create()?;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -904,11 +1346,18 @@ async fn run_program_capture(
         {
             command.process_group(0);
         }
+        containment.attach(&mut command)?;
         match command.spawn() {
-            Ok(child) => break child,
+            Ok(child) => break (child, containment),
             Err(error)
                 if error.raw_os_error() == Some(26) && spawn_attempt < SPAWN_BUSY_RETRIES =>
             {
+                containment.settle().await.map_err(|failure| {
+                    ToolError::new(
+                        "containment_failed",
+                        format!("endpoint could not settle a failed spawn: {failure}"),
+                    )
+                })?;
                 spawn_attempt += 1;
                 tokio::select! {
                     _ = tokio::time::sleep(SPAWN_BUSY_RETRY_DELAY) => {}
@@ -917,6 +1366,12 @@ async fn run_program_capture(
                 }
             }
             Err(error) => {
+                containment.settle().await.map_err(|failure| {
+                    ToolError::new(
+                        "containment_failed",
+                        format!("endpoint could not settle a failed spawn: {failure}"),
+                    )
+                })?;
                 return Err(ToolError::new(
                     "spawn_failed",
                     format!("endpoint failed to start allowlisted program: {error}"),
@@ -925,20 +1380,24 @@ async fn run_program_capture(
         }
     };
     let pid = child.id();
-    let mut process_group = ProcessGroupGuard { pid, armed: true };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        let containment_failure = containment.kill_if_populated().await.err();
         kill_process_group(pid);
         let _ = child.start_kill();
         let status = child.wait().await.ok();
-        let _ = settle_process_group(pid).await;
-        process_group.disarm();
+        let containment_failure = containment_failure.or(containment.settle().await.err());
         return Ok(ProgramCapture {
             status,
             stdout: empty_tail(),
             stderr: empty_tail(),
-            failure: Some("tool output capture was unavailable after execution started".into()),
+            failure: Some(containment_failure.map_or_else(
+                || "tool output capture was unavailable after execution started".into(),
+                |failure| {
+                    format!("tool output capture failed and containment cleanup failed: {failure}")
+                },
+            )),
         });
     };
     let stdout_hooks = Arc::clone(&lifecycle_hooks);
@@ -954,6 +1413,7 @@ async fn run_program_capture(
         capture
     });
     let mut failure = None;
+    let mut containment_was_populated = false;
     enum Completion {
         Exited(std::io::Result<ExitStatus>),
         Cancelled(&'static str),
@@ -977,12 +1437,24 @@ async fn run_program_capture(
             failure = Some(format!(
                 "endpoint could not observe tool process completion: {error}"
             ));
+            match containment.kill_if_populated().await {
+                Ok(populated) => containment_was_populated |= populated,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
             kill_process_group(pid);
             let _ = child.start_kill();
             child.wait().await.ok()
         }
         Completion::Cancelled(detail) => {
             failure = Some(detail.into());
+            match containment.kill_if_populated().await {
+                Ok(populated) => containment_was_populated |= populated,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
             kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
@@ -997,48 +1469,47 @@ async fn run_program_capture(
                 "tool operation timed out after {} seconds",
                 timeout.as_secs()
             ));
+            match containment.kill_if_populated().await {
+                Ok(populated) => containment_was_populated |= populated,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
             kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
             child.wait().await.ok()
         }
     };
+    let descendants_remained = match containment.kill_if_populated().await {
+        Ok(remained) => containment_was_populated || remained,
+        Err(containment_failure) => {
+            failure.get_or_insert(containment_failure);
+            true
+        }
+    };
+    if descendants_remained {
+        lifecycle_hooks.pause_after_kill().await;
+    }
     let (stdout, stderr) = tokio::join!(finish_tail(stdout_task), finish_tail(stderr_task));
     if stdout.1 || stderr.1 {
         kill_process_group(pid);
         failure.get_or_insert_with(|| "tool output pipes did not close before deadline".into());
     }
-    if settle_process_group(pid).await {
+    if descendants_remained {
         failure.get_or_insert_with(|| {
-            "tool process group remained active after the direct command exited".into()
+            "tool containment remained populated after the direct command exited".into()
         });
     }
-    process_group.disarm();
+    if let Err(containment_failure) = containment.settle().await {
+        failure.get_or_insert(containment_failure);
+    }
     Ok(ProgramCapture {
         status,
         stdout: stdout.0,
         stderr: stderr.0,
         failure,
     })
-}
-
-struct ProcessGroupGuard {
-    pid: Option<u32>,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            kill_process_group(self.pid);
-        }
-    }
 }
 
 async fn finish_tail(mut task: tokio::task::JoinHandle<TailCapture>) -> (TailCapture, bool) {
@@ -1109,48 +1580,6 @@ fn kill_process_group(pid: Option<u32>) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_pid: Option<u32>) {}
-
-#[cfg(unix)]
-async fn settle_process_group(pid: Option<u32>) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-
-    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
-        return false;
-    };
-    let group = Pid::from_raw(pid);
-    let remained = match killpg(group, None) {
-        Ok(()) | Err(Errno::EPERM) => true,
-        Err(Errno::ESRCH) => false,
-        Err(_) => true,
-    };
-    if !remained {
-        return false;
-    }
-
-    // A direct command is never permitted to daemonize. Keep admission and
-    // the same-tool install claim until every member of its private process
-    // group is gone, including orphaned/zombie descendants being reaped by
-    // the OS. The armed drop guard continues sending SIGKILL if this owner
-    // future is cancelled while settlement is in progress.
-    let _ = killpg(group, Signal::SIGKILL);
-    loop {
-        match killpg(group, None) {
-            Err(Errno::ESRCH) => break,
-            _ => {
-                let _ = killpg(group, Signal::SIGKILL);
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-    }
-    true
-}
-
-#[cfg(not(unix))]
-async fn settle_process_group(_pid: Option<u32>) -> bool {
-    false
-}
 
 fn first_meaningful_line(output: &str) -> Option<String> {
     output
@@ -1402,43 +1831,70 @@ mod tests {
         assert_eq!(capture.stdout.text.len(), OUTPUT_TAIL_BYTES);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn successful_parent_cannot_release_a_closed_pipe_descendant_or_process_permit() {
+    async fn successful_parent_cannot_release_a_closed_pipe_setsid_descendant_or_process_permit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let child_pid = dir.path().join("child-pid");
+        let child_cgroup = dir.path().join("child-cgroup");
         let script = executable(
             dir.path(),
             "fork-and-exit",
             &format!(
-                "/bin/sh -c 'exec </dev/null >/dev/null 2>&1; printf \"%s\" $$ > {}; while :; do :; done' & \
+                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; root=$(/usr/bin/sed -n \"s/^0:://p\" /proc/self/cgroup); /usr/bin/mkdir /sys/fs/cgroup${{root}}/nested; printf 0 > /sys/fs/cgroup${{root}}/nested/cgroup.procs; /usr/bin/cat /proc/self/cgroup > {}; printf \"%s\" $$ > {}; while :; do :; done' & \
                  while [ ! -s {} ]; do :; done; exit 0",
+                child_cgroup.display(),
                 child_pid.display(),
                 child_pid.display(),
             ),
         );
         let permits = Arc::new(Semaphore::new(1));
+        let hooks = Arc::new(HostToolLifecycleHooks::default());
+        hooks.after_kill.arm();
+        let cancelled = CancellationToken::new();
+        let shutdown = CancellationToken::new();
         let started = std::time::Instant::now();
-        let capture = run_program_capture(
-            Arc::clone(&permits),
-            Arc::new(HostToolLifecycleHooks::default()),
-            &script,
-            &[],
-            &test_env(dir.path()),
-            Duration::from_secs(1),
-            ProgramCancellation {
-                request: &CancellationToken::new(),
-                shutdown: &CancellationToken::new(),
-            },
-        )
-        .await
-        .expect("capture");
+        let task = tokio::spawn({
+            let permits = Arc::clone(&permits);
+            let hooks = Arc::clone(&hooks);
+            let env = test_env(dir.path());
+            async move {
+                run_program_capture(
+                    permits,
+                    hooks,
+                    &script,
+                    &[],
+                    &env,
+                    Duration::from_secs(1),
+                    ProgramCancellation {
+                        request: &cancelled,
+                        shutdown: &shutdown,
+                    },
+                )
+                .await
+            }
+        });
+        hooks.after_kill.wait_until_entered().await;
+        assert_eq!(permits.available_permits(), 0);
+        let membership = std::fs::read_to_string(&child_cgroup).expect("descendant cgroup");
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("unified cgroup membership");
+        let containment_path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        let root_containment_path = containment_path
+            .parent()
+            .expect("nested containment parent")
+            .to_path_buf();
+        assert!(containment_path.exists());
+        hooks.after_kill.release();
+        let capture = task.await.expect("capture task").expect("capture");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(capture.status.is_some_and(|status| status.success()));
         assert!(capture
             .failure
             .as_deref()
-            .is_some_and(|failure| failure.contains("process group remained active")));
+            .is_some_and(|failure| failure.contains("containment remained populated")));
         assert_eq!(permits.available_permits(), 1);
 
         let pid = std::fs::read_to_string(child_pid).expect("descendant pid");
@@ -1446,6 +1902,75 @@ mod tests {
             !Path::new("/proc").join(pid.trim()).exists(),
             "closed-pipe descendant remained as a process or zombie"
         );
+        assert!(!containment_path.exists(), "tool cgroup residue remained");
+        assert!(
+            !root_containment_path.exists(),
+            "root tool cgroup residue remained"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn latest_probe_with_exit_zero_setsid_descendant_is_unknown_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child_pid = dir.path().join("latest-child-pid");
+        let child_cgroup = dir.path().join("latest-child-cgroup");
+        executable(
+            dir.path(),
+            "npm",
+            &format!(
+                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; /usr/bin/cat /proc/self/cgroup > {}; printf \"%s\" $$ > {}; while :; do :; done' & \
+                 while [ ! -s {} ]; do :; done; printf '1.2.4'; exit 0",
+                child_cgroup.display(),
+                child_pid.display(),
+                child_pid.display(),
+            ),
+        );
+        let service = HostToolService::new();
+        let error = service
+            .latest_version(
+                Some(LatestPolicy::Npm("@openai/codex")),
+                &test_env(dir.path()),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("detached latest-probe descendant must prevent a definitive version");
+        assert_eq!(error.code, "probe_failed");
+        assert!(error.detail.contains("containment remained populated"));
+
+        let membership = std::fs::read_to_string(&child_cgroup).expect("descendant cgroup");
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("unified cgroup membership");
+        let containment_path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        let pid = std::fs::read_to_string(child_pid).expect("descendant pid");
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "latest probe descendant remained as a process or zombie"
+        );
+        assert!(
+            !containment_path.exists(),
+            "latest probe cgroup residue remained"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_cgroup_delegation_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let containment = ToolContainment {
+            path: dir.path().to_path_buf(),
+            cleaned: true,
+            reap_pids: HashSet::new(),
+        };
+        let error = containment
+            .validate_files()
+            .expect_err("ordinary directory must not be accepted as delegated containment");
+        assert_eq!(error.code, "containment_unavailable");
+        assert!(error.detail.contains("cgroup.procs"));
     }
 
     #[cfg(unix)]
@@ -1557,9 +2082,10 @@ mod tests {
         assert_eq!(service.processes.available_permits(), MAX_PROCESSES - 1);
         assert_eq!(long_tasks.available_permits(), 0);
         assert!(service
-            .installing
+            .install_state
             .lock()
             .expect("install claims")
+            .active
             .contains("codex"));
         assert!(Path::new("/proc").join(pid.to_string()).exists());
         assert!(
@@ -1592,9 +2118,10 @@ mod tests {
         assert_eq!(service.processes.available_permits(), MAX_PROCESSES);
         assert_eq!(long_tasks.available_permits(), 1);
         assert!(service
-            .installing
+            .install_state
             .lock()
             .expect("install claims")
+            .active
             .is_empty());
         tokio::time::timeout(Duration::from_secs(2), async {
             while Path::new("/proc").join(pid.to_string()).exists() {
@@ -1912,6 +2439,114 @@ mod tests {
             .expect("structured outcome");
         assert_eq!(first.outcome, "unknown");
         assert!(!first.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_install_gate_blocks_all_paths_until_a_separate_definitive_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(
+            dir.path(),
+            "npm",
+            "if [ \"$1\" = view ]; then printf '1.2.4'; else printf failed >&2; exit 7; fi",
+        );
+        executable(dir.path(), "codex", "printf 'codex 1.2.4'");
+        let service = HostToolService::new();
+        let env = test_env(dir.path());
+
+        let active_legacy = service
+            .claim_legacy_install("codex")
+            .expect("legacy claim")
+            .expect("known tool claim");
+        let busy = service
+            .install_with_env(
+                ToolTarget {
+                    target_id: "preset-busy".into(),
+                    tool: "codex".into(),
+                },
+                &env,
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("legacy update must exclude the interactive path");
+        assert_eq!(busy.code, "tool_busy");
+        drop(active_legacy);
+
+        let unknown = service
+            .install_with_env(
+                ToolTarget {
+                    target_id: "preset-unknown".into(),
+                    tool: "codex".into(),
+                },
+                &env,
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("post-effect failure is a structured unknown outcome");
+        assert_eq!(unknown.outcome, "unknown");
+
+        let interactive = service
+            .claim_install("codex")
+            .err()
+            .expect("interactive retry must await reconciliation");
+        assert_eq!(interactive.code, "reconciliation_required");
+        let manual = service
+            .claim_legacy_install("codex")
+            .err()
+            .expect("legacy manual retry must await reconciliation");
+        assert_eq!(manual.code, "reconciliation_required");
+        let automatic = service
+            .claim_legacy_executable_install("codex")
+            .err()
+            .expect("automatic retry must await reconciliation");
+        assert_eq!(automatic.code, "reconciliation_required");
+
+        let statuses = service
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "preset-check".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(env.clone()),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("separate endpoint check");
+        assert!(definitive_status(&statuses[0]));
+        let legacy_effect = service
+            .claim_legacy_install("codex")
+            .expect("definitive check clears reconciliation gate")
+            .expect("known tool claim");
+        legacy_effect
+            .mark_effect_started()
+            .expect("legacy effect enters reconciliation gate");
+        drop(legacy_effect);
+        let legacy_unknown = service
+            .claim_install("codex")
+            .err()
+            .expect("legacy effect ambiguity must block interactive retry");
+        assert_eq!(legacy_unknown.code, "reconciliation_required");
+
+        service
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "preset-legacy-check".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(env),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("separate check clears legacy effect ambiguity");
+        drop(
+            service
+                .claim_install("codex")
+                .expect("legacy ambiguity cleared only after endpoint check"),
+        );
     }
 
     #[cfg(unix)]

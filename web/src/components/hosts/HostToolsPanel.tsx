@@ -98,6 +98,26 @@ export function HostToolsPanel({ host }: { host: Host }) {
     refetchOnMount: "always",
     refetchInterval: 60_000,
   });
+  const authoritativeTarget = async (
+    target: HostToolTargetRef,
+    requireAutoUpdateDisabled = false,
+  ) => {
+    const metadata = await hosts.toolTargets(host.id);
+    const current = metadata.tools.find((row) => row.preset_id === target.target_id);
+    if (
+      !current ||
+      current.agent_kind !== target.tool ||
+      (requireAutoUpdateDisabled && current.auto_update)
+    ) {
+      throw new HostControlError(
+        "reconciliation_target_changed",
+        requireAutoUpdateDisabled
+          ? "Authoritative target metadata changed or legacy auto update is still enabled"
+          : "Authoritative target metadata changed; the original tool ambiguity cannot be cleared here",
+      );
+    }
+    return current;
+  };
   const installM = useMutation({
     mutationFn: async ({
       target,
@@ -113,7 +133,31 @@ export function HostToolsPanel({ host }: { host: Host }) {
           "Tool is not supported by the endpoint policy",
         );
       }
-      return client.installTool(target, { signal: controller.signal });
+      const policy = await hosts.updateToolPolicy(host.id, target.target_id, {
+        auto_update: false,
+      });
+      if (policy.auto_update) {
+        throw new HostControlError(
+          "legacy_update_active",
+          "Legacy auto update could not be disabled before the interactive effect",
+        );
+      }
+      await authoritativeTarget(target, true);
+      const result = await client.installTool(target, { signal: controller.signal });
+      if (result.outcome !== "succeeded") return result;
+      try {
+        const [status] = await client.checkTools([target], { signal: controller.signal });
+        if (!status || !isDefinitiveReconciliation(status)) {
+          throw new Error(status?.error ?? "Endpoint did not return a definitive tool status");
+        }
+        return { ...result, status };
+      } catch (error) {
+        throw new HostControlError(
+          "outcome_unknown",
+          `Install completed but its required endpoint reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+          result,
+        );
+      }
     },
     onSuccess: (result, { tool, target, controller }) => {
       if (controller.signal.aborted) {
@@ -134,7 +178,22 @@ export function HostToolsPanel({ host }: { host: Host }) {
       setLastResult({ name: tool.preset_name, result });
       qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
     },
-    onError: (err, { tool, target }) => {
+    onError: (err, { tool, target, controller }) => {
+      if (controller.signal.aborted) {
+        const unknown: ReconciliationEntry = {
+          target,
+          name: tool.preset_name,
+          code: "outcome_unknown",
+          outcomeUnknown: true,
+          error: "Cancellation raced completion. Check the tool status before retrying.",
+        };
+        qc.setQueryData<ReconciliationMap>(reconciliationKey, (current = {}) => ({
+          ...current,
+          [tool.preset_id]: unknown,
+        }));
+        setLastResult(unknown);
+        return;
+      }
       const uncertain = err instanceof HostControlError ? err.data : undefined;
       const code = err instanceof HostControlError ? err.code : undefined;
       const visible: VisibleResult = {
@@ -166,23 +225,18 @@ export function HostToolsPanel({ host }: { host: Host }) {
   });
   const reconcileM = useMutation({
     mutationFn: async ({
-      tool,
       reconciliation,
     }: {
       tool: ToolRow;
       reconciliation: ReconciliationEntry;
     }) => {
-      if (
-        !client ||
-        tool.preset_id !== reconciliation.target.target_id ||
-        tool.agent_kind !== reconciliation.target.tool ||
-        !isInteractiveToolKind(tool.agent_kind)
-      ) {
+      if (!client || !isInteractiveToolKind(reconciliation.target.tool)) {
         throw new HostControlError(
           "reconciliation_target_changed",
           "Target metadata changed; the original tool ambiguity cannot be cleared here",
         );
       }
+      await authoritativeTarget(reconciliation.target, true);
       const [status] = await client.checkTools([reconciliation.target]);
       if (!status || !isDefinitiveReconciliation(status)) {
         throw new HostControlError(
@@ -191,15 +245,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
           status,
         );
       }
-      const current = qc
-        .getQueryData<{ tools: ToolRow[] }>(["host-tools", host.id])
-        ?.tools.find((row) => row.preset_id === reconciliation.target.target_id);
-      if (!current || current.agent_kind !== reconciliation.target.tool) {
-        throw new HostControlError(
-          "reconciliation_target_changed",
-          "Target metadata changed while status was checked; reconciliation remains required",
-        );
-      }
+      await authoritativeTarget(reconciliation.target, true);
       return status;
     },
     onSuccess: (status, { tool, reconciliation }) => {
@@ -415,16 +461,18 @@ export function HostToolsPanel({ host }: { host: Host }) {
       {visibleResult && (
         <div className="border-t border-border px-4 py-3">
           <div
-            className={`mb-2 text-sm ${visibleResult.result?.success ? "text-emerald-400" : visibleResult.outcomeUnknown ? "text-amber-400" : "text-destructive"}`}
+            className={`mb-2 text-sm ${visibleResult.outcomeUnknown ? "text-amber-400" : visibleResult.result?.success ? "text-emerald-400" : "text-destructive"}`}
           >
             {visibleResult.name}:{" "}
-            {visibleResult.result?.success
-              ? "completed"
-              : visibleResult.outcomeUnknown || visibleResult.result
-                ? "outcome unknown"
-                : visibleResult.cancelled
-                  ? "cancelled"
-                  : "failed"}
+            {visibleResult.outcomeUnknown || visibleResult.result?.outcome === "unknown"
+              ? "outcome unknown"
+              : visibleResult.result?.success
+                ? "completed"
+                : visibleResult.result
+                  ? "failed"
+                  : visibleResult.cancelled
+                    ? "cancelled"
+                    : "failed"}
             {visibleResult.error ? ` · ${visibleResult.error}` : ""}
           </div>
           {visibleResult.outcomeUnknown && (

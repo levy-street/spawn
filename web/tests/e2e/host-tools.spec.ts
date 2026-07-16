@@ -75,8 +75,78 @@ test("interactive tool detail and install output stay on host control", async ({
 
   expect(checks[0]).toEqual({ targets: [{ target_id: PRESET_ID, tool: "codex" }] });
   expect(installs).toEqual([{ target: { target_id: PRESET_ID, tool: "codex" } }]);
-  expect(apiRequests).toEqual([]);
+  expect(apiRequests).toEqual([`/api/hosts/${HOST_ID}/tools/${PRESET_ID}/policy`]);
   expect(host.status).toBe("online");
+});
+
+test("interactive install disables legacy auto update before the endpoint effect", async ({
+  page,
+}) => {
+  let autoUpdate = true;
+  let metadataReads = 0;
+  const order: string[] = [];
+  page.on("dialog", (dialog) => dialog.accept());
+  await mockAuthenticatedApi(page, {
+    toolTargets: () => {
+      metadataReads += 1;
+      return [
+        {
+          preset_id: PRESET_ID,
+          preset_name: "codex",
+          agent_kind: "codex",
+          auto_update: autoUpdate,
+          last_checked_at: null,
+          last_auto_update_at: null,
+        },
+      ];
+    },
+    toolCheck: () => ({
+      tools: [
+        {
+          target_id: PRESET_ID,
+          tool: "codex",
+          command: ["codex"],
+          installed: false,
+        },
+      ],
+    }),
+    toolPolicy: (_hostId, presetId, body) => {
+      order.push("policy");
+      expect(presetId).toBe(PRESET_ID);
+      expect(body).toEqual({ auto_update: false });
+      autoUpdate = false;
+      return {
+        preset_id: PRESET_ID,
+        auto_update: false,
+        last_checked_at: null,
+        last_auto_update_at: null,
+        last_auto_update_error: null,
+      };
+    },
+    toolInstall: () => {
+      order.push("install");
+      return {
+        target_id: PRESET_ID,
+        tool: "codex",
+        command: ["codex"],
+        install_argv: ["npm", "install", "--global", "@openai/codex"],
+        outcome: "unknown",
+        success: false,
+        exit_code: 0,
+        stdout: "reconciliation required",
+        stderr: "",
+        output_truncated: false,
+        error: "endpoint reconciliation was not definitive",
+      };
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}`);
+  await page.getByRole("button", { name: "Install" }).click();
+  await expect(page.getByText(/codex: outcome unknown/)).toBeVisible();
+  expect(order).toEqual(["policy", "install"]);
+  expect(autoUpdate).toBe(false);
+  expect(metadataReads).toBeGreaterThanOrEqual(2);
 });
 
 test("install cancel is reachable and late success requires reconciliation", async ({ page }) => {
@@ -243,7 +313,7 @@ test("outcome unknown survives navigation and only a definitive Check now unlock
   expect(checkCalls).toBe(4);
 });
 
-test("reconciliation stays bound to the original tool when metadata drifts on remount", async ({
+test("reconciliation uses authoritative metadata when the server drifts without a remount", async ({
   page,
 }) => {
   let metadataKind = "codex";
@@ -292,21 +362,18 @@ test("reconciliation stays bound to the original tool when metadata drifts on re
   await page.getByRole("button", { name: "Install" }).click();
   await expect(page.getByText("original codex ambiguity")).toBeVisible();
   metadataKind = "aider";
-  await page.getByRole("link", { name: "All hosts" }).click();
-  await page.locator(`a[href="/hosts/${HOST_ID}"]`).click();
   await expect(page.getByText("reconciliation required")).toBeVisible();
-  await expect(page.getByText("aider")).toBeVisible();
 
   const checksBeforeReconciliation = checks.length;
   await page.getByRole("button", { name: "Check now" }).click();
   await expect(
-    page.getByText(/Check now failed: Target metadata changed; the original tool ambiguity/),
+    page.getByText(/Check now failed: Authoritative target metadata changed/),
   ).toBeVisible();
   await expect(page.getByText("reconciliation required")).toBeVisible();
   await expect(page.getByRole("button", { name: "Install" })).toBeDisabled();
   expect(checks).toHaveLength(checksBeforeReconciliation);
   expect(checks.at(-1)).toEqual({
-    targets: [{ target_id: PRESET_ID, tool: "aider" }],
+    targets: [{ target_id: PRESET_ID, tool: "codex" }],
   });
 });
 

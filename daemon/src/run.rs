@@ -16,6 +16,7 @@ use crate::agents::AgentRegistry;
 use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, StoredCreds};
+use crate::host_tools::HostToolService;
 use crate::proto::{
     AgentCreate, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound, Outbound,
 };
@@ -698,15 +699,52 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
         };
     }
 
+    let shared_install_claim =
+        match HostToolService::shared().claim_legacy_install(&target.agent_kind) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return HostToolInstallResult {
+                    preset_id: target.preset_id,
+                    preset_name: target.preset_name,
+                    agent_kind: target.agent_kind,
+                    command: target.command,
+                    install: target.install,
+                    success: false,
+                    exit_code: None,
+                    output: String::new(),
+                    error: Some(error.detail),
+                    status: None,
+                };
+            }
+        };
+
     let env = resolved_command_env().await;
     let version_before = read_tool_version(&target.command, &env)
         .await
         .ok()
         .flatten();
 
+    if let Some(claim) = shared_install_claim.as_ref() {
+        if let Err(error) = claim.mark_effect_started() {
+            return HostToolInstallResult {
+                preset_id: target.preset_id,
+                preset_name: target.preset_name,
+                agent_kind: target.agent_kind,
+                command: target.command,
+                install: target.install,
+                success: false,
+                exit_code: None,
+                output: String::new(),
+                error: Some(error.detail),
+                status: None,
+            };
+        }
+    }
+
     // Already-installed tools with a self-updater get it first: it updates
     // the installation PATH resolves, which the install script may not.
     let mut capture = None;
+    let mut process_started = false;
     if version_before.is_some() {
         if let Some(args) = self_update_args(&target.agent_kind) {
             let self_capture = run_program_capture(
@@ -717,6 +755,7 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
                 Some(&env),
             )
             .await;
+            process_started |= self_capture.started;
             let after = read_tool_version(&target.command, &env)
                 .await
                 .ok()
@@ -729,15 +768,22 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
     let capture = match capture {
         Some(capture) => capture,
         None => {
-            run_shell_capture(
+            let capture = run_shell_capture(
                 &install,
                 TOOL_INSTALL_TIMEOUT,
                 TOOL_OUTPUT_LIMIT,
                 Some(&env),
             )
-            .await
+            .await;
+            process_started |= capture.started;
+            capture
         }
     };
+    if !process_started {
+        if let Some(claim) = shared_install_claim.as_ref() {
+            let _ = claim.clear_pre_effect_failure();
+        }
+    }
 
     let status = Some(check_host_tool(target.clone()).await);
     let (success, error) = update_outcome(
@@ -993,6 +1039,7 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 
 #[derive(Debug)]
 struct CommandCapture {
+    started: bool,
     success: bool,
     exit_code: Option<i32>,
     output: String,
@@ -1021,6 +1068,7 @@ async fn run_program_capture(
         Ok(child) => child,
         Err(e) => {
             return CommandCapture {
+                started: false,
                 success: false,
                 exit_code: None,
                 output: String::new(),
@@ -1031,18 +1079,21 @@ async fn run_program_capture(
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => CommandCapture {
+            started: true,
             success: output.status.success(),
             exit_code: output.status.code(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
             error: None,
         },
         Ok(Err(e)) => CommandCapture {
+            started: true,
             success: false,
             exit_code: None,
             output: String::new(),
             error: Some(e.to_string()),
         },
         Err(_) => CommandCapture {
+            started: true,
             success: false,
             exit_code: None,
             output: String::new(),
@@ -1073,6 +1124,7 @@ async fn run_shell_capture(
         Ok(child) => child,
         Err(e) => {
             return CommandCapture {
+                started: false,
                 success: false,
                 exit_code: None,
                 output: String::new(),
@@ -1083,18 +1135,21 @@ async fn run_shell_capture(
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => CommandCapture {
+            started: true,
             success: output.status.success(),
             exit_code: output.status.code(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
             error: None,
         },
         Ok(Err(e)) => CommandCapture {
+            started: true,
             success: false,
             exit_code: None,
             output: String::new(),
             error: Some(e.to_string()),
         },
         Err(_) => CommandCapture {
+            started: true,
             success: false,
             exit_code: None,
             output: String::new(),
@@ -1227,7 +1282,7 @@ async fn handle_agent_create(
     if !binary_exists(&bin, &env).await {
         match create.install.as_deref() {
             Some(install_cmd) if !install_cmd.trim().is_empty() => {
-                let installed = run_install(install_cmd, &env).await;
+                let installed = run_install(&bin, install_cmd, &env).await;
                 if !installed {
                     send_spawn_failed_exit(agent_id, out_tx, "install failed").await;
                     return;
@@ -2303,7 +2358,27 @@ async fn binary_exists(bin: &str, env: &BTreeMap<String, String>) -> bool {
 /// Run an endpoint-local install command. Output is discarded because the
 /// server control socket is signaling/metadata-only; interactive tool output
 /// moves to the host DataChannel in P2-HOST-03A.
-async fn run_install(install_cmd: &str, env: &BTreeMap<String, String>) -> bool {
+async fn run_install(executable: &str, install_cmd: &str, env: &BTreeMap<String, String>) -> bool {
+    let shared_install_claim =
+        match HostToolService::shared().claim_legacy_executable_install(executable) {
+            Ok(claim) => claim,
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code,
+                    "endpoint-local install inhibited by tool gate"
+                );
+                return false;
+            }
+        };
+    if let Some(claim) = shared_install_claim.as_ref() {
+        if let Err(error) = claim.mark_effect_started() {
+            tracing::warn!(
+                code = error.code,
+                "endpoint-local install could not enter tool reconciliation gate"
+            );
+            return false;
+        }
+    }
     let mut shell = tokio::process::Command::new("bash");
     shell
         .arg("-c")
@@ -2317,6 +2392,9 @@ async fn run_install(install_cmd: &str, env: &BTreeMap<String, String>) -> bool 
     let mut child = match shell.spawn() {
         Ok(c) => c,
         Err(error) => {
+            if let Some(claim) = shared_install_claim.as_ref() {
+                let _ = claim.clear_pre_effect_failure();
+            }
             tracing::warn!(%error, "failed to start endpoint-local install");
             return false;
         }

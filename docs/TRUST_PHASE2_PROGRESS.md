@@ -203,18 +203,24 @@ operation, and reconnect behavior.
 This is **IMPLEMENTED, REVIEW PENDING**, not integrated or `DONE`. Execution is
 fail closed: unknown payload fields and arbitrary path/argv are rejected; no
 shell evaluates browser input; target/process/output/time limits are fixed;
-same-tool installs are mutually exclusive; cancellation, close, and timeout
-kill the process group. Once installation starts, any non-success, teardown,
-failed reconciliation, or lost acknowledgement is `outcome_unknown`, is never
-retried automatically, and must be reconciled with `tool.check`.
+same-tool installs across the interactive and retained compatibility paths are
+mutually exclusive; cancellation, close, and timeout kill a delegated Linux
+cgroup v2 containment. Execution fails closed when that containment is not
+available; the generated Linux user service requests `Delegate=yes`, while
+unsupported platforms and non-delegated launch modes cannot run interactive
+tool commands. Once installation starts, any non-success, teardown, failed
+reconciliation, or lost acknowledgement is `outcome_unknown`, is never retried
+automatically, and must be reconciled with a separate `tool.check`.
 
-Tool subprocesses, their whole process groups, and their stdout/stderr drain
-tasks are owned independently of request and DataChannel tasks. Process,
-session-long-task, and same-tool install permits remain held until the direct
-child is waited/reaped, both pipes have finished or been aborted and joined,
-and the process group is gone. A successful direct parent that leaves a
-closed-stdio descendant behind is killed and reported as a failed operation;
-its permit cannot be released while that descendant survives. Session close
+Tool subprocesses, every descendant admitted before exec to their delegated
+cgroup, and their stdout/stderr drain tasks are owned independently of request
+and DataChannel tasks. The daemon is a child subreaper. Process,
+session-long-task, and same-tool install permits remain held until the cgroup
+reports `populated 0`, inventoried descendants are waited/reaped, both pipes
+have finished or been aborted and joined, and the cgroup directory is removed.
+A successful direct parent that leaves a closed-stdio `setsid` descendant
+behind is killed and reported as a failed operation; its permit cannot be
+released while that descendant survives. Session close
 still obeys its one absolute deadline while late cleanup remains tracked;
 multi-target failure cancels and drains every started sibling. The browser
 exposes an explicit cancel action, preserves structured endpoint error
@@ -223,9 +229,14 @@ success as `outcome_unknown`, ignores protected late output, and directs the
 user to check status before any manual retry. An unknown outcome is retained
 in typed, per-host/target browser query state across navigation and component
 remounts; its reconciliation is bound to the exact preset ID and agent kind
-that ran. Metadata drift cannot clear that lock. Install/update and enabling
-legacy auto-update stay locked until an explicit `Check now` returns one
-definitive, error-free, internally consistent status. Built-in policy is keyed
+that ran. `Check now` fetches fresh authoritative metadata before its endpoint
+check and again before clearing the lock, so no-remount metadata drift cannot
+clear it. Every interactive effect first disables legacy auto-update through
+the policy endpoint and confirms the fresh authoritative target; the daemon's
+shared gate also inhibits any already-racing compatibility installer.
+Install/update and enabling legacy auto-update stay locked until an explicit
+`Check now` returns one definitive, error-free, internally consistent status.
+Built-in policy is keyed
 by canonical disclosed `agent_kind`; in particular, preset `aider-sonnet` maps
 to `aider` at both endpoint and browser boundaries and unknown kinds fail
 closed.
@@ -233,8 +244,11 @@ closed.
 Installer exit zero is not success by itself. The endpoint acknowledges
 success only after a bounded direct-argv reconciliation positively observes a
 recognizable installed version, a latest-version expectation, and no remaining
-update. Nonzero/timeout/cancel/session-close probes and ambiguous or
-contradictory statuses return structured `outcome_unknown`. Tool execution
+update. A latest-version observation is accepted only from an exit-zero,
+non-truncated capture with no containment/capture failure and a recognizable
+numeric version. Nonzero/timeout/cancel/session-close probes, an exit-zero
+parent with a detached descendant, and ambiguous or contradictory statuses
+return structured `outcome_unknown`. Tool execution
 uses the daemon service environment plus fixed user-bin conventions; it does
 not invoke or depend on a login shell to discover `PATH`.
 
@@ -245,8 +259,9 @@ interactive path does not complete the tool migration or Phase 2. A
 tracked-plus-unignored production source inventory guard rejects server use of
 the new E2E operation names, metadata helper/route/schema expansion, UI use or
 aliasing of the legacy interactive helpers, computed routes/operations,
-browser/endpoint shell fallbacks (including aliases, encoded strings,
-generically named dependencies, and `.args(["-c"])`), moved operation names,
+browser/endpoint shell fallbacks (including aliased arrays and `.join()`
+chains, encoded strings, generically named dependencies, unresolved spawn
+arguments, and `.args(["-c"])`), moved operation names,
 login-shell probing, protected logging, and canonical-policy drift. Python AST,
 TypeScript AST, and rustc AST inventories bind the reviewed routes, protected
 field accesses, API helpers, reconciliation logic, parser rules, process-launch
@@ -256,14 +271,14 @@ tool-failure handling, and expanded adversarial `--self-test` run from
 `scripts/test-all.sh`.
 
 **Current P2-HOST-03A candidate validation:** daemon format and strict
-all-target Clippy pass; all 191 daemon tests pass (60 library, 123 supervisor,
+all-target Clippy pass; all 194 daemon tests pass (60 library, 126 supervisor,
 8 worker E2E). Server Ruff and all 150 server tests pass. Web lint, typecheck,
-all 60 unit tests, a retry-free Playwright run with 73 passing tests and 3
+all 60 unit tests, a retry-free Playwright run with 74 passing tests and 3
 opt-in audits skipped, and the production build pass. The focused endpoint
-tool suite has 22 adversarial tests, the browser host-control suite has 37,
+tool suite has 25 adversarial tests, the browser host-control suite has 37,
 the paired zero-agent host channel covers bounded close with independently
 owned late tool cleanup, and the metadata-only server regression passes.
-`SPAWN_E2E_PORT=44173 scripts/test-all.sh` passes the complete repeatable
+`SPAWN_E2E_PORT=44531 scripts/test-all.sh` passes the complete repeatable
 matrix, including the adversarial boundary self-test plus prebuilt install,
 HTTP, Redis, PostgreSQL owner recovery, login, daemon lifecycle, live-browser,
 and service-manager smokes. No review pass or merge is claimed by this

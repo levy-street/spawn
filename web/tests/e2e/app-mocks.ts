@@ -144,6 +144,7 @@ export async function mockAuthenticatedApi(
     toolTargets?: unknown[] | (() => unknown[]);
     toolCheck?: (hostId: string, payload: Record<string, unknown>) => unknown;
     toolInstall?: (hostId: string, payload: Record<string, unknown>) => unknown;
+    toolPolicy?: (hostId: string, presetId: string, body: Record<string, unknown>) => unknown;
   } = {},
 ) {
   const agents = options.agents ?? [];
@@ -561,6 +562,19 @@ export async function mockAuthenticatedApi(
         contentType: "application/json",
         json: { tools: toolTargets ?? [] },
       });
+      return;
+    }
+    const toolPolicyMatch = path.match(/^\/api\/hosts\/([^/]+)\/tools\/([^/]+)\/policy$/);
+    if (toolPolicyMatch && method === "PATCH") {
+      const body = (await request.postDataJSON()) as Record<string, unknown>;
+      const result = options.toolPolicy?.(toolPolicyMatch[1], toolPolicyMatch[2], body) ?? {
+        preset_id: toolPolicyMatch[2],
+        auto_update: body.auto_update ?? false,
+        last_checked_at: null,
+        last_auto_update_at: null,
+        last_auto_update_error: null,
+      };
+      await route.fulfill({ status: 200, contentType: "application/json", json: result });
       return;
     }
     if (path === `/api/hosts/${HOST_ID}/dirs`) {

@@ -440,13 +440,15 @@ if found_server_attribute_reads != expected_server_attribute_reads:
     die(f"protected server field access inventory changed: {found_server_attribute_reads!r}")
 
 
-# Browser production has one public-metadata call and direct E2E check/install calls.
+# Browser production has its query plus authoritative reconciliation metadata
+# reads, direct E2E checks/install, and an explicit legacy-policy inhibitor.
 panel_relative = "web/src/components/hosts/HostToolsPanel.tsx"
 control_relative = "web/src/lib/hostControl.ts"
 api_relative = "web/src/lib/api.ts"
 for needle, expected in (
-    ("hosts.toolTargets(", 1),
-    ("client.checkTools(", 2),
+    ("hosts.toolTargets(", 2),
+    ("hosts.updateToolPolicy(", 2),
+    ("client.checkTools(", 3),
     ("client.installTool(", 1),
 ):
     require_count(panel_relative, needle, expected)
@@ -532,11 +534,11 @@ require_count(panel_relative, "new AbortController()")
 for needle, expected in (
     ('"host-tool-reconciliation"', 1),
     ("gcTime: Number.POSITIVE_INFINITY", 1),
-    ("qc.setQueryData<ReconciliationMap>(reconciliationKey", 3),
+    ("qc.setQueryData<ReconciliationMap>(reconciliationKey", 4),
     ("Check now must return a definitive status", 1),
     ("Boolean(reconciliationByTarget[tool.preset_id])", 2),
     ("if (reconciliationByTarget[tool.preset_id]) return", 1),
-    ("isDefinitiveReconciliation(status)", 1),
+    ("isDefinitiveReconciliation(status)", 2),
     ('typeof status.latest_version === "string"', 1),
     ('typeof status.update_available === "boolean"', 1),
 ):
@@ -647,9 +649,9 @@ def rust_production_source(source: str) -> str:
 
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
-    "daemon/src/host_tools.rs": "4f042f9e27aa992d2cebcfe5f02546cebf321bde469758168682ce16b034ad6c",
+    "daemon/src/host_tools.rs": "0afa269772192530b734713eb6c275a689bb86e166f35f74c86b29a90e4a46a2",
     "daemon/src/main.rs": "b96fa7f9a1ad9f52e4be6a98923ca643d37da2e0be0d97d487ec77d25b6f3e05",
-    "daemon/src/run.rs": "636f41839e6014df18aebe8e3c6dbbf9b4f5d25e36451d9f6a8c47b1691157ad",
+    "daemon/src/run.rs": "8368b2552f9e556565126e077da47e2e755e222f4abfb659fcb29f1bad182b74",
     "daemon/src/worker_backend.rs": "7b3d600b3ba7e0553a405e50c3b35e9120b3f000198efd7ed90541fef8b99baa",
 }
 found_command_sources = {
@@ -755,14 +757,14 @@ for forbidden in (
 ):
     if forbidden in host_tools_production:
         die(f"endpoint host-tools path regained a login-shell dependency: {forbidden}")
-for needle in (
-    "fn endpoint_command_env()",
-    "status.error.is_none()",
-    "status.version.is_some()",
-    "status.latest_version.is_some()",
-    "status.update_available == Some(false)",
+for needle, expected in (
+    ("fn endpoint_command_env()", 1),
+    ("status.error.is_none()", 1),
+    ("status.version.is_some()", 2),
+    ("status.latest_version.is_some()", 2),
+    ("status.update_available == Some(false)", 1),
 ):
-    require_count(host_tools_relative, needle)
+    require_count(host_tools_relative, needle, expected)
 for needle in (
     "tool_operations: Arc<HostToolOperations>",
     "tool_operations.wait_for_idle_until(deadline)",
@@ -841,8 +843,11 @@ function collectBindings(sourceFile) {
     let changed = false;
     walk(sourceFile, (node) => {
       if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || !node.initializer) return;
-      const value = staticString(node.initializer, bindings);
-      if (value !== null && bindings.get(node.name.text) !== value) {
+      const value = staticString(node.initializer, bindings) ?? staticArray(node.initializer, bindings);
+      if (
+        value !== null &&
+        JSON.stringify(bindings.get(node.name.text)) !== JSON.stringify(value)
+      ) {
         bindings.set(node.name.text, value);
         changed = true;
       }
@@ -855,8 +860,15 @@ function collectBindings(sourceFile) {
 function staticString(node, bindings) {
   if (!node) return null;
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
-  if (ts.isIdentifier(node)) return bindings.get(node.text) ?? null;
+  if (ts.isIdentifier(node)) {
+    const value = bindings.get(node.text);
+    return typeof value === "string" ? value : null;
+  }
   if (ts.isParenthesizedExpression(node)) return staticString(node.expression, bindings);
+  if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) {
+    return staticString(node.expression, bindings);
+  }
+  if (ts.isSatisfiesExpression?.(node)) return staticString(node.expression, bindings);
   if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
     const left = staticString(node.left, bindings);
     const right = staticString(node.right, bindings);
@@ -874,14 +886,11 @@ function staticString(node, bindings) {
   if (
     ts.isCallExpression(node) &&
     ts.isPropertyAccessExpression(node.expression) &&
-    node.expression.name.text === "join" &&
-    ts.isArrayLiteralExpression(node.expression.expression)
+    node.expression.name.text === "join"
   ) {
     const separator = node.arguments.length === 0 ? "" : staticString(node.arguments[0], bindings);
-    const values = node.expression.expression.elements.map((element) => staticString(element, bindings));
-    return separator === null || values.some((value) => value === null)
-      ? null
-      : values.join(separator);
+    const values = staticArray(node.expression.expression, bindings);
+    return separator === null || values === null ? null : values.join(separator);
   }
   if (
     ts.isCallExpression(node) &&
@@ -894,6 +903,39 @@ function staticString(node, bindings) {
     return String.fromCharCode(...node.arguments.map((argument) => Number(argument.text)));
   }
   return null;
+}
+
+function staticArray(node, bindings) {
+  if (!node) return null;
+  if (ts.isIdentifier(node)) {
+    const value = bindings.get(node.text);
+    return Array.isArray(value) ? value : null;
+  }
+  if (ts.isParenthesizedExpression(node)) return staticArray(node.expression, bindings);
+  if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) {
+    return staticArray(node.expression, bindings);
+  }
+  if (ts.isSatisfiesExpression?.(node)) return staticArray(node.expression, bindings);
+  if (!ts.isArrayLiteralExpression(node)) return null;
+  const values = [];
+  for (const element of node.elements) {
+    if (ts.isSpreadElement(element)) {
+      const spread = staticArray(element.expression, bindings);
+      if (spread === null) return null;
+      values.push(...spread);
+      continue;
+    }
+    const value = staticString(element, bindings);
+    if (value === null) return null;
+    values.push(value);
+  }
+  return values;
+}
+
+function staticLaunchValue(node, bindings) {
+  const string = staticString(node, bindings);
+  if (string !== null) return [string];
+  return staticArray(node, bindings);
 }
 
 const printer = ts.createPrinter({ removeComments: true });
@@ -948,8 +990,25 @@ for (const [name, expected] of Object.entries({
 for (const [relative, sourceFile] of files) {
   const bindings = collectBindings(sourceFile);
   const aliases = new Set(["hosts"]);
+  const launchAliases = new Set(["spawn", "exec", "execFile"]);
+  const launchNamespaces = new Set();
   walk(sourceFile, (node) => {
     if (ts.isImportSpecifier(node) && (node.propertyName?.text ?? node.name.text) === "hosts") aliases.add(node.name.text);
+    if (
+      ts.isImportSpecifier(node) &&
+      launchAliases.has(node.propertyName?.text ?? node.name.text)
+    ) {
+      launchAliases.add(node.name.text);
+    }
+    if (
+      ts.isImportDeclaration(node) &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      ["child_process", "node:child_process"].includes(node.moduleSpecifier.text) &&
+      node.importClause?.namedBindings &&
+      ts.isNamespaceImport(node.importClause.namedBindings)
+    ) {
+      launchNamespaces.add(node.importClause.namedBindings.name.text);
+    }
   });
   for (let pass = 0; pass < 8; pass += 1) {
     let changed = false;
@@ -963,6 +1022,28 @@ for (const [relative, sourceFile] of files) {
         !aliases.has(node.name.text)
       ) {
         aliases.add(node.name.text);
+        changed = true;
+      }
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer &&
+        ts.isIdentifier(node.initializer) &&
+        launchAliases.has(node.initializer.text) &&
+        !launchAliases.has(node.name.text)
+      ) {
+        launchAliases.add(node.name.text);
+        changed = true;
+      }
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer &&
+        ts.isIdentifier(node.initializer) &&
+        launchNamespaces.has(node.initializer.text) &&
+        !launchNamespaces.has(node.name.text)
+      ) {
+        launchNamespaces.add(node.name.text);
         changed = true;
       }
     });
@@ -994,6 +1075,28 @@ for (const [relative, sourceFile] of files) {
       if (calleeName === "eval" || calleeName === "Function") {
         die(`browser production contains dynamic evaluation in ${relative}`);
       }
+      const processLaunch =
+        (ts.isIdentifier(callee) && launchAliases.has(callee.text)) ||
+        (ts.isPropertyAccessExpression(callee) &&
+          ts.isIdentifier(callee.expression) &&
+          launchNamespaces.has(callee.expression.text) &&
+          launchAliases.has(callee.name.text));
+      if (processLaunch) {
+        const launchStrings = [];
+        for (const argument of node.arguments ?? []) {
+          const value = staticLaunchValue(argument, bindings);
+          if (value === null) {
+            die(`browser production contains an unresolved process-launch argument in ${relative}`);
+          }
+          launchStrings.push(...value);
+        }
+        if (
+          launchStrings.some((value) => value === "sh" || value === "bash") &&
+          launchStrings.includes("-c")
+        ) {
+          die(`browser production contains shell evaluation in ${relative}`);
+        }
+      }
       const strings = [];
       for (const argument of node.arguments ?? []) {
         walk(argument, (part) => {
@@ -1024,10 +1127,11 @@ function namedNodes(sourceFile) {
 const panelFile = files.get(panelRelative);
 const panelNodes = namedNodes(panelFile);
 for (const [name, expected] of Object.entries({
-  HostToolsPanel: "776149d6ad38edf6ebb9a6d5fc13b090d74d46ea5aa48901573f2ab90b38d9bd",
+  HostToolsPanel: "bac5a95fa42b9fc28039cb41243bfaa9d6b0963bb9d06f35dc3ce09a7cb36fca",
   reconciliationQ: "6aefd5966c2f6ee70ea4d77e52499f6050a07a1ff626c75ed7c9279562a1d4e5",
-  installM: "e1ea630c5b970c6301d9652aeb7a521dd8e4e57cacce52846e7f2746b4b01cc0",
-  reconcileM: "6599d05128f42455330f61a5a62e98b7f0a01f4f78ca8971c64ddabb67c36e87",
+  installM: "f8c298d7c32c1ca420dc417ce0ef503e5b0c5823f97a08c19a6cfee24901e449",
+  reconcileM: "35c8d86ff89866ef5f58e0d74c59b1b7c682d7b682404fe4c6ae649eb9663c38",
+  authoritativeTarget: "886e79c530a5aa3b270d29f89f16c7de843e1aa30de4b6bafa2a0a8b16829f6e",
   isDefinitiveReconciliation: "91bd98e42a127af99f0c52d5abbbc10cf8820f954e460a94358f5a492bb3527b",
   sameTarget: "d51a557bdd8d1c51b9f485902f7039cac6c902fd9e5bc295765c920ea4fc0137",
 })) requireHash(`HostToolsPanel.${name}`, panelNodes.get(name), panelFile, expected);
@@ -1255,6 +1359,18 @@ PY
     'const shell = ["s", "h"].join(""); const flag = String.fromCharCode(45, 99); export const run = () => spawn([shell, flag, "echo unsafe"]);' \
     >"$case_dir/web/src/lib/worker.ts"
   expect_rejected web-encoded-shell-helper
+
+  new_case web-array-alias-shell-helper
+  printf '%s\n' \
+    'const shellParts = ["s", "h"]; const shellAlias = shellParts; const flagParts = ["-", "c"]; const flagAlias = flagParts; const launch = spawn; function dormant() { return launch([shellAlias.join(""), flagAlias.join(""), "echo unsafe"]); }' \
+    >"$case_dir/web/src/lib/worker.ts"
+  expect_rejected web-array-alias-shell-helper
+
+  new_case web-unresolved-spawn-helper
+  printf '%s\n' \
+    'declare function buildArgs(): string[]; export const run = () => spawn(buildArgs());' \
+    >"$case_dir/web/src/lib/worker.ts"
+  expect_rejected web-unresolved-spawn-helper
 
   new_case daemon-multiline-shell
   python3 - "$case_dir/daemon/src/host_tool_fallback.rs" <<'PY'
