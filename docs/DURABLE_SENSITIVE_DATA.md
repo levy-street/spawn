@@ -74,6 +74,22 @@ host channel; ordinary server metadata remains whatever lifecycle state was
 already disclosed and must not be treated as proof that the protected effect
 succeeded or failed.
 
+### Canonical guarded declarations
+
+These rows are parsed by the durable-data guard; prose cannot silently override
+them, and any additional active contradiction fails CI.
+
+| Declaration | Value |
+| --- | --- |
+| `data01_runtime` | `design_only_not_implemented` |
+| `phase2_completion` | `incomplete` |
+| `phase2_canonical_store` | `endpoint_local_per_host` |
+| `phase2_opaque_server_blob_fallback` | `forbidden` |
+| `p2_host_02_status` | `reviewed_merged_4e7c89b` |
+| `acknowledgement_retry_authority` | `forbidden` |
+| `rotation_new_epoch_anchor_slots_before_old_key_retirement` | `2` |
+| `p2_data_02_required_reviewed_merged_dependencies` | `P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A` |
+
 ### Consequences we accept
 
 - Protected values cannot be viewed, edited, launched, or restarted through

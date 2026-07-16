@@ -16,6 +16,14 @@ class GuardError(RuntimeError):
     pass
 
 
+class ContradictionError(GuardError):
+    def __init__(self, category: str, path: Path, pattern: str) -> None:
+        self.category = category
+        super().__init__(
+            f"{path} contains contradictory active prose in category {category!r}: {pattern}"
+        )
+
+
 @dataclass(frozen=True)
 class Section:
     level: int
@@ -49,6 +57,40 @@ REQUIRED_DOCS = (
     "docs/TRUST_PHASE2_PROGRESS.md",
     "docs/TRUST_PHASE2_TASKS.md",
     "proto/README.md",
+)
+
+RUNTIME_STATUS_CONTRADICTIONS = (
+    r"(?:endpoint-local|durable protected-data|private)(?: runtime)? store (?:is|has been|is now|is currently|already is) (?:currently )?(?:implemented|deployed|live|running|in production|production-ready)",
+    r"\bruntime (?:is |has been |now |is currently )?implemented\b",
+    r"(?:P2-)?DATA-02 (?:is|has been|is now|is currently) (?:implemented|done|complete|completed|merged|in production)",
+    r"Phase\s*2 (?:is|has been|is now|now is|is considered) (?:complete|completed|done|achieved|live|in production)(?! when\b)",
+)
+
+OPAQUE_FALLBACK_CONTRADICTIONS = (
+    r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?(?:allowed|permitted|approved|supported) (?:as )?(?:an? )?(?:Phase\s*2 )?fallback",
+    r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed|permitted).{0,60}(?:Phase\s*2|fallback)",
+    r"Phase\s*2 (?:may|can|does) (?:use|permit|allow|fall back to|store) opaque.{0,50}server blobs?",
+    r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
+)
+
+HOST02_STATUS_CONTRADICTIONS = (
+    r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains|is still|continues to be) (?:an? )?(?:awaiting|pending|undergoing|waiting for|review-pending|unmerged|not merged|review candidate)(?: (?:independent )?(?:review|merge))?)",
+)
+
+ACK_RETRY_CONTRADICTIONS = (
+    r"(?:user )?(?:acknowledgement|acknowledgment|ack|dismissal)(?: or (?:user )?(?:acknowledgement|acknowledgment|ack|dismissal))? (?:may |can )?(?:unlock|clear|release|remove)(?:s)? (?:the )?(?:effect|retry|lock|block|reconciliation lock)",
+    r"(?:user )?(?:acknowledgement|acknowledgment|ack|dismissal) (?:may |can |directly )?(?:authorize|authorizes|permit|permits|allow|allows|enable|enables) (?:a )?retry",
+    r"user may (?:acknowledge|dismiss).{0,40}(?:and|to) retry",
+)
+
+ROTATION_RETIREMENT_CONTRADICTIONS = (
+    r"old (?:master-key |master key )?epoch (?:may|can|is allowed to) (?:be )?(?:retired|destroyed|deleted).{0,80}(?:after (?:only )?(?:one|the first|a single).{0,30}slot|before both)",
+    r"(?:retire|destroy|delete)(?:s|d)? the old (?:master-key |master key )?epoch.{0,80}(?:after (?:only )?(?:one|the first|a single).{0,30}slot|before both)",
+)
+
+DATA02_DEPENDENCY_CONTRADICTIONS = (
+    r"(?:P2-)?DATA-02 (?:may|can|is allowed to) (?:start|begin|proceed|be scheduled).{0,100}before.{0,120}(?:TERM-01|HOST-03A).{0,100}(?:review|merge)",
+    r"(?:P2-)?DATA-02.{0,40}(?:does not require|without waiting for).{0,100}(?:TERM-01|HOST-03A).{0,80}(?:review|merge)",
 )
 
 
@@ -125,11 +167,31 @@ def require(section: Section | str, path: Path, *fragments: str) -> None:
             raise GuardError(f"{path} section {label!r} lost required decision: {fragment}")
 
 
-def forbid_patterns(text: str, path: Path, patterns: tuple[str, ...]) -> None:
+def forbid_patterns(
+    text: str,
+    path: Path,
+    patterns: tuple[str, ...],
+    *,
+    category: str = "active-prose",
+) -> None:
     body = normalized(text)
     for pattern in patterns:
         if re.search(pattern, body, flags=re.IGNORECASE):
-            raise GuardError(f"{path} contains contradictory active prose matching: {pattern}")
+            raise ContradictionError(category, path, pattern)
+
+
+def declaration_map(section: Section, path: Path) -> dict[str, str]:
+    declarations: dict[str, str] = {}
+    row = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*$")
+    for line in section.body.splitlines():
+        match = row.match(line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key in declarations:
+            raise GuardError(f"{path} has duplicate canonical declaration: {key}")
+        declarations[key] = value
+    return declarations
 
 
 def validate(root: Path) -> None:
@@ -153,9 +215,28 @@ def validate(root: Path) -> None:
         "Spawn will use an **endpoint-local canonical store per host**",
         "Opaque client-encrypted server blobs are **not selected** for Phase 2.",
         "### Exact retained server metadata",
+        "### Canonical guarded declarations",
         "no server ciphertext schema/API",
         "reconciliation-record presence/detail",
     )
+    expected_declarations = {
+        "data01_runtime": "design_only_not_implemented",
+        "phase2_completion": "incomplete",
+        "phase2_canonical_store": "endpoint_local_per_host",
+        "phase2_opaque_server_blob_fallback": "forbidden",
+        "p2_host_02_status": "reviewed_merged_4e7c89b",
+        "acknowledgement_retry_authority": "forbidden",
+        "rotation_new_epoch_anchor_slots_before_old_key_retirement": "2",
+        "p2_data_02_required_reviewed_merged_dependencies": (
+            "P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A"
+        ),
+    }
+    declarations = declaration_map(decision, adr)
+    if declarations != expected_declarations:
+        raise GuardError(
+            f"{adr} canonical declarations mismatch: expected {expected_declarations}, "
+            f"found {declarations}"
+        )
     forbid_patterns(
         decision.body,
         adr,
@@ -164,6 +245,7 @@ def validate(root: Path) -> None:
             r"server (?:is|as) (?:the )?canonical (?:store|source)",
             r"server-held (?:decrypt|recovery|store root) key",
         ),
+        category="canonical-store",
     )
 
     trust = unique_section(parsed, 2, "Trust boundaries and authorization", adr)
@@ -207,6 +289,7 @@ def validate(root: Path) -> None:
             r"expired (?:request )?result.{0,80}(?:is|becomes|may be) (?:new|fresh)",
             r"(?:evict|remove).{0,80}settled result.{0,80}before 24 hours",
         ),
+        category="replay-capacity",
     )
 
     anti = unique_section(parsed, 3, "Durable anti-replay heads and admission", adr)
@@ -265,10 +348,8 @@ def validate(root: Path) -> None:
     forbid_patterns(
         rotation.body,
         adr,
-        (
-            r"old master-key epoch may be destroyed after (?:the )?first new(?:-epoch)? slot",
-            r"destroy(?:s|ed)? the old (?:master )?key after (?:the )?first new(?:-epoch)? slot",
-        ),
+        ROTATION_RETIREMENT_CONTRADICTIONS,
+        category="rotation-retirement",
     )
 
     compatibility = unique_section(parsed, 2, "Compatibility failure behavior", adr)
@@ -313,20 +394,58 @@ def validate(root: Path) -> None:
         active_without_rejected,
         adr,
         (
-            r"user (?:acknowledgement|acknowledgment|dismissal).{0,80}(?:authorizes|permits|releases|unlocks) (?:a )?retry",
-            r"(?:acknowledgement|acknowledgment|dismissal).{0,80}(?:releases|clears|removes) (?:the )?(?:effect )?lock",
+            r"server[- ]readable canonical store",
+            r"server (?:is|as) (?:the )?canonical (?:store|source)",
+            r"server-held (?:decrypt|recovery|store root) key",
+        ),
+        category="canonical-store",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        (
             r"(?:may|can) evict (?:an? )?(?:unresolved|anti-replay|effect)",
             r"(?:may|can) remove (?:an? )?(?:unresolved record|anti-replay head|effect head)",
-            r"(?:endpoint-local|durable protected-data|private) store (?:is|has been|is now) (?:implemented|deployed|live|available at runtime)",
-            r"\bruntime (?:is |has been |now )?implemented\b",
-            r"(?:P2-DATA-02|DATA-02) (?:is|has been|is now) (?:implemented|done|complete|completed|merged)",
-            r"Phase\s*2 (?:is|has been|is now) (?:complete|completed|done|achieved)(?! when\b)",
-            r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?allowed (?:Phase\s*2 )?fallback",
-            r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed).{0,50}Phase\s*2",
-            r"Phase\s*2 may (?:use|fall back to|store) opaque.{0,40}server blobs?",
-            r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
-            r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains) (?:an? )?(?:review-pending|review pending|unmerged|not merged|review candidate))",
+            r"request 4,097 (?:may|can) evict (?:an? )?(?:old|settled) result",
+            r"(?:may|can) (?:evict|remove).{0,50}settled result.{0,50}before 24 hours",
         ),
+        category="replay-capacity",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        RUNTIME_STATUS_CONTRADICTIONS,
+        category="runtime-status",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        OPAQUE_FALLBACK_CONTRADICTIONS,
+        category="opaque-fallback",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        HOST02_STATUS_CONTRADICTIONS,
+        category="host02-status",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        ACK_RETRY_CONTRADICTIONS,
+        category="ack-retry",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        ROTATION_RETIREMENT_CONTRADICTIONS,
+        category="rotation-retirement",
+    )
+    forbid_patterns(
+        active_without_rejected,
+        adr,
+        DATA02_DEPENDENCY_CONTRADICTIONS,
+        category="data02-dependencies",
     )
 
     for relative in REQUIRED_DOCS:
@@ -341,16 +460,30 @@ def validate(root: Path) -> None:
                 r"retained only at endpoints or as opaque",
                 r"opaque endpoint-encrypted blobs are selected",
                 r"server[- ]readable canonical store",
-                r"(?:endpoint-local|durable protected-data|private) store (?:is|has been|is now) (?:implemented|deployed|live|available at runtime)",
-                r"\bruntime (?:is |has been |now )?implemented\b",
-                r"(?:P2-DATA-02|DATA-02) (?:is|has been|is now) (?:implemented|done|complete|completed|merged)",
-                r"Phase\s*2 (?:is|has been|is now) (?:complete|completed|done|achieved)(?! when\b)",
-                r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?allowed (?:Phase\s*2 )?fallback",
-                r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed).{0,50}Phase\s*2",
-                r"Phase\s*2 may (?:use|fall back to|store) opaque.{0,40}server blobs?",
-                r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
-                r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains) (?:an? )?(?:review-pending|review pending|unmerged|not merged|review candidate))",
             ),
+            category="canonical-store",
+        )
+        forbid_patterns(
+            doc_text, doc, RUNTIME_STATUS_CONTRADICTIONS, category="runtime-status"
+        )
+        forbid_patterns(
+            doc_text, doc, OPAQUE_FALLBACK_CONTRADICTIONS, category="opaque-fallback"
+        )
+        forbid_patterns(
+            doc_text, doc, HOST02_STATUS_CONTRADICTIONS, category="host02-status"
+        )
+        forbid_patterns(doc_text, doc, ACK_RETRY_CONTRADICTIONS, category="ack-retry")
+        forbid_patterns(
+            doc_text,
+            doc,
+            ROTATION_RETIREMENT_CONTRADICTIONS,
+            category="rotation-retirement",
+        )
+        forbid_patterns(
+            doc_text,
+            doc,
+            DATA02_DEPENDENCY_CONTRADICTIONS,
+            category="data02-dependencies",
         )
 
     trust_text = active_markdown(root / "docs/TRUST.md")
@@ -366,6 +499,7 @@ def validate(root: Path) -> None:
         trust_text,
         root / "docs/TRUST.md",
         (r"P2-HOST-02 review candidate", r"P2-HOST-02.{0,80}review/merge pending"),
+        category="host02-status",
     )
 
     phase2_path = root / "docs/TRUST_PHASE2.md"
@@ -394,6 +528,7 @@ def validate(root: Path) -> None:
             r"filesystem portion is \*\*IMPLEMENTED, REVIEW PENDING\*\* in P2-HOST-02",
             r"interactive tool portion remains planned separately as P2-HOST-03A",
         ),
+        category="host02-status",
     )
 
     tasks = active_markdown(root / "docs/TRUST_PHASE2_TASKS.md")
@@ -442,27 +577,34 @@ def replace_required(path: Path, old: str, new: str) -> None:
 
 def self_test(source: Path) -> None:
     validate(source)
-    mutations: list[tuple[str, Callable[[Path], None]]] = []
+    mutations: list[tuple[str, Callable[[Path], None], str | None]] = []
 
     def add_comment_and_fence_decoys(path: Path, safe: str) -> None:
         text = path.read_text(encoding="utf-8")
         decoys = f"<!-- {safe} -->\n\n```text\n{safe}\n```\n\n"
         path.write_text(decoys + text, encoding="utf-8")
 
+    def append_active_claim(path: Path, claim: str, safe_decoy: str) -> None:
+        add_comment_and_fence_decoys(path, safe_decoy)
+        path.write_text(path.read_text(encoding="utf-8") + f"\n\n{claim}\n", encoding="utf-8")
+
     def canonical_html(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         expected = "Spawn will use an **endpoint-local canonical store per host**"
-        replace_required(path, expected, "Spawn will use a **server-readable canonical store**")
-        path.write_text(f"<!-- {expected} -->\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+        append_active_claim(
+            path,
+            "Spawn will use a **server-readable canonical store**.",
+            expected,
+        )
 
     def canonical_dead_section(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         expected = "Spawn will use an **endpoint-local canonical store per host**"
-        replace_required(path, expected, "Spawn will use a **server-readable canonical store**")
+        add_comment_and_fence_decoys(path, expected)
         text = path.read_text(encoding="utf-8")
         marker = "## Rejected alternatives"
         text = text.replace(marker, f"{marker}\n\n{expected}\n", 1)
-        path.write_text(text, encoding="utf-8")
+        path.write_text(text + "\n\nThe server is the canonical store.\n", encoding="utf-8")
 
     def missing_section(root: Path) -> None:
         replace_required(
@@ -478,10 +620,10 @@ def self_test(source: Path) -> None:
         path.write_text(text, encoding="utf-8")
 
     def unsafe_ack(root: Path) -> None:
-        replace_required(
+        append_active_claim(
             root / "docs/DURABLE_SENSITIVE_DATA.md",
-            "User\nacknowledgement is never retry authority.",
-            "User acknowledgement authorizes retry and releases the effect lock.",
+            "User acknowledgement or dismissal unlocks the effect and permits retry.",
+            "User acknowledgement is never retry authority; dismissal preserves the lock.",
         )
 
     def missing_replay(root: Path) -> None:
@@ -492,10 +634,10 @@ def self_test(source: Path) -> None:
         )
 
     def missing_capacity(root: Path) -> None:
-        replace_required(
+        append_active_claim(
             root / "docs/DURABLE_SENSITIVE_DATA.md",
-            "request 4,097 fails `journal_capacity`",
-            "request 4,097 may evict an old result",
+            "Request 4,097 may evict an old result before 24 hours.",
+            "Request 4,097 fails journal_capacity before effect; settled results remain for 24 hours.",
         )
 
     def missing_anchor(root: Path) -> None:
@@ -506,55 +648,63 @@ def self_test(source: Path) -> None:
         )
 
     def stale_status(root: Path) -> None:
-        replace_required(
+        append_active_claim(
             root / "docs/TRUST_PHASE2.md",
-            "## Current source reality (reviewed master through `4e7c89b`)",
             "## Current source reality (P2-HOST-02 review candidate)",
+            "Current source reality: P2-HOST-02 reviewed and merged at 4e7c89b.",
         )
 
     def runtime_implemented_claim(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        safe = "Status: **proposed for independent review; runtime not implemented**."
-        replace_required(path, safe, "Status: **runtime implemented; endpoint-local store live**.")
-        add_comment_and_fence_decoys(path, safe)
+        append_active_claim(
+            path,
+            "The endpoint-local store is currently implemented in production and Phase 2 is complete.",
+            "Status: proposed for independent review; runtime not implemented; Phase 2 incomplete.",
+        )
 
     def phase2_complete_claim(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        safe = "Phase 2 remains incomplete."
-        add_comment_and_fence_decoys(path, safe)
-        path.write_text(path.read_text(encoding="utf-8") + "\n\nPhase 2 is complete.\n", encoding="utf-8")
+        append_active_claim(
+            path,
+            "The durable protected-data store is live now; Phase 2 has been achieved.",
+            "The durable protected-data store is design-only and Phase 2 remains incomplete.",
+        )
 
     def opaque_fallback_claim(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        safe = "Opaque client-encrypted server blobs are **not selected** for Phase 2."
-        replace_required(
+        append_active_claim(
             path,
-            safe,
-            "Opaque client-encrypted server blobs are an allowed Phase 2 fallback.",
+            "Opaque server blobs are permitted as a Phase 2 fallback. Phase 2 may fall back to opaque client-encrypted server blobs.",
+            "Opaque client-encrypted server blobs are not selected and are forbidden as a Phase 2 fallback.",
         )
-        add_comment_and_fence_decoys(path, safe)
 
     def host02_unmerged_claim(root: Path) -> None:
         path = root / "docs/TRUST_PHASE2.md"
-        safe = "P2-HOST-02 is reviewed and merged at\n  `4e7c89b`"
-        replace_required(path, safe, "P2-HOST-02 is an unmerged review candidate")
-        add_comment_and_fence_decoys(path, "P2-HOST-02 is reviewed and merged at `4e7c89b`")
+        append_active_claim(
+            path,
+            "P2-HOST-02 is awaiting review and remains pending. HOST-02 continues to be an unmerged review candidate.",
+            "P2-HOST-02 is reviewed and merged at 4e7c89b.",
+        )
 
     def unsafe_rotation_retirement(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        safe = "The old master-key epoch may be destroyed only after a final database scan"
-        replace_required(
+        append_active_claim(
             path,
-            safe,
-            "The old master-key epoch may be destroyed after the first new-epoch slot",
+            "The old epoch may be retired after only one slot, before both new-epoch anchor slots are verified.",
+            "The old epoch remains until both new-epoch anchor slots and all wrappers are verified.",
         )
-        add_comment_and_fence_decoys(path, safe)
 
     def missing_data02_dependencies(root: Path) -> None:
         path = root / "docs/TRUST_PHASE2_TASKS.md"
         safe = "P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged)"
         replace_required(path, safe, "P2-DATA-01")
-        add_comment_and_fence_decoys(path, safe)
+
+    def unsafe_data02_early_start(root: Path) -> None:
+        append_active_claim(
+            root / "docs/TRUST_PHASE2_TASKS.md",
+            "P2-DATA-02 may start before P2-TERM-01 and P2-HOST-03A pass independent review.",
+            "P2-DATA-02 remains blocked until reviewed and merged P2-TERM-01 and P2-HOST-03A.",
+        )
 
     def malformed_markdown(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
@@ -565,35 +715,88 @@ def self_test(source: Path) -> None:
 
     mutations.extend(
         (
-            ("HTML-comment canonical decoy", canonical_html),
-            ("dead-section canonical decoy", canonical_dead_section),
-            ("missing section", missing_section),
-            ("duplicate section", duplicate_section),
-            ("unsafe acknowledgement", unsafe_ack),
-            ("missing durable replay head", missing_replay),
-            ("missing capacity rule", missing_capacity),
-            ("missing crash anchor", missing_anchor),
-            ("stale status", stale_status),
-            ("runtime implemented active claim with decoys", runtime_implemented_claim),
-            ("Phase 2 complete active claim with decoys", phase2_complete_claim),
-            ("opaque Phase 2 fallback active claim with decoys", opaque_fallback_claim),
-            ("HOST-02 unmerged active claim with decoys", host02_unmerged_claim),
-            ("unsafe first-slot key retirement with decoys", unsafe_rotation_retirement),
-            ("missing DATA-02 reviewed dependencies with decoys", missing_data02_dependencies),
-            ("malformed Markdown", malformed_markdown),
-            ("missing parser input", unreadable_input),
+            (
+                "active canonical-store contradiction with active safe declaration and HTML/fence decoys",
+                canonical_html,
+                "canonical-store",
+            ),
+            (
+                "active canonical-store paraphrase with active safe and dead-section decoy",
+                canonical_dead_section,
+                "canonical-store",
+            ),
+            ("missing section", missing_section, None),
+            ("duplicate section", duplicate_section, None),
+            ("unsafe acknowledgement with active safe declarations", unsafe_ack, "ack-retry"),
+            ("missing durable replay head", missing_replay, None),
+            (
+                "unsafe capacity eviction with active safe declaration and decoys",
+                missing_capacity,
+                "replay-capacity",
+            ),
+            ("missing crash anchor", missing_anchor, None),
+            (
+                "HOST-02 review-candidate heading with active safe declaration and decoys",
+                stale_status,
+                "host02-status",
+            ),
+            (
+                "runtime implemented active claim with active safe declarations and decoys",
+                runtime_implemented_claim,
+                "runtime-status",
+            ),
+            (
+                "Phase 2 complete paraphrase with active safe declarations and decoys",
+                phase2_complete_claim,
+                "runtime-status",
+            ),
+            (
+                "opaque Phase 2 fallback active claim with active safe declarations and decoys",
+                opaque_fallback_claim,
+                "opaque-fallback",
+            ),
+            (
+                "HOST-02 pending active claim with active safe declarations and decoys",
+                host02_unmerged_claim,
+                "host02-status",
+            ),
+            (
+                "unsafe one-slot key retirement with active safe declarations and decoys",
+                unsafe_rotation_retirement,
+                "rotation-retirement",
+            ),
+            ("missing DATA-02 reviewed dependencies with decoys", missing_data02_dependencies, None),
+            (
+                "DATA-02 early-start active claim with active safe declarations and decoys",
+                unsafe_data02_early_start,
+                "data02-dependencies",
+            ),
+            ("malformed Markdown", malformed_markdown, None),
+            ("missing parser input", unreadable_input, None),
         )
     )
 
     with tempfile.TemporaryDirectory(prefix="spawn-data-guard-") as temp:
         base = Path(temp)
-        for index, (name, mutation) in enumerate(mutations):
+        for index, (name, mutation, expected_category) in enumerate(mutations):
             fixture = base / str(index)
             copy_fixture(source, fixture)
             mutation(fixture)
             try:
                 validate(fixture)
-            except GuardError:
+            except ContradictionError as exc:
+                if expected_category is not None and exc.category != expected_category:
+                    raise GuardError(
+                        f"self-test {name!r} expected contradiction category "
+                        f"{expected_category!r}, got {exc.category!r}"
+                    ) from exc
+                continue
+            except GuardError as exc:
+                if expected_category is not None:
+                    raise GuardError(
+                        f"self-test {name!r} expected contradiction category "
+                        f"{expected_category!r}, but failed for another reason: {exc}"
+                    ) from exc
                 continue
             raise GuardError(f"self-test mutation unexpectedly passed: {name}")
 
