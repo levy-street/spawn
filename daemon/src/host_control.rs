@@ -1,8 +1,8 @@
 //! End-to-end host file protocol carried by `spawn.host.ctl`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -35,9 +35,68 @@ const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WRITE_STREAMS: usize = 8;
 const MAX_STREAM_TOMBSTONES: usize = 4096;
 
+#[derive(Default)]
+struct ArrivalArbiter {
+    next_order: u64,
+    cancel_cutoffs: HashMap<String, (u64, Instant)>,
+}
+
+impl ArrivalArbiter {
+    fn stamp(&mut self, value: &Value) -> Option<u64> {
+        self.prune();
+        let order = self.next_order;
+        self.next_order = self.next_order.checked_add(1)?;
+        if value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            == Some("stream.cancel")
+        {
+            let stream_id = valid_id(value.as_object()?.get("stream_id"))?;
+            if !self.cancel_cutoffs.contains_key(stream_id)
+                && self.cancel_cutoffs.len() >= MAX_STREAM_TOMBSTONES
+            {
+                return None;
+            }
+            self.cancel_cutoffs
+                .entry(stream_id.to_string())
+                .and_modify(|(cutoff, expires_at)| {
+                    *cutoff = (*cutoff).min(order);
+                    *expires_at = tombstone_deadline();
+                })
+                .or_insert_with(|| (order, tombstone_deadline()));
+        }
+        Some(order)
+    }
+
+    fn cutoff(&mut self, stream_id: &str) -> Option<u64> {
+        self.prune();
+        self.cancel_cutoffs
+            .get(stream_id)
+            .map(|(cutoff, _)| *cutoff)
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.cancel_cutoffs
+            .retain(|_, (_, expires_at)| *expires_at > now);
+    }
+}
+
 struct QueuedFrame {
     arrival_order: u64,
     value: Value,
+}
+
+struct ActiveWrite {
+    pending: Mutex<Option<PendingWrite>>,
+    cancelled: CancellationToken,
+}
+
+struct WriteCleanup {
+    stream_id: String,
+    slot: Arc<ActiveWrite>,
+    cancel_order: Option<u64>,
 }
 
 enum CancelledWrite {
@@ -74,7 +133,7 @@ impl CancelledWrite {
 
 #[derive(Default)]
 struct State {
-    writes: HashMap<String, Arc<Mutex<Option<PendingWrite>>>>,
+    writes: HashMap<String, Arc<ActiveWrite>>,
     write_requests: HashMap<String, String>,
     cancelled_writes: HashMap<String, CancelledWrite>,
     finished_write_ids: HashMap<String, Instant>,
@@ -97,11 +156,22 @@ struct Context {
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
+    cleanup_tx: mpsc::Sender<WriteCleanup>,
+    arrivals: Arc<StdMutex<ArrivalArbiter>>,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
 }
 
 impl Context {
+    fn arrived_after_cancel(&self, stream_id: &str, arrival_order: u64) -> bool {
+        match self.arrivals.lock() {
+            Ok(mut arrivals) => arrivals
+                .cutoff(stream_id)
+                .is_some_and(|cutoff| arrival_order > cutoff),
+            Err(_) => true,
+        }
+    }
+
     fn prune_tombstones(state: &mut State) {
         let now = Instant::now();
         state
@@ -439,11 +509,14 @@ impl Context {
         {
             Ok(write) => {
                 let stream_id = write.stream_id.clone();
-                let slot = Arc::new(Mutex::new(Some(write)));
+                let slot = Arc::new(ActiveWrite {
+                    pending: Mutex::new(Some(write)),
+                    cancelled: CancellationToken::new(),
+                });
                 let mut state = self.state.lock().await;
                 if state.cancelled_request_ids.remove(request_id) {
                     drop(state);
-                    if let Some(write) = slot.lock().await.take() {
+                    if let Some(write) = slot.pending.lock().await.take() {
                         write.abort().await;
                     }
                     return self
@@ -452,7 +525,7 @@ impl Context {
                 }
                 if state.writes.len() >= MAX_WRITE_STREAMS {
                     drop(state);
-                    if let Some(write) = slot.lock().await.take() {
+                    if let Some(write) = slot.pending.lock().await.take() {
                         write.abort().await;
                     }
                     return self
@@ -475,61 +548,126 @@ impl Context {
         }
     }
 
-    async fn run_write_reaper(self) {
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => break,
-                _ = tokio::time::sleep(write_reaper_interval()) => {}
-            }
-            let streams = self
-                .state
+    async fn process_write_cleanup(&self, cleanup: WriteCleanup) -> bool {
+        let Some(write) = cleanup.slot.pending.lock().await.take() else {
+            return false;
+        };
+        if let Some(cancel_order) = cleanup.cancel_order {
+            let ready = {
+                let mut state = self.state.lock().await;
+                state.write_requests.remove(&write.request_id);
+                let ready = match state.cancelled_writes.get(&cleanup.stream_id) {
+                    Some(CancelledWrite::Cancelling { ready, .. }) => Arc::clone(ready),
+                    _ => return false,
+                };
+                state.cancelled_writes.insert(
+                    cleanup.stream_id,
+                    CancelledWrite::Ready {
+                        cancel_order,
+                        next_sequence: write.next_sequence,
+                        received: write.received,
+                        expected_length: write.expected_length,
+                        expected_sha256: write.expected_sha256.clone(),
+                        expires_at: tombstone_deadline(),
+                    },
+                );
+                ready
+            };
+            ready.notify_one();
+        } else {
+            self.state
                 .lock()
                 .await
-                .writes
-                .iter()
-                .map(|(stream_id, slot)| (stream_id.clone(), Arc::clone(slot)))
-                .collect::<Vec<_>>();
-            for (stream_id, slot) in streams {
-                let mut write_guard = slot.lock().await;
-                if write_guard
-                    .as_ref()
-                    .is_none_or(|write| write.idle_for() < WRITE_IDLE_TIMEOUT)
-                {
-                    continue;
+                .write_requests
+                .remove(&write.request_id);
+        }
+        write.abort().await;
+        true
+    }
+
+    async fn reap_stale_writes(&self) -> bool {
+        let streams = self
+            .state
+            .lock()
+            .await
+            .writes
+            .iter()
+            .map(|(stream_id, slot)| (stream_id.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        for (stream_id, slot) in streams {
+            let stale = slot
+                .pending
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|write| write.idle_for() >= WRITE_IDLE_TIMEOUT);
+            if !stale {
+                continue;
+            }
+            let removed = {
+                let mut state = self.state.lock().await;
+                let same = state
+                    .writes
+                    .get(&stream_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot));
+                if !same || !Self::remember_finished_write(&mut state, &stream_id) {
+                    None
+                } else {
+                    state.writes.remove(&stream_id)
                 }
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    let same = state
-                        .writes
-                        .get(&stream_id)
-                        .is_some_and(|current| Arc::ptr_eq(current, &slot));
-                    if !same || !Self::remember_finished_write(&mut state, &stream_id) {
-                        None
-                    } else {
-                        state.writes.remove(&stream_id);
-                        write_guard.take()
-                    }
-                };
-                let Some(write) = removed else {
-                    continue;
-                };
-                drop(write_guard);
-                self.state
-                    .lock()
-                    .await
-                    .write_requests
-                    .remove(&write.request_id);
-                write.abort().await;
-                if !self
+            };
+            let Some(slot) = removed else {
+                continue;
+            };
+            slot.cancelled.cancel();
+            if !self
+                .process_write_cleanup(WriteCleanup {
+                    stream_id: stream_id.clone(),
+                    slot,
+                    cancel_order: None,
+                })
+                .await
+                || !self
                     .stream_error(&stream_id, "stream_timeout", "file write timed out")
                     .await
-                {
-                    let _ = self.dc.close().await;
-                    return;
+            {
+                return false;
+            }
+        }
+        let mut state = self.state.lock().await;
+        Self::prune_tombstones(&mut state);
+        if let Ok(mut arrivals) = self.arrivals.lock() {
+            arrivals.prune();
+        } else {
+            return false;
+        }
+        true
+    }
+
+    async fn run_write_reaper(self, mut cleanup_rx: mpsc::Receiver<WriteCleanup>) {
+        loop {
+            tokio::select! {
+                biased;
+                cleanup = cleanup_rx.recv() => {
+                    let Some(cleanup) = cleanup else { break; };
+                    if !self.process_write_cleanup(cleanup).await {
+                        let _ = self.dc.close().await;
+                        break;
+                    }
+                }
+                _ = self.shutdown.cancelled() => {
+                    while let Ok(cleanup) = cleanup_rx.try_recv() {
+                        let _ = self.process_write_cleanup(cleanup).await;
+                    }
+                    break;
+                }
+                _ = tokio::time::sleep(write_reaper_interval()) => {
+                    if !self.reap_stale_writes().await {
+                        let _ = self.dc.close().await;
+                        break;
+                    }
                 }
             }
-            let mut state = self.state.lock().await;
-            Self::prune_tombstones(&mut state);
         }
     }
 
@@ -779,6 +917,9 @@ impl Context {
             Ok(bytes) if !bytes.is_empty() && bytes.len() <= STREAM_CHUNK_BYTES => bytes,
             _ => return false,
         };
+        if self.arrived_after_cancel(stream_id, arrival_order) {
+            return false;
+        }
         if let Some(handled) = self
             .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
             .await
@@ -792,7 +933,22 @@ impl Context {
                 .await
                 .unwrap_or(false);
         };
-        let mut write_guard = slot.lock().await;
+        let mut write_guard = tokio::select! {
+            _ = slot.cancelled.cancelled() => {
+                return self
+                    .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                    .await
+                    .unwrap_or(false);
+            }
+            write_guard = slot.pending.lock() => write_guard,
+        };
+        if slot.cancelled.is_cancelled() {
+            drop(write_guard);
+            return self
+                .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                .await
+                .unwrap_or(false);
+        }
         let Some(active) = write_guard.as_mut() else {
             drop(write_guard);
             return self
@@ -800,7 +956,30 @@ impl Context {
                 .await
                 .unwrap_or(false);
         };
-        if let Err(error) = active.append(sequence, &bytes).await {
+        #[cfg(test)]
+        if let Some(delay_ms) = object.get("test_delay_ms").and_then(Value::as_u64) {
+            tokio::select! {
+                _ = slot.cancelled.cancelled() => {
+                    drop(write_guard);
+                    return self
+                        .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                        .await
+                        .unwrap_or(false);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms.min(1_000))) => {}
+            }
+        }
+        let appended = tokio::select! {
+            _ = slot.cancelled.cancelled() => {
+                drop(write_guard);
+                return self
+                    .handle_late_write_chunk(stream_id, arrival_order, sequence, bytes.len())
+                    .await
+                    .unwrap_or(false);
+            }
+            appended = active.append(sequence, &bytes) => appended,
+        };
+        if let Err(error) = appended {
             let write = write_guard.take().expect("active write exists");
             drop(write_guard);
             let mut state = self.state.lock().await;
@@ -823,6 +1002,9 @@ impl Context {
         let Some(stream_id) = valid_id(object.get("stream_id")) else {
             return false;
         };
+        if self.arrived_after_cancel(stream_id, arrival_order) {
+            return false;
+        }
         let length = object.get("length").and_then(Value::as_u64);
         let sha256 = object.get("sha256").and_then(Value::as_str);
         if let Some(handled) = self
@@ -847,7 +1029,7 @@ impl Context {
                 .await
                 .unwrap_or(false);
         };
-        let write = slot.lock().await.take();
+        let write = slot.pending.lock().await.take();
         let Some(write) = write else {
             return false;
         };
@@ -941,33 +1123,15 @@ impl Context {
             (write, read, known)
         };
         if let Some(slot) = write {
-            let write = slot.lock().await.take();
-            let Some(write) = write else {
-                return false;
-            };
-            let ready = {
-                let mut state = self.state.lock().await;
-                state.write_requests.remove(&write.request_id);
-                let ready = match state.cancelled_writes.get(stream_id) {
-                    Some(CancelledWrite::Cancelling { ready, .. }) => Arc::clone(ready),
-                    _ => return false,
-                };
-                state.cancelled_writes.insert(
-                    stream_id.to_string(),
-                    CancelledWrite::Ready {
-                        cancel_order: arrival_order,
-                        next_sequence: write.next_sequence,
-                        received: write.received,
-                        expected_length: write.expected_length,
-                        expected_sha256: write.expected_sha256.clone(),
-                        expires_at: tombstone_deadline(),
-                    },
-                );
-                ready
-            };
-            ready.notify_one();
-            write.abort().await;
-            return true;
+            slot.cancelled.cancel();
+            return self
+                .cleanup_tx
+                .try_send(WriteCleanup {
+                    stream_id: stream_id.to_string(),
+                    slot,
+                    cancel_order: Some(arrival_order),
+                })
+                .is_ok();
         }
         if let Some(read) = read {
             return read.try_send(ReadSignal::Cancel).is_ok();
@@ -998,8 +1162,17 @@ impl Context {
             read.store(true, Ordering::Release);
         }
         if let Some(write) = write {
-            if let Some(write) = write.lock().await.take() {
-                write.abort().await;
+            write.cancelled.cancel();
+            if self
+                .cleanup_tx
+                .try_send(WriteCleanup {
+                    stream_id: String::new(),
+                    slot: write,
+                    cancel_order: None,
+                })
+                .is_err()
+            {
+                return false;
             }
         }
         true
@@ -1029,8 +1202,11 @@ impl Context {
         for read in reads {
             let _ = read.try_send(ReadSignal::Cancel);
         }
+        for write in &writes {
+            write.cancelled.cancel();
+        }
         for write in writes {
-            if let Some(write) = write.lock().await.take() {
+            if let Some(write) = write.pending.lock().await.take() {
                 write.abort().await;
             }
         }
@@ -1085,7 +1261,7 @@ pub(crate) fn install(
     let context_slot = Arc::new(Mutex::new(None::<Context>));
     let shutdown = CancellationToken::new();
     let context_shutdown = shutdown.child_token();
-    let arrival_order = Arc::new(AtomicU64::new(0));
+    let arrivals = Arc::new(StdMutex::new(ArrivalArbiter::default()));
     let (normal_tx, mut normal_rx) = mpsc::channel::<QueuedFrame>(MAX_NORMAL_QUEUE);
     let (fast_tx, mut fast_rx) = mpsc::channel::<QueuedFrame>(MAX_FAST_QUEUE);
 
@@ -1128,6 +1304,15 @@ pub(crate) fn install(
                 let _ = fast_dc.close().await;
                 break;
             };
+            #[cfg(test)]
+            if let Some(delay_ms) = value
+                .value
+                .as_object()
+                .and_then(|object| object.get("test_delay_ms"))
+                .and_then(Value::as_u64)
+            {
+                tokio::time::sleep(Duration::from_millis(delay_ms.min(1_000))).await;
+            }
             if !context.handle_fast(value).await {
                 let _ = fast_dc.close().await;
                 break;
@@ -1135,11 +1320,12 @@ pub(crate) fn install(
         }
     });
 
+    let message_arrivals = Arc::clone(&arrivals);
     dc.on_message(Box::new(move |message: DataChannelMessage| {
         let dc = Arc::clone(&message_dc);
         let normal_tx = normal_tx.clone();
         let fast_tx = fast_tx.clone();
-        let arrival_order = Arc::clone(&arrival_order);
+        let arrivals = Arc::clone(&message_arrivals);
         Box::pin(async move {
             if !message.is_string || message.data.is_empty() || message.data.len() > MAX_FRAME_BYTES
             {
@@ -1156,10 +1342,10 @@ pub(crate) fn install(
                     Some("stream.ack" | "stream.cancel" | "cancel")
                 )
             });
-            let Ok(order) =
-                arrival_order.fetch_update(Ordering::AcqRel, Ordering::Acquire, |order| {
-                    order.checked_add(1)
-                })
+            let Some(order) = arrivals
+                .lock()
+                .ok()
+                .and_then(|mut arrivals| arrivals.stamp(&value))
             else {
                 close_later(dc);
                 return;
@@ -1182,6 +1368,7 @@ pub(crate) fn install(
     let open_dc = Arc::clone(&dc);
     let open_context = Arc::clone(&context_slot);
     let open_shutdown = context_shutdown;
+    let open_arrivals = Arc::clone(&arrivals);
     dc.on_open(Box::new(move || {
         let dc = Arc::clone(&open_dc);
         let context_slot = Arc::clone(&open_context);
@@ -1190,6 +1377,7 @@ pub(crate) fn install(
         let binding = binding.clone();
         let files = files_override.clone();
         let shutdown = open_shutdown.clone();
+        let arrivals = Arc::clone(&open_arrivals);
         Box::pin(async move {
             let files = match files {
                 Some(files) => files,
@@ -1201,12 +1389,15 @@ pub(crate) fn install(
                     }
                 },
             };
+            let (cleanup_tx, cleanup_rx) = mpsc::channel(MAX_WRITE_STREAMS);
             let context = Context {
                 dc: Arc::clone(&dc),
                 files,
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),
+                cleanup_tx,
+                arrivals,
                 closed: Arc::new(AtomicBool::new(false)),
                 shutdown,
             };
@@ -1214,7 +1405,7 @@ pub(crate) fn install(
                 .background_tasks
                 .lock()
                 .await
-                .spawn(context.clone().run_write_reaper());
+                .spawn(context.clone().run_write_reaper(cleanup_rx));
             *context_slot.lock().await = Some(context);
             let hello = json!({
                 "version": VERSION,

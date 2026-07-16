@@ -351,12 +351,14 @@ export class HostControlClient {
       sha256: string;
     }>("fs.read", { path }, options);
     const { stream_id: streamId, length, sha256 } = declaration;
+    this.pruneIncomingTombstones();
     if (
       typeof streamId !== "string" ||
       !Number.isSafeInteger(length) ||
       length < 0 ||
       !/^[0-9a-f]{64}$/.test(sha256) ||
-      this.incomingStreams.has(streamId)
+      this.incomingStreams.has(streamId) ||
+      this.cancelledIncomingStreams.has(streamId)
     ) {
       this.failRtc();
       throw new HostControlError("invalid_response", "Host returned an invalid read stream");

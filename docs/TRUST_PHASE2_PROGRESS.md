@@ -116,6 +116,22 @@ session reaper that drains at close. Paired-channel backlog/reuse and rapid
 write-churn shutdown regressions cover these corrections; independent review
 is still required before merge.
 
+The following re-review found that stamping alone was insufficient: the fast
+consumer still published the write-cancel cutoff too late, cancellation could
+wait on an active file-write lock and its disk cleanup, and the browser could
+accept a new read declaration that reused a cancelled stream ID. The current
+candidate synchronously assigns each arrival ordinal and publishes stream
+cancel cutoffs in one short per-session arbiter critical section before queue
+routing. Any later write chunk/end fails closed even while the fast consumer is
+backlogged. Active writes have cancellation tokens; fast cancel removes and
+tombstones the stream, signals its token, and enqueues bounded cleanup without
+waiting for file I/O. One tracked session maintenance task owns cleanup and
+idle reaping, and cancelled temporary files are dropped and unlinked without a
+pointless flush. Browser read declarations now reject both active and
+tombstoned IDs. Forced fast-delay cancel-then-chunk/end, stalled-write
+ACK/cancel survival, prompt cleanup, and browser declaration-replay regressions
+cover these findings. Independent review is still required before merge.
+
 P2-AGENT-01 and P2-TMUX-01 subsequently passed independent review and were
 integrated on `master` through `1f66d2d`; the P2-HOST-02 candidate includes
 that worker-only checkpoint and must retain its guard through re-review.

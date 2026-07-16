@@ -2084,6 +2084,18 @@ mod tests {
         (browser_pc, daemon_pc, channel, messages_rx)
     }
 
+    async fn wait_for_host_channel_close(channel: &RTCDataChannel) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while channel.ready_state()
+                != webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host control channel did not fail closed");
+    }
+
     fn insert_test_worker(
         registry: &AgentRegistry,
         agent_id: Uuid,
@@ -3579,6 +3591,283 @@ mod tests {
         source_daemon.close().await.unwrap();
         destination_browser.close().await.unwrap();
         destination_daemon.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn published_write_cancel_wins_while_the_fast_consumer_is_delayed() {
+        for terminal in ["chunk", "end"] {
+            let root = tempfile::tempdir().unwrap();
+            tokio::fs::write(root.path().join("empty.bin"), [])
+                .await
+                .unwrap();
+            let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let binding = HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "c".repeat(32),
+                protocol: HOST_CONTROL_LABEL.to_string(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            };
+            let (browser_pc, daemon_pc, channel, mut messages) =
+                paired_host_endpoint(files, binding, &format!("cancel-race-{terminal}")).await;
+
+            let read = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("finished-read-{terminal}"),
+                "fs.read",
+                json!({"path": "empty.bin"}),
+            )
+            .await;
+            let finished_read_id = read["result"]["stream_id"].as_str().unwrap();
+            let (_, read_end) = receive_host_control(&mut messages).await;
+            assert_eq!(read_end["type"], "stream.end");
+
+            let (name, length, sha256) = if terminal == "chunk" {
+                (
+                    "late-chunk.bin",
+                    1,
+                    "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                )
+            } else {
+                (
+                    "late-end.bin",
+                    0,
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+            };
+            let write = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("cancelled-write-{terminal}"),
+                "fs.write.begin",
+                json!({
+                    "dir": "~",
+                    "name": name,
+                    "length": length,
+                    "sha256": sha256,
+                    "overwrite": false,
+                }),
+            )
+            .await;
+            let stream_id = write["result"]["stream_id"].as_str().unwrap();
+
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.ack",
+                        "stream_id": finished_read_id,
+                        "sequence": 0,
+                        "test_delay_ms": 250,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            channel
+                .send_text(
+                    json!({
+                        "version": RTC_PROTOCOL_VERSION,
+                        "type": "stream.cancel",
+                        "stream_id": stream_id,
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let terminal_frame = if terminal == "chunk" {
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": stream_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"x"),
+                })
+            } else {
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.end",
+                    "stream_id": stream_id,
+                    "length": 0,
+                    "sha256": sha256,
+                })
+            };
+            channel.send_text(terminal_frame.to_string()).await.unwrap();
+
+            wait_for_host_channel_close(&channel).await;
+            assert!(!root.path().join(name).exists());
+            assert_eq!(
+                std::fs::read_dir(root.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".spawn-upload-"))
+                    .count(),
+                0,
+                "cancelled write temporary was not removed",
+            );
+            browser_pc.close().await.unwrap();
+            daemon_pc.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_write_cancel_does_not_block_read_ack_or_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let source_bytes = vec![b'r'; STREAM_CHUNK_BYTES * 9];
+        tokio::fs::write(root.path().join("ack.bin"), &source_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("cancel.bin"), &source_bytes)
+            .await
+            .unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "d".repeat(32),
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, binding, "stalled-write-control-paths").await;
+
+        let ack_read = request_host_control(
+            &channel,
+            &mut messages,
+            "concurrent-ack-read",
+            "fs.read",
+            json!({"path": "ack.bin"}),
+        )
+        .await;
+        let ack_stream_id = ack_read["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages).await;
+            assert_eq!(chunk["stream_id"], ack_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+
+        let cancel_read = request_host_control(
+            &channel,
+            &mut messages,
+            "concurrent-cancel-read",
+            "fs.read",
+            json!({"path": "cancel.bin"}),
+        )
+        .await;
+        let cancel_stream_id = cancel_read["result"]["stream_id"].as_str().unwrap();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages).await;
+            assert_eq!(chunk["stream_id"], cancel_stream_id);
+            assert_eq!(chunk["sequence"], sequence);
+        }
+
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "stalled-write.bin",
+                "length": 1,
+                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let write_stream_id = write["result"]["stream_id"].as_str().unwrap();
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "stream.chunk",
+                    "stream_id": write_stream_id,
+                    "sequence": 0,
+                    "bytes_b64": STANDARD.encode(b"x"),
+                    "test_delay_ms": 1_000,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for frame in [
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.cancel",
+                "stream_id": write_stream_id,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.ack",
+                "stream_id": ack_stream_id,
+                "sequence": 8,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.cancel",
+                "stream_id": cancel_stream_id,
+            }),
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "request",
+                "request_id": "after-stalled-write-cancel",
+                "operation": "ping",
+                "payload": {},
+            }),
+        ] {
+            channel.send_text(frame.to_string()).await.unwrap();
+        }
+
+        let mut saw_final_ack_chunk = false;
+        let mut saw_ack_end = false;
+        let mut saw_ping = false;
+        tokio::time::timeout(Duration::from_millis(750), async {
+            while !(saw_final_ack_chunk && saw_ack_end && saw_ping) {
+                let (_, message) = receive_host_control(&mut messages).await;
+                if message["request_id"] == "after-stalled-write-cancel" {
+                    assert_eq!(message["result"]["pong"], true);
+                    saw_ping = true;
+                } else if message["stream_id"] == ack_stream_id && message["type"] == "stream.chunk"
+                {
+                    assert_eq!(message["sequence"], 8);
+                    saw_final_ack_chunk = true;
+                } else if message["stream_id"] == ack_stream_id && message["type"] == "stream.end" {
+                    saw_ack_end = true;
+                } else {
+                    panic!("unexpected host-control message: {message}");
+                }
+            }
+        })
+        .await
+        .expect("write cancellation blocked an unrelated fast control path");
+        assert_eq!(
+            channel.ready_state(),
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        );
+        tokio::time::timeout(Duration::from_millis(750), async {
+            while std::fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".spawn-upload-")
+                })
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled write cleanup did not drain promptly");
+        assert!(!root.path().join("stalled-write.bin").exists());
+
+        browser_pc.close().await.unwrap();
+        daemon_pc.close().await.unwrap();
     }
 
     #[tokio::test]

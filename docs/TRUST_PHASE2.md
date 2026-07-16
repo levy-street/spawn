@@ -209,9 +209,13 @@ is restricted to stable content-free values.
   destination overwrite semantics. Filesystem calls are capability-rooted and
   no-follow for every component, no-clobber commits use a single atomic rename,
   directory pages have daemon and browser retention ceilings, and ACK/cancel
-  dispatch cannot wait behind a long sender. Arrival-ordered, bounded expiring
-  cancellation tombstones drain only frames that preceded a fast cancel, and a
-  single tracked session reaper replaces per-write cleanup sleepers. The first source/destination
+  dispatch cannot wait behind a long sender or file write. A short per-session
+  arrival arbiter assigns ordinals and publishes bounded, expiring cancel
+  cutoffs before fast/normal queue routing: only frames that preceded a cancel
+  may drain, while every later chunk/end fails closed even if the fast consumer
+  is delayed. Fast write cancellation signals the active I/O token and hands
+  disk cleanup to the single tracked session maintenance task. Cancelled read
+  IDs remain tombstoned and cannot be redeclared. The first source/destination
   timeout, error, cancellation, or peer loss aborts and cleans up both streams.
 - Add a parallel E2E request/response path for interactive tool checks/installs,
   including commands, paths, installed/latest versions, stdout/stderr, and

@@ -767,6 +767,63 @@ describe("HostControlClient", () => {
     client.close();
   });
 
+  test("rejects a read declaration that reuses a cancelled stream id", async () => {
+    const { client, pc } = await readyClient();
+    const sha256 = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    const firstOpening = client.readFile("/private/first.txt");
+    const firstRequest = JSON.parse(pc.channel.sent.at(-1));
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: firstRequest.request_id,
+        ok: true,
+        result: {
+          stream_id: "reused-read",
+          path: "/private/first.txt",
+          name: "first.txt",
+          length: 1,
+          sha256,
+        },
+      }),
+    );
+    const first = await firstOpening;
+    await first.stream.cancel("caller stopped reading");
+
+    const replayedOpening = client.readFile("/private/second.txt");
+    const replayedRequest = JSON.parse(pc.channel.sent.at(-1));
+    const oldSessionHandler = pc.channel.onmessage;
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: replayedRequest.request_id,
+        ok: true,
+        result: {
+          stream_id: "reused-read",
+          path: "/private/second.txt",
+          name: "second.txt",
+          length: 1,
+          sha256,
+        },
+      }),
+    );
+
+    await expect(replayedOpening).rejects.toMatchObject({ code: "invalid_response" });
+    expect(pc.channel.closed).toBe(true);
+    oldSessionHandler?.({
+      data: JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "reused-read",
+        sequence: 0,
+        bytes_b64: btoa("x"),
+      }),
+    });
+    expect(framesOf(pc.channel, "stream.ack")).toHaveLength(0);
+    client.close();
+  });
+
   test("declares and commits a chunked verified write", async () => {
     const { client, pc } = await readyClient();
     const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";

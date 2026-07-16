@@ -684,10 +684,9 @@ impl PendingWrite {
         let PendingWrite {
             parent,
             temporary_name,
-            mut file,
+            file,
             ..
         } = self;
-        let _ = file.flush().await;
         drop(file);
         let _ = parent.remove_file(&temporary_name);
     }
