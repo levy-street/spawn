@@ -17,10 +17,10 @@ class GuardError(RuntimeError):
 
 
 class ContradictionError(GuardError):
-    def __init__(self, category: str, path: Path, pattern: str) -> None:
+    def __init__(self, category: str, path: Path, detail: str) -> None:
         self.category = category
         super().__init__(
-            f"{path} contains contradictory active prose in category {category!r}: {pattern}"
+            f"{path} contains unapproved active prose in category {category!r}: {detail}"
         )
 
 
@@ -31,6 +31,12 @@ class Section:
     start: int
     end: int
     body: str
+
+
+@dataclass(frozen=True)
+class ControlledSentencePolicy:
+    category: str
+    controlled_terms: str
 
 
 REQUIRED_H2 = (
@@ -59,38 +65,43 @@ REQUIRED_DOCS = (
     "proto/README.md",
 )
 
-RUNTIME_STATUS_CONTRADICTIONS = (
-    r"(?:endpoint-local|durable protected-data|private)(?: runtime)? store (?:is|has been|is now|is currently|already is) (?:currently )?(?:implemented|deployed|live|running|in production|production-ready)",
-    r"\bruntime (?:is |has been |now |is currently )?implemented\b",
-    r"(?:P2-)?DATA-02 (?:is|has been|is now|is currently) (?:implemented|done|complete|completed|merged|in production)",
-    r"Phase\s*2 (?:is|has been|is now|now is|is considered) (?:complete|completed|done|achieved|live|in production)(?! when\b)",
-)
+CONTROLLED_ALLOWLIST = "docs/DURABLE_DATA_CONTROLLED_SENTENCES.txt"
 
-OPAQUE_FALLBACK_CONTRADICTIONS = (
-    r"opaque (?:client-encrypted )?server blobs? (?:are|remain) (?:an? )?(?:allowed|permitted|approved|supported) (?:as )?(?:an? )?(?:Phase\s*2 )?fallback",
-    r"opaque (?:client-encrypted )?server blobs? may be (?:used|stored|allowed|permitted).{0,60}(?:Phase\s*2|fallback)",
-    r"Phase\s*2 (?:may|can|does) (?:use|permit|allow|fall back to|store) opaque.{0,50}server blobs?",
-    r"server ciphertext (?:is|may be|remains) (?:an? )?(?:allowed |permitted )?(?:Phase\s*2 )?fallback",
-)
-
-HOST02_STATUS_CONTRADICTIONS = (
-    r"(?:P2-)?HOST-02 (?:review candidate|(?:is|remains|is still|continues to be) (?:an? )?(?:awaiting|pending|undergoing|waiting for|review-pending|unmerged|not merged|review candidate)(?: (?:independent )?(?:review|merge))?)",
-)
-
-ACK_RETRY_CONTRADICTIONS = (
-    r"(?:user )?(?:acknowledgement|acknowledgment|ack|dismissal)(?: or (?:user )?(?:acknowledgement|acknowledgment|ack|dismissal))? (?:may |can )?(?:unlock|clear|release|remove)(?:s)? (?:the )?(?:effect|retry|lock|block|reconciliation lock)",
-    r"(?:user )?(?:acknowledgement|acknowledgment|ack|dismissal) (?:may |can |directly )?(?:authorize|authorizes|permit|permits|allow|allows|enable|enables) (?:a )?retry",
-    r"user may (?:acknowledge|dismiss).{0,40}(?:and|to) retry",
-)
-
-ROTATION_RETIREMENT_CONTRADICTIONS = (
-    r"old (?:master-key |master key )?epoch (?:may|can|is allowed to) (?:be )?(?:retired|destroyed|deleted).{0,80}(?:after (?:only )?(?:one|the first|a single).{0,30}slot|before both)",
-    r"(?:retire|destroy|delete)(?:s|d)? the old (?:master-key |master key )?epoch.{0,80}(?:after (?:only )?(?:one|the first|a single).{0,30}slot|before both)",
-)
-
-DATA02_DEPENDENCY_CONTRADICTIONS = (
-    r"(?:P2-)?DATA-02 (?:may|can|is allowed to) (?:start|begin|proceed|be scheduled).{0,100}before.{0,120}(?:TERM-01|HOST-03A).{0,100}(?:review|merge)",
-    r"(?:P2-)?DATA-02.{0,40}(?:does not require|without waiting for).{0,100}(?:TERM-01|HOST-03A).{0,80}(?:review|merge)",
+# These expressions select any sentence that names a guarded subject or effect.
+# Safety is decided by exact normalized allowlist membership, never by trying to
+# enumerate unsafe statuses, claims, or their paraphrases.
+CONTROLLED_SENTENCE_POLICIES = (
+    ControlledSentencePolicy(
+        "runtime-status",
+        r"\b(?:runtime|endpoint-local (?:canonical )?store|durable protected(?:-data)? "
+        r"(?:state|store)|private persistence layer)\b|"
+        r"\b(?:p2-)?data-02\b.{0,80}\b(?:implemented|implementation|production|shipped|live)\b|"
+        r"\b(?:implemented|implementation|production|shipped|live)\b.{0,80}\b(?:p2-)?data-02\b",
+    ),
+    ControlledSentencePolicy(
+        "opaque-fallback",
+        r"\b(?:opaque|server ciphertext|offline encrypted)\b",
+    ),
+    ControlledSentencePolicy(
+        "phase2-status",
+        r"\bphase\s*-?\s*2\b",
+    ),
+    ControlledSentencePolicy(
+        "host02-status",
+        r"\b(?:p2-)?host-02\b",
+    ),
+    ControlledSentencePolicy(
+        "ack-retry",
+        r"\b(?:acknowledg\w*|dismiss\w*)\b",
+    ),
+    ControlledSentencePolicy(
+        "rotation-retirement",
+        r"\b(?:old (?:master[- ]key(?: epoch)?|epoch|key)|previous key)\b",
+    ),
+    ControlledSentencePolicy(
+        "data02-dependencies",
+        r"\b(?:p2-)?data-02\b",
+    ),
 )
 
 
@@ -150,6 +161,110 @@ def normalized(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def controlled_sentences(text: str) -> tuple[str, ...]:
+    """Return active Markdown headings, table rows, and prose sentences."""
+    sentences: list[str] = []
+    block: list[str] = []
+
+    def clean_structural_prefix(line: str) -> str:
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^\s*(?:[-+*]|\d+[.)])\s+", "", line)
+        return line.strip()
+
+    def flush_block() -> None:
+        if not block:
+            return
+        paragraph = " ".join(block)
+        block.clear()
+        sentences.extend(
+            candidate.strip()
+            for candidate in re.split(r"(?<=[.!?])\s+(?=(?:[A-Z0-9`*\[]|$))", paragraph)
+            if candidate.strip()
+        )
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_block()
+            continue
+        if line.startswith("#"):
+            flush_block()
+            sentences.append(clean_structural_prefix(line))
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            flush_block()
+            sentences.append(line)
+            continue
+        if re.match(r"^\s*(?:[-+*]|\d+[.)])\s+", raw_line):
+            flush_block()
+            block.append(clean_structural_prefix(raw_line))
+            continue
+        block.append(line)
+    flush_block()
+    return tuple(sentences)
+
+
+def normalize_controlled_sentence(sentence: str) -> str:
+    sentence = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", sentence)
+    sentence = sentence.replace("**", "").replace("__", "").replace("`", "")
+    return normalized(sentence).lower()
+
+
+def load_controlled_allowlist(root: Path) -> dict[str, frozenset[str]]:
+    path = root / CONTROLLED_ALLOWLIST
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise GuardError(f"cannot read {path}: {exc}") from exc
+
+    known_categories = {policy.category for policy in CONTROLLED_SENTENCE_POLICIES}
+    allowlist: dict[str, frozenset[str]] = {}
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        category_text, separator, sentence = line.partition(" => ")
+        if not separator or not category_text or not sentence:
+            raise GuardError(f"{path}:{line_number} has malformed controlled sentence")
+        categories = frozenset(category_text.split(","))
+        unknown = categories - known_categories
+        if unknown:
+            raise GuardError(f"{path}:{line_number} has unknown categories: {sorted(unknown)}")
+        if sentence != normalize_controlled_sentence(sentence):
+            raise GuardError(f"{path}:{line_number} controlled sentence is not already normalized")
+        if sentence in allowlist:
+            raise GuardError(
+                f"{path}:{line_number} duplicates controlled sentence from an earlier line"
+            )
+        allowlist[sentence] = categories
+    if not allowlist:
+        raise GuardError(f"{path} has no controlled sentences")
+    return allowlist
+
+
+def enforce_controlled_sentences(
+    text: str,
+    path: Path,
+    allowlist: dict[str, frozenset[str]],
+) -> dict[str, set[str]]:
+    observed: dict[str, set[str]] = {}
+    for sentence in controlled_sentences(text):
+        candidate = normalize_controlled_sentence(sentence)
+        approved_categories = allowlist.get(candidate, frozenset())
+        for policy in CONTROLLED_SENTENCE_POLICIES:
+            if not re.search(policy.controlled_terms, candidate, flags=re.IGNORECASE):
+                continue
+            if policy.category not in approved_categories:
+                raise ContradictionError(policy.category, path, candidate)
+            observed.setdefault(candidate, set()).add(policy.category)
+    return observed
+
+
+def merge_observed_sentences(target: dict[str, set[str]], source: dict[str, set[str]]) -> None:
+    for sentence, categories in source.items():
+        target.setdefault(sentence, set()).update(categories)
+
+
 def unique_section(parsed: list[Section], level: int, title: str, path: Path) -> Section:
     found = [section for section in parsed if section.level == level and section.title == title]
     if len(found) != 1:
@@ -195,6 +310,8 @@ def declaration_map(section: Section, path: Path) -> dict[str, str]:
 
 
 def validate(root: Path) -> None:
+    controlled_allowlist = load_controlled_allowlist(root)
+    controlled_observed: dict[str, set[str]] = {}
     adr = root / "docs/DURABLE_SENSITIVE_DATA.md"
     text, parsed = sections(adr)
     for title in REQUIRED_H2:
@@ -230,6 +347,8 @@ def validate(root: Path) -> None:
         "p2_data_02_required_reviewed_merged_dependencies": (
             "P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A"
         ),
+        "guarded_active_prose_policy": "exact_normalized_sentence_allowlist",
+        "guarded_active_prose_inventory": "exact_no_unused_entries",
     }
     declarations = declaration_map(decision, adr)
     if declarations != expected_declarations:
@@ -266,7 +385,7 @@ def validate(root: Path) -> None:
         "`fdatasync`s the file",
         "atomically renames it",
         "fsyncs the containing directory",
-        "A generic successful \"set secret\" return is not assumed power-loss atomic.",
+        'A generic successful "set secret" return is not assumed power-loss atomic.',
         "short writes, disk-full, torn records, rename/fsync failure",
     )
 
@@ -345,13 +464,6 @@ def validate(root: Path) -> None:
         "disk-full, crash, rename/fsync failure, or failed read-back at every wrapper",
         "P2-PURGE-01 still inventories and destroys the historical server database",
     )
-    forbid_patterns(
-        rotation.body,
-        adr,
-        ROTATION_RETIREMENT_CONTRADICTIONS,
-        category="rotation-retirement",
-    )
-
     compatibility = unique_section(parsed, 2, "Compatibility failure behavior", adr)
     require(
         compatibility,
@@ -385,10 +497,14 @@ def validate(root: Path) -> None:
         "must name the exact reviewed TERM-01/HOST-03A protocol commits",
     )
 
-    active_without_rejected = preamble + "\n" + "\n".join(
-        section.body
-        for section in parsed
-        if section.level == 2 and section.title != "Rejected alternatives"
+    active_without_rejected = (
+        preamble
+        + "\n"
+        + "\n".join(
+            section.body
+            for section in parsed
+            if section.level == 2 and section.title != "Rejected alternatives"
+        )
     )
     forbid_patterns(
         active_without_rejected,
@@ -411,41 +527,9 @@ def validate(root: Path) -> None:
         ),
         category="replay-capacity",
     )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        RUNTIME_STATUS_CONTRADICTIONS,
-        category="runtime-status",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        OPAQUE_FALLBACK_CONTRADICTIONS,
-        category="opaque-fallback",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        HOST02_STATUS_CONTRADICTIONS,
-        category="host02-status",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        ACK_RETRY_CONTRADICTIONS,
-        category="ack-retry",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        ROTATION_RETIREMENT_CONTRADICTIONS,
-        category="rotation-retirement",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        DATA02_DEPENDENCY_CONTRADICTIONS,
-        category="data02-dependencies",
+    merge_observed_sentences(
+        controlled_observed,
+        enforce_controlled_sentences(active_without_rejected, adr, controlled_allowlist),
     )
 
     for relative in REQUIRED_DOCS:
@@ -463,27 +547,24 @@ def validate(root: Path) -> None:
             ),
             category="canonical-store",
         )
-        forbid_patterns(
-            doc_text, doc, RUNTIME_STATUS_CONTRADICTIONS, category="runtime-status"
+        merge_observed_sentences(
+            controlled_observed,
+            enforce_controlled_sentences(doc_text, doc, controlled_allowlist),
         )
-        forbid_patterns(
-            doc_text, doc, OPAQUE_FALLBACK_CONTRADICTIONS, category="opaque-fallback"
+
+    observed_allowlist = {
+        sentence: frozenset(categories) for sentence, categories in controlled_observed.items()
+    }
+    if observed_allowlist != controlled_allowlist:
+        unused = sorted(set(controlled_allowlist) - set(observed_allowlist))
+        category_drift = sorted(
+            sentence
+            for sentence in set(controlled_allowlist) & set(observed_allowlist)
+            if controlled_allowlist[sentence] != observed_allowlist[sentence]
         )
-        forbid_patterns(
-            doc_text, doc, HOST02_STATUS_CONTRADICTIONS, category="host02-status"
-        )
-        forbid_patterns(doc_text, doc, ACK_RETRY_CONTRADICTIONS, category="ack-retry")
-        forbid_patterns(
-            doc_text,
-            doc,
-            ROTATION_RETIREMENT_CONTRADICTIONS,
-            category="rotation-retirement",
-        )
-        forbid_patterns(
-            doc_text,
-            doc,
-            DATA02_DEPENDENCY_CONTRADICTIONS,
-            category="data02-dependencies",
+        raise GuardError(
+            f"{root / CONTROLLED_ALLOWLIST} is not the exact active-sentence inventory; "
+            f"unused={unused[:3]}, category_drift={category_drift[:3]}"
         )
 
     trust_text = active_markdown(root / "docs/TRUST.md")
@@ -495,13 +576,6 @@ def validate(root: Path) -> None:
         "current source has no server-visible host filesystem route/frame",
         "P2-TERM-01 and P2-HOST-03A correction candidates are implemented but independently review-pending, not merged behavior",
     )
-    forbid_patterns(
-        trust_text,
-        root / "docs/TRUST.md",
-        (r"P2-HOST-02 review candidate", r"P2-HOST-02.{0,80}review/merge pending"),
-        category="host02-status",
-    )
-
     phase2_path = root / "docs/TRUST_PHASE2.md"
     phase2_text, phase2_sections = sections(phase2_path)
     unique_section(
@@ -520,17 +594,6 @@ def validate(root: Path) -> None:
         "P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged",
         "name the exact reviewed TERM-01 upload and HOST-03A tool protocol/effect-boundary commits",
     )
-    forbid_patterns(
-        phase2_text,
-        phase2_path,
-        (
-            r"Current source reality \(P2-HOST-02 review candidate\)",
-            r"filesystem portion is \*\*IMPLEMENTED, REVIEW PENDING\*\* in P2-HOST-02",
-            r"interactive tool portion remains planned separately as P2-HOST-03A",
-        ),
-        category="host02-status",
-    )
-
     tasks = active_markdown(root / "docs/TRUST_PHASE2_TASKS.md")
     require(
         tasks,
@@ -561,7 +624,11 @@ def validate(root: Path) -> None:
 
 
 def copy_fixture(source: Path, target: Path) -> None:
-    for relative in ("docs/DURABLE_SENSITIVE_DATA.md", *REQUIRED_DOCS):
+    for relative in (
+        "docs/DURABLE_SENSITIVE_DATA.md",
+        *REQUIRED_DOCS,
+        CONTROLLED_ALLOWLIST,
+    ):
         source_file = source / relative
         target_file = target / relative
         target_file.parent.mkdir(parents=True, exist_ok=True)
@@ -578,6 +645,7 @@ def replace_required(path: Path, old: str, new: str) -> None:
 def self_test(source: Path) -> None:
     validate(source)
     mutations: list[tuple[str, Callable[[Path], None], str | None]] = []
+    positive_mutations: list[tuple[str, Callable[[Path], None]]] = []
 
     def add_comment_and_fence_decoys(path: Path, safe: str) -> None:
         text = path.read_text(encoding="utf-8")
@@ -587,6 +655,12 @@ def self_test(source: Path) -> None:
     def append_active_claim(path: Path, claim: str, safe_decoy: str) -> None:
         add_comment_and_fence_decoys(path, safe_decoy)
         path.write_text(path.read_text(encoding="utf-8") + f"\n\n{claim}\n", encoding="utf-8")
+
+    def claim_fixture(relative: str, claim: str, safe_decoy: str) -> Callable[[Path], None]:
+        def mutate(root: Path) -> None:
+            append_active_claim(root / relative, claim, safe_decoy)
+
+        return mutate
 
     def canonical_html(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
@@ -616,15 +690,10 @@ def self_test(source: Path) -> None:
     def duplicate_section(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         text = path.read_text(encoding="utf-8")
-        text = text.replace("## Rejected alternatives", "## Decision\n\ndecoy\n\n## Rejected alternatives", 1)
-        path.write_text(text, encoding="utf-8")
-
-    def unsafe_ack(root: Path) -> None:
-        append_active_claim(
-            root / "docs/DURABLE_SENSITIVE_DATA.md",
-            "User acknowledgement or dismissal unlocks the effect and permits retry.",
-            "User acknowledgement is never retry authority; dismissal preserves the lock.",
+        text = text.replace(
+            "## Rejected alternatives", "## Decision\n\ndecoy\n\n## Rejected alternatives", 1
         )
+        path.write_text(text, encoding="utf-8")
 
     def missing_replay(root: Path) -> None:
         replace_required(
@@ -647,64 +716,10 @@ def self_test(source: Path) -> None:
             "### Best-effort anchor storage",
         )
 
-    def stale_status(root: Path) -> None:
-        append_active_claim(
-            root / "docs/TRUST_PHASE2.md",
-            "## Current source reality (P2-HOST-02 review candidate)",
-            "Current source reality: P2-HOST-02 reviewed and merged at 4e7c89b.",
-        )
-
-    def runtime_implemented_claim(root: Path) -> None:
-        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        append_active_claim(
-            path,
-            "The endpoint-local store is currently implemented in production and Phase 2 is complete.",
-            "Status: proposed for independent review; runtime not implemented; Phase 2 incomplete.",
-        )
-
-    def phase2_complete_claim(root: Path) -> None:
-        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        append_active_claim(
-            path,
-            "The durable protected-data store is live now; Phase 2 has been achieved.",
-            "The durable protected-data store is design-only and Phase 2 remains incomplete.",
-        )
-
-    def opaque_fallback_claim(root: Path) -> None:
-        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        append_active_claim(
-            path,
-            "Opaque server blobs are permitted as a Phase 2 fallback. Phase 2 may fall back to opaque client-encrypted server blobs.",
-            "Opaque client-encrypted server blobs are not selected and are forbidden as a Phase 2 fallback.",
-        )
-
-    def host02_unmerged_claim(root: Path) -> None:
-        path = root / "docs/TRUST_PHASE2.md"
-        append_active_claim(
-            path,
-            "P2-HOST-02 is awaiting review and remains pending. HOST-02 continues to be an unmerged review candidate.",
-            "P2-HOST-02 is reviewed and merged at 4e7c89b.",
-        )
-
-    def unsafe_rotation_retirement(root: Path) -> None:
-        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        append_active_claim(
-            path,
-            "The old epoch may be retired after only one slot, before both new-epoch anchor slots are verified.",
-            "The old epoch remains until both new-epoch anchor slots and all wrappers are verified.",
-        )
-
     def missing_data02_dependencies(root: Path) -> None:
         path = root / "docs/TRUST_PHASE2_TASKS.md"
         safe = "P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged)"
         replace_required(path, safe, "P2-DATA-01")
-
-    def unsafe_data02_early_start(root: Path) -> None:
-        append_active_claim(
-            root / "docs/TRUST_PHASE2_TASKS.md",
-            "P2-DATA-02 may start before P2-TERM-01 and P2-HOST-03A pass independent review.",
-            "P2-DATA-02 remains blocked until reviewed and merged P2-TERM-01 and P2-HOST-03A.",
-        )
 
     def malformed_markdown(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
@@ -712,6 +727,38 @@ def self_test(source: Path) -> None:
 
     def unreadable_input(root: Path) -> None:
         (root / "docs/INTERFACE_MATRIX.md").unlink()
+
+    def unused_allowlist_entry(root: Path) -> None:
+        path = root / CONTROLLED_ALLOWLIST
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + "\nruntime-status => runtime status placeholder for later prose.\n",
+            encoding="utf-8",
+        )
+
+    def allowlist_category_drift(root: Path) -> None:
+        replace_required(
+            root / CONTROLLED_ALLOWLIST,
+            "runtime-status => status: proposed for independent review; runtime not implemented.",
+            "phase2-status,runtime-status => status: proposed for independent review; runtime not implemented.",
+        )
+
+    adr_path = "docs/DURABLE_SENSITIVE_DATA.md"
+    phase2_path = "docs/TRUST_PHASE2.md"
+    tasks_path = "docs/TRUST_PHASE2_TASKS.md"
+    runtime_safe = (
+        "Status: proposed for independent review; runtime not implemented; Phase 2 incomplete."
+    )
+    opaque_safe = (
+        "Opaque client-encrypted server blobs are not selected and are forbidden "
+        "as a Phase 2 fallback."
+    )
+    host02_safe = "P2-HOST-02 is reviewed and merged at 4e7c89b."
+    ack_safe = "User acknowledgement is never retry authority; dismissal preserves the lock."
+    rotation_safe = (
+        "The old epoch remains until both new-epoch anchor slots and all wrappers are verified."
+    )
+    data02_safe = "P2-DATA-02 remains blocked until reviewed and merged P2-TERM-01 and P2-HOST-03A."
 
     mutations.extend(
         (
@@ -727,7 +774,24 @@ def self_test(source: Path) -> None:
             ),
             ("missing section", missing_section, None),
             ("duplicate section", duplicate_section, None),
-            ("unsafe acknowledgement with active safe declarations", unsafe_ack, "ack-retry"),
+            (
+                "acknowledgement unlock exact reviewer phrase",
+                claim_fixture(
+                    adr_path,
+                    "User acknowledgement or dismissal unlocks the effect and permits retry.",
+                    ack_safe,
+                ),
+                "ack-retry",
+            ),
+            (
+                "dismiss then try again reviewer paraphrase",
+                claim_fixture(
+                    adr_path,
+                    "Dismiss the warning, then try again.",
+                    ack_safe,
+                ),
+                "ack-retry",
+            ),
             ("missing durable replay head", missing_replay, None),
             (
                 "unsafe capacity eviction with active safe declaration and decoys",
@@ -737,42 +801,241 @@ def self_test(source: Path) -> None:
             ("missing crash anchor", missing_anchor, None),
             (
                 "HOST-02 review-candidate heading with active safe declaration and decoys",
-                stale_status,
+                claim_fixture(
+                    phase2_path,
+                    "## Current source reality (P2-HOST-02 review candidate)",
+                    host02_safe,
+                ),
                 "host02-status",
             ),
             (
-                "runtime implemented active claim with active safe declarations and decoys",
-                runtime_implemented_claim,
+                "runtime and Phase 2 combined exact reviewer phrase",
+                claim_fixture(
+                    adr_path,
+                    "The endpoint-local store is currently implemented in production and Phase 2 is complete.",
+                    runtime_safe,
+                ),
                 "runtime-status",
             ),
             (
-                "Phase 2 complete paraphrase with active safe declarations and decoys",
-                phase2_complete_claim,
+                "production runtime exact reviewer phrase",
+                claim_fixture(
+                    adr_path,
+                    "The endpoint-local store is currently implemented in production.",
+                    runtime_safe,
+                ),
                 "runtime-status",
             ),
             (
-                "opaque Phase 2 fallback active claim with active safe declarations and decoys",
-                opaque_fallback_claim,
+                "shipped private persistence paraphrase",
+                claim_fixture(
+                    adr_path,
+                    "The private persistence layer has shipped.",
+                    runtime_safe,
+                ),
+                "runtime-status",
+            ),
+            (
+                "DATA-02 implementation status claim",
+                claim_fixture(
+                    adr_path,
+                    "P2-DATA-02 is implemented and live.",
+                    runtime_safe,
+                ),
+                "runtime-status",
+            ),
+            (
+                "live store and achieved Phase 2 reviewer paraphrase",
+                claim_fixture(
+                    adr_path,
+                    "The durable protected-data store is live now; Phase 2 has been achieved.",
+                    runtime_safe,
+                ),
+                "runtime-status",
+            ),
+            (
+                "finished Phase 2 reviewer phrase",
+                claim_fixture(
+                    adr_path,
+                    "Phase 2 is finished.",
+                    runtime_safe,
+                ),
+                "phase2-status",
+            ),
+            (
+                "opaque permitted fallback exact reviewer phrases",
+                claim_fixture(
+                    adr_path,
+                    "Opaque server blobs are permitted as a Phase 2 fallback. Phase 2 may fall back to opaque client-encrypted server blobs.",
+                    opaque_safe,
+                ),
                 "opaque-fallback",
             ),
             (
-                "HOST-02 pending active claim with active safe declarations and decoys",
-                host02_unmerged_claim,
+                "offline encrypted server fallback paraphrase",
+                claim_fixture(
+                    adr_path,
+                    "Offline encrypted server data is an acceptable fallback.",
+                    opaque_safe,
+                ),
+                "opaque-fallback",
+            ),
+            (
+                "HOST-02 awaiting and pending exact reviewer phrases",
+                claim_fixture(
+                    phase2_path,
+                    "P2-HOST-02 is awaiting review and remains pending. HOST-02 continues to be an unmerged review candidate.",
+                    host02_safe,
+                ),
                 "host02-status",
             ),
             (
-                "unsafe one-slot key retirement with active safe declarations and decoys",
-                unsafe_rotation_retirement,
+                "HOST-02 review outstanding paraphrase",
+                claim_fixture(
+                    phase2_path,
+                    "P2-HOST-02 review is outstanding.",
+                    host02_safe,
+                ),
+                "host02-status",
+            ),
+            (
+                "unsafe one-slot old epoch retirement exact reviewer phrase",
+                claim_fixture(
+                    adr_path,
+                    "The old epoch may be retired after only one slot, before both new-epoch anchor slots are verified.",
+                    rotation_safe,
+                ),
                 "rotation-retirement",
             ),
-            ("missing DATA-02 reviewed dependencies with decoys", missing_data02_dependencies, None),
+            (
+                "previous key either-slot retirement paraphrase",
+                claim_fixture(
+                    adr_path,
+                    "Delete the previous key once either anchor slot is current.",
+                    rotation_safe,
+                ),
+                "rotation-retirement",
+            ),
+            (
+                "missing DATA-02 reviewed dependencies with decoys",
+                missing_data02_dependencies,
+                None,
+            ),
             (
                 "DATA-02 early-start active claim with active safe declarations and decoys",
-                unsafe_data02_early_start,
+                claim_fixture(
+                    tasks_path,
+                    "P2-DATA-02 may start before P2-TERM-01 and P2-HOST-03A pass independent review.",
+                    data02_safe,
+                ),
                 "data02-dependencies",
             ),
+            (
+                "unknown but safe runtime wording requires allowlist review",
+                claim_fixture(
+                    adr_path,
+                    "The endpoint-local store implementation remains design-only under this revised sentence.",
+                    runtime_safe,
+                ),
+                "runtime-status",
+            ),
+            (
+                "unknown but safe Phase 2 wording requires allowlist review",
+                claim_fixture(
+                    adr_path,
+                    "Phase 2 completion remains governed by the project ledger.",
+                    runtime_safe,
+                ),
+                "phase2-status",
+            ),
+            (
+                "unknown but safe opaque wording requires allowlist review",
+                claim_fixture(
+                    adr_path,
+                    "Opaque server blob fallback status is restated here as forbidden.",
+                    opaque_safe,
+                ),
+                "opaque-fallback",
+            ),
+            (
+                "unknown but safe HOST-02 wording requires allowlist review",
+                claim_fixture(
+                    phase2_path,
+                    "P2-HOST-02 remains reviewed and merged according to this new sentence.",
+                    host02_safe,
+                ),
+                "host02-status",
+            ),
+            (
+                "unknown but safe acknowledgement wording requires allowlist review",
+                claim_fixture(
+                    adr_path,
+                    "Acknowledgement remains outside retry authority in this newly worded sentence.",
+                    ack_safe,
+                ),
+                "ack-retry",
+            ),
+            (
+                "unknown but safe rotation wording requires allowlist review",
+                claim_fixture(
+                    adr_path,
+                    "The old key remains through both anchor slots under this new wording.",
+                    rotation_safe,
+                ),
+                "rotation-retirement",
+            ),
+            (
+                "unknown but safe DATA-02 wording requires allowlist review",
+                claim_fixture(
+                    tasks_path,
+                    "P2-DATA-02 remains blocked pending dependencies under this new sentence.",
+                    data02_safe,
+                ),
+                "data02-dependencies",
+            ),
+            ("unused controlled sentence is rejected", unused_allowlist_entry, None),
+            ("controlled sentence category drift is rejected", allowlist_category_drift, None),
             ("malformed Markdown", malformed_markdown, None),
             ("missing parser input", unreadable_input, None),
+        )
+    )
+
+    approved_forms = "\n\n".join(
+        (
+            "Status: **proposed for independent review; runtime not implemented**.",
+            "Do not claim Phase 2 complete while any recoverable plaintext copy remains.",
+            "Opaque client-encrypted server blobs are **not selected** for Phase 2.",
+            "P2-HOST-02 is reviewed and merged at `4e7c89b`; current source has no server-visible host filesystem route/frame.",
+            "User acknowledgement is never retry authority.",
+            "Every interruption retains the old key and recovers a safe authenticated slot.",
+            "P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged.",
+        )
+    )
+    positive_mutations.append(
+        (
+            "exact reviewed controlled forms remain accepted",
+            claim_fixture(adr_path, approved_forms, runtime_safe),
+        )
+    )
+    hidden_hostile_forms = "\n".join(
+        (
+            "The endpoint-local store is currently implemented in production.",
+            "Phase 2 is finished.",
+            "Offline encrypted server data is an acceptable fallback.",
+            "P2-HOST-02 review is outstanding.",
+            "Dismiss the warning, then try again.",
+            "Delete the previous key once either anchor slot is current.",
+            "P2-DATA-02 may start before P2-TERM-01 and P2-HOST-03A review.",
+        )
+    )
+
+    def hidden_controlled_claims(root: Path) -> None:
+        add_comment_and_fence_decoys(root / adr_path, hidden_hostile_forms)
+
+    positive_mutations.append(
+        (
+            "comments and fences do not create active controlled sentences",
+            hidden_controlled_claims,
         )
     )
 
@@ -799,6 +1062,16 @@ def self_test(source: Path) -> None:
                     ) from exc
                 continue
             raise GuardError(f"self-test mutation unexpectedly passed: {name}")
+
+        positive_base = base / "positive"
+        for index, (name, mutation) in enumerate(positive_mutations):
+            fixture = positive_base / str(index)
+            copy_fixture(source, fixture)
+            mutation(fixture)
+            try:
+                validate(fixture)
+            except GuardError as exc:
+                raise GuardError(f"positive self-test {name!r} unexpectedly failed: {exc}") from exc
 
 
 def main() -> int:

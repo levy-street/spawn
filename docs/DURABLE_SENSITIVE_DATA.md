@@ -77,7 +77,11 @@ succeeded or failed.
 ### Canonical guarded declarations
 
 These rows are parsed by the durable-data guard; prose cannot silently override
-them, and any additional active contradiction fails CI.
+them. After comments and code fences are removed, every active sentence using a
+guarded subject/status/effect vocabulary must exactly match the reviewed
+normalized sentence allowlist in
+[`DURABLE_DATA_CONTROLLED_SENTENCES.txt`](DURABLE_DATA_CONTROLLED_SENTENCES.txt).
+Any new wording fails CI until explicitly reviewed.
 
 | Declaration | Value |
 | --- | --- |
@@ -89,6 +93,8 @@ them, and any additional active contradiction fails CI.
 | `acknowledgement_retry_authority` | `forbidden` |
 | `rotation_new_epoch_anchor_slots_before_old_key_retirement` | `2` |
 | `p2_data_02_required_reviewed_merged_dependencies` | `P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A` |
+| `guarded_active_prose_policy` | `exact_normalized_sentence_allowlist` |
+| `guarded_active_prose_inventory` | `exact_no_unused_entries` |
 
 ### Consequences we accept
 
