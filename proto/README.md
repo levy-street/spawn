@@ -511,10 +511,18 @@ per-viewer/global admission charge remain held until descriptor/temp cleanup
 actually completes; timed-out cleanup stays tracked. A pre-publication
 cancellation cannot later publish, while an already-linearized final commit may
 finish only under the `outcome_unknown`/completed-cache rule below.
-The deadline is created at the initiating channel/peer close, not separately
-for each cleanup stage. Cancellation and viewer removal are published first;
-transport close, the effect fence, registry cleanup, and upload drain remain in
-one owned task after the peer-map deadline if they cannot all finish in time.
+The deadline is created once by the peer's immutable coordinator at the first
+initiating channel/peer close, not separately for each cleanup stage. Delayed
+sender-close, connection-state, duplicate-close, invalid-channel, and backend
+replacement paths reuse it even if they wait for serialized agent cleanup.
+Cancellation and viewer removal are published first. The peer's global
+admission token transfers from the active map entry into a bounded closing-peer
+registry/task; transport close, the effect fence, registry cleanup, and upload
+drain retain that charge after the peer-map deadline until they actually
+settle. A retained published entry whose private-name unlink or directory fsync
+failed is rescheduled by every later matching session/generation teardown;
+failure remains charged, while eventual success removes the temp, descriptors,
+operation permit, and admission entry without a second publication.
 
 The retained worker cwd is a canonical absolute capability root. The endpoint
 opens it and its attachment directories component-by-component without
@@ -538,7 +546,13 @@ Removing an in-progress browser attachment aborts its upload generation. If no
 final chunk was dispatched this is a definite silent cancellation. If the
 final chunk was dispatched, removal still removes the local preview and ignores
 late success, but it must preserve the visible `outcome_unknown` reconciliation
-warning; endpoint publication may already have occurred.
+warning; endpoint publication may already have occurred. The browser persists
+an agent/upload-scoped reconciliation record synchronously when it dispatches
+the final frame, before waiting for an acknowledgement. Acknowledged completion
+clears it; otherwise it survives the transient status timeout, Remove,
+unmount/navigation/remount, and unrelated later statuses. Its only actions are
+to focus the terminal for an endpoint check and to dismiss after that check;
+there is deliberately no retry action.
 
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.

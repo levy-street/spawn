@@ -244,29 +244,45 @@ unmount, and RTC-generation replacement abort browser uploads, send best-effort
 `upload_cancel`, and cannot resurrect UI state from late completion. A Remove
 before final dispatch stays a silent definite cancellation; after final
 dispatch the thumbnail still disappears but the reconciliation warning remains
-visible. Control-channel teardown publishes cancellation and viewer removal
-immediately, then owns transport, fence, registry, and upload cleanup in a
-tracked task bounded by the one deadline created at the initiating close event.
+visible. Final-frame dispatch persists an agent/upload-scoped reconciliation
+record before waiting for acknowledgement; it is independent of the transient
+three-second status and attachment/component lifetime, survives navigation and
+remount, and offers check-then-dismiss actions but never retry. Acknowledged
+success clears it. Control-channel teardown publishes cancellation and viewer
+removal immediately. Every callback for that peer shares an immutable
+first-close deadline, including delayed sender, state, duplicate, invalid, and
+replacement paths. The tracked cleanup owns the RTC admission token until
+transport, fence, registries, and uploads actually settle, so map removal does
+not free capacity and stalled churn remains inside the global peer cap.
+Teardown also reschedules retained post-publication unlink/fsync cleanup; a
+failure stays charged and a later session/generation teardown retries it.
 
-**Current P2-TERM-01 correction validation (review still pending):** 18 focused
+**Current P2-TERM-01 correction validation (review still pending):** 19 focused
 daemon upload tests pass, including partial resume/conflict, global-64 and
 completed-cache-128/TTL pressure, prepare/sync/commit/cleanup stalls, retained
-capacity, cancellation races, and injected post-link unlink/fsync failure with
-idempotent reconciliation. The real-peer gate rejects unordered,
+capacity, cancellation races, and repeated post-link unlink/fsync failure with
+session/generation retry, zero temp/FD/operation residue, and idempotent
+publication. Deterministic paused-time RTC tests prove delayed duplicate,
+sender, and state closes cannot gain a new deadline, and a stalled cleanup
+retains its admission slot across peer-map removal and replacement churn until
+zero residue. The real-peer gate rejects unordered,
 packet-lifetime-limited, and retransmit-limited `spawn.pty` and `spawn.ctl`
 channels without resident state. TypeScript and the browser protocol unit suite
 pass; focused browser tests cover declared reliability, large multi-chunk
 transfer, non-immediate `bufferedAmount` drain, Remove-driven cancellation, and
-lost final acknowledgement without retry. Paired real WebRTC tests cover
+lost final acknowledgement without retry. Browser coverage also advances more
+than three seconds under a fake clock, applies later ordinary status, removes
+the attachment, and unmounts/navigates/remounts the terminal while the durable
+reconciliation record remains until explicit post-check dismissal. Paired real WebRTC tests cover
 verified multi-chunk publication, a stalled-cleanup control close within one
 deadline with replacement isolation and eventual zero residue, and a lost
 final acknowledgement that reconciles the same stable ID on a replacement
 channel without a duplicate destination. The broad production-source upload
 guard and its adversarial self-test pass. Strict daemon format and all-target
-Clippy pass; all 60 library, 118 daemon, and 8 worker-E2E tests pass; server Ruff
-and all 134 server tests pass; web lint, all 55 unit tests, 74 Playwright tests
+Clippy pass; all 60 library, 121 daemon, and 8 worker-E2E tests pass; server Ruff
+and all 134 server tests pass; web lint, all 55 unit tests, 75 Playwright tests
 (3 opt-in audits skipped), and the production build pass.
-`SPAWN_E2E_PORT=45274 scripts/test-all.sh` passes the full repeatable matrix,
+`SPAWN_E2E_PORT=45275 scripts/test-all.sh` passes the full repeatable matrix,
 including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
 daemon lifecycle, live-browser, and service-manager smokes. Current-master
 mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base

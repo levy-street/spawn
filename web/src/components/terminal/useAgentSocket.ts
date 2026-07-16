@@ -65,6 +65,9 @@ export interface DirectAgentUploadOptions {
   destination?: "attachments" | "cwd";
   signal?: AbortSignal;
   uploadId?: string;
+  /** Called synchronously after the final frame is accepted by the channel.
+   *  The caller must persist ambiguity before this component can unmount. */
+  onFinalDispatched?: () => void;
 }
 
 export type SocketState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -610,7 +613,10 @@ export function useAgentSocket({
             payload.fill(0);
             if (!frame) throw new Error("Could not frame upload chunk.");
             ctlDc.send(frame.buffer as ArrayBuffer);
-            if (isFinal) finalDispatched = true;
+            if (isFinal) {
+              finalDispatched = true;
+              options.onFinalDispatched?.();
+            }
           }
           try {
             message = await waitUploadMessage(uploadId, 30_000, uploadSignal);

@@ -273,9 +273,9 @@ struct UploadLifecycleHooks {
     #[cfg(test)]
     cleanup: BlockingPause,
     #[cfg(test)]
-    fail_unlink_once: AtomicBool,
+    fail_unlink_count: AtomicUsize,
     #[cfg(test)]
-    fail_fsync_once: AtomicBool,
+    fail_fsync_count: AtomicUsize,
 }
 
 impl UploadLifecycleHooks {
@@ -301,14 +301,24 @@ impl UploadLifecycleHooks {
 
     fn fail_unlink(&self) -> bool {
         #[cfg(test)]
-        return self.fail_unlink_once.swap(false, Ordering::AcqRel);
+        return self
+            .fail_unlink_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
         #[cfg(not(test))]
         false
     }
 
     fn fail_fsync(&self) -> bool {
         #[cfg(test)]
-        return self.fail_fsync_once.swap(false, Ordering::AcqRel);
+        return self
+            .fail_fsync_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
         #[cfg(not(test))]
         false
     }
@@ -700,6 +710,7 @@ impl UploadHub {
         self.cancel_session_until(agent, session_id, deadline).await;
     }
 
+    #[cfg(test)]
     pub async fn cancel_session_until(
         &self,
         agent: AgentBinding,
@@ -711,6 +722,27 @@ impl UploadHub {
             self.cancel_entry(key.clone(), Arc::clone(entry));
         }
         self.wait_entries_until(active, deadline).await;
+    }
+
+    /// Publish cancellation/retry once, then retain the caller until every
+    /// matching descriptor/temp and its admission charge have actually
+    /// drained. Peer cleanup owns this wait after its externally visible
+    /// deadline has expired; a later teardown can safely schedule another
+    /// retry for a retained published entry.
+    pub async fn cancel_session_and_wait(&self, agent: AgentBinding, session_id: &str) {
+        let active = self.session_entries(agent, session_id);
+        for (key, entry) in &active {
+            self.cancel_entry(key.clone(), Arc::clone(entry));
+        }
+        for (_, entry) in active {
+            loop {
+                let changed = entry.changed.notified();
+                if entry.removed.load(Ordering::Acquire) {
+                    break;
+                }
+                changed.await;
+            }
+        }
     }
 
     pub fn cancel_session_now(&self, agent: AgentBinding, session_id: &str) {
@@ -916,6 +948,14 @@ impl UploadHub {
     fn cancel_entry(&self, key: UploadKey, entry: Arc<ActiveEntry>) -> bool {
         loop {
             let lifecycle = entry.lifecycle.load(Ordering::Acquire);
+            if lifecycle == UPLOAD_PUBLISHED {
+                // Publication is irreversible, but unlink/fsync of the private
+                // temporary name may still be pending. Every later teardown
+                // is a retry opportunity; keeping the entry resident retains
+                // its admission charge until cleanup actually succeeds.
+                self.schedule_cleanup(key, entry);
+                return false;
+            }
             if !matches!(lifecycle, UPLOAD_PREPARING | UPLOAD_ACTIVE) {
                 return false;
             }
@@ -2345,9 +2385,9 @@ mod tests {
             let hub = UploadHub::default();
             let hooks = hub.lifecycle_hooks();
             if fail_unlink {
-                hooks.fail_unlink_once.store(true, Ordering::Release);
+                hooks.fail_unlink_count.store(1, Ordering::Release);
             } else {
-                hooks.fail_fsync_once.store(true, Ordering::Release);
+                hooks.fail_fsync_count.store(1, Ordering::Release);
             }
             let agent = AgentBinding::new(Uuid::new_v4(), 44);
             let capability = Uuid::new_v4();
@@ -2400,6 +2440,119 @@ mod tests {
                 published, 1,
                 "stable-id reconciliation duplicated publication"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_retries_repeated_post_publish_cleanup_failures_until_fully_drained() {
+        for (fail_unlink, remove_generation) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let hub = UploadHub::default();
+            let hooks = hub.lifecycle_hooks();
+            if fail_unlink {
+                hooks.fail_unlink_count.store(2, Ordering::Release);
+            } else {
+                hooks.fail_fsync_count.store(2, Ordering::Release);
+            }
+            let agent = AgentBinding::new(Uuid::new_v4(), 45);
+            let capability = Uuid::new_v4();
+            let upload_id = Uuid::new_v4();
+            let upload_manifest = manifest(b"retry", "retry.txt", UploadDestination::Cwd);
+            hub.start(
+                agent,
+                "viewer",
+                capability,
+                upload_id,
+                tmp.path().to_str().unwrap(),
+                upload_manifest.clone(),
+            )
+            .await
+            .unwrap();
+
+            let error = hub
+                .write_chunk(
+                    agent,
+                    UploadChunkRequest {
+                        session_id: "viewer",
+                        capability,
+                        upload_id,
+                        sequence: 0,
+                        last: true,
+                        bytes: b"retry",
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "outcome_unknown");
+            assert!(
+                hub.wait_for_operations(TokioInstant::now() + Duration::from_secs(2))
+                    .await
+            );
+            assert_eq!(hub.retained_counts().await, (1, 1));
+            assert_eq!(hub.operation_count(), 0);
+
+            let deadline = TokioInstant::now() + Duration::from_secs(2);
+            if remove_generation {
+                hub.remove_generation_now(agent);
+                hub.remove_generation_until(agent, deadline).await;
+            } else {
+                hub.cancel_session_now(agent, "viewer");
+                hub.cancel_session_until(agent, "viewer", deadline).await;
+            }
+            assert!(hub.wait_for_operations(deadline).await);
+            assert_eq!(hub.retained_counts().await.0, 0);
+            assert_eq!(hub.operation_count(), 0);
+
+            let names = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| !name.contains("spawn-upload"))
+                    .count(),
+                1,
+                "cleanup retry duplicated the published destination"
+            );
+            assert!(
+                names.iter().all(|name| !name.contains("spawn-upload")),
+                "cleanup retry retained a private temporary name: {names:?}"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let retained_fds = std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                    .filter(|target| target.starts_with(tmp.path()))
+                    .count();
+                assert_eq!(
+                    retained_fds, 0,
+                    "cleanup retry retained upload file descriptors"
+                );
+            }
+
+            let reconciled = hub
+                .start(
+                    agent,
+                    "replacement-viewer",
+                    Uuid::new_v4(),
+                    upload_id,
+                    tmp.path().to_str().unwrap(),
+                    upload_manifest,
+                )
+                .await;
+            if remove_generation {
+                assert_eq!(reconciled.unwrap_err().code, "stale_agent_generation");
+            } else {
+                assert!(matches!(
+                    reconciled.unwrap(),
+                    UploadStartOutcome::Complete(_)
+                ));
+            }
         }
     }
 

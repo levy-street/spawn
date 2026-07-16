@@ -20,6 +20,7 @@ async function openTerminalWithMockSocket(
     autoSnapshot?: boolean;
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
+    fromAgents?: boolean;
   } = {},
 ) {
   const messages: Array<string | Buffer> = [];
@@ -68,6 +69,7 @@ async function openTerminalWithMockSocket(
     }
   });
 
+  if (options.fromAgents) await page.goto("/agents");
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(page.getByLabel("Agent terminal")).toBeVisible();
   return { messages, sockets, uploads };
@@ -380,11 +382,15 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
   });
   await page.waitForTimeout(100);
   expect(uploads).toHaveLength(0);
+  await page.clock.install();
+  await page.clock.fastForward(3_500);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
 });
 
 test("removing an attachment after publication preserves outcome_unknown", async ({ page }) => {
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
+    fromAgents: true,
   });
   await page.getByLabel("Agent terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
@@ -396,10 +402,13 @@ test("removing an attachment after publication preserves outcome_unknown", async
 
   await expect(page.getByRole("button", { name: "Remove maybe.png" })).toBeVisible();
   await expect.poll(() => uploads).toHaveLength(1);
+  await page.clock.install();
   await page.getByRole("button", { name: "Remove maybe.png" }).click();
 
   await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
-  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "Check the endpoint destination before retrying",
+  );
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
     .toBe(true);
@@ -407,6 +416,23 @@ test("removing an attachment after publication preserves outcome_unknown", async
     1,
   );
   expect(uploads).toHaveLength(1);
+
+  await page.clock.fastForward(3_500);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "Check the endpoint destination before retrying",
+  );
+
+  // A later ordinary status may come and go without replacing the durable
+  // reconciliation record.
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "too-large.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.alloc(20 * 1024 * 1024 + 1),
+  });
+  await expect(page.getByText(/larger than 20 MB/i)).toBeVisible();
+  await page.clock.fastForward(3_500);
+  await expect(page.getByText(/larger than 20 MB/i)).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
 
   await page.evaluate(() => {
     (
@@ -417,7 +443,50 @@ test("removing an attachment after publication preserves outcome_unknown", async
   });
   await page.waitForTimeout(100);
   await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
-  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toBeVisible();
+
+  // Navigation fully unmounts this terminal; the agent-scoped session record
+  // restores on the next component instance.
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
+  await page.getByRole("button", { name: "Check in terminal" }).click();
+  await expect(
+    page.getByTestId("terminal-live-host").locator(".xterm-helper-textarea"),
+  ).toBeFocused();
+  await page.getByRole("button", { name: "Dismiss maybe.png after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+});
+
+test("unmount after final dispatch persists reconciliation for the next terminal instance", async ({
+  page,
+}) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+    fromAgents: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "navigate.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("published"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
 });
 
 test("RTC generation replacement is definitive before final dispatch", async ({ page }) => {
@@ -461,7 +530,7 @@ test("RTC generation replacement after final dispatch is outcome_unknown", async
       window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
     ).__spawnRtcTest.replaceRtcGeneration();
   });
-  await expect(page.getByText(/reconcile the destination before retrying/i)).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("after.bin");
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
   );
