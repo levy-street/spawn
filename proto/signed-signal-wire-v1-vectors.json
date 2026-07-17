@@ -1,0 +1,57 @@
+{
+  "format": "spawn-signed-signal-wire-v1",
+  "key_material_source": "RFC 8032 section 7.1 test vectors 1 and 2; test use only",
+  "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "sender_public_key_wire": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "intended_peer_public_key_wire": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+  "mutation_fields": [
+    "type",
+    "signature_algorithm",
+    "sender_identity_public_key",
+    "intended_peer_identity_public_key",
+    "protocol",
+    "protocol_version",
+    "session_id",
+    "scope_type",
+    "scope_id",
+    "sender_role",
+    "sdp",
+    "signature"
+  ],
+  "vectors": [
+    {
+      "id": "agent-offer",
+      "envelope": {
+        "type": "rtc.offer",
+        "signature_algorithm": "ed25519",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+        "scope_type": "agent",
+        "scope_id": "11111111-2222-4333-8444-555555555555",
+        "sender_role": "browser",
+        "sdp": "v=0\r\no=- 461173305954868531 2 IN IP4 127.0.0.1\r\ns=spawn-agent\r\nt=0 0\r\na=setup:actpass\r\n",
+        "signature": "SWgfZch9iOWqw9hpSncKU_Fdu6dRwbzerHUpYogUVT68MYazPw3Xhhz1rKOIKoYJiE_lWzC3-vplODoGs2_GAg"
+      }
+    },
+    {
+      "id": "host-answer",
+      "envelope": {
+        "type": "rtc.answer",
+        "signature_algorithm": "ed25519",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.host.ctl",
+        "protocol_version": 1,
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+        "scope_type": "host",
+        "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "sender_role": "daemon",
+        "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+        "signature": "NhWDDOf1NVAHYCDalUzoKuongzM2sqZsHu2PCJWRIrRzGbLV-q-JXooerzAEwB4r8_rjTtjwGhsVH6INf5sDCw"
+      }
+    }
+  ]
+}
