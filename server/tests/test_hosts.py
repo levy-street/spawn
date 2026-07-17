@@ -30,6 +30,24 @@ class _FakeWS:
         pass
 
 
+class _RevocationObserverWS(_FakeWS):
+    def __init__(self, host_id: str) -> None:
+        super().__init__()
+        self.host_id = host_id
+        self.closed_after_host_delete: bool | None = None
+        self.close_code: int | None = None
+        self.close_reason: str | None = None
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        from spawn_server.db import get_sessionmaker
+        from spawn_server.models import Host
+
+        async with get_sessionmaker()() as session:
+            self.closed_after_host_delete = await session.get(Host, self.host_id) is None
+        self.close_code = code
+        self.close_reason = reason
+
+
 async def _wait_for_text_frame(
     fake_ws: _FakeWS,
     frame_type: str,
@@ -110,6 +128,54 @@ async def test_host_scoping(client):
     # User B can't delete it either.
     r = await client.delete(f"/api/hosts/{host_id}", headers={"Authorization": f"Bearer {b_token}"})
     assert r.status_code == 404
+
+
+async def test_host_revocation_closes_daemon_only_after_database_commit(client):
+    token = await _signup(client, "post-commit-revocation@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, HostKeyClaim, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    public_key = "A" * 43
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "post-commit-revocation@example.com")
+            )
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="post-commit-host",
+            host_key_algorithm="ed25519",
+            host_public_key=public_key,
+            status="online",
+        )
+        session.add(host)
+        session.add(
+            HostKeyClaim(
+                host_key_algorithm="ed25519",
+                host_public_key=public_key,
+                owner_user_id=user.id,
+            )
+        )
+        await session.commit()
+        host_id = host.id
+        user_id = user.id
+
+    observer = _RevocationObserverWS(host_id)
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=observer)  # type: ignore[arg-type]
+    await get_broker().register_daemon(daemon)
+    await _accept_daemon(daemon)
+
+    removed = await client.delete(f"/api/hosts/{host_id}", headers=auth)
+    assert removed.status_code == 204, removed.text
+    assert observer.closed_after_host_delete is True
+    assert observer.close_code == 4001
+    assert observer.close_reason == "host revoked"
 
 
 async def test_host_tool_check_roundtrip(client):

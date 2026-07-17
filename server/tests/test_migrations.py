@@ -179,6 +179,8 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
         assert "uq_hosts_host_public_key" in host_uniques
         assert "uq_device_codes_host_public_key" not in device_uniques
         assert "uq_browser_devices_public_key" in browser_device_uniques
+        device_indexes = {index["name"] for index in inspector.get_indexes("device_codes")}
+        assert "ix_device_codes_host_key" in device_indexes
         device_checks = {
             constraint["name"] for constraint in inspector.get_check_constraints("device_codes")
         }
@@ -193,6 +195,15 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
             "host_id",
             "browser_device_id",
         ]
+        assert inspector.get_pk_constraint("host_key_claims")["constrained_columns"] == [
+            "host_key_algorithm",
+            "host_public_key",
+        ]
+        claim_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("host_key_claims")
+        }
+        assert "ck_host_key_claims_ed25519_key" in claim_checks
 
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
@@ -283,7 +294,6 @@ def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tm
     finally:
         engine.dispose()
 
-
     _run_python(["-m", "alembic", "upgrade", "head"], env=env)
 
     engine = create_engine(sync_url, future=True)
@@ -300,6 +310,88 @@ def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tm
             ).one()
             assert host == (None, None)
             assert device == (None, None)
+    finally:
+        engine.dispose()
+
+
+def test_host_key_claim_migration_backfills_and_downgrades_fail_closed(tmp_path: Path):
+    db_path = tmp_path / "spawn-host-key-claim-migration.db"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+    sync_url = f"sqlite:///{db_path}"
+    env = _migration_env(async_url)
+    public_key = "A" * 43
+    _run_python(["-m", "alembic", "upgrade", "0019"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "insert into users (id, email, password_hash, created_at) "
+                    "values ('claim-owner', 'claim-owner@example.com', 'hash', '2026-07-17')"
+                )
+            )
+            conn.execute(
+                text(
+                    "insert into hosts "
+                    "(id, owner_user_id, name, host_key_algorithm, host_public_key, "
+                    "status, created_at) values "
+                    "('claimed-host', 'claim-owner', 'claimed', 'ed25519', :key, "
+                    "'offline', '2026-07-17')"
+                ),
+                {"key": public_key},
+            )
+    finally:
+        engine.dispose()
+
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            claim = conn.execute(
+                text(
+                    "select host_key_algorithm, host_public_key, owner_user_id, created_at "
+                    "from host_key_claims"
+                )
+            ).one()
+            assert claim[:3] == ("ed25519", public_key, "claim-owner")
+            assert str(claim.created_at).startswith("2026-07-17")
+    finally:
+        engine.dispose()
+
+    # A clean downgrade/re-upgrade is deterministic while every claim is still
+    # represented by its live Host and can therefore be backfilled again.
+    _run_python(["-m", "alembic", "downgrade", "0019"], env=env)
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("delete from hosts where id = 'claimed-host'"))
+            retained = conn.execute(
+                text("select owner_user_id from host_key_claims where host_public_key = :key"),
+                {"key": public_key},
+            ).scalar_one()
+            assert retained == "claim-owner"
+    finally:
+        engine.dispose()
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_python(["-m", "alembic", "downgrade", "0019"], env=env)
+    assert "cannot downgrade 0020 while retained host key ownership claims exist" in (
+        exc_info.value.stderr
+    )
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(text("select version_num from alembic_version")).scalar_one() == (
+                "0020"
+            )
+            assert conn.execute(
+                text("select owner_user_id from host_key_claims where host_public_key = :key"),
+                {"key": public_key},
+            ).scalar_one() == "claim-owner"
     finally:
         engine.dispose()
 

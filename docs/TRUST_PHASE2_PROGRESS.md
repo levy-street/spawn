@@ -442,6 +442,18 @@ carry the exact host/browser presentations, and the browser loudly rejects a
 substituted response. The confirmation UI displays both fingerprints before the
 user authorizes the link.
 
+**P3-IDENTITY-02D audit F8 revocation rule:** deleting a keyed Host revokes the
+live Host row, every server Host/browser pin, and every pending, approved, or
+consuming device-code ceremony for that exact key in one serialized database
+transaction. The server retains a durable exact Ed25519 key-to-original-owner
+claim. A fresh ceremony committed after deletion may intentionally re-pair the
+same key only to that original account; another account remains fail-closed
+unless a future explicit ownership-transfer ceremony is designed. Device
+start, approval, poll, and deletion share the retained claim as their first
+keyed write boundary, so delete-versus-start/poll linearizes on SQLite and
+PostgreSQL without releasing the binding. Daemon disconnect is best-effort
+external cleanup after the durable commit, not the revocation boundary.
+
 This is only the server/browser first-contact half of pairing. P3-IDENTITY-02E
 must separately make the daemon validate and persist the returned browser pin;
 02D makes no daemon-local pin, peer discovery, live-signaling, or TOFU claim.

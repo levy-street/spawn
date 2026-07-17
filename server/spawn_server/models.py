@@ -12,6 +12,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
 )
@@ -45,6 +46,7 @@ class User(Base):
     auth_identities: Mapped[list[AuthIdentity]] = relationship(back_populates="user")
     auth_provider_states: Mapped[list[AuthProviderState]] = relationship(back_populates="user")
     browser_devices: Mapped[list[BrowserDevice]] = relationship(back_populates="owner")
+    host_key_claims: Mapped[list[HostKeyClaim]] = relationship(back_populates="owner")
 
 
 class BrowserDevice(Base):
@@ -121,6 +123,33 @@ class AuthProviderState(Base):
     )
 
     user: Mapped[User | None] = relationship(back_populates="auth_provider_states")
+
+
+class HostKeyClaim(Base):
+    """Durable account ownership for a stable host identity key."""
+
+    __tablename__ = "host_key_claims"
+
+    host_key_algorithm: Mapped[str] = mapped_column(String(16), primary_key=True)
+    host_public_key: Mapped[str] = mapped_column(String(43), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    owner: Mapped[User] = relationship(back_populates="host_key_claims")
+
+    __table_args__ = (
+        CheckConstraint(
+            "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43",
+            name="ck_host_key_claims_ed25519_key",
+        ),
+    )
 
 
 class Host(Base):
@@ -402,6 +431,11 @@ class DeviceCode(Base):
             "browser_key_algorithm = 'ed25519' AND length(browser_public_key) = 43 AND "
             "length(browser_key_fingerprint) = 23)",
             name="ck_device_codes_browser_binding",
+        ),
+        Index(
+            "ix_device_codes_host_key",
+            "host_key_algorithm",
+            "host_public_key",
         ),
     )
 

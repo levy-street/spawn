@@ -15,6 +15,7 @@ from .. import auth, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..host_identity import host_key_fingerprint
+from ..host_key_claims import create_or_lock_host_key_claim, lock_host_key_claim
 from ..host_pair_approval import verify_host_pair_approval_proof
 from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 
@@ -63,6 +64,16 @@ async def device_start(
     now = _utcnow()
     expires_at = now + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
 
+    # Existing host keys have a retained ownership claim. Taking its write
+    # fence before inserting the ceremony makes start linearize with deletion:
+    # a start committed before deletion is removed, while one that begins after
+    # committed deletion is a deliberately fresh re-pair attempt.
+    await lock_host_key_claim(
+        session,
+        host_key_algorithm=body.host_key_algorithm,
+        host_public_key=body.host_public_key,
+    )
+
     # Retry user_code generation on rare collision.
     for _ in range(8):
         user_code = _gen_user_code()
@@ -110,6 +121,15 @@ async def device_poll(
 ) -> dict:
     now = _utcnow()
     poll_cutoff = now - timedelta(seconds=POLL_INTERVAL_SECONDS - 1)
+
+    # For an already-claimed key this is the common first write used by start,
+    # approval, poll, and deletion. It prevents a poll claim from crossing a
+    # committed revocation boundary on both SQLite and PostgreSQL.
+    claimed_owner = await lock_host_key_claim(
+        session,
+        host_key_algorithm=body.host_key_algorithm,
+        host_public_key=body.host_public_key,
+    )
 
     # Claim first, before loading an ORM entity. On SQLite this write-first
     # transition serializes competing writers without read-to-write upgrade
@@ -252,6 +272,16 @@ async def device_poll(
     user_id = claimed["user_id"]
     assert user_id is not None
 
+    if claimed_owner is not None and claimed_owner != user_id:
+        await session.execute(
+            update(DeviceCode)
+            .where(DeviceCode.device_code == body.device_code)
+            .values(status="denied")
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return {"error": "key_conflict"}
+
     browser_active = (
         await session.execute(
             update(BrowserDevice)
@@ -306,6 +336,23 @@ async def device_poll(
         )
         await session.commit()
         return {"error": "key_conflict"}
+
+    if claimed_owner is None:
+        claimed_owner = await create_or_lock_host_key_claim(
+            session,
+            host_key_algorithm=body.host_key_algorithm,
+            host_public_key=body.host_public_key,
+            owner_user_id=user_id,
+        )
+        if claimed_owner != user_id:
+            await session.execute(
+                update(DeviceCode)
+                .where(DeviceCode.device_code == body.device_code)
+                .values(status="denied")
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "key_conflict"}
 
     if host is None:
         candidate = Host(
@@ -512,6 +559,16 @@ async def device_approve(
 
     device_code = dc.device_code
     await session.rollback()
+    claimed_owner = await lock_host_key_claim(
+        session,
+        host_key_algorithm=body.host_key_algorithm,
+        host_public_key=body.host_public_key,
+    )
+    if claimed_owner is not None and claimed_owner != user_id:
+        await session.execute(delete(DeviceCode).where(DeviceCode.device_code == device_code))
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host key is retained by another account")
+
     browser_claim = (
         await session.execute(
             update(BrowserDevice)

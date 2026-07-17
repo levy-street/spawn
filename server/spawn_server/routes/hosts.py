@@ -14,13 +14,14 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session, get_sessionmaker
 from ..host_identity import host_key_fingerprint
-from ..models import Agent, Host, HostToolPolicy, Preset, User
+from ..host_key_claims import lock_host_key_claim
+from ..models import Agent, DeviceCode, Host, HostBrowserPin, HostToolPolicy, Preset, User
 from ..ws.broker import get_broker
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
@@ -574,12 +575,49 @@ async def delete_host(
     user: User = Depends(auth.current_user),
 ) -> None:
     h = await _get_owned_host(session, host_id, user)
-    # Boot the daemon if it's connected.
+
+    if h.host_key_algorithm is not None and h.host_public_key is not None:
+        claimed_owner = await lock_host_key_claim(
+            session,
+            host_key_algorithm=h.host_key_algorithm,
+            host_public_key=h.host_public_key,
+        )
+        if claimed_owner != h.owner_user_id:
+            # Every keyed Host is backfilled by migration 0020 or created only
+            # after its durable claim commits. Missing/mismatched state must not
+            # be deleted because that would release the key fail-open.
+            raise HTTPException(status_code=409, detail="host key ownership claim is invalid")
+
+        # Start, approval, and poll take the retained claim before touching a
+        # DeviceCode. Keep that order here so either the ceremony commits first
+        # and revocation removes its resulting authority, or deletion commits
+        # first and the ceremony loses its code. The claim itself is retained:
+        # only this same owner can intentionally pair the stable key again.
+        await session.execute(
+            delete(DeviceCode)
+            .where(
+                DeviceCode.host_key_algorithm == h.host_key_algorithm,
+                DeviceCode.host_public_key == h.host_public_key,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        # Do not rely solely on backend FK-cascade configuration for the
+        # immutable authority pins. Their removal is part of this revocation
+        # transaction and must hold on both production PostgreSQL and SQLite.
+        await session.execute(
+            delete(HostBrowserPin)
+            .where(HostBrowserPin.host_id == h.id)
+            .execution_options(synchronize_session=False)
+        )
+    await session.delete(h)
+    await session.commit()
+
+    # External cleanup follows the durable revocation boundary. Closing first
+    # could disconnect a healthy daemon even if the database transaction later
+    # failed, while a committed Host deletion already invalidates its token.
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is not None:
         try:
             await daemon.websocket.close(code=4001, reason="host revoked")
         except Exception:
             pass
-    await session.delete(h)
-    await session.commit()
