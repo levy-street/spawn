@@ -91,6 +91,12 @@ The pinned inline-token policy explicitly treats text, escaped/entity
 `text_special`, code, breaks, HTML, image alt, and link/image titles as visible;
 emphasis/strong/strikethrough markers are structural only, and every unknown
 inline child token fails closed instead of silently disappearing.
+Top-level tokens are likewise exhaustively divided into visible inline/HTML,
+inactive fenced/indented code, and known structural block/container/table
+tokens; both rendering and corpus inventory reject every unknown block token.
+Explicit fence closure is derived from the parser's container-normalized token
+span and content-line count, so valid blockquote/list fences remain inactive
+while unclosed container fences fail closed.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in

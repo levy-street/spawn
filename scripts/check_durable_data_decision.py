@@ -119,6 +119,48 @@ INLINE_STRUCTURAL_TOKEN_TYPES = frozenset(
     {"em_open", "em_close", "strong_open", "strong_close", "s_open", "s_close"}
 )
 
+# Exhaustive top-level token policy for the pinned CommonMark block rules plus
+# the enabled table rule. Inline and HTML blocks carry visible prose; fenced and
+# indented code are intentionally inactive; every remaining known type is
+# structural. Both rendering and corpus inventory validate this set before
+# walking tokens so a future block token cannot disappear silently.
+BLOCK_VISIBLE_TOKEN_TYPES = frozenset({"inline", "html_block"})
+BLOCK_INACTIVE_TOKEN_TYPES = frozenset({"fence", "code_block"})
+BLOCK_STRUCTURAL_TOKEN_TYPES = frozenset(
+    {
+        "paragraph_open",
+        "paragraph_close",
+        "heading_open",
+        "heading_close",
+        "blockquote_open",
+        "blockquote_close",
+        "bullet_list_open",
+        "bullet_list_close",
+        "ordered_list_open",
+        "ordered_list_close",
+        "list_item_open",
+        "list_item_close",
+        "hr",
+        "table_open",
+        "table_close",
+        "thead_open",
+        "thead_close",
+        "tbody_open",
+        "tbody_close",
+        "tr_open",
+        "tr_close",
+        "th_open",
+        "th_close",
+        "td_open",
+        "td_close",
+    }
+)
+SUPPORTED_BLOCK_TOKEN_TYPES = (
+    BLOCK_VISIBLE_TOKEN_TYPES
+    | BLOCK_INACTIVE_TOKEN_TYPES
+    | BLOCK_STRUCTURAL_TOKEN_TYPES
+)
+
 
 class VisibleHtmlParser(HTMLParser):
     def __init__(self) -> None:
@@ -160,6 +202,12 @@ def append_separated(parts: list[str], values: tuple[str, ...]) -> None:
         parts.extend((" ", value, " "))
 
 
+def validate_block_token_types(tokens: list[Token]) -> None:
+    for token in tokens:
+        if token.type not in SUPPORTED_BLOCK_TOKEN_TYPES:
+            raise GuardError(f"unsupported CommonMark block token type: {token.type}")
+
+
 def markdown_tokens(path: Path) -> list[Token]:
     try:
         source = path.read_text(encoding="utf-8")
@@ -169,16 +217,25 @@ def markdown_tokens(path: Path) -> list[Token]:
         tokens = COMMONMARK.parse(source)
     except Exception as exc:
         raise GuardError(f"cannot parse CommonMark in {path}: {exc}") from exc
-    lines = source.splitlines()
     for token in tokens:
-        if token.type == "fence" and token.map is not None:
-            _, end = token.map
+        if token.type == "fence":
+            if token.map is None:
+                raise GuardError(f"CommonMark fence token has no source map in {path}")
+            start, end = token.map
             marker = token.markup
-            closing = re.fullmatch(
-                rf" {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*",
-                lines[end - 1],
-            )
-            if closing is None:
+            if (
+                len(marker) < 3
+                or marker[0] not in {"`", "~"}
+                or marker != marker[0] * len(marker)
+            ):
+                raise GuardError(f"invalid CommonMark fence token in {path}")
+            content_lines = token.content.count("\n")
+            if token.content and not token.content.endswith("\n"):
+                content_lines += 1
+            # markdown-it includes an explicit close in the token span but not
+            # in token.content. This relation is invariant under blockquote and
+            # list container prefix removal, unlike matching the raw source line.
+            if end - start != content_lines + 2:
                 raise GuardError(f"unclosed CommonMark fence in {path}")
         candidates = [token, *(token.children or [])]
         for candidate in candidates:
@@ -225,6 +282,7 @@ def visible_inline_tokens(tokens: list[Token]) -> str:
 
 
 def rendered_blocks(tokens: list[Token]) -> tuple[str, ...]:
+    validate_block_token_types(tokens)
     blocks: list[str] = []
     index = 0
     while index < len(tokens):
@@ -242,7 +300,9 @@ def rendered_blocks(tokens: list[Token]) -> tuple[str, ...]:
             row = " | ".join(cell for cell in cells if cell)
             if row:
                 blocks.append(row)
-        elif token.type == "inline" and token.children is not None:
+        elif token.type == "inline":
+            if token.children is None:
+                raise GuardError("CommonMark inline block has no child tokens")
             visible = visible_inline_tokens(token.children)
             if visible:
                 blocks.append(visible)
@@ -369,6 +429,7 @@ def split_visible_sentences(text: str) -> tuple[str, ...]:
 def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
     path = root / relative
     tokens = markdown_tokens(path)
+    validate_block_token_types(tokens)
     heading_stack: list[tuple[int, str]] = []
     block_ordinals: Counter[tuple[tuple[str, ...], str]] = Counter()
     blocks: list[tuple[tuple[str, ...], str, int, str]] = []
@@ -422,7 +483,9 @@ def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
             blockquote_depth += 1
         elif token.type == "blockquote_close":
             blockquote_depth -= 1
-        elif token.type == "inline" and token.children is not None:
+        elif token.type == "inline":
+            if token.children is None:
+                raise GuardError(f"{path} CommonMark inline block has no child tokens")
             kind = (
                 "list-item"
                 if list_depth
@@ -950,6 +1013,65 @@ def self_test(source: Path) -> None:
             raise
     else:
         raise GuardError("unknown CommonMark inline token did not fail closed")
+
+    future_block = [Token("future_block", "", 0)]
+    try:
+        rendered_blocks(future_block)
+    except GuardError as exc:
+        if "unsupported CommonMark block token type" not in str(exc):
+            raise
+    else:
+        raise GuardError("rendered_blocks did not reject an unknown block token")
+
+    original_parse = COMMONMARK.parse
+    COMMONMARK.parse = lambda _: future_block
+    try:
+        try:
+            corpus_sentences(source, "docs/DURABLE_SENSITIVE_DATA.md")
+        except GuardError as exc:
+            if "unsupported CommonMark block token type" not in str(exc):
+                raise
+        else:
+            raise GuardError("corpus_sentences did not reject an unknown block token")
+    finally:
+        COMMONMARK.parse = original_parse
+
+    fence_cases = (
+        (
+            "closed blockquote fence",
+            "> ```text\n> Phase 2 is finished.\n> ```\n",
+            True,
+        ),
+        (
+            "unclosed blockquote fence",
+            "> ```text\n> Phase 2 is finished.\n",
+            False,
+        ),
+        (
+            "closed ordered-list fence",
+            "1. item\n\n    ```text\n    Phase 2 is finished.\n    ```\n",
+            True,
+        ),
+        (
+            "unclosed ordered-list fence",
+            "1. item\n\n    ```text\n    Phase 2 is finished.\n",
+            False,
+        ),
+    )
+    with tempfile.TemporaryDirectory(prefix="spawn-data-fence-") as temp:
+        for index, (name, fixture_source, should_pass) in enumerate(fence_cases):
+            path = Path(temp) / f"{index}.md"
+            path.write_text(fixture_source, encoding="utf-8")
+            try:
+                markdown_tokens(path)
+            except GuardError as exc:
+                if should_pass or "unclosed CommonMark fence" not in str(exc):
+                    raise GuardError(f"fence self-test {name!r} failed: {exc}") from exc
+            else:
+                if not should_pass:
+                    raise GuardError(
+                        f"fence self-test {name!r} accepted an unclosed fence"
+                    )
     mutations: list[tuple[str, Callable[[Path], None], str | None]] = []
     positive_mutations: list[tuple[str, Callable[[Path], None]]] = []
 
