@@ -461,6 +461,16 @@ delete-versus-start/poll linearizes on SQLite and PostgreSQL without releasing
 the binding. Daemon disconnect is best-effort external cleanup after the
 durable commit, not the revocation boundary.
 
+**P3-LIVE-F7 daemon host-key possession (reviewed and merged at `4b35222`,
+with strict-ingress hardening at `8bc3cdc`):** `device/start` now returns its existing fresh 32-byte approval nonce
+to the daemon, which signs `SPAWN-HOST-PAIR-POSSESSION-V1` over the exact raw
+device code, nonce, and strict Ed25519 host public key before printing the user
+code. The server records a one-way versioned proof state only on that exact
+unexpired pending row. Pending browser review, approval, and token-producing
+poll all fail closed without it. Cross-code, nonce, key, ceremony, expiry, and
+deletion replay paths cannot create a Host, retained ownership claim, pin, or
+token. Rust produces the shared golden signature and Python verifies it.
+
 This is only the server/browser first-contact half of pairing. Later server
 revocation can block an unconsumed approval, but it cannot erase a pin already
 persisted by a daemon in 02E. 02D makes no peer-discovery, live-signaling, or
@@ -598,12 +608,13 @@ finding a hard live prerequisite:
 - **F6:** null/unkeyed Hosts and missing local identities/pins are refused at
   `/ws/daemon`, `/ws/host`, `/ws/browser`, daemon dispatch, browser agent, and
   HostControl prerequisites. There is no unsigned compatibility path.
-- **F7:** pairing gains a fresh non-replayable server challenge and a
-  domain-separated daemon proof bound to the exact ceremony/key before
-  approval or token issue.
+- **F7:** reviewed and merged pairing requires a fresh non-replayable server
+  challenge and a domain-separated daemon proof bound to the exact ceremony/key
+  before approval or token issue. This foundation alone makes no live-signaling
+  claim.
 - **F8:** Host deletion retains both a durable key-owner claim and a
-  deletion/device-code revocation fence. The parallel server branch owns this
-  work, which remains a final live dependency.
+  deletion/device-code revocation fence. This work is reviewed and merged at
+  `8805622`.
 
 The final integration makes verified types mandatory in daemon
 `handle_offer`/`handle_host_offer` and centralized browser remote-description
@@ -674,8 +685,8 @@ until the decision passes review and is merged.
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
 5. After 02E passes combined integration validation, close the foundation
-   findings under P3-AUDIT-01, preserve reviewed F8, then implement the
-   remaining P3-LIVE-F1 through F7 work, browser auth/trust scoping, and the
+   findings under P3-AUDIT-01, preserve reviewed F7 and F8, then implement the
+   remaining P3-LIVE-F1 through F6 work, browser auth/trust scoping, and the
    signed-only cutover as independently reviewed hard dependencies. Only after
    those pass integrate live signed WebSocket
    signaling bound to SDP, session, agent-or-host scope, protocol version,

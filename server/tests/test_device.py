@@ -29,6 +29,10 @@ from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
 )
+from spawn_server.host_pair_possession import (
+    decode_device_code,
+    encode_host_pair_possession_transcript,
+)
 from spawn_server.models import (
     BrowserDevice,
     DeviceCode,
@@ -37,6 +41,7 @@ from spawn_server.models import (
     HostKeyClaim,
     User,
 )
+from spawn_server.routes import device as device_routes
 
 _KEY_VECTORS = json.loads(
     (Path(__file__).parents[2] / "proto" / "ed25519-public-key-negative-vectors.json").read_text()
@@ -107,7 +112,22 @@ async def _revoke_browser(client, auth: dict[str, str], device: dict):
     return response.json()
 
 
-async def _start(client, public_key: str, *, name: str = "gpu-box-1") -> dict:
+async def _mark_possession_verified(device_code: str) -> None:
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, device_code)
+        assert dc is not None
+        dc.host_possession_version = 1
+        dc.host_possession_verified_at = datetime.now(UTC)
+        await session.commit()
+
+
+async def _start(
+    client,
+    public_key: str,
+    *,
+    name: str = "gpu-box-1",
+    proved: bool = True,
+) -> dict:
     response = await client.post(
         "/api/auth/device/start",
         json={
@@ -120,7 +140,32 @@ async def _start(client, public_key: str, *, name: str = "gpu-box-1") -> dict:
         },
     )
     assert response.status_code == 200, response.text
-    return response.json()
+    start = response.json()
+    if proved:
+        # Most existing device-flow tests use the shared accepted-point corpus,
+        # whose private scalars are deliberately unavailable. Dedicated proof
+        # tests below exercise the real endpoint with generated signing keys.
+        await _mark_possession_verified(start["device_code"])
+    return start
+
+
+async def _prove_possession(client, start: dict, private_key: Ed25519PrivateKey):
+    public_key = private_key.public_key().public_bytes_raw()
+    transcript = encode_host_pair_possession_transcript(
+        decode_device_code(start["device_code"]),
+        decode_approval_nonce(start["approval_nonce"]),
+        public_key,
+    )
+    return await client.post(
+        "/api/auth/device/possession",
+        json={
+            "device_code": start["device_code"],
+            "approval_nonce": start["approval_nonce"],
+            "host_key_algorithm": "ed25519",
+            "host_public_key": _wire(public_key),
+            "signature": _wire(private_key.sign(transcript)),
+        },
+    )
 
 
 async def _poll(client, start: dict, public_key: str):
@@ -289,6 +334,506 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
         assert pin is not None
         assert pin.browser_public_key == browser[0]["public_key"]
         assert pin.browser_key_fingerprint == browser[0]["fingerprint"]
+
+
+async def test_host_possession_is_required_before_review_approval_or_token_issue(client):
+    user_id, auth = await _signup(client, "host-possession-required@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    host_private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(host_private_key.public_key().public_bytes_raw())
+    start = await _start(client, public_key, name="proved-host", proved=False)
+    untrusted_review = {
+        "host_name": "proved-host",
+        "approval_nonce": start["approval_nonce"],
+        "host_key_algorithm": "ed25519",
+        "host_public_key": public_key,
+        "host_key_fingerprint": host_key_fingerprint("ed25519", public_key),
+    }
+
+    pending = await client.post(
+        "/api/auth/device/pending",
+        json={"user_code": start["user_code"]},
+        headers=auth,
+    )
+    assert pending.status_code == 409
+    assert "possession proof" in pending.json()["detail"]
+    blocked_approval = await _approve(
+        client,
+        start,
+        user_id,
+        auth,
+        untrusted_review,
+        browser,
+    )
+    assert blocked_approval.status_code == 409
+    assert (await _poll(client, start, public_key)).json() == {
+        "error": "authorization_pending"
+    }
+    async with get_sessionmaker()() as session:
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
+        assert (
+            await session.execute(select(func.count(HostKeyClaim.host_public_key)))
+        ).scalar_one() == 0
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.host_id)))
+        ).scalar_one() == 0
+
+    proof = await _prove_possession(client, start, host_private_key)
+    assert proof.status_code == 200, proof.text
+    assert proof.json() == {"verified": True, "version": 1}
+    retry = await _prove_possession(client, start, host_private_key)
+    assert retry.status_code == 200, retry.text
+    assert retry.json() == proof.json()
+
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+    poll = await _poll(client, start, public_key)
+    assert poll.status_code == 200, poll.text
+    assert "access_token" in poll.json()
+    assert "signature" not in str(proof.json()).lower()
+    assert "private" not in str(start).lower()
+
+
+def _possession_request(
+    start: dict,
+    host_private_key: Ed25519PrivateKey,
+    *,
+    device_code: str | None = None,
+    approval_nonce: str | None = None,
+    host_public_key: str | None = None,
+) -> dict:
+    device_code = device_code or start["device_code"]
+    approval_nonce = approval_nonce or start["approval_nonce"]
+    public_bytes = host_private_key.public_key().public_bytes_raw()
+    transcript = encode_host_pair_possession_transcript(
+        decode_device_code(start["device_code"]),
+        decode_approval_nonce(start["approval_nonce"]),
+        public_bytes,
+    )
+    return {
+        "device_code": device_code,
+        "approval_nonce": approval_nonce,
+        "host_key_algorithm": "ed25519",
+        "host_public_key": host_public_key or _wire(public_bytes),
+        "signature": _wire(host_private_key.sign(transcript)),
+    }
+
+
+async def test_possession_proof_rejects_binding_substitution_and_cross_ceremony_replay(client):
+    host_private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(host_private_key.public_key().public_bytes_raw())
+    first = await _start(client, public_key, proved=False)
+    second = await _start(client, public_key, proved=False)
+    valid_first = _possession_request(first, host_private_key)
+
+    changed_code = bytearray(decode_device_code(first["device_code"]))
+    changed_code[0] ^= 1
+    wrong_code = await client.post(
+        "/api/auth/device/possession",
+        json={**valid_first, "device_code": _wire(changed_code)},
+    )
+    assert wrong_code.status_code == 422
+
+    changed_nonce = bytearray(decode_approval_nonce(first["approval_nonce"]))
+    changed_nonce[0] ^= 1
+    wrong_nonce = await client.post(
+        "/api/auth/device/possession",
+        json={**valid_first, "approval_nonce": _wire(changed_nonce)},
+    )
+    assert wrong_nonce.status_code == 422
+
+    wrong_private_key = Ed25519PrivateKey.generate()
+    wrong_key = await client.post(
+        "/api/auth/device/possession",
+        json={
+            **valid_first,
+            "host_public_key": _wire(wrong_private_key.public_key().public_bytes_raw()),
+        },
+    )
+    assert wrong_key.status_code == 422
+
+    cross_ceremony = await client.post(
+        "/api/auth/device/possession",
+        json={
+            **valid_first,
+            "device_code": second["device_code"],
+            "approval_nonce": second["approval_nonce"],
+        },
+    )
+    assert cross_ceremony.status_code == 422
+
+    async with get_sessionmaker()() as session:
+        for start in (first, second):
+            dc = await session.get(DeviceCode, start["device_code"])
+            assert dc is not None
+            assert dc.host_possession_version is None
+            assert dc.host_possession_verified_at is None
+
+
+async def test_possession_proof_rejects_malformed_high_s_invalid_r_and_expiry(client):
+    host_private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(host_private_key.public_key().public_bytes_raw())
+    start = await _start(client, public_key, proved=False)
+    valid = _possession_request(start, host_private_key)
+    signature = bytearray(base64.urlsafe_b64decode(valid["signature"] + "=="))
+    ed25519_order = 2**252 + 27742317777372353535851937790883648493
+    high_s = bytes(signature[:32]) + ed25519_order.to_bytes(32, "little")
+    invalid_r = bytes([0xFF] * 32) + bytes(signature[32:])
+
+    for rejected_signature in (
+        valid["signature"][:-1],
+        valid["signature"] + "=",
+        _wire(high_s),
+        _wire(invalid_r),
+    ):
+        rejected = await client.post(
+            "/api/auth/device/possession",
+            json={**valid, "signature": rejected_signature},
+        )
+        assert rejected.status_code == 422, rejected.text
+
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        dc.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    expired = await client.post("/api/auth/device/possession", json=valid)
+    assert expired.status_code == 400
+    assert "expired" in expired.json()["detail"]
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        assert dc.host_possession_version is None
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
+
+
+async def _assert_concurrent_possession_retries_are_idempotent(
+    client,
+    *,
+    public_key: str,
+    host_private_key: Ed25519PrivateKey,
+) -> None:
+    start = await _start(client, public_key, proved=False)
+    responses = await asyncio.gather(
+        *(_prove_possession(client, start, host_private_key) for _ in range(16))
+    )
+    assert [(response.status_code, response.json()) for response in responses] == [
+        (200, {"verified": True, "version": 1})
+    ] * 16
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        assert dc.host_possession_version == 1
+        assert dc.host_possession_verified_at is not None
+
+
+async def test_file_sqlite_concurrent_possession_retries_are_idempotent(file_sqlite_client):
+    private_key = Ed25519PrivateKey.generate()
+    await _assert_concurrent_possession_retries_are_idempotent(
+        file_sqlite_client,
+        public_key=_wire(private_key.public_key().public_bytes_raw()),
+        host_private_key=private_key,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_concurrent_possession_retries_are_idempotent(client):
+    private_key = Ed25519PrivateKey.generate()
+    await _assert_concurrent_possession_retries_are_idempotent(
+        client,
+        public_key=_wire(private_key.public_key().public_bytes_raw()),
+        host_private_key=private_key,
+    )
+
+
+async def _assert_host_possession_state_constraint(client) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(private_key.public_key().public_bytes_raw())
+    start = await _start(client, public_key, proved=False)
+    verified_at = datetime.now(UTC)
+
+    for version, timestamp in (
+        (1, None),
+        (None, verified_at),
+        (2, verified_at),
+    ):
+        async with get_sessionmaker()() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == start["device_code"])
+                    .values(
+                        host_possession_version=version,
+                        host_possession_verified_at=timestamp,
+                    )
+                )
+                await session.commit()
+
+    async with get_sessionmaker()() as session:
+        row = await session.get(DeviceCode, start["device_code"])
+        assert row is not None
+        assert row.host_possession_version is None
+        assert row.host_possession_verified_at is None
+        row.host_possession_version = 1
+        row.host_possession_verified_at = verified_at
+        await session.commit()
+
+
+async def test_file_sqlite_host_possession_state_constraint(file_sqlite_client):
+    await _assert_host_possession_state_constraint(file_sqlite_client)
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires PostgreSQL constraint enforcement",
+)
+async def test_postgresql_host_possession_state_constraint(client):
+    await _assert_host_possession_state_constraint(client)
+
+
+def _is_possession_transition(statement) -> bool:
+    table = getattr(statement, "table", None)
+    return bool(
+        getattr(statement, "is_update", False)
+        and getattr(table, "name", None) == "device_codes"
+        and "host_possession_version" in str(statement)
+        and getattr(statement, "_returning", ())
+    )
+
+
+def _is_expiry_transition(statement) -> bool:
+    table = getattr(statement, "table", None)
+    where = str(getattr(statement, "whereclause", ""))
+    return bool(
+        getattr(statement, "is_update", False)
+        and getattr(table, "name", None) == "device_codes"
+        and "device_codes.expires_at <=" in where
+        and "device_codes.status" in where
+    )
+
+
+async def _assert_proof_delete_race_linearizes(
+    client,
+    monkeypatch,
+    *,
+    email: str,
+    proof_commits_first: bool,
+) -> None:
+    user_id, auth = await _signup(client, email)
+    browser = await _register_browser(client, user_id, auth)
+    private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(private_key.public_key().public_bytes_raw())
+    paired = await _pair(client, user_id, auth, browser, public_key)
+    start = await _start(client, public_key, proved=False)
+    reached = asyncio.Event()
+    release = asyncio.Event()
+
+    with monkeypatch.context() as patch:
+        original_execute = AsyncSession.execute
+
+        async def execute_with_barrier(self, statement, *args, **kwargs):
+            result = await original_execute(self, statement, *args, **kwargs)
+            target = (
+                _is_possession_transition(statement)
+                if proof_commits_first
+                else _is_host_device_code_fence(statement)
+            )
+            if target and not reached.is_set():
+                reached.set()
+                await release.wait()
+            return result
+
+        patch.setattr(AsyncSession, "execute", execute_with_barrier)
+        first = asyncio.create_task(
+            _prove_possession(client, start, private_key)
+            if proof_commits_first
+            else client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+        )
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        second = asyncio.create_task(
+            client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+            if proof_commits_first
+            else _prove_possession(client, start, private_key)
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not second.done()
+        finally:
+            release.set()
+        first_response, second_response = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+
+    proof = first_response if proof_commits_first else second_response
+    deletion = second_response if proof_commits_first else first_response
+    assert deletion.status_code == 204, deletion.text
+    if proof_commits_first:
+        assert proof.status_code == 200, proof.text
+    else:
+        assert proof.status_code == 404, proof.text
+    async with get_sessionmaker()() as session:
+        assert await session.get(Host, paired["host_id"]) is None
+        assert await session.get(DeviceCode, start["device_code"]) is None
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.host_id)))
+        ).scalar_one() == 0
+        claim = await session.get(HostKeyClaim, ("ed25519", public_key))
+        assert claim is not None
+        assert claim.owner_user_id == user_id
+
+
+async def test_file_sqlite_proof_delete_race_linearizes_both_orders(
+    file_sqlite_client,
+    monkeypatch,
+):
+    await _assert_proof_delete_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-proof-before-delete@example.com",
+        proof_commits_first=True,
+    )
+    await _assert_proof_delete_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-delete-before-proof@example.com",
+        proof_commits_first=False,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_proof_delete_race_linearizes_both_orders(client, monkeypatch):
+    await _assert_proof_delete_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-proof-before-delete@example.com",
+        proof_commits_first=True,
+    )
+    await _assert_proof_delete_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-delete-before-proof@example.com",
+        proof_commits_first=False,
+    )
+
+
+async def _assert_proof_expiry_race_linearizes(
+    client,
+    monkeypatch,
+    *,
+    proof_commits_first: bool,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = _wire(private_key.public_key().public_bytes_raw())
+    start = await _start(client, public_key, proved=False)
+    boundary = datetime(2030, 1, 1, tzinfo=UTC)
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        dc.expires_at = boundary
+        await session.commit()
+
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    with monkeypatch.context() as patch:
+        original_execute = AsyncSession.execute
+
+        def task_clock() -> datetime:
+            task = asyncio.current_task()
+            return (
+                boundary - timedelta(seconds=1)
+                if task is not None and task.get_name() == "possession-proof"
+                else boundary + timedelta(seconds=1)
+            )
+
+        async def execute_with_barrier(self, statement, *args, **kwargs):
+            result = await original_execute(self, statement, *args, **kwargs)
+            target = (
+                _is_possession_transition(statement)
+                if proof_commits_first
+                else _is_expiry_transition(statement)
+            )
+            if target and not reached.is_set():
+                reached.set()
+                await release.wait()
+            return result
+
+        patch.setattr(device_routes, "_utcnow", task_clock)
+        patch.setattr(AsyncSession, "execute", execute_with_barrier)
+        first = asyncio.create_task(
+            _prove_possession(client, start, private_key)
+            if proof_commits_first
+            else _poll(client, start, public_key),
+            name="possession-proof" if proof_commits_first else "ceremony-expiry",
+        )
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        second = asyncio.create_task(
+            _poll(client, start, public_key)
+            if proof_commits_first
+            else _prove_possession(client, start, private_key),
+            name="ceremony-expiry" if proof_commits_first else "possession-proof",
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not second.done()
+        finally:
+            release.set()
+        first_response, second_response = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+
+    proof = first_response if proof_commits_first else second_response
+    expiry = second_response if proof_commits_first else first_response
+    assert expiry.json() == {"error": "expired_token"}
+    assert proof.status_code == (200 if proof_commits_first else 409), proof.text
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        assert dc.status == "expired"
+        assert (dc.host_possession_version == 1) == proof_commits_first
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
+        assert (
+            await session.execute(select(func.count(HostKeyClaim.host_public_key)))
+        ).scalar_one() == 0
+
+
+async def test_file_sqlite_proof_expiry_race_linearizes_both_orders(
+    file_sqlite_client,
+    monkeypatch,
+):
+    await _assert_proof_expiry_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        proof_commits_first=True,
+    )
+    await _assert_proof_expiry_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        proof_commits_first=False,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_proof_expiry_race_linearizes_both_orders(client, monkeypatch):
+    await _assert_proof_expiry_race_linearizes(
+        client,
+        monkeypatch,
+        proof_commits_first=True,
+    )
+    await _assert_proof_expiry_race_linearizes(
+        client,
+        monkeypatch,
+        proof_commits_first=False,
+    )
 
 
 async def test_approval_rejects_stale_nonce_and_substituted_browser_tuple(client):
@@ -1378,7 +1923,7 @@ async def _assert_delete_start_race_linearizes(
 
         patch.setattr(AsyncSession, "execute", execute_with_barrier)
         first = asyncio.create_task(
-            _start(client, public_key, name="delete-start-race")
+            _start(client, public_key, name="delete-start-race", proved=False)
             if start_commits_first
             else client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
         )
@@ -1386,7 +1931,7 @@ async def _assert_delete_start_race_linearizes(
         second = asyncio.create_task(
             client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
             if start_commits_first
-            else _start(client, public_key, name="delete-start-race")
+            else _start(client, public_key, name="delete-start-race", proved=False)
         )
         try:
             await asyncio.sleep(0.05)
@@ -1411,6 +1956,7 @@ async def _assert_delete_start_race_linearizes(
         assert (await _poll(client, start, public_key)).json() == {"error": "expired_token"}
         return
 
+    await _mark_possession_verified(start["device_code"])
     review = await _review(client, start, auth)
     approval = await _approve(client, start, user_id, auth, review, browser)
     assert approval.status_code == 200, approval.text

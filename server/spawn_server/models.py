@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    SmallInteger,
     String,
     UniqueConstraint,
 )
@@ -396,6 +397,12 @@ class DeviceCode(Base):
     host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
     host_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
     approval_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    # Nullable is the explicit fail-closed state for pre-0021 and newly-started
+    # ceremonies. Only a verified v1 host-key signature sets this one-way pair.
+    host_possession_version: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    host_possession_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     browser_device_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=True
     )
@@ -422,6 +429,12 @@ class DeviceCode(Base):
         CheckConstraint(
             "approval_nonce IS NULL OR length(approval_nonce) = 43",
             name="ck_device_codes_approval_nonce",
+        ),
+        CheckConstraint(
+            "(host_possession_version IS NULL AND host_possession_verified_at IS NULL) OR "
+            "(host_possession_version IS NOT NULL AND host_possession_version = 1 AND "
+            "host_possession_verified_at IS NOT NULL)",
+            name="ck_device_codes_host_possession",
         ),
         CheckConstraint(
             "(browser_device_id IS NULL AND browser_key_algorithm IS NULL AND "
