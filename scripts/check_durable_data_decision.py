@@ -103,6 +103,11 @@ COMMONMARK = MarkdownIt("commonmark", {"html": True}).enable(["strikethrough", "
 # is safer than maintaining a bypass-prone per-role attribute list.
 VISIBLE_HTML_ATTRIBUTES = frozenset({"alt", "label", "placeholder", "title", "value"})
 
+# CommonMark exposes link/image destinations as href/src attributes, but those
+# are not renderer-visible prose. Its title attribute is a visible tooltip and
+# must join the exact prose inventory. Image alt text remains token child prose.
+VISIBLE_COMMONMARK_ATTRIBUTES = frozenset({"title"})
+
 
 class VisibleHtmlParser(HTMLParser):
     def __init__(self) -> None:
@@ -129,6 +134,19 @@ def visible_html(source: str) -> str:
     except Exception as exc:
         raise GuardError(f"invalid active HTML: {exc}") from exc
     return " ".join(parser.parts)
+
+
+def commonmark_visible_attributes(token: Token) -> tuple[str, ...]:
+    return tuple(
+        value
+        for name in sorted(VISIBLE_COMMONMARK_ATTRIBUTES)
+        if (value := token.attrGet(name)) is not None and value
+    )
+
+
+def append_separated(parts: list[str], values: tuple[str, ...]) -> None:
+    for value in values:
+        parts.extend((" ", value, " "))
 
 
 def markdown_tokens(path: Path) -> list[Token]:
@@ -163,7 +181,16 @@ def markdown_tokens(path: Path) -> list[Token]:
 
 def visible_inline_tokens(tokens: list[Token]) -> str:
     parts: list[str] = []
+    link_attributes: list[tuple[str, ...]] = []
     for token in tokens:
+        if token.type == "link_open":
+            link_attributes.append(commonmark_visible_attributes(token))
+            continue
+        if token.type == "link_close":
+            if not link_attributes:
+                raise GuardError("malformed CommonMark link token nesting")
+            append_separated(parts, link_attributes.pop())
+            continue
         if token.type in {"text", "code_inline"}:
             parts.append(token.content)
         elif token.type in {"softbreak", "hardbreak"}:
@@ -176,8 +203,14 @@ def visible_inline_tokens(tokens: list[Token]) -> str:
                 if token.children is not None
                 else token.content
             )
+            append_separated(parts, commonmark_visible_attributes(token))
         elif token.children is not None:
             parts.append(visible_inline_tokens(token.children))
+            append_separated(parts, commonmark_visible_attributes(token))
+        else:
+            append_separated(parts, commonmark_visible_attributes(token))
+    if link_attributes:
+        raise GuardError("malformed CommonMark link token nesting")
     return canonical_visible_text("".join(parts), casefold=False)
 
 
@@ -1498,6 +1531,46 @@ def self_test(source: Path) -> None:
             "ARIA description prose remains visible",
             adr_path,
             '<div aria-description="Phase 2 is finished."></div>',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "CommonMark image alt prose remains visible",
+            adr_path,
+            "![Phase 2 is finished.](missing.png)",
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "inline CommonMark link title remains visible",
+            adr_path,
+            '[x](https://example.invalid "Phase 2 is finished.")',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "inline CommonMark image title remains visible",
+            adr_path,
+            '![alt](missing.png "Phase 2 is finished.")',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "reference CommonMark link title remains visible",
+            adr_path,
+            '[x][claim]\n\n[claim]: https://example.invalid "Phase 2 is finished."',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "reference CommonMark image title remains visible",
+            adr_path,
+            '![alt][claim]\n\n[claim]: missing.png "Phase 2 is finished."',
             runtime_safe,
             "data-design-prose",
             "phase 2 is finished.",

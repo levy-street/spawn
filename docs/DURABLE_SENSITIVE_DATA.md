@@ -83,6 +83,10 @@ code-block tokens, and inventories rendered prose/inline-code/HTML text nodes.
 Raw HTML also inventories `alt`, `value`, `title`, `label`, `placeholder`, and
 every `aria-*` attribute value; these may expose visual or accessibility prose,
 so the guard treats them conservatively even where one browser hides a value.
+Native CommonMark image alt text remains child prose, and the only supported
+renderer-visible native attribute, link/image `title`, is inventoried after its
+associated label/alt with an explicit whitespace separator. Native `href` and
+`src` destinations are not rendered as content or a tooltip and are excluded.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in
