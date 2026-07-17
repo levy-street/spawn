@@ -108,6 +108,17 @@ VISIBLE_HTML_ATTRIBUTES = frozenset({"alt", "label", "placeholder", "title", "va
 # must join the exact prose inventory. Image alt text remains token child prose.
 VISIBLE_COMMONMARK_ATTRIBUTES = frozenset({"title"})
 
+# Exhaustive child-token policy for the pinned CommonMark inline rules plus the
+# enabled strikethrough extension. Escape and entity rules emit text_special;
+# it is renderer-visible content, not ignorable parser bookkeeping. Link/image,
+# HTML, and breaks have dedicated branches below. Formatting markers are the
+# only child tokens that intentionally contribute no characters. Any new token
+# type fails closed until this policy and its fixtures are reviewed.
+INLINE_VISIBLE_TEXT_TOKEN_TYPES = frozenset({"text", "text_special", "code_inline"})
+INLINE_STRUCTURAL_TOKEN_TYPES = frozenset(
+    {"em_open", "em_close", "strong_open", "strong_close", "s_open", "s_close"}
+)
+
 
 class VisibleHtmlParser(HTMLParser):
     def __init__(self) -> None:
@@ -191,7 +202,7 @@ def visible_inline_tokens(tokens: list[Token]) -> str:
                 raise GuardError("malformed CommonMark link token nesting")
             append_separated(parts, link_attributes.pop())
             continue
-        if token.type in {"text", "code_inline"}:
+        if token.type in INLINE_VISIBLE_TEXT_TOKEN_TYPES:
             parts.append(token.content)
         elif token.type in {"softbreak", "hardbreak"}:
             parts.append(" ")
@@ -204,11 +215,10 @@ def visible_inline_tokens(tokens: list[Token]) -> str:
                 else token.content
             )
             append_separated(parts, commonmark_visible_attributes(token))
-        elif token.children is not None:
-            parts.append(visible_inline_tokens(token.children))
+        elif token.type in INLINE_STRUCTURAL_TOKEN_TYPES:
             append_separated(parts, commonmark_visible_attributes(token))
         else:
-            append_separated(parts, commonmark_visible_attributes(token))
+            raise GuardError(f"unsupported CommonMark inline token type: {token.type}")
     if link_attributes:
         raise GuardError("malformed CommonMark link token nesting")
     return canonical_visible_text("".join(parts), casefold=False)
@@ -933,6 +943,13 @@ def replace_required(path: Path, old: str, new: str) -> None:
 
 def self_test(source: Path) -> None:
     validate(source)
+    try:
+        visible_inline_tokens([Token("future_inline", "", 0)])
+    except GuardError as exc:
+        if "unsupported CommonMark inline token type" not in str(exc):
+            raise
+    else:
+        raise GuardError("unknown CommonMark inline token did not fail closed")
     mutations: list[tuple[str, Callable[[Path], None], str | None]] = []
     positive_mutations: list[tuple[str, Callable[[Path], None]]] = []
 
@@ -1539,6 +1556,30 @@ def self_test(source: Path) -> None:
             "CommonMark image alt prose remains visible",
             adr_path,
             "![Phase 2 is finished.](missing.png)",
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "CommonMark image alt entity whitespace remains visible",
+            adr_path,
+            "![Phase&#32;2&nbsp;is finished.](missing.png)",
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "CommonMark image alt entity whitespace and escaped punctuation remain visible",
+            adr_path,
+            "![Phase&#32;2&nbsp;is finished\\.](missing.png)",
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "CommonMark top-level entity whitespace and escaped punctuation remain visible",
+            adr_path,
+            "Phase&#32;2&nbsp;is finished\\.",
             runtime_safe,
             "data-design-prose",
             "phase 2 is finished.",

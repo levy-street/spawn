@@ -87,6 +87,10 @@ Native CommonMark image alt text remains child prose, and the only supported
 renderer-visible native attribute, link/image `title`, is inventoried after its
 associated label/alt with an explicit whitespace separator. Native `href` and
 `src` destinations are not rendered as content or a tooltip and are excluded.
+The pinned inline-token policy explicitly treats text, escaped/entity
+`text_special`, code, breaks, HTML, image alt, and link/image titles as visible;
+emphasis/strong/strikethrough markers are structural only, and every unknown
+inline child token fails closed instead of silently disappearing.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in
