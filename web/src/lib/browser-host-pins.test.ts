@@ -86,6 +86,27 @@ function resolveInput(
   };
 }
 
+function revokeInput(
+  overrides: Partial<{
+    accountId: string;
+    origin: string;
+    targetHostId: string;
+    claimedHostId: string;
+    claimedHostPublicKey: string | null;
+    claimedHostFingerprint: string | null;
+  }> = {},
+) {
+  return {
+    accountId: ACCOUNT,
+    origin: ORIGIN,
+    targetHostId: HOST_ID,
+    claimedHostId: HOST_ID,
+    claimedHostPublicKey: HOST_KEY,
+    claimedHostFingerprint: "SHA256:OfcT0KZEJT8EUpQh",
+    ...overrides,
+  };
+}
+
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -140,6 +161,26 @@ async function expectPinError(
   }
   expect(caught).toBeInstanceOf(BrowserHostPinError);
   expect((caught as BrowserHostPinError).code).toBe(code);
+}
+
+async function expectRevokeBlockedWithoutDelete(
+  factory: IDBFactory,
+  input: Parameters<typeof revokeBrowserHostPin>[0],
+  code: BrowserHostPinError["code"],
+): Promise<void> {
+  const before = JSON.stringify(await rawRecords(factory));
+  let deleteCalls = 0;
+  let caught: unknown;
+  try {
+    await revokeBrowserHostPin(input, options(factory, 2_000));
+    deleteCalls += 1;
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(BrowserHostPinError);
+  expect((caught as BrowserHostPinError).code).toBe(code);
+  expect(deleteCalls).toBe(0);
+  expect(JSON.stringify(await rawRecords(factory))).toBe(before);
 }
 
 function wireFromHex(value: string): string {
@@ -398,7 +439,7 @@ describe("browser-local host pins", () => {
 
     await approveBrowserHostPin(approvalInput(), options(factory));
     expect(await resolveActiveBrowserHostPin(resolveInput(), options(factory))).toBe(HOST_KEY);
-    await revokeBrowserHostPin(resolveInput(), options(factory, 2_000));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
     await expectPinError(
       resolveActiveBrowserHostPin(resolveInput(), options(factory)),
       "revoked_pin",
@@ -441,11 +482,60 @@ describe("browser-local host pins", () => {
     expect((await rawRecords(factory))[0].hostPublicKey).toBe(HOST_KEY);
   });
 
+  test("deletion refuses split, substituted, and unbound identities without mutation or DELETE", async () => {
+    const unboundFactory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(unboundFactory));
+    await expectRevokeBlockedWithoutDelete(unboundFactory, revokeInput(), "missing_pin");
+
+    const multipleUnboundFactory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(multipleUnboundFactory));
+    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(multipleUnboundFactory),
+    );
+    await expectRevokeBlockedWithoutDelete(
+      multipleUnboundFactory,
+      revokeInput({
+        claimedHostPublicKey: OTHER_HOST_KEY,
+        claimedHostFingerprint: otherFingerprint,
+      }),
+      "missing_pin",
+    );
+
+    const boundFactory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(boundFactory));
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(boundFactory),
+    );
+    await resolveActiveBrowserHostPin(resolveInput(), options(boundFactory));
+    await expectRevokeBlockedWithoutDelete(
+      boundFactory,
+      revokeInput({ claimedHostId: OTHER_HOST_ID }),
+      "host_id_response_mismatch",
+    );
+    await expectRevokeBlockedWithoutDelete(
+      boundFactory,
+      revokeInput({
+        claimedHostPublicKey: OTHER_HOST_KEY,
+        claimedHostFingerprint: otherFingerprint,
+      }),
+      "host_id_key_conflict",
+    );
+    await expectRevokeBlockedWithoutDelete(
+      boundFactory,
+      revokeInput({ claimedHostFingerprint: "SHA256:AAAAAAAAAAAAAAAA" }),
+      "fingerprint_mismatch",
+    );
+  });
+
   test("deletion tombstone is idempotent, survives disappearance, and blocks reappearance", async () => {
     const factory = new IDBFactory();
     await approveBrowserHostPin(approvalInput(), options(factory));
-    const first = await revokeBrowserHostPin(resolveInput(), options(factory, 2_000));
-    const retry = await revokeBrowserHostPin(resolveInput(), options(factory, 3_000));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    const first = await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
+    const retry = await revokeBrowserHostPin(revokeInput(), options(factory, 3_000));
     expect(first.state).toBe("revoked");
     expect(retry).toEqual(first);
     expect(retry.hostIds).toEqual([HOST_ID]);
@@ -465,7 +555,8 @@ describe("browser-local host pins", () => {
     const idempotent = await approveBrowserHostPin(approvalInput(), options(factory, 9_000));
     expect(idempotent).toEqual(first);
 
-    await revokeBrowserHostPin(resolveInput(), options(factory, 2_000));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
     const reactivated = await approveBrowserHostPin(approvalInput(), options(factory, 3_000));
     expect(reactivated.state).toBe("active");
     expect(reactivated.createdAtMs).toBe(1_000);

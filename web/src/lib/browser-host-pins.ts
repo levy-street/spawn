@@ -58,6 +58,7 @@ export type BrowserHostPinErrorCode =
   | "duplicate_conflict"
   | "fingerprint_mismatch"
   | "host_id_key_conflict"
+  | "host_id_response_mismatch"
   | "invalid_account"
   | "invalid_host_id"
   | "invalid_key"
@@ -94,7 +95,16 @@ export interface ResolveBrowserHostPinInput {
   readonly claimedHostFingerprint: string | null;
 }
 
-export interface RevokeBrowserHostPinInput extends ResolveBrowserHostPinInput {}
+export interface RevokeBrowserHostPinInput {
+  readonly accountId: string;
+  /** Canonical Host ID taken only from the route and used by server DELETE. */
+  readonly targetHostId: string;
+  /** Host ID returned by the Host API response for the route. */
+  readonly claimedHostId: string;
+  readonly claimedHostPublicKey: string | null;
+  readonly claimedHostFingerprint: string | null;
+  readonly origin: string;
+}
 
 interface StrictIdentity {
   readonly hostFingerprint: string;
@@ -692,56 +702,51 @@ export async function resolveActiveBrowserHostPin(
   }
 }
 
-/** Write an exact retained local tombstone before attempting server deletion. */
+/**
+ * Write an exact retained local tombstone before attempting server deletion.
+ *
+ * Deletion is intentionally not a Host-ID discovery/binding flow. The route
+ * target, Host response, and a binding established by an earlier explicit
+ * resolver call must already agree exactly. A revoked exact binding remains
+ * idempotently retryable after a server DELETE failure.
+ */
 export async function revokeBrowserHostPin(
   input: RevokeBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
 ): Promise<BrowserHostPin> {
   assertScope(input.accountId, input.origin);
-  assertCanonicalUuid(input.hostId, "hostId");
+  assertCanonicalUuid(input.targetHostId, "hostId");
+  assertCanonicalUuid(input.claimedHostId, "hostId");
+  if (input.claimedHostId !== input.targetHostId) {
+    throw new BrowserHostPinError(
+      "host_id_response_mismatch",
+      "the Host API response ID does not exactly match the route and DELETE target",
+    );
+  }
   const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
     return await compareAndWrite(database, (records) => {
       const scoped = recordsInScope(records, input.accountId, input.origin);
-      const bound = scoped.find((record) => record.hostIds.includes(input.hostId));
-      if (bound !== undefined && bound.hostPublicKey !== identity.hostPublicKey) {
+      const bound = scoped.find((record) => record.hostIds.includes(input.targetHostId));
+      if (bound === undefined) {
+        throw new BrowserHostPinError(
+          "missing_pin",
+          "server deletion requires an existing exact local Host-ID-to-key binding",
+        );
+      }
+      if (bound.hostPublicKey !== identity.hostPublicKey) {
         throw new BrowserHostPinError(
           "host_id_key_conflict",
           "this Host ID is bound to a different local key; deletion was blocked",
         );
       }
-      const exact = scoped.find((record) => record.hostPublicKey === identity.hostPublicKey);
-      if (exact === undefined) {
-        throw new BrowserHostPinError(
-          "missing_pin",
-          "server deletion requires an exact active local host pin",
-        );
-      }
-      if (exact.state === "revoked") {
-        if (exact.hostIds.includes(input.hostId)) return { result: publicPin(exact) };
-        throw new BrowserHostPinError(
-          "revoked_pin",
-          "this key is already revoked under different routing metadata; deletion was blocked",
-        );
-      }
-      if (
-        !exact.hostIds.includes(input.hostId) &&
-        exact.hostIds.length >= BROWSER_HOST_PIN_MAX_HOST_IDS
-      ) {
-        throw new BrowserHostPinError(
-          "capacity_exceeded",
-          `one local key may observe at most ${BROWSER_HOST_PIN_MAX_HOST_IDS} Host IDs`,
-        );
-      }
+      if (bound.state === "revoked") return { result: publicPin(bound) };
       const now = checkedNow(options);
       const revoked: StoredBrowserHostPinV1 = {
-        ...exact,
-        hostIds: exact.hostIds.includes(input.hostId)
-          ? exact.hostIds
-          : [...exact.hostIds, input.hostId].sort(),
-        revokedAtMs: Math.max(now, exact.approvedAtMs),
+        ...bound,
+        revokedAtMs: Math.max(now, bound.approvedAtMs),
         state: "revoked",
       };
       return { nextRecord: revoked, result: publicPin(revoked) };

@@ -31,8 +31,10 @@ import { agentActivityDetail, agentCommand, agentTitle, relativeTime } from "@/l
 import { ApiError, agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
+  BrowserHostPinError,
   browserHostPinServerOrigin,
   loadBrowserHostPin,
+  resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
 
@@ -98,18 +100,26 @@ function HostDetail() {
           false,
         );
       }
+      const targetHostId = id as string;
+      if (host.id !== targetHostId) {
+        throw new HostDeletionFlowError(
+          "Host API response ID does not exactly match the route and DELETE target",
+          false,
+        );
+      }
       let localTombstoneWritten = false;
       try {
         await revokeBrowserHostPin({
           accountId: user.id,
           origin: browserHostPinServerOrigin(),
-          hostId: host.id,
+          targetHostId,
+          claimedHostId: host.id,
           claimedHostPublicKey: host.host_public_key ?? null,
           claimedHostFingerprint: host.host_key_fingerprint ?? null,
         });
         localTombstoneWritten = true;
         setLocalDeletionPending(true);
-        await hosts.remove(id as string);
+        await hosts.remove(targetHostId);
       } catch (err) {
         const message = err instanceof ApiError || err instanceof Error ? err.message : String(err);
         throw new HostDeletionFlowError(message, localTombstoneWritten);
@@ -143,15 +153,35 @@ function HostDetail() {
     let cancelled = false;
     void (async () => {
       try {
+        if (host.id !== id) {
+          throw new Error("Host API response ID does not exactly match this route");
+        }
+        try {
+          await resolveActiveBrowserHostPin({
+            accountId: user.id,
+            origin: browserHostPinServerOrigin(),
+            hostId: id,
+            claimedHostPublicKey: hostPublicKey,
+            claimedHostFingerprint: hostFingerprint,
+          });
+        } catch (err) {
+          // An already-bound tombstone is expected after a failed server
+          // DELETE. Confirm its exact binding below without reactivating it.
+          if (!(err instanceof BrowserHostPinError) || err.code !== "revoked_pin") throw err;
+        }
         const pin = await loadBrowserHostPin({
           accountId: user.id,
           origin: browserHostPinServerOrigin(),
           hostPublicKey,
           hostFingerprint,
         });
-        if (!cancelled) setLocalDeletionPending(pin?.state === "revoked");
+        if (pin === null || !pin.hostIds.includes(id)) {
+          throw new Error("No exact local Host-ID-to-key binding exists for this route");
+        }
+        if (!cancelled) setLocalDeletionPending(pin.state === "revoked");
       } catch (err) {
         if (!cancelled) {
+          setLocalDeletionPending(false);
           setError(
             `Local host trust status is unavailable: ${err instanceof Error ? err.message : String(err)}`,
           );
@@ -161,7 +191,7 @@ function HostDetail() {
     return () => {
       cancelled = true;
     };
-  }, [host, user]);
+  }, [host, user, id]);
 
   const submitRename = () => {
     const next = draftName.trim();

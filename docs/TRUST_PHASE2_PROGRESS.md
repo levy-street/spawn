@@ -532,15 +532,23 @@ key/fingerprint, requires an active local match, and only then may bind the
 bounded routing Host ID. Missing/null/mismatched/revoked pins and a previously
 bound Host ID with a new key fail loudly.
 
-Explicit Host deletion now writes the locally matched host/key/Host-ID revoked
-tombstone before issuing server DELETE. Local failure aborts the DELETE; server
-failure keeps a retryable tombstone, and Host API disappearance/reappearance
-does not erase or reactivate it. Tests cover first approval, reload and native
+Host-detail trust resolution first requires the Host response ID to equal the
+canonical route exactly, then may establish the bounded active Host-ID/key
+binding. Explicit Host deletion cannot discover or add a binding: its response
+ID must again equal the route/DELETE target, and the response key/fingerprint
+must match an existing exact active or already-tombstoned binding. It writes
+that retained tombstone before issuing DELETE to the same route target. Local
+failure aborts DELETE without changing any pin; server failure keeps an
+idempotently retryable tombstone, and Host API disappearance/reappearance does
+not erase or reactivate it. Tests cover first approval, reload and native
 multi-tab convergence, account/origin isolation, cap+1, corruption/version and
 unknown fields, the shared 49-key weak/noncanonical/off-curve corpus,
-fingerprint/key substitution, partial approval/deletion recovery, strict
-resolver cases, disappearance/reappearance, exact reapproval, and public-only
-pin persistence.
+split response/route IDs, fingerprint/key substitution, unbound and multiple
+active-unbound identities, partial approval/deletion recovery, strict resolver
+cases, disappearance/reappearance, exact reapproval, and public-only pin
+persistence. Every blocked deletion case proves zero DELETE and byte-equivalent
+local records; the normal path proves resolution binds before tombstone-first
+DELETE.
 
 This is a review-pending browser-local foundation only. RTC, terminal pools,
 HostControl, and server WebSocket admission do not consume the resolver yet;
