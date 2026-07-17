@@ -127,6 +127,17 @@ function storageFailure(message: string): BrowserDeviceIdentityError {
   return new BrowserDeviceIdentityError("storage_failure", message);
 }
 
+function hasExpectedObjectStoreSchema(database: IDBDatabase): boolean {
+  try {
+    const store = database
+      .transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readonly")
+      .objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
+    return store.keyPath === "accountId" && store.autoIncrement === false;
+  } catch {
+    return false;
+  }
+}
+
 function openDatabase(factory: IDBFactory, databaseName: string): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     let finished = false;
@@ -180,12 +191,15 @@ function openDatabase(factory: IDBFactory, databaseName: string): Promise<IDBDat
         database.close();
         return;
       }
-      if (!database.objectStoreNames.contains(BROWSER_DEVICE_IDENTITY_STORE_NAME)) {
+      if (
+        !database.objectStoreNames.contains(BROWSER_DEVICE_IDENTITY_STORE_NAME) ||
+        !hasExpectedObjectStoreSchema(database)
+      ) {
         database.close();
         fail(
           new BrowserDeviceIdentityError(
             "corrupt_record",
-            "browser device identity object store is missing",
+            "browser device identity object store schema is invalid",
           ),
         );
         return;

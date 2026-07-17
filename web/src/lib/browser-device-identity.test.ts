@@ -83,6 +83,53 @@ async function putRawRecord(
   }
 }
 
+async function precreateDatabaseWithSchema(
+  factory: IDBFactory,
+  schema: {
+    autoIncrement: boolean;
+    keyPath: string | readonly string[] | null;
+    seedKey?: IDBValidKey;
+    seedRecord: Record<string, unknown>;
+  },
+): Promise<void> {
+  const request = factory.open(
+    BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
+    BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
+  );
+  request.onupgradeneeded = () => {
+    const keyPath: string | string[] | null =
+      typeof schema.keyPath === "string" || schema.keyPath === null
+        ? schema.keyPath
+        : Array.from(schema.keyPath);
+    const store = request.result.createObjectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME, {
+      autoIncrement: schema.autoIncrement,
+      keyPath,
+    });
+    if (schema.seedKey === undefined) {
+      store.add(schema.seedRecord);
+    } else {
+      store.add(schema.seedRecord, schema.seedKey);
+    }
+  };
+  const database = await requestResult(request);
+  database.close();
+}
+
+async function rawRecords(factory: IDBFactory): Promise<unknown[]> {
+  const database = await openExisting(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+  try {
+    const transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readonly");
+    const completion = transactionResult(transaction);
+    const records = await requestResult(
+      transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME).getAll(),
+    );
+    await completion;
+    return records;
+  } finally {
+    database.close();
+  }
+}
+
 function transcript(accountId: string, publicKeyWire: string): SignedSignalTranscript {
   return {
     signalKind: "offer",
@@ -247,6 +294,50 @@ describe("browser device identity", () => {
       loadOrCreateBrowserDeviceIdentity("account-unavailable", { indexedDBFactory: null }),
       "storage_unavailable",
     );
+  });
+
+  test("rejects every mismatched version-1 object-store schema without creating a key", async () => {
+    const schemas = [
+      {
+        autoIncrement: false,
+        keyPath: "wrongAccountId",
+        seedRecord: { marker: "wrong-key-path", wrongAccountId: "seed" },
+      },
+      {
+        autoIncrement: false,
+        keyPath: ["tenant", "account"],
+        seedRecord: { account: "seed", marker: "compound-key-path", tenant: "test" },
+      },
+      {
+        autoIncrement: false,
+        keyPath: null,
+        seedKey: "seed",
+        seedRecord: { marker: "out-of-line-key" },
+      },
+      {
+        autoIncrement: true,
+        keyPath: "accountId",
+        seedRecord: { accountId: "seed", marker: "auto-increment" },
+      },
+    ] as const;
+
+    for (const schema of schemas) {
+      const factory = new IDBFactory();
+      const storage = options(factory);
+      await precreateDatabaseWithSchema(factory, schema);
+      const before = await rawRecords(factory);
+
+      await expectIdentityError(
+        loadOrCreateBrowserDeviceIdentity("account-schema-check", storage),
+        "corrupt_record",
+      );
+      await expectIdentityError(
+        loadOrCreateBrowserDeviceIdentity("account-schema-check", storage),
+        "corrupt_record",
+      );
+
+      expect(await rawRecords(factory)).toEqual(before);
+    }
   });
 
   test("deletes only when the expected public key matches", async () => {

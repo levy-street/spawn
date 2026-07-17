@@ -101,6 +101,120 @@ test("persists a non-extractable identity across real browser page sessions", as
   ]);
 });
 
+test("rejects corrupt version-1 store schemas repeatedly without rotating", async ({ page }) => {
+  await loadFixture(page);
+  const results = await page.evaluate(async () => {
+    const api = globalThis.SpawnBrowserIdentity;
+    const deleteDatabase = () =>
+      new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error("database deletion blocked"));
+      });
+    const createInvalidDatabase = (keyPath: string, autoIncrement: boolean, marker: string) =>
+      new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open(
+          api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
+          api.BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
+        );
+        request.onupgradeneeded = () => {
+          const store = request.result.createObjectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME, {
+            autoIncrement,
+            keyPath,
+          });
+          store.add({ [keyPath]: "seed", marker });
+        };
+        request.onsuccess = () => {
+          request.result.close();
+          resolve();
+        };
+        request.onerror = () => reject(request.error);
+      });
+    const inspectDatabase = () =>
+      new Promise<{
+        autoIncrement: boolean;
+        keyPath: IDBObjectStore["keyPath"];
+        records: unknown[];
+      }>((resolve, reject) => {
+        const request = indexedDB.open(api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+        request.onsuccess = () => {
+          const database = request.result;
+          const transaction = database.transaction(
+            api.BROWSER_DEVICE_IDENTITY_STORE_NAME,
+            "readonly",
+          );
+          const store = transaction.objectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME);
+          const records = store.getAll();
+          records.onsuccess = () => {
+            resolve({
+              autoIncrement: store.autoIncrement,
+              keyPath: store.keyPath,
+              records: records.result,
+            });
+            database.close();
+          };
+          records.onerror = () => {
+            database.close();
+            reject(records.error);
+          };
+        };
+        request.onerror = () => reject(request.error);
+      });
+
+    const cases = [
+      { autoIncrement: false, keyPath: "wrongAccountId", marker: "wrong-key-path" },
+      { autoIncrement: true, keyPath: "accountId", marker: "auto-increment" },
+    ];
+    const observed = [];
+    for (const invalid of cases) {
+      await deleteDatabase();
+      await createInvalidDatabase(invalid.keyPath, invalid.autoIncrement, invalid.marker);
+      const before = await inspectDatabase();
+      const errors = [];
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await api.loadOrCreateBrowserDeviceIdentity("browser-invalid-schema");
+          errors.push("unexpected-success");
+        } catch (error) {
+          errors.push(error instanceof api.BrowserDeviceIdentityError ? error.code : "unexpected");
+        }
+      }
+      observed.push({ after: await inspectDatabase(), before, errors });
+    }
+    return observed;
+  });
+
+  expect(results).toEqual([
+    {
+      after: {
+        autoIncrement: false,
+        keyPath: "wrongAccountId",
+        records: [{ marker: "wrong-key-path", wrongAccountId: "seed" }],
+      },
+      before: {
+        autoIncrement: false,
+        keyPath: "wrongAccountId",
+        records: [{ marker: "wrong-key-path", wrongAccountId: "seed" }],
+      },
+      errors: ["corrupt_record", "corrupt_record"],
+    },
+    {
+      after: {
+        autoIncrement: true,
+        keyPath: "accountId",
+        records: [{ accountId: "seed", marker: "auto-increment" }],
+      },
+      before: {
+        autoIncrement: true,
+        keyPath: "accountId",
+        records: [{ accountId: "seed", marker: "auto-increment" }],
+      },
+      errors: ["corrupt_record", "corrupt_record"],
+    },
+  ]);
+});
+
 test("two tabs converge and expected-key deletion cannot remove a different identity", async ({
   context,
   page,
