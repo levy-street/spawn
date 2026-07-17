@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -11,8 +12,10 @@ from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
 from .host_identity import (
     decode_ed25519_public_key,
     decode_host_public_key,
+    ed25519_key_fingerprint,
     host_key_fingerprint,
 )
+from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
 
 # ---------- auth ----------
 
@@ -141,10 +144,23 @@ class DevicePollSuccess(BaseModel):
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
     host_key_fingerprint: str
+    browser_device_id: str
+    browser_key_algorithm: Literal["ed25519"]
+    browser_public_key: str
+    browser_key_fingerprint: str
 
 
 class DevicePollPending(BaseModel):
-    error: Literal["authorization_pending", "slow_down", "expired_token", "denied"]
+    error: Literal[
+        "authorization_pending",
+        "slow_down",
+        "expired_token",
+        "denied",
+        "invalid_device_binding",
+        "key_conflict",
+        "pin_conflict",
+        "pin_limit",
+    ]
 
 
 class DevicePendingRequest(BaseModel):
@@ -154,9 +170,21 @@ class DevicePendingRequest(BaseModel):
 
 
 class DeviceApproveRequest(DevicePendingRequest):
+    approval_nonce: str = Field(
+        min_length=APPROVAL_NONCE_B64URL_LENGTH,
+        max_length=APPROVAL_NONCE_B64URL_LENGTH,
+    )
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str = Field(min_length=43, max_length=43)
     host_key_fingerprint: str = Field(min_length=23, max_length=23)
+    browser_device_id: str = Field(min_length=36, max_length=36)
+    browser_key_algorithm: Literal["ed25519"]
+    browser_public_key: str = Field(min_length=43, max_length=43)
+    browser_key_fingerprint: str = Field(min_length=23, max_length=23)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
 
     @field_validator("host_public_key")
     @classmethod
@@ -164,23 +192,58 @@ class DeviceApproveRequest(DevicePendingRequest):
         decode_host_public_key("ed25519", value)
         return value
 
+    @field_validator("approval_nonce")
+    @classmethod
+    def validate_approval_nonce(cls, value: str) -> str:
+        decode_approval_nonce(value)
+        return value
+
+    @field_validator("browser_device_id")
+    @classmethod
+    def validate_browser_device_id(cls, value: str) -> str:
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError as exc:
+            raise ValueError("browser device id must be a UUID") from exc
+        if value != str(parsed):
+            raise ValueError("browser device id must be a canonical lowercase UUID")
+        return value
+
+    @field_validator("browser_public_key")
+    @classmethod
+    def validate_browser_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
     @model_validator(mode="after")
     def validate_fingerprint_binding(self) -> DeviceApproveRequest:
         expected = host_key_fingerprint(self.host_key_algorithm, self.host_public_key)
         if self.host_key_fingerprint != expected:
             raise ValueError("host key fingerprint does not match public key")
+        browser_expected = ed25519_key_fingerprint(self.browser_public_key)
+        if self.browser_key_fingerprint != browser_expected:
+            raise ValueError("browser key fingerprint does not match public key")
         return self
 
 
 class DeviceApproveResponse(BaseModel):
     host_name: str
+    approval_nonce: str
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
     host_key_fingerprint: str
+    browser_device_id: str
+    browser_key_algorithm: Literal["ed25519"]
+    browser_public_key: str
+    browser_key_fingerprint: str
 
 
-class DevicePendingResponse(DeviceApproveResponse):
-    pass
+class DevicePendingResponse(BaseModel):
+    host_name: str
+    approval_nonce: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str
+    host_key_fingerprint: str
 
 
 # ---------- hosts ----------

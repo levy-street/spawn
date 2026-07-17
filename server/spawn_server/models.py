@@ -64,6 +64,9 @@ class BrowserDevice(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="browser_devices")
+    host_pins: Mapped[list[HostBrowserPin]] = relationship(
+        back_populates="browser_device", passive_deletes=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -181,6 +184,9 @@ class Host(Base):
 
     owner: Mapped[User] = relationship(back_populates="hosts")
     agents: Mapped[list[Agent]] = relationship(back_populates="host")
+    browser_pins: Mapped[list[HostBrowserPin]] = relationship(
+        back_populates="host", passive_deletes=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -193,6 +199,36 @@ class Host(Base):
             "host_key_algorithm",
             "host_public_key",
             name="uq_hosts_host_public_key",
+        ),
+    )
+
+
+class HostBrowserPin(Base):
+    """Immutable snapshot of one browser identity explicitly approved for a host."""
+
+    __tablename__ = "host_browser_pins"
+
+    host_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="CASCADE"), primary_key=True
+    )
+    browser_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    browser_key_algorithm: Mapped[str] = mapped_column(String(16), nullable=False)
+    browser_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    browser_key_fingerprint: Mapped[str] = mapped_column(String(23), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    host: Mapped[Host] = relationship(back_populates="browser_pins")
+    browser_device: Mapped[BrowserDevice] = relationship(back_populates="host_pins")
+
+    __table_args__ = (
+        CheckConstraint(
+            "browser_key_algorithm = 'ed25519' AND length(browser_public_key) = 43 "
+            "AND length(browser_key_fingerprint) = 23",
+            name="ck_host_browser_pins_key",
         ),
     )
 
@@ -330,6 +366,13 @@ class DeviceCode(Base):
     # deployment. New endpoints fail closed if either value is absent.
     host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
     host_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    approval_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    browser_device_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=True
+    )
+    browser_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    browser_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    browser_key_fingerprint: Mapped[str | None] = mapped_column(String(23), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -347,10 +390,16 @@ class DeviceCode(Base):
             "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
             name="ck_device_codes_host_key_pair",
         ),
-        UniqueConstraint(
-            "host_key_algorithm",
-            "host_public_key",
-            name="uq_device_codes_host_public_key",
+        CheckConstraint(
+            "approval_nonce IS NULL OR length(approval_nonce) = 43",
+            name="ck_device_codes_approval_nonce",
+        ),
+        CheckConstraint(
+            "(browser_device_id IS NULL AND browser_key_algorithm IS NULL AND "
+            "browser_public_key IS NULL AND browser_key_fingerprint IS NULL) OR "
+            "(browser_device_id IS NOT NULL AND browser_key_algorithm = 'ed25519' AND "
+            "length(browser_public_key) = 43 AND length(browser_key_fingerprint) = 23)",
+            name="ck_device_codes_browser_binding",
         ),
     )
 

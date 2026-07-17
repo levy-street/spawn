@@ -1,4 +1,5 @@
 import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
+import { encodeHostPairApprovalTranscript } from "./host-pair-approval-transcript";
 import {
   ED25519_PUBLIC_KEY_WIRE_CHARS,
   ED25519_SIGNATURE_BYTES,
@@ -425,6 +426,41 @@ export async function createBrowserDeviceRegistrationProof(
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
       "browser registration signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/** Sign only the bounded host-pair approval contract with this opaque identity. */
+export async function createHostPairApprovalProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  approvalNonce: string,
+  hostPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeHostPairApprovalTranscript(
+    accountId,
+    approvalNonce,
+    hostPublicKey,
+    record.publicKeyWire,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "host-pair approval signer returned an invalid signature length",
     );
   }
   return encodeBase64Url(signature);

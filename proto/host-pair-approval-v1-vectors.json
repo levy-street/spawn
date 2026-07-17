@@ -1,0 +1,25 @@
+{
+  "contract": "SPAWN-HOST-PAIR-APPROVE-V1",
+  "version": 1,
+  "positive": {
+    "user_id": "00000000-0000-4000-8000-000000000001",
+    "approval_nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "host_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+    "browser_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "transcript_hex": "535041574e2d484f53542d504149522d415050524f56452d56310100000000000040008000000000000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660cd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "transcript_sha256": "23cb16873252dbdacdfef29b09ad347150580a765c890276f7749d9917ac5b77",
+    "signature": "V4DhwT6vJKp1t-f9PGgiJXEjEZbJ1_cUUMqGDtZj3U9tfgeQIbVjugCPeF3aCRHr-EscxYQb8-PUmJggOgucAA"
+  },
+  "mutations": {
+    "user_id": "00000000-0000-4000-8000-000000000002",
+    "approval_nonce": "_wECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "host_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "browser_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+    "signature": "WIDhwT6vJKp1t-f9PGgiJXEjEZbJ1_cUUMqGDtZj3U9tfgeQIbVjugCPeF3aCRHr-EscxYQb8-PUmJggOgucAA"
+  },
+  "malformed_nonces": [
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh+"
+  ]
+}

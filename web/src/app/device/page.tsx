@@ -7,7 +7,15 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ApiError, auth, type DeviceApproval } from "@/lib/api";
+import { ApiError, auth, type DevicePendingApproval } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import {
+  createHostPairApprovalProof,
+  loadBrowserDeviceIdentity,
+} from "@/lib/browser-device-identity";
+import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+
+class ApprovalIdentityError extends Error {}
 
 export default function DevicePage() {
   return (
@@ -20,9 +28,11 @@ export default function DevicePage() {
 }
 
 function DeviceInner() {
+  const { user } = useAuth();
+  const registration = useBrowserDeviceRegistration(user?.id);
   const [code, setCode] = useState("");
   const [hostName, setHostName] = useState<string | null>(null);
-  const [pending, setPending] = useState<DeviceApproval | null>(null);
+  const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -42,21 +52,60 @@ function DeviceInner() {
   };
 
   const onApprove = async () => {
-    if (!pending) return;
+    if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
     setSubmitting(true);
     try {
+      const localIdentity = await loadBrowserDeviceIdentity(user.id);
+      if (
+        localIdentity === null ||
+        localIdentity.publicKeyWire !== registration.data.device.public_key
+      ) {
+        throw new ApprovalIdentityError(
+          "Local browser identity changed; refresh and review the daemon again",
+        );
+      }
+      const signature = await createHostPairApprovalProof(
+        localIdentity,
+        user.id,
+        pending.approval_nonce,
+        pending.host_public_key,
+      );
       const r = await auth.approveDevice({
         user_code: code.trim().toUpperCase(),
+        approval_nonce: pending.approval_nonce,
         host_key_algorithm: pending.host_key_algorithm,
         host_public_key: pending.host_public_key,
         host_key_fingerprint: pending.host_key_fingerprint,
+        browser_device_id: registration.data.device.id,
+        browser_key_algorithm: registration.data.device.key_algorithm,
+        browser_public_key: registration.data.device.public_key,
+        browser_key_fingerprint: registration.data.device.fingerprint,
+        signature,
       });
+      if (
+        r.host_name !== pending.host_name ||
+        r.approval_nonce !== pending.approval_nonce ||
+        r.host_key_algorithm !== pending.host_key_algorithm ||
+        r.host_public_key !== pending.host_public_key ||
+        r.host_key_fingerprint !== pending.host_key_fingerprint ||
+        r.browser_device_id !== registration.data.device.id ||
+        r.browser_key_algorithm !== registration.data.device.key_algorithm ||
+        r.browser_public_key !== registration.data.device.public_key ||
+        r.browser_key_fingerprint !== registration.data.device.fingerprint
+      ) {
+        throw new ApprovalIdentityError(
+          "Approval response changed the reviewed host or browser identity",
+        );
+      }
       setHostName(r.host_name);
       setPending(null);
       setCode("");
     } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Approval failed";
+      const message =
+        err instanceof ApiError || err instanceof ApprovalIdentityError
+          ? err.message
+          : "Approval failed";
       setError(message);
       setPending(null);
     } finally {
@@ -98,6 +147,17 @@ function DeviceInner() {
                 {error}
               </p>
             )}
+            {registration.isError && (
+              <p className="text-sm text-destructive" role="alert">
+                Browser identity registration failed; approval is unavailable.
+              </p>
+            )}
+            {registration.data && registration.data.status !== "ready" && (
+              <p className="text-sm text-destructive" role="alert">
+                This browser identity is {registration.data.status.replace("_", " ")}; approval is
+                unavailable.
+              </p>
+            )}
             {hostName && (
               <p className="text-sm text-foreground" role="status">
                 Approved daemon for host <code>{hostName}</code>. It should connect within a few
@@ -118,11 +178,20 @@ function DeviceInner() {
                 <p className="text-xs text-muted-foreground">
                   Compare this with the fingerprint printed by <code>spawnd login</code>.
                 </p>
+                <p className="text-sm">Approving browser fingerprint:</p>
+                <p
+                  className="break-all font-mono text-sm font-semibold"
+                  data-testid="browser-key-fingerprint"
+                >
+                  {registration.data?.status === "ready"
+                    ? registration.data.device.fingerprint
+                    : "unavailable"}
+                </p>
                 <div className="flex gap-2">
                   <Button
                     type="button"
                     className="flex-1"
-                    disabled={submitting}
+                    disabled={submitting || registration.data?.status !== "ready"}
                     onClick={onApprove}
                   >
                     {submitting ? "Approving..." : "Confirm approval"}

@@ -181,47 +181,91 @@ PY
 )"
 
 printf '%s\n' "smoke-local-login: approving device code"
-python3 - "$base_url" "$user_token" "$user_code" <<'PY'
+(
+  cd server
+  uv run python - "$base_url" "$user_token" "$user_code" <<'PY'
+import base64
 import json
 import sys
 import urllib.error
 import urllib.request
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from spawn_server.browser_registration import encode_browser_registration_transcript
+from spawn_server.host_identity import decode_ed25519_public_key
+from spawn_server.host_pair_approval import (
+    decode_approval_nonce,
+    encode_host_pair_approval_transcript,
+)
+
 base_url, token, user_code = sys.argv[1:]
 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-pending_req = urllib.request.Request(
-    base_url + "/api/auth/device/pending",
-    data=json.dumps({"user_code": user_code}).encode(),
-    method="POST",
-    headers=headers,
+
+
+def post(path: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        base_url + path,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        raise SystemExit(f"{path} failed: {error.code} {error.read().decode()}") from error
+
+
+def wire(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+me_req = urllib.request.Request(base_url + "/api/me", headers=headers)
+with urllib.request.urlopen(me_req, timeout=10) as response:
+    user_id = json.loads(response.read().decode())["user"]["id"]
+
+browser_key = Ed25519PrivateKey.generate()
+browser_public = browser_key.public_key().public_bytes_raw()
+browser = post(
+    "/api/browser-devices/register",
+    {
+        "key_algorithm": "ed25519",
+        "public_key": wire(browser_public),
+        "signature": wire(
+            browser_key.sign(encode_browser_registration_transcript(user_id, browser_public))
+        ),
+    },
 )
-try:
-    with urllib.request.urlopen(pending_req, timeout=10) as response:
-        reviewed = json.loads(response.read().decode())
-except urllib.error.HTTPError as error:
-    raise SystemExit(f"pending review failed: {error.code} {error.read().decode()}") from error
+reviewed = post("/api/auth/device/pending", {"user_code": user_code})
 if reviewed.get("host_name") != "cli-login-smoke":
     raise SystemExit(f"unexpected pending response: {reviewed!r}")
+host_public = decode_ed25519_public_key(reviewed["host_public_key"])
+approval_transcript = encode_host_pair_approval_transcript(
+    user_id,
+    decode_approval_nonce(reviewed["approval_nonce"]),
+    host_public,
+    browser_public,
+)
 approval = {
     "user_code": user_code,
+    "approval_nonce": reviewed["approval_nonce"],
     "host_key_algorithm": reviewed["host_key_algorithm"],
     "host_public_key": reviewed["host_public_key"],
     "host_key_fingerprint": reviewed["host_key_fingerprint"],
+    "browser_device_id": browser["id"],
+    "browser_key_algorithm": browser["key_algorithm"],
+    "browser_public_key": browser["public_key"],
+    "browser_key_fingerprint": browser["fingerprint"],
+    "signature": wire(browser_key.sign(approval_transcript)),
 }
-approve_req = urllib.request.Request(
-    base_url + "/api/auth/device/approve",
-    data=json.dumps(approval).encode(),
-    method="POST",
-    headers=headers,
-)
-try:
-    with urllib.request.urlopen(approve_req, timeout=10) as response:
-        body = json.loads(response.read().decode())
-except urllib.error.HTTPError as error:
-    raise SystemExit(f"approve failed: {error.code} {error.read().decode()}") from error
+body = post("/api/auth/device/approve", approval)
 if body.get("host_name") != "cli-login-smoke":
     raise SystemExit(f"unexpected approve response: {body!r}")
+if any(body.get(field) != approval[field] for field in approval if field != "user_code" and field != "signature"):
+    raise SystemExit(f"approval response changed reviewed identity: {body!r}")
 PY
+)
 
 (
   sleep 35

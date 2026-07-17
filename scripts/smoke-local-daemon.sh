@@ -956,13 +956,23 @@ start_server
 
 printf '%s\n' "smoke-local-daemon: provisioning daemon credentials"
 creds="$(
-  python3 - "$base_url" "$daemon_home" <<'PY'
+  cd server
+  uv run python - "$base_url" "$daemon_home" <<'PY'
 import json
 import os
 import sys
 import base64
 import urllib.error
 import urllib.request
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from spawn_server.browser_registration import encode_browser_registration_transcript
+from spawn_server.host_identity import decode_ed25519_public_key
+from spawn_server.host_pair_approval import (
+    decode_approval_nonce,
+    encode_host_pair_approval_transcript,
+)
 
 base_url, home = sys.argv[1:]
 
@@ -987,6 +997,7 @@ signup = request(
     {"email": "smoke@example.com", "password": "passpasspass"},
 )
 token = signup["access_token"]
+user_id = signup["user"]["id"]
 seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
 public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
 host_public_key = base64.urlsafe_b64encode(public).rstrip(b"=").decode()
@@ -1006,17 +1017,46 @@ start = request(
     },
 )
 reviewed = request("POST", "/api/auth/device/pending", {"user_code": start["user_code"]}, token)
-request(
+browser_key = Ed25519PrivateKey.generate()
+browser_public = browser_key.public_key().public_bytes_raw()
+browser_public_key = base64.urlsafe_b64encode(browser_public).rstrip(b"=").decode()
+registration = encode_browser_registration_transcript(user_id, browser_public)
+browser = request(
     "POST",
-    "/api/auth/device/approve",
+    "/api/browser-devices/register",
     {
-        "user_code": start["user_code"],
-        "host_key_algorithm": reviewed["host_key_algorithm"],
-        "host_public_key": reviewed["host_public_key"],
-        "host_key_fingerprint": reviewed["host_key_fingerprint"],
+        "key_algorithm": "ed25519",
+        "public_key": browser_public_key,
+        "signature": base64.urlsafe_b64encode(browser_key.sign(registration)).rstrip(b"=").decode(),
     },
     token,
 )
+approval_transcript = encode_host_pair_approval_transcript(
+    user_id,
+    decode_approval_nonce(reviewed["approval_nonce"]),
+    decode_ed25519_public_key(reviewed["host_public_key"]),
+    browser_public,
+)
+approval = {
+    "user_code": start["user_code"],
+    "approval_nonce": reviewed["approval_nonce"],
+    "host_key_algorithm": reviewed["host_key_algorithm"],
+    "host_public_key": reviewed["host_public_key"],
+    "host_key_fingerprint": reviewed["host_key_fingerprint"],
+    "browser_device_id": browser["id"],
+    "browser_key_algorithm": browser["key_algorithm"],
+    "browser_public_key": browser["public_key"],
+    "browser_key_fingerprint": browser["fingerprint"],
+    "signature": base64.urlsafe_b64encode(browser_key.sign(approval_transcript)).rstrip(b"=").decode(),
+}
+approved = request(
+    "POST",
+    "/api/auth/device/approve",
+    approval,
+    token,
+)
+if any(approved.get(field) != value for field, value in approval.items() if field not in {"user_code", "signature"}):
+    raise SystemExit(f"approval response changed reviewed identity: {approved!r}")
 poll = request(
     "POST",
     "/api/auth/device/poll",

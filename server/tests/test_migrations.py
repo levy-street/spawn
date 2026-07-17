@@ -85,8 +85,22 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
             for constraint in inspector.get_unique_constraints("browser_devices")
         }
         assert "uq_hosts_host_public_key" in host_uniques
-        assert "uq_device_codes_host_public_key" in device_uniques
+        assert "uq_device_codes_host_public_key" not in device_uniques
         assert "uq_browser_devices_public_key" in browser_device_uniques
+        device_checks = {
+            constraint["name"] for constraint in inspector.get_check_constraints("device_codes")
+        }
+        pin_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("host_browser_pins")
+        }
+        assert "ck_device_codes_approval_nonce" in device_checks
+        assert "ck_device_codes_browser_binding" in device_checks
+        assert "ck_host_browser_pins_key" in pin_checks
+        assert inspector.get_pk_constraint("host_browser_pins")["constrained_columns"] == [
+            "host_id",
+            "browser_device_id",
+        ]
 
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
@@ -177,6 +191,7 @@ def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tm
     finally:
         engine.dispose()
 
+
     _run_python(["-m", "alembic", "upgrade", "head"], env=env)
 
     engine = create_engine(sync_url, future=True)
@@ -193,6 +208,48 @@ def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tm
             ).one()
             assert host == (None, None)
             assert device == (None, None)
+    finally:
+        engine.dispose()
+
+
+def test_browser_pair_migration_preserves_interrupted_codes_as_explicitly_unapproved(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "spawn-browser-pair-migration.db"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+    sync_url = f"sqlite:///{db_path}"
+    env = _migration_env(async_url)
+    _run_python(["-m", "alembic", "upgrade", "0018"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "insert into device_codes "
+                    "(device_code, user_code, host_name, host_key_algorithm, host_public_key, "
+                    "status, expires_at, created_at) values "
+                    "('interrupted', 'PAIR-OLD1', 'legacy', 'ed25519', :key, "
+                    "'pending', '2026-07-18', '2026-07-17')"
+                ),
+                {"key": "A" * 43},
+            )
+    finally:
+        engine.dispose()
+
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "select approval_nonce, browser_device_id, browser_key_algorithm, "
+                    "browser_public_key, browser_key_fingerprint from device_codes "
+                    "where device_code = 'interrupted'"
+                )
+            ).one()
+            assert row == (None, None, None, None, None)
+            assert conn.execute(text("select count(*) from host_browser_pins")).scalar_one() == 0
     finally:
         engine.dispose()
 

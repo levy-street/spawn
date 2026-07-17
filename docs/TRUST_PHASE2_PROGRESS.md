@@ -374,9 +374,12 @@ missing canonical marker; it cannot approve this ADR or prove a runtime claim.
 
 **Parallel Phase 3 foundations:** reviewed P3-IDENTITY-01A is integrated at
 `ab20cbc`; reviewed P3-IDENTITY-01B is integrated through `e34d412`; and
-reviewed P3-IDENTITY-02A is integrated at `37c91d4`. These establish canonical
-Ed25519 transcripts, durable daemon pairing keys, and account-scoped
-non-extractable browser-local keys. They do not make live signaling signed.
+reviewed P3-IDENTITY-02A is integrated at `37c91d4`; reviewed browser account
+registration P3-IDENTITY-02B is integrated at `3ec8b91`; and the reviewed
+offline signed-wire adapter P3-IDENTITY-02C is integrated at `6028b2a`. These
+establish canonical Ed25519 transcripts, durable daemon pairing keys,
+account-scoped non-extractable browser-local keys, and strict offline adapters.
+They do not make live signaling signed.
 
 **P3-IDENTITY-02A browser identity (reviewed and integrated at `37c91d4`):** the bounded
 browser library now persists one versioned, account-scoped, non-extractable
@@ -397,7 +400,7 @@ non-extractable `CryptoKey`; no private bytes or JWK are exported, logged, put i
 Web Storage, or sent to the server. Its independent review and mergeability
 gate passed before integration.
 
-**P3-IDENTITY-02B account registry (implemented, review pending):** an
+**P3-IDENTITY-02B account registry (reviewed and integrated at `3ec8b91`):** an
 authenticated browser signs the fixed-width, domain-separated
 `SPAWN-BROWSER-REGISTER-V1` transcript containing the server-authenticated user
 UUID and exact browser public key. The server strictly preflights key/signature
@@ -415,9 +418,35 @@ key only after server confirmation, exposes retry after partial failure, and
 requires an explicit action before generating a replacement. No private key,
 JWK, or signature enters Web Storage or logs.
 
-P3-IDENTITY-02B still does **not** bind a browser key into daemon host pairing,
-does not add peer-key discovery or TOFU continuity, and does not wire signatures
-into live agent/host RTC signaling. No live signaling/TOFU security claim exists.
+P3-IDENTITY-02B by itself does **not** bind a browser key into daemon host
+pairing, add peer-key discovery or TOFU continuity, or wire signatures into
+live agent/host RTC signaling. No live signaling/TOFU security claim exists.
+
+**P3-IDENTITY-02D server/browser host-pair binding (implemented, independent
+review pending):** each device-code ceremony now receives a fresh server nonce.
+The approving browser signs a fixed-width `SPAWN-HOST-PAIR-APPROVE-V1`
+transcript containing the authenticated user UUID, exact nonce, reviewed host
+Ed25519 key, and exact active registered browser Ed25519 key. Approval compares
+the complete reviewed host/browser tuple, verifies possession, and snapshots it
+with a one-shot conditional update. Poll rechecks that the browser registration
+is still active, so revocation before consumption fails closed without issuing a
+token, creating a Host, or creating a pin.
+
+Successful poll transactionally creates or reuses the exact Host and inserts an
+immutable Host/browser pin containing both public-key snapshots. Each Host may
+hold at most 32 such pins; Host admission is serialized on PostgreSQL and
+write-serialized on file SQLite. Independently approved ceremonies at the final
+slot race to exactly one success, while the loser receives a stable `pin_limit`
+error and leaves no partial pin or token. Pending, approval, and poll responses
+carry the exact host/browser presentations, and the browser loudly rejects a
+substituted response. The confirmation UI displays both fingerprints before the
+user authorizes the link.
+
+This is only the server/browser first-contact half of pairing. P3-IDENTITY-02E
+must separately make the daemon validate and persist the returned browser pin;
+02D makes no daemon-local pin, peer discovery, live-signaling, or TOFU claim.
+Later server revocation can block an unconsumed approval, but it cannot erase a
+pin already persisted by a daemon in 02E.
 
 The P2-DATA-01 checkpoint described above remains documentation only. No
 endpoint protected-data store, DataChannel operation, migration, server-column
@@ -431,8 +460,8 @@ until the decision passes review and is merged.
    restore REST/WS compatibility content paths while integrating later work.
 2. Finish independent review of the bounded P2-DATA-01 design and the parallel
    P2-HOST-03A interactive installer candidate. In parallel, independently
-   review P3-IDENTITY-02B without claiming host-pairing integration, TOFU, or
-   signed signaling. Keep the legacy tool route
+   review P3-IDENTITY-02D without claiming daemon-local pin persistence, TOFU,
+   or signed signaling. Keep the legacy tool route
    until its endpoint-owned durable targets exist; this wave is not the final
    tool cut.
 3. Only after P2-DATA-01 and P2-HOST-03A have passed independent review and
@@ -451,9 +480,10 @@ until the decision passes review and is merged.
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-5. After browser account registration P3-IDENTITY-02B passes its own review,
-   separately integrate peer-key discovery, TOFU/fingerprint continuity, and
-   signed signaling bound to SDP, session,
+5. After P3-IDENTITY-02D passes its own review, implement separately reviewed
+   P3-IDENTITY-02E daemon validation and durable local pin consumption. Only
+   then separately integrate peer-key discovery, TOFU/fingerprint continuity,
+   and signed signaling bound to SDP, session,
    agent-or-host scope, protocol version, sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and
    cross-session/cross-scope replay for both agent- and host-scoped peer
