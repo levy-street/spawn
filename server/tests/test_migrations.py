@@ -72,6 +72,15 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
             orm_columns = {column.name for column in table.columns}
             assert orm_columns <= migrated_columns, table_name
 
+        host_uniques = {
+            constraint["name"] for constraint in inspector.get_unique_constraints("hosts")
+        }
+        device_uniques = {
+            constraint["name"] for constraint in inspector.get_unique_constraints("device_codes")
+        }
+        assert "uq_hosts_host_public_key" in host_uniques
+        assert "uq_device_codes_host_public_key" in device_uniques
+
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
             assert version == _current_migration_head()
@@ -80,9 +89,7 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
                 text("select name, default_argv, install from presets")
             ).mappings()
             presets = {row["name"]: row for row in preset_rows}
-            assert {"claude-code", "codex", "opencode", "aider-sonnet", "shell"} <= set(
-                presets
-            )
+            assert {"claude-code", "codex", "opencode", "aider-sonnet", "shell"} <= set(presets)
             assert json.loads(presets["codex"]["default_argv"]) == ["codex"]
             assert presets["codex"]["install"] is None
             conn.execute(
@@ -118,10 +125,66 @@ asyncio.run(main())
             install = conn.execute(
                 text("select install from presets where owner_user_id is null and name = 'codex'")
             ).scalar_one()
-            assert install == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+            assert (
+                install
+                == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+            )
             count = conn.execute(
                 text("select count(*) from presets where owner_user_id is null")
             ).scalar_one()
             assert count == 5
+    finally:
+        engine.dispose()
+
+
+def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tmp_path: Path):
+    db_path = tmp_path / "spawn-host-identity-migration.db"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+    sync_url = f"sqlite:///{db_path}"
+    env = _migration_env(async_url)
+    _run_python(["-m", "alembic", "upgrade", "0016"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "insert into users (id, email, password_hash, created_at) "
+                    "values ('user', 'legacy@example.com', 'hash', '2026-07-17')"
+                )
+            )
+            conn.execute(
+                text(
+                    "insert into hosts (id, owner_user_id, name, status, created_at) "
+                    "values ('host', 'user', 'legacy', 'offline', '2026-07-17')"
+                )
+            )
+            conn.execute(
+                text(
+                    "insert into device_codes "
+                    "(device_code, user_code, host_name, status, expires_at, created_at) "
+                    "values ('device', 'OLD1-CODE', 'legacy', 'pending', "
+                    "'2026-07-18', '2026-07-17')"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            host = conn.execute(
+                text("select host_key_algorithm, host_public_key from hosts where id = 'host'")
+            ).one()
+            device = conn.execute(
+                text(
+                    "select host_key_algorithm, host_public_key "
+                    "from device_codes where device_code = 'device'"
+                )
+            ).one()
+            assert host == (None, None)
+            assert device == (None, None)
     finally:
         engine.dispose()

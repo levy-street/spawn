@@ -312,6 +312,8 @@ pub struct DeviceStartRequest<'a> {
     pub os: &'a str,
     pub arch: &'a str,
     pub version: &'a str,
+    pub host_key_algorithm: &'a str,
+    pub host_public_key: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +329,8 @@ pub struct DeviceStartResponse {
 #[derive(Debug, Serialize)]
 pub struct DevicePollRequest<'a> {
     pub device_code: &'a str,
+    pub host_key_algorithm: &'a str,
+    pub host_public_key: &'a str,
 }
 
 /// The poll endpoint returns either a success body (`access_token`+`host_id`)
@@ -336,5 +340,8 @@ pub struct DevicePollRequest<'a> {
 pub struct DevicePollResponse {
     pub access_token: Option<String>,
     pub host_id: Option<Uuid>,
+    pub host_key_algorithm: Option<String>,
+    pub host_public_key: Option<String>,
+    pub host_key_fingerprint: Option<String>,
     pub error: Option<String>,
 }

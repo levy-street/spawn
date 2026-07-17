@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session, get_sessionmaker
+from ..host_identity import host_key_fingerprint
 from ..models import Agent, Host, HostToolPolicy, Preset, User
 from ..ws.broker import get_broker
 
@@ -45,12 +46,20 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 
 def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
+    fingerprint = (
+        host_key_fingerprint(host.host_key_algorithm, host.host_public_key)
+        if host.host_key_algorithm is not None and host.host_public_key is not None
+        else None
+    )
     return schemas.HostOut(
         id=host.id,
         name=host.name,
         os=host.os,
         arch=host.arch,
         version=host.version,
+        host_key_algorithm=host.host_key_algorithm,
+        host_public_key=host.host_public_key,
+        host_key_fingerprint=fingerprint,
         status=host.status,
         last_seen_at=host.last_seen_at,
         agent_count=agent_count,
@@ -193,9 +202,7 @@ def _auto_update_error_from_result(result: schemas.HostToolInstallResult | None)
     return "install failed"
 
 
-async def _run_auto_update(
-    *, user_id: str, host_id: str, preset_id: str, target: dict
-) -> None:
+async def _run_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> None:
     try:
         daemon = get_broker().get_daemon_for_host(host_id)
         if daemon is None:
@@ -228,9 +235,7 @@ async def _run_auto_update(
             await session.commit()
 
 
-async def _owned_auto_update(
-    *, user_id: str, host_id: str, preset_id: str, target: dict
-) -> None:
+async def _owned_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> None:
     key = (user_id, host_id, preset_id)
     try:
         await _run_auto_update(
@@ -257,9 +262,7 @@ def _auto_update_task_done(task: asyncio.Task[None]) -> None:
         )
 
 
-def _start_auto_update(
-    *, user_id: str, host_id: str, preset_id: str, target: dict
-) -> bool:
+def _start_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> bool:
     key = (user_id, host_id, preset_id)
     if key in _AUTO_UPDATE_IN_FLIGHT:
         return False
@@ -300,9 +303,9 @@ async def run_auto_update_checks_once() -> None:
     async with sm() as session:
         rows = (
             await session.execute(
-                select(HostToolPolicy, Preset).join(
-                    Preset, HostToolPolicy.preset_id == Preset.id
-                ).where(HostToolPolicy.auto_update.is_(True))
+                select(HostToolPolicy, Preset)
+                .join(Preset, HostToolPolicy.preset_id == Preset.id)
+                .where(HostToolPolicy.auto_update.is_(True))
             )
         ).all()
 

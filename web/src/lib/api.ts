@@ -78,6 +78,9 @@ export const HostSchema = z.object({
   os: z.string().nullable().optional(),
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
+  host_key_algorithm: z.literal("ed25519").nullable().optional(),
+  host_public_key: z.string().nullable().optional(),
+  host_key_fingerprint: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   agent_count: z.number().int(),
@@ -248,7 +251,11 @@ export const DeviceStartResponseSchema = z.object({
 
 export const DeviceApproveResponseSchema = z.object({
   host_name: z.string(),
+  host_key_algorithm: z.literal("ed25519"),
+  host_public_key: z.string(),
+  host_key_fingerprint: z.string(),
 });
+export type DeviceApproval = z.infer<typeof DeviceApproveResponseSchema>;
 
 export const AuthProviderSchema = z.object({
   id: z.enum(["google", "microsoft", "github"]),
@@ -289,6 +296,12 @@ export const auth = {
     }),
   approveDevice: (body: { user_code: string }) =>
     api("/api/auth/device/approve", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: DeviceApproveResponseSchema,
+    }),
+  pendingDevice: (body: { user_code: string }) =>
+    api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),
       schema: DeviceApproveResponseSchema,

@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ApiError, auth } from "@/lib/api";
+import { ApiError, auth, type DeviceApproval } from "@/lib/api";
 
 export default function DevicePage() {
   return (
@@ -22,16 +22,32 @@ export default function DevicePage() {
 function DeviceInner() {
   const [code, setCode] = useState("");
   const [hostName, setHostName] = useState<string | null>(null);
+  const [pending, setPending] = useState<DeviceApproval | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const onSubmit = async (e: FormEvent) => {
+  const onReview = async (e: FormEvent) => {
     e.preventDefault();
+    setError(null);
+    setSubmitting(true);
+    try {
+      const r = await auth.pendingDevice({ user_code: code.trim().toUpperCase() });
+      setPending(r);
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Approval failed";
+      setError(message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const onApprove = async () => {
     setError(null);
     setSubmitting(true);
     try {
       const r = await auth.approveDevice({ user_code: code.trim().toUpperCase() });
       setHostName(r.host_name);
+      setPending(null);
       setCode("");
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Approval failed";
@@ -51,7 +67,7 @@ function DeviceInner() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form className="space-y-3" onSubmit={onSubmit}>
+          <form className="space-y-3" onSubmit={onReview}>
             <div className="space-y-1">
               <Label htmlFor="user_code">Device code</Label>
               <Input
@@ -61,8 +77,13 @@ function DeviceInner() {
                 autoCapitalize="characters"
                 autoComplete="one-time-code"
                 value={code}
-                onChange={(e) => setCode(e.target.value)}
+                onChange={(e) => {
+                  setCode(e.target.value);
+                  setPending(null);
+                  setHostName(null);
+                }}
                 required
+                disabled={pending !== null}
               />
             </div>
             {error && (
@@ -76,9 +97,44 @@ function DeviceInner() {
                 seconds.
               </p>
             )}
-            <Button type="submit" className="w-full" disabled={submitting}>
-              {submitting ? "Approving..." : "Approve daemon"}
-            </Button>
+            {pending ? (
+              <div className="space-y-3 rounded-md border p-3">
+                <p className="text-sm">
+                  Confirm host <code>{pending.host_name}</code> with fingerprint:
+                </p>
+                <p
+                  className="break-all font-mono text-sm font-semibold"
+                  data-testid="host-key-fingerprint"
+                >
+                  {pending.host_key_fingerprint}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Compare this with the fingerprint printed by <code>spawnd login</code>.
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    className="flex-1"
+                    disabled={submitting}
+                    onClick={onApprove}
+                  >
+                    {submitting ? "Approving..." : "Confirm approval"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={submitting}
+                    onClick={() => setPending(null)}
+                  >
+                    Back
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <Button type="submit" className="w-full" disabled={submitting}>
+                {submitting ? "Checking..." : "Review daemon"}
+              </Button>
+            )}
           </form>
         </CardContent>
       </Card>

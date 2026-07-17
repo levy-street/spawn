@@ -220,10 +220,12 @@ function HostDetail() {
       {host && (
         <div className="space-y-4">
           {/* Facts */}
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-xl border border-border p-4 text-sm @md/shell:grid-cols-4">
+          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-xl border border-border p-4 text-sm @md/shell:grid-cols-3 @xl/shell:grid-cols-6">
             <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
             <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
             <Fact label="Files" value="end-to-end encrypted" />
+            <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
+            <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />
             <Fact
               label="Connection"
               value={

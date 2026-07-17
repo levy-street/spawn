@@ -153,13 +153,18 @@ derived names are scrubbed before their source columns disappear.
 
 ## Identity and pairing
 
-The device-code flow is already a pairing ceremony; it just doesn't
-exchange keys yet. Target design:
+The device-code flow now binds the host key lifecycle described below. Browser
+device identity and signed signaling remain the subsequent Phase 3 work:
 
 - **Host identity**: `spawnd login` generates an Ed25519 keypair, stored
-  beside the daemon token in the OS keyring. The public key is submitted
-  with `device/start` and shown (as a short fingerprint) on the
-  `/device` approval page, binding it to the user at approval time.
+  beside the daemon token in the OS keyring (or the existing mode-0600 Unix
+  headless fallback). It is preserved across retries/re-login and removed only
+  by the existing explicit `spawnd logout` credential reset. The public key is
+  submitted with `device/start` and shown (as a short fingerprint) on the
+  `/device` approval page, binding it to the user at approval time. Same-owner
+  re-login reuses the pinned Host; host deletion revokes its token authority and
+  removes the pin. Private key material never enters a request, log, or
+  status/API response.
 - **Browser device identity**: on first login, the browser generates a
   non-extractable WebCrypto keypair (IndexedDB). The public key is
   registered with the account.

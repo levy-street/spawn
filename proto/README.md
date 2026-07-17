@@ -22,9 +22,24 @@ also accepts `Bearer` for API testing).
 | POST   | `/api/auth/login`          | `{email, password}`                 | `{access_token, user}`                                                                                            |
 | POST   | `/api/auth/logout`         | —                                   | 204                                                                                                               |
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
-| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version}`    | `{device_code, user_code, verification_uri, interval, expires_in}`                                                |
-| POST   | `/api/auth/device/poll`    | `{device_code}`                     | `{access_token, host_id}` on success; `{error: "authorization_pending"\|"slow_down"\|"expired_token"\|"denied"}` |
-| POST   | `/api/auth/device/approve` | `{user_code}`                       | `{host_name}` (authenticated as a web user)                                                                       |
+| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, verification_uri, interval, expires_in}` |
+| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint}` on success; otherwise a device-flow `error` |
+| POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
+| POST   | `/api/auth/device/approve` | `{user_code}`                       | the same server-derived host identity presentation after one-shot approval |
+
+`host_public_key` is the canonical unpadded base64url encoding of the exact
+32-byte Ed25519 public key. The server derives `host_key_fingerprint` as
+`SHA256:` plus the unpadded base64url encoding of the first 12 SHA-256 digest
+bytes; clients never submit a fingerprint. Start and poll require the key
+binding, and the daemon rejects a successful poll whose returned binding does
+not exactly match its persisted identity.
+
+This is an intentionally fail-closed device-flow protocol upgrade: legacy
+daemons that omit the key receive request validation errors and must upgrade.
+Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
+so a rolling deploy does not invent or silently rotate an identity. Re-pairing
+an existing daemon pins it; a same-owner re-login with the same key reuses the
+Host row, while another owner cannot claim it.
 
 ### Hosts
 
@@ -47,6 +62,9 @@ Host shape:
   "os": "linux",
   "arch": "x86_64",
   "version": "0.1.0",
+  "host_key_algorithm": "ed25519|null",
+  "host_public_key": "canonical-base64url|null",
+  "host_key_fingerprint": "SHA256:short-base64url|null",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
   "agent_count": 2

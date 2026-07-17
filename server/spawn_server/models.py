@@ -99,6 +99,10 @@ class Host(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Nullable only for hosts created before the 0017 pairing migration. Every
+    # new device-code approval stores an immutable Ed25519 pin here.
+    host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    host_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="offline", nullable=False)
     daemon_connection_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     daemon_generation: Mapped[int] = mapped_column(
@@ -146,6 +150,19 @@ class Host(Base):
     owner: Mapped[User] = relationship(back_populates="hosts")
     agents: Mapped[list[Agent]] = relationship(back_populates="host")
 
+    __table_args__ = (
+        CheckConstraint(
+            "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
+            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            name="ck_hosts_host_key_pair",
+        ),
+        UniqueConstraint(
+            "host_key_algorithm",
+            "host_public_key",
+            name="uq_hosts_host_public_key",
+        ),
+    )
+
 
 class Preset(Base):
     __tablename__ = "presets"
@@ -179,9 +196,7 @@ class HostToolPolicy(Base):
         String(36), ForeignKey("presets.id", ondelete="CASCADE"), nullable=False, index=True
     )
     auto_update: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    last_checked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_auto_update_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -278,6 +293,10 @@ class DeviceCode(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Nullable only for device codes left behind by an interrupted pre-0017
+    # deployment. New endpoints fail closed if either value is absent.
+    host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    host_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -287,6 +306,20 @@ class DeviceCode(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
+            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            name="ck_device_codes_host_key_pair",
+        ),
+        UniqueConstraint(
+            "host_key_algorithm",
+            "host_public_key",
+            name="uq_device_codes_host_public_key",
+        ),
+    )
+
 
 class Screen(Base):
     __tablename__ = "screens"
@@ -305,9 +338,7 @@ class Screen(Base):
     # auto-deleted when emptied and promoted to permanent on rename or a
     # third pane. Deliberate "New screen" screens are never ephemeral.
     ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    pinned_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from .host_identity import decode_host_public_key
 
 # ---------- auth ----------
 
@@ -49,10 +51,20 @@ class AuthProviderList(BaseModel):
 
 
 class DeviceStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     host_name: str = Field(max_length=128)
     os: str | None = None
     arch: str | None = None
     version: str | None = None
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
 
 
 class DeviceStartResponse(BaseModel):
@@ -64,12 +76,25 @@ class DeviceStartResponse(BaseModel):
 
 
 class DevicePollRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     device_code: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
 
 
 class DevicePollSuccess(BaseModel):
     access_token: str
     host_id: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str
+    host_key_fingerprint: str
 
 
 class DevicePollPending(BaseModel):
@@ -77,11 +102,20 @@ class DevicePollPending(BaseModel):
 
 
 class DeviceApproveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     user_code: str
 
 
 class DeviceApproveResponse(BaseModel):
     host_name: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str
+    host_key_fingerprint: str
+
+
+class DevicePendingResponse(DeviceApproveResponse):
+    pass
 
 
 # ---------- hosts ----------
@@ -94,12 +128,17 @@ class HostOut(BaseModel):
     os: str | None = None
     arch: str | None = None
     version: str | None = None
+    host_key_algorithm: Literal["ed25519"] | None = None
+    host_public_key: str | None = None
+    host_key_fingerprint: str | None = None
     status: str
     last_seen_at: datetime | None = None
     agent_count: int = 0
 
 
 class HostPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, max_length=128)
 
 
@@ -273,6 +312,7 @@ class AgentOut(BaseModel):
     exit_code: int | None = None
     pinned_at: datetime | None = None
     archived_at: datetime | None = None
+
 
 # ---------- screens ----------
 

@@ -6,12 +6,14 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..config import get_settings
 from ..db import get_session
+from ..host_identity import host_key_fingerprint
 from ..models import DeviceCode, Host, User
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
@@ -51,7 +53,28 @@ async def device_start(
     body: schemas.DeviceStartRequest,
     session: AsyncSession = Depends(get_session),
 ) -> schemas.DeviceStartResponse:
-    expires_at = _utcnow() + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
+    now = _utcnow()
+    expires_at = now + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
+
+    # Only one live approval ceremony may exist for a key. Stale rows can be
+    # replaced; successful rows are deleted by poll, while the Host pin is the
+    # durable identity authority.
+    existing_key = (
+        await session.execute(
+            select(DeviceCode).where(
+                DeviceCode.host_key_algorithm == body.host_key_algorithm,
+                DeviceCode.host_public_key == body.host_public_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_key is not None:
+        existing_expiry = _aware(existing_key.expires_at)
+        if existing_key.status in {"pending", "approved", "consuming"} and (
+            existing_expiry is None or existing_expiry > now
+        ):
+            raise HTTPException(status_code=409, detail="host key pairing already in progress")
+        await session.delete(existing_key)
+        await session.flush()
 
     # Retry user_code generation on rare collision.
     for _ in range(8):
@@ -71,11 +94,17 @@ async def device_start(
         os=body.os,
         arch=body.arch,
         version=body.version,
+        host_key_algorithm=body.host_key_algorithm,
+        host_public_key=body.host_public_key,
         status="pending",
         expires_at=expires_at,
     )
     session.add(dc)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="host key pairing already in progress") from exc
 
     return schemas.DeviceStartResponse(
         device_code=dc.device_code,
@@ -96,6 +125,14 @@ async def device_poll(
     ).scalar_one_or_none()
     if dc is None:
         return {"error": "expired_token"}
+
+    if (
+        dc.host_key_algorithm is None
+        or dc.host_public_key is None
+        or dc.host_key_algorithm != body.host_key_algorithm
+        or dc.host_public_key != body.host_public_key
+    ):
+        return {"error": "invalid_device_binding"}
 
     now = _utcnow()
     last = _aware(dc.last_polled_at)
@@ -119,30 +156,98 @@ async def device_poll(
         await session.commit()
         return {"error": "authorization_pending"}
 
-    # Approved → create the host and issue a daemon token. One-shot: mark consumed.
-    host = Host(
-        owner_user_id=dc.user_id,
-        name=dc.host_name or "host",
-        os=dc.os,
-        arch=dc.arch,
-        version=dc.version,
-        status="offline",
+    # Atomically claim the approved row before creating/reusing its Host. This
+    # conditional transition makes concurrent/replayed polls one-shot.
+    claimed = await session.execute(
+        update(DeviceCode)
+        .where(
+            DeviceCode.device_code == body.device_code,
+            DeviceCode.status == "approved",
+            DeviceCode.user_id == dc.user_id,
+            DeviceCode.host_key_algorithm == body.host_key_algorithm,
+            DeviceCode.host_public_key == body.host_public_key,
+        )
+        .values(status="consuming")
+        .execution_options(synchronize_session=False)
     )
-    session.add(host)
-    await session.flush()
+    if claimed.rowcount != 1:
+        await session.rollback()
+        return {"error": "expired_token"}
+
+    host = (
+        await session.execute(
+            select(Host).where(
+                Host.host_key_algorithm == body.host_key_algorithm,
+                Host.host_public_key == body.host_public_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if host is not None and host.owner_user_id != dc.user_id:
+        await session.execute(
+            update(DeviceCode)
+            .where(DeviceCode.device_code == body.device_code)
+            .values(status="denied")
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return {"error": "key_conflict"}
+
+    if host is None:
+        host = Host(
+            owner_user_id=dc.user_id,
+            name=dc.host_name or "host",
+            os=dc.os,
+            arch=dc.arch,
+            version=dc.version,
+            host_key_algorithm=body.host_key_algorithm,
+            host_public_key=body.host_public_key,
+            status="offline",
+        )
+        session.add(host)
+        await session.flush()
+    else:
+        # Re-login preserves both host identity and any user-assigned name.
+        host.os = dc.os
+        host.arch = dc.arch
+        host.version = dc.version
+
     token = auth.issue_daemon_token(host.id, dc.user_id)
-    dc.status = "consumed"
-    await session.commit()
-    return {"access_token": token, "host_id": host.id}
+    fingerprint = host_key_fingerprint(body.host_key_algorithm, body.host_public_key)
+    await session.execute(
+        delete(DeviceCode)
+        .where(
+            DeviceCode.device_code == body.device_code,
+            DeviceCode.status == "consuming",
+        )
+        .execution_options(synchronize_session=False)
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return {"error": "key_conflict"}
+    return {
+        "access_token": token,
+        "host_id": host.id,
+        "host_key_algorithm": body.host_key_algorithm,
+        "host_public_key": body.host_public_key,
+        "host_key_fingerprint": fingerprint,
+    }
 
 
-@router.post("/approve", response_model=schemas.DeviceApproveResponse)
-async def device_approve(
-    body: schemas.DeviceApproveRequest,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.DeviceApproveResponse:
-    code = body.user_code.strip().upper()
+def _approval_response(dc: DeviceCode) -> schemas.DeviceApproveResponse:
+    if dc.host_key_algorithm is None or dc.host_public_key is None:
+        raise HTTPException(status_code=400, detail="legacy device code must be restarted")
+    return schemas.DeviceApproveResponse(
+        host_name=dc.host_name or "host",
+        host_key_algorithm=dc.host_key_algorithm,
+        host_public_key=dc.host_public_key,
+        host_key_fingerprint=host_key_fingerprint(dc.host_key_algorithm, dc.host_public_key),
+    )
+
+
+async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceCode:
+    code = user_code.strip().upper()
     dc = (
         await session.execute(select(DeviceCode).where(DeviceCode.user_code == code))
     ).scalar_one_or_none()
@@ -151,9 +256,59 @@ async def device_approve(
     expires = _aware(dc.expires_at)
     if expires is not None and expires <= _utcnow():
         raise HTTPException(status_code=400, detail="user code expired")
-    if dc.status not in ("pending",):
+    if dc.status != "pending":
         raise HTTPException(status_code=400, detail=f"user code is {dc.status}")
-    dc.status = "approved"
-    dc.user_id = user.id
+    _approval_response(dc)
+    return dc
+
+
+@router.post("/pending", response_model=schemas.DevicePendingResponse)
+async def device_pending(
+    body: schemas.DeviceApproveRequest,
+    session: AsyncSession = Depends(get_session),
+    _user: User = Depends(auth.current_user),
+) -> schemas.DevicePendingResponse:
+    """Inspect the server-derived identity before the user confirms approval."""
+
+    dc = await _pending_device_code(session, body.user_code)
+    return schemas.DevicePendingResponse(**_approval_response(dc).model_dump())
+
+
+@router.post("/approve", response_model=schemas.DeviceApproveResponse)
+async def device_approve(
+    body: schemas.DeviceApproveRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.DeviceApproveResponse:
+    dc = await _pending_device_code(session, body.user_code)
+    assert dc.host_key_algorithm is not None
+    assert dc.host_public_key is not None
+
+    pinned_host = (
+        await session.execute(
+            select(Host).where(
+                Host.host_key_algorithm == dc.host_key_algorithm,
+                Host.host_public_key == dc.host_public_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if pinned_host is not None and pinned_host.owner_user_id != user.id:
+        await session.delete(dc)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host key is already paired")
+
+    approved = await session.execute(
+        update(DeviceCode)
+        .where(
+            DeviceCode.device_code == dc.device_code,
+            DeviceCode.status == "pending",
+            DeviceCode.user_id.is_(None),
+        )
+        .values(status="approved", user_id=user.id)
+        .execution_options(synchronize_session=False)
+    )
+    if approved.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail="user code is no longer pending")
     await session.commit()
-    return schemas.DeviceApproveResponse(host_name=dc.host_name or "host")
+    return _approval_response(dc)
