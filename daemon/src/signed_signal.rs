@@ -8,13 +8,14 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const TRANSCRIPT_MAGIC: &[u8] = b"SPAWN-RTC-SIGNAL-SIG-V1";
 pub const TRANSCRIPT_VERSION: u8 = 1;
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
-pub const MAX_SESSION_ID_BYTES: usize = 256;
-pub const MAX_SCOPE_ID_BYTES: usize = 256;
+pub const MAX_SESSION_ID_BYTES: usize = 36;
+pub const MAX_SCOPE_ID_BYTES: usize = 36;
 pub const MAX_SDP_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,8 +232,9 @@ impl SignedSignalTranscript {
         if self.protocol_version == 0 {
             return Err(SignedSignalError::InvalidProtocolVersion);
         }
-        validate_length("session_id", self.session_id.len(), 1, MAX_SESSION_ID_BYTES)?;
-        validate_length("scope_id", self.scope_id.len(), 1, MAX_SCOPE_ID_BYTES)?;
+        validate_canonical_uuid("session_id", &self.session_id, MAX_SESSION_ID_BYTES)?;
+        validate_canonical_uuid("scope_id", &self.scope_id, MAX_SCOPE_ID_BYTES)?;
+        strict_verifying_key_from_bytes(&self.intended_peer_public_key)?;
         validate_length("sdp", self.sdp.len(), 1, MAX_SDP_BYTES)
     }
 }
@@ -256,6 +258,8 @@ pub enum SignedSignalError {
     },
     #[error("invalid UTF-8 in {0}")]
     InvalidUtf8(&'static str),
+    #[error("{0} must be an exact lowercase-hyphenated canonical UUID")]
+    InvalidCanonicalUuid(&'static str),
     #[error("truncated transcript while reading {0}")]
     Truncated(&'static str),
     #[error("transcript has {0} trailing bytes")]
@@ -270,6 +274,20 @@ pub enum SignedSignalError {
     InvalidSignature,
     #[error("operating-system randomness unavailable")]
     RandomnessUnavailable,
+}
+
+fn validate_canonical_uuid(
+    field: &'static str,
+    value: &str,
+    exact_length: usize,
+) -> Result<(), SignedSignalError> {
+    validate_length(field, value.len(), exact_length, exact_length)?;
+    let parsed =
+        Uuid::parse_str(value).map_err(|_| SignedSignalError::InvalidCanonicalUuid(field))?;
+    if parsed.to_string() != value {
+        return Err(SignedSignalError::InvalidCanonicalUuid(field));
+    }
+    Ok(())
 }
 
 pub fn generate_signing_key() -> Result<SigningKey, SignedSignalError> {
@@ -318,18 +336,23 @@ pub fn public_key_to_wire(verifying_key: &VerifyingKey) -> String {
 
 pub fn public_key_from_wire(value: &str) -> Result<VerifyingKey, SignedSignalError> {
     let decoded = decode_wire_exact::<ED25519_PUBLIC_KEY_BYTES>(value, "public_key")?;
-    let compressed = CompressedEdwardsY(decoded);
+    strict_verifying_key_from_bytes(&decoded)
+}
+
+fn strict_verifying_key_from_bytes(
+    decoded: &[u8; ED25519_PUBLIC_KEY_BYTES],
+) -> Result<VerifyingKey, SignedSignalError> {
+    let compressed = CompressedEdwardsY(*decoded);
     let point = compressed
         .decompress()
         .ok_or(SignedSignalError::InvalidPublicKey)?;
     // ed25519-dalek intentionally accepts ZIP-215 encodings. Recompressing the
     // decoded point makes the RFC 8032 canonical-encoding requirement explicit
     // without maintaining field arithmetic here.
-    if point.compress().to_bytes() != decoded {
+    if point.compress().to_bytes() != *decoded {
         return Err(SignedSignalError::InvalidPublicKey);
     }
-    let key =
-        VerifyingKey::from_bytes(&decoded).map_err(|_| SignedSignalError::InvalidPublicKey)?;
+    let key = VerifyingKey::from_bytes(decoded).map_err(|_| SignedSignalError::InvalidPublicKey)?;
     if key.is_weak() {
         return Err(SignedSignalError::InvalidPublicKey);
     }
@@ -500,6 +523,11 @@ mod tests {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
+    const TEST_SESSION_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const TEST_SCOPE_ID: &str = "bbbbbbbb-2222-4333-8444-555555555555";
+    const MUTATED_SESSION_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef";
+    const MUTATED_SCOPE_ID: &str = "11111111-2222-4333-8444-555555555556";
+
     #[derive(Deserialize)]
     struct GoldenFile {
         format: String,
@@ -588,6 +616,12 @@ mod tests {
             .collect()
     }
 
+    fn valid_peer_key() -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        hex(&golden().intended_peer_key.public_key_hex)
+            .try_into()
+            .unwrap()
+    }
+
     fn transcript(vector: &GoldenVector) -> SignedSignalTranscript {
         let peer: [u8; 32] = hex(&vector.intended_peer_public_key_hex)
             .try_into()
@@ -629,7 +663,7 @@ mod tests {
         let protocol_version =
             original.protocol_version() + if field == "protocol_version" { 1 } else { 0 };
         let session_id = if field == "session_id" {
-            format!("{}-mutated", original.session_id())
+            MUTATED_SESSION_ID.to_owned()
         } else {
             original.session_id().to_owned()
         };
@@ -642,7 +676,7 @@ mod tests {
             original.scope_type()
         };
         let scope_id = if field == "scope_id" {
-            format!("{}-mutated", original.scope_id())
+            MUTATED_SCOPE_ID.to_owned()
         } else {
             original.scope_id().to_owned()
         };
@@ -656,7 +690,9 @@ mod tests {
         };
         let mut peer = *original.intended_peer_public_key();
         if field == "intended_peer_public_key" {
-            peer[0] ^= 1;
+            peer = hex(&golden().signing_key.public_key_hex)
+                .try_into()
+                .unwrap();
         }
         let sdp = if field == "sdp" {
             format!("{}a=x-mutated:1\r\n", original.sdp())
@@ -680,11 +716,11 @@ mod tests {
         SignedSignalTranscript::new(
             SignalKind::Offer,
             2,
-            "session-1",
+            TEST_SESSION_ID,
             ScopeType::Agent,
-            "agent-1",
+            TEST_SCOPE_ID,
             SenderRole::Browser,
-            [7; 32],
+            valid_peer_key(),
             "v=0\r\ns=spawn\r\n",
         )
         .unwrap()
@@ -715,16 +751,77 @@ mod tests {
     }
 
     #[test]
+    fn session_and_scope_ids_are_exact_canonical_uuid_text_on_encode_and_decode() {
+        let invalid = [
+            "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+            "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee",
+            "{aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee}",
+            " aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee ",
+            "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+        ];
+        for value in invalid {
+            assert!(matches!(
+                SignedSignalTranscript::new(
+                    SignalKind::Offer,
+                    2,
+                    value,
+                    ScopeType::Agent,
+                    TEST_SCOPE_ID,
+                    SenderRole::Browser,
+                    valid_peer_key(),
+                    "v=0",
+                ),
+                Err(SignedSignalError::InvalidLength {
+                    field: "session_id",
+                    ..
+                }) | Err(SignedSignalError::InvalidCanonicalUuid("session_id"))
+            ));
+            assert!(matches!(
+                SignedSignalTranscript::new(
+                    SignalKind::Offer,
+                    2,
+                    TEST_SESSION_ID,
+                    ScopeType::Agent,
+                    value,
+                    SenderRole::Browser,
+                    valid_peer_key(),
+                    "v=0",
+                ),
+                Err(SignedSignalError::InvalidLength {
+                    field: "scope_id",
+                    ..
+                }) | Err(SignedSignalError::InvalidCanonicalUuid("scope_id"))
+            ));
+        }
+
+        let mut uppercase_session = example().encode().unwrap();
+        let session_offset = TRANSCRIPT_MAGIC.len() + 1 + 1 + 4 + 2;
+        uppercase_session[session_offset] = b'A';
+        assert_eq!(
+            SignedSignalTranscript::decode(&uppercase_session),
+            Err(SignedSignalError::InvalidCanonicalUuid("session_id"))
+        );
+
+        let mut uppercase_scope = example().encode().unwrap();
+        let scope_offset = session_offset + MAX_SESSION_ID_BYTES + 1 + 2;
+        uppercase_scope[scope_offset] = b'B';
+        assert_eq!(
+            SignedSignalTranscript::decode(&uppercase_scope),
+            Err(SignedSignalError::InvalidCanonicalUuid("scope_id"))
+        );
+    }
+
+    #[test]
     fn transcript_rejects_bounds_invalid_utf8_and_trailing_bytes() {
         assert!(matches!(
             SignedSignalTranscript::new(
                 SignalKind::Offer,
                 0,
-                "session",
+                TEST_SESSION_ID,
                 ScopeType::Agent,
-                "agent",
+                TEST_SCOPE_ID,
                 SenderRole::Browser,
-                [0; 32],
+                valid_peer_key(),
                 "v=0",
             ),
             Err(SignedSignalError::InvalidProtocolVersion)
@@ -735,9 +832,9 @@ mod tests {
                 1,
                 "x".repeat(MAX_SESSION_ID_BYTES + 1),
                 ScopeType::Agent,
-                "agent",
+                TEST_SCOPE_ID,
                 SenderRole::Browser,
-                [0; 32],
+                valid_peer_key(),
                 "v=0",
             ),
             Err(SignedSignalError::InvalidLength {
@@ -748,11 +845,11 @@ mod tests {
         assert!(SignedSignalTranscript::new(
             SignalKind::Answer,
             u32::MAX,
-            "s".repeat(MAX_SESSION_ID_BYTES),
+            TEST_SESSION_ID,
             ScopeType::Host,
-            "h".repeat(MAX_SCOPE_ID_BYTES),
+            TEST_SCOPE_ID,
             SenderRole::Daemon,
-            [1; 32],
+            valid_peer_key(),
             "s".repeat(MAX_SDP_BYTES),
         )
         .is_ok());
@@ -760,19 +857,19 @@ mod tests {
             (
                 "session_id",
                 "s".repeat(MAX_SESSION_ID_BYTES + 1),
-                "h".to_owned(),
+                TEST_SCOPE_ID.to_owned(),
                 "v=0".to_owned(),
             ),
             (
                 "scope_id",
-                "s".to_owned(),
+                TEST_SESSION_ID.to_owned(),
                 "h".repeat(MAX_SCOPE_ID_BYTES + 1),
                 "v=0".to_owned(),
             ),
             (
                 "sdp",
-                "s".to_owned(),
-                "h".to_owned(),
+                TEST_SESSION_ID.to_owned(),
+                TEST_SCOPE_ID.to_owned(),
                 "x".repeat(MAX_SDP_BYTES + 1),
             ),
         ] {
@@ -784,7 +881,7 @@ mod tests {
                     ScopeType::Agent,
                     scope,
                     SenderRole::Browser,
-                    [0; 32],
+                    valid_peer_key(),
                     sdp,
                 ),
                 Err(SignedSignalError::InvalidLength { field: actual, .. }) if actual == field
@@ -943,6 +1040,109 @@ mod tests {
         let encoded = example().encode().unwrap();
         assert!(weak.verify(&encoded, &signature).is_ok());
         assert!(weak.verify_strict(&encoded, &signature).is_err());
+    }
+
+    #[test]
+    fn intended_peer_key_uses_the_full_strict_point_contract_at_every_core_boundary() {
+        let corpus = negative_keys();
+        let mut rejected = Vec::new();
+        rejected.extend(
+            corpus
+                .weak_public_keys
+                .iter()
+                .map(|vector| (vector.id.clone(), vector.public_key_hex.clone())),
+        );
+        rejected.extend(
+            corpus
+                .noncanonical_public_key_hex
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (format!("noncanonical-{index}"), value.clone())),
+        );
+        rejected.extend(
+            corpus
+                .invalid_encodings
+                .iter()
+                .map(|vector| (vector.id.clone(), vector.public_key_hex.clone())),
+        );
+        assert_eq!(rejected.len(), 49);
+
+        let signing_key = signing_key_from_seed(&hex(&golden().signing_key.seed_hex)).unwrap();
+        let valid = example();
+        let signature = sign_transcript(&signing_key, &valid).unwrap();
+        let peer_offset = TRANSCRIPT_MAGIC.len()
+            + 1
+            + 1
+            + 4
+            + 2
+            + MAX_SESSION_ID_BYTES
+            + 1
+            + 2
+            + MAX_SCOPE_ID_BYTES
+            + 1;
+        for (id, public_key_hex) in rejected {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] = hex(&public_key_hex).try_into().unwrap();
+            assert_eq!(
+                SignedSignalTranscript::new(
+                    SignalKind::Offer,
+                    2,
+                    TEST_SESSION_ID,
+                    ScopeType::Agent,
+                    TEST_SCOPE_ID,
+                    SenderRole::Browser,
+                    raw,
+                    "v=0",
+                ),
+                Err(SignedSignalError::InvalidPublicKey),
+                "constructor: {id}"
+            );
+
+            let mut forged_core = valid.clone();
+            forged_core.intended_peer_public_key = raw;
+            assert_eq!(
+                forged_core.encode(),
+                Err(SignedSignalError::InvalidPublicKey),
+                "encoder: {id}"
+            );
+            assert_eq!(
+                sign_transcript(&signing_key, &forged_core),
+                Err(SignedSignalError::InvalidPublicKey),
+                "signer: {id}"
+            );
+            assert_eq!(
+                verify_transcript(&signing_key.verifying_key(), &forged_core, &signature),
+                Err(SignedSignalError::InvalidPublicKey),
+                "verifier: {id}"
+            );
+
+            let mut forged_wire = valid.encode().unwrap();
+            forged_wire[peer_offset..peer_offset + ED25519_PUBLIC_KEY_BYTES].copy_from_slice(&raw);
+            assert_eq!(
+                SignedSignalTranscript::decode(&forged_wire),
+                Err(SignedSignalError::InvalidPublicKey),
+                "decoder: {id}"
+            );
+        }
+
+        assert_eq!(corpus.accepted_mixed_torsion_public_key_hex.len(), 7);
+        for public_key_hex in &corpus.accepted_mixed_torsion_public_key_hex {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] = hex(public_key_hex).try_into().unwrap();
+            let accepted = SignedSignalTranscript::new(
+                SignalKind::Offer,
+                2,
+                TEST_SESSION_ID,
+                ScopeType::Agent,
+                TEST_SCOPE_ID,
+                SenderRole::Browser,
+                raw,
+                "v=0",
+            )
+            .unwrap();
+            let encoded = accepted.encode().unwrap();
+            assert_eq!(SignedSignalTranscript::decode(&encoded).unwrap(), accepted);
+            let signature = sign_transcript(&signing_key, &accepted).unwrap();
+            verify_transcript(&signing_key.verifying_key(), &accepted, &signature).unwrap();
+        }
     }
 
     #[test]

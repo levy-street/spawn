@@ -442,18 +442,30 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   pins maximum). Status shows device IDs and fingerprints, never browser keys
   or credential secrets. This is not live signaling trust yet; server
   revocation cannot silently remove a local pin, and explicit re-pair/local
-  management remains required.
+  management remains required. The initial tuple is server-mediated and is not
+  an independently sourced expected-peer pin until a later explicit OOB
+  fingerprint comparison/activation gate passes.
 - Keyring and fallback copies use a shared whole-record commit identity. Loads
   select one complete `(generation, record ID)` and never combine its token,
   host identity/server metadata, or browser pins with another generation.
-  The Unix mode-0600 record is independently complete; native platforms keep
+  The Unix mode-0600 record is independently complete and is the commit point;
+  keyring read/write failure automatically uses that complete file without a
+  disable flag. Native platforms keep
   the private seed in the complete keyring record and treat the file as only a
   matching seed-free metadata projection.
+- Keyring accounts are scoped to the SHA-256 identity of the canonical config
+  directory, so separate `SPAWN_CONFIG_DIR` trees cannot inherit or delete one
+  another's host/browser trust. Linux's native backend is kernel keyutils.
+  Only the exact default directory may perform a conflict-checked one-time
+  migration from the pre-scoping global account.
 - Credential mutations use an exclusive cross-process lock and reread both
   durable copies inside it. The pre-ceremony base record must still match
   before either backend is written, so a delayed login cannot regress a newer
   generation or discard another login's immutable browser pin. The lock is
-  released before any interactive device approval wait.
+  released before any interactive device approval wait. A nonempty pin set is
+  bound to canonical server origin plus Host ID; relogin across either domain
+  fails before writing and requires explicit `spawnd logout` or a separate
+  `SPAWN_CONFIG_DIR`.
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.

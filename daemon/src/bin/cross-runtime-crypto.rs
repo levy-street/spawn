@@ -35,6 +35,9 @@ struct ExchangeArtifact {
     browser_key_fingerprint: String,
     host_key_fingerprint: String,
     exact_sdp: String,
+    invalid_identifiers: Vec<String>,
+    invalid_intended_peer_public_keys: Vec<String>,
+    accepted_intended_peer_public_keys: Vec<String>,
     signal: SignalArtifact,
     wire: WireArtifact,
     registration: RegistrationArtifact,
@@ -84,6 +87,19 @@ struct HostPairArtifact {
     canonical_bytes: String,
     canonical_sha256: String,
     signature: String,
+}
+
+#[derive(Deserialize)]
+struct NegativeKeyCorpus {
+    weak_public_keys: Vec<NegativeKeyVector>,
+    noncanonical_public_key_hex: Vec<String>,
+    invalid_encodings: Vec<NegativeKeyVector>,
+    accepted_mixed_torsion_public_key_hex: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct NegativeKeyVector {
+    public_key_hex: String,
 }
 
 fn main() -> Result<()> {
@@ -164,6 +180,8 @@ fn produce() -> Result<ExchangeArtifact> {
         canonical_sha256: sha256_wire(&host_pair_bytes),
         signature: raw_signature_wire(&browser_key, &host_pair_bytes),
     };
+    let (invalid_intended_peer_public_keys, accepted_intended_peer_public_keys) =
+        intended_peer_key_corpus()?;
 
     Ok(ExchangeArtifact {
         producer: "rust".to_owned(),
@@ -172,6 +190,9 @@ fn produce() -> Result<ExchangeArtifact> {
         browser_key_fingerprint,
         host_key_fingerprint,
         exact_sdp,
+        invalid_identifiers: invalid_identifiers(),
+        invalid_intended_peer_public_keys,
+        accepted_intended_peer_public_keys,
         signal,
         wire: WireArtifact {
             envelope_sha256: sha256_wire(envelope.as_bytes()),
@@ -228,6 +249,70 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
         &artifact.signal.intended_peer_public_key,
         &artifact.host_public_key,
     )?;
+    for invalid in &artifact.invalid_identifiers {
+        let invalid_session = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            invalid,
+            ScopeType::Agent,
+            &artifact.signal.scope_id,
+            SenderRole::Browser,
+            *host_key.as_bytes(),
+            &expected_sdp,
+        );
+        if invalid_session.is_ok() {
+            bail!("Rust accepted exchanged noncanonical session UUID {invalid:?}");
+        }
+        let invalid_scope = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            &artifact.signal.session_id,
+            ScopeType::Agent,
+            invalid,
+            SenderRole::Browser,
+            *host_key.as_bytes(),
+            &expected_sdp,
+        );
+        if invalid_scope.is_ok() {
+            bail!("Rust accepted exchanged noncanonical scope UUID {invalid:?}");
+        }
+    }
+    if artifact.invalid_intended_peer_public_keys.len() != 49
+        || artifact.accepted_intended_peer_public_keys.len() != 7
+    {
+        bail!("exchanged intended-peer point corpus has the wrong cardinality");
+    }
+    for invalid in &artifact.invalid_intended_peer_public_keys {
+        let raw = decode_canonical_exact::<32>(invalid, "invalid intended-peer public key")?;
+        if SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            &artifact.signal.session_id,
+            ScopeType::Agent,
+            &artifact.signal.scope_id,
+            SenderRole::Browser,
+            raw,
+            &expected_sdp,
+        )
+        .is_ok()
+        {
+            bail!("Rust accepted exchanged invalid intended-peer point");
+        }
+    }
+    for accepted in &artifact.accepted_intended_peer_public_keys {
+        let raw = decode_canonical_exact::<32>(accepted, "accepted intended-peer public key")?;
+        SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            &artifact.signal.session_id,
+            ScopeType::Agent,
+            &artifact.signal.scope_id,
+            SenderRole::Browser,
+            raw,
+            &expected_sdp,
+        )
+        .context("Rust rejected exchanged accepted intended-peer point")?;
+    }
 
     let transcript = signal_transcript(&artifact.signal, &host_key)?;
     let signal_bytes = transcript
@@ -388,6 +473,72 @@ fn exact_sdp(host_fingerprint: &str, browser_fingerprint: &str) -> String {
     format!(
         "v=0\r\no=spawn 424242 2 IN IP4 127.0.0.1\r\ns=spawn cross-runtime\r\nt=0 0\r\na=fingerprint:sha-256 {DTLS_FINGERPRINT}\r\na=x-spawn-host-key-fingerprint:{host_fingerprint}\r\na=x-spawn-browser-key-fingerprint:{browser_fingerprint}\r\n"
     )
+}
+
+fn invalid_identifiers() -> Vec<String> {
+    [
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+        "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee",
+        "{aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee}",
+        " aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee ",
+        "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn intended_peer_key_corpus() -> Result<(Vec<String>, Vec<String>)> {
+    let corpus: NegativeKeyCorpus = serde_json::from_str(include_str!(
+        "../../../proto/ed25519-public-key-negative-vectors.json"
+    ))
+    .context("parsing shared Ed25519 point corpus")?;
+    let mut invalid = Vec::new();
+    invalid.extend(
+        corpus
+            .weak_public_keys
+            .into_iter()
+            .map(|vector| vector.public_key_hex),
+    );
+    invalid.extend(corpus.noncanonical_public_key_hex);
+    invalid.extend(
+        corpus
+            .invalid_encodings
+            .into_iter()
+            .map(|vector| vector.public_key_hex),
+    );
+    let encode = |value: String| -> Result<String> {
+        let bytes = decode_lower_hex(&value)?;
+        if bytes.len() != 32 {
+            bail!("Ed25519 corpus key has the wrong width");
+        }
+        Ok(canonical_wire(&bytes))
+    };
+    Ok((
+        invalid
+            .into_iter()
+            .map(&encode)
+            .collect::<Result<Vec<_>>>()?,
+        corpus
+            .accepted_mixed_torsion_public_key_hex
+            .into_iter()
+            .map(encode)
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn decode_lower_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Ed25519 corpus contains invalid hex");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("hex is ASCII");
+            u8::from_str_radix(pair, 16).context("decoding Ed25519 corpus hex")
+        })
+        .collect()
 }
 
 fn raw_signature_wire(signing_key: &SigningKey, message: &[u8]) -> String {

@@ -14,6 +14,7 @@ import {
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
 
@@ -41,10 +42,21 @@ function DeviceInner() {
     setError(null);
     setSubmitting(true);
     try {
-      const r = await auth.pendingDevice({ user_code: code.trim().toUpperCase() });
+      const r = await auth.pendingDevice({
+        user_code: code.trim().toUpperCase(),
+      });
+      const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
+      if (r.host_key_fingerprint !== expectedFingerprint) {
+        throw new ApprovalIdentityError(
+          "Daemon fingerprint did not match its public key; approval was blocked",
+        );
+      }
       setPending(r);
     } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Approval failed";
+      const message =
+        err instanceof ApiError || err instanceof ApprovalIdentityError
+          ? err.message
+          : "Approval failed";
       setError(message);
     } finally {
       setSubmitting(false);

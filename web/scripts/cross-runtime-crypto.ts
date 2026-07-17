@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import negativeKeysJson from "../../proto/ed25519-public-key-negative-vectors.json";
 
 import {
   encodeBrowserDeviceRegistrationTranscript,
@@ -10,7 +11,9 @@ import {
   verifyHostPairApprovalProof,
 } from "../src/lib/host-pair-approval-transcript";
 import {
+  decodeBase64Url,
   decodeEd25519PublicKeyWire,
+  ED25519_PUBLIC_KEY_BYTES,
   encodeBase64Url,
   encodeSignedSignalTranscript,
   exportEd25519PublicKeyWire,
@@ -20,7 +23,10 @@ import {
   type SignedSignalTranscript,
   verifySignedSignalTranscript,
 } from "../src/lib/signed-signal";
-import { signRtcSignalWire, verifyRtcSignalWire } from "../src/lib/signed-signal-wire";
+import {
+  signRtcSignalWire,
+  verifyRtcSignalWire,
+} from "../src/lib/signed-signal-wire";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const rustArgs = [
@@ -43,6 +49,9 @@ interface ExchangeArtifact {
   browser_key_fingerprint: string;
   host_key_fingerprint: string;
   exact_sdp: string;
+  invalid_identifiers: string[];
+  invalid_intended_peer_public_keys: string[];
+  accepted_intended_peer_public_keys: string[];
   signal: SignalArtifact;
   wire: WireArtifact;
   registration: RegistrationArtifact;
@@ -86,6 +95,19 @@ interface HostPairArtifact {
   signature: string;
 }
 
+interface NegativeKeyVector {
+  public_key_hex: string;
+}
+
+interface NegativeKeyCorpus {
+  weak_public_keys: NegativeKeyVector[];
+  noncanonical_public_key_hex: string[];
+  invalid_encodings: NegativeKeyVector[];
+  accepted_mixed_torsion_public_key_hex: string[];
+}
+
+const negativeKeys = negativeKeysJson as NegativeKeyCorpus;
+
 function rust(command: "produce" | "verify", input?: string): string {
   const result = spawnSync("cargo", [...rustArgs, command], {
     cwd: repoRoot,
@@ -107,12 +129,37 @@ function ownedBuffer(value: Uint8Array): ArrayBuffer {
   return output;
 }
 
+function hexToBytes(value: string): Uint8Array {
+  if (value.length % 2 !== 0 || !/^[0-9a-f]+$/u.test(value)) {
+    throw new Error("invalid shared Ed25519 corpus hex");
+  }
+  return Uint8Array.from(value.match(/../gu) ?? [], (pair) =>
+    Number.parseInt(pair, 16),
+  );
+}
+
+function intendedPeerKeyCorpus(): { accepted: string[]; invalid: string[] } {
+  const invalidHex = [
+    ...negativeKeys.weak_public_keys.map((vector) => vector.public_key_hex),
+    ...negativeKeys.noncanonical_public_key_hex,
+    ...negativeKeys.invalid_encodings.map((vector) => vector.public_key_hex),
+  ];
+  return {
+    accepted: negativeKeys.accepted_mixed_torsion_public_key_hex.map((value) =>
+      encodeBase64Url(hexToBytes(value)),
+    ),
+    invalid: invalidHex.map((value) => encodeBase64Url(hexToBytes(value))),
+  };
+}
+
 function assertEqual(field: string, actual: unknown, expected: unknown): void {
   if (actual !== expected) throw new Error(`${field} mismatch`);
 }
 
 async function sha256Wire(value: Uint8Array): Promise<string> {
-  return encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", ownedBuffer(value))));
+  return encodeBase64Url(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", ownedBuffer(value))),
+  );
 }
 
 async function keyFingerprint(publicKeyWire: string): Promise<string> {
@@ -137,7 +184,9 @@ function transcriptFrom(artifact: SignalArtifact): SignedSignalTranscript {
     scopeType: artifact.scope_type,
     scopeId: artifact.scope_id,
     senderRole: artifact.sender_role,
-    intendedPeerPublicKey: decodeEd25519PublicKeyWire(artifact.intended_peer_public_key),
+    intendedPeerPublicKey: decodeEd25519PublicKeyWire(
+      artifact.intended_peer_public_key,
+    ),
     sdp: artifact.sdp,
   };
 }
@@ -165,17 +214,92 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
     artifact.signal.intended_peer_public_key,
     artifact.host_public_key,
   );
+  for (const invalid of artifact.invalid_identifiers) {
+    let rejectedSession = false;
+    try {
+      encodeSignedSignalTranscript({
+        ...transcriptFrom(artifact.signal),
+        sessionId: invalid,
+      });
+    } catch {
+      rejectedSession = true;
+    }
+    if (!rejectedSession)
+      throw new Error(
+        `WebCrypto accepted noncanonical session UUID ${invalid}`,
+      );
+    let rejectedScope = false;
+    try {
+      encodeSignedSignalTranscript({
+        ...transcriptFrom(artifact.signal),
+        scopeId: invalid,
+      });
+    } catch {
+      rejectedScope = true;
+    }
+    if (!rejectedScope)
+      throw new Error(`WebCrypto accepted noncanonical scope UUID ${invalid}`);
+  }
+  assertEqual(
+    "invalid intended-peer corpus size",
+    artifact.invalid_intended_peer_public_keys.length,
+    49,
+  );
+  assertEqual(
+    "accepted intended-peer corpus size",
+    artifact.accepted_intended_peer_public_keys.length,
+    7,
+  );
+  for (const invalid of artifact.invalid_intended_peer_public_keys) {
+    let rejected = false;
+    try {
+      encodeSignedSignalTranscript({
+        ...transcriptFrom(artifact.signal),
+        intendedPeerPublicKey: decodeBase64Url(
+          invalid,
+          ED25519_PUBLIC_KEY_BYTES,
+        ),
+      });
+    } catch {
+      rejected = true;
+    }
+    if (!rejected)
+      throw new Error(
+        "WebCrypto accepted exchanged invalid intended-peer point",
+      );
+  }
+  for (const accepted of artifact.accepted_intended_peer_public_keys) {
+    encodeSignedSignalTranscript({
+      ...transcriptFrom(artifact.signal),
+      intendedPeerPublicKey: decodeBase64Url(
+        accepted,
+        ED25519_PUBLIC_KEY_BYTES,
+      ),
+    });
+  }
 
   const transcript = transcriptFrom(artifact.signal);
   const transcriptBytes = encodeSignedSignalTranscript(transcript);
-  assertEqual("signed-signal bytes", artifact.signal.canonical_bytes, encodeBase64Url(transcriptBytes));
+  assertEqual(
+    "signed-signal bytes",
+    artifact.signal.canonical_bytes,
+    encodeBase64Url(transcriptBytes),
+  );
   assertEqual(
     "signed-signal hash",
     artifact.signal.canonical_sha256,
     await sha256Wire(transcriptBytes),
   );
-  const browserKey = await importEd25519PublicKeyWire(artifact.browser_public_key);
-  if (!(await verifySignedSignalTranscript(browserKey, transcript, artifact.signal.signature))) {
+  const browserKey = await importEd25519PublicKeyWire(
+    artifact.browser_public_key,
+  );
+  if (
+    !(await verifySignedSignalTranscript(
+      browserKey,
+      transcript,
+      artifact.signal.signature,
+    ))
+  ) {
     throw new Error("WebCrypto rejected the Rust signed-signal signature");
   }
 
@@ -189,10 +313,22 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
     artifact.browser_public_key,
     artifact.host_public_key,
   );
-  assertEqual("wire sender", verifiedWire.senderPublicKeyWire, artifact.browser_public_key);
+  assertEqual(
+    "wire sender",
+    verifiedWire.senderPublicKeyWire,
+    artifact.browser_public_key,
+  );
   assertEqual("wire protocol", verifiedWire.protocol, "spawn.pty");
-  assertEqual("wire session", verifiedWire.transcript.sessionId, transcript.sessionId);
-  assertEqual("wire scope", verifiedWire.transcript.scopeId, transcript.scopeId);
+  assertEqual(
+    "wire session",
+    verifiedWire.transcript.sessionId,
+    transcript.sessionId,
+  );
+  assertEqual(
+    "wire scope",
+    verifiedWire.transcript.scopeId,
+    transcript.scopeId,
+  );
   assertEqual("wire SDP", verifiedWire.transcript.sdp, expectedSdp);
 
   assertEqual(
@@ -221,11 +357,21 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
       artifact.registration.signature,
     ))
   ) {
-    throw new Error("WebCrypto rejected the Rust browser-registration signature");
+    throw new Error(
+      "WebCrypto rejected the Rust browser-registration signature",
+    );
   }
 
-  assertEqual("host-pair user", artifact.host_pair.user_id, artifact.registration.user_id);
-  assertEqual("host-pair host key", artifact.host_pair.host_public_key, artifact.host_public_key);
+  assertEqual(
+    "host-pair user",
+    artifact.host_pair.user_id,
+    artifact.registration.user_id,
+  );
+  assertEqual(
+    "host-pair host key",
+    artifact.host_pair.host_public_key,
+    artifact.host_public_key,
+  );
   assertEqual(
     "host-pair browser key",
     artifact.host_pair.browser_public_key,
@@ -260,10 +406,17 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
   }
 }
 
-async function rawSignature(privateKey: CryptoKey, transcript: Uint8Array): Promise<string> {
+async function rawSignature(
+  privateKey: CryptoKey,
+  transcript: Uint8Array,
+): Promise<string> {
   return encodeBase64Url(
     new Uint8Array(
-      await crypto.subtle.sign({ name: "Ed25519" }, privateKey, ownedBuffer(transcript)),
+      await crypto.subtle.sign(
+        { name: "Ed25519" },
+        privateKey,
+        ownedBuffer(transcript),
+      ),
     ),
   );
 }
@@ -271,7 +424,9 @@ async function rawSignature(privateKey: CryptoKey, transcript: Uint8Array): Prom
 async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
   const browserKey = await generateEd25519IdentityKeyPair();
   const hostKey = await generateEd25519IdentityKeyPair();
-  const browserPublicKey = await exportEd25519PublicKeyWire(browserKey.publicKey);
+  const browserPublicKey = await exportEd25519PublicKeyWire(
+    browserKey.publicKey,
+  );
   const hostPublicKey = await exportEd25519PublicKeyWire(hostKey.publicKey);
   const browserFingerprint = await keyFingerprint(browserPublicKey);
   const hostFingerprint = await keyFingerprint(hostPublicKey);
@@ -287,7 +442,10 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     sdp,
   };
   const signalBytes = encodeSignedSignalTranscript(transcript);
-  const signalSignature = await signSignedSignalTranscript(browserKey.privateKey, transcript);
+  const signalSignature = await signSignedSignalTranscript(
+    browserKey.privateKey,
+    transcript,
+  );
   const envelope = await signRtcSignalWire(
     {
       publicKeyWire: browserPublicKey,
@@ -297,14 +455,20 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
   );
 
   const userId = crypto.randomUUID();
-  const registrationBytes = encodeBrowserDeviceRegistrationTranscript(userId, browserPublicKey);
-  const approvalNonce = encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const registrationBytes = encodeBrowserDeviceRegistrationTranscript(
+    userId,
+    browserPublicKey,
+  );
+  const approvalNonce = encodeBase64Url(
+    crypto.getRandomValues(new Uint8Array(32)),
+  );
   const hostPairBytes = encodeHostPairApprovalTranscript(
     userId,
     approvalNonce,
     hostPublicKey,
     browserPublicKey,
   );
+  const intendedPeerKeys = intendedPeerKeyCorpus();
   return {
     producer: "webcrypto",
     browser_public_key: browserPublicKey,
@@ -312,6 +476,15 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     browser_key_fingerprint: browserFingerprint,
     host_key_fingerprint: hostFingerprint,
     exact_sdp: sdp,
+    invalid_identifiers: [
+      "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+      "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee",
+      "{aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee}",
+      " aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee ",
+      "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+    ],
+    invalid_intended_peer_public_keys: intendedPeerKeys.invalid,
+    accepted_intended_peer_public_keys: intendedPeerKeys.accepted,
     signal: {
       signal_kind: "offer",
       protocol_version: transcript.protocolVersion,

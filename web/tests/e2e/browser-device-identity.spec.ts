@@ -46,7 +46,9 @@ test("persists a non-extractable identity across real browser page sessions", as
   await loadFixture(page);
   const first = await page.evaluate(async () => {
     const api = globalThis.SpawnBrowserIdentity;
-    const identity = await api.loadOrCreateBrowserDeviceIdentity("browser-persistence");
+    const identity = await api.loadOrCreateBrowserDeviceIdentity(
+      "00000000-0000-0000-0000-000000000201",
+    );
     return {
       keys: Object.keys(identity).sort(),
       publicKeyWire: identity.publicKeyWire,
@@ -57,7 +59,9 @@ test("persists a non-extractable identity across real browser page sessions", as
   await page.addScriptTag({ path: bundlePath });
   const reloaded = await page.evaluate(async () => {
     const api = globalThis.SpawnBrowserIdentity;
-    const identity = await api.loadOrCreateBrowserDeviceIdentity("browser-persistence");
+    const identity = await api.loadOrCreateBrowserDeviceIdentity(
+      "00000000-0000-0000-0000-000000000201",
+    );
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
       request.onsuccess = () => resolve(request.result);
@@ -67,7 +71,7 @@ test("persists a non-extractable identity across real browser page sessions", as
       const transaction = database.transaction(api.BROWSER_DEVICE_IDENTITY_STORE_NAME, "readonly");
       const request = transaction
         .objectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME)
-        .get("browser-persistence");
+        .get("00000000-0000-0000-0000-000000000201");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -102,6 +106,34 @@ test("persists a non-extractable identity across real browser page sessions", as
     "publicKeyWire",
     "version",
   ]);
+});
+
+test("native browser ingress rejects every noncanonical account UUID spelling", async ({
+  page,
+}) => {
+  await loadFixture(page);
+  const codes = await page.evaluate(async () => {
+    const invalid = [
+      "account-arbitrary",
+      "00000000000000000000000000000001",
+      "{00000000-0000-0000-0000-000000000001}",
+      "00000000-0000-0000-0000-000000000001 ",
+      "00000000-0000-0000-0000-00000000000A",
+    ];
+    return Promise.all(
+      invalid.map(async (accountId) => {
+        try {
+          await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity(accountId);
+          return "unexpected-success";
+        } catch (error) {
+          return error instanceof globalThis.SpawnBrowserIdentity.BrowserDeviceIdentityError
+            ? error.code
+            : "unexpected-error";
+        }
+      }),
+    );
+  });
+  expect(codes).toEqual(Array.from({ length: 5 }, () => "invalid_account"));
 });
 
 test("rejects corrupt version-1 store schemas repeatedly without rotating", async ({ page }) => {
@@ -232,7 +264,7 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
       const errors = [];
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-          await api.loadOrCreateBrowserDeviceIdentity("browser-invalid-schema");
+          await api.loadOrCreateBrowserDeviceIdentity("00000000-0000-0000-0000-000000000202");
           errors.push("unexpected-success");
         } catch (error) {
           errors.push(error instanceof api.BrowserDeviceIdentityError ? error.code : "unexpected");
@@ -317,27 +349,39 @@ test("two tabs converge and expected-key deletion cannot remove a different iden
   const [first, second] = await Promise.all([
     page.evaluate(
       async () =>
-        (await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity("browser-race"))
-          .publicKeyWire,
+        (
+          await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity(
+            "00000000-0000-0000-0000-000000000203",
+          )
+        ).publicKeyWire,
     ),
     secondPage.evaluate(
       async () =>
-        (await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity("browser-race"))
-          .publicKeyWire,
+        (
+          await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity(
+            "00000000-0000-0000-0000-000000000203",
+          )
+        ).publicKeyWire,
     ),
   ]);
   expect(second).toBe(first);
 
   const other = await page.evaluate(
     async () =>
-      (await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity("browser-other"))
-        .publicKeyWire,
+      (
+        await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity(
+          "00000000-0000-0000-0000-000000000204",
+        )
+      ).publicKeyWire,
   );
   expect(other).not.toBe(first);
 
   const mismatchCode = await page.evaluate(async (wrongKey) => {
     try {
-      await globalThis.SpawnBrowserIdentity.deleteBrowserDeviceIdentity("browser-race", wrongKey);
+      await globalThis.SpawnBrowserIdentity.deleteBrowserDeviceIdentity(
+        "00000000-0000-0000-0000-000000000203",
+        wrongKey,
+      );
       return "unexpected-success";
     } catch (error) {
       return error instanceof globalThis.SpawnBrowserIdentity.BrowserDeviceIdentityError
@@ -349,15 +393,21 @@ test("two tabs converge and expected-key deletion cannot remove a different iden
   expect(
     await secondPage.evaluate(
       async () =>
-        (await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity("browser-race"))
-          .publicKeyWire,
+        (
+          await globalThis.SpawnBrowserIdentity.loadOrCreateBrowserDeviceIdentity(
+            "00000000-0000-0000-0000-000000000203",
+          )
+        ).publicKeyWire,
     ),
   ).toBe(first);
 
   expect(
     await page.evaluate(
       async (expectedKey) =>
-        globalThis.SpawnBrowserIdentity.deleteBrowserDeviceIdentity("browser-race", expectedKey),
+        globalThis.SpawnBrowserIdentity.deleteBrowserDeviceIdentity(
+          "00000000-0000-0000-0000-000000000203",
+          expectedKey,
+        ),
       first,
     ),
   ).toBe(true);

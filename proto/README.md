@@ -66,22 +66,29 @@ compares it exactly. A legacy success response without this tuple fails closed;
 pending/error responses remain backward compatible.
 
 The daemon stores at most 32 immutable browser device/key pins in deterministic
-device-ID order alongside its protected credential record. Exact repeats are
+device-ID order alongside its protected credential record, bound as one set to
+the canonical server origin plus returned Host ID. Exact repeats are
 idempotent. Reusing a device ID for another key or a key for another device is
-a local conflict and never overwrites the existing pin. This storage is an
-offline foundation only: the pin is not connected to live RTC verification
-yet. Server-side browser revocation does not silently delete a daemon-local
-pin; explicit re-pairing and local pin-management commands are required future
-work.
+a local conflict and never overwrites the existing pin. Relogin to another
+origin/Host fails before persistence; explicit reset or a separate config
+directory is required. This storage is an offline, server-mediated foundation
+only: the pin is not connected to live RTC verification and does not yet meet
+independent expected-peer provenance. Server-side browser revocation does not
+silently delete a daemon-local pin; explicit re-pairing and local pin-management
+commands are required future work.
 
-The protected credential copies are generation-bound whole records. The
-daemon chooses one complete record by monotonic generation and unique record
-ID after interrupted or concurrent backend writes; it never overlays a token,
-host ID/server, private host seed, or browser pins from different commits.
+The protected credential copies are generation-bound whole records. It never
+overlays a token, host ID/server, private host seed, or browser pins from
+different commits. On Unix the atomically replaced, parent-synced mode-0600
+file is the commit point; a higher redundant keyring generation after a failed
+file replacement is not promoted.
 Legacy records without a generation are migrated on their next successful
-save. The Unix mode-0600 fallback remains a complete usable record if the
-keyring is unavailable; on native platforms the keyring remains the only
-seed-bearing complete record.
+save. Keyring accounts are scoped to the canonical config-directory identity;
+only the exact default directory may conflict-check and migrate the old global
+account, while alternate config trees never read or clear it. Genuine keyring read/write unavailability automatically falls back to
+the complete Unix record without requiring `SPAWN_DISABLE_KEYRING`; on native
+platforms the keyring remains the only seed-bearing complete record and an
+EOF-truncated seed-free projection is atomically rebuilt from it.
 
 Every credential mutation holds a short-lived cross-process lock from its
 durable reread through both backend writes. It compare-and-swaps the record

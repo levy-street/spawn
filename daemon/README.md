@@ -25,9 +25,11 @@ This uses a device-code flow:
 
 1. The daemon prints a verification URL and short user code.
 2. Open the URL in a browser, sign in, and approve the code.
-3. The daemon stores the resulting access token in your OS keyring (with a
-   mode-600 file fallback at `~/.config/spawn/credentials.json` on headless
-   hosts) along with the assigned `host_id` and the server URL.
+3. The daemon stores the resulting access token, host identity, assigned
+   `host_id`, server URL, and bounded approving-browser pin set. On Unix the
+   parent-synced mode-600 `~/.config/spawn/credentials.json` record is complete
+   and automatically remains authoritative when the optional OS keyring is
+   unavailable.
 
 ## Run
 
@@ -68,11 +70,20 @@ spawnd logout     # wipe stored token, host identity, and host_id
 | default | `https://localhost:8000` |
 
 Credentials live at `~/.config/spawn/credentials.json` (mode 600) and/or in
-your OS keyring under service `spawn`, user `daemon`. On Unix the fallback is
+your OS keyring under service `spawn`, with the account scoped by a SHA-256
+identity of the canonical config directory. Linux uses kernel keyutils, not
+Secret Service/DBus. Only the exact default config directory may migrate the
+legacy global `daemon` account, and only when its file does not conflict; an
+alternate `SPAWN_CONFIG_DIR` never reads or deletes that global account. On Unix the fallback is
 accepted only as a regular, non-symlink file owned by the effective user with
 no group/other permission bits; malformed, oversized, or insecure files fail
-closed. Other platforms keep the private host seed in the native keyring and
-store only non-seed fallback metadata. `spawnd logout` attempts both backends
+closed. New config directories are mode 700; credential replacement and reset
+sync the parent directory, and narrowly named owned mode-600 orphan temps are
+cleaned under the credential lock. A pin-bearing record may relogin only to the
+same canonical server origin and Host ID; use `spawnd logout` for an explicit
+trust reset or a separate `SPAWN_CONFIG_DIR` for another pairing. Other
+platforms keep the private host seed in the native keyring and store only
+non-seed fallback metadata. `spawnd logout` attempts both backends
 and returns a failure if either cannot be cleared, so it never reports a
 successful reset while credentials may remain.
 

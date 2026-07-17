@@ -378,10 +378,11 @@ P3-IDENTITY-02A is integrated at `37c91d4`; reviewed browser account
 registration P3-IDENTITY-02B is integrated at `3ec8b91`; the reviewed offline
 signed-wire adapter P3-IDENTITY-02C is integrated at `6028b2a`; and reviewed
 server/browser host-pair binding P3-IDENTITY-02D is integrated at `7cc4ddc`.
-The reviewed P3-IDENTITY-02E daemon-local pin candidate at `2e48b82` has passed
-combined checkpoint validation against that 02D merge. It is not merge-ready
-until the separately reviewed browser-registration canonicalization correction
-lands on master and is integrated and retested here. These establish
+The reviewed P3-IDENTITY-02E daemon-local pin candidate at `2e48b82` was
+integrated with 02D in pushed checkpoint `2df5a93`; the separately reviewed
+browser-registration canonicalization correction is integrated in the active
+credential/crypto correction cycle. Independent re-review and current-master
+mergeability are still required before acceptance. These establish
 canonical Ed25519 transcripts, durable daemon pairing keys, account-scoped
 non-extractable browser-local keys, strict offline adapters, and bounded
 first-contact pins. They do not make live signaling signed or establish TOFU.
@@ -452,8 +453,8 @@ revocation can block an unconsumed approval, but it cannot erase a pin already
 persisted by a daemon in 02E. 02D makes no peer-discovery, live-signaling, or
 TOFU claim.
 
-**P3-IDENTITY-02E daemon-local browser pins (reviewed candidate at `2e48b82`,
-checkpoint validation passed):** a successful device poll must now contain the
+**P3-IDENTITY-02E daemon-local browser pins (correction/re-review active after
+checkpoint `2df5a93`):** a successful device poll must now contain the
 exact approving browser device ID, canonical Ed25519 public key, and matching
 derived fingerprint. The daemon validates that tuple only after validating its
 own host/token binding, then atomically merges at most 32 immutable browser pins
@@ -464,14 +465,22 @@ pin.
 Credential persistence uses generation-bound whole records rather than merging
 fields across keyring and mode-0600 copies. Mutations hold the cross-process
 credential lock across a durable reread and revision compare-and-swap, so stale
-writers fail before either backend write. Status output is redacted and lookup
-is read-only. The combined real device-login proof passed with an exact
-four-field approved-tuple comparison against the single daemon-persisted pin,
-as did the merged daemon/server/web, Chromium, build, guard, real-browser, and
-current-master gates. The pushed checkpoint remains a candidate until the
-reviewed registration-canonicalization correction lands on master and this
-branch integrates and retests that exact commit. It does not connect the pin to
-live RTC verification or delete it on server revocation.
+writers fail before either backend write. The correction binds any nonempty pin
+set to canonical server origin plus Host ID, refuses domain changes before a
+write with explicit reset/separate-config recovery, and treats the complete
+Unix file as the commit point when its OS keyring is genuinely unavailable
+(Linux uses kernel keyutils, not Secret Service/DBus). Keyring accounts are
+now scoped by the canonical config-directory identity; alternate config trees
+cannot cross-load or cross-delete trust, and only the exact default directory
+may perform a conflict-checked one-time migration of the legacy global entry.
+Strict outer-schema, parent-sync, atomic projection, EOF-only torn-projection
+rebuild, locked stale-temp cleanup, and automatic secret-drop protections are
+covered. Status and smoke failures remain redacted. A real two-login proof now
+runs without the keyring-disable flag and compares both exact four-field
+browser tuples after re-login; a backend-injected subprocess also proves two
+login updates survive raw keyring get/set failures. The initial pin source is still server-mediated,
+so 02E alone does not supply independently sourced expected-peer provenance,
+connect a pin to live RTC verification, or delete it on server revocation.
 
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed
@@ -495,6 +504,83 @@ the separate pending P3-IDENTITY-02 implementation/review gate. P3-AUDIT-01 does
 not silently satisfy that work and no current live-signaling security claim is
 made.
 
+**Independent Phase 3 audit addendum (F1–F8 disposition):** the preserved
+independent report is [`TRUST_PHASE3_AUDIT.md`](TRUST_PHASE3_AUDIT.md). Its
+bottom line controls current status: the cryptographic foundation is strong,
+but the running offer/answer path remains unsigned. The ledger now makes every
+finding a hard live prerequisite:
+
+- **F1:** `ws/browser.py`, `ws/host.py`, and `ws/daemon.py` carry the exact
+  signed 12-field envelope in both directions as one bounded opaque/nested
+  payload. Routing metadata remains outside and untrusted; the server never
+  parses or reserializes signed bytes. One calculated common bound must fit
+  nesting plus current roughly 1.1/1.2 MiB Host WebSocket/Redis caps and pass
+  exact-limit/+1 and signature-strip tests at every boundary.
+- **F2:** daemon and browser RTC entry points accept only verified-signal
+  types. Only `verified.transcript.sdp` reaches WebRTC, fingerprint change is
+  fatal, and agent/host tests substitute raw relay SDP against verified SDP in
+  both directions.
+- **F3:** nonce, generation, topology, and outer routing fields are routing
+  semantics, never peer trust or freshness. Each endpoint compares the
+  verified tuple with its own pending session/scope/version/kind/role and every
+  outer duplicate. ICE starts only after the signed remote description.
+- **F4:** reciprocal expected-peer pins require independent local provenance.
+  Browser host pins are bounded by account + canonical server origin + Host ID
+  and come from local derivation plus OOB approval, never the Host API. Daemon
+  first activation requires an explicit comparison with the trusted browser
+  UI's locally derived fingerprint (or equivalent independent channel); poll
+  data alone is insufficient, and substitution must abort before token/pin
+  write. Every HostControl destination resolves its own pin/signer. Host API
+  disappearance/deletion does not erase local trust or restore first contact:
+  explicit deletion leaves a retryable local revoked host/key tombstone, and a
+  same-ID/new-key reappearance remains fatal until explicit re-pair/rotation.
+- **F5:** registration, pending review, approval, persistence, and live use
+  strictly decode the key, derive the 12-byte SHA-256 fingerprint locally, and
+  require equality. The current correction adds unit and native-browser
+  same-key/wrong-fingerprint failures.
+- **F6:** null/unkeyed Hosts and missing local identities/pins are refused at
+  `/ws/daemon`, `/ws/host`, `/ws/browser`, daemon dispatch, browser agent, and
+  HostControl prerequisites. There is no unsigned compatibility path.
+- **F7:** pairing gains a fresh non-replayable server challenge and a
+  domain-separated daemon proof bound to the exact ceremony/key before
+  approval or token issue.
+- **F8:** Host deletion retains both a durable key-owner claim and a
+  deletion/device-code revocation fence. The parallel server branch owns this
+  work, which remains a final live dependency.
+
+The final integration makes verified types mandatory in daemon
+`handle_offer`/`handle_host_offer` and centralized browser remote-description
+helpers. A small source/type check protects the literal invariant that no live
+offer/answer has raw `sdp` beside the opaque envelope and no
+`setRemoteDescription` reads WebSocket-message SDP; this is not a prose-linter.
+Browser trust capabilities are also auth-scoped: when the authenticated user
+becomes null, changes UUID, or browser registration is revoked/errors,
+`LiveTerminalProvider` closes/evicts every warm terminal and discards signers
+and pins even though it is mounted above `AuthGate`. Account-switch and expired-
+session tests plus distinct H1→H2 cross-host pins are mandatory.
+
+Daemon trust state cannot remain the one-time `run()` credential snapshot.
+Pin add/revoke and token/host-key rotation require a revisioned coherent
+whole-record reload/notification, or a loud enforced restart boundary. The
+canonical server-origin + Host-ID domain is rechecked on every change; token,
+host signing key, and browser pins never mix across revisions. Live tests add
+and revoke a browser pin while `run` is active and prove immediate activation
+and refusal rather than stale reconnect acceptance.
+
+Live identifiers also become strict before wiring: the Date.now/Math.random
+agent-session fallback is removed. Agent and HostControl session IDs use
+`crypto.randomUUID()` or an RFC 4122 value built from `getRandomValues`, and
+unavailable CSPRNG fails before RTC creation. Server outer routing plus both
+endpoints require exact lowercase-hyphen UUID text with no trimming,
+length-only acceptance, or parse/reserialize normalization.
+
+Deployment is a signed-only coordinated cutover, not a compatibility phase.
+The affected WS subprotocols are bumped, or signed-envelope fields become
+unconditional on the existing versions; missing fields/version are fatal and
+never negotiated down. Old cached PWA assets and old daemons are rejected by
+the server/daemon boundary. Old-browser and old-daemon unsigned-frame tests
+must create no RTC peer or session before the non-rolling deployment proceeds.
+
 The P2-DATA-01 checkpoint described above remains documentation only. No
 endpoint protected-data store, DataChannel operation, migration, server-column
 clearing, deployment, or purge has occurred, and P2-DATA-02 remains blocked
@@ -508,9 +594,9 @@ until the decision passes review and is merged.
 2. Finish independent review of the bounded P2-DATA-01 design and the parallel
    P2-HOST-03A interactive installer candidate. Preserve reviewed and merged
    P3-IDENTITY-02D at `7cc4ddc` without claiming TOFU or signed signaling, and
-   integrate the reviewed registration-canonicalization correction into the
-   validated 02E daemon-pin checkpoint, rerun the affected gates, and only then
-   mark it merge-ready. Keep
+   finish independent re-review of the integrated registration, credential,
+   fingerprint, and signed-core corrections in the 02E candidate; rerun the
+   affected gates and only then mark it merge-ready. Keep
    the legacy tool route
    until its endpoint-owned durable targets exist; this wave is not the final
    tool cut.
@@ -530,14 +616,12 @@ until the decision passes review and is merged.
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-5. After 02E passes combined integration validation, run P3-AUDIT-01 as a fresh
-   zero-unresolved-finding adversarial review across signed wire, host keys,
-   daemon pins, browser registration, and server/browser pairing, including
-   substitution, canonicalization, first-contact/TOFU, and real
-   Rust/WebCrypto exchange gates. Only after that separately integrate peer-key
-   discovery, TOFU/fingerprint continuity, and live signed WebSocket signaling
-   bound to SDP, session,
-   agent-or-host scope, protocol version, sender role, and intended peer key.
+5. After 02E passes combined integration validation, close the foundation
+   findings under P3-AUDIT-01, then implement P3-LIVE-F1 through F8, browser
+   auth/trust scoping, and the signed-only cutover as independently reviewed
+   hard dependencies. Only after those pass integrate live signed WebSocket
+   signaling bound to SDP, session, agent-or-host scope, protocol version,
+   sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and
    cross-session/cross-scope replay for both agent- and host-scoped peer
    connections; unverified operator-hosted JavaScript remains outside that

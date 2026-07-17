@@ -1,5 +1,6 @@
 import {
   decodeBase64Url,
+  decodeEd25519PublicKeyWire,
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_BYTES,
   importEd25519PublicKeyWire,
@@ -39,7 +40,7 @@ export function encodeBrowserDeviceRegistrationTranscript(
   userId: string,
   publicKeyWire: string,
 ): Uint8Array {
-  const publicKey = decodeBase64Url(publicKeyWire, ED25519_PUBLIC_KEY_BYTES);
+  const publicKey = decodeEd25519PublicKeyWire(publicKeyWire);
   const output = new Uint8Array(BROWSER_DEVICE_REGISTRATION_TRANSCRIPT_BYTES);
   let offset = 0;
   output.set(BROWSER_DEVICE_REGISTRATION_MAGIC, offset);

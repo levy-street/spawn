@@ -7,6 +7,7 @@ import {
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_PUBLIC_KEY_WIRE_CHARS,
   ED25519_SIGNATURE_WIRE_CHARS,
+  ed25519PublicKeyFingerprint,
   encodeBase64Url,
   encodeSignedSignalTranscript,
   exportEd25519PublicKeyWire,
@@ -58,6 +59,8 @@ interface GoldenFile {
 }
 
 const golden = goldenJson as GoldenFile;
+const mutatedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef";
+const mutatedScopeId = "11111111-2222-4333-8444-555555555556";
 
 interface NegativeKeyVector {
   id: string;
@@ -113,19 +116,19 @@ function mutate(original: SignedSignalTranscript, field: string): SignedSignalTr
       mutated.protocolVersion += 1;
       break;
     case "session_id":
-      mutated.sessionId += "-mutated";
+      mutated.sessionId = mutatedSessionId;
       break;
     case "scope_type":
       mutated.scopeType = original.scopeType === "agent" ? "host" : "agent";
       break;
     case "scope_id":
-      mutated.scopeId += "-mutated";
+      mutated.scopeId = mutatedScopeId;
       break;
     case "sender_role":
       mutated.senderRole = original.senderRole === "browser" ? "daemon" : "browser";
       break;
     case "intended_peer_public_key":
-      mutated.intendedPeerPublicKey[0] ^= 1;
+      mutated.intendedPeerPublicKey = hexToBytes(golden.signing_key.public_key_hex);
       break;
     case "sdp":
       mutated.sdp += "a=x-mutated:1\r\n";
@@ -207,7 +210,7 @@ describe("signed signaling transcript", () => {
     expect(() => decodeSignedSignalTranscript(trailing)).toThrow("trailing bytes");
   });
 
-  test("enforces numeric, byte, strict-Unicode, key, and SDP bounds", () => {
+  test("enforces numeric, canonical UUID, key, and SDP bounds", () => {
     const base = transcript(golden.vectors[0]);
     expect(() => encodeSignedSignalTranscript({ ...base, protocolVersion: 0 })).toThrow(
       "protocolVersion",
@@ -216,16 +219,25 @@ describe("signed signaling transcript", () => {
       "protocolVersion",
     );
     expect(() =>
-      encodeSignedSignalTranscript({ ...base, sessionId: "s".repeat(MAX_SESSION_ID_BYTES + 1) }),
+      encodeSignedSignalTranscript({
+        ...base,
+        sessionId: "s".repeat(MAX_SESSION_ID_BYTES + 1),
+      }),
     ).toThrow("sessionId");
     expect(() =>
-      encodeSignedSignalTranscript({ ...base, scopeId: "s".repeat(MAX_SCOPE_ID_BYTES + 1) }),
+      encodeSignedSignalTranscript({
+        ...base,
+        scopeId: "s".repeat(MAX_SCOPE_ID_BYTES + 1),
+      }),
     ).toThrow("scopeId");
     expect(() =>
-      encodeSignedSignalTranscript({ ...base, sdp: "s".repeat(MAX_SDP_BYTES + 1) }),
+      encodeSignedSignalTranscript({
+        ...base,
+        sdp: "s".repeat(MAX_SDP_BYTES + 1),
+      }),
     ).toThrow("sdp");
     expect(() => encodeSignedSignalTranscript({ ...base, sessionId: "\ud800" })).toThrow(
-      "strict Unicode",
+      "canonical UUID",
     );
     expect(() =>
       encodeSignedSignalTranscript({
@@ -237,11 +249,50 @@ describe("signed signaling transcript", () => {
       encodeSignedSignalTranscript({
         ...base,
         protocolVersion: 0xffff_ffff,
-        sessionId: "s".repeat(MAX_SESSION_ID_BYTES),
-        scopeId: "h".repeat(MAX_SCOPE_ID_BYTES),
+        sessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        scopeId: "11111111-2222-4333-8444-555555555555",
         sdp: "x".repeat(MAX_SDP_BYTES),
       }),
     ).not.toThrow();
+  });
+
+  test("rejects noncanonical UUID spellings at encoder and decoder ingress", () => {
+    const base = transcript(golden.vectors[0]);
+    for (const invalid of [
+      "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+      "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee",
+      "{aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee}",
+      " aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee ",
+      "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+    ]) {
+      expect(() => encodeSignedSignalTranscript({ ...base, sessionId: invalid })).toThrow();
+      expect(() => encodeSignedSignalTranscript({ ...base, scopeId: invalid })).toThrow();
+    }
+
+    const encoded = encodeSignedSignalTranscript(base);
+    const sessionOffset = SIGNED_SIGNAL_MAGIC.byteLength + 1 + 1 + 4 + 2;
+    const uppercaseSession = encoded.slice();
+    const sessionLetter = uppercaseSession.findIndex(
+      (byte, index) =>
+        index >= sessionOffset && index < sessionOffset + MAX_SESSION_ID_BYTES && byte >= 97,
+    );
+    expect(sessionLetter).toBeGreaterThanOrEqual(sessionOffset);
+    uppercaseSession[sessionLetter] -= 32;
+    expect(() => decodeSignedSignalTranscript(uppercaseSession)).toThrow("canonical UUID");
+
+    const scopeEncoded = encodeSignedSignalTranscript({
+      ...base,
+      scopeId: "bbbbbbbb-2222-4333-8444-555555555555",
+    });
+    const scopeOffset = sessionOffset + MAX_SESSION_ID_BYTES + 1 + 2;
+    const uppercaseScope = scopeEncoded.slice();
+    const scopeLetter = uppercaseScope.findIndex(
+      (byte, index) =>
+        index >= scopeOffset && index < scopeOffset + MAX_SCOPE_ID_BYTES && byte >= 97,
+    );
+    expect(scopeLetter).toBeGreaterThanOrEqual(scopeOffset);
+    uppercaseScope[scopeLetter] -= 32;
+    expect(() => decodeSignedSignalTranscript(uppercaseScope)).toThrow("canonical UUID");
   });
 
   test("uses strict canonical unpadded base64url", () => {
@@ -257,6 +308,15 @@ describe("signed signaling transcript", () => {
     );
     expect(ED25519_PUBLIC_KEY_WIRE_CHARS).toBe(43);
     expect(ED25519_SIGNATURE_WIRE_CHARS).toBe(86);
+  });
+
+  test("derives the exact bounded fingerprint only from a strict public key", async () => {
+    await expect(
+      ed25519PublicKeyFingerprint("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"),
+    ).resolves.toBe("SHA256:OfcT0KZEJT8EUpQh");
+    await expect(
+      ed25519PublicKeyFingerprint("AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    ).rejects.toThrow("weak Ed25519 public key");
   });
 
   test("rejects oversized fixed-width wire values before base64 decoding", () => {
@@ -342,6 +402,67 @@ describe("shared Rust/WebCrypto Ed25519 vectors", () => {
     expect(negativeKeys.accepted_mixed_torsion_public_key_hex).toHaveLength(7);
     for (const publicKeyHex of negativeKeys.accepted_mixed_torsion_public_key_hex) {
       await expect(importEd25519PublicKey(hexToBytes(publicKeyHex))).resolves.toBeDefined();
+    }
+  });
+
+  test("applies the full strict point contract to intended-peer keys at every core boundary", async () => {
+    const rejected = [
+      ...negativeKeys.weak_public_keys,
+      ...negativeKeys.noncanonical_public_key_hex.map((public_key_hex, index) => ({
+        id: `noncanonical-${index}`,
+        public_key_hex,
+      })),
+      ...negativeKeys.invalid_encodings,
+    ];
+    expect(rejected).toHaveLength(49);
+    const privateKey = await importTestEd25519PrivateKey(golden.signing_key.seed_hex);
+    const publicKey = await importEd25519PublicKeyWire(golden.signing_key.public_key_wire);
+    const base = transcript(golden.vectors[0]);
+    const encoded = encodeSignedSignalTranscript(base);
+    const peerOffset =
+      SIGNED_SIGNAL_MAGIC.byteLength +
+      1 +
+      1 +
+      4 +
+      2 +
+      MAX_SESSION_ID_BYTES +
+      1 +
+      2 +
+      MAX_SCOPE_ID_BYTES +
+      1;
+
+    for (const vector of rejected) {
+      const raw = hexToBytes(vector.public_key_hex);
+      const invalid = { ...base, intendedPeerPublicKey: raw };
+      expect(() => encodeSignedSignalTranscript(invalid), `encoder: ${vector.id}`).toThrow(
+        "Ed25519 public key",
+      );
+      await expect(
+        signSignedSignalTranscript(privateKey, invalid),
+        `signer: ${vector.id}`,
+      ).rejects.toThrow("Ed25519 public key");
+      await expect(
+        verifySignedSignalTranscript(publicKey, invalid, golden.vectors[0].signature_wire),
+        `verifier: ${vector.id}`,
+      ).rejects.toThrow("Ed25519 public key");
+
+      const forgedWire = encoded.slice();
+      forgedWire.set(raw, peerOffset);
+      expect(() => decodeSignedSignalTranscript(forgedWire), `decoder: ${vector.id}`).toThrow(
+        "Ed25519 public key",
+      );
+    }
+
+    expect(negativeKeys.accepted_mixed_torsion_public_key_hex).toHaveLength(7);
+    for (const publicKeyHex of negativeKeys.accepted_mixed_torsion_public_key_hex) {
+      const accepted = {
+        ...base,
+        intendedPeerPublicKey: hexToBytes(publicKeyHex),
+      };
+      const acceptedBytes = encodeSignedSignalTranscript(accepted);
+      expect(decodeSignedSignalTranscript(acceptedBytes)).toEqual(accepted);
+      const signature = await signSignedSignalTranscript(privateKey, accepted);
+      expect(await verifySignedSignalTranscript(publicKey, accepted, signature)).toBe(true);
     }
   });
 
