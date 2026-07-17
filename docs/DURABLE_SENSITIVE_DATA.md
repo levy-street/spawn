@@ -83,6 +83,9 @@ code-block tokens, and inventories rendered prose/inline-code/HTML text nodes.
 Raw HTML also inventories `alt`, `value`, `title`, `label`, `placeholder`, and
 every `aria-*` attribute value; these may expose visual or accessibility prose,
 so the guard treats them conservatively even where one browser hides a value.
+Inline raw-HTML attribute prose receives semantic whitespace on both sides, and
+multiple visible attributes remain separated, so neighboring text or
+punctuation cannot fuse security-relevant words.
 Native CommonMark image alt text remains child prose, and the only supported
 renderer-visible native attribute, link/image `title`, is inventoried after its
 associated label/alt with an explicit whitespace separator. Native `href` and
@@ -105,10 +108,11 @@ subjectless continuations retain their governing DATA subject, and a new
 explicit non-DATA subject starts a separate claim. Only claim-local negation,
 historical context, or review-and-merge conditions are allowed. Historical
 context requires a past-tense predicate with explicit historical framing;
-review-and-merge conditions require a modal or non-realized transition and never
-excuse present-time or completed-past claims. Anaphoric pronouns retain their
-subject across adjacent visible blocks, while explicit non-DATA subjects,
-document edges, thematic breaks, and inactive code reset that scope.
+review-and-merge conditions require a prospective modal or non-realized
+transition and never excuse present-time, completed-past, or perfect-aspect
+claims. Bare and discourse-connective-led anaphoric pronouns retain their subject
+across adjacent visible blocks, while explicit non-DATA subjects, document edges,
+thematic breaks, and inactive code reset that scope.
 Regenerating the exact prose inventory cannot bless a premature claim.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,

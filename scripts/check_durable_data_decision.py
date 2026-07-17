@@ -72,6 +72,7 @@ class StatusPredicateContext:
     linking_verb: str | None
     modal: str | None
     past_auxiliary: bool
+    perfect_aspect: bool
     current: bool
 
 
@@ -274,7 +275,9 @@ def visible_inline_tokens(tokens: list[Token]) -> str:
         elif token.type in {"softbreak", "hardbreak"}:
             parts.append(" ")
         elif token.type == "html_inline":
-            parts.append(visible_html(token.content))
+            visible = visible_html(token.content)
+            if visible:
+                append_separated(parts, (visible,))
         elif token.type == "image":
             parts.append(
                 visible_inline_tokens(token.children)
@@ -599,6 +602,10 @@ FUTURE_OR_HYPOTHETICAL_MODAL = re.compile(
     r"\b(?:may|might|must|will|would|can|could|shall|should)\b"
 )
 PAST_TENSE_AUXILIARY = re.compile(r"\b(?:did|had)\b")
+PERFECT_STATUS_ASPECT = re.compile(
+    r"\b(?:have|has|had)\b(?:\s+[a-z0-9_-]+){0,3}\s+"
+    r"(?:been|become)\b"
+)
 STATUS_PREDICATE = re.compile(
     rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
     rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
@@ -617,7 +624,8 @@ COMPLETE_CLAUSE_START = re.compile(
     rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
 )
 STRONG_STATUS_CLAUSE_BOUNDARY = re.compile(
-    r"\s*(?:;|:)\s*|\s*,?\s*\b(?:but|however|yet|whereas)\b\s*"
+    r"\s*(?:;|:)\s*|\s*,?\s*\b(?:but|however|whereas)\b\s*|"
+    r"\s*,\s*\byet\b\s*"
 )
 CONDITIONAL_STATUS_CLAUSE_BOUNDARY = re.compile(r"\b(?:and|or|before|after|while)\b")
 NON_GOVERNING_SUBJECT_REFERENCE = re.compile(
@@ -626,6 +634,11 @@ NON_GOVERNING_SUBJECT_REFERENCE = re.compile(
     r",\s*(?:unlike|like|compared (?:with|to)|as opposed to|not|"
     r"rather than|instead of)\b[^,]*,|"
     r"^\s*(?:unlike|compared (?:with|to)|in contrast (?:with|to))\b[^,]*,|"
+    rf"-\s*(?:unlike|like|compared (?:with|to)|as opposed to|not)\b.*?-"
+    rf"(?=(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}))|"
+    rf"^\s*(?:between|among)\b.*,\s*(?=(?:only\s+)?"
+    rf"{EXPLICIT_CLAUSE_SUBJECT_PATTERN}\s+(?:{STATUS_LINKING_VERB.pattern}|"
+    rf"{STATUS_AUXILIARY.pattern}|{PREMATURE_DATA_STATUS_WORD.pattern}))|"
     rf"\b(?:rather than|instead of)\s+(?:the\s+)?{DATA_STATUS_SUBJECT_PATTERN}"
 )
 EXPLICIT_GENERIC_SUBJECT = re.compile(
@@ -641,7 +654,20 @@ NON_REALIZED_STATUS_LINKING_VERBS = frozenset({"become", "becomes"})
 REVIEW_WORD = re.compile(r"\b(?:review|reviewed)\b")
 MERGE_WORD = re.compile(r"\b(?:merge|merged)\b")
 CURRENT_DATA_CONTEXT = re.compile(r"\b(?:now|currently)\b")
-ANAPHORIC_SUBJECT_START = re.compile(rf"^\s*{PRONOUN_SUBJECT_PATTERN}\b")
+DISCOURSE_CONNECTIVE_PATTERN = (
+    r"(?:however|nevertheless|nonetheless|moreover|furthermore|therefore|thus|"
+    r"consequently|meanwhile|likewise|similarly|instead|still|then|also|yet|"
+    r"and|but|so)"
+)
+ANAPHORIC_SUBJECT_START = re.compile(
+    rf"^\s*(?:{DISCOURSE_CONNECTIVE_PATTERN}\s*,?\s+)*"
+    rf"{PRONOUN_SUBJECT_PATTERN}\b"
+)
+NEGATION_MODIFIER_PATTERN = (
+    r"(?!(?:approved|accepted|authoritative|selected|and|or|nor|but)\b)"
+    r"[a-z0-9_-]+"
+)
+COORDINATED_STATUS_MODIFIER_PATTERN = r"(?:[a-z0-9_-]+ly|yet|still|already|ever)"
 
 
 def status_is_locally_negated(group: str, status_word: re.Match[str]) -> bool:
@@ -649,8 +675,7 @@ def status_is_locally_negated(group: str, status_word: re.Match[str]) -> bool:
     return bool(
         re.search(
             r"\b(?:not|never|no longer)"
-            r"(?:\s+(?!(?:approved|accepted|authoritative|selected|and|or|nor|but)\b)"
-            r"[a-z0-9_-]+){0,2}\s*$",
+            rf"(?:\s+{NEGATION_MODIFIER_PATTERN}){{0,3}}\s*$",
             prefix,
         )
     )
@@ -667,15 +692,29 @@ def status_is_negated(
 
     first = status_words[0]
     prefix = group[: first.start()]
-    shared_negative = re.search(r"\b(?:not|never|no longer)\s*$", prefix)
-    shared_neither = re.search(r"\bneither\s*$", prefix)
+    shared_negative = re.search(
+        rf"\b(?:not|never|no longer)"
+        rf"(?:\s+{NEGATION_MODIFIER_PATTERN}){{0,3}}\s*$",
+        prefix,
+    )
+    shared_neither = re.search(
+        rf"\bneither(?:\s+{NEGATION_MODIFIER_PATTERN}){{0,3}}\s*$",
+        prefix,
+    )
     if shared_negative is None and shared_neither is None:
         return False
 
     connectors = PREMATURE_DATA_STATUS_WORD.sub(
         "", group[first.start() : status_words[-1].end()]
     )
-    if re.fullmatch(r"(?:\s|,|\band\b|\bor\b|\bnor\b)*", connectors) is None:
+    if (
+        re.fullmatch(
+            rf"(?:\s|,|\b(?:and|or|nor)\b|"
+            rf"\b{COORDINATED_STATUS_MODIFIER_PATTERN}\b)*",
+            connectors,
+        )
+        is None
+    ):
         return False
     if shared_neither is not None:
         return bool(re.search(r"\bnor\b", connectors))
@@ -703,12 +742,14 @@ def status_predicate_contexts(
     linking_verb: str | None = None
     modal: str | None = None
     past_auxiliary = False
+    perfect_aspect = False
     cursor = 0
     for index, status_word in enumerate(status_words):
         predicate_prefix = group[cursor : status_word.start()]
         linking_verbs = tuple(STATUS_LINKING_VERB.finditer(predicate_prefix))
         modals = tuple(FUTURE_OR_HYPOTHETICAL_MODAL.finditer(predicate_prefix))
         past_auxiliaries = tuple(PAST_TENSE_AUXILIARY.finditer(predicate_prefix))
+        has_perfect_aspect = PERFECT_STATUS_ASPECT.search(predicate_prefix) is not None
         if linking_verbs:
             linking_verb = linking_verbs[-1].group()
             # A newly stated finite/linking predicate supersedes modality from
@@ -717,11 +758,17 @@ def status_predicate_contexts(
                 modal = None
             if not past_auxiliaries:
                 past_auxiliary = False
+            if not has_perfect_aspect:
+                perfect_aspect = False
         if modals:
             modal = modals[-1].group()
             past_auxiliary = False
+            if not has_perfect_aspect:
+                perfect_aspect = False
         if past_auxiliaries:
             past_auxiliary = True
+        if has_perfect_aspect:
+            perfect_aspect = True
 
         suffix_end = (
             status_words[index + 1].start()
@@ -734,6 +781,7 @@ def status_predicate_contexts(
                 linking_verb=linking_verb,
                 modal=modal,
                 past_auxiliary=past_auxiliary,
+                perfect_aspect=perfect_aspect,
                 current=CURRENT_DATA_CONTEXT.search(predicate_window) is not None,
             )
         )
@@ -770,11 +818,13 @@ def status_has_historical_context(
     shared_postfix = temporal_group[status_words[-1].end() :]
 
     leading_frame = re.match(
-        r"\s*(?:historically|previously|formerly)\b", shared_prefix
+        r"\s*(?:(?:historically|previously|formerly)\b|"
+        r"(?:in the past|at one time)\s*,)",
+        shared_prefix,
     )
     predicate_prefix_frame = re.search(
         r"\b(?:was|were|became|remained)\s+"
-        r"(?:historically|previously|formerly)\s*$",
+        r"(?:historically|previously|formerly|once)\s*$",
         predicate_prefix,
     )
     predicate_suffix_frame = re.match(
@@ -824,9 +874,12 @@ def status_has_future_review_gate(
     )
     if not before_is_gate and not after_is_gate:
         return False
-    return context.modal is not None or (
-        not context.past_auxiliary
-        and context.linking_verb in NON_REALIZED_STATUS_LINKING_VERBS
+    return not context.perfect_aspect and (
+        context.modal is not None
+        or (
+            not context.past_auxiliary
+            and context.linking_verb in NON_REALIZED_STATUS_LINKING_VERBS
+        )
     )
 
 
@@ -2189,6 +2242,27 @@ def self_test(source: Path) -> None:
         ("endpoint-owned store selected", "The endpoint-owned store is selected."),
         ("generic canonical store selected", "The canonical store is selected."),
         (
+            "inline raw HTML title keeps text boundaries",
+            'a<span title="P2-DATA-01 is accepted">b</span>.',
+        ),
+        (
+            "inline raw HTML ARIA label keeps text boundaries",
+            'a<span aria-label="P2-DATA-01 is accepted">b</span>.',
+        ),
+        (
+            "inline raw HTML multiple attributes stay mutually separated",
+            'x<span title="P2-DATA-01 is accepted" '
+            'aria-label="The private store is selected">y</span>z.',
+        ),
+        (
+            "raw HTML block title remains semantic prose",
+            '<div title="P2-DATA-01 is accepted">x</div>',
+        ),
+        (
+            "native CommonMark title remains semantic prose",
+            '[x](https://example.invalid "P2-DATA-01 is accepted")',
+        ),
+        (
             "DATA first in a shared coordinated predicate",
             "P2-DATA-01 and P2-HOST-02 are accepted.",
         ),
@@ -2285,6 +2359,38 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 had been accepted only after review and merge.",
         ),
         (
+            "must-perfect acceptance is completed rather than prospective",
+            "P2-DATA-01 must have been accepted only after review and merge.",
+        ),
+        (
+            "may-perfect acceptance is completed rather than prospective",
+            "P2-DATA-01 may have been accepted only after review and merge.",
+        ),
+        (
+            "might-perfect transition is completed rather than prospective",
+            "P2-DATA-01 might have become accepted only after review and merge.",
+        ),
+        (
+            "could-perfect acceptance is completed rather than prospective",
+            "P2-DATA-01 could have been accepted only after review and merge.",
+        ),
+        (
+            "should-perfect acceptance is completed rather than prospective",
+            "P2-DATA-01 should have been accepted only after review and merge.",
+        ),
+        (
+            "would-perfect transition is completed rather than prospective",
+            "P2-DATA-01 would have become accepted only after review and merge.",
+        ),
+        (
+            "will-perfect acceptance is completed aspect",
+            "P2-DATA-01 will have been accepted only after review and merge.",
+        ),
+        (
+            "shall-perfect transition is completed aspect",
+            "P2-DATA-01 shall have become accepted only after review and merge.",
+        ),
+        (
             "future modal contradicted by current status",
             "P2-DATA-01 will be accepted now only after review and merge.",
         ),
@@ -2307,6 +2413,31 @@ def self_test(source: Path) -> None:
         (
             "DATA main subject precedes rather-than non-DATA object",
             "P2-DATA-01 rather than P2-HOST-02 is accepted.",
+        ),
+        (
+            "dash comparison leaves DATA as main subject",
+            "P2-DATA-01—unlike P2-HOST-02—is accepted.",
+        ),
+        (
+            "between comparison leaves DATA as explicit main subject",
+            "Between P2-HOST-02 and P2-DATA-01, only P2-DATA-01 is accepted.",
+        ),
+        (
+            "among comparison leaves DATA as explicit main subject",
+            "Among P2-HOST-02, P2-TERM-01, and P2-DATA-01, only "
+            "P2-DATA-01 is accepted.",
+        ),
+        (
+            "past-review noun phrase is not explicit historical framing",
+            "In the past review, P2-DATA-01 was accepted.",
+        ),
+        (
+            "once-clause is not a predicate-local historical adverb",
+            "P2-DATA-01 was selected once the previous review merged.",
+        ),
+        (
+            "modified negative and-list does not negate current selection",
+            "P2-DATA-01 is not yet approved and currently selected now.",
         ),
         (
             "elided DATA subject after negated adversative",
@@ -2354,6 +2485,27 @@ def self_test(source: Path) -> None:
         (
             "pronoun inherits DATA across HTML paragraphs",
             "<p>P2-DATA-01 remains review pending.</p>\n\n<p>It is accepted now.</p>",
+        ),
+        (
+            "however-led pronoun inherits DATA across paragraphs",
+            "P2-DATA-01 remains review pending.\n\nHowever, it is accepted now.",
+        ),
+        (
+            "nevertheless-led pronoun inherits DATA across paragraphs",
+            "P2-DATA-01 remains review pending.\n\nNevertheless, it is accepted now.",
+        ),
+        (
+            "coordinator-led pronoun inherits DATA across paragraphs",
+            "P2-DATA-01 remains review pending.\n\nAnd it is accepted now.",
+        ),
+        (
+            "consequent demonstrative inherits DATA across paragraphs",
+            "P2-DATA-01 remains review pending.\n\nTherefore, this is selected now.",
+        ),
+        (
+            "nested discourse connectives retain anaphoric DATA scope",
+            "P2-DATA-01 remains review pending.\n\n"
+            "However, therefore, it is accepted now.",
         ),
     )
     mutations.extend(
@@ -2716,12 +2868,72 @@ def self_test(source: Path) -> None:
             "Historically, a P2-DATA-01 experiment became accepted.",
         ),
         (
+            "explicit in-the-past frame",
+            "In the past, P2-DATA-01 was accepted.",
+        ),
+        (
+            "predicate-local once frame",
+            "P2-DATA-01 was once selected.",
+        ),
+        (
+            "explicit at-one-time frame",
+            "At one time, P2-DATA-01 was authoritative.",
+        ),
+        (
+            "predicate-local formerly frame",
+            "P2-DATA-01 was formerly accepted.",
+        ),
+        (
             "future modal review gate",
             "P2-DATA-01 will become accepted only after review and merge.",
         ),
         (
             "hypothetical modal review gate with reversed evidence order",
             "P2-DATA-01 may be accepted only after merge and independent review.",
+        ),
+        (
+            "must prospective review gate",
+            "P2-DATA-01 must be accepted only after review and merge.",
+        ),
+        (
+            "might prospective review gate",
+            "P2-DATA-01 might become accepted only after review and merge.",
+        ),
+        (
+            "could prospective review gate",
+            "P2-DATA-01 could be accepted only after review and merge.",
+        ),
+        (
+            "should prospective review gate",
+            "P2-DATA-01 should become accepted only after review and merge.",
+        ),
+        (
+            "would prospective review gate",
+            "P2-DATA-01 would be accepted only after review and merge.",
+        ),
+        (
+            "shall prospective review gate",
+            "P2-DATA-01 shall become accepted only after review and merge.",
+        ),
+        (
+            "shared negative list with yet modifier",
+            "P2-DATA-01 is not yet approved or accepted.",
+        ),
+        (
+            "shared negative list with formally modifier",
+            "P2-DATA-01 was never formally approved or accepted.",
+        ),
+        (
+            "neither-nor list with current modifier",
+            "P2-DATA-01 is neither currently approved nor accepted.",
+        ),
+        (
+            "coordinated negative list with second adverb",
+            "P2-DATA-01 is not yet approved or formally accepted.",
+        ),
+        (
+            "neither-nor list with modifiers on both statuses",
+            "P2-DATA-01 is neither currently approved nor formally accepted.",
         ),
         (
             "non-DATA main subject with DATA unlike comparison",
@@ -2742,6 +2954,31 @@ def self_test(source: Path) -> None:
         (
             "leading DATA comparison leaves non-DATA as main subject",
             "Unlike P2-DATA-01, P2-HOST-02 is accepted.",
+        ),
+        (
+            "em-dash DATA comparison leaves non-DATA main subject",
+            "P2-HOST-02—unlike P2-DATA-01—is accepted.",
+        ),
+        (
+            "en-dash DATA comparison leaves non-DATA main subject",
+            "P2-HOST-02–unlike P2-DATA-01–is accepted.",
+        ),
+        (
+            "spaced-dash DATA comparison leaves non-DATA main subject",
+            "P2-HOST-02 - unlike P2-DATA-01 - is accepted.",
+        ),
+        (
+            "between comparison leaves named non-DATA main subject",
+            "Between P2-HOST-02 and P2-DATA-01, only P2-HOST-02 is accepted.",
+        ),
+        (
+            "between comparison object order does not change main subject",
+            "Between P2-DATA-01 and P2-HOST-02, only P2-HOST-02 is accepted.",
+        ),
+        (
+            "among comparison leaves named non-DATA main subject",
+            "Among P2-DATA-01, P2-TERM-01, and P2-HOST-02, only "
+            "P2-HOST-02 is accepted.",
         ),
         (
             "non-DATA main subject uses instead-of DATA object",
@@ -2794,6 +3031,16 @@ def self_test(source: Path) -> None:
             "fenced code is a hard discourse boundary",
             "P2-DATA-01 remains review pending.\n\n```text\n"
             "inactive boundary\n```\n\nIt is accepted.",
+        ),
+        (
+            "thematic break resets connective-led anaphora",
+            "P2-DATA-01 remains review pending.\n\n---\n\nHowever, it is accepted.",
+        ),
+        (
+            "explicit non-DATA reset governs connective-led pronoun",
+            "P2-DATA-01 remains review pending.\n\n"
+            "The control protocol remains review pending.\n\n"
+            "Nevertheless, it is accepted.",
         ),
     )
     positive_mutations.extend(
