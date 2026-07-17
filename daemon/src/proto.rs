@@ -7,6 +7,45 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Live relay bound shared with the server. The endpoint wire adapter has a
+/// larger construction bound, but nested WebSocket/Redis routing deliberately
+/// accepts at most 512 KiB until the signed cutover is complete.
+pub const MAX_SIGNED_RTC_RELAY_BYTES: usize = 512 * 1024;
+
+fn deserialize_bounded_signed_envelope<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_some_and(|wire| wire.len() > MAX_SIGNED_RTC_RELAY_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "signed RTC envelope exceeds its live relay bound",
+        ));
+    }
+    Ok(value)
+}
+
+fn serialize_bounded_signed_envelope<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if value
+        .as_ref()
+        .is_some_and(|wire| wire.len() > MAX_SIGNED_RTC_RELAY_BYTES)
+    {
+        return Err(serde::ser::Error::custom(
+            "signed RTC envelope exceeds its live relay bound",
+        ));
+    }
+    value.serialize(serializer)
+}
+
 // ---------------------------------------------------------------------------
 // Daemon → server
 // ---------------------------------------------------------------------------
@@ -69,7 +108,17 @@ pub enum Outbound {
         protocol: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol_version: Option<u16>,
-        sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sdp: Option<String>,
+        /// Opaque signed-envelope JSON. The server may route this string but
+        /// only the endpoint verifier may interpret its SDP.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_bounded_signed_envelope",
+            deserialize_with = "deserialize_bounded_signed_envelope"
+        )]
+        signed_envelope: Option<String>,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
@@ -172,7 +221,12 @@ pub enum Inbound {
         protocol: Option<String>,
         #[serde(default)]
         protocol_version: Option<u16>,
-        sdp: String,
+        #[serde(default)]
+        sdp: Option<String>,
+        /// Preserved exactly for the Phase-3 verifier cutover. F1 accepts the
+        /// relay shape; F2 will verify it before starting WebRTC negotiation.
+        #[serde(default, deserialize_with = "deserialize_bounded_signed_envelope")]
+        signed_envelope: Option<String>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
         #[serde(default)]
@@ -367,6 +421,89 @@ pub struct DevicePollResponse {
     pub browser_public_key: Option<String>,
     pub browser_key_fingerprint: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod signed_rtc_relay_tests {
+    use super::*;
+
+    #[test]
+    fn signed_offer_preserves_the_exact_opaque_string_without_raw_sdp() {
+        let wire = " \n{\\\"type\\\":\\\"rtc.offer\\\",\\\"signature\\\":\\\"opaque\\\"}\t";
+        let frame = serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+            "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "binding_generation": 7,
+            "agent_id": "11111111-2222-4333-8444-555555555555",
+            "scope_type": "agent",
+            "scope_id": "11111111-2222-4333-8444-555555555555",
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
+            "signed_envelope": wire,
+            "ice_servers": []
+        });
+        let parsed: Inbound = serde_json::from_value(frame).expect("signed relay shape");
+        assert!(matches!(
+            parsed,
+            Inbound::RtcOffer {
+                sdp: None,
+                signed_envelope: Some(ref preserved),
+                ..
+            } if preserved == wire
+        ));
+    }
+
+    #[test]
+    fn signed_offer_rejects_live_bound_plus_one() {
+        let exact = serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+            "signed_envelope": "x".repeat(MAX_SIGNED_RTC_RELAY_BYTES)
+        });
+        assert!(serde_json::from_value::<Inbound>(exact).is_ok());
+
+        let frame = serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+            "signed_envelope": "x".repeat(MAX_SIGNED_RTC_RELAY_BYTES + 1)
+        });
+        assert!(serde_json::from_value::<Inbound>(frame).is_err());
+    }
+
+    #[test]
+    fn outbound_answer_has_symmetric_opaque_shape() {
+        let answer = Outbound::RtcAnswer {
+            session_id: "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1".to_owned(),
+            binding_nonce: Some("a".repeat(32)),
+            agent_id: None,
+            scope_type: Some("host".to_owned()),
+            scope_id: Some(Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap()),
+            protocol: Some("spawn.host.ctl".to_owned()),
+            protocol_version: Some(1),
+            sdp: None,
+            signed_envelope: Some("{\\\"signature\\\":\\\"opaque\\\"}".to_owned()),
+        };
+        let value = serde_json::to_value(answer).unwrap();
+        assert!(value.get("sdp").is_none());
+        assert_eq!(
+            value["signed_envelope"],
+            serde_json::json!("{\\\"signature\\\":\\\"opaque\\\"}")
+        );
+
+        let oversized = Outbound::RtcAnswer {
+            session_id: "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1".to_owned(),
+            binding_nonce: None,
+            agent_id: None,
+            scope_type: None,
+            scope_id: None,
+            protocol: None,
+            protocol_version: None,
+            sdp: None,
+            signed_envelope: Some("x".repeat(MAX_SIGNED_RTC_RELAY_BYTES + 1)),
+        };
+        assert!(serde_json::to_value(oversized).is_err());
+    }
 }
 
 #[cfg(test)]

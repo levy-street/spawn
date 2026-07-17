@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -32,6 +33,22 @@ from spawn_server.ws.host_signal import (
     host_pending_presence_key,
     host_presence_key,
 )
+
+
+def _signed_agent_answer_wire(session_id: str, agent_id: str) -> str:
+    vectors = json.loads(
+        (Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json").read_text()
+    )["vectors"]
+    envelope = dict(vectors[0]["envelope"])
+    envelope.update(
+        {
+            "type": "rtc.answer",
+            "session_id": session_id,
+            "scope_id": agent_id,
+            "sender_role": "daemon",
+        }
+    )
+    return "\n" + json.dumps(envelope, separators=(",", ":")) + " "
 
 
 class FakeDaemonWebSocket:
@@ -1437,9 +1454,52 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
                 "binding_generation": live_daemon.host_generation,
             }
 
+        signed_session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1"
+        assert await broker.register_rtc_session(
+            signed_session_id,
+            browser_conn,
+            daemon=live_daemon,
+            scope_type="agent",
+            scope_id=agent_id,
+            protocol="spawn.pty",
+            protocol_version=2,
+            binding_nonce="a" * 32,
+            signed_signal=True,
+        )
+        answer_wire = _signed_agent_answer_wire(signed_session_id, agent_id)
+        base_answer = {
+            "type": "rtc.answer",
+            "session_id": signed_session_id,
+            "binding_nonce": "a" * 32,
+            "agent_id": agent_id,
+            "scope_type": "agent",
+            "scope_id": agent_id,
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
+        }
+        # Raw/mixed answers cannot downgrade a binding selected by its signed offer.
+        ws.queue_text(base_answer)
+        ws.queue_text({**base_answer, "sdp": "v=0\r\nraw downgrade"})
+        ws.queue_text(
+            {
+                **base_answer,
+                "sdp": "v=0\r\nraw sibling",
+                "signed_envelope": answer_wire,
+            }
+        )
+        await asyncio.sleep(0.02)
+        ws.queue_text({**base_answer, "signed_envelope": answer_wire})
+        signed_dispatch = decode_rtc_signal_dispatch(
+            await asyncio.wait_for(anext(stream), timeout=1)
+        )
+        assert signed_dispatch is not None
+        assert signed_dispatch.signal["signed_envelope"] == answer_wire
+        assert "sdp" not in signed_dispatch.signal
+
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
     await broker.unregister_rtc_session("rtc-daemon-1", browser_conn)
+    await broker.unregister_rtc_session(signed_session_id, browser_conn)
 
 
 async def test_daemon_ws_activity_is_content_free_and_binary_fails_closed(client, caplog):

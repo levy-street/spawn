@@ -29,6 +29,14 @@ from .host_signal import (
     host_signal_channel,
     valid_rtc_binding_nonce,
 )
+from .signed_signal_relay import (
+    MAX_RTC_ROUTING_FRAME_BYTES,
+    SIGNED_ENVELOPE_FIELD,
+    SignedRtcRelayError,
+    reject_raw_sdp_in_signed_mode,
+    signed_mode_selected,
+    validate_signed_rtc_relay_envelope,
+)
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
@@ -250,10 +258,27 @@ async def browser_ws(
                     )
                     frame_type = signal.get("type")
                     if frame_type == "rtc.answer":
-                        if (
-                            not dispatch_is_session_owner
-                            or _valid_rtc_sdp(signal.get("sdp")) is None
-                        ):
+                        if not dispatch_is_session_owner:
+                            continue
+                        try:
+                            if binding.signed_signal:
+                                if not signed_mode_selected(signal):
+                                    continue
+                                reject_raw_sdp_in_signed_mode(signal)
+                                validate_signed_rtc_relay_envelope(
+                                    signal[SIGNED_ENVELOPE_FIELD],
+                                    expected_type="rtc.answer",
+                                    expected_session_id=binding.session_id,
+                                    expected_scope_type=binding.scope_type,
+                                    expected_scope_id=binding.scope_id,
+                                    expected_protocol=binding.protocol,
+                                    expected_protocol_version=binding.protocol_version,
+                                )
+                            elif signed_mode_selected(signal) or _valid_rtc_sdp(
+                                signal.get("sdp")
+                            ) is None:
+                                continue
+                        except SignedRtcRelayError:
                             continue
                     elif frame_type == "rtc.candidate":
                         if (
@@ -326,6 +351,9 @@ async def browser_ws(
                 break
 
             elif data_text is not None:
+                if len(data_text.encode("utf-8")) > MAX_RTC_ROUTING_FRAME_BYTES:
+                    await websocket.close(code=1009, reason="signaling frame too large")
+                    break
                 try:
                     obj = json.loads(data_text)
                 except json.JSONDecodeError:
@@ -356,13 +384,34 @@ async def browser_ws(
                 elif ftype == "rtc.offer":
                     proposed_nonce = obj.get("binding_nonce")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    sdp = _valid_rtc_sdp(obj.get("sdp"))
                     if (
                         session_id is None
-                        or sdp is None
                         or not valid_rtc_binding_nonce(proposed_nonce)
                         or not _valid_browser_agent_rtc_tuple(obj, agent_id)
                     ):
+                        continue
+                    signed_signal = signed_mode_selected(obj)
+                    try:
+                        if signed_signal:
+                            reject_raw_sdp_in_signed_mode(obj)
+                            signed_envelope = validate_signed_rtc_relay_envelope(
+                                obj[SIGNED_ENVELOPE_FIELD],
+                                expected_type="rtc.offer",
+                                expected_session_id=session_id,
+                                expected_scope_type="agent",
+                                expected_scope_id=agent_id,
+                                expected_protocol=AGENT_RTC_PROTOCOL,
+                                expected_protocol_version=AGENT_RTC_PROTOCOL_VERSION,
+                            ).wire
+                            sdp = None
+                        else:
+                            signed_envelope = None
+                            sdp = _valid_rtc_sdp(obj.get("sdp"))
+                            if sdp is None:
+                                continue
+                    except SignedRtcRelayError:
+                        # Presence selects signed mode; malformed/missing signed
+                        # data never falls through to the legacy raw-SDP path.
                         continue
                     if not get_settings().webrtc_enabled:
                         disabled: dict[str, object] = {
@@ -423,6 +472,7 @@ async def browser_ws(
                         protocol=AGENT_RTC_PROTOCOL,
                         protocol_version=AGENT_RTC_PROTOCOL_VERSION,
                         binding_nonce=binding_nonce,
+                        signed_signal=signed_signal,
                         ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
                     )
                     if not registered:
@@ -454,25 +504,31 @@ async def browser_ws(
                                 "status": "negotiating",
                             }
                         )
+                    offer_payload: dict[str, object] = {
+                        "type": "rtc.offer",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "binding_nonce": binding.nonce if binding is not None else binding_nonce,
+                        "binding_generation": (
+                            binding.daemon_generation if binding is not None else generation
+                        ),
+                        "scope_type": "agent",
+                        "scope_id": agent_id,
+                        "protocol": AGENT_RTC_PROTOCOL,
+                        "protocol_version": AGENT_RTC_PROTOCOL_VERSION,
+                        "ice_servers": ice_servers_for_session(get_settings(), label=user.id),
+                    }
+                    if signed_signal:
+                        assert signed_envelope is not None
+                        offer_payload[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                    else:
+                        assert sdp is not None
+                        offer_payload["sdp"] = sdp
                     published = binding is not None and await _publish_agent_rtc_signal(
                         host_id,
                         binding,
                         rtc_response_channel,
-                        {
-                            "type": "rtc.offer",
-                            "session_id": session_id,
-                            "agent_id": agent_id,
-                            "binding_nonce": binding.nonce,
-                            "binding_generation": binding.daemon_generation,
-                            "scope_type": binding.scope_type,
-                            "scope_id": binding.scope_id,
-                            "protocol": binding.protocol,
-                            "protocol_version": binding.protocol_version,
-                            "sdp": sdp,
-                            "ice_servers": ice_servers_for_session(
-                                get_settings(), label=user.id
-                            ),
-                        },
+                        offer_payload,
                     )
                     if not published:
                         await broker.unregister_rtc_session(session_id, route)

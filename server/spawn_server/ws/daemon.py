@@ -42,6 +42,14 @@ from .host_signal import (
     valid_rtc_binding_nonce,
     wait_for_signal_pump,
 )
+from .signed_signal_relay import (
+    MAX_RTC_ROUTING_FRAME_BYTES,
+    SIGNED_ENVELOPE_FIELD,
+    SignedRtcRelayError,
+    reject_raw_sdp_in_signed_mode,
+    signed_mode_selected,
+    validate_signed_rtc_relay_envelope,
+)
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
@@ -865,7 +873,23 @@ async def _process_host_rtc_signal(
                 await _bounded_send_text(conn, signal)
             return True
         if frame_type == "rtc.offer":
-            if _valid_rtc_sdp(signal.get("sdp")) is None:
+            try:
+                if binding.signed_signal:
+                    if not signed_mode_selected(signal):
+                        return True
+                    reject_raw_sdp_in_signed_mode(signal)
+                    validate_signed_rtc_relay_envelope(
+                        signal[SIGNED_ENVELOPE_FIELD],
+                        expected_type="rtc.offer",
+                        expected_session_id=binding.session_id,
+                        expected_scope_type=binding.scope_type,
+                        expected_scope_id=binding.scope_id,
+                        expected_protocol=binding.protocol,
+                        expected_protocol_version=binding.protocol_version,
+                    )
+                elif signed_mode_selected(signal) or _valid_rtc_sdp(signal.get("sdp")) is None:
+                    return True
+            except SignedRtcRelayError:
                 return True
         elif frame_type == "rtc.candidate":
             if _valid_rtc_candidate(signal.get("candidate")) is None:
@@ -883,7 +907,22 @@ async def _process_host_rtc_signal(
         return True
     frame_type = signal.get("type")
     if frame_type == "rtc.offer":
-        if _valid_rtc_sdp(signal.get("sdp")) is None:
+        signed_signal = signed_mode_selected(signal)
+        try:
+            if signed_signal:
+                reject_raw_sdp_in_signed_mode(signal)
+                validate_signed_rtc_relay_envelope(
+                    signal[SIGNED_ENVELOPE_FIELD],
+                    expected_type="rtc.offer",
+                    expected_session_id=session_id,
+                    expected_scope_type="host",
+                    expected_scope_id=conn.host_id,
+                    expected_protocol=HOST_CONTROL_PROTOCOL,
+                    expected_protocol_version=HOST_CONTROL_VERSION,
+                )
+            elif _valid_rtc_sdp(signal.get("sdp")) is None:
+                return True
+        except SignedRtcRelayError:
             return True
         binding_nonce = signal.get("binding_nonce")
         if not valid_rtc_binding_nonce(binding_nonce):
@@ -905,6 +944,7 @@ async def _process_host_rtc_signal(
             protocol=HOST_CONTROL_PROTOCOL,
             protocol_version=HOST_CONTROL_VERSION,
             binding_nonce=binding_nonce,
+            signed_signal=signed_signal,
             ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
         )
         if not registered:
@@ -1042,6 +1082,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 break
 
             elif data_text is not None:
+                if len(data_text.encode("utf-8")) > MAX_RTC_ROUTING_FRAME_BYTES:
+                    await websocket.close(code=1009, reason="signaling frame too large")
+                    break
                 try:
                     obj = json.loads(data_text)
                 except json.JSONDecodeError:
@@ -1417,19 +1460,47 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
 
                 elif ftype == "rtc.answer":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    sdp = _valid_rtc_sdp(obj.get("sdp"))
-                    if session_id and sdp:
+                    if session_id:
                         binding = await broker.rtc_session_for(session_id, daemon=conn)
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
                             log.warning("rtc answer did not match its registered session")
+                            continue
+                        try:
+                            if binding.signed_signal:
+                                if not signed_mode_selected(obj):
+                                    continue
+                                reject_raw_sdp_in_signed_mode(obj)
+                                signed_envelope = validate_signed_rtc_relay_envelope(
+                                    obj[SIGNED_ENVELOPE_FIELD],
+                                    expected_type="rtc.answer",
+                                    expected_session_id=binding.session_id,
+                                    expected_scope_type=binding.scope_type,
+                                    expected_scope_id=binding.scope_id,
+                                    expected_protocol=binding.protocol,
+                                    expected_protocol_version=binding.protocol_version,
+                                ).wire
+                                sdp = None
+                            else:
+                                if signed_mode_selected(obj):
+                                    continue
+                                signed_envelope = None
+                                sdp = _valid_rtc_sdp(obj.get("sdp"))
+                                if sdp is None:
+                                    continue
+                        except SignedRtcRelayError:
                             continue
                         payload: dict[str, object] = {
                             "type": "rtc.answer",
                             "session_id": session_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
-                            "sdp": sdp,
                         }
+                        if binding.signed_signal:
+                            assert signed_envelope is not None
+                            payload[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                        else:
+                            assert sdp is not None
+                            payload["sdp"] = sdp
                         if binding.scope_type == "agent":
                             payload["agent_id"] = binding.scope_id
                         payload.update(
