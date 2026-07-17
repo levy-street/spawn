@@ -186,6 +186,10 @@ from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
 )
+from spawn_server.host_pair_possession import (
+    decode_device_code,
+    encode_host_pair_possession_transcript,
+)
 
 base_url, home, email, password = sys.argv[1:]
 
@@ -224,6 +228,26 @@ start = request(
         **host_binding,
     },
 )
+host_key = Ed25519PrivateKey.from_private_bytes(seed)
+possession_transcript = encode_host_pair_possession_transcript(
+    decode_device_code(start["device_code"]),
+    decode_approval_nonce(start["approval_nonce"]),
+    public,
+)
+possession = request(
+    "POST",
+    "/api/auth/device/possession",
+    {
+        "device_code": start["device_code"],
+        "approval_nonce": start["approval_nonce"],
+        **host_binding,
+        "signature": base64.urlsafe_b64encode(
+            host_key.sign(possession_transcript)
+        ).rstrip(b"=").decode(),
+    },
+)
+if possession != {"verified": True, "version": 1}:
+    raise SystemExit(f"unexpected host possession response: {possession!r}")
 reviewed = request("POST", "/api/auth/device/pending", {"user_code": start["user_code"]}, token)
 browser_key = Ed25519PrivateKey.generate()
 browser_public = browser_key.public_key().public_bytes_raw()
@@ -282,6 +306,7 @@ for config_dir in (
     os.path.join(home, "Library", "Application Support", "spawn"),
 ):
     os.makedirs(config_dir, exist_ok=True)
+    os.chmod(config_dir, 0o700)
     with open(os.path.join(config_dir, "credentials.json"), "w", encoding="utf-8") as handle:
         json.dump(creds, handle)
     os.chmod(os.path.join(config_dir, "credentials.json"), 0o600)

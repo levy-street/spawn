@@ -145,6 +145,64 @@ async def main():
 asyncio.run(main())
 """
 
+POSTGRES_POSSESSION_CONSTRAINT_CODE = """
+import asyncio
+from datetime import UTC, datetime
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from spawn_server.db import dispose_engine, get_engine, init_engine
+
+INSERT = text(
+    "insert into device_codes "
+    "(device_code, user_code, host_name, host_key_algorithm, host_public_key, "
+    "approval_nonce, host_possession_version, host_possession_verified_at, "
+    "status, expires_at, created_at) values "
+    "(:device_code, :user_code, 'possession', 'ed25519', :key, :nonce, "
+    ":version, :verified_at, 'pending', '2026-07-18', '2026-07-17')"
+)
+BASE = {"key": "A" * 43, "nonce": "B" * 43}
+VERIFIED_AT = datetime(2026, 7, 17, tzinfo=UTC)
+
+async def expect_rejected(engine, values):
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(INSERT, {**BASE, **values})
+    except IntegrityError:
+        return
+    raise AssertionError(f"host possession constraint accepted {values!r}")
+
+async def main():
+    init_engine()
+    engine = get_engine()
+    async with engine.begin() as conn:
+        for index, (version, verified_at) in enumerate((
+            (None, None),
+            (1, VERIFIED_AT),
+        )):
+            await conn.execute(INSERT, {
+                **BASE,
+                "device_code": f"pg-possession-valid-{index}",
+                "user_code": f"PGPV-000{index}",
+                "version": version,
+                "verified_at": verified_at,
+            })
+
+    for index, (version, verified_at) in enumerate((
+        (1, None),
+        (None, VERIFIED_AT),
+        (2, VERIFIED_AT),
+    )):
+        await expect_rejected(engine, {
+            "device_code": f"pg-possession-invalid-{index}",
+            "user_code": f"PGPI-000{index}",
+            "version": version,
+            "verified_at": verified_at,
+        })
+    await dispose_engine()
+
+asyncio.run(main())
+"""
+
 
 def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_path: Path):
     db_path = tmp_path / "spawn-migrations.db"
@@ -190,6 +248,7 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
         }
         assert "ck_device_codes_approval_nonce" in device_checks
         assert "ck_device_codes_browser_binding" in device_checks
+        assert "ck_device_codes_host_possession" in device_checks
         assert "ck_host_browser_pins_key" in pin_checks
         assert inspector.get_pk_constraint("host_browser_pins")["constrained_columns"] == [
             "host_id",
@@ -427,13 +486,64 @@ def test_browser_pair_migration_preserves_interrupted_codes_as_explicitly_unappr
         with engine.begin() as conn:
             row = conn.execute(
                 text(
-                    "select approval_nonce, browser_device_id, browser_key_algorithm, "
+                    "select approval_nonce, host_possession_version, "
+                    "host_possession_verified_at, browser_device_id, browser_key_algorithm, "
                     "browser_public_key, browser_key_fingerprint from device_codes "
                     "where device_code = 'interrupted'"
                 )
             ).one()
-            assert row == (None, None, None, None, None)
+            assert row == (None, None, None, None, None, None, None)
             assert conn.execute(text("select count(*) from host_browser_pins")).scalar_one() == 0
+    finally:
+        engine.dispose()
+
+
+def test_host_possession_migration_downgrade_reupgrade_resets_proof_fail_closed(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "spawn-host-possession-migration.db"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+    sync_url = f"sqlite:///{db_path}"
+    env = _migration_env(async_url)
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "insert into device_codes "
+                    "(device_code, user_code, host_name, host_key_algorithm, host_public_key, "
+                    "approval_nonce, host_possession_version, host_possession_verified_at, "
+                    "status, expires_at, created_at) values "
+                    "('proved-device', 'PROV-CODE', 'proved', 'ed25519', :key, :nonce, "
+                    "1, '2026-07-17', 'pending', '2026-07-18', '2026-07-17')"
+                ),
+                {"key": "A" * 43, "nonce": "B" * 43},
+            )
+    finally:
+        engine.dispose()
+
+    _run_python(["-m", "alembic", "downgrade", "0020"], env=env)
+    engine = create_engine(sync_url, future=True)
+    try:
+        columns = {column["name"] for column in inspect(engine).get_columns("device_codes")}
+        assert "host_possession_version" not in columns
+        assert "host_possession_verified_at" not in columns
+    finally:
+        engine.dispose()
+
+    _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            proof = conn.execute(
+                text(
+                    "select host_possession_version, host_possession_verified_at "
+                    "from device_codes where device_code = 'proved-device'"
+                )
+            ).one()
+            assert proof == (None, None)
     finally:
         engine.dispose()
 
@@ -595,6 +705,46 @@ def test_browser_pair_migration_rejects_every_partial_browser_binding(tmp_path: 
                     )
     finally:
         engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires a disposable PostgreSQL test database",
+)
+def test_postgresql_host_possession_migration_constraint_and_reupgrade_fail_closed():
+    database_url = os.environ["SPAWN_DATABASE_URL"]
+    assert database_url.startswith("postgresql+asyncpg://")
+    env = _migration_env(database_url)
+    inspect_proof_code = """
+import asyncio
+import json
+from sqlalchemy import text
+from spawn_server.db import dispose_engine, get_engine, init_engine
+
+async def main():
+    init_engine()
+    engine = get_engine()
+    async with engine.connect() as conn:
+        proof = (await conn.execute(text(
+            "select host_possession_version, host_possession_verified_at "
+            "from device_codes where device_code = 'pg-possession-valid-1'"
+        ))).one()
+    print(json.dumps(list(proof)))
+    await dispose_engine()
+
+asyncio.run(main())
+"""
+
+    _run_python(["-c", POSTGRES_RESET_CODE], env=env)
+    try:
+        _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+        _run_python(["-c", POSTGRES_POSSESSION_CONSTRAINT_CODE], env=env)
+        _run_python(["-m", "alembic", "downgrade", "0020"], env=env)
+        _run_python(["-m", "alembic", "upgrade", "head"], env=env)
+        proof = json.loads(_run_python(["-c", inspect_proof_code], env=env).stdout)
+        assert proof == [None, None]
+    finally:
+        _run_python(["-c", POSTGRES_RESET_CODE], env=env)
 
 
 @pytest.mark.skipif(

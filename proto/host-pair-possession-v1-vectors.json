@@ -1,0 +1,14 @@
+{
+  "contract": "SPAWN-HOST-PAIR-POSSESSION-V1",
+  "positive": {
+    "approval_nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+    "device_code": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "host_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "signature": "4Rpu9zkZeKI8F4WLDURpgSjsfktWicSUJEOJb7V837oP9fyyyYRwZMRLxjNG9mADRdf72S-AebxWwrdv1e-ZAQ",
+    "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "transcript_hex": "535041574e2d484f53542d504149522d504f5353455353494f4e2d563101000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3fd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "transcript_sha256": "3fa5e6b2b2efea9f9c7b82df72aecf0cdff068dca1b8ce4a5eb3b95352fe2f93"
+  },
+  "producer": "spawnd Rust ed25519-dalek 2.2",
+  "version": 1
+}
