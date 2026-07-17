@@ -200,8 +200,12 @@ signed-WebSocket and TOFU integration is implemented and reviewed:
     log, closing the first-contact gap.
 
 Key rotation and revocation ride the existing host revocation path
-(`DELETE /api/hosts/{id}`): revoking a host drops its token *and* its
-pinned key; browsers refuse sessions with unpinned keys at L1+.
+(`DELETE /api/hosts/{id}`): revoking a host drops its live token authority,
+server Host/browser pins, and all older device-code ceremonies. It deliberately
+retains the stable Ed25519 key's original account ownership claim, so deletion
+cannot become an implicit cross-account key transfer; only the original account
+may intentionally re-pair that key. Browsers refuse sessions with unpinned keys
+at L1+.
 
 ## Feature relocation map
 

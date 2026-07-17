@@ -448,13 +448,26 @@ carry the exact host/browser presentations, and the browser loudly rejects a
 substituted response. The confirmation UI displays both fingerprints before the
 user authorizes the link.
 
+**P3-IDENTITY-02D audit F8 revocation rule (reviewed and integrated at
+`8805622`):** deleting a keyed Host revokes the live Host row, every server
+Host/browser pin, and every pending, approved, or consuming device-code
+ceremony for that exact key in one serialized database transaction. The server
+retains a durable exact Ed25519 key-to-original-owner claim. A fresh ceremony
+committed after deletion may intentionally re-pair the same key only to that
+original account; another account remains fail-closed unless a future explicit
+ownership-transfer ceremony is designed. Device start, approval, poll, and
+deletion share the retained claim as their first keyed write boundary, so
+delete-versus-start/poll linearizes on SQLite and PostgreSQL without releasing
+the binding. Daemon disconnect is best-effort external cleanup after the
+durable commit, not the revocation boundary.
+
 This is only the server/browser first-contact half of pairing. Later server
 revocation can block an unconsumed approval, but it cannot erase a pin already
 persisted by a daemon in 02E. 02D makes no peer-discovery, live-signaling, or
 TOFU claim.
 
 **P3-IDENTITY-02E daemon-local browser pins (correction/re-review active after
-checkpoint `2df5a93`):** a successful device poll must now contain the
+checkpoint `e11d04b`):** a successful device poll must now contain the
 exact approving browser device ID, canonical Ed25519 public key, and matching
 derived fingerprint. The daemon validates that tuple only after validating its
 own host/token binding, then atomically merges at most 32 immutable browser pins
@@ -478,9 +491,10 @@ rebuild, locked stale-temp cleanup, and automatic secret-drop protections are
 covered. Status and smoke failures remain redacted. A real two-login proof now
 runs without the keyring-disable flag and compares both exact four-field
 browser tuples after re-login; a backend-injected subprocess also proves two
-login updates survive raw keyring get/set failures. The initial pin source is still server-mediated,
-so 02E alone does not supply independently sourced expected-peer provenance,
-connect a pin to live RTC verification, or delete it on server revocation.
+login updates survive raw keyring get/set failures. The initial pin source is
+still server-mediated, so 02E alone does not supply independently sourced
+expected-peer provenance, connect a pin to live RTC verification, or delete it
+on server revocation.
 
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed
@@ -617,9 +631,10 @@ until the decision passes review and is merged.
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
 5. After 02E passes combined integration validation, close the foundation
-   findings under P3-AUDIT-01, then implement P3-LIVE-F1 through F8, browser
-   auth/trust scoping, and the signed-only cutover as independently reviewed
-   hard dependencies. Only after those pass integrate live signed WebSocket
+   findings under P3-AUDIT-01, preserve reviewed F8, then implement the
+   remaining P3-LIVE-F1 through F7 work, browser auth/trust scoping, and the
+   signed-only cutover as independently reviewed hard dependencies. Only after
+   those pass integrate live signed WebSocket
    signaling bound to SDP, session, agent-or-host scope, protocol version,
    sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and

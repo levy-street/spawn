@@ -15,7 +15,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from spawn_server import auth as server_auth
 from spawn_server.browser_registration import encode_browser_registration_transcript
 from spawn_server.db import get_sessionmaker
 from spawn_server.host_identity import (
@@ -27,7 +29,14 @@ from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
 )
-from spawn_server.models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
+from spawn_server.models import (
+    BrowserDevice,
+    DeviceCode,
+    Host,
+    HostBrowserPin,
+    HostKeyClaim,
+    User,
+)
 
 _KEY_VECTORS = json.loads(
     (Path(__file__).parents[2] / "proto" / "ed25519-public-key-negative-vectors.json").read_text()
@@ -1088,6 +1097,367 @@ async def test_revocation_removes_pin_and_old_token_authority(client):
             )
         ).scalar_one()
         assert count == 0
+        with pytest.raises(HTTPException) as exc_info:
+            await server_auth.daemon_principal(
+                authorization=f"Bearer {first['access_token']}",
+                session=session,
+            )
+        assert exc_info.value.status_code == 401
 
     repaired = await _pair(client, user_id, auth, browser, public_key)
     assert repaired["host_id"] != first["host_id"]
+
+
+async def test_revocation_fences_every_existing_ceremony_retains_owner_and_allows_repair(
+    client,
+):
+    owner_id, owner_auth = await _signup(client, "durable-host-owner@example.com")
+    other_id, other_auth = await _signup(client, "host-key-capture@example.com")
+    owner_browser = await _register_browser(client, owner_id, owner_auth)
+    other_browser = await _register_browser(client, other_id, other_auth)
+    public_key = _public_key(28)
+    paired = await _pair(client, owner_id, owner_auth, owner_browser, public_key)
+
+    pending = await _start(client, public_key, name="pending-before-delete")
+    pending_review = await _review(client, pending, owner_auth)
+    approved = await _start(client, public_key, name="approved-before-delete")
+    approved_review = await _review(client, approved, owner_auth)
+    assert (
+        await _approve(
+            client,
+            approved,
+            owner_id,
+            owner_auth,
+            approved_review,
+            owner_browser,
+        )
+    ).status_code == 200
+    consuming = await _start(client, public_key, name="consuming-before-delete")
+    async with get_sessionmaker()() as session:
+        changed = await session.execute(
+            update(DeviceCode)
+            .where(DeviceCode.device_code == consuming["device_code"])
+            .values(status="consuming")
+        )
+        assert changed.rowcount == 1
+        await session.commit()
+
+    removed = await client.delete(f"/api/hosts/{paired['host_id']}", headers=owner_auth)
+    assert removed.status_code == 204, removed.text
+    assert (
+        await _approve(
+            client,
+            pending,
+            owner_id,
+            owner_auth,
+            pending_review,
+            owner_browser,
+        )
+    ).status_code == 404
+    for fenced in (pending, approved, consuming):
+        assert (await _poll(client, fenced, public_key)).json() == {"error": "expired_token"}
+
+    async with get_sessionmaker()() as session:
+        assert await session.get(Host, paired["host_id"]) is None
+        assert (
+            await session.execute(
+                select(func.count(DeviceCode.device_code)).where(
+                    DeviceCode.host_key_algorithm == "ed25519",
+                    DeviceCode.host_public_key == public_key,
+                )
+            )
+        ).scalar_one() == 0
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.host_id)))
+        ).scalar_one() == 0
+        claim = await session.get(HostKeyClaim, ("ed25519", public_key))
+        assert claim is not None
+        assert claim.owner_user_id == owner_id
+
+    capture = await _start(client, public_key, name="capture-attempt")
+    capture_review = await _review(client, capture, other_auth)
+    capture_approval = await _approve(
+        client,
+        capture,
+        other_id,
+        other_auth,
+        capture_review,
+        other_browser,
+    )
+    assert capture_approval.status_code == 409
+    assert "another account" in capture_approval.json()["detail"]
+    assert (await _poll(client, capture, public_key)).json() == {"error": "expired_token"}
+
+    repaired = await _pair(client, owner_id, owner_auth, owner_browser, public_key)
+    assert repaired["host_id"] != paired["host_id"]
+    async with get_sessionmaker()() as session:
+        claim = await session.get(HostKeyClaim, ("ed25519", public_key))
+        assert claim is not None
+        assert claim.owner_user_id == owner_id
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 1
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.host_id)))
+        ).scalar_one() == 1
+
+
+def _is_device_poll_claim(statement) -> bool:
+    table = getattr(statement, "table", None)
+    return bool(
+        getattr(statement, "is_update", False)
+        and getattr(table, "name", None) == "device_codes"
+        and getattr(statement, "_returning", ())
+    )
+
+
+def _is_host_device_code_fence(statement) -> bool:
+    table = getattr(statement, "table", None)
+    where = str(getattr(statement, "whereclause", ""))
+    return bool(
+        getattr(statement, "is_delete", False)
+        and getattr(table, "name", None) == "device_codes"
+        and "device_codes.host_key_algorithm" in where
+        and "device_codes.host_public_key" in where
+    )
+
+
+def _is_host_key_claim_lock(statement) -> bool:
+    table = getattr(statement, "table", None)
+    return bool(
+        getattr(statement, "is_update", False)
+        and getattr(table, "name", None) == "host_key_claims"
+        and getattr(statement, "_returning", ())
+    )
+
+
+async def _assert_delete_poll_race_linearizes(
+    client,
+    monkeypatch,
+    *,
+    email: str,
+    public_key: str,
+    poll_commits_first: bool,
+) -> None:
+    user_id, auth = await _signup(client, email)
+    browser = await _register_browser(client, user_id, auth)
+    paired = await _pair(client, user_id, auth, browser, public_key)
+    start = await _start(client, public_key, name="delete-poll-race")
+    review = await _review(client, start, auth)
+    assert (
+        await _approve(client, start, user_id, auth, review, browser)
+    ).status_code == 200
+
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    with monkeypatch.context() as patch:
+        original_execute = AsyncSession.execute
+
+        async def execute_with_barrier(self, statement, *args, **kwargs):
+            result = await original_execute(self, statement, *args, **kwargs)
+            target = (
+                _is_device_poll_claim(statement)
+                if poll_commits_first
+                else _is_host_device_code_fence(statement)
+            )
+            if target and not reached.is_set():
+                reached.set()
+                await release.wait()
+            return result
+
+        patch.setattr(AsyncSession, "execute", execute_with_barrier)
+        first = asyncio.create_task(
+            _poll(client, start, public_key)
+            if poll_commits_first
+            else client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+        )
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        second = asyncio.create_task(
+            client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+            if poll_commits_first
+            else _poll(client, start, public_key)
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not second.done()
+        finally:
+            release.set()
+        first_response, second_response = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+
+    poll = first_response if poll_commits_first else second_response
+    deletion = second_response if poll_commits_first else first_response
+    assert deletion.status_code == 204, deletion.text
+    if poll_commits_first:
+        assert "access_token" in poll.json(), poll.text
+    else:
+        assert poll.json() == {"error": "expired_token"}
+
+    async with get_sessionmaker()() as session:
+        assert await session.get(Host, paired["host_id"]) is None
+        assert await session.get(DeviceCode, start["device_code"]) is None
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.host_id)))
+        ).scalar_one() == 0
+        claim = await session.get(HostKeyClaim, ("ed25519", public_key))
+        assert claim is not None
+        assert claim.owner_user_id == user_id
+
+
+async def test_file_sqlite_delete_poll_race_linearizes_both_commit_orders(
+    file_sqlite_client,
+    monkeypatch,
+):
+    await _assert_delete_poll_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-delete-poll-first@example.com",
+        public_key=_public_key(29),
+        poll_commits_first=True,
+    )
+    await _assert_delete_poll_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-delete-first@example.com",
+        public_key=_public_key(30),
+        poll_commits_first=False,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_delete_poll_race_linearizes_both_commit_orders(
+    client,
+    monkeypatch,
+):
+    await _assert_delete_poll_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-delete-poll-first@example.com",
+        public_key=_public_key(31),
+        poll_commits_first=True,
+    )
+    await _assert_delete_poll_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-delete-first@example.com",
+        public_key=_public_key(32),
+        poll_commits_first=False,
+    )
+
+
+async def _assert_delete_start_race_linearizes(
+    client,
+    monkeypatch,
+    *,
+    email: str,
+    public_key: str,
+    start_commits_first: bool,
+) -> None:
+    user_id, auth = await _signup(client, email)
+    browser = await _register_browser(client, user_id, auth)
+    paired = await _pair(client, user_id, auth, browser, public_key)
+
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    with monkeypatch.context() as patch:
+        original_execute = AsyncSession.execute
+
+        async def execute_with_barrier(self, statement, *args, **kwargs):
+            result = await original_execute(self, statement, *args, **kwargs)
+            target = (
+                _is_host_key_claim_lock(statement)
+                if start_commits_first
+                else _is_host_device_code_fence(statement)
+            )
+            if target and not reached.is_set():
+                reached.set()
+                await release.wait()
+            return result
+
+        patch.setattr(AsyncSession, "execute", execute_with_barrier)
+        first = asyncio.create_task(
+            _start(client, public_key, name="delete-start-race")
+            if start_commits_first
+            else client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+        )
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        second = asyncio.create_task(
+            client.delete(f"/api/hosts/{paired['host_id']}", headers=auth)
+            if start_commits_first
+            else _start(client, public_key, name="delete-start-race")
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not second.done()
+        finally:
+            release.set()
+        first_response, second_response = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+
+    start = first_response if start_commits_first else second_response
+    deletion = second_response if start_commits_first else first_response
+    assert deletion.status_code == 204, deletion.text
+    async with get_sessionmaker()() as session:
+        claim = await session.get(HostKeyClaim, ("ed25519", public_key))
+        assert claim is not None
+        assert claim.owner_user_id == user_id
+        code = await session.get(DeviceCode, start["device_code"])
+        assert (code is None) == start_commits_first
+
+    if start_commits_first:
+        assert (await _poll(client, start, public_key)).json() == {"error": "expired_token"}
+        return
+
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+    repaired = await _poll(client, start, public_key)
+    assert "access_token" in repaired.json(), repaired.text
+    assert repaired.json()["host_id"] != paired["host_id"]
+
+
+async def test_file_sqlite_delete_start_race_linearizes_both_commit_orders(
+    file_sqlite_client,
+    monkeypatch,
+):
+    await _assert_delete_start_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-start-first@example.com",
+        public_key=_public_key(33),
+        start_commits_first=True,
+    )
+    await _assert_delete_start_race_linearizes(
+        file_sqlite_client,
+        monkeypatch,
+        email="sqlite-delete-before-start@example.com",
+        public_key=_public_key(34),
+        start_commits_first=False,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_delete_start_race_linearizes_both_commit_orders(
+    client,
+    monkeypatch,
+):
+    await _assert_delete_start_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-start-first@example.com",
+        public_key=_public_key(35),
+        start_commits_first=True,
+    )
+    await _assert_delete_start_race_linearizes(
+        client,
+        monkeypatch,
+        email="postgres-delete-before-start@example.com",
+        public_key=_public_key(36),
+        start_commits_first=False,
+    )
