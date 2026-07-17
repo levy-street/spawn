@@ -18,6 +18,7 @@ from spawn_server.ws.signed_signal_relay import (
     MAX_RTC_ROUTING_METADATA_BYTES,
     MAX_SIGNED_RTC_RELAY_BYTES,
     SignedRtcRelayError,
+    signed_mode_selected,
     validate_signed_relay_container,
     validate_signed_rtc_relay_envelope,
 )
@@ -177,6 +178,31 @@ def test_nested_bound_and_routing_allowance_fit_the_live_frame_limit():
         validate_signed_relay_container(
             {"type": "rtc.candidate", "signed_envelope": "{}"}
         )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "rtc.offer", "signed_envelope": None},
+        {
+            "type": "rtc.offer",
+            "signed_envelope": None,
+            "sdp": "v=0\r\nraw downgrade",
+        },
+        {"type": "rtc.answer", "signed_envelope": {"unknown": True}},
+        {"type": "rtc.answer", "signed_envelope": ["wire"]},
+    ],
+)
+def test_present_non_string_signed_field_never_falls_through_to_legacy(frame):
+    assert signed_mode_selected(frame)
+    with pytest.raises(SignedRtcRelayError):
+        validate_signed_relay_container(frame)
+
+
+def test_absent_signed_field_remains_legacy_at_server_container_boundary():
+    frame = {"type": "rtc.offer", "sdp": "v=0\r\n"}
+    assert not signed_mode_selected(frame)
+    validate_signed_relay_container(frame)
 
 
 def test_redis_offer_and_answer_wrappers_preserve_exact_unicode_and_escapes():

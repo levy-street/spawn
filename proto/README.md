@@ -309,8 +309,11 @@ initiating offer freezes signed-versus-legacy mode for the RTC generation, so a
 signed offer cannot receive a raw or mixed answer. Current endpoints still use
 the raw examples below until F2 installs verification and feeds only verified
 transcript SDP to WebRTC; the daemon refuses an opaque signed offer before RTC
-negotiation in this intermediate state. Thus these raw examples are staged
-compatibility, not a trusted or downgrade-resistant final mode.
+negotiation in this intermediate state. Field presence selects signed mode:
+when `signed_envelope` is present it must be a bounded, non-null JSON string;
+`null`, objects, arrays, and other JSON types are rejected before dispatch and
+cannot fall through to raw SDP. Thus these raw examples are staged compatibility,
+not a trusted or downgrade-resistant final mode.
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",

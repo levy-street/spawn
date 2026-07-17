@@ -615,6 +615,30 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
         signal_task = asyncio.create_task(_pump_host_rtc_signals(daemon, ready, expiry_tasks))
         await wait_for_signal_pump(signal_task, ready)
 
+        offers_before = len(_daemon_messages_of_type(daemon_ws, "rtc.offer"))
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce,
+                signed_envelope=None,
+            )
+        )
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce,
+                signed_envelope=None,
+                sdp="v=0\r\nraw downgrade",
+            )
+        )
+        await asyncio.sleep(0.02)
+        assert len(_daemon_messages_of_type(daemon_ws, "rtc.offer")) == offers_before
+        assert await broker.rtc_session_for(session_id) is None
+
         ws.queue_text(
             _agent_rtc_frame(
                 agent_id,

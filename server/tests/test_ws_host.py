@@ -485,6 +485,35 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
     browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
     try:
         await _wait_until(lambda: bool(browser_socket.sent_text))
+        offers_before = sum(
+            message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket)
+        )
+        browser_socket.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": None,
+                **_metadata(host_id),
+            }
+        )
+        browser_socket.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": None,
+                "sdp": "v=0\r\nraw downgrade",
+                **_metadata(host_id),
+            }
+        )
+        await asyncio.sleep(0.02)
+        assert (
+            sum(
+                message.get("type") == "rtc.offer"
+                for message in _json_messages(daemon_socket)
+            )
+            == offers_before
+        )
+
         browser_socket.queue_text(
             {
                 "type": "rtc.offer",
@@ -516,6 +545,25 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "type": "rtc.answer",
                 "session_id": session_id,
                 "binding_nonce": binding_nonce,
+                **_metadata(host_id),
+            }
+        )
+        daemon_socket.queue_text(
+            {
+                "type": "rtc.answer",
+                "session_id": session_id,
+                "binding_nonce": binding_nonce,
+                "signed_envelope": None,
+                **_metadata(host_id),
+            }
+        )
+        daemon_socket.queue_text(
+            {
+                "type": "rtc.answer",
+                "session_id": session_id,
+                "binding_nonce": binding_nonce,
+                "signed_envelope": None,
+                "sdp": "v=0\r\nraw downgrade",
                 **_metadata(host_id),
             }
         )

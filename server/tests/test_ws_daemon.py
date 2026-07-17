@@ -1479,6 +1479,14 @@ async def test_daemon_ws_routes_rtc_signaling_back_to_browser(client):
         }
         # Raw/mixed answers cannot downgrade a binding selected by its signed offer.
         ws.queue_text(base_answer)
+        ws.queue_text({**base_answer, "signed_envelope": None})
+        ws.queue_text(
+            {
+                **base_answer,
+                "signed_envelope": None,
+                "sdp": "v=0\r\nraw downgrade",
+            }
+        )
         ws.queue_text({**base_answer, "sdp": "v=0\r\nraw downgrade"})
         ws.queue_text(
             {
