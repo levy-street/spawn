@@ -496,6 +496,49 @@ still server-mediated, so 02E alone does not supply independently sourced
 expected-peer provenance, connect a pin to live RTC verification, or delete it
 on server revocation.
 
+**P3-LIVE-F4 browser-local host-pin half (candidate; independent review
+pending):** branch `impl/p3-browser-host-pins` adds a separate version-1
+IndexedDB store for public daemon identities. Every record is scoped to an
+exact canonical authenticated account UUID plus canonical HTTP(S) server
+origin, identifies a strict Ed25519 public key by its locally derived exact
+fingerprint, and retains explicit active/revoked state with creation, approval,
+and revocation times. The store is bounded to 256 active-or-tombstone key
+records total and eight unique, canonical, sorted observed Host IDs per key;
+it never evicts or deletes a key/tombstone. Exact fields, record/database
+versions, object-store schema, timestamps, origins, IDs, keys, fingerprints,
+and cross-record Host-ID conflicts are validated on every read. Crypto work is
+kept outside IndexedDB write-transaction lifetimes; a validated snapshot plus
+serialized compare/write retry makes concurrent tabs converge without silent
+replacement.
+
+The explicit browser ceremony now persists or exact-key-reactivates the local
+pin only after the user clicks confirmation and before the approval POST. A
+local failure makes zero approval calls; a later signature/API/response failure
+leaves a visible reload-safe local pin with retry guidance. Exact active
+reapproval is idempotent. Only another fresh user-confirmed approval may
+reactivate the same revoked key. Resolver/API reads cannot create or reactivate
+trust: the future-facing resolver strictly derives and compares the claimed
+key/fingerprint, requires an active local match, and only then may bind the
+bounded routing Host ID. Missing/null/mismatched/revoked pins and a previously
+bound Host ID with a new key fail loudly.
+
+Explicit Host deletion now writes the locally matched host/key/Host-ID revoked
+tombstone before issuing server DELETE. Local failure aborts the DELETE; server
+failure keeps a retryable tombstone, and Host API disappearance/reappearance
+does not erase or reactivate it. Tests cover first approval, reload and native
+multi-tab convergence, account/origin isolation, cap+1, corruption/version and
+unknown fields, the shared 49-key weak/noncanonical/off-curve corpus,
+fingerprint/key substitution, partial approval/deletion recovery, strict
+resolver cases, disappearance/reappearance, exact reapproval, and public-only
+pin persistence.
+
+This is a review-pending browser-local foundation only. RTC, terminal pools,
+HostControl, and server WebSocket admission do not consume the resolver yet;
+the daemon reciprocal OOB activation half and live signaling work remain open.
+It therefore makes no claim that live signaling is signed, that TOFU has been
+eliminated end to end, or that L1 is established. The preserved independent
+audit remains unchanged.
+
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed
 wire, host identity key, daemon-local browser pins, browser registration, and
