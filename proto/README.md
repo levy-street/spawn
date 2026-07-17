@@ -299,6 +299,19 @@ Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `agent.activity` records meaningful PTY output timing, while
 `agent.input_activity` records input timing for the direct WebRTC DataChannel.
 
+Phase-3 F1 adds a staged, mutually exclusive offer/answer carrier:
+`"signed_envelope":"<exact signed-wire JSON text>"` replaces the sibling raw
+`sdp`. The server treats that value as opaque for forwarding, performs only
+untrusted structural/routing checks, and never verifies its signature or
+supplies a peer-key pin. Its live UTF-8 bound is 512 KiB; JSON nesting is then
+bounded by the existing 1,100 KiB WebSocket and 1,200 KiB Redis limits. The
+initiating offer freezes signed-versus-legacy mode for the RTC generation, so a
+signed offer cannot receive a raw or mixed answer. Current endpoints still use
+the raw examples below until F2 installs verification and feeds only verified
+transcript SDP to WebRTC; the daemon refuses an opaque signed offer before RTC
+negotiation in this intermediate state. Thus these raw examples are staged
+compatibility, not a trusted or downgrade-resistant final mode.
+
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-generated-hex",

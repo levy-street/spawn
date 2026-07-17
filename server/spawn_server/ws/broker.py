@@ -16,6 +16,7 @@ from .owner_dispatch import (
     owner_result_channel,
     publish_owner_result,
 )
+from .signed_signal_relay import SIGNED_ENVELOPE_FIELD
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -37,7 +38,9 @@ class DaemonConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(json.dumps(payload))
+            await self.websocket.send_text(
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            )
 
 @dataclass(eq=False)
 class BrowserConn:
@@ -49,7 +52,9 @@ class BrowserConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(json.dumps(payload))
+            await self.websocket.send_text(
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            )
 
     @property
     def route_id(self) -> str:
@@ -66,7 +71,9 @@ class HostBrowserConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(json.dumps(payload))
+            await self.websocket.send_text(
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            )
 
     @property
     def route_id(self) -> str:
@@ -86,6 +93,9 @@ class RtcSessionBinding:
     daemon_generation: int
     nonce: str
     expires_at: float
+    # Selected by the initiating offer and immutable for this RTC generation.
+    # A signed session must never accept or forward a legacy raw-SDP answer.
+    signed_signal: bool = False
 
 
 @dataclass(frozen=True)
@@ -268,6 +278,7 @@ class Broker:
         protocol: str,
         protocol_version: int,
         binding_nonce: str | None = None,
+        signed_signal: bool = False,
         ttl_seconds: int | None = None,
         now: float | None = None,
     ) -> bool:
@@ -337,6 +348,7 @@ class Broker:
                 daemon_generation=generation,
                 nonce=nonce,
                 expires_at=float("inf") if ttl_seconds is None else now + ttl_seconds,
+                signed_signal=signed_signal,
             )
             return True
 

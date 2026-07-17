@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from spawn_server import auth
@@ -23,6 +24,30 @@ from spawn_server.ws.host_signal import (
     host_presence_key,
     wait_for_signal_pump,
 )
+
+
+def _signed_agent_wire(signal_type: str, session_id: str, agent_id: str) -> str:
+    vectors = json.loads(
+        (Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json").read_text()
+    )["vectors"]
+    envelope = dict(vectors[0]["envelope"])
+    envelope.update(
+        {
+            "type": signal_type,
+            "session_id": session_id,
+            "scope_id": agent_id,
+            "sender_role": "browser" if signal_type == "rtc.offer" else "daemon",
+        }
+    )
+    # Structurally canonical substitutions prove the server is not acting as
+    # a trust oracle and does not rewrite security-relevant fields.
+    sender = envelope["sender_identity_public_key"]
+    peer = envelope["intended_peer_identity_public_key"]
+    envelope["sender_identity_public_key"] = peer
+    envelope["intended_peer_identity_public_key"] = sender
+    signature = str(envelope["signature"])
+    envelope["signature"] = ("A" if signature[0] != "A" else "B") + signature[1:]
+    return "\n" + json.dumps(envelope, separators=(",", ":")) + " "
 
 
 class FakeBrowserWebSocket:
@@ -550,6 +575,87 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
             lambda: len(_daemon_messages_of_type(daemon_ws, "rtc.candidate"))
             == before_candidate_count + 1
         )
+    finally:
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=1)
+        if signal_task is not None:
+            signal_task.cancel()
+            await asyncio.gather(signal_task, return_exceptions=True)
+        for expiry_task in expiry_tasks:
+            expiry_task.cancel()
+        await asyncio.gather(*expiry_tasks, return_exceptions=True)
+        await broker.unregister_daemon(daemon)
+
+
+async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgrade(
+    client, monkeypatch
+):
+    monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    user_id, token = await _signup(client, "ws-browser-signed-relay@example.com")
+    host_id, agent_id = await _create_host_and_agent(user_id)
+    session_id = str(uuid.uuid4())
+    nonce = "c" * 32
+    offer_wire = _signed_agent_wire("rtc.offer", session_id, agent_id)
+    answer_wire = _signed_agent_wire("rtc.answer", session_id, agent_id)
+
+    daemon_ws = FakeDaemonWebSocket()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
+    broker = get_broker()
+    expiry_tasks: set[asyncio.Task[None]] = set()
+    signal_task: asyncio.Task[None] | None = None
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id))  # type: ignore[arg-type]
+    try:
+        await _wait_until(lambda: bool(_messages_of_type(ws, "rtc.config")))
+        await broker.register_daemon(daemon)
+        await _accept_daemon(daemon)
+        await broker.attach_agent_to_daemon(agent_id, daemon)
+        ready = asyncio.Event()
+        signal_task = asyncio.create_task(_pump_host_rtc_signals(daemon, ready, expiry_tasks))
+        await wait_for_signal_pump(signal_task, ready)
+
+        ws.queue_text(
+            _agent_rtc_frame(
+                agent_id,
+                type="rtc.offer",
+                session_id=session_id,
+                binding_nonce=nonce,
+                signed_envelope=offer_wire,
+            )
+        )
+        await _wait_until(lambda: bool(_daemon_messages_of_type(daemon_ws, "rtc.offer")))
+        forwarded = _daemon_messages_of_type(daemon_ws, "rtc.offer")[-1]
+        assert forwarded["signed_envelope"] == offer_wire
+        assert "sdp" not in forwarded
+        assert json.loads(forwarded["signed_envelope"])["signature"] == json.loads(offer_wire)[
+            "signature"
+        ]
+        binding = await broker.rtc_session_for(session_id, daemon=daemon)
+        assert binding is not None and binding.signed_signal
+
+        response = {
+            "type": "rtc.answer",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "binding_nonce": binding.nonce,
+            "binding_generation": binding.daemon_generation,
+            "scope_type": "agent",
+            "scope_id": agent_id,
+            "protocol": "spawn.pty",
+            "protocol_version": 2,
+        }
+        before = len(_messages_of_type(ws, "rtc.answer"))
+        await binding.browser.send_text(response)
+        await binding.browser.send_text({**response, "sdp": "v=0\r\nraw downgrade"})
+        await asyncio.sleep(0.02)
+        assert len(_messages_of_type(ws, "rtc.answer")) == before
+
+        await binding.browser.send_text({**response, "signed_envelope": answer_wire})
+        await _wait_until(lambda: len(_messages_of_type(ws, "rtc.answer")) == before + 1)
+        delivered = _messages_of_type(ws, "rtc.answer")[-1]
+        assert delivered["signed_envelope"] == answer_wire
+        assert "sdp" not in delivered
     finally:
         ws.queue_disconnect()
         await asyncio.wait_for(task, timeout=1)

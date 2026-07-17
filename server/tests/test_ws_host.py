@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from spawn_server import auth
@@ -26,6 +28,24 @@ from spawn_server.ws.host import (
     _rtc_binding_capacity_available,
     host_ws,
 )
+
+
+def _signed_host_wire(signal_type: str, session_id: str, host_id: str) -> str:
+    vectors = json.loads(
+        (Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json").read_text()
+    )["vectors"]
+    envelope = dict(vectors[1]["envelope"])
+    envelope.update(
+        {
+            "type": signal_type,
+            "session_id": session_id,
+            "scope_id": host_id,
+            "sender_role": "browser" if signal_type == "rtc.offer" else "daemon",
+        }
+    )
+    signature = str(envelope["signature"])
+    envelope["signature"] = ("A" if signature[0] != "A" else "B") + signature[1:]
+    return " \n" + json.dumps(envelope, separators=(",", ":")) + "\t"
 
 
 class FakeWebSocket:
@@ -452,6 +472,103 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_not_forw
 
     browser_socket.queue_disconnect()
     await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))
+
+
+async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgrade(client):
+    user_id, token = await _signup(client, "host-rtc-signed-relay@example.com")
+    host_id = await _create_host(user_id, "signed-answer-host")
+    session_id = str(uuid.uuid4())
+    offer_wire = _signed_host_wire("rtc.offer", session_id, host_id)
+    answer_wire = _signed_host_wire("rtc.answer", session_id, host_id)
+    daemon_socket, daemon_task = await _start_daemon(user_id, host_id)
+    browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
+    browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
+    try:
+        await _wait_until(lambda: bool(browser_socket.sent_text))
+        browser_socket.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": offer_wire,
+                **_metadata(host_id),
+            }
+        )
+        await _wait_until(
+            lambda: any(
+                message.get("type") == "rtc.offer"
+                for message in _json_messages(daemon_socket)
+            )
+        )
+        offer = [
+            message
+            for message in _json_messages(daemon_socket)
+            if message.get("type") == "rtc.offer"
+        ][-1]
+        assert offer["signed_envelope"] == offer_wire
+        assert "sdp" not in offer
+        binding_nonce = offer["binding_nonce"]
+
+        before = sum(
+            message.get("type") == "rtc.answer" for message in _json_messages(browser_socket)
+        )
+        daemon_socket.queue_text(
+            {
+                "type": "rtc.answer",
+                "session_id": session_id,
+                "binding_nonce": binding_nonce,
+                **_metadata(host_id),
+            }
+        )
+        daemon_socket.queue_text(
+            {
+                "type": "rtc.answer",
+                "session_id": session_id,
+                "binding_nonce": binding_nonce,
+                "sdp": "v=0\r\nraw downgrade",
+                **_metadata(host_id),
+            }
+        )
+        daemon_socket.queue_text(
+            {
+                "type": "rtc.answer",
+                "session_id": session_id,
+                "binding_nonce": binding_nonce,
+                "signed_envelope": answer_wire,
+                **_metadata(host_id),
+            }
+        )
+        await _wait_until(
+            lambda: sum(
+                message.get("type") == "rtc.answer"
+                for message in _json_messages(browser_socket)
+            )
+            == before + 1
+        )
+        answer = [
+            message
+            for message in _json_messages(browser_socket)
+            if message.get("type") == "rtc.answer"
+        ][-1]
+        assert answer["signed_envelope"] == answer_wire
+        assert "sdp" not in answer
+
+        # A signed value plus a raw sibling is never interpreted as legacy.
+        browser_socket.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": str(uuid.uuid4()),
+                "signed_envelope": offer_wire,
+                "sdp": "v=0\r\nsubstitute",
+                **_metadata(host_id),
+            }
+        )
+        await asyncio.sleep(0.02)
+        assert sum(
+            message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket)
+        ) == 1
+    finally:
+        browser_socket.queue_disconnect()
+        await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))
 
 
 async def test_host_signaling_rejects_repeated_offers_and_caps_pending_sessions(client):

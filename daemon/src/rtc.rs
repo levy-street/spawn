@@ -803,7 +803,8 @@ impl RtcSessions {
                 scope_id: Some(binding.signaling.agent_id),
                 protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
                 protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
-                sdp: local_sdp,
+                sdp: Some(local_sdp),
+                signed_envelope: None,
             },
         )
         .await;
@@ -947,7 +948,8 @@ impl RtcSessions {
                 scope_id: Some(binding.host_id),
                 protocol: Some(binding.protocol),
                 protocol_version: Some(binding.protocol_version),
-                sdp: local_sdp,
+                sdp: Some(local_sdp),
+                signed_envelope: None,
             },
         )
         .await;

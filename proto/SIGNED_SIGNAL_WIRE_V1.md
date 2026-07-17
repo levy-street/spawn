@@ -1,8 +1,10 @@
 # Signed RTC JSON wire envelope v1
 
 This adapter carries the accepted signed-signal transcript on an endpoint
-boundary. It is not installed on a live WebSocket route yet and does not
-establish key trust, pin distribution, TOFU, or L1.
+boundary. The F1 relay prerequisite can now carry its exact JSON text as one
+opaque `signed_envelope` string, but endpoint signing, pin verification, and
+verified-SDP consumption are not installed on the live RTC path yet. The
+carrier does not establish key trust, pin distribution, TOFU, or L1.
 
 An envelope is one JSON object containing exactly these fields:
 
@@ -35,6 +37,13 @@ required. Uppercase, unhyphenated, braced, whitespace-padded, and arbitrary
 spellings are rejected before signature acceptance. Future live routing must
 use and compare the exact verified strings without trimming or
 parse-and-reserialize normalization.
+
+The live relay carrier applies an additional 512 KiB UTF-8 bound to the whole
+opaque string. This smaller transport bound is intentional: nesting a JSON
+envelope as a JSON string can double every byte, and 512 KiB plus 64 KiB of
+routing allowance stays below the existing 1,100 KiB WebSocket and 1,200 KiB
+Redis dispatch caps. The endpoint adapters retain their larger construction
+bound for transport-independent use.
 
 Protocol versions use JSON value semantics consistently across runtimes. After
 the runtime JSON number conversion, the value must be finite, exactly integral,

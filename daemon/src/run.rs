@@ -867,9 +867,28 @@ async fn dispatch_loop(
                     protocol,
                     protocol_version,
                     sdp,
+                    signed_envelope,
                     ice_servers,
                     ice_transport_policy,
                 } => {
+                    if signed_envelope.is_some() {
+                        // F1 makes the complete opaque offer reachable here.
+                        // F2 must install pin verification and extract the
+                        // verified transcript SDP. Never fall back to a raw
+                        // sibling SDP when signed mode was selected.
+                        if sdp.is_some() {
+                            tracing::warn!("rejecting mixed signed/raw RTC offer");
+                        } else {
+                            tracing::warn!(
+                                "signed RTC offer relay reached daemon before verifier cutover"
+                            );
+                        }
+                        continue;
+                    }
+                    let Some(sdp) = sdp else {
+                        tracing::warn!("rejecting RTC offer without SDP envelope");
+                        continue;
+                    };
                     match (
                         binding_nonce,
                         binding_generation,

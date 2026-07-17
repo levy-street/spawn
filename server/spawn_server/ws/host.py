@@ -39,12 +39,20 @@ from .host_signal import (
     receive_with_signal_pump,
     wait_for_signal_pump,
 )
+from .signed_signal_relay import (
+    MAX_RTC_ROUTING_FRAME_BYTES,
+    SIGNED_ENVELOPE_FIELD,
+    SignedRtcRelayError,
+    reject_raw_sdp_in_signed_mode,
+    signed_mode_selected,
+    validate_signed_rtc_relay_envelope,
+)
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.host")
 
 HOST_WS_SUBPROTOCOL = "spawn.host.v1"
-MAX_SIGNAL_FRAME_BYTES = 1100 * 1024
+MAX_SIGNAL_FRAME_BYTES = MAX_RTC_ROUTING_FRAME_BYTES
 WS_CLOSE_BINARY = 4002
 MAX_HOST_RTC_BINDING_IDENTITIES = 256
 
@@ -56,6 +64,7 @@ class BrowserRtcSession:
     daemon_generation: int
     nonce: str
     expires_at: float
+    signed_signal: bool = False
 
 
 def _is_turn_only(ice_servers: list[dict[str, object]]) -> bool:
@@ -285,7 +294,25 @@ async def _pump_browser_signals(
                 continue
             frame_type = signal.get("type")
             if frame_type == "rtc.answer":
-                if _valid_rtc_sdp(signal.get("sdp")) is None:
+                try:
+                    if binding.signed_signal:
+                        if not signed_mode_selected(signal):
+                            continue
+                        reject_raw_sdp_in_signed_mode(signal)
+                        validate_signed_rtc_relay_envelope(
+                            signal[SIGNED_ENVELOPE_FIELD],
+                            expected_type="rtc.answer",
+                            expected_session_id=binding.session_id,
+                            expected_scope_type="host",
+                            expected_scope_id=host_id,
+                            expected_protocol=HOST_CONTROL_PROTOCOL,
+                            expected_protocol_version=HOST_CONTROL_VERSION,
+                        )
+                    elif signed_mode_selected(signal) or _valid_rtc_sdp(
+                        signal.get("sdp")
+                    ) is None:
+                        continue
+                except SignedRtcRelayError:
                     continue
             elif frame_type == "rtc.candidate":
                 if _valid_rtc_candidate(signal.get("candidate")) is None:
@@ -447,8 +474,26 @@ async def host_ws(
                 if not get_settings().webrtc_enabled:
                     await _send_status(conn, host_id, session_id, "failed")
                     continue
-                sdp = _valid_rtc_sdp(obj.get("sdp"))
-                if sdp is None:
+                signed_signal = signed_mode_selected(obj)
+                try:
+                    if signed_signal:
+                        reject_raw_sdp_in_signed_mode(obj)
+                        signed_envelope = validate_signed_rtc_relay_envelope(
+                            obj[SIGNED_ENVELOPE_FIELD],
+                            expected_type="rtc.offer",
+                            expected_session_id=session_id,
+                            expected_scope_type="host",
+                            expected_scope_id=host_id,
+                            expected_protocol=HOST_CONTROL_PROTOCOL,
+                            expected_protocol_version=HOST_CONTROL_VERSION,
+                        ).wire
+                        sdp = None
+                    else:
+                        signed_envelope = None
+                        sdp = _valid_rtc_sdp(obj.get("sdp"))
+                        if sdp is None:
+                            continue
+                except SignedRtcRelayError:
                     continue
                 daemon_owner = decode_host_presence_owner(
                     await get_backend().get_ephemeral(host_presence_key(host_id))
@@ -473,6 +518,7 @@ async def host_ws(
                             daemon_generation=daemon_owner.generation,
                             nonce=new_rtc_binding_nonce(),
                             expires_at=now + HOST_RTC_SESSION_TTL_SECONDS,
+                            signed_signal=signed_signal,
                         )
                         sessions[session_id] = binding
                 if binding is None:
@@ -488,19 +534,22 @@ async def host_ws(
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
+                values: dict[str, object] = {
+                    "binding_nonce": binding.nonce,
+                    "ice_servers": ice_servers,
+                    "ice_transport_policy": transport_policy,
+                }
+                if signed_signal:
+                    assert signed_envelope is not None
+                    values[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                else:
+                    assert sdp is not None
+                    values["sdp"] = sdp
                 published = await _publish_signal(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload(
-                        "rtc.offer",
-                        session_id,
-                        host_id,
-                        binding_nonce=binding.nonce,
-                        sdp=sdp,
-                        ice_servers=ice_servers,
-                        ice_transport_policy=transport_policy,
-                    ),
+                    _signal_payload("rtc.offer", session_id, host_id, **values),
                 )
                 if not published:
                     await _retire_if_exact_binding(
