@@ -392,8 +392,8 @@ committed head/result. If integrity/anchor checks cannot authenticate either
 state, the daemon returns `data_integrity`, blocks the object, and does not
 invent an `outcome_unknown` record from untrusted state.
 
-The same endpoint journal must cover all external effects already accepted or
-pending in this wave: merged HOST-02 filesystem mkdir, rename, remove, write,
+The same endpoint journal must cover all external effects already reviewed and
+merged or pending in this wave: HOST-02 filesystem mkdir, rename, remove, write,
 and transfer-destination commit; independently reviewed TERM-01 agent upload
 commit merged at `5d99ebb4`; review-pending HOST-03A tool install; and DATA-02
 launch/restart. Before any effect it stores an encrypted, versioned record

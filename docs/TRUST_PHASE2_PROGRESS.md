@@ -403,7 +403,7 @@ and is merged.
    interactive installer candidate. Keep the legacy tool route until its
    endpoint-owned durable targets exist; this wave is not the final tool cut.
 3. Only after P2-DATA-01 and P2-HOST-03A have passed independent review and
-   merged (with P2-HOST-02 and P2-TERM-01 already accepted), implement the
+   merged (with P2-HOST-02 and P2-TERM-01 already merged), implement the
    then-reviewed per-host endpoint-local store in P2-DATA-02. Its evidence must
    name exact reviewed protocol/effect-boundary commits, including TERM-01 at
    `5d99ebb4` and the future accepted HOST-03A commit. Move full launch

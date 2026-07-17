@@ -540,54 +540,111 @@ PREMATURE_DATA_STATUS_WORD = re.compile(
 DATA_STATUS_SUBJECT = re.compile(
     r"\b(?:"
     r"p2-data-(?:01|02)|"
-    r"durable protected(?:-data)? (?:state|target)|"
+    r"data-(?:01|02)(?: decision| design| target| contract| store)?|"
+    r"durable protected(?:-data)? (?:state|target|store)|"
+    r"protected-data store|"
+    r"endpoint(?:-local)? store|"
     r"(?:endpoint-local|per-host(?: endpoint-local)?) "
     r"(?:canonical |durable )?store|"
     r"(?:p2-data-02 )?store contract"
     r")\b"
 )
-EXPLICIT_DATA_STATUS_CONTEXT = (
-    re.compile(r"\bnot (?:approved|accepted|authoritative|selected)\b"),
-    re.compile(
-        r"\b(?:only when|only after|until)\b.{0,200}\b(?:review|reviewed|merge|merged)\b"
-    ),
-    re.compile(
-        r"\b(?:historical|historically|superseded|former|previous|previously)\b"
-        r".{0,200}\b(?:approved|accepted|authoritative|selected)\b"
-    ),
+DATA_STATUS_CLAUSE_BOUNDARY = re.compile(
+    r"\s*;\s*|\s*,\s*(?=(?:but|however|yet|whereas)\b)|"
+    r"\s+\b(?:but|however|yet|whereas)\b\s+"
 )
+DATA_STATUS_CLAIM_CONJUNCTION = re.compile(
+    r"\s+\band\b\s+(?=(?:the\s+)?(?:"
+    r"p2-data-(?:01|02)|data-(?:01|02)|durable protected|protected-data store|"
+    r"endpoint(?:-local)? store|per-host(?: endpoint-local)? store|store contract"
+    r")\b)"
+)
+HISTORICAL_DATA_CONTEXT = re.compile(
+    r"\b(?:historical|historically|superseded|former|previous|previously)\b"
+)
+REVIEW_AND_MERGE = re.compile(r"\b(?:review|reviewed)\b.{0,120}\b(?:merge|merged)\b")
 
 
-def spans_are_near(left: re.Match[str], right: re.Match[str], limit: int = 96) -> bool:
-    if left.end() < right.start():
-        return right.start() - left.end() <= limit
-    if right.end() < left.start():
-        return left.start() - right.end() <= limit
-    return True
+def status_is_locally_negated(clause: str, status_word: re.Match[str]) -> bool:
+    prefix = clause[: status_word.start()]
+    return bool(
+        re.search(
+            r"\b(?:not|never|no longer)(?:\s+[a-z0-9_-]+){0,2}\s*$",
+            prefix,
+        )
+    )
+
+
+def status_has_historical_context(
+    clause: str, status_word: re.Match[str], subject: re.Match[str]
+) -> bool:
+    historical = tuple(HISTORICAL_DATA_CONTEXT.finditer(clause[: status_word.start()]))
+    if not historical:
+        return False
+    last_historical = historical[-1]
+    if PREMATURE_DATA_STATUS_WORD.search(
+        clause[last_historical.end() : status_word.start()]
+    ):
+        return False
+    claim_start = min(status_word.start(), subject.start())
+    claim_end = max(status_word.end(), subject.end())
+    current_context = clause[claim_start : min(len(clause), claim_end + 48)]
+    return not re.search(r"\b(?:now|currently)\b", current_context)
+
+
+def status_has_future_review_gate(
+    clause: str, status_word: re.Match[str], subject: re.Match[str]
+) -> bool:
+    claim_start = min(status_word.start(), subject.start())
+    claim_end = max(status_word.end(), subject.end())
+    before = clause[:claim_start]
+    after = clause[claim_end:]
+    after_gate = re.search(r"\bonly (?:when|after)\b", after)
+    if after_gate is not None and REVIEW_AND_MERGE.search(after[after_gate.start() :]):
+        return True
+    before_gate = re.search(r"\bonly (?:when|after)\b", before)
+    if before_gate is None:
+        return False
+    gated_prefix = before[before_gate.start() :]
+    if not REVIEW_AND_MERGE.search(gated_prefix):
+        return False
+    if PREMATURE_DATA_STATUS_WORD.search(
+        clause[before_gate.end() : status_word.start()]
+    ):
+        return False
+    current_context = clause[claim_start : min(len(clause), claim_end + 48)]
+    return not re.search(r"\b(?:now|currently)\b", current_context)
 
 
 def enforce_pending_data_review_status(root: Path, status: str) -> None:
     if status != "proposed_independent_review_pending":
         return
     for record in all_corpus_sentences(root):
-        sentence = record.sentence
-        status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(sentence))
-        subjects = tuple(DATA_STATUS_SUBJECT.finditer(sentence))
-        if not status_words or not subjects:
-            continue
-        if not any(
-            spans_are_near(status_word, subject)
-            for status_word in status_words
-            for subject in subjects
-        ):
-            continue
-        if any(pattern.search(sentence) for pattern in EXPLICIT_DATA_STATUS_CONTEXT):
-            continue
-        raise ContradictionError(
-            "data-review-status-prose",
-            root / record.path,
-            f"{record.location} sentence {record.sentence_index}: {sentence}",
+        primary_clauses = DATA_STATUS_CLAUSE_BOUNDARY.split(record.sentence)
+        clauses = (
+            clause
+            for primary_clause in primary_clauses
+            for clause in DATA_STATUS_CLAIM_CONJUNCTION.split(primary_clause)
         )
+        for clause in clauses:
+            status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(clause))
+            subjects = tuple(DATA_STATUS_SUBJECT.finditer(clause))
+            if not status_words or not subjects:
+                continue
+            for status_word in status_words:
+                if status_is_locally_negated(clause, status_word):
+                    continue
+                for subject in subjects:
+                    if status_has_historical_context(clause, status_word, subject):
+                        continue
+                    if status_has_future_review_gate(clause, status_word, subject):
+                        continue
+                    raise ContradictionError(
+                        "data-review-status-prose",
+                        root / record.path,
+                        f"{record.location} sentence {record.sentence_index}: "
+                        f"{clause.strip()}",
+                    )
 
 
 class DuplicateJsonKey(ValueError):
@@ -1390,6 +1447,86 @@ def self_test(source: Path) -> None:
                 status_claim_fixture(
                     "docs/DURABLE_SENSITIVE_DATA.md",
                     "P2-DATA-01 selected the per-host endpoint-local canonical store.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "long DATA-01 status claim has no distance bypass",
+                status_claim_fixture(
+                    "docs/DESIGN.md",
+                    "P2-DATA-01 remains the subject of detailed implementation "
+                    "requirements and extensive verification evidence remains the "
+                    "subject of detailed implementation requirements and extensive "
+                    "verification evidence is approved.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "endpoint-store approved variant survives reinventory",
+                status_claim_fixture(
+                    "docs/INTERFACE_MATRIX.md",
+                    "The endpoint store is approved.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "protected-data-store authoritative variant survives reinventory",
+                status_claim_fixture(
+                    "proto/README.md",
+                    "The protected-data store is authoritative.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "DATA-01 decision accepted variant survives reinventory",
+                status_claim_fixture(
+                    "docs/DURABLE_SENSITIVE_DATA.md",
+                    "The DATA-01 decision is accepted.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "historical safe clause cannot mask current selected claim",
+                status_claim_fixture(
+                    "docs/DESIGN.md",
+                    "A historical P2-DATA-01 experiment was approved, but "
+                    "P2-DATA-01 is selected now.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "negated safe clause cannot mask authoritative contract claim",
+                status_claim_fixture(
+                    "docs/INTERFACE_MATRIX.md",
+                    "P2-DATA-01 is not approved, but the P2-DATA-02 store contract "
+                    "is authoritative now.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "review-gated prototype clause cannot mask current selected claim",
+                status_claim_fixture(
+                    "proto/README.md",
+                    "Only after review and merge may one prototype be accepted; "
+                    "P2-DATA-01 is selected now.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "same-clause review gate cannot mask later current selected claim",
+                status_claim_fixture(
+                    "docs/DURABLE_SENSITIVE_DATA.md",
+                    "Only after review and merge may a prototype be accepted and "
+                    "P2-DATA-01 is selected now.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "same-clause historical marker cannot mask later current selected claim",
+                status_claim_fixture(
+                    "docs/DESIGN.md",
+                    "Historically a prototype was accepted and P2-DATA-01 is "
+                    "selected now.",
                 ),
                 "data-review-status-prose",
             ),
