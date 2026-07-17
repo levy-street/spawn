@@ -1,4 +1,8 @@
-import { decodeEd25519PublicKeyWire, type SignedSignalTranscript } from "./signed-signal";
+import {
+  decodeEd25519PublicKeyWire,
+  encodeBase64Url,
+  type SignedSignalTranscript,
+} from "./signed-signal";
 import {
   type RtcSignalProtocol,
   type SignedRtcSignalInput,
@@ -67,12 +71,52 @@ type SessionPhase = "new" | "signing" | "offered" | "verifying" | "applied" | "f
 /** One signed offer and one signed answer for one immutable RTC generation. */
 export class SignedRtcLiveSession {
   private phase: SessionPhase = "new";
+  readonly route: SignedRtcRoute;
+  readonly sessionId: string;
+  private readonly browserPublicKeyWire: string;
+  private readonly hostPublicKeyWire: string;
+  private readonly hostPublicKey: Uint8Array;
+  private readonly signOfferOperation: (input: SignedRtcSignalInput) => Promise<string>;
+  private readonly assertActiveOperation: () => void;
 
-  constructor(
-    readonly route: SignedRtcRoute,
-    readonly sessionId: string,
-    private readonly trust: SignedRtcTrustCapability,
-  ) {}
+  constructor(route: SignedRtcRoute, sessionId: string, trust: SignedRtcTrustCapability) {
+    const scopeType = route.scopeType;
+    const scopeId = canonicalUuidSnapshot(route.scopeId, "scopeId");
+    const protocol = route.protocol;
+    const protocolVersion = route.protocolVersion;
+    if (
+      !(
+        (scopeType === "agent" && protocol === "spawn.pty" && protocolVersion === 2) ||
+        (scopeType === "host" && protocol === "spawn.host.ctl" && protocolVersion === 1)
+      )
+    ) {
+      throw new SignedRtcLiveError(
+        "signed_transcript_mismatch",
+        "signed RTC route is not one exact supported topology",
+      );
+    }
+    this.route = Object.freeze({ scopeType, scopeId, protocol, protocolVersion }) as SignedRtcRoute;
+    this.sessionId = canonicalUuidSnapshot(sessionId, "sessionId");
+
+    // Read every capability member exactly once. The generation thereafter
+    // owns these canonical values and bound operations, so mutable objects,
+    // getters, and proxies cannot rotate either identity underneath an offer.
+    const browserPublicKeyWire = trust.browserPublicKeyWire;
+    const hostPublicKeyWire = trust.hostPublicKeyWire;
+    const signOfferOperation = trust.signOffer;
+    const assertActiveOperation = trust.assertActive;
+    if (typeof signOfferOperation !== "function" || typeof assertActiveOperation !== "function") {
+      throw new SignedRtcLiveError(
+        "inactive_trust",
+        "signed RTC trust capability operations are unavailable",
+      );
+    }
+    this.browserPublicKeyWire = canonicalPublicKeySnapshot(browserPublicKeyWire);
+    this.hostPublicKey = decodeEd25519PublicKeyWire(hostPublicKeyWire).slice();
+    this.hostPublicKeyWire = encodeBase64Url(this.hostPublicKey);
+    this.signOfferOperation = (input) => signOfferOperation.call(trust, input);
+    this.assertActiveOperation = () => assertActiveOperation.call(trust);
+  }
 
   async createOffer(sdp: string): Promise<{ readonly signed_envelope: string }> {
     if (this.phase !== "new") {
@@ -91,10 +135,10 @@ export class SignedRtcLiveSession {
         scopeType: this.route.scopeType,
         scopeId: this.route.scopeId,
         senderRole: "browser",
-        intendedPeerPublicKey: decodeEd25519PublicKeyWire(this.trust.hostPublicKeyWire),
+        intendedPeerPublicKey: this.hostPublicKey.slice(),
         sdp,
       };
-      const wire = await this.trust.signOffer({
+      const wire = await this.signOfferOperation({
         protocol: this.route.protocol,
         transcript,
       });
@@ -106,8 +150,8 @@ export class SignedRtcLiveSession {
       // exact route before the carrier may leave this endpoint.
       const verified = await verifyRtcSignalWire(
         wire,
-        this.trust.browserPublicKeyWire,
-        this.trust.hostPublicKeyWire,
+        this.browserPublicKeyWire,
+        this.hostPublicKeyWire,
       );
       this.assertPhase("signing");
       this.assertTrustActive();
@@ -154,8 +198,8 @@ export class SignedRtcLiveSession {
       this.assertTrustActive();
       const verified = await verifyRtcSignalWire(
         frame.signed_envelope,
-        this.trust.hostPublicKeyWire,
-        this.trust.browserPublicKeyWire,
+        this.hostPublicKeyWire,
+        this.browserPublicKeyWire,
       );
       this.assertPhase("verifying");
       this.assertTrustActive();
@@ -177,7 +221,7 @@ export class SignedRtcLiveSession {
 
   private assertTrustActive(): void {
     try {
-      this.trust.assertActive();
+      this.assertActiveOperation();
     } catch (error) {
       throw new SignedRtcLiveError(
         "inactive_trust",
@@ -241,4 +285,26 @@ export class SignedRtcLiveSession {
       // Verification failure remains fatal even if browser teardown throws.
     }
   }
+}
+
+const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+function canonicalUuidSnapshot(value: unknown, field: string): string {
+  if (typeof value !== "string" || !CANONICAL_UUID_PATTERN.test(value)) {
+    throw new SignedRtcLiveError(
+      "signed_transcript_mismatch",
+      `${field} must be one exact canonical UUID`,
+    );
+  }
+  return value;
+}
+
+function canonicalPublicKeySnapshot(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new SignedRtcLiveError(
+      "signed_transcript_mismatch",
+      "signed RTC identity pins must be canonical Ed25519 public keys",
+    );
+  }
+  return encodeBase64Url(decodeEd25519PublicKeyWire(value));
 }

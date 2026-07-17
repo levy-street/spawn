@@ -141,6 +141,47 @@ async function fixture(route: SignedRtcRoute, sessionId = SESSION_ID) {
   };
 }
 
+async function signedAnswer(
+  route: SignedRtcRoute,
+  sessionId: string,
+  host: Awaited<ReturnType<typeof generateEd25519IdentityKeyPair>>,
+  hostPublicKeyWire: string,
+  browserPublicKeyWire: string,
+  sdp = VERIFIED_SDP,
+): Promise<string> {
+  return signRtcSignalWire(
+    {
+      publicKeyWire: hostPublicKeyWire,
+      sign: (transcript) => signSignedSignalTranscript(host.privateKey, transcript),
+    },
+    {
+      protocol: route.protocol,
+      transcript: {
+        signalKind: "answer",
+        protocolVersion: route.protocolVersion,
+        sessionId,
+        scopeType: route.scopeType,
+        scopeId: route.scopeId,
+        senderRole: "daemon",
+        intendedPeerPublicKey: decodeEd25519PublicKeyWire(browserPublicKeyWire),
+        sdp,
+      },
+    },
+  );
+}
+
+function answerFrame(route: SignedRtcRoute, sessionId: string, signedEnvelope: string) {
+  return {
+    session_id: sessionId,
+    scope_type: route.scopeType,
+    scope_id: route.scopeId,
+    protocol: route.protocol,
+    protocol_version: route.protocolVersion,
+    signed_envelope: signedEnvelope,
+    sdp: HOSTILE_RAW_SDP,
+  };
+}
+
 describe("signed RTC live answer adapter", () => {
   for (const route of routes) {
     test(`${route.scopeType} consumes only verified transcript SDP when the relay raw SDP differs`, async () => {
@@ -314,5 +355,155 @@ describe("signed RTC live answer adapter", () => {
     peer.release();
     await expect(result).rejects.toMatchObject({ code: "inactive_trust" });
     expect(peer.closeCalls).toBe(1);
+  });
+
+  test("a generation snapshots H1 once, rejects a post-offer H2 rotation, and a fresh H2 generation succeeds", async () => {
+    const route = routes[0];
+    const browser = await generateEd25519IdentityKeyPair();
+    const hostH1 = await generateEd25519IdentityKeyPair();
+    const hostH2 = await generateEd25519IdentityKeyPair();
+    const browserWire = await exportEd25519PublicKeyWire(browser.publicKey);
+    const hostH1Wire = await exportEd25519PublicKeyWire(hostH1.publicKey);
+    const hostH2Wire = await exportEd25519PublicKeyWire(hostH2.publicKey);
+    let selectedHostWire = hostH1Wire;
+    let browserReads = 0;
+    let hostReads = 0;
+    const trust: SignedRtcTrustCapability = {
+      get browserPublicKeyWire() {
+        browserReads += 1;
+        return browserWire;
+      },
+      get hostPublicKeyWire() {
+        hostReads += 1;
+        return selectedHostWire;
+      },
+      assertActive: () => {},
+      signOffer: (input) =>
+        signRtcSignalWire(
+          {
+            publicKeyWire: browserWire,
+            sign: (transcript) => signSignedSignalTranscript(browser.privateKey, transcript),
+          },
+          input,
+        ),
+    };
+
+    const h1Session = new SignedRtcLiveSession(route, SESSION_ID, trust);
+    expect({ browserReads, hostReads }).toEqual({ browserReads: 1, hostReads: 1 });
+    await h1Session.createOffer("v=0\r\ns=h1-offer\r\n");
+    selectedHostWire = hostH2Wire;
+    const h1Peer = new FakePeer();
+    await expect(
+      h1Session.verifyAndApplyAnswer(
+        h1Peer,
+        answerFrame(
+          route,
+          SESSION_ID,
+          await signedAnswer(route, SESSION_ID, hostH2, hostH2Wire, browserWire),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "sender_pin_mismatch" });
+    expect(h1Peer.applied).toEqual([]);
+    expect(h1Peer.closeCalls).toBe(1);
+    expect({ browserReads, hostReads }).toEqual({ browserReads: 1, hostReads: 1 });
+
+    const nextSessionId = "12345678-9abc-4def-8abc-123456789abc";
+    const h2Session = new SignedRtcLiveSession(route, nextSessionId, trust);
+    await h2Session.createOffer("v=0\r\ns=h2-offer\r\n");
+    const h2Peer = new FakePeer();
+    await h2Session.verifyAndApplyAnswer(
+      h2Peer,
+      answerFrame(
+        route,
+        nextSessionId,
+        await signedAnswer(route, nextSessionId, hostH2, hostH2Wire, browserWire),
+      ),
+    );
+    expect(h2Peer.applied).toEqual([{ type: "answer", sdp: VERIFIED_SDP }]);
+    expect(h2Peer.closeCalls).toBe(0);
+    expect({ browserReads, hostReads }).toEqual({ browserReads: 2, hostReads: 2 });
+  });
+
+  test("browser-pin getters and route proxies are snapshotted against post-construction substitution", async () => {
+    const browserB1 = await generateEd25519IdentityKeyPair();
+    const browserB2 = await generateEd25519IdentityKeyPair();
+    const host = await generateEd25519IdentityKeyPair();
+    const browserB1Wire = await exportEd25519PublicKeyWire(browserB1.publicKey);
+    const browserB2Wire = await exportEd25519PublicKeyWire(browserB2.publicKey);
+    const hostWire = await exportEd25519PublicKeyWire(host.publicKey);
+    let selectedBrowserWire = browserB1Wire;
+    let browserReads = 0;
+    const mutableRoute = { ...routes[1] } as {
+      scopeType: "host";
+      scopeId: string;
+      protocol: "spawn.host.ctl";
+      protocolVersion: 1;
+    };
+    const routeReads = new Map<PropertyKey, number>();
+    const routeProxy = new Proxy(mutableRoute, {
+      get(target, property, receiver) {
+        routeReads.set(property, (routeReads.get(property) ?? 0) + 1);
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const trust: SignedRtcTrustCapability = {
+      get browserPublicKeyWire() {
+        browserReads += 1;
+        return selectedBrowserWire;
+      },
+      hostPublicKeyWire: hostWire,
+      assertActive: () => {},
+      signOffer: (input) =>
+        signRtcSignalWire(
+          {
+            publicKeyWire: browserB1Wire,
+            sign: (transcript) => signSignedSignalTranscript(browserB1.privateKey, transcript),
+          },
+          input,
+        ),
+    };
+    const session = new SignedRtcLiveSession(routeProxy, SESSION_ID, trust);
+    expect(browserReads).toBe(1);
+    for (const property of ["scopeType", "scopeId", "protocol", "protocolVersion"]) {
+      expect(routeReads.get(property)).toBe(1);
+    }
+    mutableRoute.scopeId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    selectedBrowserWire = browserB2Wire;
+    await session.createOffer("v=0\r\ns=b1-offer\r\n");
+    const peer = new FakePeer();
+    await expect(
+      session.verifyAndApplyAnswer(
+        peer,
+        answerFrame(
+          routes[1],
+          SESSION_ID,
+          await signedAnswer(routes[1], SESSION_ID, host, hostWire, browserB2Wire),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "peer_pin_mismatch" });
+    expect(peer.applied).toEqual([]);
+    expect(peer.closeCalls).toBe(1);
+    expect(browserReads).toBe(1);
+    for (const property of ["scopeType", "scopeId", "protocol", "protocolVersion"]) {
+      expect(routeReads.get(property)).toBe(1);
+    }
+  });
+
+  test("post-construction operation mutation cannot bypass the captured live epoch", async () => {
+    const value = await fixture(routes[0]);
+    let active = true;
+    const mutableTrust = {
+      ...value.trust,
+      assertActive: () => {
+        if (!active) throw new DOMException("trust epoch ended", "AbortError");
+      },
+    };
+    const session = new SignedRtcLiveSession(routes[0], SESSION_ID, mutableTrust);
+    mutableTrust.assertActive = () => {};
+    mutableTrust.signOffer = async () => "attacker-controlled replacement";
+    active = false;
+    await expect(session.createOffer("v=0\r\ns=revoked\r\n")).rejects.toMatchObject({
+      code: "inactive_trust",
+    });
   });
 });

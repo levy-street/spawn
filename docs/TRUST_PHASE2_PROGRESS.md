@@ -664,6 +664,15 @@ wrong-peer, mutated, replayed, second, or topology-mismatched answers seal the
 generation and close the peer. A fresh RTC retry must use a fresh session and
 gate.
 
+The generation synchronously snapshots and canonicalizes both exact public
+keys plus the session/route topology at construction and never rereads mutable
+identity fields from the supplied capability or caller-owned route. Tests
+mutate H1 to H2 and B1 to B2 through hostile getters/proxies after construction:
+the old generation rejects without SDP application, while a newly constructed
+H2 generation succeeds. The live epoch operation is also captured once and
+still asserted across every asynchronous boundary, so later replacement of a
+capability method cannot revive revoked trust.
+
 Deterministic agent and HostControl adapter tests substitute an outer hostile
 fingerprint while the signed transcript remains valid, and assert that only
 the transcript copy reaches the mocked peer. The HostControl production path
@@ -671,7 +680,9 @@ has the same integration regression. The fresh Rust/WebCrypto executable gate
 now also has Rust create a host-signed answer which WebCrypto verifies and
 applies through this production adapter; the reverse WebCrypto answer is
 verified by Rust. A small grep-level source guard inventories the two live
-consumers and every production `setRemoteDescription` site. The exact staged
+consumers and exact approved remote-description capability shapes. Its
+self-test injects direct, alias, bind, destructured, bracket, dynamic, and copy
+bypasses and requires rejection. The exact staged
 caller inventory and remaining dependencies are recorded in
 [`TRUST_PHASE3_F2_INVENTORY.md`](TRUST_PHASE3_F2_INVENTORY.md).
 

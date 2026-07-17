@@ -11,6 +11,14 @@ does not claim that F2, the signed-only cutover, or L1 is complete.
 | `web/src/lib/hostControl.ts` | Creates one `SignedRtcLiveSession` for the exact Host/session generation, sends only its opaque `signed_envelope`, treats outer Host topology mismatch as fatal, and applies the answer through `verifyAndApplyAnswer` | The reviewed HostControl trust registry must supply the destination's exact active local pin and epoch signer; H1 and H2 must remain distinct |
 | `web/src/lib/signed-rtc-live.ts` | Calls `verifyRtcSignalWire`, retains its return value, compares the verified transcript with immutable local session/scope/protocol/version/kind/role state, and gives `setRemoteDescription` only `verified.transcript.sdp` | Daemon offer verification and live answer signing are separate work |
 
+At construction the common adapter reads each capability key and operation
+exactly once, synchronously validates/canonicalizes both Ed25519 pins and the
+session/route UUIDs, and owns an immutable copy of the exact topology and Host
+key bytes. Offer and answer processing never reread mutable capability or route
+identity fields. The epoch assertion remains live at every asynchronous
+boundary, but a getter, proxy, post-offer H1-to-H2 rotation, or operation swap
+cannot change the generation's verifier expectations.
+
 The common adapter deliberately never reads `frame.sdp`. A raw sibling in an
 attacker-controlled test cannot become fallback data. A locally signed offer
 freezes the generation into signed mode; a stripped, missing, malformed,
@@ -33,7 +41,11 @@ The latter two remain only for the coordinated cutover and are why this branch
 does not claim unconditional live signing. `scripts/check-signed-rtc-live.sh`
 is a small grep-level guard that fixes this inventory, requires both live
 consumers to use the common adapter, requires the verifier result to be
-retained, and requires the verified SDP literal at the trusted call.
+retained, and requires the verified SDP literal at the trusted call. It counts
+the complete `setRemote`/`RemoteDescription` token family and exact approved
+call shapes in all three files rather than allowlisting whole files. Its bounded
+self-test injects direct, alias, bind, destructured, bracket, dynamic-name, and
+copied raw-SDP calls and requires every one to fail.
 
 ## Signed-wire caller inventory
 
@@ -54,6 +66,8 @@ retained, and requires the verified SDP literal at the trusted call.
 Tests cover both agent and Host routes, raw-versus-verified fingerprint
 substitution, signature/pin/intended-peer/topology/session mutation, stripping,
 malformed input, one-answer concurrency, renegotiation, trust invalidation,
-and fresh retry. The interoperability runner additionally sends a fresh
-Rust-host-signed answer through the production WebCrypto live adapter and has
-Rust verify the reverse WebCrypto-host-signed answer.
+post-construction Host/browser key substitution, hostile getters/proxies, and
+fresh retry with the newly selected Host key. The interoperability runner
+additionally sends a fresh Rust-host-signed answer through the production
+WebCrypto live adapter and has Rust verify the reverse WebCrypto-host-signed
+answer.
