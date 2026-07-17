@@ -396,25 +396,43 @@ def rust_pattern_bindings(path: Path, tokens, start: int, end: int, declaration:
     return tuple(sorted(bindings))
 
 
-def reviewed_rust_sink_family(parts: tuple[str, ...]) -> str | None:
+def reviewed_rust_sink_family(
+    parts: tuple[str, ...], shadowed_roots: frozenset[str] = frozenset()
+) -> str | None:
     command_paths = {
         ("async_std", "process", "Command"),
         ("std", "process", "Command"),
         ("tokio", "process", "Command"),
     }
     library_paths = {("libloading", "Library")}
-    if any(parts[-len(candidate) :] == candidate for candidate in command_paths):
+    if not parts or parts[0] in shadowed_roots:
+        return None
+    if parts in command_paths:
         return "command"
-    if any(parts[-len(candidate) :] == candidate for candidate in library_paths):
+    if parts in library_paths:
         return "library"
     return None
 
 
-def rust_sink_type_names(path: Path, tokens) -> tuple[set[str], set[str]]:
+def rust_sink_type_names(
+    path: Path, tokens
+) -> tuple[set[str], set[str], frozenset[str]]:
     """Resolve reviewed process/dynamic-loader use trees and type aliases."""
 
-    command_names = {"Command"}
-    library_names = {"Library"}
+    # Bare type names carry no audited provenance. They become sinks only via
+    # an exact reviewed import/type alias below. This also prevents a local
+    # `struct Command` or `struct Library` from being treated like the std or
+    # libloading type merely because its constructor has the same spelling.
+    command_names: set[str] = set()
+    library_names: set[str] = set()
+    reviewed_roots = {"async_std", "libloading", "std", "tokio"}
+    shadowed_roots = frozenset(
+        tokens[index + 1][1]
+        for index in range(len(tokens) - 1)
+        if tokens[index] == ("ident", "mod")
+        and tokens[index + 1][0] == "ident"
+        and tokens[index + 1][1] in reviewed_roots
+    )
     alias_edges: list[tuple[str, str]] = []
     parser_work = 0
 
@@ -472,7 +490,7 @@ def rust_sink_type_names(path: Path, tokens) -> tuple[set[str], set[str]]:
                 index += 2
             else:
                 return index + 1
-        add_family(alias, reviewed_rust_sink_family(full_path))
+        add_family(alias, reviewed_rust_sink_family(full_path, shadowed_roots))
         while index < end and tokens[index] != ("punct", ","):
             index += 1
         return index
@@ -545,7 +563,7 @@ def rust_sink_type_names(path: Path, tokens) -> tuple[set[str], set[str]]:
             cursor += 2
         if not valid_path:
             continue
-        family = reviewed_rust_sink_family(tuple(parts))
+        family = reviewed_rust_sink_family(tuple(parts), shadowed_roots)
         if family is not None:
             add_family(alias, family)
         elif len(parts) == 1:
@@ -572,12 +590,14 @@ def rust_sink_type_names(path: Path, tokens) -> tuple[set[str], set[str]]:
             queue.append(item)
             if len(visited) > max_analysis_nodes:
                 die(path, f"Rust type-alias graph exceeds {max_analysis_nodes} nodes")
-    return command_names, library_names
+    return command_names, library_names, shadowed_roots
 
 
 def reject_rust_concat(path: Path, source: str) -> None:
     tokens = rust_tokens(path, source)
-    command_type_names, library_type_names = rust_sink_type_names(path, tokens)
+    command_type_names, library_type_names, shadowed_sink_roots = rust_sink_type_names(
+        path, tokens
+    )
     concat_cache: dict[int, tuple[int, str | None]] = {}
 
     def analyze_concat(start: int) -> tuple[int, str | None]:
@@ -802,26 +822,87 @@ def reject_rust_concat(path: Path, source: str) -> None:
         "system",
     }
 
+    brace_scopes: list[int] = []
+    lexical_scope_at: list[int | None] = []
+    for index, token in enumerate(tokens):
+        if token == ("punct", "}") and brace_scopes:
+            brace_scopes.pop()
+        lexical_scope_at.append(brace_scopes[-1] if brace_scopes else None)
+        if token == ("punct", "{"):
+            brace_scopes.append(index)
+    local_type_definitions: dict[str, list[tuple[int | None, int]]] = defaultdict(list)
+    for index in range(len(tokens) - 1):
+        if (
+            tokens[index][0] == "ident"
+            and tokens[index][1] in {"enum", "mod", "struct", "trait", "union"}
+            and tokens[index + 1][0] == "ident"
+        ):
+            scope_opener = lexical_scope_at[index]
+            scope_end = (
+                len(tokens)
+                if scope_opener is None
+                else delimiter_pairs.get(scope_opener, len(tokens))
+            )
+            local_type_definitions[tokens[index + 1][1]].append(
+                (scope_opener, scope_end)
+            )
+
+    def imported_sink_name_is_visible(name: str, position: int) -> bool:
+        for scope_opener, scope_end in local_type_definitions.get(name, ()):
+            if scope_opener is None or scope_opener < position < scope_end:
+                return False
+        return True
+
     def is_executable_sink(index: int) -> bool:
         name = tokens[index][1]
         if name in executable_functions:
             return True
         if name not in {"from", "new", "open"}:
             return False
-        prefix_identifiers: set[str] = set()
+        reversed_path: list[str] = []
         cursor = index - 1
-        while cursor >= 0 and (
-            tokens[cursor][0] == "ident" or tokens[cursor][1] in {".", ":"}
+        while (
+            cursor >= 2
+            and tokens[cursor] == ("punct", ":")
+            and tokens[cursor - 1] == ("punct", ":")
+            and tokens[cursor - 2][0] == "ident"
         ):
-            if tokens[cursor][0] == "ident":
-                prefix_identifiers.add(tokens[cursor][1])
-            cursor -= 1
+            reversed_path.append(tokens[cursor - 2][1])
+            cursor -= 3
+        type_path = tuple(reversed(reversed_path))
+        absolute_path = (
+            cursor >= 1
+            and tokens[cursor] == ("punct", ":")
+            and tokens[cursor - 1] == ("punct", ":")
+        )
+        locally_shadowed_root = (
+            type_path
+            and not absolute_path
+            and not imported_sink_name_is_visible(type_path[0], index)
+        )
+        family = reviewed_rust_sink_family(
+            type_path,
+            frozenset({type_path[0]}) if locally_shadowed_root else frozenset(),
+        )
+        imported_name = type_path[-1] if type_path else ""
         return (
             name in {"from", "new"}
-            and not prefix_identifiers.isdisjoint(command_type_names)
+            and (
+                family == "command"
+                or (
+                    imported_name in command_type_names
+                    and imported_sink_name_is_visible(imported_name, index)
+                )
+            )
         ) or (
             name in {"new", "open"}
-            and not prefix_identifiers.isdisjoint(library_type_names)
+            and (
+                family == "library"
+                or (
+                    imported_name in library_type_names
+                    and imported_sink_name_is_visible(imported_name, index)
+                )
+            )
         )
 
     for index in range(len(tokens) - 1):
@@ -875,6 +956,237 @@ def reject_rust_concat(path: Path, source: str) -> None:
                 ranges.append((start, closer))
             return tuple(ranges)
 
+        # Keep lexical module and owner identities so unrelated methods with
+        # the same bare name cannot share a summary. The parser deliberately
+        # covers ordinary modules, structs, traits, and impls without trying to
+        # become a Rust type checker; unresolved receivers are handled
+        # conservatively later.
+        module_blocks: list[tuple[int, int, str]] = []
+        struct_blocks: list[tuple[int, int, tuple[str, ...]]] = []
+        owner_blocks: list[
+            tuple[int, int, tuple[str, ...], str, tuple[str, ...] | None]
+        ] = []
+
+        def modules_at(position: int) -> tuple[str, ...]:
+            return tuple(
+                name
+                for opener, closer, name in sorted(module_blocks)
+                if opener < position < closer
+            )
+
+        for index in range(len(tokens) - 2):
+            spend_work("declaration-context analysis")
+            if (
+                tokens[index] == ("ident", "mod")
+                and tokens[index + 1][0] == "ident"
+                and tokens[index + 2] == ("punct", "{")
+            ):
+                closer = delimiter_pairs.get(index + 2)
+                if closer is not None:
+                    module_blocks.append((index + 2, closer, tokens[index + 1][1]))
+
+        def declared_type_key(
+            parts: tuple[str, ...], module_path: tuple[str, ...]
+        ) -> tuple[str, ...]:
+            if not parts:
+                return ()
+            if parts[0] == "crate":
+                return parts[1:]
+            if parts[0] == "self":
+                return module_path + parts[1:]
+            if parts[0] == "super":
+                return module_path[:-1] + parts[1:]
+            return module_path + parts if len(parts) == 1 else parts
+
+        for index in range(len(tokens) - 2):
+            if (
+                tokens[index] == ("ident", "struct")
+                and tokens[index + 1][0] == "ident"
+            ):
+                opener = index + 2
+                while opener < len(tokens) and tokens[opener][1] not in {"{", ";"}:
+                    spend_work("struct-context analysis")
+                    opener += 1
+                if opener < len(tokens) and tokens[opener] == ("punct", "{"):
+                    closer = delimiter_pairs.get(opener)
+                    if closer is not None:
+                        key = modules_at(index) + (tokens[index + 1][1],)
+                        struct_blocks.append((opener, closer, key))
+
+            if tokens[index][0] != "ident" or tokens[index][1] not in {"impl", "trait"}:
+                continue
+            declaration_kind = tokens[index][1]
+            opener = index + 1
+            while opener < len(tokens) and tokens[opener][1] not in {"{", ";"}:
+                spend_work("owner-context analysis")
+                opener += 1
+            if opener >= len(tokens) or tokens[opener] != ("punct", "{"):
+                continue
+            closer = delimiter_pairs.get(opener)
+            if closer is None:
+                continue
+            implemented_trait: tuple[str, ...] | None = None
+            if declaration_kind == "trait":
+                raw_parts = (
+                    (tokens[index + 1][1],)
+                    if index + 1 < opener and tokens[index + 1][0] == "ident"
+                    else ()
+                )
+            else:
+                for_positions = [
+                    cursor
+                    for cursor in range(index + 1, opener)
+                    if tokens[cursor] == ("ident", "for")
+                ]
+                if for_positions:
+                    trait_cursor = index + 1
+                    if trait_cursor < opener and tokens[trait_cursor] == ("punct", "<"):
+                        angle_depth = 0
+                        while trait_cursor < for_positions[-1]:
+                            if tokens[trait_cursor] == ("punct", "<"):
+                                angle_depth += 1
+                            elif tokens[trait_cursor] == ("punct", ">"):
+                                angle_depth -= 1
+                                if angle_depth == 0:
+                                    trait_cursor += 1
+                                    break
+                            trait_cursor += 1
+                    trait_parts: list[str] = []
+                    while trait_cursor < for_positions[-1] and tokens[trait_cursor][0] == "ident":
+                        trait_parts.append(tokens[trait_cursor][1])
+                        trait_cursor += 1
+                        if (
+                            trait_cursor + 1 < for_positions[-1]
+                            and tokens[trait_cursor] == ("punct", ":")
+                            and tokens[trait_cursor + 1] == ("punct", ":")
+                        ):
+                            trait_cursor += 2
+                            continue
+                        break
+                    implemented_trait = declared_type_key(
+                        tuple(trait_parts), modules_at(index)
+                    )
+                cursor = for_positions[-1] + 1 if for_positions else index + 1
+                if cursor < opener and tokens[cursor] == ("punct", "<"):
+                    angle_depth = 0
+                    while cursor < opener:
+                        spend_work("impl-generic analysis")
+                        if tokens[cursor] == ("punct", "<"):
+                            angle_depth += 1
+                        elif tokens[cursor] == ("punct", ">"):
+                            angle_depth -= 1
+                            if angle_depth == 0:
+                                cursor += 1
+                                break
+                        cursor += 1
+                parts: list[str] = []
+                while cursor < opener:
+                    spend_work("impl-owner analysis")
+                    if tokens[cursor][0] != "ident":
+                        break
+                    parts.append(tokens[cursor][1])
+                    cursor += 1
+                    if (
+                        cursor + 1 < opener
+                        and tokens[cursor] == ("punct", ":")
+                        and tokens[cursor + 1] == ("punct", ":")
+                    ):
+                        cursor += 2
+                        continue
+                    break
+                raw_parts = tuple(parts)
+            owner_key = declared_type_key(raw_parts, modules_at(index))
+            if owner_key:
+                owner_blocks.append(
+                    (opener, closer, owner_key, declaration_kind, implemented_trait)
+                )
+
+        known_types = {key for _, _, key in struct_blocks} | {
+            key for _, _, key, _, _ in owner_blocks
+        }
+        known_types_by_short: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+        for type_key in known_types:
+            known_types_by_short[type_key[-1]].add(type_key)
+
+        def normalize_type_path(
+            parts: tuple[str, ...], module_path: tuple[str, ...]
+        ) -> tuple[str, ...] | None:
+            if not parts:
+                return None
+            if parts[0] == "crate":
+                candidate = parts[1:]
+            elif parts[0] == "self":
+                candidate = module_path + parts[1:]
+            elif parts[0] == "super":
+                candidate = module_path[:-1] + parts[1:]
+            elif len(parts) == 1:
+                local = module_path + parts
+                if local in known_types:
+                    return local
+                matches = known_types_by_short.get(parts[0], set())
+                return next(iter(matches)) if len(matches) == 1 else None
+            else:
+                candidate = parts
+                relative = module_path + parts
+                if relative in known_types:
+                    return relative
+            return candidate if candidate in known_types else None
+
+        def path_parts(start: int, end: int) -> tuple[tuple[str, ...], int]:
+            parts: list[str] = []
+            cursor = start
+            while cursor < end and tokens[cursor][0] == "ident":
+                parts.append(tokens[cursor][1])
+                cursor += 1
+                if (
+                    cursor + 1 < end
+                    and tokens[cursor] == ("punct", ":")
+                    and tokens[cursor + 1] == ("punct", ":")
+                ):
+                    cursor += 2
+                    continue
+                break
+            return tuple(parts), cursor
+
+        def type_from_range(
+            start: int, end: int, module_path: tuple[str, ...]
+        ) -> tuple[str, ...] | None:
+            colon = next(
+                (
+                    cursor
+                    for cursor in range(start, end)
+                    if tokens[cursor] == ("punct", ":")
+                    and not (
+                        cursor + 1 < end and tokens[cursor + 1] == ("punct", ":")
+                    )
+                    and not (
+                        cursor > start and tokens[cursor - 1] == ("punct", ":")
+                    )
+                ),
+                None,
+            )
+            if colon is None:
+                return None
+            cursor = colon + 1
+            while cursor < end and (
+                tokens[cursor][1] in {"&", "mut", "dyn"}
+                or tokens[cursor][0] == "lifetime"
+            ):
+                cursor += 1
+            parts, _ = path_parts(cursor, end)
+            return normalize_type_path(parts, module_path)
+
+        struct_fields: dict[
+            tuple[str, ...], dict[str, tuple[str, ...]]
+        ] = defaultdict(dict)
+        for opener, closer, type_key in struct_blocks:
+            for start, end in comma_ranges(opener, closer):
+                if start >= end or tokens[start][0] != "ident":
+                    continue
+                field_type = type_from_range(start, end, type_key[:-1])
+                if field_type is not None:
+                    struct_fields[type_key][tokens[start][1]] = field_type
+
         function_records: list[dict[str, object]] = []
         parameter_nodes = 0
         for index, token in enumerate(tokens):
@@ -898,55 +1210,78 @@ def reject_rust_concat(path: Path, source: str) -> None:
             while body_opener < len(tokens) and tokens[body_opener][1] not in {"{", ";"}:
                 spend_work("function-signature analysis")
                 body_opener += 1
-            if (
-                body_opener >= len(tokens)
-                or tokens[body_opener] != ("punct", "{")
-            ):
+            if body_opener >= len(tokens) or tokens[body_opener] != ("punct", "{"):
                 continue
             body_end = delimiter_pairs.get(body_opener)
             if body_end is None:
                 die(path, "Rust function body has no closing delimiter")
+            module_path = modules_at(index)
+            owners = [
+                (owner_opener, owner_key, owner_kind, implemented_trait)
+                for owner_opener, owner_end, owner_key, owner_kind, implemented_trait in owner_blocks
+                if owner_opener < index < owner_end
+            ]
+            owner_context = max(owners) if owners else None
+            owner_key = owner_context[1] if owner_context else None
+            owner_kind = owner_context[2] if owner_context else None
+            implemented_trait = owner_context[3] if owner_context else None
             parameters: list[tuple[str, ...]] = []
+            parameter_types: list[tuple[str, ...] | None] = []
+            has_receiver = False
             for start, end in comma_ranges(opener, parameter_end):
-                if any(
-                    tokens[cursor] == ("ident", "self")
-                    for cursor in range(start, end)
+                if any(tokens[cursor] == ("ident", "self") for cursor in range(start, end)):
+                    parameters.append(("self",))
+                    parameter_types.append(owner_key)
+                    has_receiver = True
+                else:
+                    parameters.append(rust_pattern_bindings(path, tokens, start, end, "let"))
+                    parameter_types.append(type_from_range(start, end, module_path))
+            return_type = None
+            for cursor in range(parameter_end + 1, body_opener - 1):
+                if (
+                    tokens[cursor] == ("punct", "-")
+                    and tokens[cursor + 1] == ("punct", ">")
                 ):
-                    continue
-                parameters.append(
-                    rust_pattern_bindings(path, tokens, start, end, "let")
-                )
+                    return_type = type_from_range(cursor + 1, body_opener, module_path)
+                    if return_type is None:
+                        return_parts, _ = path_parts(cursor + 2, body_opener)
+                        return_type = normalize_type_path(return_parts, module_path)
+                    break
             parameter_nodes += len(parameters) + sum(map(len, parameters))
             if parameter_nodes > max_analysis_nodes:
-                die(
-                    path,
-                    f"Rust callable parameter graph exceeds {max_analysis_nodes} nodes",
-                )
+                die(path, f"Rust callable parameter graph exceeds {max_analysis_nodes} nodes")
             function_records.append(
                 {
                     "name": name,
+                    "module": module_path,
+                    "owner": owner_key,
+                    "owner_kind": owner_kind,
+                    "implemented_trait": implemented_trait,
+                    "kind": "method" if owner_key is not None else "free",
+                    "has_receiver": has_receiver,
                     "parameters": tuple(parameters),
+                    "parameter_types": tuple(parameter_types),
+                    "return_type": return_type,
                     "body_start": body_opener + 1,
                     "body_end": body_end,
                     "body_opener": body_opener,
                     "braced": True,
+                    "definition": index,
+                    "assignment_equals": None,
                 }
             )
             if len(function_records) > max_analysis_nodes:
                 die(path, f"Rust function graph exceeds {max_analysis_nodes} nodes")
 
-        # Simple locally-bound closures participate in the same summaries as
-        # functions. Complex callable traits remain ordinary expressions and
-        # cannot erase taint already tracked by the intraprocedural graph.
-        for targets, start, end, _, _ in assignment_records:
+        # Closures are first-class callable identities. Their data flow is kept
+        # separate from ordinary taint so an alias/container can preserve the
+        # precise function summary without turning every data identifier into
+        # a possible call target.
+        for targets, start, end, _, equals in assignment_records:
             if len(targets) != 1:
                 continue
             opener = start
-            while (
-                opener < end
-                and tokens[opener][0] == "ident"
-                and tokens[opener][1] in {"async", "move"}
-            ):
+            while opener < end and tokens[opener][0] == "ident" and tokens[opener][1] in {"async", "move"}:
                 opener += 1
             if opener >= end or tokens[opener] != ("punct", "|"):
                 continue
@@ -957,40 +1292,20 @@ def reject_rust_concat(path: Path, source: str) -> None:
             if parameter_end >= end:
                 die(path, "Rust closure parameters have no closing delimiter")
             parameters: list[tuple[str, ...]] = []
-            parameter_start = opener + 1
-            segment_start = parameter_start
-            base_depth = delimiter_depths[opener]
-            for cursor in range(parameter_start, parameter_end):
-                spend_work("closure-parameter analysis")
-                if (
-                    tokens[cursor] == ("punct", ",")
-                    and delimiter_depths[cursor] == base_depth
-                ):
+            parameter_types: list[tuple[str, ...] | None] = []
+            segment_start = opener + 1
+            for cursor in range(opener + 1, parameter_end + 1):
+                if cursor == parameter_end or tokens[cursor] == ("punct", ","):
                     if segment_start < cursor:
-                        parameters.append(
-                            rust_pattern_bindings(
-                                path, tokens, segment_start, cursor, "let"
-                            )
-                        )
+                        parameters.append(rust_pattern_bindings(path, tokens, segment_start, cursor, "let"))
+                        parameter_types.append(type_from_range(segment_start, cursor, modules_at(equals)))
                     segment_start = cursor + 1
-            if segment_start < parameter_end:
-                parameters.append(
-                    rust_pattern_bindings(
-                        path, tokens, segment_start, parameter_end, "let"
-                    )
-                )
-            parameter_nodes += len(parameters) + sum(map(len, parameters))
-            if parameter_nodes > max_analysis_nodes:
-                die(
-                    path,
-                    f"Rust callable parameter graph exceeds {max_analysis_nodes} nodes",
-                )
             body_start = parameter_end + 1
             if body_start < end and tokens[body_start] == ("punct", "{"):
                 body_end = delimiter_pairs.get(body_start)
                 if body_end is None or body_end > end:
                     die(path, "Rust closure body has no bounded closing delimiter")
-                body_opener = body_start
+                body_opener: int | None = body_start
                 body_start += 1
                 braced = True
             else:
@@ -1000,39 +1315,237 @@ def reject_rust_concat(path: Path, source: str) -> None:
             function_records.append(
                 {
                     "name": targets[0],
+                    "module": modules_at(equals),
+                    "owner": None,
+                    "owner_kind": None,
+                    "implemented_trait": None,
+                    "kind": "closure",
+                    "has_receiver": False,
                     "parameters": tuple(parameters),
+                    "parameter_types": tuple(parameter_types),
+                    "return_type": None,
                     "body_start": body_start,
                     "body_end": body_end,
                     "body_opener": body_opener,
                     "braced": braced,
+                    "definition": opener,
+                    "assignment_equals": equals,
                 }
             )
-            if len(function_records) > max_analysis_nodes:
+            parameter_nodes += len(parameters) + sum(map(len, parameters))
+            if parameter_nodes > max_analysis_nodes or len(function_records) > max_analysis_nodes:
                 die(path, f"Rust callable graph exceeds {max_analysis_nodes} nodes")
 
         if not function_records:
             return
 
-        function_names = {str(record["name"]) for record in function_records}
-        summaries = {
-            name: {
+        summaries = [
+            {
                 "return_dynamic": False,
                 "return_parameters": set(),
+                "return_callables": set(),
                 "sink_parameters": set(),
             }
-            for name in function_names
-        }
-        callers: dict[str, set[int]] = defaultdict(set)
-        calls_by_record: list[tuple[tuple[int, int, str, tuple[tuple[int, int], ...]], ...]] = []
-        call_edge_count = 0
+            for _ in function_records
+        ]
+        records_by_name: dict[str, set[int]] = defaultdict(set)
+        free_records_by_name: dict[str, set[int]] = defaultdict(set)
+        methods_by_name: dict[str, set[int]] = defaultdict(set)
+        methods_by_owner_name: dict[tuple[tuple[str, ...], str], set[int]] = defaultdict(set)
+        inherent_methods_by_owner_name: dict[
+            tuple[tuple[str, ...], str], set[int]
+        ] = defaultdict(set)
+        implemented_traits: dict[tuple[str, ...], set[tuple[str, ...]]] = defaultdict(set)
+        for _, _, owner_key, _, implemented_trait in owner_blocks:
+            if implemented_trait is not None:
+                implemented_traits[owner_key].add(implemented_trait)
+        closure_by_equals: dict[int, int] = {}
         for record_index, record in enumerate(function_records):
+            name = str(record["name"])
+            records_by_name[name].add(record_index)
+            if record["kind"] == "method":
+                methods_by_name[name].add(record_index)
+                methods_by_owner_name[(record["owner"], name)].add(record_index)
+                if (
+                    record["owner_kind"] == "impl"
+                    and record["implemented_trait"] is None
+                ):
+                    inherent_methods_by_owner_name[(record["owner"], name)].add(
+                        record_index
+                    )
+                if record["implemented_trait"] is not None:
+                    implemented_traits[record["owner"]].add(
+                        record["implemented_trait"]
+                    )
+            elif record["kind"] == "free":
+                free_records_by_name[name].add(record_index)
+            else:
+                closure_by_equals[int(record["assignment_equals"])] = record_index
+
+        def qualified_free_records(
+            parts: tuple[str, ...], module_path: tuple[str, ...]
+        ) -> frozenset[int]:
+            if not parts:
+                return frozenset()
+            if parts[0] == "crate":
+                qualified_module = parts[1:-1]
+            elif parts[0] == "self":
+                qualified_module = module_path + parts[1:-1]
+            elif parts[0] == "super":
+                qualified_module = module_path[:-1] + parts[1:-1]
+            else:
+                qualified_module = parts[:-1]
+                relative_module = module_path + parts[:-1]
+                if any(
+                    function_records[candidate]["module"] == relative_module
+                    for candidate in free_records_by_name.get(parts[-1], ())
+                ):
+                    qualified_module = relative_module
+            return frozenset(
+                candidate
+                for candidate in free_records_by_name.get(parts[-1], ())
+                if function_records[candidate]["module"] == qualified_module
+            )
+
+        callable_imports: list[
+            tuple[
+                str,
+                tuple[str, ...],
+                int | None,
+                int,
+                int,
+                tuple[str, ...],
+            ]
+        ] = []
+
+        def parse_callable_use_tree(
+            index: int,
+            end: int,
+            prefix: tuple[str, ...],
+            scope_opener: int | None,
+            scope_end: int,
+            module_path: tuple[str, ...],
+            depth: int,
+        ) -> int:
+            if depth > max_rust_concat_depth:
+                die(path, "Rust callable use-tree nesting exceeded its depth")
+            while index < end and tokens[index] == ("punct", ":"):
+                index += 1
+            segments: list[str] = []
+            while index < end and tokens[index][0] == "ident" and tokens[index][1] != "as":
+                spend_work("callable import analysis")
+                segments.append(tokens[index][1])
+                index += 1
+                if (
+                    index + 1 < end
+                    and tokens[index] == ("punct", ":")
+                    and tokens[index + 1] == ("punct", ":")
+                ):
+                    index += 2
+                    if index < end and tokens[index] == ("punct", "{"):
+                        closer = delimiter_pairs.get(index)
+                        if closer is None or closer > end:
+                            return end
+                        cursor = index + 1
+                        nested_prefix = prefix + tuple(segments)
+                        while cursor < closer:
+                            if tokens[cursor] == ("punct", ","):
+                                cursor += 1
+                                continue
+                            next_cursor = parse_callable_use_tree(
+                                cursor,
+                                closer,
+                                nested_prefix,
+                                scope_opener,
+                                scope_end,
+                                module_path,
+                                depth + 1,
+                            )
+                            cursor = next_cursor if next_cursor > cursor else cursor + 1
+                        return closer + 1
+                    continue
+                break
+            if not segments:
+                return index + 1
+            alias = segments[-1]
+            if index < end and tokens[index] == ("ident", "as"):
+                if index + 1 < end and tokens[index + 1][0] == "ident":
+                    alias = tokens[index + 1][1]
+                    index += 2
+            callable_imports.append(
+                (
+                    alias,
+                    prefix + tuple(segments),
+                    scope_opener,
+                    scope_end,
+                    0
+                    if scope_opener is None
+                    else delimiter_depths[scope_opener] + 1,
+                    module_path,
+                )
+            )
+            if len(callable_imports) > max_analysis_edges:
+                die(path, f"Rust callable import graph exceeds {max_analysis_edges} edges")
+            while index < end and tokens[index] != ("punct", ","):
+                index += 1
+            return index
+
+        for use_index, token in enumerate(tokens):
+            if token != ("ident", "use"):
+                continue
+            use_end = next_semicolon_same_depth[use_index]
+            if use_end >= len(tokens):
+                continue
+            scope_opener = lexical_scope_at[use_index]
+            scope_end = (
+                len(tokens)
+                if scope_opener is None
+                else delimiter_pairs.get(scope_opener, len(tokens))
+            )
+            parse_callable_use_tree(
+                use_index + 1,
+                use_end,
+                (),
+                scope_opener,
+                scope_end,
+                modules_at(use_index),
+                0,
+            )
+
+        def imported_callable_records(name: str, position: int) -> frozenset[int]:
+            visible = [
+                spec
+                for spec in callable_imports
+                if spec[0] == name
+                and (spec[2] is None or spec[2] < position < spec[3])
+            ]
+            if not visible:
+                return frozenset()
+            deepest = max(spec[4] for spec in visible)
+            return frozenset(
+                candidate
+                for spec in visible
+                if spec[4] == deepest
+                for candidate in qualified_free_records(spec[1], spec[5])
+            )
+
+        calls_by_record: list[
+            tuple[tuple[int, int, str, tuple[tuple[int, int], ...]], ...]
+        ] = []
+        potential_callers: dict[int, set[int]] = defaultdict(set)
+        dependency_edges: set[tuple[int, int]] = set()
+        for caller_index, record in enumerate(function_records):
             calls: list[tuple[int, int, str, tuple[tuple[int, int], ...]]] = []
             body_start = int(record["body_start"])
             body_end = int(record["body_end"])
-            for index in range(body_start, body_end - 1):
+            for index in range(body_start, body_end):
                 spend_work("call-graph analysis")
+                if tokens[index][0] == "ident":
+                    for callee_index in records_by_name.get(tokens[index][1], ()):
+                        dependency_edges.add((callee_index, caller_index))
                 if (
-                    tokens[index][0] != "ident"
+                    index + 1 >= body_end
+                    or tokens[index][0] != "ident"
                     or tokens[index + 1] != ("punct", "(")
                     or (index > body_start and tokens[index - 1] == ("punct", "!"))
                 ):
@@ -1040,143 +1553,305 @@ def reject_rust_concat(path: Path, source: str) -> None:
                 closer = delimiter_pairs.get(index + 1)
                 if closer is None or closer > body_end:
                     continue
-                arguments = comma_ranges(index + 1, closer)
-                name = tokens[index][1]
-                calls.append((index, closer, name, arguments))
-                if name in function_names:
-                    callers[name].add(record_index)
-                    call_edge_count += 1
-                    if call_edge_count > max_analysis_edges:
-                        die(
-                            path,
-                            f"Rust interprocedural call graph exceeds {max_analysis_edges} edges",
-                        )
+                calls.append((index, closer, tokens[index][1], comma_ranges(index + 1, closer)))
             calls_by_record.append(tuple(calls))
+            for start, _, name, _ in calls:
+                for callee_index in imported_callable_records(name, start):
+                    dependency_edges.add((callee_index, caller_index))
+        if len(dependency_edges) > max_analysis_edges:
+            die(path, f"Rust interprocedural call graph exceeds {max_analysis_edges} edges")
+        for callee_index, caller_index in dependency_edges:
+            potential_callers[callee_index].add(caller_index)
 
-        assignments_by_record: list[tuple[tuple[tuple[str, ...], int, int, int], ...]] = []
+        assignments_by_record: list[
+            tuple[tuple[tuple[str, ...], int, int, int], ...]
+        ] = []
         for record in function_records:
             body_start = int(record["body_start"])
             body_end = int(record["body_end"])
-            local_assignments = tuple(
-                (targets, start, end, equals)
-                for targets, start, end, _, equals in assignment_records
-                if body_start <= equals < body_end and end <= body_end
+            assignments_by_record.append(
+                tuple(
+                    (targets, start, end, equals)
+                    for targets, start, end, _, equals in assignment_records
+                    if body_start <= equals < body_end and end <= body_end
+                )
             )
-            assignments_by_record.append(local_assignments)
 
-        def merge_flow(
-            first: tuple[bool, frozenset[int]],
-            second: tuple[bool, frozenset[int]],
-        ) -> tuple[bool, frozenset[int]]:
-            return first[0] or second[0], first[1] | second[1]
+        Flow = tuple[bool, frozenset[int], frozenset[int]]
+        empty_flow: Flow = (False, frozenset(), frozenset())
+
+        def merge_flow(first: Flow, second: Flow) -> Flow:
+            merged = (first[0] or second[0], first[1] | second[1], first[2] | second[2])
+            if len(merged[1]) + len(merged[2]) > max_analysis_nodes:
+                die(path, f"Rust flow value exceeds {max_analysis_nodes} identities")
+            return merged
+
+        def resolve_free_name(
+            name: str, module_path: tuple[str, ...], position: int | None = None
+        ) -> frozenset[int]:
+            if position is not None:
+                imported = imported_callable_records(name, position)
+                if imported:
+                    return imported
+            candidates = free_records_by_name.get(name, set())
+            local = {
+                candidate
+                for candidate in candidates
+                if function_records[candidate]["module"] == module_path
+            }
+            return frozenset(local or candidates)
+
+        def resolve_path_callable(
+            parts: tuple[str, ...], module_path: tuple[str, ...], position: int | None = None
+        ) -> frozenset[int]:
+            if not parts:
+                return frozenset()
+            if len(parts) == 1:
+                return resolve_free_name(parts[0], module_path, position)
+            owner = normalize_type_path(parts[:-1], module_path)
+            if owner is not None:
+                inherent = inherent_methods_by_owner_name.get((owner, parts[-1]), set())
+                if inherent:
+                    return frozenset(inherent)
+                concrete = methods_by_owner_name.get((owner, parts[-1]), set())
+                if concrete:
+                    return frozenset(concrete)
+                return frozenset(
+                    candidate
+                    for trait_key in implemented_traits.get(owner, ())
+                    for candidate in methods_by_owner_name.get(
+                        (trait_key, parts[-1]), ()
+                    )
+                )
+            return qualified_free_records(parts, module_path)
+
+        def receiver_expression_start(end: int, floor: int, depth: int = 0) -> int:
+            if depth > max_rust_concat_depth or end <= floor:
+                return max(floor, end - 1)
+            position = end - 1
+            value = tokens[position][1]
+            if value in {')', ']', '}'} and position in delimiter_pairs:
+                opener = delimiter_pairs[position]
+                start = opener
+                if value == "]":
+                    start = receiver_expression_start(opener, floor, depth + 1)
+                elif value == ")" and opener > floor and (
+                    tokens[opener - 1][0] == "ident" or tokens[opener - 1][1] in {')', ']', '}'}
+                ):
+                    start = receiver_expression_start(opener, floor, depth + 1)
+                elif value == "}" and opener > floor and tokens[opener - 1][0] == "ident":
+                    start = opener - 1
+                    while (
+                        start >= floor + 3
+                        and tokens[start - 1] == ("punct", ":")
+                        and tokens[start - 2] == ("punct", ":")
+                        and tokens[start - 3][0] == "ident"
+                    ):
+                        start -= 3
+            else:
+                start = position
+                while (
+                    start >= floor + 3
+                    and tokens[start - 1] == ("punct", ":")
+                    and tokens[start - 2] == ("punct", ":")
+                    and tokens[start - 3][0] == "ident"
+                ):
+                    start -= 3
+            if start > floor and tokens[start - 1] == ("punct", "."):
+                start = receiver_expression_start(start - 1, floor, depth + 1)
+            while start > floor and tokens[start - 1][1] in {"&", "mut", "*"}:
+                start -= 1
+            return start
 
         def analyze_record(
             record_index: int,
-        ) -> tuple[bool, set[int], set[int]]:
+        ) -> tuple[bool, set[int], set[int], set[int]]:
             record = function_records[record_index]
             body_start = int(record["body_start"])
             body_end = int(record["body_end"])
-            bindings: dict[str, tuple[bool, frozenset[int]]] = {}
+            module_path = record["module"]
+            bindings: dict[str, Flow] = {}
+            type_bindings: dict[str, set[tuple[str, ...]]] = defaultdict(set)
             for parameter_index, names in enumerate(record["parameters"]):
+                parameter_type = record["parameter_types"][parameter_index]
                 for name in names:
-                    bindings[str(name)] = (False, frozenset({parameter_index}))
+                    bindings[str(name)] = (False, frozenset({parameter_index}), frozenset())
+                    if parameter_type is not None:
+                        type_bindings[str(name)].add(parameter_type)
 
-            def expression_flow(
-                start: int, end: int, depth: int = 0
-            ) -> tuple[bool, frozenset[int]]:
+            def expression_types(start: int, end: int, depth: int = 0) -> set[tuple[str, ...]]:
+                if depth > max_rust_concat_depth or start >= end:
+                    return set()
+                while start < end and tokens[start][1] in {"&", "mut", "*"}:
+                    start += 1
+                if start >= end:
+                    return set()
+                if (
+                    tokens[start] == ("punct", "(")
+                    and delimiter_pairs.get(start) == end - 1
+                ):
+                    return expression_types(start + 1, end - 1, depth + 1)
+                if tokens[start] == ("punct", "["):
+                    closer = delimiter_pairs.get(start)
+                    ranges = comma_ranges(start, closer) if closer is not None and closer < end else ()
+                    return expression_types(*ranges[0], depth + 1) if ranges else set()
+                if tokens[start][0] != "ident":
+                    return set()
+                parts, cursor = path_parts(start, end)
+                current_types: set[tuple[str, ...]] = set()
+                if len(parts) == 1 and parts[0] in type_bindings:
+                    current_types.update(type_bindings[parts[0]])
+                normalized = normalize_type_path(parts, module_path)
+                if normalized is not None:
+                    current_types.add(normalized)
+                if cursor < end and tokens[cursor] == ("punct", "{"):
+                    normalized = normalize_type_path(parts, module_path)
+                    return {normalized} if normalized is not None else set()
+                if cursor < end and tokens[cursor] == ("punct", "("):
+                    callable_candidates = resolve_path_callable(parts, module_path, start)
+                    current_types.update(
+                        function_records[candidate]["return_type"]
+                        for candidate in callable_candidates
+                        if function_records[candidate]["return_type"] is not None
+                    )
+                    if len(parts) > 1:
+                        owner = normalize_type_path(parts[:-1], module_path)
+                        if owner is not None and parts[-1] in {"default", "new"}:
+                            current_types.add(owner)
+                scan = start
+                while scan + 1 < end:
+                    if (
+                        tokens[scan] == ("punct", ".")
+                        and tokens[scan + 1][0] == "ident"
+                        and not (scan + 2 < end and tokens[scan + 2] == ("punct", "("))
+                    ):
+                        field = tokens[scan + 1][1]
+                        current_types = {
+                            struct_fields[type_key][field]
+                            for type_key in current_types
+                            if field in struct_fields.get(type_key, {})
+                        }
+                    scan += 1
+                return current_types
+
+            def call_resolution(
+                start: int,
+                explicit_arguments: tuple[tuple[int, int], ...],
+                depth: int = 0,
+            ) -> tuple[frozenset[int], tuple[tuple[int, int], ...], bool]:
+                name = tokens[start][1]
+                if start > body_start and tokens[start - 1] == ("punct", "."):
+                    receiver_start = receiver_expression_start(start - 1, body_start)
+                    receiver = (receiver_start, start - 1)
+                    receiver_types = expression_types(*receiver, depth + 1)
+                    if receiver_types:
+                        candidates = {
+                            candidate
+                            for receiver_type in receiver_types
+                            for candidate in resolve_path_callable(
+                                receiver_type + (name,), module_path, start
+                            )
+                        }
+                        return frozenset(candidates), (receiver,) + explicit_arguments, True
+                    return frozenset(methods_by_name.get(name, ())), (receiver,) + explicit_arguments, False
+
+                path_start = start
+                while (
+                    path_start >= body_start + 3
+                    and tokens[path_start - 1] == ("punct", ":")
+                    and tokens[path_start - 2] == ("punct", ":")
+                    and tokens[path_start - 3][0] == "ident"
+                ):
+                    path_start -= 3
+                parts, _ = path_parts(path_start, start + 1)
+                if len(parts) > 1:
+                    return resolve_path_callable(parts, module_path, start), explicit_arguments, True
+                if name in bindings:
+                    return bindings[name][2], explicit_arguments, True
+                return resolve_free_name(name, module_path, start), explicit_arguments, True
+
+            calls_at_start = {call[0]: call for call in calls_by_record[record_index]}
+
+            def expression_flow(start: int, end: int, depth: int = 0) -> Flow:
                 if depth > max_rust_concat_depth:
                     die(path, "Rust interprocedural expression nesting exceeded its depth")
-                flow: tuple[bool, frozenset[int]] = (False, frozenset())
+                flow = empty_flow
                 cursor = start
                 while cursor < end:
                     spend_work("expression analysis")
                     if cursor in dynamic_concat_starts:
-                        flow = (True, flow[1])
-                    if (
-                        tokens[cursor][0] == "ident"
-                        and cursor + 1 < end
-                        and tokens[cursor + 1] == ("punct", "(")
-                        and tokens[cursor][1] in summaries
-                    ):
-                        closer = delimiter_pairs.get(cursor + 1)
-                        if closer is not None and closer < end:
-                            arguments = comma_ranges(cursor + 1, closer)
-                            summary = summaries[tokens[cursor][1]]
+                        flow = (True, flow[1], flow[2])
+                    call = calls_at_start.get(cursor)
+                    if call is not None and call[1] < end:
+                        _, closer, _, explicit_arguments = call
+                        candidates, arguments, _ = call_resolution(cursor, explicit_arguments, depth + 1)
+                        for candidate in candidates:
+                            summary = summaries[candidate]
                             if summary["return_dynamic"]:
-                                flow = (True, flow[1])
+                                flow = (True, flow[1], flow[2])
+                            flow = merge_flow(
+                                flow,
+                                (False, frozenset(), frozenset(summary["return_callables"])),
+                            )
                             for parameter_index in summary["return_parameters"]:
                                 if parameter_index < len(arguments):
-                                    flow = merge_flow(
-                                        flow,
-                                        expression_flow(
-                                            *arguments[parameter_index], depth + 1
-                                        ),
-                                    )
-                            cursor = closer + 1
-                            continue
+                                    flow = merge_flow(flow, expression_flow(*arguments[parameter_index], depth + 1))
+                        cursor = closer + 1
+                        continue
                     if tokens[cursor][0] == "ident":
                         name = tokens[cursor][1]
                         previous = tokens[cursor - 1][1] if cursor > start else ""
-                        previous_previous = (
-                            tokens[cursor - 2][1] if cursor > start + 1 else ""
-                        )
+                        previous_previous = tokens[cursor - 2][1] if cursor > start + 1 else ""
                         following = tokens[cursor + 1][1] if cursor + 1 < end else ""
-                        following_following = (
-                            tokens[cursor + 2][1] if cursor + 2 < end else ""
-                        )
-                        member = previous == "." or (
-                            previous == ":" and previous_previous == ":"
-                        )
+                        following_following = tokens[cursor + 2][1] if cursor + 2 < end else ""
+                        member = previous == "." or (previous == ":" and previous_previous == ":")
                         field_label = following == ":" and following_following != ":"
-                        if not member and not field_label and name in bindings:
-                            flow = merge_flow(flow, bindings[name])
+                        if not member and not field_label:
+                            if name in bindings:
+                                flow = merge_flow(flow, bindings[name])
+                            else:
+                                parts, path_end = path_parts(cursor, end)
+                                callable_ids = resolve_path_callable(parts, module_path, cursor)
+                                if callable_ids:
+                                    flow = merge_flow(flow, (False, frozenset(), callable_ids))
+                                    cursor = path_end
+                                    continue
                     cursor += 1
                 return flow
 
-            assignments_at_end: dict[
-                int, list[tuple[tuple[str, ...], int, int, int]]
-            ] = defaultdict(list)
+            assignments_at_end: dict[int, list[tuple[tuple[str, ...], int, int, int]]] = defaultdict(list)
             for assignment in assignments_by_record[record_index]:
                 assignments_at_end[assignment[2]].append(assignment)
-            calls_at_start = {
-                call[0]: call for call in calls_by_record[record_index]
-            }
-            collection_updates: dict[
-                int, list[tuple[str, tuple[tuple[int, int], ...]]]
-            ] = defaultdict(list)
+            collection_updates: dict[int, list[tuple[str, tuple[tuple[int, int], ...]]]] = defaultdict(list)
             for start, closer, name, arguments in calls_by_record[record_index]:
-                if (
-                    name in collection_mutators
-                    and start >= body_start + 2
-                    and tokens[start - 1] == ("punct", ".")
-                    and tokens[start - 2][0] == "ident"
-                ):
-                    collection_updates[closer].append(
-                        (tokens[start - 2][1], arguments)
-                    )
+                if name in collection_mutators and start >= body_start + 2 and tokens[start - 1] == ("punct", "."):
+                    receiver_start = receiver_expression_start(start - 1, body_start)
+                    if receiver_start < start - 1 and tokens[receiver_start][0] == "ident":
+                        collection_updates[closer].append((tokens[receiver_start][1], arguments))
 
             return_dynamic = False
             return_parameters: set[int] = set()
+            return_callables: set[int] = set()
             sink_parameters: set[int] = set()
             for index in range(body_start, body_end + 1):
                 spend_work("callable-body analysis")
                 call = calls_at_start.get(index)
                 if call is not None:
-                    start, _, name, arguments = call
+                    start, _, name, explicit_arguments = call
+                    candidates, arguments, _ = call_resolution(start, explicit_arguments)
                     relevant_parameters: set[int] = set()
                     if is_executable_sink(start):
+                        arguments = explicit_arguments
                         relevant_parameters.update(range(len(arguments)))
-                    elif name in summaries:
-                        relevant_parameters.update(summaries[name]["sink_parameters"])
+                    else:
+                        for candidate in candidates:
+                            relevant_parameters.update(summaries[candidate]["sink_parameters"])
                     for parameter_index in relevant_parameters:
                         if parameter_index >= len(arguments):
                             continue
                         argument_flow = expression_flow(*arguments[parameter_index])
                         if argument_flow[0]:
-                            die(
-                                path,
-                                f"unreviewed Rust concat value reaches summarized executable call {name}",
-                            )
+                            die(path, f"unreviewed Rust concat value reaches summarized executable call {name}")
                         sink_parameters.update(argument_flow[1])
 
                 if index < body_end and tokens[index] == ("ident", "return"):
@@ -1184,25 +1859,34 @@ def reject_rust_concat(path: Path, source: str) -> None:
                     returned = expression_flow(index + 1, return_end)
                     return_dynamic = return_dynamic or returned[0]
                     return_parameters.update(returned[1])
+                    return_callables.update(returned[2])
 
                 for receiver, arguments in collection_updates.get(index, ()):
-                    update = (False, frozenset())
+                    update = empty_flow
                     for argument in arguments:
                         update = merge_flow(update, expression_flow(*argument))
-                    bindings[receiver] = merge_flow(
-                        bindings.get(receiver, (False, frozenset())), update
-                    )
+                    bindings[receiver] = merge_flow(bindings.get(receiver, empty_flow), update)
 
-                for targets, start, end, _ in sorted(
-                    assignments_at_end.get(index, ()),
-                    key=lambda assignment: assignment[3],
-                    reverse=True,
+                for targets, start, end, equals in sorted(
+                    assignments_at_end.get(index, ()), key=lambda assignment: assignment[3], reverse=True
                 ):
                     assigned = expression_flow(start, end)
+                    closure_index = closure_by_equals.get(equals)
+                    if closure_index is not None:
+                        assigned = merge_flow(assigned, (False, frozenset(), frozenset({closure_index})))
+                    assigned_types = expression_types(start, end)
                     for target in targets:
-                        bindings[target] = merge_flow(
-                            bindings.get(target, (False, frozenset())), assigned
+                        bindings[target] = merge_flow(bindings.get(target, empty_flow), assigned)
+                        type_bindings[target].update(assigned_types)
+                    context = assignment_contexts.get(equals)
+                    if context is not None and context[1] is None:
+                        left = context[0]
+                        root_name = next(
+                            (tokens[cursor][1] for cursor in range(left, equals) if tokens[cursor][0] == "ident"),
+                            None,
                         )
+                        if root_name is not None and root_name not in targets:
+                            bindings[root_name] = merge_flow(bindings.get(root_name, empty_flow), assigned)
 
             if bool(record["braced"]):
                 body_opener = int(record["body_opener"])
@@ -1211,8 +1895,7 @@ def reject_rust_concat(path: Path, source: str) -> None:
                     (
                         index
                         for index in range(body_start, body_end)
-                        if tokens[index] == ("punct", ";")
-                        and delimiter_depths[index] == interior_depth
+                        if tokens[index] == ("punct", ";") and delimiter_depths[index] == interior_depth
                     ),
                     default=body_start - 1,
                 )
@@ -1223,7 +1906,8 @@ def reject_rust_concat(path: Path, source: str) -> None:
                 returned = expression_flow(tail_start, body_end)
                 return_dynamic = return_dynamic or returned[0]
                 return_parameters.update(returned[1])
-            return return_dynamic, return_parameters, sink_parameters
+                return_callables.update(returned[2])
+            return return_dynamic, return_parameters, return_callables, sink_parameters
 
         queue = deque(range(len(function_records)))
         queued = set(queue)
@@ -1231,38 +1915,30 @@ def reject_rust_concat(path: Path, source: str) -> None:
         while queue:
             record_index = queue.popleft()
             queued.discard(record_index)
-            return_dynamic, return_parameters, sink_parameters = analyze_record(
-                record_index
-            )
-            name = str(function_records[record_index]["name"])
-            summary = summaries[name]
+            return_dynamic, return_parameters, return_callables, sink_parameters = analyze_record(record_index)
+            summary = summaries[record_index]
             changed = False
             if return_dynamic and not summary["return_dynamic"]:
                 summary["return_dynamic"] = True
                 changed = True
             new_return_parameters = return_parameters - summary["return_parameters"]
-            summary["return_parameters"].update(new_return_parameters)
-            changed = changed or bool(new_return_parameters)
+            new_return_callables = return_callables - summary["return_callables"]
             new_sink_parameters = sink_parameters - summary["sink_parameters"]
+            summary["return_parameters"].update(new_return_parameters)
+            summary["return_callables"].update(new_return_callables)
             summary["sink_parameters"].update(new_sink_parameters)
-            changed = changed or bool(new_sink_parameters)
-            summary_edge_count += len(new_return_parameters) + len(new_sink_parameters)
+            changed = changed or bool(new_return_parameters or new_return_callables or new_sink_parameters)
+            summary_edge_count += len(new_return_parameters) + len(new_return_callables) + len(new_sink_parameters)
             if summary_edge_count > max_analysis_edges:
-                die(
-                    path,
-                    f"Rust callable summary graph exceeds {max_analysis_edges} edges",
-                )
+                die(path, f"Rust callable summary graph exceeds {max_analysis_edges} edges")
             if not changed:
                 continue
-            for caller in sorted(callers.get(name, ())):
+            for caller in sorted(potential_callers.get(record_index, ())):
                 if caller not in queued:
                     queue.append(caller)
                     queued.add(caller)
                     if len(queue) > max_analysis_nodes:
-                        die(
-                            path,
-                            f"Rust interprocedural work queue exceeds {max_analysis_nodes} nodes",
-                        )
+                        die(path, f"Rust interprocedural work queue exceeds {max_analysis_nodes} nodes")
 
     reject_interprocedural_flows()
 
@@ -1629,6 +2305,16 @@ self_test() {
     rm "$path"
   }
 
+  expect_computed_fixture_accepted() {
+    local path="$1"
+    local label="$2"
+    if ! WORKER_ONLY_GUARD_ROOT="$fixture" "$script_path" >/dev/null; then
+      printf '%s\n' "worker-only guard self-test: rejected $label" >&2
+      return 1
+    fi
+    rm "$path"
+  }
+
   write_rust_fixture() {
     local path="$1"
     python3 -c \
@@ -1907,6 +2593,18 @@ RS
     "$fixture/daemon/examples/dynamic-concat-command-alias-sink.rs" \
     "import-aliased Command dynamic Rust executable sink" || return 1
 
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-command-import-sink.rs" <<'RS'
+use std::process::Command;
+
+fn main() {
+    let executable = concat!(env!("WORKER_BIN"), "/worker");
+    let _ = Command::new(executable).status();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-command-import-sink.rs" \
+    "provenance-resolved bare Command import sink" || return 1
+
   write_rust_fixture "$fixture/daemon/examples/dynamic-concat-grouped-command-sink.rs" <<'RS'
 use std::process::{Command as Process, Stdio};
 
@@ -2128,6 +2826,453 @@ RS
     "$fixture/daemon/examples/dynamic-concat-cycle-sink.rs" \
     "cycle-safe summarized dynamic Rust executable sink" || return 1
 
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-assigned-receiver.rs" <<'RS'
+struct Runner {
+    executable: &'static str,
+}
+impl Runner {
+    fn launch(&self) {
+        let _ = std::process::Command::new(self.executable).status();
+    }
+}
+
+fn main() {
+    let runner = Runner {
+        executable: concat!(env!("WORKER_BIN"), "/worker"),
+    };
+    let alias = runner;
+    alias.launch();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-assigned-receiver.rs" \
+    "assigned and aliased receiver-state executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-temporary-receiver.rs" <<'RS'
+struct Runner {
+    executable: &'static str,
+}
+impl Runner {
+    fn launch(&mut self) {
+        let candidates = [self.executable];
+        let _ = std::process::Command::new(candidates[0]).status();
+    }
+}
+
+fn main() {
+    Runner {
+        executable: concat!(env!("WORKER_BIN"), "/worker"),
+    }.launch();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-temporary-receiver.rs" \
+    "temporary mutable receiver-state executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-nested-receiver.rs" <<'RS'
+struct Runner {
+    executable: &'static str,
+}
+struct Wrapper {
+    runner: Runner,
+}
+impl Runner {
+    fn launch(self) {
+        let _ = std::process::Command::new(self.executable).status();
+    }
+}
+
+fn main() {
+    let wrapper = Wrapper {
+        runner: Runner {
+            executable: concat!(env!("WORKER_BIN"), "/worker"),
+        },
+    };
+    wrapper.runner.launch();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-nested-receiver.rs" \
+    "nested by-value receiver-state executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-container-receiver.rs" <<'RS'
+struct Runner {
+    executable: &'static str,
+}
+impl Runner {
+    fn launch(&self) {
+        let _ = std::process::Command::new(self.executable).status();
+    }
+}
+
+fn main() {
+    let runners = [Runner {
+        executable: concat!(env!("WORKER_BIN"), "/worker"),
+    }];
+    runners[0].launch();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-container-receiver.rs" \
+    "container-held receiver-state executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-mutated-receiver.rs" <<'RS'
+struct Runner {
+    executable: &'static str,
+}
+impl Runner {
+    fn launch(&self) {
+        let _ = std::process::Command::new(self.executable).status();
+    }
+}
+
+fn main() {
+    let mut runner = Runner { executable: "worker" };
+    runner.executable = concat!(env!("WORKER_BIN"), "/worker");
+    runner.launch();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-mutated-receiver.rs" \
+    "mutated receiver-field executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-callable-alias.rs" <<'RS'
+fn launch(executable: &str) {
+    let _ = std::process::Command::new(executable).status();
+}
+
+fn main() {
+    let callback = launch;
+    callback(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-callable-alias.rs" \
+    "local function-pointer alias executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-returned-callable.rs" <<'RS'
+fn launch(executable: &str) {
+    let _ = std::process::Command::new(executable).status();
+}
+fn choose() -> fn(&str) {
+    launch
+}
+
+fn main() {
+    let callbacks = [choose()];
+    let callback = callbacks[0];
+    callback(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-returned-callable.rs" \
+    "returned and container-aliased callable executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-callable-cycle.rs" <<'RS'
+fn launch(executable: &str) {
+    let _ = std::process::Command::new(executable).status();
+}
+
+fn main() {
+    let mut first = launch;
+    let second = first;
+    first = second;
+    second(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-callable-cycle.rs" \
+    "cycle-safe callable alias executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-returned-callable-cycle.rs" <<'RS'
+fn launch(executable: &str) {
+    let _ = std::process::Command::new(executable).status();
+}
+fn choose(recurse: bool) -> fn(&str) {
+    if recurse { choose(false) } else { launch }
+}
+
+fn main() {
+    let callback = choose(true);
+    callback(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-returned-callable-cycle.rs" \
+    "cycle-safe returned callable executable sink" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-local-sink-type-names.rs" <<'RS'
+struct Command;
+impl Command {
+    fn new(_: &str) -> Self { Self }
+}
+struct Library;
+impl Library {
+    fn open(_: &str) -> Self { Self }
+}
+
+fn main() {
+    let generated = concat!(env!("OUT_DIR"), "/generated.rs");
+    let _ = Command::new(generated);
+    let _ = Library::open(generated);
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-local-sink-type-names.rs" \
+    "local Command and Library constructors" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-shadowed-reviewed-root.rs" <<'RS'
+mod std {
+    pub mod process {
+        pub struct Command;
+        impl Command {
+            pub fn new(_: &str) -> Self { Self }
+        }
+    }
+}
+
+fn main() {
+    let generated = concat!(env!("OUT_DIR"), "/generated.rs");
+    let _ = std::process::Command::new(generated);
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-shadowed-reviewed-root.rs" \
+    "locally shadowed reviewed sink root" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-absolute-reviewed-root.rs" <<'RS'
+mod std {
+    pub mod process {
+        pub struct Command;
+    }
+}
+
+fn main() {
+    let executable = concat!(env!("WORKER_BIN"), "/worker");
+    let _ = ::std::process::Command::new(executable).status();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-absolute-reviewed-root.rs" \
+    "absolute reviewed sink despite a local root shadow" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-scope-reviewed-root.rs" <<'RS'
+mod nested {
+    mod std {
+        pub mod process {
+            pub struct Command;
+        }
+    }
+}
+
+fn main() {
+    let executable = concat!(env!("WORKER_BIN"), "/worker");
+    let _ = std::process::Command::new(executable).status();
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-scope-reviewed-root.rs" \
+    "reviewed sink outside an unrelated nested root shadow" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-qualified-method-collision.rs" <<'RS'
+struct Safe;
+impl Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Safe.launch(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-qualified-method-collision.rs" \
+    "explicit safe receiver with a colliding audited method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-qualified-method-collision.rs" <<'RS'
+struct Safe;
+impl Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Real.launch(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-qualified-method-collision.rs" \
+    "explicit audited receiver with a colliding safe method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-associated-method-collision.rs" <<'RS'
+struct Safe;
+impl Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Safe::launch(&Safe, concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-associated-method-collision.rs" \
+    "explicit Safe associated method with a colliding Real method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-associated-method-collision.rs" <<'RS'
+struct Safe;
+impl Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Real::launch(&Real, concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-associated-method-collision.rs" \
+    "explicit Real associated method with a colliding Safe method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-constructor-method-collision.rs" <<'RS'
+struct Safe;
+impl Safe {
+    fn new() -> Self { Self }
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Safe::new().launch(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-constructor-method-collision.rs" \
+    "constructor-resolved safe receiver with a colliding audited method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-qualified-trait-collision.rs" <<'RS'
+trait Launcher { fn launch(&self, value: &str); }
+struct Safe;
+impl Launcher for Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Launcher for Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    Safe.launch(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-qualified-trait-collision.rs" \
+    "explicit safe trait receiver with a colliding audited impl" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-inherent-trait-precedence.rs" <<'RS'
+trait Launcher { fn launch(&self, value: &str); }
+struct Safe;
+impl Launcher for Safe {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+impl Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+
+fn main() {
+    Safe.launch(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-inherent-trait-precedence.rs" \
+    "safe inherent method that takes precedence over a trait method" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-unresolved-trait-collision.rs" <<'RS'
+trait Launcher { fn launch(&self, value: &str); }
+struct Safe;
+impl Launcher for Safe {
+    fn launch(&self, value: &str) { println!("{value}"); }
+}
+struct Real;
+impl Launcher for Real {
+    fn launch(&self, executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn invoke<T: Launcher>(runner: T) {
+    runner.launch(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-unresolved-trait-collision.rs" \
+    "unresolved receiver with a plausible audited trait impl" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/safe-qualified-free-function-collision.rs" <<'RS'
+mod safe {
+    pub fn launch(value: &str) { println!("{value}"); }
+}
+mod real {
+    pub fn launch(executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    safe::launch(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+RS
+  expect_computed_fixture_accepted \
+    "$fixture/daemon/examples/safe-qualified-free-function-collision.rs" \
+    "qualified safe free function with a colliding audited function" || return 1
+
+  write_rust_fixture "$fixture/daemon/examples/dynamic-concat-qualified-free-function.rs" <<'RS'
+mod safe {
+    pub fn launch(value: &str) { println!("{value}"); }
+}
+mod real {
+    pub fn launch(executable: &str) {
+        let _ = std::process::Command::new(executable).status();
+    }
+}
+
+fn main() {
+    real::launch(concat!(env!("WORKER_BIN"), "/worker"));
+}
+RS
+  expect_computed_fixture_rejected \
+    "$fixture/daemon/examples/dynamic-concat-qualified-free-function.rs" \
+    "qualified audited free function with a colliding safe function" || return 1
+
   write_rust_fixture "$fixture/daemon/examples/safe-dynamic-helper.rs" <<'RS'
 struct Widget;
 impl Widget {
@@ -2296,7 +3441,9 @@ PY
   # Dependency propagation must visit bindings and edges, not repeatedly scan
   # the whole file. Eight thousand reverse aliases reproduces the old quadratic
   # path; cycles, broad fanout, long append lists, and a deep return-summary
-  # chain exercise bounded intraprocedural and interprocedural cases.
+  # chain exercise bounded intraprocedural and interprocedural cases. The Rust
+  # fixture also drives long callable/receiver alias chains and hundreds of
+  # same-name methods, ensuring the qualified summaries remain bounded.
   python3 - \
     "$fixture/server/spawn_server/routes/binding-graph-performance.py" \
     "$fixture/scripts/binding-graph-performance.sh" \
@@ -2344,11 +3491,43 @@ rust_lines = [
     f"{{ return_{index + 1}(value) }}"
     for index in range(1_200)
 ]
+rust_lines.append("fn safe_callback(value: &'static str) { println!(\"{}\", value); }")
+rust_lines.extend(
+    f"struct SafeReceiver{index}; impl SafeReceiver{index} {{ "
+    f"fn launch(&self, value: &'static str) {{ println!(\"{{}}\", value); }} }}"
+    for index in range(200)
+)
+rust_lines.extend(
+    [
+        "struct RealReceiver;",
+        "impl RealReceiver {",
+        "    fn launch(&self, executable: &'static str) {",
+        "        let _ = std::process::Command::new(executable).status();",
+        "    }",
+        "}",
+    ]
+)
 rust_lines.extend(
     [
         "fn return_1200(value: &'static str) -> &'static str { value }",
         "fn main() {",
         '    let generated = concat!(env!("OUT_DIR"), "/generated.rs");',
+    ]
+)
+rust_lines.append("    let callback_0 = safe_callback;")
+rust_lines.extend(
+    f"    let callback_{index} = callback_{index - 1};"
+    for index in range(1, 801)
+)
+rust_lines.append("    let receiver_0 = SafeReceiver199;")
+rust_lines.extend(
+    f"    let receiver_{index} = receiver_{index - 1};"
+    for index in range(1, 801)
+)
+rust_lines.extend(
+    [
+        "    callback_800(generated);",
+        "    receiver_800.launch(generated);",
         '    println!("{}", return_0(generated));',
         "}",
     ]
