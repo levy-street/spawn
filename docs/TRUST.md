@@ -437,6 +437,12 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   or credential secrets. This is not live signaling trust yet; server
   revocation cannot silently remove a local pin, and explicit re-pair/local
   management remains required.
+- Keyring and fallback copies use a shared whole-record commit identity. Loads
+  select one complete `(generation, record ID)` and never combine its token,
+  host identity/server metadata, or browser pins with another generation.
+  The Unix mode-0600 record is independently complete; native platforms keep
+  the private seed in the complete keyring record and treat the file as only a
+  matching seed-free metadata projection.
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.

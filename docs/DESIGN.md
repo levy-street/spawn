@@ -125,6 +125,10 @@
      the browser key second, then atomically stores the token, private host
      identity, and bounded immutable browser pin in its credential backends.
      Existing local pins survive explicit relogin.
+     Credential backends store versioned whole-record generations rather than
+     overlaying keyring secrets onto file metadata. A monotonic generation and
+     unique record ID provide deterministic recovery from interrupted or
+     concurrent writes without ever constructing a mixed credential set.
 - Daemon tokens are scoped: `host:<host_id>:control`. Revocable from the web
   UI (kills the WS).
 - Browser pins are daemon-local first-contact state. Server revocation does not

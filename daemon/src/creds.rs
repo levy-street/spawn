@@ -5,6 +5,9 @@
 //! no Secret Service is available. The same secret bundle holds the daemon
 //! token and Ed25519 private seed; neither is ever sent to logs or status.
 //! Metadata in that file also supplies `host_id` and the configured server.
+//! Every non-legacy commit has a version, monotonic generation, and unique
+//! record ID. Both backends receive a whole record; load selects one record by
+//! `(generation, record_id)` and never overlays fields across copies.
 
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
@@ -18,7 +21,7 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
 use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire};
@@ -39,8 +42,17 @@ const CANONICAL_UUID_BYTES: usize = 36;
 const PUBLIC_KEY_WIRE_BYTES: usize = 43;
 const FINGERPRINT_WIRE_BYTES: usize = 23;
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StoredCreds {
+    /// Versioned commit identity shared by every backend copy. All three
+    /// fields are absent only for legacy records and otherwise form one
+    /// indivisible generation marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_record_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_record_id: Option<String>,
     /// Daemon access token (long-lived).
     pub access_token: Option<String>,
     /// The host_id the server assigned when we registered.
@@ -93,14 +105,12 @@ impl BrowserPin {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredSecrets {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    access_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    host_private_key_seed: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    browser_pins: Option<Vec<BrowserPin>>,
+const CREDENTIAL_RECORD_VERSION: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendPolicy {
+    UnixCompleteFile,
+    NativeKeyring,
 }
 
 impl StoredCreds {
@@ -209,24 +219,52 @@ pub fn commit_login_update<F>(
     persist: F,
 ) -> Result<bool>
 where
-    F: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&mut StoredCreds) -> Result<()>,
 {
+    commit_login_update_observed(
+        current,
+        access_token,
+        host_id,
+        server_url,
+        browser_pin,
+        persist,
+        |_| {},
+    )
+}
+
+fn commit_login_update_observed<F, O>(
+    current: &mut StoredCreds,
+    access_token: String,
+    host_id: Uuid,
+    server_url: String,
+    browser_pin: BrowserPin,
+    persist: F,
+    observe_wiped_token: O,
+) -> Result<bool>
+where
+    F: FnOnce(&mut StoredCreds) -> Result<()>,
+    O: FnOnce(&str),
+{
+    let mut access_token = Zeroizing::new(access_token);
     let mut candidate = current.clone();
     let inserted = match merge_browser_pin(&mut candidate, browser_pin) {
         Ok(inserted) => inserted,
         Err(error) => {
             zeroize_stored_creds(&mut candidate);
+            access_token.zeroize();
+            observe_wiped_token(access_token.as_str());
             return Err(error);
         }
     };
     if let Some(previous) = candidate.access_token.as_mut() {
         previous.zeroize();
     }
-    candidate.access_token = Some(access_token);
+    candidate.access_token = Some(std::mem::take(&mut *access_token));
     candidate.host_id = Some(host_id);
     candidate.server_url = Some(server_url);
-    if let Err(error) = validate_persistable_creds(&candidate).and_then(|()| persist(&candidate)) {
+    if let Err(error) = validate_loaded_creds(&candidate).and_then(|()| persist(&mut candidate)) {
         zeroize_stored_creds(&mut candidate);
+        observe_wiped_token(candidate.access_token.as_deref().unwrap_or(""));
         return Err(error);
     }
     let mut previous = std::mem::replace(current, candidate);
@@ -234,62 +272,323 @@ where
     Ok(inserted)
 }
 
-/// Load stored creds. Tries keyring first for the token; reads the file for
-/// metadata regardless. Missing creds returns `Ok(StoredCreds::default())`.
-pub fn load() -> Result<StoredCreds> {
-    // A malformed file must not silently rotate a host identity.
-    let mut from_file = load_file()?;
-
-    if keyring_disabled() {
-        return Ok(from_file);
+fn platform_policy() -> BackendPolicy {
+    #[cfg(unix)]
+    {
+        BackendPolicy::UnixCompleteFile
     }
-
-    match keyring_get() {
-        Ok(Some(mut value)) => {
-            // Backend unavailability may use the documented file fallback,
-            // but malformed stored data must fail closed rather than rotate.
-            merge_keyring_value(&mut from_file, &mut value)?;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "keyring read failed; using file-stored token if any");
-        }
+    #[cfg(not(unix))]
+    {
+        BackendPolicy::NativeKeyring
     }
-    if let Err(error) = validate_loaded_creds(&from_file) {
+}
+
+fn load_without_keyring(from_file: Option<StoredCreds>) -> Result<StoredCreds> {
+    let Some(mut from_file) = from_file else {
+        return Ok(StoredCreds::default());
+    };
+    if platform_policy() == BackendPolicy::NativeKeyring && !record_is_empty(&from_file) {
         zeroize_stored_creds(&mut from_file);
-        return Err(error);
+        bail!("native credential metadata requires its matching OS keyring record")
     }
     Ok(from_file)
 }
 
-/// Persist credentials. The existing 0600 headless fallback stores the same
-/// token/private-seed bundle that is written to the OS keyring when available.
-pub fn save(creds: &StoredCreds) -> Result<()> {
+fn advance_credential_generation(creds: &mut StoredCreds) -> Result<()> {
+    let next = record_order(creds)?.map_or(Ok(1_u64), |(generation, _)| {
+        generation
+            .checked_add(1)
+            .context("credential generation exhausted")
+    })?;
+    creds.credential_record_version = Some(CREDENTIAL_RECORD_VERSION);
+    creds.credential_generation = Some(next);
+    creds.credential_record_id = Some(Uuid::new_v4().to_string());
+    Ok(())
+}
+
+fn record_order(creds: &StoredCreds) -> Result<Option<(u64, Uuid)>> {
+    match (
+        creds.credential_record_version,
+        creds.credential_generation,
+        creds.credential_record_id.as_deref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(CREDENTIAL_RECORD_VERSION), Some(generation), Some(record_id)) if generation > 0 => {
+            if record_id.len() != CANONICAL_UUID_BYTES {
+                bail!("credential record ID is not a canonical UUID")
+            }
+            let parsed = Uuid::parse_str(record_id).context("parsing credential record ID")?;
+            if parsed.to_string() != record_id {
+                bail!("credential record ID is not canonical")
+            }
+            Ok(Some((generation, parsed)))
+        }
+        (Some(version), Some(_), Some(_)) if version != CREDENTIAL_RECORD_VERSION => {
+            bail!("unsupported credential record version {version}")
+        }
+        _ => bail!("credential record has a partial or malformed generation marker"),
+    }
+}
+
+fn reconcile_backend_records(
+    from_file: Option<StoredCreds>,
+    from_keyring: Option<StoredCreds>,
+    policy: BackendPolicy,
+) -> Result<StoredCreds> {
+    let file_order = from_file.as_ref().map(record_order).transpose()?.flatten();
+    let keyring_order = from_keyring
+        .as_ref()
+        .map(record_order)
+        .transpose()?
+        .flatten();
+    match (from_file, from_keyring, file_order, keyring_order) {
+        (None, None, _, _) => Ok(StoredCreds::default()),
+        (Some(file), None, _, _) => match policy {
+            BackendPolicy::UnixCompleteFile => Ok(file),
+            BackendPolicy::NativeKeyring if record_is_empty(&file) => Ok(file),
+            BackendPolicy::NativeKeyring => {
+                let mut file = file;
+                zeroize_stored_creds(&mut file);
+                bail!("versioned native credential file has no matching complete keyring record")
+            }
+        },
+        (None, Some(keyring), _, _) => Ok(keyring),
+        (Some(file), Some(keyring), None, None) => reconcile_legacy_records(file, keyring, policy),
+        (Some(mut file), Some(keyring), Some(_), None) => match policy {
+            BackendPolicy::UnixCompleteFile => {
+                let mut keyring = keyring;
+                zeroize_stored_creds(&mut keyring);
+                Ok(file)
+            }
+            BackendPolicy::NativeKeyring => {
+                zeroize_stored_creds(&mut file);
+                let mut keyring = keyring;
+                zeroize_stored_creds(&mut keyring);
+                bail!("native keyring is legacy while its metadata file is versioned")
+            }
+        },
+        (Some(mut file), Some(keyring), None, Some(_)) => {
+            zeroize_stored_creds(&mut file);
+            Ok(keyring)
+        }
+        (Some(file), Some(keyring), Some(file_order), Some(keyring_order)) => match policy {
+            BackendPolicy::UnixCompleteFile => {
+                choose_complete_record(file, keyring, file_order, keyring_order)
+            }
+            BackendPolicy::NativeKeyring => {
+                if file_order == keyring_order {
+                    let mut projection = file_creds_without_private_seed(&keyring);
+                    let matches = projection == file;
+                    zeroize_stored_creds(&mut projection);
+                    if !matches {
+                        let mut file = file;
+                        let mut keyring = keyring;
+                        zeroize_stored_creds(&mut file);
+                        zeroize_stored_creds(&mut keyring);
+                        bail!("native credential backends disagree within one generation")
+                    }
+                }
+                let mut file = file;
+                zeroize_stored_creds(&mut file);
+                Ok(keyring)
+            }
+        },
+    }
+}
+
+fn record_is_empty(creds: &StoredCreds) -> bool {
+    creds.credential_record_version.is_none()
+        && creds.credential_generation.is_none()
+        && creds.credential_record_id.is_none()
+        && creds.access_token.is_none()
+        && creds.host_id.is_none()
+        && creds.server_url.is_none()
+        && creds.host_private_key_seed.is_none()
+        && creds.browser_pins.is_empty()
+}
+
+fn choose_complete_record(
+    mut file: StoredCreds,
+    mut keyring: StoredCreds,
+    file_order: (u64, Uuid),
+    keyring_order: (u64, Uuid),
+) -> Result<StoredCreds> {
+    match file_order.cmp(&keyring_order) {
+        std::cmp::Ordering::Greater => {
+            zeroize_stored_creds(&mut keyring);
+            Ok(file)
+        }
+        std::cmp::Ordering::Less => {
+            zeroize_stored_creds(&mut file);
+            Ok(keyring)
+        }
+        std::cmp::Ordering::Equal if file == keyring => {
+            zeroize_stored_creds(&mut keyring);
+            Ok(file)
+        }
+        std::cmp::Ordering::Equal => {
+            zeroize_stored_creds(&mut file);
+            zeroize_stored_creds(&mut keyring);
+            bail!("credential backends disagree within one record identity")
+        }
+    }
+}
+
+fn reconcile_legacy_records(
+    mut file: StoredCreds,
+    mut keyring: StoredCreds,
+    policy: BackendPolicy,
+) -> Result<StoredCreds> {
+    // Current Unix releases wrote a complete fallback even when keyring writes
+    // succeeded. Prefer that coherent legacy set rather than allowing a stale
+    // keyring token to override it. Older metadata-only/native layouts fill
+    // only absent fields and reject every conflicting value.
+    if policy == BackendPolicy::UnixCompleteFile
+        && (file.access_token.is_some() || file.host_private_key_seed.is_some())
+    {
+        zeroize_stored_creds(&mut keyring);
+        return Ok(file);
+    }
+    let merge_result = (|| {
+        merge_legacy_field(
+            &mut file.access_token,
+            &mut keyring.access_token,
+            "access token",
+        )?;
+        merge_legacy_field(&mut file.host_id, &mut keyring.host_id, "host ID")?;
+        merge_legacy_field(&mut file.server_url, &mut keyring.server_url, "server URL")?;
+        merge_legacy_field(
+            &mut file.host_private_key_seed,
+            &mut keyring.host_private_key_seed,
+            "host private identity",
+        )?;
+        for pin in std::mem::take(&mut keyring.browser_pins) {
+            merge_browser_pin(&mut file, pin).context("merging legacy keyring browser pins")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = merge_result {
+        zeroize_stored_creds(&mut file);
+        zeroize_stored_creds(&mut keyring);
+        return Err(error);
+    }
+    zeroize_stored_creds(&mut keyring);
+    Ok(file)
+}
+
+fn merge_legacy_field<T: PartialEq>(
+    target: &mut Option<T>,
+    source: &mut Option<T>,
+    label: &str,
+) -> Result<()> {
+    match (target.as_ref(), source.as_ref()) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("legacy credential backends conflict on {label}")
+        }
+        (None, Some(_)) => *target = source.take(),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Load one complete credential generation. Backend records are never overlaid:
+/// reconciliation selects an entire versioned record, so tokens, host metadata,
+/// private identity, and browser pins cannot come from different commits.
+pub fn load() -> Result<StoredCreds> {
+    let mut from_file = load_file_record()?;
+
+    if keyring_disabled() {
+        return load_without_keyring(from_file);
+    }
+
+    let from_keyring = match keyring_get() {
+        Ok(Some(mut value)) => match decode_keyring_value_and_wipe(&mut value) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                if let Some(record) = from_file.as_mut() {
+                    zeroize_stored_creds(record);
+                }
+                return Err(error);
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            #[cfg(unix)]
+            {
+                tracing::warn!(error = %e, "keyring read failed; using the complete Unix credential record");
+                return Ok(from_file.unwrap_or_default());
+            }
+            #[cfg(not(unix))]
+            {
+                let mut from_file = from_file.unwrap_or_default();
+                zeroize_stored_creds(&mut from_file);
+                return Err(e).context("reading required native-keyring credential record");
+            }
+        }
+    };
+    reconcile_backend_records(from_file, from_keyring, platform_policy())
+}
+
+/// Persist one new coherent generation. On Unix the mode-0600 file is the
+/// required complete fallback and the keyring is a redundant complete copy.
+/// On other platforms the native keyring is required because it is the only
+/// copy containing the host private seed; the metadata file is its generation-
+/// matched seed-free projection.
+pub fn save(creds: &mut StoredCreds) -> Result<()> {
+    let policy = platform_policy();
+    save_with_backends(
+        creds,
+        policy,
+        |candidate| {
+            if keyring_disabled() {
+                if policy == BackendPolicy::UnixCompleteFile {
+                    return Ok(());
+                }
+                bail!("OS keyring is disabled")
+            }
+            keyring_set(candidate)
+        },
+        save_file_for_platform,
+    )
+}
+
+fn save_with_backends<K, F>(
+    creds: &mut StoredCreds,
+    policy: BackendPolicy,
+    set_keyring: K,
+    save_file: F,
+) -> Result<()>
+where
+    K: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&StoredCreds) -> Result<()>,
+{
+    advance_credential_generation(creds)?;
     // Validate the complete coherent record, including both serialized backend
     // bounds, before either backend can observe an update.
     validate_persistable_creds(creds)?;
-    let keyring_saved = if keyring_disabled() {
-        false
-    } else if let Err(e) = keyring_set(creds) {
-        tracing::warn!(error = %e, "keyring write failed; using the supported Unix file fallback when available");
-        false
-    } else {
-        true
-    };
-    #[cfg(not(unix))]
-    if creds.host_private_key_seed.is_some() && !keyring_saved {
-        bail!("cannot securely persist host identity without the OS keyring")
+    validate_complete_current_record(creds)?;
+    let keyring_result = set_keyring(creds);
+    match policy {
+        BackendPolicy::UnixCompleteFile => {
+            if let Err(error) = keyring_result {
+                tracing::warn!(error = %error, "keyring write failed; committing the complete Unix file fallback");
+            }
+            save_file(creds)
+        }
+        BackendPolicy::NativeKeyring => {
+            keyring_result.context("persisting required native-keyring credential record")?;
+            save_file(creds)
+        }
     }
-    save_file_for_platform(creds, keyring_saved)
 }
 
 #[cfg(unix)]
-fn save_file_for_platform(creds: &StoredCreds, _keyring_saved: bool) -> Result<()> {
+fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     save_file(creds)
 }
 
 #[cfg(not(unix))]
-fn save_file_for_platform(creds: &StoredCreds, _keyring_saved: bool) -> Result<()> {
+fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     // Non-Unix platforms do not have this module's audited mode-0600 fallback.
     // Keep public metadata and the legacy token fallback, but the private seed
     // is stored only in the native keyring.
@@ -299,11 +598,13 @@ fn save_file_for_platform(creds: &StoredCreds, _keyring_saved: bool) -> Result<(
     result
 }
 
-#[cfg(any(not(unix), test))]
 fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
     // Construct this field-by-field: cloning the whole value would transiently
     // copy the private seed before replacing it with None.
     StoredCreds {
+        credential_record_version: creds.credential_record_version,
+        credential_generation: creds.credential_generation,
+        credential_record_id: creds.credential_record_id.clone(),
         access_token: creds.access_token.clone(),
         host_id: creds.host_id,
         server_url: creds.server_url.clone(),
@@ -507,103 +808,60 @@ fn keyring_get() -> Result<Option<String>> {
     }
 }
 
-fn decode_keyring_value(value: &str) -> Result<StoredSecrets> {
+fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     if value.len() > MAX_CREDENTIALS_FILE_BYTES {
         bail!("stored keyring credential bundle is too large")
     }
-    // Backward compatibility for keyrings containing the legacy raw daemon
-    // token. The next save upgrades it to a secret bundle.
-    if value.starts_with('{') {
-        let mut secrets: StoredSecrets =
-            serde_json::from_str(value).context("parsing keyring daemon secret bundle")?;
-        if let Err(error) = validate_secret_bounds(
-            secrets.access_token.as_deref(),
-            secrets.host_private_key_seed.as_deref(),
-        ) {
-            zeroize_secrets(&mut secrets);
+    // Backward compatibility: legacy JSON secret bundles are a strict subset
+    // of StoredCreds, while an older raw daemon token remains supported. The
+    // next save upgrades either form to a complete versioned record.
+    if value.trim_start().starts_with('{') {
+        let mut creds: StoredCreds =
+            serde_json::from_str(value).context("parsing keyring credential record")?;
+        if let Err(error) = validate_loaded_creds(&creds) {
+            zeroize_stored_creds(&mut creds);
             return Err(error);
         }
-        Ok(secrets)
+        if let Err(error) = validate_complete_current_record(&creds) {
+            zeroize_stored_creds(&mut creds);
+            return Err(error);
+        }
+        Ok(creds)
     } else {
         if value.len() > MAX_ACCESS_TOKEN_BYTES {
             bail!("stored keyring access token is too large")
         }
-        Ok(StoredSecrets {
+        Ok(StoredCreds {
             access_token: Some(value.to_owned()),
-            host_private_key_seed: None,
-            browser_pins: None,
+            ..StoredCreds::default()
         })
     }
 }
 
-fn merge_keyring_value(from_file: &mut StoredCreds, value: &mut String) -> Result<()> {
+fn decode_keyring_value_and_wipe(value: &mut String) -> Result<StoredCreds> {
     let decoded = decode_keyring_value(value);
     value.zeroize();
-    let mut secrets = match decoded {
-        Ok(secrets) => secrets,
-        Err(error) => {
-            // `from_file` may already contain a fallback token and private seed.
-            // A malformed keyring entry must fail closed without dropping those
-            // loaded secret buffers unwiped on this early return.
-            zeroize_stored_creds(from_file);
-            return Err(error);
-        }
-    };
-    if let Some(access_token) = secrets.access_token.take() {
-        if let Some(previous) = from_file.access_token.as_mut() {
-            previous.zeroize();
-        }
-        from_file.access_token = Some(access_token);
-    }
-    if let Some(seed) = secrets.host_private_key_seed.take() {
-        if let Some(previous) = from_file.host_private_key_seed.as_mut() {
-            previous.zeroize();
-        }
-        from_file.host_private_key_seed = Some(seed);
-    }
-    if let Some(pins) = secrets.browser_pins.take() {
-        if let Err(error) = validate_browser_pins(&pins) {
-            zeroize_secrets(&mut secrets);
-            zeroize_stored_creds(from_file);
-            return Err(error);
-        }
-        // A process interruption or temporarily unavailable backend may leave
-        // one protected copy one successful login behind the other. Merge only
-        // exact compatible records; ID/key conflicts still fail closed.
-        for pin in pins {
-            if let Err(error) = merge_browser_pin(from_file, pin) {
-                zeroize_secrets(&mut secrets);
-                zeroize_stored_creds(from_file);
-                return Err(error).context("merging keyring browser pins");
-            }
-        }
-    }
-    zeroize_secrets(&mut secrets);
-    Ok(())
+    decoded
 }
 
 fn keyring_set(creds: &StoredCreds) -> Result<()> {
     let entry = keyring_entry()?;
-    let mut bundle = StoredSecrets {
-        access_token: creds.access_token.clone(),
-        host_private_key_seed: creds.host_private_key_seed.clone(),
-        browser_pins: Some(creds.browser_pins.clone()),
-    };
-    let mut encoded = match serde_json::to_string(&bundle) {
+    let mut record = creds.clone();
+    let mut encoded = match serde_json::to_string(&record) {
         Ok(encoded) => encoded,
         Err(error) => {
-            zeroize_secrets(&mut bundle);
+            zeroize_stored_creds(&mut record);
             return Err(error.into());
         }
     };
     if encoded.len() > MAX_CREDENTIALS_FILE_BYTES {
         encoded.zeroize();
-        zeroize_secrets(&mut bundle);
+        zeroize_stored_creds(&mut record);
         bail!("keyring credential bundle is too large")
     }
     let result = entry.set_password(&encoded);
     encoded.zeroize();
-    zeroize_secrets(&mut bundle);
+    zeroize_stored_creds(&mut record);
     result.map_err(Into::into)
 }
 
@@ -620,14 +878,19 @@ fn keyring_delete() -> Result<()> {
 // file fallback
 // ---------------------------------------------------------------------------
 
-fn load_file() -> Result<StoredCreds> {
+fn load_file_record() -> Result<Option<StoredCreds>> {
     let path = config::credentials_path()?;
-    load_file_at(&path)
+    load_file_record_at(&path)
 }
 
+#[cfg(test)]
 fn load_file_at(path: &Path) -> Result<StoredCreds> {
+    Ok(load_file_record_at(path)?.unwrap_or_default())
+}
+
+fn load_file_record_at(path: &Path) -> Result<Option<StoredCreds>> {
     let Some(mut raw) = read_credentials_file(path)? else {
-        return Ok(StoredCreds::default());
+        return Ok(None);
     };
     let parsed = serde_json::from_slice(&raw);
     raw.zeroize();
@@ -636,7 +899,12 @@ fn load_file_at(path: &Path) -> Result<StoredCreds> {
         zeroize_stored_creds(&mut creds);
         return Err(error);
     }
-    Ok(creds)
+    #[cfg(unix)]
+    if let Err(error) = validate_complete_current_record(&creds) {
+        zeroize_stored_creds(&mut creds);
+        return Err(error);
+    }
+    Ok(Some(creds))
 }
 
 fn save_file(creds: &StoredCreds) -> Result<()> {
@@ -663,6 +931,7 @@ fn validate_secret_bounds(access_token: Option<&str>, encoded_seed: Option<&str>
 }
 
 fn validate_loaded_creds(creds: &StoredCreds) -> Result<()> {
+    record_order(creds)?;
     validate_secret_bounds(
         creds.access_token.as_deref(),
         creds.host_private_key_seed.as_deref(),
@@ -679,6 +948,13 @@ fn validate_loaded_creds(creds: &StoredCreds) -> Result<()> {
     Ok(())
 }
 
+fn validate_complete_current_record(creds: &StoredCreds) -> Result<()> {
+    if record_order(creds)?.is_some() && creds.host_private_key_seed.is_none() {
+        bail!("versioned complete credential record omitted the host private identity")
+    }
+    Ok(())
+}
+
 fn validate_persistable_creds(creds: &StoredCreds) -> Result<()> {
     validate_loaded_creds(creds)?;
     let mut file_json = serde_json::to_vec_pretty(creds)?;
@@ -687,21 +963,17 @@ fn validate_persistable_creds(creds: &StoredCreds) -> Result<()> {
     if file_len > MAX_CREDENTIALS_FILE_BYTES {
         bail!("credential record is too large")
     }
-    let mut bundle = StoredSecrets {
-        access_token: creds.access_token.clone(),
-        host_private_key_seed: creds.host_private_key_seed.clone(),
-        browser_pins: Some(creds.browser_pins.clone()),
-    };
-    let mut keyring_json = match serde_json::to_string(&bundle) {
+    let mut keyring_record = creds.clone();
+    let mut keyring_json = match serde_json::to_string(&keyring_record) {
         Ok(json) => json,
         Err(error) => {
-            zeroize_secrets(&mut bundle);
+            zeroize_stored_creds(&mut keyring_record);
             return Err(error.into());
         }
     };
     let keyring_len = keyring_json.len();
     keyring_json.zeroize();
-    zeroize_secrets(&mut bundle);
+    zeroize_stored_creds(&mut keyring_record);
     if keyring_len > MAX_CREDENTIALS_FILE_BYTES {
         bail!("keyring credential bundle is too large")
     }
@@ -742,15 +1014,6 @@ fn validate_browser_pins(pins: &[BrowserPin]) -> Result<()> {
         previous_device_id = Some(pin.browser_device_id.as_str());
     }
     Ok(())
-}
-
-fn zeroize_secrets(secrets: &mut StoredSecrets) {
-    if let Some(value) = secrets.access_token.as_mut() {
-        value.zeroize();
-    }
-    if let Some(value) = secrets.host_private_key_seed.as_mut() {
-        value.zeroize();
-    }
 }
 
 fn zeroize_stored_creds(creds: &mut StoredCreds) {
@@ -900,6 +1163,35 @@ mod tests {
             host_private_key_seed: Some(URL_SAFE_NO_PAD.encode([7_u8; ED25519_SEED_BYTES])),
             ..StoredCreds::default()
         }
+    }
+
+    fn complete_record(
+        generation: u64,
+        record_id: u128,
+        token: &str,
+        host_id: u128,
+        server: &str,
+        seed_byte: u8,
+    ) -> StoredCreds {
+        StoredCreds {
+            credential_record_version: Some(CREDENTIAL_RECORD_VERSION),
+            credential_generation: Some(generation),
+            credential_record_id: Some(Uuid::from_u128(record_id).to_string()),
+            access_token: Some(token.into()),
+            host_id: Some(Uuid::from_u128(host_id)),
+            server_url: Some(server.into()),
+            host_private_key_seed: Some(URL_SAFE_NO_PAD.encode([seed_byte; ED25519_SEED_BYTES])),
+            browser_pins: Vec::new(),
+        }
+    }
+
+    fn assert_same_coherent_record(actual: &StoredCreds, expected: &StoredCreds) {
+        assert!(actual == expected);
+        assert_eq!(actual.access_token, expected.access_token);
+        assert_eq!(actual.host_id, expected.host_id);
+        assert_eq!(actual.server_url, expected.server_url);
+        assert_eq!(actual.host_private_key_seed, expected.host_private_key_seed);
+        assert_eq!(actual.browser_pins, expected.browser_pins);
     }
 
     fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {
@@ -1100,6 +1392,293 @@ mod tests {
     }
 
     #[test]
+    fn failed_login_commit_exposes_only_a_wiped_token_buffer() {
+        let mut creds = fixed_creds();
+        let observed = std::cell::Cell::new(false);
+        let error = commit_login_update_observed(
+            &mut creds,
+            "returned-poll-secret".into(),
+            Uuid::from_u128(10),
+            "https://new.example/".into(),
+            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+            |_| bail!("injected persistence failure"),
+            |wiped| {
+                observed.set(true);
+                // zeroize's String implementation overwrites its allocation
+                // and then clears the visible length.
+                assert!(wiped.is_empty());
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected persistence failure"));
+        assert!(observed.get());
+        assert!(creds.access_token.is_none());
+    }
+
+    #[test]
+    fn unix_partial_backend_orders_select_one_whole_generation_and_retry_converges() {
+        use std::cell::RefCell;
+
+        let old = complete_record(1, 1, "old-token", 10, "https://old.example/", 7);
+
+        // Keyring commits N+1 but the required Unix file write fails. save()
+        // reports failure; next load may use the newer keyring record, but it
+        // must use that entire record rather than overlaying old file metadata.
+        let mut keyring_first = old.clone();
+        keyring_first.access_token = Some("keyring-new-token".into());
+        keyring_first.host_id = Some(Uuid::from_u128(20));
+        keyring_first.server_url = Some("https://keyring-new.example/".into());
+        keyring_first.host_private_key_seed =
+            Some(URL_SAFE_NO_PAD.encode([8_u8; ED25519_SEED_BYTES]));
+        merge_browser_pin(
+            &mut keyring_first,
+            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+        )
+        .unwrap();
+        let written_keyring = RefCell::new(None);
+        assert!(save_with_backends(
+            &mut keyring_first,
+            BackendPolicy::UnixCompleteFile,
+            |record| {
+                *written_keyring.borrow_mut() = Some(record.clone());
+                Ok(())
+            },
+            |_| bail!("injected file failure"),
+        )
+        .is_err());
+        let keyring_new = written_keyring.into_inner().unwrap();
+        let loaded = reconcile_backend_records(
+            Some(old.clone()),
+            Some(keyring_new.clone()),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &keyring_new);
+
+        // The inverse partial order is a supported Unix fallback: stale
+        // keyring write fails, complete N+1 file succeeds and wins on load.
+        let mut file_first = old.clone();
+        file_first.access_token = Some("file-new-token".into());
+        file_first.host_id = Some(Uuid::from_u128(30));
+        file_first.server_url = Some("https://file-new.example/".into());
+        file_first.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode([9_u8; ED25519_SEED_BYTES]));
+        merge_browser_pin(
+            &mut file_first,
+            browser_pin(Uuid::from_u128(2), RFC_KEY_TWO),
+        )
+        .unwrap();
+        let written_file = RefCell::new(None);
+        save_with_backends(
+            &mut file_first,
+            BackendPolicy::UnixCompleteFile,
+            |_| bail!("injected keyring failure"),
+            |record| {
+                *written_file.borrow_mut() = Some(record.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let file_new = written_file.into_inner().unwrap();
+        let loaded = reconcile_backend_records(
+            Some(file_new.clone()),
+            Some(old),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &file_new);
+
+        // A retry starts from the selected complete generation and writes one
+        // identical higher commit to both backends.
+        let mut retry = loaded;
+        let retry_keyring = RefCell::new(None);
+        let retry_file = RefCell::new(None);
+        save_with_backends(
+            &mut retry,
+            BackendPolicy::UnixCompleteFile,
+            |record| {
+                *retry_keyring.borrow_mut() = Some(record.clone());
+                Ok(())
+            },
+            |record| {
+                *retry_file.borrow_mut() = Some(record.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let retry_keyring = retry_keyring.into_inner().unwrap();
+        let retry_file = retry_file.into_inner().unwrap();
+        assert_same_coherent_record(&retry_keyring, &retry_file);
+        let converged = reconcile_backend_records(
+            Some(retry_file.clone()),
+            Some(retry_keyring),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&converged, &retry_file);
+    }
+
+    #[test]
+    fn generation_reconciliation_never_hybrids_servers_hosts_or_concurrent_writers() {
+        let older = complete_record(4, 4, "older-token", 40, "https://older.example/", 4);
+        let newer = complete_record(5, 1, "newer-token", 50, "https://newer.example/", 5);
+        let loaded = reconcile_backend_records(
+            Some(older),
+            Some(newer.clone()),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &newer);
+
+        // Two writers both derived generation 6 from the same base. Their
+        // unique record IDs provide a stable total order across a split write.
+        let writer_file = complete_record(
+            6,
+            100,
+            "file-writer-token",
+            60,
+            "https://file-writer.example/",
+            6,
+        );
+        let writer_keyring = complete_record(
+            6,
+            200,
+            "keyring-writer-token",
+            70,
+            "https://keyring-writer.example/",
+            7,
+        );
+        let first = reconcile_backend_records(
+            Some(writer_file.clone()),
+            Some(writer_keyring.clone()),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        let second = reconcile_backend_records(
+            Some(writer_file),
+            Some(writer_keyring.clone()),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&first, &writer_keyring);
+        assert_same_coherent_record(&second, &writer_keyring);
+
+        let mut corrupt_same_id = writer_keyring.clone();
+        corrupt_same_id.server_url = Some("https://corrupt.example/".into());
+        assert!(reconcile_backend_records(
+            Some(corrupt_same_id),
+            Some(writer_keyring),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_keyring_policy_never_uses_a_metadata_projection_as_a_complete_record() {
+        use std::cell::{Cell, RefCell};
+
+        let old = complete_record(1, 1, "old-token", 10, "https://old.example/", 1);
+        let mut candidate = old.clone();
+        candidate.access_token = Some("new-token".into());
+        candidate.host_id = Some(Uuid::from_u128(20));
+        candidate.server_url = Some("https://new.example/".into());
+        let file_called = Cell::new(false);
+        assert!(save_with_backends(
+            &mut candidate,
+            BackendPolicy::NativeKeyring,
+            |_| bail!("injected required keyring failure"),
+            |_| {
+                file_called.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!file_called.get());
+
+        // Once the required complete keyring write succeeds, a later metadata
+        // projection failure is still reported. The next load uses the whole
+        // new keyring generation, never old-file metadata.
+        let mut keyring_first = old.clone();
+        keyring_first.access_token = Some("keyring-new-token".into());
+        keyring_first.host_id = Some(Uuid::from_u128(30));
+        keyring_first.server_url = Some("https://keyring-new.example/".into());
+        let written_keyring = RefCell::new(None);
+        assert!(save_with_backends(
+            &mut keyring_first,
+            BackendPolicy::NativeKeyring,
+            |record| {
+                *written_keyring.borrow_mut() = Some(record.clone());
+                Ok(())
+            },
+            |_| bail!("injected metadata file failure"),
+        )
+        .is_err());
+        let keyring_new = written_keyring.into_inner().unwrap();
+        let old_projection = file_creds_without_private_seed(&old);
+        let loaded = reconcile_backend_records(
+            Some(old_projection),
+            Some(keyring_new.clone()),
+            BackendPolicy::NativeKeyring,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &keyring_new);
+
+        let mut newer_file = file_creds_without_private_seed(&candidate);
+        newer_file.credential_generation = Some(99);
+        newer_file.credential_record_id = Some(Uuid::from_u128(99).to_string());
+        let loaded = reconcile_backend_records(
+            Some(newer_file),
+            Some(old.clone()),
+            BackendPolicy::NativeKeyring,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &old);
+
+        let projection = file_creds_without_private_seed(&old);
+        let loaded = reconcile_backend_records(
+            Some(projection),
+            Some(old.clone()),
+            BackendPolicy::NativeKeyring,
+        )
+        .unwrap();
+        assert_same_coherent_record(&loaded, &old);
+    }
+
+    #[test]
+    fn malformed_or_partial_generation_markers_fail_closed() {
+        let mut partial = fixed_creds();
+        partial.credential_record_version = Some(CREDENTIAL_RECORD_VERSION);
+        assert!(validate_loaded_creds(&partial).is_err());
+
+        for (version, generation, record_id) in [
+            (Some(2), Some(1), Some(Uuid::from_u128(1).to_string())),
+            (
+                Some(CREDENTIAL_RECORD_VERSION),
+                Some(0),
+                Some(Uuid::from_u128(1).to_string()),
+            ),
+            (
+                Some(CREDENTIAL_RECORD_VERSION),
+                Some(1),
+                Some("NOT-A-CANONICAL-UUID".into()),
+            ),
+        ] {
+            let malformed = StoredCreds {
+                credential_record_version: version,
+                credential_generation: generation,
+                credential_record_id: record_id,
+                ..fixed_creds()
+            };
+            assert!(validate_loaded_creds(&malformed).is_err());
+        }
+
+        let mut incomplete_keyring =
+            complete_record(1, 1, "token", 1, "https://server.example/", 1);
+        incomplete_keyring.host_private_key_seed = None;
+        let encoded = serde_json::to_string(&incomplete_keyring).unwrap();
+        assert!(decode_keyring_value(&encoded).is_err());
+    }
+
+    #[test]
     fn successful_relogin_preserves_existing_pins_and_redacts_status() {
         let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
         let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
@@ -1192,25 +1771,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_keyring_bundle_wipes_loaded_fallback_secrets() {
-        let mut fallback = fixed_creds();
-        fallback.access_token = Some("fallback-access-token".into());
+    fn malformed_keyring_bundle_is_wiped_without_touching_the_file_record() {
+        let fallback = fixed_creds();
+        let before = fallback.clone();
         let mut malformed = "{not-json".to_string();
 
-        assert!(merge_keyring_value(&mut fallback, &mut malformed).is_err());
+        assert!(decode_keyring_value_and_wipe(&mut malformed).is_err());
         assert!(malformed.bytes().all(|byte| byte == 0));
-        assert!(fallback
-            .access_token
-            .as_deref()
-            .expect("the allocation remains available for inspection")
-            .bytes()
-            .all(|byte| byte == 0));
-        assert!(fallback
-            .host_private_key_seed
-            .as_deref()
-            .expect("the allocation remains available for inspection")
-            .bytes()
-            .all(|byte| byte == 0));
+        assert!(fallback == before);
     }
 
     #[test]
@@ -1246,43 +1814,55 @@ mod tests {
         let path = temp.path().join("credentials.json");
         let mut original = fixed_creds();
         merge_browser_pin(&mut original, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        advance_credential_generation(&mut original).unwrap();
         let expected = host_identity(&original).unwrap();
         save_file_at(&path, &original).unwrap();
         let restored = load_file_at(&path).unwrap();
+        assert_same_coherent_record(&restored, &original);
         assert_eq!(
             restored.host_private_key_seed,
             original.host_private_key_seed
         );
         assert_eq!(host_identity(&restored).unwrap(), expected);
         assert_eq!(restored.browser_pins(), original.browser_pins());
+
+        let mut keyring_json = serde_json::to_string(&original).unwrap();
+        let keyring_restored = decode_keyring_value_and_wipe(&mut keyring_json).unwrap();
+        assert_same_coherent_record(&keyring_restored, &original);
+        assert!(keyring_json.is_empty());
     }
 
     #[test]
-    fn keyring_bundle_merges_compatible_pins_and_rejects_conflicts() {
+    fn legacy_keyring_bundle_migrates_compatible_pins_and_rejects_conflicts() {
         let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
         let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
-        let mut fallback = fixed_creds();
+        let mut fallback = StoredCreds::default();
         merge_browser_pin(&mut fallback, first.clone()).unwrap();
-        let bundle = StoredSecrets {
-            access_token: Some("keyring-token".into()),
-            host_private_key_seed: None,
-            browser_pins: Some(vec![first.clone(), second.clone()]),
-        };
+        let mut bundle = fixed_creds();
+        bundle.access_token = Some("keyring-token".into());
+        bundle.browser_pins = vec![first.clone(), second.clone()];
         let mut encoded = serde_json::to_string(&bundle).unwrap();
-        merge_keyring_value(&mut fallback, &mut encoded).unwrap();
-        assert_eq!(fallback.access_token.as_deref(), Some("keyring-token"));
-        assert_eq!(fallback.browser_pins(), &[first.clone(), second]);
+        let keyring = decode_keyring_value_and_wipe(&mut encoded).unwrap();
+        let merged =
+            reconcile_backend_records(Some(fallback), Some(keyring), BackendPolicy::NativeKeyring)
+                .unwrap();
+        assert_eq!(merged.access_token.as_deref(), Some("keyring-token"));
+        assert_eq!(merged.browser_pins(), &[first.clone(), second]);
         assert!(encoded.bytes().all(|byte| byte == 0));
 
-        let mut conflicting = fixed_creds();
-        merge_browser_pin(&mut conflicting, first.clone()).unwrap();
-        let bundle = StoredSecrets {
-            access_token: None,
-            host_private_key_seed: None,
-            browser_pins: Some(vec![browser_pin(Uuid::from_u128(1), RFC_KEY_TWO)]),
+        let mut conflicting = StoredCreds::default();
+        merge_browser_pin(&mut conflicting, first).unwrap();
+        let bundle = StoredCreds {
+            access_token: Some("keyring-token".into()),
+            browser_pins: vec![browser_pin(Uuid::from_u128(1), RFC_KEY_TWO)],
+            ..StoredCreds::default()
         };
-        let mut encoded = serde_json::to_string(&bundle).unwrap();
-        assert!(merge_keyring_value(&mut conflicting, &mut encoded).is_err());
+        assert!(reconcile_backend_records(
+            Some(conflicting),
+            Some(bundle),
+            BackendPolicy::NativeKeyring,
+        )
+        .is_err());
     }
 
     #[test]

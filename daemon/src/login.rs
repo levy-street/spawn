@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::StatusCode;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::LoginArgs;
 use crate::config;
@@ -26,7 +27,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
     let identity = creds::ensure_host_identity(&mut stored)?;
-    creds::save(&stored).context("persisting host identity")?;
+    creds::save(&mut stored).context("persisting host identity")?;
 
     let host_name = args.host_name.unwrap_or_else(detect_hostname);
     let os = std::env::consts::OS.to_string();
@@ -142,53 +143,87 @@ fn commit_poll_success<F>(
     persist: F,
 ) -> Result<uuid::Uuid>
 where
-    F: FnOnce(&creds::StoredCreds) -> Result<()>,
+    F: FnOnce(&mut creds::StoredCreds) -> Result<()>,
 {
+    commit_poll_success_observed(stored, body, identity, server, persist, |_| {})
+}
+
+fn commit_poll_success_observed<F, O>(
+    stored: &mut creds::StoredCreds,
+    mut body: DevicePollResponse,
+    identity: &HostIdentity,
+    server: &url::Url,
+    persist: F,
+    observe_wiped_token: O,
+) -> Result<uuid::Uuid>
+where
+    F: FnOnce(&mut creds::StoredCreds) -> Result<()>,
+    O: FnOnce(&str),
+{
+    // Take secret ownership before inspecting any other success field. Every
+    // early return below leaves the token inside an auto-zeroizing allocation.
+    let mut token = body.access_token.take().map(Zeroizing::new);
     // The browser tuple is first-contact trust input. Do not inspect or decode
     // it until the existing host binding and success shape are exact.
-    verify_poll_identity(&body, identity)?;
-    if body.error.is_some() {
-        return Err(anyhow!("device/poll mixed success and error fields"));
+    let result = (|| {
+        verify_poll_identity(&body, identity)?;
+        if body.error.is_some() {
+            return Err(anyhow!("device/poll mixed success and error fields"));
+        }
+        let token_ref = token
+            .as_deref()
+            .context("device/poll success omitted access_token")?;
+        let host_id = body
+            .host_id
+            .context("device/poll success omitted host_id")?;
+        creds::validate_login_access_token(token_ref)?;
+        let browser_device_id = body
+            .browser_device_id
+            .as_deref()
+            .context("device/poll success omitted browser_device_id")?;
+        let browser_key_algorithm = body
+            .browser_key_algorithm
+            .as_deref()
+            .context("device/poll success omitted browser_key_algorithm")?;
+        let browser_public_key = body
+            .browser_public_key
+            .as_deref()
+            .context("device/poll success omitted browser_public_key")?;
+        let browser_key_fingerprint = body
+            .browser_key_fingerprint
+            .as_deref()
+            .context("device/poll success omitted browser_key_fingerprint")?;
+        let browser_pin = creds::browser_pin_from_approval(
+            browser_device_id,
+            browser_key_algorithm,
+            browser_public_key,
+            browser_key_fingerprint,
+        )
+        .context("validating approved browser identity from device/poll")?;
+        let owned_token = std::mem::take(
+            &mut **token
+                .as_mut()
+                .expect("validated poll access token remains owned"),
+        );
+        creds::commit_login_update(
+            stored,
+            owned_token,
+            host_id,
+            server.to_string(),
+            browser_pin,
+            persist,
+        )?;
+        Ok(host_id)
+    })();
+    if result.is_err() {
+        if let Some(token) = token.as_mut() {
+            token.zeroize();
+            observe_wiped_token(token.as_str());
+        } else {
+            observe_wiped_token("");
+        }
     }
-    let token = body
-        .access_token
-        .context("device/poll success omitted access_token")?;
-    let host_id = body
-        .host_id
-        .context("device/poll success omitted host_id")?;
-    creds::validate_login_access_token(&token)?;
-    let browser_device_id = body
-        .browser_device_id
-        .as_deref()
-        .context("device/poll success omitted browser_device_id")?;
-    let browser_key_algorithm = body
-        .browser_key_algorithm
-        .as_deref()
-        .context("device/poll success omitted browser_key_algorithm")?;
-    let browser_public_key = body
-        .browser_public_key
-        .as_deref()
-        .context("device/poll success omitted browser_public_key")?;
-    let browser_key_fingerprint = body
-        .browser_key_fingerprint
-        .as_deref()
-        .context("device/poll success omitted browser_key_fingerprint")?;
-    let browser_pin = creds::browser_pin_from_approval(
-        browser_device_id,
-        browser_key_algorithm,
-        browser_public_key,
-        browser_key_fingerprint,
-    )
-    .context("validating approved browser identity from device/poll")?;
-    creds::commit_login_update(
-        stored,
-        token,
-        host_id,
-        server.to_string(),
-        browser_pin,
-        persist,
-    )?;
-    Ok(host_id)
+    result
 }
 
 fn verify_poll_identity(body: &DevicePollResponse, identity: &HostIdentity) -> Result<()> {
@@ -339,6 +374,58 @@ mod tests {
             )
             .unwrap_err();
             assert!(format!("{error:#}").contains("access token"));
+        }
+    }
+
+    #[test]
+    fn every_early_poll_failure_observes_a_wiped_returned_token() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut cases = Vec::new();
+
+        let mut wrong_host = complete_response();
+        wrong_host.host_public_key = Some("different-host".into());
+        cases.push(wrong_host);
+
+        let mut mixed = complete_response();
+        mixed.error = Some("denied".into());
+        cases.push(mixed);
+
+        let mut missing_host_id = complete_response();
+        missing_host_id.host_id = None;
+        cases.push(missing_host_id);
+
+        let mut missing_browser_field = complete_response();
+        missing_browser_field.browser_public_key = None;
+        cases.push(missing_browser_field);
+
+        let mut invalid_token = complete_response();
+        invalid_token.access_token = Some("x".repeat(12 * 1024 + 1));
+        cases.push(invalid_token);
+
+        let mut invalid_pin = complete_response();
+        invalid_pin.browser_public_key = Some("short".into());
+        cases.push(invalid_pin);
+
+        for body in cases {
+            let observed = std::cell::Cell::new(false);
+            let persisted = std::cell::Cell::new(false);
+            assert!(commit_poll_success_observed(
+                &mut creds::StoredCreds::default(),
+                body,
+                &identity(),
+                &server,
+                |_| {
+                    persisted.set(true);
+                    Ok(())
+                },
+                |wiped| {
+                    observed.set(true);
+                    assert!(wiped.is_empty());
+                },
+            )
+            .is_err());
+            assert!(observed.get());
+            assert!(!persisted.get());
         }
     }
 

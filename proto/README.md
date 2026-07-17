@@ -66,6 +66,15 @@ yet. Server-side browser revocation does not silently delete a daemon-local
 pin; explicit re-pairing and local pin-management commands are required future
 work.
 
+The protected credential copies are generation-bound whole records. The
+daemon chooses one complete record by monotonic generation and unique record
+ID after interrupted or concurrent backend writes; it never overlays a token,
+host ID/server, private host seed, or browser pins from different commits.
+Legacy records without a generation are migrated on their next successful
+save. The Unix mode-0600 fallback remains a complete usable record if the
+keyring is unavailable; on native platforms the keyring remains the only
+seed-bearing complete record.
+
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
 Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
