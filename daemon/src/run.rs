@@ -370,6 +370,24 @@ where
             return Ok(ServeOutcome::CredentialsChanged(Box::new(reloaded)));
         }
     };
+    // A durable commit can land while DNS/TCP/TLS/WebSocket negotiation is in
+    // flight after the pre-connect gate. Recheck before splitting the socket,
+    // registering the host, installing sinks, or accepting any control/RTC
+    // frame; a stale handshake is dropped without becoming an admitted daemon
+    // session.
+    match credential_change_now_with(live_credentials, load.clone()) {
+        Ok(Some(next)) => {
+            drop(stream);
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Ok(ServeOutcome::CredentialsChanged(Box::new(next)));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            drop(stream);
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Err(error);
+        }
+    }
     tracing::info!(%ws_url, "ws connected");
 
     let (write_half, read_half) = stream.split();

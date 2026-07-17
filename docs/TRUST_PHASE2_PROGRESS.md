@@ -647,11 +647,13 @@ and refusal rather than stale reconnect acceptance.
 daemon supervisor now owns exactly one validated current credential generation
 containing its access token, host signing key, canonical server-origin + exact
 Host-ID domain, and bounded browser-pin set. It rereads the complete record
-immediately before every WebSocket attempt and polls one complete load at a
-bounded 500 ms interval while connected or backing off. An unchanged revision
-must be field-for-field the same decoded record; a same-revision substitution,
-generation rollback/non-advance, reused record identity, missing
-login/key/domain, changed Host ID/origin, or corrupt/noncanonical key or pin
+immediately before every WebSocket attempt and again after handshake but before
+host registration, sink installation, or control/RTC admission. It polls one
+complete load at a bounded 500 ms interval while connected or backing off. An
+unchanged revision must be field-for-field the same decoded record; a
+same-revision substitution, generation rollback/non-advance, reused record
+identity, missing login/key/domain, changed Host ID/origin, or
+corrupt/noncanonical key or pin
 fails closed without keeping the old authorization active. A valid higher
 generation tears down the old WebSocket/RTC authorization before reconnecting
 with its new token.
