@@ -374,9 +374,72 @@ expected_server_attribute_reads = Counter({
 })
 
 
-def python_attrgetter_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+def python_attrgetter_callable(
+    node: ast.AST,
+    operator_modules: set[str],
+    callables: set[str],
+    containers: set[str],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in callables
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == "attrgetter"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in operator_modules
+    ):
+        return True
+    if isinstance(node, ast.Subscript):
+        return python_attrgetter_container(
+            node.value, operator_modules, callables, containers
+        )
+    return False
+
+
+def python_attrgetter_container(
+    node: ast.AST,
+    operator_modules: set[str],
+    callables: set[str],
+    containers: set[str],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in containers
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(
+            python_attrgetter_callable(item, operator_modules, callables, containers)
+            or python_attrgetter_container(item, operator_modules, callables, containers)
+            for item in node.elts
+        )
+    if isinstance(node, ast.Dict):
+        return any(
+            item is not None
+            and (
+                python_attrgetter_callable(item, operator_modules, callables, containers)
+                or python_attrgetter_container(item, operator_modules, callables, containers)
+            )
+            for item in (*node.keys, *node.values)
+        )
+    if isinstance(node, ast.Subscript):
+        return python_attrgetter_container(
+            node.value, operator_modules, callables, containers
+        )
+    return False
+
+
+def python_assignment_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(*(python_assignment_names(item) for item in target.elts))
+    return set()
+
+
+def python_attrgetter_bindings(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str]]:
     operator_modules = {"operator"}
     callables = {"attrgetter"}
+    containers: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for name in node.names:
@@ -392,37 +455,63 @@ def python_attrgetter_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             if isinstance(node, ast.Assign):
-                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                    continue
-                target, value = node.targets[0].id, node.value
+                targets = set().union(
+                    *(python_assignment_names(target) for target in node.targets)
+                )
+                value = node.value
             else:
-                if not isinstance(node.target, ast.Name) or node.value is None:
+                if node.value is None:
                     continue
-                target, value = node.target.id, node.value
-            resolved = (
-                isinstance(value, ast.Name) and value.id in callables
-            ) or (
-                isinstance(value, ast.Attribute)
-                and value.attr == "attrgetter"
-                and isinstance(value.value, ast.Name)
-                and value.value.id in operator_modules
+                targets = python_assignment_names(node.target)
+                value = node.value
+            resolved_callable = python_attrgetter_callable(
+                value, operator_modules, callables, containers
             )
-            if resolved and target not in callables:
-                callables.add(target)
-                changed = True
+            resolved_container = python_attrgetter_container(
+                value, operator_modules, callables, containers
+            )
+            for target in targets:
+                if resolved_callable and target not in callables:
+                    callables.add(target)
+                    changed = True
+                if resolved_container:
+                    if target not in containers:
+                        containers.add(target)
+                        changed = True
+                    if target not in callables:
+                        # A destructured or indexed container may yield the
+                        # callable; treating the alias itself conservatively
+                        # prevents another storage hop from erasing that flow.
+                        callables.add(target)
+                        changed = True
         if not changed:
             break
-    return operator_modules, callables
+    return operator_modules, callables, containers
 
 
 class LegacyStringVisitor(ast.NodeVisitor):
     def __init__(self, relative: str, tree: ast.Module, bindings: dict[str, str]) -> None:
         self.relative = relative
         self.bindings = bindings
-        self.operator_modules, self.attrgetter_callables = python_attrgetter_bindings(tree)
+        (
+            self.operator_modules,
+            self.attrgetter_callables,
+            self.attrgetter_containers,
+        ) = python_attrgetter_bindings(tree)
         self.scope = ["<module>"]
         self.legacy = Counter()
         self.protected_attributes = Counter()
+        self.attrgetter_references = Counter()
+
+    def visit(self, node: ast.AST):
+        if (
+            isinstance(node, ast.expr)
+            and static_python_string(node, self.bindings) == "attrgetter"
+        ):
+            self.attrgetter_references[
+                (self.relative, self.scope[-1], f"static-string:{node.lineno}")
+            ] += 1
+        return super().visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.scope.append(node.name)
@@ -431,11 +520,34 @@ class LegacyStringVisitor(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "operator":
+            for name in node.names:
+                if name.name == "attrgetter":
+                    self.attrgetter_references[
+                        (self.relative, self.scope[-1], "import")
+                    ] += 1
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id in self.attrgetter_callables:
+            self.attrgetter_references[
+                (self.relative, self.scope[-1], f"name:{node.id}")
+            ] += 1
+
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str) and node.value.startswith("host.tools."):
             self.legacy[(self.relative, self.scope[-1], node.value)] += 1
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if (
+            node.attr == "attrgetter"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.operator_modules
+        ):
+            self.attrgetter_references[
+                (self.relative, self.scope[-1], "operator.attrgetter")
+            ] += 1
         if node.attr in protected_server_attributes:
             self.protected_attributes[(self.relative, self.scope[-1], node.attr)] += 1
         self.generic_visit(node)
@@ -448,13 +560,11 @@ class LegacyStringVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        is_attrgetter = (
-            isinstance(node.func, ast.Name) and node.func.id in self.attrgetter_callables
-        ) or (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "attrgetter"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in self.operator_modules
+        is_attrgetter = python_attrgetter_callable(
+            node.func,
+            self.operator_modules,
+            self.attrgetter_callables,
+            self.attrgetter_containers,
         )
         if is_attrgetter:
             for argument in node.args:
@@ -463,6 +573,15 @@ class LegacyStringVisitor(ast.NodeVisitor):
                     self.protected_attributes[
                         (self.relative, self.scope[-1], f"attrgetter:{value}")
                     ] += 1
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and static_python_string(node.args[1], self.bindings) == "attrgetter"
+        ):
+            self.attrgetter_references[
+                (self.relative, self.scope[-1], "getattr:attrgetter")
+            ] += 1
         if (
             isinstance(node.func, ast.Name)
             and node.func.id == "getattr"
@@ -488,6 +607,7 @@ class LegacyStringVisitor(ast.NodeVisitor):
 
 found_legacy_strings = Counter()
 found_server_attribute_reads = Counter()
+found_attrgetter_references = Counter()
 for relative, tree in server_trees.items():
     visitor = LegacyStringVisitor(
         relative, tree, server_string_bindings.get(relative, {})
@@ -495,10 +615,13 @@ for relative, tree in server_trees.items():
     visitor.visit(tree)
     found_legacy_strings.update(visitor.legacy)
     found_server_attribute_reads.update(visitor.protected_attributes)
+    found_attrgetter_references.update(visitor.attrgetter_references)
 if found_legacy_strings != expected_legacy_strings:
     die(f"exact legacy server tool frame inventory changed: {found_legacy_strings!r}")
 if found_server_attribute_reads != expected_server_attribute_reads:
     die(f"protected server field access inventory changed: {found_server_attribute_reads!r}")
+if found_attrgetter_references:
+    die(f"unreviewed operator.attrgetter reference: {found_attrgetter_references!r}")
 
 
 # Browser production has its query plus authoritative reconciliation metadata
@@ -710,7 +833,7 @@ def rust_production_source(source: str) -> str:
 
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
-    "daemon/src/host_tools.rs": "43f116f6b38d0e14f988a386d88b45a96ebfdd43713a74ba3476adbd70b2a881",
+    "daemon/src/host_tools.rs": "9a6478f355ee81b1304506fed2f788d6039fcae96a82cbdfba0ca7032390f372",
     "daemon/src/main.rs": "74eb113f9acb3746632bdfeb8369e619a34b8fc44f86f7703a1d86bce432b754",
     "daemon/src/run.rs": "331508f7d1f573f2cf1ea9cda7343a3dca2a9e7f818217e0fb06346af5c5b8e6",
     "daemon/src/worker_backend.rs": "085b56874c94ec644c3255ed8b521a032b23564abb7afcd810bc4bb5e46b8105",
@@ -724,7 +847,7 @@ rust_guard_root = rust_guard_manifest.parent
 expected_rust_guard_hashes = {
     "Cargo.toml": "f6f0fbd99fe844b2b94a83d7d150a35dc52b00cab395b681133867712d365d14",
     "Cargo.lock": "0a1cdcd7d34c1226af937fa16daaf8a3ac4e96cdd39d38f58c3f254675744e73",
-    "src/main.rs": "db4143dfdb814b084c7d8b9a5b09a8a177c67197f1dada7ed486b14c496df4ed",
+    "src/main.rs": "3b9ab9ce9e69e1f16d7c0c4c7f9b5d000d9c1f86c745fc7ffee995e5fa7d2830",
 }
 found_rust_guard_files = {
     path.relative_to(rust_guard_root).as_posix()
@@ -762,6 +885,11 @@ found_rust_process_inventory = [
 ]
 expected_rust_process_inventory = [
     "process-call\tdaemon/src/host_tools.rs\tcommand-new",
+    "process-call\tdaemon/src/host_tools.rs\tsyscall",
+    "process-call\tdaemon/src/host_tools.rs\tsyscall",
+    "process-call\tdaemon/src/host_tools.rs\tsyscall",
+    "process-call\tdaemon/src/host_tools.rs\tsyscall",
+    "process-call\tdaemon/src/host_tools.rs\tsyscall",
     "process-call\tdaemon/src/run.rs\tcommand-new",
     "process-call\tdaemon/src/run.rs\tcommand-new",
     "process-call\tdaemon/src/run.rs\tcommand-new",
@@ -774,7 +902,7 @@ if found_rust_process_inventory != expected_rust_process_inventory:
         "parsed Rust foreign/process launch inventory changed: "
         f"{found_rust_process_inventory!r}"
     )
-expected_rust_structural_digest = "4fa199dcd84deacbef63cc5807405fb21daa88c5799bd309a25fb5d3e5fb7422"
+expected_rust_structural_digest = "7a252adb47c708b5ab2b7d5f6f6d5694a745935d7faa638cd842c7045a9c5742"
 found_rust_structural_digest = hashlib.sha256(structural.stdout.encode()).hexdigest()
 if found_rust_structural_digest != expected_rust_structural_digest:
     die(
@@ -1443,6 +1571,50 @@ def indirect(value):
 PY
   expect_rejected server-attrgetter-callable-alias
 
+  new_case server-attrgetter-container-alias
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+selectors = ({"pick": (operator.attrgetter,)},)
+def indirect_container(value):
+    return selectors[0]["pick"][0]("in" + "stall")(value)
+''')
+PY
+  expect_rejected server-attrgetter-container-alias
+
+  new_case server-attrgetter-return-reference
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+def give_selector():
+    return operator.attrgetter
+def hidden_return(value):
+    return give_selector()("install")(value)
+''')
+PY
+  expect_rejected server-attrgetter-return-reference
+
+  new_case server-attrgetter-reflection-alias
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+lookup = getattr
+selector_name = "attr" + "getter"
+def hidden_reflection(value):
+    return lookup(operator, selector_name)("install")(value)
+''')
+PY
+  expect_rejected server-attrgetter-reflection-alias
+
   new_case web-legacy-alias
   printf '%s\n' 'export const hostToolFallback = hosts["installTool"];' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
@@ -1560,6 +1732,49 @@ Path(sys.argv[1]).write_text('''fn dormant() {
 ''')
 PY
   expect_rejected daemon-raw-exec
+
+  new_case daemon-generic-exec-syscall
+  python3 - "$case_dir/daemon/src/activity.rs" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+fn hidden_generic_exec() {
+    let nr = nix::libc::SYS_execve;
+    unsafe { nix::libc::syscall(nr, std::ptr::null::<i8>()); }
+}
+''')
+PY
+  expect_rejected daemon-generic-exec-syscall
+
+  new_case daemon-stored-command-constructor
+  python3 - "$case_dir/daemon/src/activity.rs" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+struct HiddenLaunch(fn(&str) -> std::process::Command);
+fn hidden_stored_constructor() {
+    let holder = HiddenLaunch(std::process::Command::new);
+    (holder.0)("sh");
+}
+''')
+PY
+  expect_rejected daemon-stored-command-constructor
+
+  new_case daemon-dynamic-loader-reference
+  python3 - "$case_dir/daemon/src/activity.rs" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+fn hidden_dynamic_symbol() {
+    let resolver = nix::libc::dlsym;
+    let _ = resolver(std::ptr::null_mut(), b"execve\\0".as_ptr().cast());
+}
+''')
+PY
+  expect_rejected daemon-dynamic-loader-reference
 
   new_case daemon-escaped-ffi-link-name
   python3 - "$case_dir/daemon/src/escaped_ffi.rs" <<'PY'

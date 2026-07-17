@@ -215,8 +215,10 @@ inherited, architecture-reviewed seccomp filter. Tool writes are limited to
 HOME, temporary/runtime roots, and `/dev/null`; cgroup hierarchy writes, namespace
 and mount manipulation, ptrace/process-memory and fd-stealing APIs, BPF/perf,
 io_uring setup, and AF_UNIX manager connections are denied. All inherited FDs
-above stderr are marked close-on-exec. Execution fails closed when cgroup v2,
-Landlock, or the reviewed seccomp architecture is unavailable. Once
+above stderr are marked close-on-exec. On x86-64, x32-tagged syscall numbers
+are killed before native syscall dispatch or its default allow. Execution fails
+closed when cgroup v2, Landlock, or the reviewed seccomp architecture is
+unavailable. Once
 installation starts, any non-success, teardown, failed reconciliation, or lost
 acknowledgement is `outcome_unknown`, is never retried automatically, and must
 be reconciled with a separate `tool.check` whose idle effect-generation token
@@ -228,6 +230,18 @@ and DataChannel tasks. The daemon is a child subreaper. Process,
 session-long-task, and same-tool install permits remain held until the cgroup
 reports `populated 0`, inventoried descendants are waited/reaped, both pipes
 have finished or been aborted and joined, and the cgroup directory is removed.
+A single absolute cleanup deadline covers freeze, PID inventory, population,
+direct-child wait, raw reap, and recursive removal. Filesystem inventories and
+removal run off the async runtime; a timed-out task stays owned by the
+containment and is awaited without a concurrent retry. Partial PID inventories
+are retained, and a post-kill `/proc` cgroup-membership scan finds adopted
+zombies that `cgroup.procs` no longer reports. Any residual containment is
+registered atomically in a capped quarantine before process capacity or effect
+claims are released. That quarantine globally rejects new tool processes and
+cannot reconcile an ambiguous install until its tracked reaper drains and a
+new definitive check succeeds. Repeated pre-spawn failures settle their empty
+cgroups through the same ownership path and do not accumulate capacity or
+cleanup workers.
 A successful direct parent that leaves a closed-stdio `setsid` descendant
 behind is killed and reported as a failed operation; its permit cannot be
 released while that descendant survives. Regressions also prove that a
@@ -276,10 +290,16 @@ browser/endpoint shell fallbacks (including aliased arrays and `.join()`
 chains, encoded strings, generically named dependencies, unresolved spawn
 arguments, and `.args(["-c"])`), moved operation names,
 login-shell probing, protected logging, and canonical-policy drift. Python AST,
-TypeScript AST, and rustc AST inventories bind the reviewed routes, protected
-field accesses, API helpers, reconciliation logic, parser rules, process-launch
-sites, and command policy. Comments or unreachable duplicate sentinels cannot
-satisfy those structural checks. The exact HOST-03B compatibility inventory,
+TypeScript AST, and a locked parsed Rust helper bind the reviewed routes,
+protected field accesses, API helpers, reconciliation logic, parser rules,
+process-launch sites, and command policy. The Python boundary has a zero
+baseline for `operator.attrgetter` imports, references, aliases, containers,
+subscripts, returned callables, and statically constructed reflection strings.
+The Rust boundary pins the parsed token structure of every production daemon
+source and separately inventories function-item references, generic syscalls,
+dynamic-loader symbols, escaped FFI link names, lexical aliases, glob/type/
+extern imports, and macro token trees. Comments or unreachable duplicate
+sentinels cannot satisfy those structural checks. The exact HOST-03B compatibility inventory,
 tool-failure handling, and expanded adversarial `--self-test` run from
 `scripts/test-all.sh`.
 

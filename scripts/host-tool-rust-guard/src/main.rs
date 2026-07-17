@@ -134,6 +134,11 @@ fn process_symbol(symbol: &str) -> bool {
             | "posix_spawnp"
             | "popen"
             | "system"
+            | "syscall"
+            | "dlopen"
+            | "dlmopen"
+            | "dlsym"
+            | "dlvsym"
     )
 }
 
@@ -543,11 +548,12 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         }
     }
 
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let Expr::Path(path) = node.func.as_ref() {
-            self.record_call_path(path);
-        }
-        visit::visit_expr_call(self, node);
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        // Function items can be stored in tuples, fields, constants, or other
+        // containers and invoked later. Inventory every expression reference,
+        // not only paths that happen to be the immediate target of a call.
+        self.record_call_path(node);
+        visit::visit_expr_path(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -612,6 +618,11 @@ fn main() {
         let file = syn::parse_file(&source)
             .unwrap_or_else(|error| panic!("cannot parse {display}: {error}"));
         records.push(format!("source-file\t{display}"));
+        records.push(format!(
+            "source-structure\t{}\t{}",
+            display,
+            encode_hex(&file.to_token_stream().to_string())
+        ));
         records.extend(inventory(&display, &file));
     }
     records.sort();

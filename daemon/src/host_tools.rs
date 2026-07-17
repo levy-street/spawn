@@ -42,6 +42,9 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTAINMENT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const QUARANTINE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_CONTAINMENT_TREE_DEPTH: usize = 64;
+const MAX_CONTAINMENT_TREE_ENTRIES: usize = 4_096;
+const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
 const SPAWN_BUSY_RETRIES: usize = 3;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 pub(crate) const MAX_PROCESSES: usize = 4;
@@ -217,11 +220,17 @@ struct HostToolLifecycleHooks {
     #[cfg(test)]
     cleanup_freeze: AsyncPause,
     #[cfg(test)]
+    cleanup_inventory: AsyncPause,
+    #[cfg(test)]
     cleanup_populated: AsyncPause,
     #[cfg(test)]
     cleanup_reap: AsyncPause,
     #[cfg(test)]
+    cleanup_remove: AsyncPause,
+    #[cfg(test)]
     quarantine_reaper: AsyncPause,
+    #[cfg(test)]
+    fail_pre_spawn: AtomicBool,
     #[cfg(all(test, target_os = "linux"))]
     containment_path: StdMutex<Option<PathBuf>>,
 }
@@ -319,11 +328,27 @@ impl HostToolLifecycleHooks {
         true
     }
 
+    async fn pause_cleanup_inventory_io(&self) {
+        #[cfg(test)]
+        if self.cleanup_inventory.armed.swap(false, Ordering::AcqRel) {
+            self.cleanup_inventory.entered.notify_one();
+            self.cleanup_inventory.release.notified().await;
+        }
+    }
+
     async fn cleanup_reap_until(&self, _deadline: tokio::time::Instant) -> bool {
         #[cfg(test)]
         return self.cleanup_reap.pause_until(_deadline).await;
         #[cfg(not(test))]
         true
+    }
+
+    async fn pause_cleanup_remove_io(&self) {
+        #[cfg(test)]
+        if self.cleanup_remove.armed.swap(false, Ordering::AcqRel) {
+            self.cleanup_remove.entered.notify_one();
+            self.cleanup_remove.release.notified().await;
+        }
     }
 
     async fn pause_quarantine_reaper(&self) {
@@ -332,6 +357,13 @@ impl HostToolLifecycleHooks {
             self.quarantine_reaper.entered.notify_one();
             self.quarantine_reaper.release.notified().await;
         }
+    }
+
+    fn take_pre_spawn_failure(&self) -> bool {
+        #[cfg(test)]
+        return self.fail_pre_spawn.swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        false
     }
 }
 
@@ -717,8 +749,8 @@ impl HostToolService {
             &resolved,
             &args,
             env,
-            INSTALL_TIMEOUT,
             ProgramCancellation {
+                timeout: INSTALL_TIMEOUT,
                 request: &cancelled,
                 shutdown: &shutdown,
             },
@@ -963,8 +995,8 @@ impl HostToolService {
             &path,
             policy.version_args,
             env,
-            check_timeout,
             ProgramCancellation {
+                timeout: check_timeout,
                 request: cancelled,
                 shutdown,
             },
@@ -1060,8 +1092,8 @@ impl HostToolService {
             &path,
             &args,
             env,
-            timeout,
             ProgramCancellation {
+                timeout,
                 request: cancelled,
                 shutdown,
             },
@@ -1708,10 +1740,18 @@ impl ToolSandbox {
 }
 
 #[cfg(target_os = "linux")]
+struct ContainmentInventory {
+    pids: HashSet<i32>,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
 struct ToolContainment {
     path: PathBuf,
     cleaned: bool,
     reap_pids: HashSet<i32>,
+    pending_inventory: Option<tokio::task::JoinHandle<ContainmentInventory>>,
+    pending_removal: Option<tokio::task::JoinHandle<Result<(), String>>>,
     lifecycle_hooks: Arc<HostToolLifecycleHooks>,
 }
 
@@ -1747,14 +1787,14 @@ impl ToolContainment {
             let path = parent.join(format!("spawn-tool-{}-{sequence}", std::process::id()));
             match std::fs::create_dir(&path) {
                 Ok(()) => {
-                    let containment = Self {
+                    return Ok(Self {
                         path,
                         cleaned: false,
                         reap_pids: HashSet::new(),
+                        pending_inventory: None,
+                        pending_removal: None,
                         lifecycle_hooks,
-                    };
-                    containment.validate_files()?;
-                    return Ok(containment);
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -1858,12 +1898,96 @@ impl ToolContainment {
             .map_err(|error| format!("cannot kill tool containment: {error}"))
     }
 
+    async fn inventory_pids_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let mut task = self.pending_inventory.take().unwrap_or_else(|| {
+            let path = self.path.clone();
+            let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
+            tokio::spawn(async move {
+                lifecycle_hooks.pause_cleanup_inventory_io().await;
+                match tokio::task::spawn_blocking(move || {
+                    inventory_containment_pids_until(&path, deadline)
+                })
+                .await
+                {
+                    Ok(inventory) => inventory,
+                    Err(error) => ContainmentInventory {
+                        pids: HashSet::new(),
+                        error: Some(format!(
+                            "tool containment PID inventory blocking task failed: {error}"
+                        )),
+                    },
+                }
+            })
+        });
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(inventory)) => {
+                self.reap_pids.extend(inventory.pids);
+                if tokio::time::Instant::now() >= deadline {
+                    Err(
+                        "tool containment PID inventory completed after its cleanup deadline"
+                            .into(),
+                    )
+                } else if let Some(error) = inventory.error {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Err(error)) => Err(format!(
+                "tool containment PID inventory task failed: {error}"
+            )),
+            Err(_) => {
+                self.pending_inventory = Some(task);
+                Err("tool containment PID inventory exceeded its cleanup deadline".into())
+            }
+        }
+    }
+
+    async fn remove_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let mut task = self.pending_removal.take().unwrap_or_else(|| {
+            let path = self.path.clone();
+            let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
+            tokio::spawn(async move {
+                lifecycle_hooks.pause_cleanup_remove_io().await;
+                tokio::task::spawn_blocking(move || remove_cgroup_tree_until(&path, deadline))
+                    .await
+                    .map_err(|error| {
+                        format!("tool containment removal blocking task failed: {error}")
+                    })?
+            })
+        });
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(Ok(()))) => {
+                self.cleaned = true;
+                if tokio::time::Instant::now() >= deadline {
+                    Err("tool containment removal completed after its cleanup deadline".into())
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(error)) => Err(format!("tool containment removal task failed: {error}")),
+            Err(_) => {
+                self.pending_removal = Some(task);
+                Err("tool containment removal exceeded its cleanup deadline".into())
+            }
+        }
+    }
+
     async fn kill_if_populated_until(
         &mut self,
         deadline: tokio::time::Instant,
     ) -> Result<bool, String> {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = self.kill_now();
+            return Err("tool containment cleanup deadline elapsed before population check".into());
+        }
         let populated = self.populated()?;
         if populated {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self.kill_now();
+                return Err("tool containment cleanup deadline elapsed before freeze".into());
+            }
             std::fs::write(self.path.join("cgroup.freeze"), b"1\n")
                 .map_err(|error| format!("cannot freeze tool containment: {error}"))?;
             let freeze_hook_completed = self.lifecycle_hooks.cleanup_freeze_until(deadline).await;
@@ -1875,7 +1999,10 @@ impl ToolContainment {
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            let inventory_result = inventory_cgroup_pids(&self.path, &mut self.reap_pids);
+            let inventory_result = self.inventory_pids_until(deadline).await;
+            // Killing is attempted even when freeze or inventory failed. The
+            // inventory is bounded by the same absolute deadline, so it cannot
+            // turn a stalled freeze into an unbounded pre-kill traversal.
             let kill_result = self.kill_now();
             if freeze_timed_out {
                 let suffix = kill_result
@@ -1893,24 +2020,44 @@ impl ToolContainment {
     }
 
     async fn settle_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if self.pending_removal.is_some() {
+            return self.remove_until(deadline).await;
+        }
+        if self.pending_inventory.is_some() {
+            if let Err(error) = self.inventory_pids_until(deadline).await {
+                let _ = self.kill_now();
+                return Err(error);
+            }
+        }
         let initial_kill = self.kill_if_populated_until(deadline).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(initial_kill.err().unwrap_or_else(|| {
+                "tool containment cleanup exceeded its deadline after kill".into()
+            }));
+        }
         if !self.lifecycle_hooks.cleanup_populated_until(deadline).await {
             let _ = self.kill_now();
             return Err("tool containment remained populated past the cleanup deadline".into());
         }
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self.kill_now();
+                return Err("tool containment remained populated past the cleanup deadline".into());
+            }
             if !self.populated()? {
                 break;
             }
             self.kill_now()?;
-            if tokio::time::Instant::now() >= deadline {
-                return Err("tool containment remained populated past the cleanup deadline".into());
-            }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        if let Err(error) = initial_kill {
-            return Err(error);
-        }
+        initial_kill?;
+        // cgroup.procs excludes zombies. A second containment inventory after
+        // cgroup.kill scans /proc membership too, so adopted descendants remain
+        // reapable even if the pre-kill inventory timed out or was partial.
+        self.inventory_pids_until(deadline).await?;
         if !self.lifecycle_hooks.cleanup_reap_until(deadline).await {
             return Err("tool descendants were not reaped before the cleanup deadline".into());
         }
@@ -1918,14 +2065,13 @@ impl ToolContainment {
         for raw_pid in reap_pids {
             let pid = nix::unistd::Pid::from_raw(raw_pid);
             loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(
+                        "tool descendants were not reaped before the cleanup deadline".into(),
+                    );
+                }
                 match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
                     Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(
-                                "tool descendants were not reaped before the cleanup deadline"
-                                    .into(),
-                            );
-                        }
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     Ok(_) | Err(nix::errno::Errno::ECHILD) => {
@@ -1941,9 +2087,7 @@ impl ToolContainment {
         if tokio::time::Instant::now() >= deadline {
             return Err("tool containment cleanup exceeded its deadline".into());
         }
-        remove_cgroup_tree(&self.path)?;
-        self.cleaned = true;
-        Ok(())
+        self.remove_until(deadline).await
     }
 }
 
@@ -1986,19 +2130,111 @@ impl ToolResidueAdmission {
 }
 
 #[cfg(target_os = "linux")]
-fn inventory_cgroup_pids(path: &Path, pids: &mut HashSet<i32>) -> Result<(), String> {
+fn inventory_containment_pids_until(
+    path: &Path,
+    deadline: tokio::time::Instant,
+) -> ContainmentInventory {
+    let mut pids = HashSet::new();
+    let mut entries_seen = 0;
+    let cgroup_error =
+        inventory_cgroup_pids_inner(path, &mut pids, deadline, 0, &mut entries_seen).err();
+    let proc_error = inventory_proc_cgroup_members_until(path, &mut pids, deadline).err();
+    let error = match (cgroup_error, proc_error) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    };
+    ContainmentInventory { pids, error }
+}
+
+#[cfg(target_os = "linux")]
+fn inventory_cgroup_pids_inner(
+    path: &Path,
+    pids: &mut HashSet<i32>,
+    deadline: tokio::time::Instant,
+    depth: usize,
+    entries_seen: &mut usize,
+) -> Result<(), String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("tool containment PID inventory exceeded its cleanup deadline".into());
+    }
+    if depth > MAX_CONTAINMENT_TREE_DEPTH {
+        return Err("tool containment PID inventory exceeded its depth limit".into());
+    }
     let procs = std::fs::read_to_string(path.join("cgroup.procs"))
         .map_err(|error| format!("cannot inventory contained tool processes: {error}"))?;
     pids.extend(procs.lines().filter_map(|value| value.parse::<i32>().ok()));
+    if tokio::time::Instant::now() >= deadline {
+        return Err("tool containment PID inventory exceeded its cleanup deadline".into());
+    }
     let entries = std::fs::read_dir(path)
         .map_err(|error| format!("cannot enumerate nested tool containment: {error}"))?;
     for entry in entries {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("tool containment PID inventory exceeded its cleanup deadline".into());
+        }
+        *entries_seen += 1;
+        if *entries_seen > MAX_CONTAINMENT_TREE_ENTRIES {
+            return Err("tool containment PID inventory exceeded its entry limit".into());
+        }
         let entry = entry.map_err(|error| format!("cannot inspect nested containment: {error}"))?;
         let file_type = entry
             .file_type()
             .map_err(|error| format!("cannot inspect nested containment entry: {error}"))?;
         if file_type.is_dir() {
-            inventory_cgroup_pids(&entry.path(), pids)?;
+            inventory_cgroup_pids_inner(&entry.path(), pids, deadline, depth + 1, entries_seen)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inventory_proc_cgroup_members_until(
+    path: &Path,
+    pids: &mut HashSet<i32>,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let relative = path
+        .strip_prefix("/sys/fs/cgroup")
+        .map_err(|_| "tool containment is outside the cgroup v2 mount".to_string())?;
+    let membership = format!("0::/{}", relative.to_string_lossy().trim_start_matches('/'));
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|error| format!("cannot enumerate process membership: {error}"))?;
+    let mut entries_seen = 0;
+    for entry in entries {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("tool containment process scan exceeded its cleanup deadline".into());
+        }
+        entries_seen += 1;
+        if entries_seen > MAX_PROC_SCAN_ENTRIES {
+            return Err("tool containment process scan exceeded its entry limit".into());
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let contents = match std::fs::read_to_string(entry.path().join("cgroup")) {
+            Ok(contents) => contents,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("cannot inspect process cgroup membership: {error}"));
+            }
+        };
+        if contents.lines().any(|line| line == membership) {
+            pids.insert(pid);
         }
     }
     Ok(())
@@ -2010,25 +2246,57 @@ impl Drop for ToolContainment {
         if self.cleaned {
             return;
         }
+        // Normal paths settle or quarantine before dropping. Drop itself must
+        // never run recursive filesystem work on the async runtime, and a
+        // timed-out removal task remains the sole owner of that mutation.
         let _ = self.kill_now();
-        if self.populated() == Ok(false) && remove_cgroup_tree(&self.path).is_ok() {
-            self.cleaned = true;
+        if self.pending_removal.is_none() {
+            // This constant, non-recursive leaf attempt only covers unwind.
+            // Every ordinary post-create failure is settled or quarantined.
+            let _ = std::fs::remove_dir(&self.path);
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn remove_cgroup_tree(path: &Path) -> Result<(), String> {
+fn remove_cgroup_tree_until(path: &Path, deadline: tokio::time::Instant) -> Result<(), String> {
+    let mut entries_seen = 0;
+    remove_cgroup_tree_inner(path, deadline, 0, &mut entries_seen)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_cgroup_tree_inner(
+    path: &Path,
+    deadline: tokio::time::Instant,
+    depth: usize,
+    entries_seen: &mut usize,
+) -> Result<(), String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("tool containment removal exceeded its cleanup deadline".into());
+    }
+    if depth > MAX_CONTAINMENT_TREE_DEPTH {
+        return Err("tool containment removal exceeded its depth limit".into());
+    }
     let entries = std::fs::read_dir(path)
         .map_err(|error| format!("cannot enumerate tool containment: {error}"))?;
     for entry in entries {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("tool containment removal exceeded its cleanup deadline".into());
+        }
+        *entries_seen += 1;
+        if *entries_seen > MAX_CONTAINMENT_TREE_ENTRIES {
+            return Err("tool containment removal exceeded its entry limit".into());
+        }
         let entry = entry.map_err(|error| format!("cannot inspect tool containment: {error}"))?;
         let file_type = entry
             .file_type()
             .map_err(|error| format!("cannot inspect tool containment entry: {error}"))?;
         if file_type.is_dir() {
-            remove_cgroup_tree(&entry.path())?;
+            remove_cgroup_tree_inner(&entry.path(), deadline, depth + 1, entries_seen)?;
         }
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("tool containment removal exceeded its cleanup deadline".into());
     }
     std::fs::remove_dir(path)
         .map_err(|error| format!("cannot remove empty tool containment: {error}"))
@@ -2073,6 +2341,7 @@ impl ToolContainment {
 struct ProgramCancellation<'a> {
     request: &'a CancellationToken,
     shutdown: &'a CancellationToken,
+    timeout: Duration,
 }
 
 async fn run_program_capture(
@@ -2082,12 +2351,12 @@ async fn run_program_capture(
     program: &Path,
     args: &[&str],
     env: &BTreeMap<String, String>,
-    timeout: Duration,
     cancellation: ProgramCancellation<'_>,
 ) -> Result<ProgramCapture, ToolError> {
     let ProgramCancellation {
         request: cancelled,
         shutdown,
+        timeout,
     } = cancellation;
     let _permit = acquire_process_permit(processes, cancelled, shutdown).await?;
     let mut residue_admission = Some(residue_supervisor.admit()?);
@@ -2096,8 +2365,36 @@ async fn run_program_capture(
     }
     let mut spawn_attempt = 0;
     let (mut child, mut containment) = loop {
-        let containment = ToolContainment::create(Arc::clone(&lifecycle_hooks))?;
         let sandbox = ToolSandbox::create(env)?;
+        let containment = ToolContainment::create(Arc::clone(&lifecycle_hooks))?;
+        #[cfg(all(test, target_os = "linux"))]
+        lifecycle_hooks.record_containment_path(containment.path.clone());
+        let validation = if lifecycle_hooks.take_pre_spawn_failure() {
+            Err(ToolError::new(
+                "containment_unavailable",
+                "forced pre-spawn containment validation failure",
+            ))
+        } else {
+            containment.validate_files()
+        };
+        if let Err(error) = validation {
+            return match settle_or_quarantine(
+                containment,
+                tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT,
+                &mut residue_admission,
+            )
+            .await
+            {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ToolError::new(
+                    "containment_failed",
+                    format!(
+                        "endpoint could not clean a pre-spawn containment failure: {cleanup}; prior error: {}",
+                        error.detail
+                    ),
+                )),
+            };
+        }
         let mut command = Command::new(program);
         command
             .args(args)
@@ -2110,7 +2407,24 @@ async fn run_program_capture(
         {
             command.process_group(0);
         }
-        containment.attach(&mut command)?;
+        if let Err(error) = containment.attach(&mut command) {
+            return match settle_or_quarantine(
+                containment,
+                tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT,
+                &mut residue_admission,
+            )
+            .await
+            {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ToolError::new(
+                    "containment_failed",
+                    format!(
+                        "endpoint could not clean a pre-spawn attach failure: {cleanup}; prior error: {}",
+                        error.detail
+                    ),
+                )),
+            };
+        }
         sandbox.attach(&mut command);
         match command.spawn() {
             Ok(child) => break (child, containment),
@@ -2157,8 +2471,6 @@ async fn run_program_capture(
         }
     };
     let pid = child.id();
-    #[cfg(all(test, target_os = "linux"))]
-    lifecycle_hooks.record_containment_path(containment.path.clone());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
@@ -2555,8 +2867,10 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum StalledCleanupPhase {
         Freeze,
+        Inventory,
         Populated,
         Reap,
+        Remove,
     }
 
     #[cfg(target_os = "linux")]
@@ -2568,7 +2882,7 @@ mod tests {
             dir.path(),
             "stalled-cleanup",
             &format!(
-                "printf '%s' $$ > '{}'; while :; do :; done",
+                "setsid sh -c 'while :; do :; done' & descendant=$!; printf '%s %s' $$ \"$descendant\" > '{}'; while :; do :; done",
                 pid_file.display()
             ),
         );
@@ -2580,8 +2894,10 @@ mod tests {
         let hooks = Arc::new(HostToolLifecycleHooks::default());
         match phase {
             StalledCleanupPhase::Freeze => hooks.cleanup_freeze.arm(),
+            StalledCleanupPhase::Inventory => hooks.cleanup_inventory.arm(),
             StalledCleanupPhase::Populated => hooks.cleanup_populated.arm(),
             StalledCleanupPhase::Reap => hooks.cleanup_reap.arm(),
+            StalledCleanupPhase::Remove => hooks.cleanup_remove.arm(),
         }
         hooks.quarantine_reaper.arm();
         let processes = Arc::new(Semaphore::new(1));
@@ -2594,8 +2910,8 @@ mod tests {
             &script,
             &[],
             &test_env(dir.path()),
-            Duration::from_millis(20),
             ProgramCancellation {
+                timeout: Duration::from_millis(20),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
@@ -2626,8 +2942,8 @@ mod tests {
                 &blocked_script,
                 &[],
                 &test_env(dir.path()),
-                Duration::from_secs(1),
                 ProgramCancellation {
+                    timeout: Duration::from_secs(1),
                     request: &CancellationToken::new(),
                     shutdown: &CancellationToken::new(),
                 },
@@ -2640,6 +2956,13 @@ mod tests {
         assert!(!spawn_marker.exists());
 
         let containment_path = hooks.containment_path();
+        match phase {
+            StalledCleanupPhase::Inventory => hooks.cleanup_inventory.release(),
+            StalledCleanupPhase::Remove => hooks.cleanup_remove.release(),
+            StalledCleanupPhase::Freeze
+            | StalledCleanupPhase::Populated
+            | StalledCleanupPhase::Reap => {}
+        }
         hooks.quarantine_reaper.release();
         assert!(
             supervisor
@@ -2648,8 +2971,13 @@ mod tests {
             "{phase:?} quarantine did not eventually drain"
         );
         assert!(!containment_path.exists());
-        let pid = std::fs::read_to_string(pid_file).expect("tool pid");
-        assert!(!Path::new("/proc").join(pid.trim()).exists());
+        let pids = std::fs::read_to_string(pid_file).expect("tool pids");
+        for pid in pids.split_whitespace() {
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "{phase:?} cleanup left adopted process or zombie {pid}"
+            );
+        }
 
         let capture = run_program_capture(
             processes,
@@ -2658,8 +2986,8 @@ mod tests {
             &blocked_script,
             &[],
             &test_env(dir.path()),
-            Duration::from_secs(1),
             ProgramCancellation {
+                timeout: Duration::from_secs(1),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
@@ -2860,8 +3188,8 @@ mod tests {
             &script,
             &[&malicious],
             &env,
-            Duration::from_secs(1),
             ProgramCancellation {
+                timeout: Duration::from_secs(1),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
@@ -2879,8 +3207,8 @@ mod tests {
             &script,
             &[&oversized],
             &env,
-            Duration::from_secs(1),
             ProgramCancellation {
+                timeout: Duration::from_secs(1),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
@@ -2960,8 +3288,8 @@ mod tests {
             &script,
             &[],
             &test_env(dir.path()),
-            Duration::from_secs(2),
             ProgramCancellation {
+                timeout: Duration::from_secs(2),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
@@ -3026,8 +3354,8 @@ mod tests {
                     &script,
                     &[],
                     &env,
-                    Duration::from_secs(1),
                     ProgramCancellation {
+                        timeout: Duration::from_secs(1),
                         request: &cancelled,
                         shutdown: &shutdown,
                     },
@@ -3116,6 +3444,8 @@ mod tests {
             path: dir.path().to_path_buf(),
             cleaned: true,
             reap_pids: HashSet::new(),
+            pending_inventory: None,
+            pending_removal: None,
             lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
         };
         let error = containment
@@ -3130,10 +3460,50 @@ mod tests {
     async fn stalled_cleanup_phases_are_bounded_quarantined_and_capacity_gated() {
         for phase in [
             StalledCleanupPhase::Freeze,
+            StalledCleanupPhase::Inventory,
             StalledCleanupPhase::Populated,
             StalledCleanupPhase::Reap,
+            StalledCleanupPhase::Remove,
         ] {
             assert_stalled_cleanup_is_quarantined(phase).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pre_spawn_containment_failure_removes_the_empty_cgroup_and_releases_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawn_marker = dir.path().join("must-not-spawn");
+        let script = executable(
+            dir.path(),
+            "pre-spawn-failure",
+            &format!("printf spawned > '{}'", spawn_marker.display()),
+        );
+        let hooks = Arc::new(HostToolLifecycleHooks::default());
+        let processes = Arc::new(Semaphore::new(1));
+        let supervisor = Arc::new(ToolResidueSupervisor::default());
+        for _ in 0..(MAX_PROCESSES * 2) {
+            hooks.fail_pre_spawn.store(true, Ordering::Release);
+            let error = run_program_capture(
+                Arc::clone(&processes),
+                Arc::clone(&supervisor),
+                hooks.clone(),
+                &script,
+                &[],
+                &test_env(dir.path()),
+                ProgramCancellation {
+                    timeout: Duration::from_secs(1),
+                    request: &CancellationToken::new(),
+                    shutdown: &CancellationToken::new(),
+                },
+            )
+            .await
+            .expect_err("forced pre-spawn validation failure must fail closed");
+            assert_eq!(error.code, "containment_unavailable");
+            assert!(!spawn_marker.exists());
+            assert!(!hooks.containment_path().exists());
+            assert_eq!(processes.available_permits(), 1);
+            assert_eq!(supervisor.quarantined(), 0);
         }
     }
 
@@ -3157,8 +3527,8 @@ mod tests {
             &script,
             &[],
             &env,
-            Duration::from_secs(5),
             ProgramCancellation {
+                timeout: Duration::from_secs(5),
                 request: &cancelled,
                 shutdown: &CancellationToken::new(),
             },
@@ -3319,8 +3689,8 @@ mod tests {
                     &script,
                     &[],
                     &env,
-                    Duration::from_secs(1),
                     ProgramCancellation {
+                        timeout: Duration::from_secs(1),
                         request: &CancellationToken::new(),
                         shutdown: &CancellationToken::new(),
                     },
@@ -3514,8 +3884,8 @@ mod tests {
             &script,
             &[],
             &env,
-            Duration::from_millis(20),
             ProgramCancellation {
+                timeout: Duration::from_millis(20),
                 request: &CancellationToken::new(),
                 shutdown: &CancellationToken::new(),
             },
