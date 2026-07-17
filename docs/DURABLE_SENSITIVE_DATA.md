@@ -103,8 +103,13 @@ and rejects any claim that promotes P2-DATA or its durable store/contract beyond
 pending review. Shared predicates apply to every coordinated subject,
 subjectless continuations retain their governing DATA subject, and a new
 explicit non-DATA subject starts a separate claim. Only claim-local negation,
-historical context, or review-and-merge conditions are allowed; regenerating the
-exact prose inventory cannot bless a premature claim.
+historical context, or review-and-merge conditions are allowed. Historical
+context requires a past-tense predicate with explicit historical framing;
+review-and-merge conditions require a modal or non-realized transition and never
+excuse present-time or completed-past claims. Anaphoric pronouns retain their
+subject across adjacent visible blocks, while explicit non-DATA subjects,
+document edges, thematic breaks, and inactive code reset that scope.
+Regenerating the exact prose inventory cannot bless a premature claim.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in

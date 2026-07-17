@@ -47,6 +47,8 @@ class CorpusSentence:
     sentence_index: int
     occurrence: int
     sentence: str
+    semantic_block_index: int = 0
+    hard_boundary_before: bool = False
 
     @property
     def identity(self) -> tuple[str, str, int, int, str]:
@@ -63,6 +65,14 @@ class CorpusSentence:
 class InventorySentence:
     record: CorpusSentence
     categories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StatusPredicateContext:
+    linking_verb: str | None
+    modal: str | None
+    past_auxiliary: bool
+    current: bool
 
 
 REQUIRED_H2 = (
@@ -432,24 +442,40 @@ def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
     validate_block_token_types(tokens)
     heading_stack: list[tuple[int, str]] = []
     block_ordinals: Counter[tuple[tuple[str, ...], str]] = Counter()
-    blocks: list[tuple[tuple[str, ...], str, int, str]] = []
+    blocks: list[tuple[tuple[str, ...], str, int, str, int, bool]] = []
     list_depth = 0
     blockquote_depth = 0
+    semantic_block_index = 0
+    hard_boundary_pending = False
 
     def section_path() -> tuple[str, ...]:
         return tuple(title for _, title in heading_stack)
 
     def add_block(section: tuple[str, ...], kind: str, visible: str) -> None:
+        nonlocal hard_boundary_pending, semantic_block_index
         visible = canonical_visible_text(visible, casefold=False)
         if not visible:
             return
         key = (section, kind)
         block_ordinals[key] += 1
-        blocks.append((section, kind, block_ordinals[key], visible))
+        semantic_block_index += 1
+        blocks.append(
+            (
+                section,
+                kind,
+                block_ordinals[key],
+                visible,
+                semantic_block_index,
+                hard_boundary_pending,
+            )
+        )
+        hard_boundary_pending = False
 
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token.type in BLOCK_INACTIVE_TOKEN_TYPES or token.type == "hr":
+            hard_boundary_pending = True
         if token.type == "heading_open":
             if index + 1 >= len(tokens):
                 raise GuardError(f"{path} has a malformed CommonMark heading")
@@ -507,7 +533,14 @@ def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
 
     occurrence_counts: Counter[str] = Counter()
     records: list[CorpusSentence] = []
-    for section, kind, block_ordinal, visible in blocks:
+    for (
+        section,
+        kind,
+        block_ordinal,
+        visible,
+        semantic_block_index,
+        hard_boundary_before,
+    ) in blocks:
         location = (
             f"{json.dumps(section, ensure_ascii=False, separators=(',', ':'))}"
             f"::{kind}[{block_ordinal}]"
@@ -521,6 +554,8 @@ def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
                     sentence_index=sentence_index,
                     occurrence=occurrence_counts[sentence],
                     sentence=sentence,
+                    semantic_block_index=semantic_block_index,
+                    hard_boundary_before=(hard_boundary_before and sentence_index == 1),
                 )
             )
     return tuple(records)
@@ -560,6 +595,10 @@ STATUS_LINKING_VERB = re.compile(
 STATUS_AUXILIARY = re.compile(
     r"\b(?:do|does|did|may|might|must|will|would|can|could|shall|should)\b"
 )
+FUTURE_OR_HYPOTHETICAL_MODAL = re.compile(
+    r"\b(?:may|might|must|will|would|can|could|shall|should)\b"
+)
+PAST_TENSE_AUXILIARY = re.compile(r"\b(?:did|had)\b")
 STATUS_PREDICATE = re.compile(
     rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
     rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
@@ -581,19 +620,28 @@ STRONG_STATUS_CLAUSE_BOUNDARY = re.compile(
     r"\s*(?:;|:)\s*|\s*,?\s*\b(?:but|however|yet|whereas)\b\s*"
 )
 CONDITIONAL_STATUS_CLAUSE_BOUNDARY = re.compile(r"\b(?:and|or|before|after|while)\b")
-COMPARATIVE_PARENTHETICAL = re.compile(
-    r",\s*(?:unlike|like|compared (?:with|to)|as opposed to)\b[^,]*,"
+NON_GOVERNING_SUBJECT_REFERENCE = re.compile(
+    r"\([^)]*\b(?:unlike|like|compared (?:with|to)|as opposed to|not|"
+    r"rather than|instead of)\b[^)]*\)|"
+    r",\s*(?:unlike|like|compared (?:with|to)|as opposed to|not|"
+    r"rather than|instead of)\b[^,]*,|"
+    r"^\s*(?:unlike|compared (?:with|to)|in contrast (?:with|to))\b[^,]*,|"
+    rf"\b(?:rather than|instead of)\s+(?:the\s+)?{DATA_STATUS_SUBJECT_PATTERN}"
 )
 EXPLICIT_GENERIC_SUBJECT = re.compile(
     rf"\b(?:{GENERIC_NOUN_SUBJECT_PATTERN}|{IDENTIFIER_SUBJECT_PATTERN})\b"
 )
 EXPLICIT_PRONOUN_SUBJECT = re.compile(rf"\b{PRONOUN_SUBJECT_PATTERN}\b")
-HISTORICAL_DATA_CONTEXT = re.compile(
-    r"\b(?:historical|historically|superseded|former|previous|previously)\b"
+HISTORICAL_DATA_SUBJECT_MODIFIER = re.compile(
+    rf"\b(?:historical|superseded|former|previous)\s+"
+    rf"{DATA_STATUS_SUBJECT_PATTERN}"
 )
+PAST_STATUS_LINKING_VERBS = frozenset({"was", "were", "became", "remained"})
+NON_REALIZED_STATUS_LINKING_VERBS = frozenset({"become", "becomes"})
 REVIEW_WORD = re.compile(r"\b(?:review|reviewed)\b")
 MERGE_WORD = re.compile(r"\b(?:merge|merged)\b")
 CURRENT_DATA_CONTEXT = re.compile(r"\b(?:now|currently)\b")
+ANAPHORIC_SUBJECT_START = re.compile(rf"^\s*{PRONOUN_SUBJECT_PATTERN}\b")
 
 
 def status_is_locally_negated(group: str, status_word: re.Match[str]) -> bool:
@@ -638,42 +686,148 @@ def status_is_negated(
     return "," in connectors or bool(re.search(r"\b(?:or|nor)\b", connectors))
 
 
-def status_group_has_historical_context(
+def without_non_governing_subject_references(group: str) -> str:
+    """Blank comparison/exclusion objects while preserving match offsets."""
+
+    return NON_GOVERNING_SUBJECT_REFERENCE.sub(
+        lambda match: " " * len(match.group()), group
+    )
+
+
+def status_predicate_contexts(
+    group: str, status_words: tuple[re.Match[str], ...]
+) -> tuple[StatusPredicateContext, ...]:
+    """Bind tense, modality, and current-time markers to each status predicate."""
+
+    contexts: list[StatusPredicateContext] = []
+    linking_verb: str | None = None
+    modal: str | None = None
+    past_auxiliary = False
+    cursor = 0
+    for index, status_word in enumerate(status_words):
+        predicate_prefix = group[cursor : status_word.start()]
+        linking_verbs = tuple(STATUS_LINKING_VERB.finditer(predicate_prefix))
+        modals = tuple(FUTURE_OR_HYPOTHETICAL_MODAL.finditer(predicate_prefix))
+        past_auxiliaries = tuple(PAST_TENSE_AUXILIARY.finditer(predicate_prefix))
+        if linking_verbs:
+            linking_verb = linking_verbs[-1].group()
+            # A newly stated finite/linking predicate supersedes modality from
+            # an earlier coordinated predicate unless it restates a modal.
+            if not modals:
+                modal = None
+            if not past_auxiliaries:
+                past_auxiliary = False
+        if modals:
+            modal = modals[-1].group()
+            past_auxiliary = False
+        if past_auxiliaries:
+            past_auxiliary = True
+
+        suffix_end = (
+            status_words[index + 1].start()
+            if index + 1 < len(status_words)
+            else len(group)
+        )
+        predicate_window = predicate_prefix + group[status_word.end() : suffix_end]
+        contexts.append(
+            StatusPredicateContext(
+                linking_verb=linking_verb,
+                modal=modal,
+                past_auxiliary=past_auxiliary,
+                current=CURRENT_DATA_CONTEXT.search(predicate_window) is not None,
+            )
+        )
+        cursor = status_word.end()
+    return tuple(contexts)
+
+
+def status_has_historical_context(
     group: str,
     status_words: tuple[re.Match[str], ...],
+    contexts: tuple[StatusPredicateContext, ...],
+    status_index: int,
 ) -> bool:
-    if CURRENT_DATA_CONTEXT.search(group) is not None:
+    context = contexts[status_index]
+    if context.current:
         return False
-    first = status_words[0]
-    last = status_words[-1]
-    return (
-        HISTORICAL_DATA_CONTEXT.search(group[: first.start()]) is not None
-        or HISTORICAL_DATA_CONTEXT.search(group[last.end() :]) is not None
+    explicitly_past = (
+        context.past_auxiliary or context.linking_verb in PAST_STATUS_LINKING_VERBS
     )
+    if not explicitly_past:
+        return False
+
+    temporal_group = without_non_governing_subject_references(group)
+    status_word = status_words[status_index]
+    previous_end = status_words[status_index - 1].end() if status_index else 0
+    next_start = (
+        status_words[status_index + 1].start()
+        if status_index + 1 < len(status_words)
+        else len(group)
+    )
+    predicate_prefix = temporal_group[previous_end : status_word.start()]
+    predicate_suffix = temporal_group[status_word.end() : next_start]
+    shared_prefix = temporal_group[: status_words[0].start()]
+    shared_postfix = temporal_group[status_words[-1].end() :]
+
+    leading_frame = re.match(
+        r"\s*(?:historically|previously|formerly)\b", shared_prefix
+    )
+    predicate_prefix_frame = re.search(
+        r"\b(?:was|were|became|remained)\s+"
+        r"(?:historically|previously|formerly)\s*$",
+        predicate_prefix,
+    )
+    predicate_suffix_frame = re.match(
+        r"\s*(?:historically|previously|formerly)\b", predicate_suffix
+    )
+    shared_postfix_frame = re.match(
+        r"\s*(?:historically|previously|formerly)\b", shared_postfix
+    )
+    if any(
+        frame is not None
+        for frame in (
+            leading_frame,
+            predicate_prefix_frame,
+            predicate_suffix_frame,
+            shared_postfix_frame,
+        )
+    ):
+        return True
+
+    subject_region = subject_region_for_status_group(temporal_group, status_words)
+    return HISTORICAL_DATA_SUBJECT_MODIFIER.search(subject_region) is not None
 
 
 def contains_review_and_merge(text: str) -> bool:
     return REVIEW_WORD.search(text) is not None and MERGE_WORD.search(text) is not None
 
 
-def status_group_has_future_review_gate(
+def status_has_future_review_gate(
     group: str,
     status_words: tuple[re.Match[str], ...],
+    contexts: tuple[StatusPredicateContext, ...],
+    status_index: int,
 ) -> bool:
-    if CURRENT_DATA_CONTEXT.search(group) is not None:
+    context = contexts[status_index]
+    if context.current:
         return False
     before = group[: status_words[0].start()]
     after = group[status_words[-1].end() :]
 
     before_gate = re.search(r"\bonly (?:when|after)\b", before)
-    if before_gate is not None and contains_review_and_merge(
+    before_is_gate = before_gate is not None and contains_review_and_merge(
         before[before_gate.start() :]
-    ):
-        return True
+    )
     after_gate = re.search(r"\bonly (?:when|after)\b", after)
-    if after_gate is None:
+    after_is_gate = after_gate is not None and contains_review_and_merge(
+        after[after_gate.start() :]
+    )
+    if not before_is_gate and not after_is_gate:
         return False
-    return contains_review_and_merge(after[after_gate.start() :])
+    return context.modal is not None or (
+        not context.past_auxiliary
+        and context.linking_verb in NON_REALIZED_STATUS_LINKING_VERBS
+    )
 
 
 def split_conditional_status_clauses(clause: str) -> tuple[str, ...]:
@@ -736,7 +890,7 @@ def data_subject_scope(
 ) -> tuple[bool, bool]:
     """Return DATA scope and whether this claim states an explicit subject."""
 
-    without_comparisons = COMPARATIVE_PARENTHETICAL.sub(" ", group)
+    without_comparisons = without_non_governing_subject_references(group)
     status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(without_comparisons))
     subject_region = (
         subject_region_for_status_group(without_comparisons, status_words)
@@ -790,12 +944,24 @@ def enforce_pending_data_review_status(root: Path, status: str) -> None:
         return
     discourse_location: tuple[str, str] | None = None
     discourse_sentence_index = 0
+    discourse_block_index = 0
     discourse_data_scope = False
     for record in all_corpus_sentences(root):
         location = (record.path, record.location)
-        if (
-            location != discourse_location
-            or record.sentence_index != discourse_sentence_index + 1
+        same_block_continuation = (
+            location == discourse_location
+            and record.sentence_index == discourse_sentence_index + 1
+        )
+        same_document = (
+            discourse_location is not None and record.path == discourse_location[0]
+        )
+        adjacent_semantic_block = (
+            same_document and record.semantic_block_index == discourse_block_index + 1
+        )
+        if not same_block_continuation and not (
+            adjacent_semantic_block
+            and not record.hard_boundary_before
+            and ANAPHORIC_SUBJECT_START.match(record.sentence) is not None
         ):
             discourse_data_scope = False
         groups, discourse_data_scope = data_status_claim_groups(
@@ -803,16 +969,29 @@ def enforce_pending_data_review_status(root: Path, status: str) -> None:
         )
         discourse_location = location
         discourse_sentence_index = record.sentence_index
+        discourse_block_index = record.semantic_block_index
         for group, has_data_subject_scope in groups:
-            status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(group))
+            temporal_group = without_non_governing_subject_references(group)
+            status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(temporal_group))
             if not status_words or not has_data_subject_scope:
                 continue
-            if status_group_has_historical_context(group, status_words):
-                continue
-            if status_group_has_future_review_gate(group, status_words):
-                continue
+            contexts = status_predicate_contexts(temporal_group, status_words)
             for status_index, _ in enumerate(status_words):
-                if status_is_negated(group, status_words, status_index):
+                if status_is_negated(temporal_group, status_words, status_index):
+                    continue
+                if status_has_historical_context(
+                    temporal_group,
+                    status_words,
+                    contexts,
+                    status_index,
+                ):
+                    continue
+                if status_has_future_review_gate(
+                    temporal_group,
+                    status_words,
+                    contexts,
+                    status_index,
+                ):
                     continue
                 raise ContradictionError(
                     "data-review-status-prose",
@@ -1389,6 +1568,17 @@ def self_test(source: Path) -> None:
             path = root / relative
             path.write_text(
                 path.read_text(encoding="utf-8") + f"\n\n{claim}\n",
+                encoding="utf-8",
+            )
+            write_prose_inventory(root)
+
+        return mutate
+
+    def status_markup_fixture(relative: str, markup: str) -> Callable[[Path], None]:
+        def mutate(root: Path) -> None:
+            path = root / relative
+            path.write_text(
+                path.read_text(encoding="utf-8") + f"\n\n{markup}\n",
                 encoding="utf-8",
             )
             write_prose_inventory(root)
@@ -2051,6 +2241,74 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 remains review pending. It is accepted now.",
         ),
         (
+            "incidental former alternative is not historical framing",
+            "P2-DATA-01 is selected over the former alternative.",
+        ),
+        (
+            "incidental previous review is not historical framing",
+            "P2-DATA-01 is accepted after the previous review.",
+        ),
+        (
+            "incidental previous adverb in review object is not historical framing",
+            "P2-DATA-01 was accepted after a previously completed review.",
+        ),
+        (
+            "outer former subject does not historically frame DATA predicate",
+            "The former alternative says P2-DATA-01 was accepted.",
+        ),
+        (
+            "historical past predicate cannot mask present predicate",
+            "Historically, P2-DATA-01 was approved and is selected.",
+        ),
+        (
+            "previously framed past predicate cannot mask present predicate",
+            "Previously, P2-DATA-01 was approved and is authoritative.",
+        ),
+        (
+            "completed past acceptance is not a future review gate",
+            "P2-DATA-01 was accepted only after review and merge.",
+        ),
+        (
+            "inverted completed past acceptance is not a future review gate",
+            "Only after review and merge was P2-DATA-01 accepted.",
+        ),
+        (
+            "completed past transition is not a future review gate",
+            "P2-DATA-01 became accepted only after review and merge.",
+        ),
+        (
+            "did-plus-transition is not a future review gate",
+            "Only after review and merge did P2-DATA-01 become accepted.",
+        ),
+        (
+            "past-perfect acceptance is not a future review gate",
+            "P2-DATA-01 had been accepted only after review and merge.",
+        ),
+        (
+            "future modal contradicted by current status",
+            "P2-DATA-01 will be accepted now only after review and merge.",
+        ),
+        (
+            "inverted future modal contradicted by current status",
+            "Only after review and merge will P2-DATA-01 be accepted currently.",
+        ),
+        (
+            "DATA main subject with parenthetical non-DATA comparison",
+            "P2-DATA-01 (unlike P2-HOST-02) is accepted.",
+        ),
+        (
+            "DATA main subject with excluded non-DATA object",
+            "P2-DATA-01, not P2-HOST-02, is accepted.",
+        ),
+        (
+            "leading non-DATA comparison leaves DATA as main subject",
+            "Unlike P2-HOST-02, P2-DATA-01 is accepted.",
+        ),
+        (
+            "DATA main subject precedes rather-than non-DATA object",
+            "P2-DATA-01 rather than P2-HOST-02 is accepted.",
+        ),
+        (
             "elided DATA subject after negated adversative",
             "P2-DATA-01 is not approved, but selected now.",
         ),
@@ -2075,6 +2333,36 @@ def self_test(source: Path) -> None:
             "data-review-status-prose",
         )
         for name, sentence in status_reinventory_rejects
+    )
+    status_block_reinventory_rejects = (
+        (
+            "pronoun inherits DATA across paragraphs",
+            "P2-DATA-01 remains review pending.\n\nIt is accepted now.",
+        ),
+        (
+            "pronoun inherits DATA across blockquote paragraphs",
+            "> P2-DATA-01 remains review pending.\n>\n> It is accepted now.",
+        ),
+        (
+            "pronoun inherits DATA across list items",
+            "- P2-DATA-01 remains review pending.\n- It is accepted now.",
+        ),
+        (
+            "pronoun inherits DATA from heading to paragraph",
+            "## P2-DATA-01 remains review pending\n\nIt is accepted now.",
+        ),
+        (
+            "pronoun inherits DATA across HTML paragraphs",
+            "<p>P2-DATA-01 remains review pending.</p>\n\n<p>It is accepted now.</p>",
+        ),
+    )
+    mutations.extend(
+        (
+            f"status cross-block reject: {name}",
+            status_markup_fixture("docs/DESIGN.md", markup),
+            "data-review-status-prose",
+        )
+        for name, markup in status_block_reinventory_rejects
     )
 
     normalization_cases = (
@@ -2412,8 +2700,56 @@ def self_test(source: Path) -> None:
             "A P2-DATA-01 experiment was approved historically.",
         ),
         (
+            "previously framed coordinated past statuses",
+            "Previously, P2-DATA-01 was approved and accepted.",
+        ),
+        (
+            "predicate-local previous adverb",
+            "A P2-DATA-01 experiment was previously approved.",
+        ),
+        (
+            "superseded DATA experiment subject",
+            "A superseded P2-DATA-01 experiment was accepted.",
+        ),
+        (
+            "historically framed past transition",
+            "Historically, a P2-DATA-01 experiment became accepted.",
+        ),
+        (
+            "future modal review gate",
+            "P2-DATA-01 will become accepted only after review and merge.",
+        ),
+        (
+            "hypothetical modal review gate with reversed evidence order",
+            "P2-DATA-01 may be accepted only after merge and independent review.",
+        ),
+        (
             "non-DATA main subject with DATA unlike comparison",
             "P2-HOST-02, unlike P2-DATA-01, is accepted.",
+        ),
+        (
+            "non-DATA main subject with parenthetical DATA comparison",
+            "P2-HOST-02 (unlike P2-DATA-01) is accepted.",
+        ),
+        (
+            "non-DATA main subject excludes DATA object",
+            "The control protocol, not P2-DATA-01, is accepted.",
+        ),
+        (
+            "non-DATA main subject parenthetically excludes DATA object",
+            "The control protocol (not P2-DATA-01) is accepted.",
+        ),
+        (
+            "leading DATA comparison leaves non-DATA as main subject",
+            "Unlike P2-DATA-01, P2-HOST-02 is accepted.",
+        ),
+        (
+            "non-DATA main subject uses instead-of DATA object",
+            "The control protocol instead of P2-DATA-01 is accepted.",
+        ),
+        (
+            "non-DATA main subject uses rather-than DATA object",
+            "The control protocol rather than P2-DATA-01 is accepted.",
         ),
     )
     positive_mutations.extend(
@@ -2422,6 +2758,50 @@ def self_test(source: Path) -> None:
             status_claim_fixture("docs/DESIGN.md", sentence),
         )
         for name, sentence in status_reinventory_accepts
+    )
+    status_block_reinventory_accepts = (
+        (
+            "paragraph non-DATA reset before pronoun",
+            "P2-DATA-01 remains review pending.\n\n"
+            "The control protocol remains review pending.\n\nIt is accepted.",
+        ),
+        (
+            "blockquote non-DATA reset before pronoun",
+            "> P2-DATA-01 remains review pending.\n>\n"
+            "> The control protocol remains review pending.\n>\n> It is accepted.",
+        ),
+        (
+            "list-item non-DATA reset before pronoun",
+            "- P2-DATA-01 remains review pending.\n"
+            "- The control protocol remains review pending.\n- It is accepted.",
+        ),
+        (
+            "heading non-DATA reset before pronoun",
+            "P2-DATA-01 remains review pending.\n\n"
+            "## The control protocol remains review pending\n\nIt is accepted.",
+        ),
+        (
+            "HTML non-DATA reset before pronoun",
+            "<p>P2-DATA-01 remains review pending.</p>\n\n"
+            "<p>The control protocol remains review pending.</p>\n\n"
+            "<p>It is accepted.</p>",
+        ),
+        (
+            "thematic break is a hard discourse boundary",
+            "P2-DATA-01 remains review pending.\n\n---\n\nIt is accepted.",
+        ),
+        (
+            "fenced code is a hard discourse boundary",
+            "P2-DATA-01 remains review pending.\n\n```text\n"
+            "inactive boundary\n```\n\nIt is accepted.",
+        ),
+    )
+    positive_mutations.extend(
+        (
+            f"status cross-block accept: {name}",
+            status_markup_fixture("docs/DESIGN.md", markup),
+        )
+        for name, markup in status_block_reinventory_accepts
     )
 
     with tempfile.TemporaryDirectory(prefix="spawn-data-guard-") as temp:
