@@ -246,6 +246,16 @@ impl StoredCreds {
             value.zeroize();
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_runtime_storage_health_for_test(
+        &mut self,
+        native_projection_degraded: bool,
+        unix_keyring_degraded: bool,
+    ) {
+        self.native_projection_degraded = native_projection_degraded;
+        self.unix_keyring_degraded = unix_keyring_degraded;
+    }
 }
 
 impl CredentialRevision {
@@ -628,6 +638,57 @@ pub fn credential_revision(creds: &StoredCreds) -> Result<CredentialRevision> {
     })
 }
 
+/// Compare the complete persisted authorization record while deliberately
+/// excluding only the two runtime backend-health observations. Destructuring
+/// without `..` makes a future `StoredCreds` field a compile error here, so a
+/// new serialized/security field cannot silently escape same-revision checks.
+pub(crate) fn persisted_authoritative_eq(left: &StoredCreds, right: &StoredCreds) -> bool {
+    let StoredCreds {
+        credential_record_version: left_version,
+        credential_generation: left_generation,
+        credential_record_id: left_record_id,
+        access_token: left_token,
+        host_id: left_host_id,
+        server_url: left_server_url,
+        host_private_key_seed: left_seed,
+        browser_pins: left_pins,
+        native_projection_degraded: _,
+        unix_keyring_degraded: _,
+    } = left;
+    let StoredCreds {
+        credential_record_version: right_version,
+        credential_generation: right_generation,
+        credential_record_id: right_record_id,
+        access_token: right_token,
+        host_id: right_host_id,
+        server_url: right_server_url,
+        host_private_key_seed: right_seed,
+        browser_pins: right_pins,
+        native_projection_degraded: _,
+        unix_keyring_degraded: _,
+    } = right;
+
+    (
+        left_version,
+        left_generation,
+        left_record_id,
+        left_token,
+        left_host_id,
+        left_server_url,
+        left_seed,
+        left_pins,
+    ) == (
+        right_version,
+        right_generation,
+        right_record_id,
+        right_token,
+        right_host_id,
+        right_server_url,
+        right_seed,
+        right_pins,
+    )
+}
+
 /// Revalidate a complete record at a live authorization boundary. `load()`
 /// already performs these checks, but callers deliberately repeat them before
 /// admitting a revision so injected/test loaders and future backends cannot
@@ -965,21 +1026,21 @@ pub fn load() -> Result<StoredCreds> {
 }
 
 fn load_unlocked() -> Result<StoredCreds> {
-    load_unlocked_with_keyring_warning(true)
+    load_unlocked_with_optional_repair(true)
 }
 
-/// Reload for the live supervisor. The ordinary initial load reports a Unix
-/// keyring outage once; a 500 ms monitor must not repeat that same warning
-/// indefinitely when the complete mode-0600 Unix record is the designed
-/// authoritative fallback.
+/// Reload for the live supervisor. A 500 ms monitor must remain read-only and
+/// quiet for optional projections: ordinary interactive load/status performs
+/// one repair attempt, while live reload selects the authoritative whole
+/// record and reports runtime degradation without repeated writes or logs.
 pub(crate) fn load_for_live_reload() -> Result<StoredCreds> {
     with_credential_lock(|| {
         cleanup_stale_credential_temps(config::credentials_path()?.as_path())?;
-        load_unlocked_with_keyring_warning(false)
+        load_unlocked_with_optional_repair(false)
     })
 }
 
-fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> Result<StoredCreds> {
+fn load_unlocked_with_optional_repair(repair_optional_backends: bool) -> Result<StoredCreds> {
     #[cfg(unix)]
     let from_file = load_file_record()?;
     #[cfg(not(unix))]
@@ -1003,7 +1064,7 @@ fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> R
         resolve_unix_keyring_read_with_warning(
             from_file,
             keyring_result,
-            _warn_unix_keyring_unavailable,
+            repair_optional_backends,
             |record| keyring_set_for_user(&scope.user, record),
         )
     }
@@ -1022,7 +1083,12 @@ fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> R
                 return Err(failure.error);
             }
         };
-        reconcile_native_projection(from_file, from_keyring, save_file_for_platform)
+        reconcile_native_projection(
+            from_file,
+            from_keyring,
+            repair_optional_backends,
+            save_file_for_platform,
+        )
     }
 }
 
@@ -1095,6 +1161,7 @@ where
 fn reconcile_native_projection<F>(
     from_file: Result<Option<StoredCreds>>,
     mut from_keyring: Option<StoredCreds>,
+    attempt_repair: bool,
     save_projection: F,
 ) -> Result<StoredCreds>
 where
@@ -1110,7 +1177,7 @@ where
             let mut expected_projection = file_creds_without_private_seed(&selected);
             let projection_matches = from_file.as_ref() == Some(&expected_projection);
             zeroize_stored_creds(&mut expected_projection);
-            if !record_is_empty(&selected) && !projection_matches {
+            if !record_is_empty(&selected) && !projection_matches && attempt_repair {
                 match save_projection(&selected) {
                     Ok(CredentialFileWriteOutcome::Committed) => {
                         selected.native_projection_degraded = false;
@@ -1120,6 +1187,8 @@ where
                         tracing::warn!("native credential metadata projection remains degraded; the complete OS-keyring record is authoritative");
                     }
                 }
+            } else if !record_is_empty(&selected) && !projection_matches {
+                selected.native_projection_degraded = true;
             }
             Ok(selected)
         }
@@ -1141,16 +1210,21 @@ where
                     "native credential projection is corrupt and no complete keyring record exists",
                 );
             };
-            let rebuilt = match save_projection(keyring) {
-                Ok(CredentialFileWriteOutcome::Committed) => {
-                    keyring.native_projection_degraded = false;
-                    true
+            let rebuilt = if attempt_repair {
+                match save_projection(keyring) {
+                    Ok(CredentialFileWriteOutcome::Committed) => {
+                        keyring.native_projection_degraded = false;
+                        true
+                    }
+                    Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded) | Err(_) => {
+                        keyring.native_projection_degraded = true;
+                        tracing::warn!("native credential metadata projection remains degraded; the complete OS-keyring record is authoritative");
+                        false
+                    }
                 }
-                Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded) | Err(_) => {
-                    keyring.native_projection_degraded = true;
-                    tracing::warn!("native credential metadata projection remains degraded; the complete OS-keyring record is authoritative");
-                    false
-                }
+            } else {
+                keyring.native_projection_degraded = true;
+                false
             };
             if rebuilt {
                 tracing::warn!(error = %file_error, "rebuilt torn native credential projection from the complete keyring record");
@@ -3661,6 +3735,7 @@ mod tests {
         let reload_with_failed_repair = reconcile_native_projection(
             Ok(projection.borrow().clone()),
             Some(durable_keyring.clone()),
+            true,
             |_| bail!("injected projection repair failure"),
         )
         .unwrap();
@@ -3690,6 +3765,7 @@ mod tests {
         let repaired = reconcile_native_projection(
             Ok(projection.borrow().clone()),
             Some(durable_keyring.clone()),
+            true,
             |record| {
                 *repaired_projection.borrow_mut() = Some(file_creds_without_private_seed(record));
                 Ok(CredentialFileWriteOutcome::Committed)
@@ -3707,6 +3783,7 @@ mod tests {
         let converged = reconcile_native_projection(
             Ok(repaired_projection.into_inner()),
             Some(durable_keyring),
+            true,
             |_| panic!("matching repaired projection must not be rewritten"),
         )
         .unwrap();
@@ -3812,6 +3889,7 @@ mod tests {
         let recovered = reconcile_native_projection(
             Err(parse_error(r#"{"access_token":"truncated"#)),
             Some(keyring.clone()),
+            true,
             |record| {
                 *written_projection.borrow_mut() = Some(file_creds_without_private_seed(record));
                 Ok(CredentialFileWriteOutcome::Committed)
@@ -3827,7 +3905,7 @@ mod tests {
         );
 
         let degraded =
-            reconcile_native_projection(Err(parse_error("")), Some(keyring.clone()), |_| {
+            reconcile_native_projection(Err(parse_error("")), Some(keyring.clone()), true, |_| {
                 bail!("injected torn-projection repair failure")
             })
             .unwrap();
@@ -3844,6 +3922,7 @@ mod tests {
                 r#"{"access_token":"token","unknown_projection_field":true}"#,
             )),
             Some(keyring),
+            true,
             |_| {
                 write_called.set(true);
                 Ok(CredentialFileWriteOutcome::Committed)
@@ -3852,6 +3931,72 @@ mod tests {
         let error = result.err().expect("unknown projection fields must fail");
         assert!(!write_called.get());
         assert!(format!("{error:#}").contains("strict validation"));
+    }
+
+    #[test]
+    fn native_live_reload_is_read_only_and_quiet_while_interactive_load_repairs_once() {
+        #[derive(Clone)]
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let keyring = complete_record(7, 7, "native-token", 10, "https://server.example/", 7);
+        let repair_attempts = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || CapturedWriter(Arc::clone(&captured_for_writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // A missing projection represents the persistent repair-failure case:
+        // the closure would fail and log on every 500 ms pass if live reload
+        // accidentally retained repair-capable behavior.
+        for _ in 0..8 {
+            let repair_attempts = Arc::clone(&repair_attempts);
+            let loaded =
+                reconcile_native_projection(Ok(None), Some(keyring.clone()), false, move |_| {
+                    repair_attempts.fetch_add(1, Ordering::SeqCst);
+                    bail!("injected persistent projection write failure")
+                })
+                .unwrap();
+            assert!(loaded.native_projection_degraded);
+            assert_same_coherent_record(&loaded, &keyring);
+        }
+        drop(guard);
+        assert_eq!(repair_attempts.load(Ordering::SeqCst), 0);
+        assert!(captured.lock().unwrap().is_empty());
+
+        // The ordinary interactive load/status path still performs exactly
+        // one bounded repair and returns a healthy authoritative generation.
+        let repaired_projection = RefCell::new(None);
+        let repaired =
+            reconcile_native_projection(Ok(None), Some(keyring.clone()), true, |record| {
+                assert!(repaired_projection.borrow().is_none());
+                *repaired_projection.borrow_mut() = Some(file_creds_without_private_seed(record));
+                Ok(CredentialFileWriteOutcome::Committed)
+            })
+            .unwrap();
+        assert!(!repaired.native_projection_degraded);
+        assert_same_coherent_record(&repaired, &keyring);
+        let projection = repaired_projection.into_inner().unwrap();
+        assert_eq!(
+            record_order(&projection).unwrap(),
+            record_order(&keyring).unwrap()
+        );
+        assert!(projection.host_private_key_seed.is_none());
     }
 
     #[test]

@@ -498,8 +498,11 @@ an existing file -- including an empty or legacy file -- over a stale, future,
 or conflicting optional keyring copy and rejects versioned keyring-only state.
 Normal interactive load/status repairs the redundancy from the file; the
 bounded 500 ms live-trust reload marks it degraded without repeatedly writing
-or logging, leaving the same authoritative whole record active. Keyring
-accounts are now scoped by
+or logging, leaving the same authoritative whole record active. Native systems
+follow the same live-read rule for their optional seed-free metadata
+projection: normal load/status may attempt one rebuild from the authoritative
+keyring, while the bounded monitor only marks degradation. Keyring accounts are
+now scoped by
 the canonical config-directory identity; alternate config trees
 cannot cross-load or cross-delete trust, and only the exact default directory
 may perform a conflict-checked one-time migration of the legacy global entry.
@@ -729,9 +732,14 @@ reset. Reattachment checks expiry before polling a queued reply, and an
 explicit timer-first biased wait makes expiry win when reply and deadline are
 both observable at the exact boundary. A reply that may have completed earlier
 but was not observed before the deadline is conservatively rejected. An
-unchanged revision must be field-for-field the same decoded record; a
-same-revision substitution, generation rollback/non-advance, reused record
-identity, missing login/key/domain, changed Host ID/origin, or
+unchanged revision must be field-for-field the same persisted authoritative
+record. Only the two serde-skipped runtime projection-health observations are
+excluded, so healthy/degraded/external-repair observations neither reconnect
+nor advance the RTC trust epoch. The equality destructures every credential
+field without a catch-all, making a future field a compile-time completeness
+failure. A same-revision serialized substitution, generation rollback/non-
+advance, reused record identity, missing login/key/domain, changed Host
+ID/origin, or
 corrupt/noncanonical key or pin
 fails closed without keeping the old authorization active. A valid higher
 generation tears down the old WebSocket/RTC authorization before reconnecting

@@ -111,8 +111,9 @@ struct CredentialLoader {
 
 impl CredentialLoader {
     fn for_daemon() -> Result<Self> {
-        // Preserve the ordinary initial-load warning behavior, then keep the
-        // 500 ms live monitor quiet on Unix's designed file fallback.
+        // Preserve one ordinary initial-load repair/warning pass, then keep
+        // the 500 ms live monitor read-only and quiet for Unix's redundant
+        // keyring and native systems' seed-free metadata projection.
         let mut initial = true;
         Self::start(CREDENTIAL_LOAD_DEADLINE, move || {
             if std::mem::take(&mut initial) {
@@ -358,7 +359,7 @@ impl LiveCredentialSnapshot {
     fn classify_reload(&self, record: StoredCreds) -> Result<Option<Self>> {
         let next = Self::validated(record, self.server_origin.clone(), Some(self.host_id))?;
         if next.revision == self.revision {
-            if next.record == self.record {
+            if creds::persisted_authoritative_eq(&next.record, &self.record) {
                 return Ok(None);
             }
             return Err(anyhow!(
@@ -2400,20 +2401,35 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let mut same_revision: serde_json::Value =
-            serde_json::to_value(&active_record).expect("serialize record");
-        same_revision["access_token"] = serde_json::json!("substituted-token");
-        let same_revision: StoredCreds =
-            serde_json::from_value(same_revision).expect("mutated record");
-        let error = active
-            .classify_reload(same_revision)
-            .err()
-            .expect("same-revision substitution must fail");
-        assert!(error
-            .to_string()
-            .contains("without a new whole-record revision"));
-        assert!(!error.to_string().contains("secret-token"));
-        assert!(!error.to_string().contains("substituted-token"));
+        // Every persisted field remains strict at the same revision. Include
+        // mutations that retain the registered Host ID and canonical origin,
+        // so only the complete persisted-record comparison can catch them.
+        for (field, value) in [
+            ("access_token", serde_json::json!("substituted-token")),
+            (
+                "server_url",
+                serde_json::json!("https://spawn.example/different-path"),
+            ),
+            (
+                "host_private_key_seed",
+                serde_json::json!(URL_SAFE_NO_PAD.encode([8_u8; 32])),
+            ),
+            ("browser_pins", serde_json::json!([])),
+        ] {
+            let mut same_revision = serde_json::to_value(&active_record).expect("serialize record");
+            same_revision[field] = value;
+            let same_revision: StoredCreds =
+                serde_json::from_value(same_revision).expect("mutated record");
+            let error = active
+                .classify_reload(same_revision)
+                .err()
+                .expect("same-revision substitution must fail");
+            assert!(error
+                .to_string()
+                .contains("without a new whole-record revision"));
+            assert!(!error.to_string().contains("secret-token"));
+            assert!(!error.to_string().contains("substituted-token"));
+        }
 
         let rollback = credential_record(
             4,
@@ -2496,6 +2512,85 @@ mod tests {
                 .expect("missing backend record must fail")
         )
         .contains("no daemon token"));
+    }
+
+    #[test]
+    fn runtime_storage_health_transitions_do_not_rotate_or_tear_down_live_trust() {
+        let host_id = Uuid::from_u128(10);
+        let persisted = credential_record(
+            5,
+            50,
+            "stable-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+        let healthy = live_snapshot(persisted.clone());
+
+        // Healthy -> degraded observations from either backend are not a new
+        // authorization generation and therefore produce no reconnect/epoch
+        // transition (`None` is the supervisor's unchanged-snapshot path).
+        for (native_degraded, unix_degraded) in [(true, false), (false, true), (true, true)] {
+            let mut observed = persisted.clone();
+            observed.set_runtime_storage_health_for_test(native_degraded, unix_degraded);
+            assert!(healthy.classify_reload(observed).unwrap().is_none());
+        }
+
+        // An external projection/keyring repair can make the next observation
+        // healthy without rotating trust or tearing down RTC admission.
+        let mut degraded_record = persisted.clone();
+        degraded_record.set_runtime_storage_health_for_test(true, true);
+        let degraded = live_snapshot(degraded_record);
+        assert!(degraded.classify_reload(persisted).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_watcher_ignores_health_only_repair_until_authoritative_trust_changes() {
+        let host_id = Uuid::from_u128(10);
+        let persisted = credential_record(
+            5,
+            50,
+            "stable-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+        let active = live_snapshot(persisted.clone());
+        let changed = credential_record(
+            6,
+            60,
+            "rotated-token",
+            host_id,
+            "https://spawn.example/",
+            8,
+            &[(Uuid::from_u128(102), TEST_BROWSER_KEY_TWO)],
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let mut loader = CredentialLoader::start(Duration::from_millis(200), move || {
+            let call = load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call >= 3 {
+                return Ok(changed.clone());
+            }
+            let mut observed = persisted.clone();
+            match call {
+                0 => observed.set_runtime_storage_health_for_test(true, false),
+                1 => {} // External native projection repair: healthy again.
+                2 => observed.set_runtime_storage_health_for_test(false, true),
+                _ => unreachable!(),
+            }
+            Ok(observed)
+        })
+        .expect("credential loader");
+
+        let next = wait_for_credential_change_with(&active, Duration::from_millis(2), &mut loader)
+            .await
+            .expect("bounded reload");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(next.generation, 6);
+        assert_eq!(next.record.access_token.as_deref(), Some("rotated-token"));
     }
 
     #[tokio::test]
