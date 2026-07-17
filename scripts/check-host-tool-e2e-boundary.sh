@@ -374,8 +374,15 @@ expected_server_attribute_reads = Counter({
 
 
 class LegacyStringVisitor(ast.NodeVisitor):
-    def __init__(self, relative: str) -> None:
+    def __init__(self, relative: str, tree: ast.Module, bindings: dict[str, str]) -> None:
         self.relative = relative
+        self.bindings = bindings
+        self.attrgetter_names = {"attrgetter"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "operator":
+                for name in node.names:
+                    if name.name == "attrgetter":
+                        self.attrgetter_names.add(name.asname or name.name)
         self.scope = ["<module>"]
         self.legacy = Counter()
         self.protected_attributes = Counter()
@@ -404,6 +411,18 @@ class LegacyStringVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        is_attrgetter = (
+            isinstance(node.func, ast.Name) and node.func.id in self.attrgetter_names
+        ) or (
+            isinstance(node.func, ast.Attribute) and node.func.attr == "attrgetter"
+        )
+        if is_attrgetter:
+            for argument in node.args:
+                value = static_python_string(argument, self.bindings)
+                if value in protected_server_attributes:
+                    self.protected_attributes[
+                        (self.relative, self.scope[-1], f"attrgetter:{value}")
+                    ] += 1
         if (
             isinstance(node.func, ast.Name)
             and node.func.id == "getattr"
@@ -430,7 +449,9 @@ class LegacyStringVisitor(ast.NodeVisitor):
 found_legacy_strings = Counter()
 found_server_attribute_reads = Counter()
 for relative, tree in server_trees.items():
-    visitor = LegacyStringVisitor(relative)
+    visitor = LegacyStringVisitor(
+        relative, tree, server_string_bindings.get(relative, {})
+    )
     visitor.visit(tree)
     found_legacy_strings.update(visitor.legacy)
     found_server_attribute_reads.update(visitor.protected_attributes)
@@ -649,17 +670,25 @@ def rust_production_source(source: str) -> str:
 
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
-    "daemon/src/host_tools.rs": "0afa269772192530b734713eb6c275a689bb86e166f35f74c86b29a90e4a46a2",
+    "daemon/src/host_tools.rs": "4b4418ab7218e49c522013fb7c1b7a55d80fd1f5580512c8cc7ab7dd769cf8ef",
     "daemon/src/main.rs": "b96fa7f9a1ad9f52e4be6a98923ca643d37da2e0be0d97d487ec77d25b6f3e05",
     "daemon/src/run.rs": "8368b2552f9e556565126e077da47e2e755e222f4abfb659fcb29f1bad182b74",
     "daemon/src/worker_backend.rs": "7b3d600b3ba7e0553a405e50c3b35e9120b3f000198efd7ed90541fef8b99baa",
 }
+rust_exec_api = re.compile(
+    r"\b(?:execl|execle|execlp|execv|execve|execveat|execvp|execvpe|fexecve|posix_spawn|posix_spawnp)\b"
+    r"|\bSYS_execve(?:at)?\b"
+    r"|\b(?:nix::)?libc::(?:system|popen)\b"
+)
 found_command_sources = {
     relative
     for relative, source in sources.items()
     if relative.startswith("daemon/src/")
     and relative.endswith(".rs")
-    and re.search(r"\bCommand\b", rust_production_source(source))
+    and (
+        re.search(r"\bCommand\b", rust_production_source(source))
+        or rust_exec_api.search(rust_production_source(source))
+    )
 }
 if found_command_sources != expected_command_ast_hashes.keys():
     die(f"daemon process-launch source inventory changed: {sorted(found_command_sources)!r}")
@@ -1302,6 +1331,11 @@ PY
     >"$case_dir/server/spawn_server/routes/relay.py"
   expect_rejected server-vars-access
 
+  new_case server-attrgetter-access
+  printf '%s\n' 'import operator' 'def relay(value): return operator.attrgetter("install")(value)' \
+    >"$case_dir/server/spawn_server/routes/relay.py"
+  expect_rejected server-attrgetter-access
+
   new_case web-legacy-alias
   printf '%s\n' 'export const hostToolFallback = hosts["installTool"];' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
@@ -1408,6 +1442,17 @@ fn run() { Runner::new("sh").args(["-c", "echo unsafe"]); }
 ''')
 PY
   expect_rejected daemon-command-alias
+
+  new_case daemon-raw-exec
+  python3 - "$case_dir/daemon/src/raw_exec.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''fn dormant() {
+    unsafe { nix::libc::execl(std::ptr::null(), std::ptr::null()); }
+}
+''')
+PY
+  expect_rejected daemon-raw-exec
 
   new_case daemon-args-shell
   python3 - "$case_dir/daemon/src/helpers.rs" <<'PY'

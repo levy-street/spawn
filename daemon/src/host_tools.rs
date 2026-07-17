@@ -4,7 +4,7 @@
 //! path, shell string, or argv. Every executed program/argument vector comes
 //! from the fixed policy below and is resolved against the endpoint's PATH.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -17,6 +17,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -189,6 +194,13 @@ pub(crate) struct HostToolService {
 struct ToolInstallState {
     active: HashSet<&'static str>,
     reconciliation_required: HashSet<&'static str>,
+    effect_generation: HashMap<&'static str, u64>,
+}
+
+#[derive(Clone, Copy)]
+struct ReconciliationCheck {
+    tool: &'static str,
+    effect_generation: u64,
 }
 
 #[derive(Default)]
@@ -197,6 +209,10 @@ struct HostToolLifecycleHooks {
     after_kill: AsyncPause,
     #[cfg(test)]
     pipe_drain: AsyncPause,
+    #[cfg(test)]
+    reconciliation_clear: AsyncPause,
+    #[cfg(all(test, target_os = "linux"))]
+    containment_path: StdMutex<Option<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -223,6 +239,23 @@ impl AsyncPause {
 }
 
 impl HostToolLifecycleHooks {
+    #[cfg(all(test, target_os = "linux"))]
+    fn record_containment_path(&self, path: PathBuf) {
+        *self
+            .containment_path
+            .lock()
+            .expect("containment path hook lock") = Some(path);
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn containment_path(&self) -> PathBuf {
+        self.containment_path
+            .lock()
+            .expect("containment path hook lock")
+            .clone()
+            .expect("tool containment path was not recorded")
+    }
+
     async fn pause_after_kill(&self) {
         #[cfg(test)]
         if self.after_kill.armed.swap(false, Ordering::AcqRel) {
@@ -236,6 +269,18 @@ impl HostToolLifecycleHooks {
         if self.pipe_drain.armed.swap(false, Ordering::AcqRel) {
             self.pipe_drain.entered.notify_one();
             self.pipe_drain.release.notified().await;
+        }
+    }
+
+    async fn pause_reconciliation_clear(&self) {
+        #[cfg(test)]
+        if self
+            .reconciliation_clear
+            .armed
+            .swap(false, Ordering::AcqRel)
+        {
+            self.reconciliation_clear.entered.notify_one();
+            self.reconciliation_clear.release.notified().await;
         }
     }
 }
@@ -397,6 +442,7 @@ impl HostToolService {
         let operation_cancelled = cancelled.child_token();
         let mut checks = FuturesUnordered::new();
         for (index, target) in targets.into_iter().enumerate() {
+            let reconciliation = self.begin_reconciliation_check(&target.tool)?;
             let service = Arc::clone(self);
             let env = Arc::clone(&env);
             let cancelled = operation_cancelled.clone();
@@ -404,6 +450,7 @@ impl HostToolService {
             checks.push(async move {
                 (
                     index,
+                    reconciliation,
                     service.check_one(target, &env, &cancelled, &shutdown).await,
                 )
             });
@@ -411,7 +458,12 @@ impl HostToolService {
         let mut ordered = Vec::with_capacity(checks.len());
         ordered.resize_with(checks.len(), || None);
         let mut first_error = None;
-        while let Some((index, result)) = checks.next().await {
+        let mut reconciliation_checks = Vec::with_capacity(checks.len());
+        reconciliation_checks.resize(checks.len(), None);
+        while let Some((index, reconciliation, result)) = checks.next().await {
+            if let Some(slot) = reconciliation_checks.get_mut(index) {
+                *slot = reconciliation;
+            }
             match result {
                 Ok(status) => {
                     if let Some(slot) = ordered.get_mut(index) {
@@ -430,9 +482,10 @@ impl HostToolService {
             return Err(error);
         }
         let statuses = ordered.into_iter().flatten().collect::<Vec<_>>();
-        for status in &statuses {
+        self.lifecycle_hooks.pause_reconciliation_clear().await;
+        for (status, reconciliation) in statuses.iter().zip(reconciliation_checks) {
             if definitive_status(status) {
-                self.clear_reconciliation_if_idle(&status.tool)?;
+                self.complete_reconciliation_check(reconciliation)?;
             }
         }
         Ok(statuses)
@@ -649,6 +702,13 @@ impl HostToolService {
             .install_state
             .lock()
             .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
+        let generation = state.effect_generation.entry(tool).or_default();
+        *generation = generation.checked_add(1).ok_or_else(|| {
+            ToolError::new(
+                "closed",
+                "tool effect generation exhausted; restart the endpoint before installing",
+            )
+        })?;
         state.reconciliation_required.insert(tool);
         Ok(())
     }
@@ -665,16 +725,50 @@ impl HostToolService {
         Ok(())
     }
 
-    fn clear_reconciliation_if_idle(&self, tool: &str) -> Result<(), ToolError> {
+    fn begin_reconciliation_check(
+        &self,
+        tool: &str,
+    ) -> Result<Option<ReconciliationCheck>, ToolError> {
         let Some(tool) = policy_for(tool).map(|policy| policy.tool) else {
+            return Ok(None);
+        };
+        let state = self
+            .install_state
+            .lock()
+            .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
+        if state.active.contains(tool) {
+            return Ok(None);
+        }
+        Ok(Some(ReconciliationCheck {
+            tool,
+            effect_generation: state
+                .effect_generation
+                .get(tool)
+                .copied()
+                .unwrap_or_default(),
+        }))
+    }
+
+    fn complete_reconciliation_check(
+        &self,
+        reconciliation: Option<ReconciliationCheck>,
+    ) -> Result<(), ToolError> {
+        let Some(reconciliation) = reconciliation else {
             return Ok(());
         };
         let mut state = self
             .install_state
             .lock()
             .map_err(|_| ToolError::new("closed", "tool install registry is unavailable"))?;
-        if !state.active.contains(tool) {
-            state.reconciliation_required.remove(tool);
+        let generation = state
+            .effect_generation
+            .get(reconciliation.tool)
+            .copied()
+            .unwrap_or_default();
+        if !state.active.contains(reconciliation.tool)
+            && generation == reconciliation.effect_generation
+        {
+            state.reconciliation_required.remove(reconciliation.tool);
         }
         Ok(())
     }
@@ -741,6 +835,8 @@ impl HostToolService {
             .or_else(|| first_meaningful_line(&capture.stderr.text));
         let error = if let Some(failure) = capture.failure {
             Some(failure)
+        } else if capture.stdout.truncated || capture.stderr.truncated {
+            Some("version command output exceeded the conservative bound".into())
         } else if !capture.status.is_some_and(|status| status.success()) {
             Some(format!(
                 "version command exited with code {}",
@@ -1043,6 +1139,375 @@ struct ProgramCapture {
 }
 
 #[cfg(target_os = "linux")]
+struct ToolSandbox {
+    ruleset: File,
+}
+
+#[cfg(target_os = "linux")]
+impl ToolSandbox {
+    fn create(env: &BTreeMap<String, String>) -> Result<Self, ToolError> {
+        const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+        const LANDLOCK_RULE_PATH_BENEATH: i32 = 1;
+        const WRITE_FILE: u64 = 1 << 1;
+        const REMOVE_DIR: u64 = 1 << 4;
+        const REMOVE_FILE: u64 = 1 << 5;
+        const MAKE_CHAR: u64 = 1 << 6;
+        const MAKE_DIR: u64 = 1 << 7;
+        const MAKE_REG: u64 = 1 << 8;
+        const MAKE_SOCK: u64 = 1 << 9;
+        const MAKE_FIFO: u64 = 1 << 10;
+        const MAKE_BLOCK: u64 = 1 << 11;
+        const MAKE_SYM: u64 = 1 << 12;
+        const REFER: u64 = 1 << 13;
+        const TRUNCATE: u64 = 1 << 14;
+
+        #[repr(C)]
+        struct RulesetAttr {
+            handled_access_fs: u64,
+        }
+        #[repr(C)]
+        struct PathBeneathAttr {
+            allowed_access: u64,
+            parent_fd: i32,
+        }
+
+        let abi = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<RulesetAttr>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        if abi < 3 {
+            return Err(ToolError::new(
+                "containment_unavailable",
+                "endpoint requires Landlock ABI 3 or newer for tool filesystem confinement",
+            ));
+        }
+        let mut handled_access_fs = WRITE_FILE
+            | REMOVE_DIR
+            | REMOVE_FILE
+            | MAKE_CHAR
+            | MAKE_DIR
+            | MAKE_REG
+            | MAKE_SOCK
+            | MAKE_FIFO
+            | MAKE_BLOCK
+            | MAKE_SYM
+            | REFER
+            | TRUNCATE;
+        // The first three ABIs contain every mutation right used here. Do not
+        // request newer rights unless their semantics are reviewed.
+        if abi < 2 {
+            handled_access_fs &= !REFER;
+        }
+        if abi < 3 {
+            handled_access_fs &= !TRUNCATE;
+        }
+        let attr = RulesetAttr { handled_access_fs };
+        let fd = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_landlock_create_ruleset,
+                &attr as *const RulesetAttr,
+                std::mem::size_of::<RulesetAttr>(),
+                0u32,
+            )
+        };
+        if fd < 0 {
+            return Err(ToolError::new(
+                "containment_unavailable",
+                format!(
+                    "endpoint cannot create the tool Landlock ruleset: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        let ruleset = unsafe { File::from_raw_fd(fd as i32) };
+        set_close_on_exec(&ruleset).map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("endpoint cannot protect the tool Landlock descriptor: {error}"),
+            )
+        })?;
+
+        let mut writable_roots = HashMap::new();
+        for path in [
+            Some(PathBuf::from("/tmp")),
+            Some(PathBuf::from("/var/tmp")),
+            env.get("HOME").map(PathBuf::from),
+            env.get("TMPDIR").map(PathBuf::from),
+            env.get("XDG_CACHE_HOME").map(PathBuf::from),
+            env.get("XDG_CONFIG_HOME").map(PathBuf::from),
+            env.get("XDG_DATA_HOME").map(PathBuf::from),
+            env.get("XDG_STATE_HOME").map(PathBuf::from),
+            env.get("XDG_RUNTIME_DIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let canonical = path.canonicalize().map_err(|error| {
+                ToolError::new(
+                    "containment_unavailable",
+                    format!(
+                        "endpoint cannot resolve a tool sandbox writable root {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            if canonical == Path::new("/") || canonical.starts_with("/sys") {
+                return Err(ToolError::new(
+                    "containment_unavailable",
+                    "tool sandbox writable roots cannot include the filesystem or cgroup hierarchy root",
+                ));
+            }
+            writable_roots.insert(canonical, (handled_access_fs, true));
+        }
+        let dev_null = PathBuf::from("/dev/null").canonicalize().map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("endpoint cannot resolve /dev/null for tool confinement: {error}"),
+            )
+        })?;
+        writable_roots.insert(dev_null, (WRITE_FILE | TRUNCATE, false));
+        for (path, (allowed_access, directory)) in writable_roots {
+            let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+                ToolError::new(
+                    "containment_unavailable",
+                    "tool sandbox writable root contains an invalid NUL byte",
+                )
+            })?;
+            let path_fd = unsafe {
+                nix::libc::open(
+                    c_path.as_ptr(),
+                    nix::libc::O_PATH
+                        | nix::libc::O_CLOEXEC
+                        | if directory { nix::libc::O_DIRECTORY } else { 0 },
+                )
+            };
+            if path_fd < 0 {
+                return Err(ToolError::new(
+                    "containment_unavailable",
+                    format!(
+                        "endpoint cannot open tool sandbox writable root {}: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+            let path_fd = unsafe { File::from_raw_fd(path_fd) };
+            let path_attr = PathBeneathAttr {
+                allowed_access,
+                parent_fd: path_fd.as_raw_fd(),
+            };
+            let result = unsafe {
+                nix::libc::syscall(
+                    nix::libc::SYS_landlock_add_rule,
+                    ruleset.as_raw_fd(),
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    &path_attr as *const PathBeneathAttr,
+                    0u32,
+                )
+            };
+            if result != 0 {
+                return Err(ToolError::new(
+                    "containment_unavailable",
+                    format!(
+                        "endpoint cannot add tool sandbox writable root {}: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+        }
+        Ok(Self { ruleset })
+    }
+
+    fn attach(self, command: &mut Command) {
+        let ruleset = self.ruleset;
+        unsafe {
+            command.pre_exec(move || {
+                if nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::syscall(
+                    nix::libc::SYS_landlock_restrict_self,
+                    ruleset.as_raw_fd(),
+                    0u32,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::syscall(
+                    nix::libc::SYS_close_range,
+                    3u32,
+                    u32::MAX,
+                    nix::libc::CLOSE_RANGE_CLOEXEC,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                install_tool_seccomp_filter()?;
+                Ok(())
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_close_on_exec(file: &File) -> std::io::Result<()> {
+    let flags = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        nix::libc::fcntl(
+            file.as_raw_fd(),
+            nix::libc::F_SETFD,
+            flags | nix::libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const TOOL_AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const TOOL_AUDIT_ARCH: u32 = 0xc000_00b7;
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn install_tool_seccomp_filter() -> std::io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_ALU_AND_K: u16 = 0x54;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const NR_OFFSET: u32 = 0;
+    const ARCH_OFFSET: u32 = 4;
+    const ARG0_OFFSET: u32 = 16;
+
+    fn stmt(code: u16, k: u32) -> nix::libc::sock_filter {
+        nix::libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    fn jump(code: u16, k: u32, jt: u8, jf: u8) -> nix::libc::sock_filter {
+        nix::libc::sock_filter { code, jt, jf, k }
+    }
+    fn deny(filters: &mut Vec<nix::libc::sock_filter>, syscall: i64, errno: i32) {
+        filters.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+        filters.push(stmt(BPF_RET_K, RET_ERRNO | errno as u32));
+    }
+
+    let mut filters = vec![
+        stmt(BPF_LD_W_ABS, ARCH_OFFSET),
+        jump(BPF_JMP_JEQ_K, TOOL_AUDIT_ARCH, 1, 0),
+        stmt(BPF_RET_K, RET_KILL_PROCESS),
+        stmt(BPF_LD_W_ABS, NR_OFFSET),
+    ];
+    deny(&mut filters, nix::libc::SYS_clone3, nix::libc::ENOSYS);
+    let namespace_flags = (nix::libc::CLONE_NEWNS
+        | nix::libc::CLONE_NEWCGROUP
+        | nix::libc::CLONE_NEWUTS
+        | nix::libc::CLONE_NEWIPC
+        | nix::libc::CLONE_NEWUSER
+        | nix::libc::CLONE_NEWPID
+        | nix::libc::CLONE_NEWNET
+        | nix::libc::CLONE_NEWTIME) as u32;
+    filters.push(jump(BPF_JMP_JEQ_K, nix::libc::SYS_clone as u32, 0, 4));
+    filters.push(stmt(BPF_LD_W_ABS, ARG0_OFFSET));
+    filters.push(stmt(BPF_ALU_AND_K, namespace_flags));
+    filters.push(jump(BPF_JMP_JEQ_K, 0, 1, 0));
+    filters.push(stmt(BPF_RET_K, RET_ERRNO | nix::libc::EPERM as u32));
+    filters.push(stmt(BPF_LD_W_ABS, NR_OFFSET));
+    for syscall in [
+        nix::libc::SYS_unshare,
+        nix::libc::SYS_setns,
+        nix::libc::SYS_mount,
+        nix::libc::SYS_umount2,
+        nix::libc::SYS_pivot_root,
+        nix::libc::SYS_chroot,
+        nix::libc::SYS_open_tree,
+        nix::libc::SYS_move_mount,
+        nix::libc::SYS_fsopen,
+        nix::libc::SYS_fsmount,
+        nix::libc::SYS_ptrace,
+        nix::libc::SYS_process_vm_readv,
+        nix::libc::SYS_process_vm_writev,
+        nix::libc::SYS_pidfd_getfd,
+        nix::libc::SYS_bpf,
+        nix::libc::SYS_perf_event_open,
+        nix::libc::SYS_io_uring_setup,
+        nix::libc::SYS_userfaultfd,
+        nix::libc::SYS_kcmp,
+    ] {
+        deny(&mut filters, syscall, nix::libc::EPERM);
+    }
+    for syscall in [nix::libc::SYS_socket, nix::libc::SYS_socketpair] {
+        filters.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 3));
+        filters.push(stmt(BPF_LD_W_ABS, ARG0_OFFSET));
+        filters.push(jump(BPF_JMP_JEQ_K, nix::libc::AF_UNIX as u32, 0, 1));
+        filters.push(stmt(BPF_RET_K, RET_ERRNO | nix::libc::EPERM as u32));
+        filters.push(stmt(BPF_LD_W_ABS, NR_OFFSET));
+    }
+    filters.push(stmt(BPF_RET_K, RET_ALLOW));
+    let program = nix::libc::sock_fprog {
+        len: filters.len().try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seccomp filter too large")
+        })?,
+        filter: filters.as_mut_ptr(),
+    };
+    if unsafe {
+        nix::libc::prctl(
+            nix::libc::PR_SET_SECCOMP,
+            nix::libc::SECCOMP_MODE_FILTER,
+            &program as *const nix::libc::sock_fprog,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn install_tool_seccomp_filter() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "interactive tool execution requires a reviewed seccomp architecture",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+struct ToolSandbox;
+
+#[cfg(not(target_os = "linux"))]
+impl ToolSandbox {
+    fn create(_env: &BTreeMap<String, String>) -> Result<Self, ToolError> {
+        Err(ToolError::new(
+            "containment_unavailable",
+            "interactive tool execution requires reviewed Linux filesystem and syscall confinement",
+        ))
+    }
+
+    fn attach(self, _command: &mut Command) {}
+}
+
+#[cfg(target_os = "linux")]
 struct ToolContainment {
     path: PathBuf,
     cleaned: bool,
@@ -1132,7 +1597,7 @@ impl ToolContainment {
     }
 
     fn membership_file(&self) -> Result<File, ToolError> {
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .open(self.path.join("cgroup.procs"))
             .map_err(|error| {
@@ -1140,7 +1605,14 @@ impl ToolContainment {
                     "containment_unavailable",
                     format!("delegated tool cgroup cannot admit a child: {error}"),
                 )
-            })
+            })?;
+        set_close_on_exec(&file).map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("tool cgroup admission descriptor is not close-on-exec: {error}"),
+            )
+        })?;
+        Ok(file)
     }
 
     fn attach(&self, command: &mut Command) -> Result<(), ToolError> {
@@ -1334,6 +1806,7 @@ async fn run_program_capture(
     let mut spawn_attempt = 0;
     let (mut child, mut containment) = loop {
         let mut containment = ToolContainment::create()?;
+        let sandbox = ToolSandbox::create(env)?;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -1347,6 +1820,7 @@ async fn run_program_capture(
             command.process_group(0);
         }
         containment.attach(&mut command)?;
+        sandbox.attach(&mut command);
         match command.spawn() {
             Ok(child) => break (child, containment),
             Err(error)
@@ -1380,6 +1854,8 @@ async fn run_program_capture(
         }
     };
     let pid = child.id();
+    #[cfg(all(test, target_os = "linux"))]
+    lifecycle_hooks.record_containment_path(containment.path.clone());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
@@ -1833,17 +2309,114 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn sandbox_blocks_direct_and_manager_assisted_cgroup_escape_after_fork_and_exec() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let direct_escape = dir.path().join("direct-escape");
+        let manager_request = dir.path().join("manager-request");
+        let manager_escape = dir.path().join("manager-escape");
+        let normal_write = dir.path().join("normal-write");
+        let manager_socket = dir.path().join("manager.sock");
+        let listener = UnixListener::bind(&manager_socket).expect("test manager socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking manager socket");
+        let manager_done = Arc::new(AtomicBool::new(false));
+        let manager = std::thread::spawn({
+            let manager_done = Arc::clone(&manager_done);
+            let manager_escape = manager_escape.clone();
+            move || loop {
+                match listener.accept() {
+                    Ok((_stream, _address)) => {
+                        let status = std::process::Command::new("/bin/sh")
+                            .args([
+                                "-c",
+                                &format!("printf escaped > '{}'", manager_escape.display()),
+                            ])
+                            .status()
+                            .expect("manager-assisted launch");
+                        assert!(status.success(), "manager-assisted launch failed");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if manager_done.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("test manager accept failed: {error}"),
+                }
+            }
+        });
+        let python = format!(
+            "import socket; s=socket.socket(socket.AF_UNIX); s.connect({:?}); s.sendall(b\"spawn\")",
+            manager_socket.to_string_lossy()
+        );
+        let script = executable(
+            dir.path(),
+            "escape-attempts",
+            &format!(
+                "/bin/sh -c 'IFS= read -r membership < /proc/self/cgroup; relative=${{membership#0::}}; parent=${{relative%/*}}; printf \"0\\n\" > \"/sys/fs/cgroup$parent/cgroup.procs\"' 2>/dev/null && printf escaped > '{}' || :; \
+                 /usr/bin/python3 -c '{}' 2>/dev/null && printf requested > '{}' || :; \
+                 /usr/bin/python3 -c 'import socket; s=socket.socket(socket.AF_INET); s.close()'; \
+                 printf allowed > '{}'; printf 'codex 1.2.4'",
+                direct_escape.display(),
+                python,
+                manager_request.display(),
+                normal_write.display(),
+            ),
+        );
+        let hooks = Arc::new(HostToolLifecycleHooks::default());
+        let capture = run_program_capture(
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&hooks),
+            &script,
+            &[],
+            &test_env(dir.path()),
+            Duration::from_secs(2),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("sandboxed escape attempts");
+        manager_done.store(true, Ordering::Release);
+        manager.join().expect("test manager thread");
+
+        assert!(capture.status.is_some_and(|status| status.success()));
+        assert_eq!(capture.stdout.text, "codex 1.2.4");
+        assert!(
+            normal_write.is_file(),
+            "HOME mutation was unexpectedly blocked"
+        );
+        assert!(
+            !direct_escape.exists(),
+            "direct parent-cgroup escape succeeded"
+        );
+        assert!(
+            !manager_request.exists() && !manager_escape.exists(),
+            "user-manager-assisted escape request succeeded"
+        );
+        assert!(
+            !hooks.containment_path().exists(),
+            "escape-attempt containment residue remained"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn successful_parent_cannot_release_a_closed_pipe_setsid_descendant_or_process_permit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let child_pid = dir.path().join("child-pid");
-        let child_cgroup = dir.path().join("child-cgroup");
         let script = executable(
             dir.path(),
             "fork-and-exit",
             &format!(
-                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; root=$(/usr/bin/sed -n \"s/^0:://p\" /proc/self/cgroup); /usr/bin/mkdir /sys/fs/cgroup${{root}}/nested; printf 0 > /sys/fs/cgroup${{root}}/nested/cgroup.procs; /usr/bin/cat /proc/self/cgroup > {}; printf \"%s\" $$ > {}; while :; do :; done' & \
+                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; printf \"%s\" $$ > {}; while :; do :; done' & \
                  while [ ! -s {} ]; do :; done; exit 0",
-                child_cgroup.display(),
                 child_pid.display(),
                 child_pid.display(),
             ),
@@ -1876,21 +2449,18 @@ mod tests {
         });
         hooks.after_kill.wait_until_entered().await;
         assert_eq!(permits.available_permits(), 0);
-        let membership = std::fs::read_to_string(&child_cgroup).expect("descendant cgroup");
-        let relative = membership
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .expect("unified cgroup membership");
-        let containment_path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-        let root_containment_path = containment_path
-            .parent()
-            .expect("nested containment parent")
-            .to_path_buf();
+        let containment_path = hooks.containment_path();
         assert!(containment_path.exists());
         hooks.after_kill.release();
         let capture = task.await.expect("capture task").expect("capture");
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(capture.status.is_some_and(|status| status.success()));
+        assert!(
+            capture.status.is_some_and(|status| status.success()),
+            "unexpected direct status {:?}, stderr {:?}, failure {:?}",
+            capture.status,
+            capture.stderr.text,
+            capture.failure
+        );
         assert!(capture
             .failure
             .as_deref()
@@ -1903,10 +2473,6 @@ mod tests {
             "closed-pipe descendant remained as a process or zombie"
         );
         assert!(!containment_path.exists(), "tool cgroup residue remained");
-        assert!(
-            !root_containment_path.exists(),
-            "root tool cgroup residue remained"
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1914,19 +2480,18 @@ mod tests {
     async fn latest_probe_with_exit_zero_setsid_descendant_is_unknown_and_leaves_no_residue() {
         let dir = tempfile::tempdir().expect("tempdir");
         let child_pid = dir.path().join("latest-child-pid");
-        let child_cgroup = dir.path().join("latest-child-cgroup");
         executable(
             dir.path(),
             "npm",
             &format!(
-                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; /usr/bin/cat /proc/self/cgroup > {}; printf \"%s\" $$ > {}; while :; do :; done' & \
+                "/usr/bin/setsid /bin/sh -c 'exec </dev/null >/dev/null 2>&1; printf \"%s\" $$ > {}; while :; do :; done' & \
                  while [ ! -s {} ]; do :; done; printf '1.2.4'; exit 0",
-                child_cgroup.display(),
                 child_pid.display(),
                 child_pid.display(),
             ),
         );
         let service = HostToolService::new();
+        let hooks = Arc::clone(&service.lifecycle_hooks);
         let error = service
             .latest_version(
                 Some(LatestPolicy::Npm("@openai/codex")),
@@ -1938,21 +2503,19 @@ mod tests {
             .await
             .expect_err("detached latest-probe descendant must prevent a definitive version");
         assert_eq!(error.code, "probe_failed");
-        assert!(error.detail.contains("containment remained populated"));
+        assert!(
+            error.detail.contains("containment remained populated"),
+            "unexpected latest probe failure: {}",
+            error.detail
+        );
 
-        let membership = std::fs::read_to_string(&child_cgroup).expect("descendant cgroup");
-        let relative = membership
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .expect("unified cgroup membership");
-        let containment_path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
         let pid = std::fs::read_to_string(child_pid).expect("descendant pid");
         assert!(
             !Path::new("/proc").join(pid.trim()).exists(),
             "latest probe descendant remained as a process or zombie"
         );
         assert!(
-            !containment_path.exists(),
+            !hooks.containment_path().exists(),
             "latest probe cgroup residue remained"
         );
     }
@@ -2551,6 +3114,76 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn older_check_cannot_reconcile_an_effect_that_started_after_its_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(dir.path(), "npm", "printf '1.2.4'");
+        executable(dir.path(), "codex", "printf 'codex 1.2.4'");
+        let service = HostToolService::new();
+        service.lifecycle_hooks.reconciliation_clear.arm();
+        let check = {
+            let service = Arc::clone(&service);
+            let env = Arc::new(test_env(dir.path()));
+            tokio::spawn(async move {
+                service
+                    .check_inner(
+                        vec![ToolTarget {
+                            target_id: "older-check".into(),
+                            tool: "codex".into(),
+                        }],
+                        env,
+                        CancellationToken::new(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        service
+            .lifecycle_hooks
+            .reconciliation_clear
+            .wait_until_entered()
+            .await;
+
+        let effect = service
+            .claim_install("codex")
+            .expect("concurrent effect claim");
+        effect
+            .mark_effect_started()
+            .expect("concurrent effect generation");
+        drop(effect);
+        service.lifecycle_hooks.reconciliation_clear.release();
+
+        let statuses = check
+            .await
+            .expect("check task")
+            .expect("older check result");
+        assert!(definitive_status(&statuses[0]));
+        let blocked = service
+            .claim_install("codex")
+            .err()
+            .expect("older check must not reconcile a newer effect generation");
+        assert_eq!(blocked.code, "reconciliation_required");
+
+        service
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "newer-check".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(test_env(dir.path())),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("newer check reconciles the observed generation");
+        drop(
+            service
+                .claim_install("codex")
+                .expect("newer definitive check clears reconciliation"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn post_spawn_install_failure_is_unknown_and_preserves_bounded_detail() {
         let dir = tempfile::tempdir().expect("tempdir");
         executable(
@@ -2612,6 +3245,38 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains('7')));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncated_installed_version_output_is_not_accepted_as_authoritative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(dir.path(), "npm", "printf '1.2.4'");
+        executable(
+            dir.path(),
+            "codex",
+            "i=0; while [ \"$i\" -lt 5000 ]; do printf '\\n'; i=$((i + 1)); done; printf 'codex 1.2.4'",
+        );
+        let statuses = HostToolService::new()
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "truncated-version".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(test_env(dir.path())),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("bounded version check");
+        let status = &statuses[0];
+        assert!(!status.installed);
+        assert!(status.path.is_none());
+        assert!(status.version.is_none());
+        assert!(status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("exceeded the conservative bound")));
     }
 
     #[cfg(unix)]
@@ -2791,7 +3456,7 @@ mod tests {
         executable(
             dir.path(),
             "npm",
-            "if [ \"$1\" = view ]; then printf '1.2.4'; else printf 'installed'; fi",
+            "if [ \"$1\" = view ]; then printf '1.2.4'; else printf installed > \"$HOME/install-marker\"; printf installed > /dev/null; printf 'installed'; fi",
         );
         executable(dir.path(), "codex", "printf 'codex 1.2.4'");
         let service = HostToolService::new();
@@ -2809,6 +3474,11 @@ mod tests {
             .expect("successful install");
         assert_eq!(result.outcome, "succeeded");
         assert!(result.success);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("install-marker"))
+                .expect("HOME install marker"),
+            "installed"
+        );
         assert_eq!(
             result.status.and_then(|status| status.version).as_deref(),
             Some("codex 1.2.4")

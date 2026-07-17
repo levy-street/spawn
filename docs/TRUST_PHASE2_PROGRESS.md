@@ -204,15 +204,23 @@ This is **IMPLEMENTED, REVIEW PENDING**, not integrated or `DONE`. Execution is
 fail closed: unknown payload fields and arbitrary path/argv are rejected; no
 shell evaluates browser input; target/process/output/time limits are fixed;
 same-tool installs across the interactive and retained compatibility paths are
-mutually exclusive; cancellation, close, and timeout kill a delegated Linux
-cgroup v2 containment. Execution fails closed when that containment is not
-available; the generated Linux user service requests `Delegate=yes`, while
-unsupported platforms and non-delegated launch modes cannot run interactive
-tool commands. Once installation starts, any non-success, teardown, failed
-reconciliation, or lost acknowledgement is `outcome_unknown`, is never retried
-automatically, and must be reconciled with a separate `tool.check`.
+mutually exclusive; cancellation, close, and timeout kill a per-attempt Linux
+cgroup v2 containment. The generated Linux user service deliberately does not
+request `Delegate=`: delegation alone cannot stop a same-UID tool from moving
+itself into a writable ancestor and is not a trust boundary. Before exec, the
+endpoint instead applies Landlock ABI 3 filesystem mutation confinement and an
+inherited, architecture-reviewed seccomp filter. Tool writes are limited to
+HOME, temporary/runtime roots, and `/dev/null`; cgroup hierarchy writes, namespace
+and mount manipulation, ptrace/process-memory and fd-stealing APIs, BPF/perf,
+io_uring setup, and AF_UNIX manager connections are denied. All inherited FDs
+above stderr are marked close-on-exec. Execution fails closed when cgroup v2,
+Landlock, or the reviewed seccomp architecture is unavailable. Once
+installation starts, any non-success, teardown, failed reconciliation, or lost
+acknowledgement is `outcome_unknown`, is never retried automatically, and must
+be reconciled with a separate `tool.check` whose idle effect-generation token
+is unchanged through atomic completion.
 
-Tool subprocesses, every descendant admitted before exec to their delegated
+Tool subprocesses, every descendant admitted before exec to their per-attempt
 cgroup, and their stdout/stderr drain tasks are owned independently of request
 and DataChannel tasks. The daemon is a child subreaper. Process,
 session-long-task, and same-tool install permits remain held until the cgroup
@@ -220,7 +228,10 @@ reports `populated 0`, inventoried descendants are waited/reaped, both pipes
 have finished or been aborted and joined, and the cgroup directory is removed.
 A successful direct parent that leaves a closed-stdio `setsid` descendant
 behind is killed and reported as a failed operation; its permit cannot be
-released while that descendant survives. Session close
+released while that descendant survives. Regressions also prove that a
+fork/exec descendant cannot move to the parent cgroup or ask a same-UID
+AF_UNIX user-manager surrogate to launch outside containment, while ordinary
+HOME writes and AF_INET sockets remain available. Session close
 still obeys its one absolute deadline while late cleanup remains tracked;
 multi-target failure cancels and drains every started sibling. The browser
 exposes an explicit cancel action, preserves structured endpoint error
