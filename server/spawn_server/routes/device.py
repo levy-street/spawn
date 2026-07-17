@@ -17,6 +17,7 @@ from ..db import get_session
 from ..host_identity import host_key_fingerprint
 from ..host_key_claims import create_or_lock_host_key_claim, lock_host_key_claim
 from ..host_pair_approval import verify_host_pair_approval_proof
+from ..host_pair_possession import verify_host_pair_possession_proof
 from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
@@ -54,6 +55,34 @@ def _gen_device_code() -> str:
 
 def _gen_approval_nonce() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+async def _expire_device_code(
+    session: AsyncSession,
+    *,
+    device_code: str,
+    host_key_algorithm: str,
+    host_public_key: str,
+    now: datetime,
+) -> None:
+    """Commit an expiry transition in the shared claim-first lock order."""
+
+    await lock_host_key_claim(
+        session,
+        host_key_algorithm=host_key_algorithm,
+        host_public_key=host_public_key,
+    )
+    await session.execute(
+        update(DeviceCode)
+        .where(
+            DeviceCode.device_code == device_code,
+            DeviceCode.expires_at <= now,
+            DeviceCode.status != "consuming",
+        )
+        .values(status="expired", last_polled_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
 
 
 @router.post("/start", response_model=schemas.DeviceStartResponse)
@@ -105,13 +134,98 @@ async def device_start(
         await session.rollback()
         raise HTTPException(status_code=409, detail="could not allocate device code; retry") from exc
 
+    assert dc.approval_nonce is not None
     return schemas.DeviceStartResponse(
         device_code=dc.device_code,
         user_code=dc.user_code,
+        approval_nonce=dc.approval_nonce,
         verification_uri=f"{get_settings().public_url.rstrip('/')}/device",
         interval=POLL_INTERVAL_SECONDS,
         expires_in=DEVICE_CODE_TTL_SECONDS,
     )
+
+
+@router.post("/possession", response_model=schemas.DevicePossessionResponse)
+async def device_possession(
+    body: schemas.DevicePossessionRequest,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DevicePossessionResponse:
+    """Activate one ceremony only after its host proves private-key possession."""
+
+    verify_host_pair_possession_proof(
+        device_code_wire=body.device_code,
+        approval_nonce_wire=body.approval_nonce,
+        host_public_key_wire=body.host_public_key,
+        signature_wire=body.signature,
+    )
+    now = _utcnow()
+
+    # Preserve the F8 claim-first ordering shared by start, approval, poll, and
+    # Host deletion. Existing-host deletion therefore either fences this
+    # unproved code first or waits for the exact proof transition to commit.
+    await lock_host_key_claim(
+        session,
+        host_key_algorithm=body.host_key_algorithm,
+        host_public_key=body.host_public_key,
+    )
+    verified = (
+        await session.execute(
+            update(DeviceCode)
+            .where(
+                DeviceCode.device_code == body.device_code,
+                DeviceCode.approval_nonce == body.approval_nonce,
+                DeviceCode.host_key_algorithm == body.host_key_algorithm,
+                DeviceCode.host_public_key == body.host_public_key,
+                DeviceCode.status == "pending",
+                DeviceCode.host_possession_version.is_(None),
+                DeviceCode.host_possession_verified_at.is_(None),
+                DeviceCode.expires_at > now,
+            )
+            .values(
+                host_possession_version=1,
+                host_possession_verified_at=now,
+            )
+            .returning(DeviceCode.device_code)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one_or_none()
+    if verified is not None:
+        await session.commit()
+        return schemas.DevicePossessionResponse(verified=True, version=1)
+
+    # Release any claim/row lock before diagnosing a lost conditional update.
+    # An exact already-verified tuple is the sole idempotent retry case.
+    await session.rollback()
+    snapshot = (
+        await session.execute(
+            select(
+                DeviceCode.approval_nonce,
+                DeviceCode.host_key_algorithm,
+                DeviceCode.host_public_key,
+                DeviceCode.host_possession_version,
+                DeviceCode.host_possession_verified_at,
+                DeviceCode.status,
+                DeviceCode.expires_at,
+            ).where(DeviceCode.device_code == body.device_code)
+        )
+    ).mappings().one_or_none()
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="unknown device code")
+    if (
+        snapshot["approval_nonce"] != body.approval_nonce
+        or snapshot["host_key_algorithm"] != body.host_key_algorithm
+        or snapshot["host_public_key"] != body.host_public_key
+    ):
+        raise HTTPException(status_code=409, detail="device ceremony binding changed")
+    expires = _aware(snapshot["expires_at"])
+    if expires is None or expires <= now:
+        raise HTTPException(status_code=400, detail="device code expired")
+    if (
+        snapshot["host_possession_version"] == 1
+        and snapshot["host_possession_verified_at"] is not None
+    ):
+        return schemas.DevicePossessionResponse(verified=True, version=1)
+    raise HTTPException(status_code=409, detail="device ceremony is no longer provable")
 
 
 @router.post("/poll")
@@ -148,6 +262,8 @@ async def device_poll(
             DeviceCode.browser_key_algorithm == "ed25519",
             DeviceCode.browser_public_key.is_not(None),
             DeviceCode.browser_key_fingerprint.is_not(None),
+            DeviceCode.host_possession_version == 1,
+            DeviceCode.host_possession_verified_at.is_not(None),
             DeviceCode.expires_at > now,
             or_(
                 DeviceCode.last_polled_at.is_(None),
@@ -183,6 +299,8 @@ async def device_poll(
                         DeviceCode.host_public_key,
                         DeviceCode.status,
                         DeviceCode.user_id,
+                        DeviceCode.host_possession_version,
+                        DeviceCode.host_possession_verified_at,
                         DeviceCode.expires_at,
                         DeviceCode.last_polled_at,
                     ).where(DeviceCode.device_code == body.device_code)
@@ -204,17 +322,22 @@ async def device_poll(
 
         expires = _aware(snapshot["expires_at"])
         if expires is not None and expires <= now:
-            await session.execute(
-                update(DeviceCode)
-                .where(
-                    DeviceCode.device_code == body.device_code,
-                    DeviceCode.expires_at <= now,
-                )
-                .values(status="expired", last_polled_at=now)
-                .execution_options(synchronize_session=False)
+            await session.rollback()
+            await _expire_device_code(
+                session,
+                device_code=body.device_code,
+                host_key_algorithm=body.host_key_algorithm,
+                host_public_key=body.host_public_key,
+                now=now,
             )
-            await session.commit()
             return {"error": "expired_token"}
+
+        if (
+            snapshot["host_possession_version"] != 1
+            or snapshot["host_possession_verified_at"] is None
+        ):
+            await session.rollback()
+            return {"error": "authorization_pending"}
 
         # A claimed ceremony is already one-shot even while its winning
         # transaction is still creating the Host. Never expose that transient
@@ -511,6 +634,8 @@ async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceC
         raise HTTPException(status_code=400, detail="user code expired")
     if dc.status != "pending":
         raise HTTPException(status_code=400, detail=f"user code is {dc.status}")
+    if dc.host_possession_version != 1 or dc.host_possession_verified_at is None:
+        raise HTTPException(status_code=409, detail="host possession proof is pending")
     _pending_response(dc)
     return dc
 
@@ -614,6 +739,8 @@ async def device_approve(
             DeviceCode.host_key_algorithm == body.host_key_algorithm,
             DeviceCode.host_public_key == body.host_public_key,
             DeviceCode.browser_device_id.is_(None),
+            DeviceCode.host_possession_version == 1,
+            DeviceCode.host_possession_verified_at.is_not(None),
         )
         .values(
             status="approved",

@@ -2,9 +2,10 @@
 //!
 //! Flow per `proto/README.md`:
 //!   1. POST /api/auth/device/start  -> { device_code, user_code, verification_uri, interval, expires_in }
-//!   2. Print "open <verification_uri> and enter code XXXX-XXXX".
-//!   3. Poll /api/auth/device/poll until success / expiry / denial.
-//!   4. On success store {access_token, host_id, server_url}.
+//!   2. Sign and POST /api/auth/device/possession for that exact ceremony.
+//!   3. Only after proof succeeds, print the verification URI and user code.
+//!   4. Poll /api/auth/device/poll until success / expiry / denial.
+//!   5. On success store {access_token, host_id, server_url}.
 
 use std::time::Duration;
 
@@ -16,7 +17,8 @@ use crate::config;
 use crate::creds;
 use crate::creds::HostIdentity;
 use crate::proto::{
-    DevicePollRequest, DevicePollResponse, DeviceStartRequest, DeviceStartResponse,
+    DevicePollRequest, DevicePollResponse, DevicePossessionRequest, DevicePossessionResponse,
+    DeviceStartRequest, DeviceStartResponse,
 };
 
 pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
@@ -56,6 +58,33 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
         .json()
         .await
         .context("decoding device/start response")?;
+
+    // Prove possession before activating the human-visible user code. The
+    // private seed stays inside creds; only the fixed-width signature leaves.
+    let possession_signature =
+        creds::sign_host_pair_possession(&stored, &start.device_code, &start.approval_nonce)?;
+    let possession_url = config::api_url(&server, "/api/auth/device/possession")?;
+    let possession: DevicePossessionResponse = client
+        .post(possession_url.as_str())
+        .json(&DevicePossessionRequest {
+            device_code: &start.device_code,
+            approval_nonce: &start.approval_nonce,
+            host_key_algorithm: identity.algorithm,
+            host_public_key: &identity.public_key,
+            signature: &possession_signature,
+        })
+        .send()
+        .await
+        .context("POST /api/auth/device/possession")?
+        .error_for_status()?
+        .json()
+        .await
+        .context("decoding device/possession response")?;
+    if !possession.verified || possession.version != 1 {
+        return Err(anyhow!(
+            "device/possession returned an unsupported verification state"
+        ));
+    }
 
     println!(
         "spawn: open {} and enter code:  {}",

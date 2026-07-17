@@ -165,7 +165,9 @@ for _ in range(100):
     conn = sqlite3.connect(db_path)
     try:
         row = conn.execute(
-            "select user_code from device_codes where host_name = ? order by expires_at desc limit 1",
+            "select user_code from device_codes where host_name = ? "
+            "and host_possession_version = 1 and host_possession_verified_at is not null "
+            "order by expires_at desc limit 1",
             ("cli-login-smoke",),
         ).fetchone()
     except sqlite3.OperationalError:
@@ -176,7 +178,7 @@ for _ in range(100):
         print(row[0])
         raise SystemExit(0)
     time.sleep(0.1)
-raise SystemExit("spawnd login did not create a pending device code")
+raise SystemExit("spawnd login did not prove its pending device code")
 PY
 )"
 

@@ -163,10 +163,13 @@ device identity and signed signaling remain the subsequent Phase 3 work:
   headless fallback). It is preserved across retries/re-login and removed only
   by the existing explicit `spawnd logout` credential reset. The public key is
   submitted with `device/start` and shown (as a short fingerprint) on the
-  `/device` approval page, binding it to the user at approval time. Same-owner
-  re-login reuses the pinned Host; host deletion revokes its token authority and
-  removes the pin. Private key material never enters a request, log, or
-  status/API response.
+  `/device` approval page. Before showing the user code, the daemon signs the
+  exact fresh device-code/approval-nonce ceremony challenge; browser review,
+  approval, and token issue remain unavailable until the server verifies that
+  proof against the submitted host key. Same-owner re-login reuses the pinned
+  Host; host deletion revokes its token authority and removes the live pin while
+  retaining the original account's key claim. Private key material never enters
+  a request, log, or status/API response.
 - **Browser device identity**: on first login, the browser generates a
   non-extractable WebCrypto keypair (IndexedDB). The public key is
   registered with the account.

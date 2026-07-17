@@ -16,6 +16,7 @@ from .host_identity import (
     host_key_fingerprint,
 )
 from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
+from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
 
 # ---------- auth ----------
 
@@ -119,9 +120,52 @@ class DeviceStartRequest(BaseModel):
 class DeviceStartResponse(BaseModel):
     device_code: str
     user_code: str
+    approval_nonce: str
     verification_uri: str
     interval: int
     expires_in: int
+
+
+class DevicePossessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_code: str = Field(
+        min_length=DEVICE_CODE_B64URL_LENGTH,
+        max_length=DEVICE_CODE_B64URL_LENGTH,
+    )
+    approval_nonce: str = Field(
+        min_length=APPROVAL_NONCE_B64URL_LENGTH,
+        max_length=APPROVAL_NONCE_B64URL_LENGTH,
+    )
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
+
+    @field_validator("device_code")
+    @classmethod
+    def validate_device_code(cls, value: str) -> str:
+        decode_device_code(value)
+        return value
+
+    @field_validator("approval_nonce")
+    @classmethod
+    def validate_approval_nonce(cls, value: str) -> str:
+        decode_approval_nonce(value)
+        return value
+
+    @field_validator("host_public_key")
+    @classmethod
+    def validate_host_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePossessionResponse(BaseModel):
+    verified: Literal[True]
+    version: Literal[1]
 
 
 class DevicePollRequest(BaseModel):

@@ -454,6 +454,16 @@ keyed write boundary, so delete-versus-start/poll linearizes on SQLite and
 PostgreSQL without releasing the binding. Daemon disconnect is best-effort
 external cleanup after the durable commit, not the revocation boundary.
 
+**P3-LIVE-F7 daemon host-key possession (implemented, independent review
+pending):** `device/start` now returns its existing fresh 32-byte approval nonce
+to the daemon, which signs `SPAWN-HOST-PAIR-POSSESSION-V1` over the exact raw
+device code, nonce, and strict Ed25519 host public key before printing the user
+code. The server records a one-way versioned proof state only on that exact
+unexpired pending row. Pending browser review, approval, and token-producing
+poll all fail closed without it. Cross-code, nonce, key, ceremony, expiry, and
+deletion replay paths cannot create a Host, retained ownership claim, pin, or
+token. Rust produces the shared golden signature and Python verifies it.
+
 This is only the server/browser first-contact half of pairing. P3-IDENTITY-02E
 must separately make the daemon validate and persist the returned browser pin;
 02D makes no daemon-local pin, peer discovery, live-signaling, or TOFU claim.

@@ -19,6 +19,9 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::config;
+use spawnd::host_pair_possession::{
+    sign_transcript, signature_to_wire, HostPairPossessionTranscript,
+};
 
 const KEYRING_SERVICE: &str = "spawn";
 const KEYRING_USER: &str = "daemon";
@@ -157,6 +160,41 @@ pub fn ensure_host_identity(creds: &mut StoredCreds) -> Result<HostIdentity> {
 
 /// Derive only public presentation data from a stored seed without generating.
 pub fn host_identity(creds: &StoredCreds) -> Result<Option<HostIdentity>> {
+    let Some(signing_key) = host_signing_key(creds)? else {
+        return Ok(None);
+    };
+    let public_bytes = signing_key.verifying_key().to_bytes();
+    let public_key = URL_SAFE_NO_PAD.encode(public_bytes);
+    let digest = Sha256::digest(public_bytes);
+    let fingerprint = format!(
+        "SHA256:{}",
+        URL_SAFE_NO_PAD.encode(&digest[..FINGERPRINT_HASH_BYTES])
+    );
+    Ok(Some(HostIdentity {
+        algorithm: HOST_KEY_ALGORITHM,
+        public_key,
+        fingerprint,
+    }))
+}
+
+/// Sign the exact server-issued ceremony challenge without exposing the seed.
+pub fn sign_host_pair_possession(
+    creds: &StoredCreds,
+    device_code: &str,
+    approval_nonce: &str,
+) -> Result<String> {
+    let signing_key = host_signing_key(creds)?.context("host identity was not generated")?;
+    let host_public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    let transcript =
+        HostPairPossessionTranscript::from_wire(device_code, approval_nonce, &host_public_key)
+            .context("constructing host-pair possession transcript")?;
+    Ok(signature_to_wire(&sign_transcript(
+        &signing_key,
+        &transcript,
+    )))
+}
+
+fn host_signing_key(creds: &StoredCreds) -> Result<Option<SigningKey>> {
     let Some(encoded_seed) = creds.host_private_key_seed.as_deref() else {
         return Ok(None);
     };
@@ -180,18 +218,7 @@ pub fn host_identity(creds: &StoredCreds) -> Result<Option<HostIdentity>> {
     }
     let signing_key = SigningKey::from_bytes(&seed);
     seed.zeroize();
-    let public_bytes = signing_key.verifying_key().to_bytes();
-    let public_key = URL_SAFE_NO_PAD.encode(public_bytes);
-    let digest = Sha256::digest(public_bytes);
-    let fingerprint = format!(
-        "SHA256:{}",
-        URL_SAFE_NO_PAD.encode(&digest[..FINGERPRINT_HASH_BYTES])
-    );
-    Ok(Some(HostIdentity {
-        algorithm: HOST_KEY_ALGORITHM,
-        public_key,
-        fingerprint,
-    }))
+    Ok(Some(signing_key))
 }
 
 /// Wipe stored creds (file + keyring).
@@ -627,6 +654,30 @@ mod tests {
         assert!(!first
             .public_key
             .contains(creds.host_private_key_seed.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn possession_signature_matches_shared_rust_vector_without_exposing_seed() {
+        let seed = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let creds = StoredCreds {
+            host_private_key_seed: Some(URL_SAFE_NO_PAD.encode(seed)),
+            ..StoredCreds::default()
+        };
+        let signature = sign_host_pair_possession(
+            &creds,
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+        )
+        .unwrap();
+        assert_eq!(
+            signature,
+            "4Rpu9zkZeKI8F4WLDURpgSjsfktWicSUJEOJb7V837oP9fyyyYRwZMRLxjNG9mADRdf72S-AebxWwrdv1e-ZAQ"
+        );
+        assert!(!signature.contains(creds.host_private_key_seed.as_deref().unwrap()));
     }
 
     #[test]

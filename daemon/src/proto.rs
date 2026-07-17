@@ -320,10 +320,26 @@ pub struct DeviceStartRequest<'a> {
 pub struct DeviceStartResponse {
     pub device_code: String,
     pub user_code: String,
+    pub approval_nonce: String,
     pub verification_uri: String,
     pub interval: u64,
     #[allow(dead_code)]
     pub expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DevicePossessionRequest<'a> {
+    pub device_code: &'a str,
+    pub approval_nonce: &'a str,
+    pub host_key_algorithm: &'a str,
+    pub host_public_key: &'a str,
+    pub signature: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DevicePossessionResponse {
+    pub verified: bool,
+    pub version: u8,
 }
 
 #[derive(Debug, Serialize)]

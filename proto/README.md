@@ -17,6 +17,9 @@ the shared `browser-device-registration-v1-vectors.json` corpus.
 Browser-authorized host pairing uses
 [`HOST_PAIR_APPROVAL_V1.md`](HOST_PAIR_APPROVAL_V1.md) and the shared
 `host-pair-approval-v1-vectors.json` corpus.
+Daemon host-key possession before browser approval uses
+[`HOST_PAIR_POSSESSION_V1.md`](HOST_PAIR_POSSESSION_V1.md) and the shared
+Rust-produced `host-pair-possession-v1-vectors.json` corpus.
 
 ## Identifiers
 
@@ -37,7 +40,8 @@ also accepts `Bearer` for API testing).
 | POST   | `/api/auth/login`          | `{email, password}`                 | `{access_token, user}`                                                                                            |
 | POST   | `/api/auth/logout`         | —                                   | 204                                                                                                               |
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
-| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, verification_uri, interval, expires_in}` |
+| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, approval_nonce, verification_uri, interval, expires_in}` |
+| POST   | `/api/auth/device/possession` | `{device_code, approval_nonce, host_key_algorithm:"ed25519", host_public_key, signature}` | `{verified:true, version:1}` after exact unexpired host-key proof |
 | POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | host tuple plus the exact approving browser device/key/fingerprint on success; otherwise a device-flow `error` |
 | POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, approval_nonce, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
 | POST   | `/api/auth/device/approve` | reviewed host tuple/nonce plus `{browser_device_id, browser_key_algorithm, browser_public_key, browser_key_fingerprint, signature}` | the exact reviewed host and browser presentation after one-shot approval |
@@ -55,13 +59,18 @@ browser device before atomically binding that browser snapshot to the ceremony.
 Poll rechecks that it is still active, creates/reuses the Host, and inserts an
 immutable Host/browser pin. An existing Host is locked while admitting at most
 32 pins; a full host returns stable `pin_limit` without a partial pin or token.
+Before exposing the user code, the daemon signs the fixed-width transcript in
+`HOST_PAIR_POSSESSION_V1.md` over the exact device code, approval nonce, and
+host public key. Pending review, approval, and token-producing poll fail closed
+until that exact unexpired ceremony records possession version 1.
 
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
 Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
 so a rolling deploy does not invent or silently rotate an identity. Migration
 0019 likewise leaves interrupted pre-nonce codes visibly unapproved so they
-must restart. Re-pairing
+must restart. Migration 0021 leaves every pre-upgrade code visibly unproved, so
+it also must restart or submit a valid proof before approval. Re-pairing
 an existing daemon pins it; a same-owner re-login with the same key reuses the
 Host row, while another owner cannot claim it. Multiple explicit ceremonies may
 independently add immutable browser pins to that Host.

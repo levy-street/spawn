@@ -244,6 +244,7 @@ export type AuthResponse = z.infer<typeof AuthResponseSchema>;
 export const DeviceStartResponseSchema = z.object({
   device_code: z.string(),
   user_code: z.string(),
+  approval_nonce: z.string().length(43),
   verification_uri: z.string(),
   interval: z.number(),
   expires_in: z.number(),
