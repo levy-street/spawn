@@ -1,3 +1,4 @@
+import { assertBrowserDeviceIdentitySignerActive } from "./browser-device-identity";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
@@ -100,10 +101,17 @@ export async function signRtcSignalWire(
   // Re-import so signing cannot emit an invalid or weak intended-peer key.
   await importEd25519PublicKeyWire(intendedPeerWire);
   const signature = await signer.sign(copyTranscript(transcript));
+  assertBrowserDeviceIdentitySignerActive(signer);
   // The accepted browser identity intentionally exposes no private CryptoKey.
   // This proof binds its public handle to the opaque signing closure and fails
   // closed if a caller combines halves from different identities.
-  if (!(await verifySignedSignalTranscript(senderPublicKey, transcript, signature))) {
+  const signatureVerified = await verifySignedSignalTranscript(
+    senderPublicKey,
+    transcript,
+    signature,
+  );
+  assertBrowserDeviceIdentitySignerActive(signer);
+  if (!signatureVerified) {
     throw new SignedRtcWireError(
       "signature_mismatch",
       "identity signer did not produce a signature for its public key",
@@ -127,6 +135,7 @@ export async function signRtcSignalWire(
   if (wire.length > MAX_SIGNED_RTC_WIRE_CHARS) {
     throw new SignedRtcWireError("wire_too_large", "signed RTC envelope exceeds its wire bound");
   }
+  assertBrowserDeviceIdentitySignerActive(signer);
   return wire;
 }
 

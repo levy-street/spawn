@@ -233,6 +233,54 @@ describe("browser device identity", () => {
     ).rejects.toMatchObject({ name: "AbortError" });
   });
 
+  test("post-sign wire verification cannot return a valid wire after epoch abort", async () => {
+    const factory = new IDBFactory();
+    const accountId = "00000000-0000-4000-8000-000000000092";
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const controller = new AbortController();
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      identity,
+      accountId,
+      identity.publicKeyWire,
+      controller.signal,
+    );
+    const originalVerifyDescriptor = Object.getOwnPropertyDescriptor(crypto.subtle, "verify");
+    const originalVerify = crypto.subtle.verify.bind(crypto.subtle);
+    let postSignVerifyReached = false;
+    let postSignVerifyAccepted = false;
+    let escapedWire: string | undefined;
+    Object.defineProperty(crypto.subtle, "verify", {
+      configurable: true,
+      value: async (...args: Parameters<SubtleCrypto["verify"]>) => {
+        postSignVerifyReached = true;
+        controller.abort();
+        postSignVerifyAccepted = await originalVerify(...args);
+        return postSignVerifyAccepted;
+      },
+    });
+
+    let caught: unknown;
+    try {
+      escapedWire = await signRtcSignalWire(scoped, {
+        protocol: "spawn.host.ctl",
+        transcript: transcript(identity.publicKeyWire),
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      if (originalVerifyDescriptor === undefined) {
+        Reflect.deleteProperty(crypto.subtle, "verify");
+      } else {
+        Object.defineProperty(crypto.subtle, "verify", originalVerifyDescriptor);
+      }
+    }
+
+    expect(postSignVerifyReached).toBe(true);
+    expect(postSignVerifyAccepted).toBe(true);
+    expect(escapedWire).toBeUndefined();
+    expect(caught).toMatchObject({ name: "AbortError" });
+  });
+
   test("the public-only loader exposes no signer and cannot satisfy proof helpers", async () => {
     const factory = new IDBFactory();
     const accountId = "00000000-0000-4000-8000-000000000091";
@@ -248,20 +296,51 @@ describe("browser device identity", () => {
     ).rejects.toThrow("does not belong");
   });
 
-  test("production raw identity loading and scoped signing cross one reviewed boundary", async () => {
-    const hits: Array<{ path: string; load: number; scope: number; approval: number }> = [];
+  test("production raw identity loading and signing cross one reviewed boundary", async () => {
+    const hits: Array<{
+      path: string;
+      load: number;
+      scope: number;
+      approval: number;
+      rawSign: number;
+      wireSign: number;
+    }> = [];
     const glob = new Bun.Glob("src/**/*.{ts,tsx}");
     for await (const path of glob.scan(".")) {
-      if (path.includes(".test.") || path.endsWith("browser-device-identity.ts")) continue;
+      if (
+        path.includes(".test.") ||
+        path.endsWith("browser-device-identity.ts") ||
+        path.endsWith("signed-signal.ts") ||
+        path.endsWith("signed-signal-wire.ts")
+      ) {
+        continue;
+      }
       const source = await Bun.file(path).text();
       const load = source.match(/\bloadBrowserDeviceIdentity\s*\(/gu)?.length ?? 0;
       const scope = source.match(/\bscopeBrowserDeviceIdentityToTrustEpoch\b/gu)?.length ?? 0;
       const approval = source.match(/\bcreateHostPairApprovalProof\b/gu)?.length ?? 0;
-      if (load + scope + approval > 0) hits.push({ path, load, scope, approval });
+      const rawSign = source.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length ?? 0;
+      const wireSign = source.match(/\bsignRtcSignalWire\s*\(/gu)?.length ?? 0;
+      if (load + scope + approval + rawSign + wireSign > 0) {
+        hits.push({ path, load, scope, approval, rawSign, wireSign });
+      }
     }
     expect(hits).toEqual([
-      { path: "src/lib/browser-trust-operations.ts", load: 1, scope: 2, approval: 2 },
+      {
+        path: "src/lib/browser-trust-operations.ts",
+        load: 1,
+        scope: 2,
+        approval: 2,
+        rawSign: 0,
+        wireSign: 0,
+      },
     ]);
+    const identitySource = await Bun.file("src/lib/browser-device-identity.ts").text();
+    expect(identitySource.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length).toBe(3);
+    const rawSignerSource = await Bun.file("src/lib/signed-signal.ts").text();
+    expect(rawSignerSource.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length).toBe(1);
+    const wireSignerSource = await Bun.file("src/lib/signed-signal-wire.ts").text();
+    expect(wireSignerSource.match(/\bsignRtcSignalWire\s*\(/gu)?.length).toBe(1);
   });
 
   test("serializes concurrent first creation so every tab-equivalent caller sees one winner", async () => {

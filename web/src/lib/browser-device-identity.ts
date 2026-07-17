@@ -75,6 +75,21 @@ function assertIdentityCapabilityActive(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new DOMException("Browser trust epoch ended", "AbortError");
 }
 
+/**
+ * Reassert the private trust-epoch capability associated with an opaque
+ * browser signer. Generic interop signers have no browser epoch to assert;
+ * production use of those low-level signers is separately inventory-guarded.
+ *
+ * This deliberately exposes neither the capability nor its AbortSignal. It is
+ * an unconditional return-boundary check for helpers that must await work
+ * after invoking the opaque signer.
+ */
+export function assertBrowserDeviceIdentitySignerActive(identity: object): void {
+  assertIdentityCapabilityActive(
+    privateIdentityRecords.get(identity as BrowserDeviceIdentity)?.signal,
+  );
+}
+
 function assertAccountId(accountId: string): void {
   if (typeof accountId !== "string" || !CANONICAL_ACCOUNT_ID_PATTERN.test(accountId)) {
     throw new BrowserDeviceIdentityError(
@@ -396,7 +411,11 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
   const identity: BrowserDeviceIdentity = {
     publicKey: record.publicKey,
     publicKeyWire: record.publicKeyWire,
-    sign: (transcript) => signSignedSignalTranscript(record.privateKey, transcript),
+    sign: async (transcript) => {
+      const signature = await signSignedSignalTranscript(record.privateKey, transcript);
+      assertBrowserDeviceIdentitySignerActive(identity);
+      return signature;
+    },
   };
   privateIdentityRecords.set(identity, { record });
   return Object.freeze(identity);
@@ -435,7 +454,9 @@ export async function createBrowserDeviceRegistrationProof(
       "browser registration signer returned an invalid signature length",
     );
   }
-  return encodeBase64Url(signature);
+  const encodedSignature = encodeBase64Url(signature);
+  assertBrowserDeviceIdentitySignerActive(identity);
+  return encodedSignature;
 }
 
 /** Sign only the bounded host-pair approval contract with this opaque identity. */
@@ -481,7 +502,10 @@ export async function createHostPairApprovalProof(
       "host-pair approval signer returned an invalid signature length",
     );
   }
-  return encodeBase64Url(signature);
+  const encodedSignature = encodeBase64Url(signature);
+  assertIdentityCapabilityActive(signal);
+  assertBrowserDeviceIdentitySignerActive(identity);
+  return encodedSignature;
 }
 
 /**
@@ -578,7 +602,7 @@ export function scopeBrowserDeviceIdentityToTrustEpoch(
     sign: async (transcript: SignedSignalTranscript) => {
       assertIdentityCapabilityActive(signal);
       const signature = await signSignedSignalTranscript(record.privateKey, transcript);
-      assertIdentityCapabilityActive(signal);
+      assertBrowserDeviceIdentitySignerActive(scoped);
       return signature;
     },
   });
