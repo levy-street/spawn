@@ -120,7 +120,6 @@ printf '%s\n' "smoke-host-owner-recovery: running crash and race gates"
       tests/test_ws_daemon.py::test_registration_repairs_db_b_redis_a_with_successor_c \
       tests/test_ws_daemon.py::test_delayed_c_recovery_cannot_overwrite_successor_d \
       tests/test_ws_broker.py::test_committed_owner_promotion_repairs_older_cache_but_never_overwrites_successor \
-      tests/test_ws_broker.py::test_upload_resolution_distinguishes_missing_waiter_from_stale_owner \
       tests/test_ws_broker.py::test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding
 )
 

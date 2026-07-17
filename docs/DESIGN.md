@@ -38,10 +38,10 @@
   `/ws/daemon` is JSON-only `spawn.control.v2`; `/ws/browser` requires
   `spawn.v2`. The server has no terminal input/output, transcript, history,
   snapshot, viewport, or display-owner relay. Terminal data, history and
-  viewport operations travel on mandatory `spawn.pty` + `spawn.ctl` direct
-  channels. Agent uploads still cross the server, and launch manifests,
-  preset environment/install/tool values, and skill bodies still have
-  server-readable paths or stores pending P2-TERM-01 and P2-DATA-02. The MCP
+  viewport operations and capability-bound agent uploads travel on mandatory,
+  fully reliable ordered `spawn.pty` + `spawn.ctl` direct channels. Launch
+  manifests, preset environment/install/tool values, and skill bodies still
+  have server-readable paths or stores pending P2-DATA-02. The MCP
   surface (endpoint, managed-server registry, MCP-client OAuth) was
   removed entirely on 2026-07-09 per TRUST.md.
 
@@ -167,16 +167,17 @@ closed; the server never fills the gap from a cache.
   - Subprotocol `spawn.control.v2`, JSON only.
   - Out: `register`, `host.heartbeat`, content-free `agent.activity` /
     `agent.input_activity`, lifecycle, and bound `rtc.*` signaling.
-  - In: `agent.create`, `agent.kill`, upload/control operations still awaiting
-    later trust tasks, and bound `rtc.*` signaling.
+  - In: `agent.create`, `agent.kill`, remaining lifecycle/control operations,
+    and bound `rtc.*` signaling. There is no agent-upload frame.
 - Browser `/ws/browser?agent_id=...`:
   - Mandatory subprotocol `spawn.v2`; text-only auth, disclosed lifecycle,
-    uploads pending migration, TURN config, and bound `rtc.*` signaling.
+    TURN config, and bound `rtc.*` signaling. There is no upload/content leg.
   - Binary frames and terminal viewport/history commands fail closed.
 - Terminal data plane: mandatory WebRTC DataChannels `spawn.pty` (bytes) and
-  `spawn.ctl` (history/snapshot/viewport/display ownership), negotiated via
-  the content-free WS signaling plane. TURN is an encrypted reachability
-  fallback, not a server terminal-content fallback.
+  `spawn.ctl` (history/snapshot/viewport/display ownership and agent uploads),
+  negotiated via the content-free WS signaling plane. Both are ordered and
+  fully reliable. TURN is an encrypted reachability fallback, not a server
+  terminal-content fallback.
 
 ## Roadmap
 
@@ -189,9 +190,10 @@ operator-model migration, specified in `TRUST.md`:
    `spawn.v2`.
 2. **Endpoint-owned data** — history and snapshots now use agent
    DataChannels, and server transcripts plus the Redis PTY ring are deleted.
-   Upload, fs-listing/transfer, launch-manifest, preset, tool-target, and skill
-   migrations remain tracked Phase 2 work; the server still sees those values
-   until their individual cutovers land. (The
+   Agent uploads and host fs-listing/transfer now use direct endpoint channels.
+   Launch-manifest, preset, tool-target, and skill migrations remain tracked
+   Phase 2 work; the server still sees those values until their individual
+   cutovers land. (The
    `/mcp` visibility question is resolved: the MCP surface was cut
    entirely on 2026-07-09.)
 3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device

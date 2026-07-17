@@ -400,6 +400,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut pty_open = false;
     let mut exit_reported = false;
     let mut pty_source_offset = 0u64;
+    let mut agent_cwd: Option<String> = None;
 
     let started_at = tokio::time::Instant::now();
     let mut exited_at: Option<tokio::time::Instant> = None;
@@ -438,6 +439,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     pid: pty.as_ref().map(|p| p.pid),
                     cols: pty.as_ref().map(|p| p.size.lock().unwrap().0).unwrap_or(0),
                     rows: pty.as_ref().map(|p| p.size.lock().unwrap().1).unwrap_or(0),
+                    cwd: agent_cwd.clone(),
                 };
                 let hello_sent = tokio::time::timeout(
                     SUPERVISOR_HELLO_TIMEOUT,
@@ -486,6 +488,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &mut pty_tx,
                     &mut exit_tx,
                     &child_state,
+                    &mut agent_cwd,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => pty_open = true,
@@ -648,13 +651,23 @@ async fn handle_frame(
     pty_tx: &mut Option<mpsc::Sender<PlaintextChunk>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
     child_state: &SharedChild,
+    agent_cwd: &mut Option<String>,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
             if !matches!(state, State::AwaitingStart) {
                 bail!("Start received but agent is already {}", state_name(state));
             }
-            let spec: wire::StartSpec = wire::decode_json(&payload)?;
+            let mut spec: wire::StartSpec = wire::decode_json(&payload)?;
+            let canonical_cwd =
+                std::fs::canonicalize(&spec.cwd).context("resolving agent cwd capability root")?;
+            if !canonical_cwd.is_dir() {
+                bail!("agent cwd capability root is not a directory");
+            }
+            spec.cwd = canonical_cwd
+                .to_str()
+                .context("agent cwd capability root is not UTF-8")?
+                .to_string();
             let (cols, rows) = (spec.cols.max(1), spec.rows.max(1));
             let mut emu = Emulator::new(cols, rows);
             let initial = emu.serialize();
@@ -678,10 +691,19 @@ async fn handle_frame(
             let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
                 .context("spawning agent PTY")?;
             let pid = started.pid;
+            *agent_cwd = Some(spec.cwd.clone());
             *pty = Some(started);
             *state = State::Running;
             if let Some(w) = conn_write.as_mut() {
-                let _ = wire::write_json_frame(w, wire::T_STARTED, &wire::Started { pid }).await;
+                let _ = wire::write_json_frame(
+                    w,
+                    wire::T_STARTED,
+                    &wire::Started {
+                        pid,
+                        cwd: spec.cwd.clone(),
+                    },
+                )
+                .await;
             }
             tracing::info!(pid, "agent started");
             Ok(LoopAction::PtyStarted)

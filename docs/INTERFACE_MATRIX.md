@@ -23,7 +23,7 @@ MCP tool surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md
 | Terminal input | terminal page | none | terminal socket hook | `spawn.pty` DataChannel direct to endpoint |
 | Resize/scroll/redraw/display ownership | terminal page | none | `spawn.ctl` client | versioned `spawn.ctl` request direct to endpoint |
 | History/snapshot replay | terminal reconnect/history | none | `spawn.ctl` client | bounded `spawn.ctl` chunk response direct from worker |
-| Upload file/image to agent cwd | terminal upload/drop/paste | `/upload`, `/upload-file` | `agents.upload/uploadFile` | `agent.upload` request/result |
+| Upload file/image to agent | terminal upload/drop/paste | none | terminal `spawn.ctl` client | bounded `spawn.ctl` `upload_start`/kind-2 chunks/cancel/completion direct to endpoint |
 
 ## Approved durable protected-data target (P2-DATA-01)
 
@@ -52,13 +52,16 @@ Intentional differences:
   errors never use REST or the server daemon WebSocket. The browser talks to
   the selected host on its independently bound `spawn.host.ctl` DataChannel;
   cross-host copies are browser-mediated between two such sessions.
-- Browser display ownership, terminal input, viewport control, and replay are
+- Browser display ownership, terminal input, viewport control, replay, and
+  agent upload are
   endpoint-owned DataChannel features. REST and server WebSockets deliberately
   expose none of those content-bearing operations.
 - The `spawnd` CLI is host-side daemon administration only: login, status,
   logout, run, install, and service setup. User agent control lives in browser
   and REST.
-- Browser upload includes native file picker, drop, and paste affordances.
-  REST carries the same data as JSON base64 and also supports multipart.
+- Browser upload includes native file picker, drop, and paste affordances. It
+  hashes, chunks, backpressures, retries, and cancels on the direct per-agent
+  control channel; there is no REST, signaling-WebSocket, or daemon-WebSocket
+  upload-content path.
 - Managed skills are projected per agent. Spawn does not mutate the host
   user's global skill configuration.

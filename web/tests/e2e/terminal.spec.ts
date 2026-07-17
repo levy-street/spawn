@@ -18,9 +18,18 @@ async function openTerminalWithMockSocket(
     noChannels?: boolean;
     noReady?: boolean;
     autoSnapshot?: boolean;
+    uploadFinalAction?: "complete" | "disconnect" | "hold";
+    stallUploadBackpressure?: boolean;
+    fromAgents?: boolean;
   } = {},
 ) {
   const messages: Array<string | Buffer> = [];
+  const uploads: Array<{
+    name: string;
+    mimeType: string;
+    destination: "attachments" | "cwd";
+    bytes: Buffer;
+  }> = [];
   await installAgentRtcMock(page, messages, {
     control: options.control,
     history: options.history,
@@ -28,6 +37,11 @@ async function openTerminalWithMockSocket(
     openChannels: !options.noChannels,
     sendReady: !options.noReady,
     autoSnapshot: options.autoSnapshot,
+    uploadFinalAction: options.uploadFinalAction,
+    stallUploadBackpressure: options.stallUploadBackpressure,
+    onUpload: (upload) => {
+      uploads.push(upload);
+    },
   });
   await mockAuthenticatedApi(page, { agents: [agent()] });
   const sockets: WebSocketRoute[] = [];
@@ -55,9 +69,10 @@ async function openTerminalWithMockSocket(
     }
   });
 
+  if (options.fromAgents) await page.goto("/agents");
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(page.getByLabel("Agent terminal")).toBeVisible();
-  return { messages, sockets };
+  return { messages, sockets, uploads };
 }
 
 function binaryText(messages: Array<string | Buffer>) {
@@ -81,6 +96,110 @@ function jsonMessages(messages: Array<string | Buffer>) {
       }
     })
     .filter(Boolean);
+}
+
+async function failReconciliationStorageAfter(page: Page, successfulWrites: number) {
+  await page.addInitScript(
+    ({ prefix, successfulWrites }) => {
+      const originalSetItem = Storage.prototype.setItem;
+      const originalRemoveItem = Storage.prototype.removeItem;
+      let writes = 0;
+      const shouldFail = (key: string) => key.startsWith(prefix) && writes++ >= successfulWrites;
+      Storage.prototype.setItem = function (key: string, value: string) {
+        if (shouldFail(key)) throw new DOMException("test storage failure", "QuotaExceededError");
+        return originalSetItem.call(this, key, value);
+      };
+      Storage.prototype.removeItem = function (key: string) {
+        if (shouldFail(key)) throw new DOMException("test storage failure", "QuotaExceededError");
+        return originalRemoveItem.call(this, key);
+      };
+      (
+        window as unknown as { __spawnRestoreReconciliationStorage: () => void }
+      ).__spawnRestoreReconciliationStorage = () => {
+        Storage.prototype.setItem = originalSetItem;
+        Storage.prototype.removeItem = originalRemoveItem;
+      };
+    },
+    { prefix: "spawn.upload-reconciliation.v1:", successfulWrites },
+  );
+}
+
+async function restoreReconciliationStorage(page: Page) {
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRestoreReconciliationStorage: () => void }
+    ).__spawnRestoreReconciliationStorage();
+  });
+}
+
+async function failReconciliationHistoryFallback(page: Page) {
+  await page.addInitScript(() => {
+    const original = History.prototype.replaceState;
+    History.prototype.replaceState = function (data: unknown, unused: string, url?: string | URL) {
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        "__spawnUploadReconciliationFallback" in data
+      ) {
+        throw new DOMException("test history failure", "DataCloneError");
+      }
+      return original.call(this, data, unused, url);
+    };
+    (
+      window as unknown as { __spawnRestoreReconciliationHistory: () => void }
+    ).__spawnRestoreReconciliationHistory = () => {
+      History.prototype.replaceState = original;
+    };
+  });
+}
+
+async function stallFirstUploadHash(page: Page) {
+  await page.addInitScript(() => {
+    const original = Blob.prototype.arrayBuffer;
+    let first = true;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Blob.prototype.arrayBuffer = async function () {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return original.call(this);
+    };
+    (
+      window as unknown as { __spawnReleaseFirstUploadHash: () => void }
+    ).__spawnReleaseFirstUploadHash = release;
+  });
+}
+
+async function stallFinalUploadRead(page: Page) {
+  await page.addInitScript(() => {
+    const original = Blob.prototype.arrayBuffer;
+    let uploadReads = 0;
+    let finalReadStarted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Blob.prototype.arrayBuffer = async function () {
+      uploadReads += 1;
+      if (uploadReads === 2) {
+        finalReadStarted = true;
+        await gate;
+      }
+      return original.call(this);
+    };
+    (
+      window as unknown as {
+        __spawnFinalUploadReadGate: { started: () => boolean; release: () => void };
+      }
+    ).__spawnFinalUploadReadGate = {
+      started: () => finalReadStarted,
+      release,
+    };
+  });
 }
 
 function liveTerminal(page: Page) {
@@ -238,23 +357,30 @@ test("owner sees additional viewer count", async ({ page }) => {
   await expect(page.getByText("2 viewers")).toBeVisible();
 });
 
-test("terminal sends resize frames and uploads files over REST", async ({ page }) => {
-  const { messages } = await openTerminalWithMockSocket(page);
-  const uploads: Array<Record<string, unknown>> = [];
-  await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
-    const body = route.request().postDataJSON() as Record<string, unknown>;
-    uploads.push(body);
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      json: {
-        agent_id: AGENT_ID,
-        path: "/Users/tester/projects/spawn/note.txt",
-        client_id: String(body.client_id ?? ""),
-        pasted: false,
-      },
-    });
-  });
+test("terminal sends resize and chunked uploads over direct DataChannels", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const test = (
+          window as unknown as {
+            __spawnRtcTest?: {
+              channelReliability: (label: string) => {
+                ordered: boolean;
+                maxPacketLifeTime: number | null;
+                maxRetransmits: number | null;
+              } | null;
+            };
+          }
+        ).__spawnRtcTest;
+        return [test?.channelReliability("spawn.pty"), test?.channelReliability("spawn.ctl")];
+      }),
+    )
+    .toEqual([
+      { ordered: true, maxPacketLifeTime: null, maxRetransmits: null },
+      { ordered: true, maxPacketLifeTime: null, maxRetransmits: null },
+    ]);
 
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "resize"))
@@ -269,11 +395,653 @@ test("terminal sends resize frames and uploads files over REST", async ({ page }
     .toMatchObject({
       destination: "cwd",
       name: "note.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.from("hello file"),
+    });
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "upload_start"))
+    .toMatchObject({
+      destination: "cwd",
+      name: "note.txt",
       mime_type: "text/plain",
-      bytes_b64: Buffer.from("hello file").toString("base64"),
-      paste: false,
+      total_bytes: 10,
+      chunks: 1,
+      capability: "00112233-4455-4677-8899-aabbccddeeff",
+      agent_generation: 1,
     });
   await expect(page.getByText("Uploaded /Users/tester/projects/spawn/note.txt")).toBeVisible();
+});
+
+test("lost final upload acknowledgement is outcome_unknown and is never retried", async ({
+  page,
+}) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "disconnect",
+  });
+
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({ name: "maybe.txt", mimeType: "text/plain", buffer: Buffer.from("published") });
+
+  await expect.poll(() => uploads).toHaveLength(1);
+  await expect(page.getByText(/may have been published/i)).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+});
+
+test("reconciliation capacity refuses the ninth upload before any endpoint effect", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    ({ agentId }) => {
+      sessionStorage.setItem(
+        `spawn.upload-reconciliation.v1:${agentId}`,
+        JSON.stringify(
+          Array.from({ length: 8 }, (_, index) => ({
+            uploadId: `retained-${index}`,
+            fileName: `retained-${index}.txt`,
+            message: "Reconcile before retrying.",
+            recordedAt: index + 1,
+            phase: "outcome_unknown",
+          })),
+        ),
+      );
+    },
+    { agentId: AGENT_ID },
+  );
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await expect(page.getByTestId("upload-reconciliation").locator("strong")).toHaveCount(8);
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "refused.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("must not reach endpoint"),
+  });
+  await expect(page.getByText(/reconciliation capacity is full/i)).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(
+    jsonMessages(messages).filter((message) => message?.type === "upload_cancel"),
+  ).toHaveLength(0);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation").locator("strong")).toHaveCount(8);
+
+  await page.getByRole("button", { name: "Dismiss retained-0.txt after checking" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "accepted.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("accepted"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("reservation storage failure survives SPA remount and locks endpoint effects", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 0);
+  const { messages, uploads } = await openTerminalWithMockSocket(page, { fromAgents: true });
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "blocked-before.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("blocked"),
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("blocked-before.txt");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await page.goForward();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("blocked-before.txt");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "also-blocked.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("blocked again"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+
+  await restoreReconciliationStorage(page);
+  await page.getByRole("button", { name: "Dismiss blocked-before.txt after checking" }).click();
+  await page.getByRole("button", { name: "Dismiss also-blocked.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "after-recovery.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("allowed"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("pre-final storage failure cancels before publication and keeps the upload locked", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 1);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "blocked-final.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("must not publish"),
+  });
+
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "final frame was not dispatched",
+  );
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_cancel"))
+    .toHaveLength(1);
+  expect(uploads).toHaveLength(0);
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "locked-too.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("still locked"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(0);
+});
+
+test("a concurrent storage fault permanently blocks every older stalled reservation", async ({
+  page,
+}) => {
+  await stallFirstUploadHash(page);
+  await failReconciliationStorageAfter(page, 2);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  const input = page.locator('input[type="file"]');
+
+  await input.setInputFiles({
+    name: "stalled-a.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("stalled A"),
+  });
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("stalled-a.txt");
+  await input.setInputFiles({
+    name: "faulting-b.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("faulting B"),
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("faulting-b.txt");
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  expect(uploads).toHaveLength(0);
+
+  await restoreReconciliationStorage(page);
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+
+  await input.setInputFiles({
+    name: "locked-c.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("locked C"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  await page.getByRole("button", { name: "Dismiss faulting-b.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toHaveCount(0);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnReleaseFirstUploadHash: () => void }
+    ).__spawnReleaseFirstUploadHash();
+  });
+  await page.waitForTimeout(150);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await input.setInputFiles({
+    name: "safe-d.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("safe D"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    2,
+  );
+});
+
+test("dual storage and history failure stays typed and updates overlapping consumers", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 0);
+  await failReconciliationHistoryFallback(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.evaluate((agentId) => {
+    const probe = document.createElement("div");
+    probe.dataset.testid = "upload-reconciliation-overlap-probe";
+    document.body.append(probe);
+    const sync = (event: Event) => {
+      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      const runtime = (
+        globalThis as typeof globalThis & {
+          __spawnUploadReconciliationRuntime?: {
+            memory: Map<string, Array<{ fileName: string }>>;
+            faults: Map<string, string>;
+          };
+        }
+      ).__spawnUploadReconciliationRuntime;
+      probe.textContent = `${runtime?.faults.get(agentId) ?? ""}|${
+        runtime?.memory
+          .get(agentId)
+          ?.map((record) => record.fileName)
+          .join(",") ?? ""
+      }`;
+    };
+    window.addEventListener("spawn:upload-reconciliation", sync);
+  }, AGENT_ID);
+
+  await page
+    .locator('input[type="file"]')
+    .first()
+    .setInputFiles({
+      name: "dual-failure.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("never dispatched"),
+    });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("dual-failure.txt");
+  await expect(page.getByTestId("upload-reconciliation-overlap-probe")).toContainText(
+    "Upload reconciliation storage is unavailable.|dual-failure.txt",
+  );
+  await expect(
+    page.getByText("Upload reconciliation storage is unavailable.").first(),
+  ).toBeVisible();
+  expect(await page.getByText(/DataCloneError|test history failure/).count()).toBe(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    0,
+  );
+  expect(uploads).toHaveLength(0);
+
+  await restoreReconciliationStorage(page);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRestoreReconciliationHistory: () => void }
+    ).__spawnRestoreReconciliationHistory();
+  });
+  await page.getByRole("button", { name: "Dismiss dual-failure.txt after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation-overlap-probe")).toHaveText("|");
+});
+
+test("post-final storage failure preserves one ambiguity and blocks retry across remount", async ({
+  page,
+}) => {
+  await failReconciliationStorageAfter(page, 2);
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+    fromAgents: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "published-once.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("published once"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("published-once.txt");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await page.goForward();
+  await expect(page.getByTestId("upload-reconciliation-fault")).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "must-not-retry.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("no retry"),
+  });
+  await page.waitForTimeout(100);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await restoreReconciliationStorage(page);
+  await page.getByRole("button", { name: "Dismiss published-once.txt after checking" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "new-after-check.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("new effect"),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(2);
+});
+
+test("multi-chunk upload waits for real bufferedAmount drain", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  const bytes = Buffer.alloc(100_000, 0x5a);
+
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({ name: "large.bin", mimeType: "application/octet-stream", buffer: bytes });
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "upload_start"))
+    .toMatchObject({ name: "large.bin", total_bytes: bytes.length, chunks: 3 });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { releaseUploadBackpressure: () => void } }
+    ).__spawnRtcTest.releaseUploadBackpressure();
+  });
+  await expect.poll(() => uploads.at(-1)?.bytes.length).toBe(bytes.length);
+  expect(uploads.at(-1)?.bytes.equals(bytes)).toBe(true);
+});
+
+test("removing an uploading attachment aborts it and sends upload_cancel", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(
+      new File([new Uint8Array(100_000).fill(0x31)], "cancel.png", { type: "image/png" }),
+    );
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove cancel.png" })).toBeVisible();
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_start"))
+    .toBe(true);
+  await page.getByRole("button", { name: "Remove cancel.png" }).click();
+  await expect(page.getByRole("button", { name: "Remove cancel.png" })).toHaveCount(0);
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { releaseUploadBackpressure: () => void } }
+    ).__spawnRtcTest.releaseUploadBackpressure();
+  });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+  await page.clock.install();
+  await page.clock.fastForward(3_500);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+});
+
+test("remove during the final Blob read ignores queued completion and sends no final frame", async ({
+  page,
+}) => {
+  await stallFinalUploadRead(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["gated final read"], "gated-remove.png", { type: "image/png" }));
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove gated-remove.png" })).toBeVisible();
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __spawnFinalUploadReadGate: { started: () => boolean };
+          }
+        ).__spawnFinalUploadReadGate.started(),
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as {
+          __spawnRtcTest: { queueActiveUploadCompletion: () => boolean };
+        }
+      ).__spawnRtcTest.queueActiveUploadCompletion(),
+    ),
+  ).toBe(true);
+  await page.waitForTimeout(25);
+
+  await page.getByRole("button", { name: "Remove gated-remove.png" }).click();
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnFinalUploadReadGate: { release: () => void } }
+    ).__spawnFinalUploadReadGate.release();
+  });
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+});
+
+test("removing an attachment after publication preserves outcome_unknown", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+    fromAgents: true,
+  });
+  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["published"], "maybe.png", { type: "image/png" }));
+    terminal.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toBeVisible();
+  await expect.poll(() => uploads).toHaveLength(1);
+  await page.clock.install();
+  await page.getByRole("button", { name: "Remove maybe.png" }).click();
+
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "Check the endpoint destination before retrying",
+  );
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+
+  await page.clock.fastForward(3_500);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText(
+    "Check the endpoint destination before retrying",
+  );
+
+  // A later ordinary status may come and go without replacing the durable
+  // reconciliation record.
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "too-large.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.alloc(20 * 1024 * 1024 + 1),
+  });
+  await expect(page.getByText(/larger than 20 MB/i)).toBeVisible();
+  await page.clock.fastForward(3_500);
+  await expect(page.getByText(/larger than 20 MB/i)).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __spawnRtcTest: { releaseHeldUploadCompletion: () => void };
+      }
+    ).__spawnRtcTest.releaseHeldUploadCompletion();
+  });
+  await page.waitForTimeout(100);
+  await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
+  await expect(page.getByTestId("upload-reconciliation")).toBeVisible();
+
+  // Navigation fully unmounts this terminal; the agent-scoped session record
+  // restores on the next component instance.
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
+  await page.getByRole("button", { name: "Check in terminal" }).click();
+  await expect(
+    page.getByTestId("terminal-live-host").locator(".xterm-helper-textarea"),
+  ).toBeFocused();
+  await page.getByRole("button", { name: "Dismiss maybe.png after checking" }).click();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+});
+
+test("unmount after final dispatch persists reconciliation for the next terminal instance", async ({
+  page,
+}) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+    fromAgents: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "navigate.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("published"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
+});
+
+test("RTC generation replacement is definitive before final dispatch", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    stallUploadBackpressure: true,
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "before.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.alloc(100_000),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_start"))
+    .toBe(true);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  expect(uploads).toHaveLength(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("RTC generation replacement during the final Blob read cannot dispatch", async ({ page }) => {
+  await stallFinalUploadRead(page);
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "gated-generation.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("gated generation"),
+  });
+  await expect
+    .poll(() => jsonMessages(messages).filter((message) => message?.type === "upload_start"))
+    .toHaveLength(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __spawnFinalUploadReadGate: { started: () => boolean };
+          }
+        ).__spawnFinalUploadReadGate.started(),
+      ),
+    )
+    .toBe(true);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+    (
+      window as unknown as { __spawnFinalUploadReadGate: { release: () => void } }
+    ).__spawnFinalUploadReadGate.release();
+  });
+  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(uploads).toHaveLength(0);
+  await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+});
+
+test("RTC generation replacement after final dispatch is outcome_unknown", async ({ page }) => {
+  const { messages, uploads } = await openTerminalWithMockSocket(page, {
+    uploadFinalAction: "hold",
+  });
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "after.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("published"),
+  });
+  await expect.poll(() => uploads).toHaveLength(1);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration();
+  });
+  await expect(page.getByTestId("upload-reconciliation")).toContainText("after.bin");
+  expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
+    1,
+  );
+  expect(uploads).toHaveLength(1);
 });
 
 test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({

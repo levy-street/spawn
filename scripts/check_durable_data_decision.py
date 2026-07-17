@@ -130,8 +130,8 @@ def markdown_tokens(path: Path) -> list[Token]:
         if token.type == "fence" and token.map is not None:
             _, end = token.map
             marker = token.markup
-            closing = re.search(
-                rf"{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$",
+            closing = re.fullmatch(
+                rf" {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*",
                 lines[end - 1],
             )
             if closing is None:
@@ -802,7 +802,8 @@ def validate(root: Path) -> None:
         dependency,
         adr,
         "P2-DATA-02 is schedulable only after P2-DATA-01 and P2-HOST-02 are reviewed and merged",
-        "P2-TERM-01 upload and P2-HOST-03A interactive-tool candidates have each passed independent review and merged",
+        "P2-TERM-01 upload and P2-HOST-03A interactive-tool work have each passed independent review and merged",
+        "TERM-01 satisfies that dependency at `5d99ebb4`; HOST-03A remains pending",
         "must name the exact reviewed TERM-01/HOST-03A protocol commits",
     )
 
@@ -815,17 +816,17 @@ def validate(root: Path) -> None:
     require(
         trust_text,
         root / "docs/TRUST.md",
-        "P2-AGENT-02/P2-TERM-02 cut is reviewed and merged at `5722288`",
-        "P2-HOST-02 is reviewed and merged at `4e7c89b`",
-        "current source has no server-visible host filesystem route/frame",
-        "P2-TERM-01 and P2-HOST-03A correction candidates are implemented but independently review-pending, not merged behavior",
+        "removed in P2-AGENT-02/P2-TERM-02, reviewed and merged at `5722288`",
+        "removed in reviewed/merged P2-HOST-02 at `4e7c89b`",
+        "current source has no server-visible agent-upload path",
+        "P2-HOST-03A and P2-DATA-01 remain independent-review candidates, not accepted behavior",
     )
     phase2_path = root / "docs/TRUST_PHASE2.md"
     phase2_text, phase2_sections = sections(phase2_path)
     unique_section(
         phase2_sections,
         2,
-        "Current source reality (reviewed master through `4e7c89b`)",
+        "Current source reality (reviewed master through `5d99ebb4`)",
         phase2_path,
     )
     require(
@@ -834,7 +835,7 @@ def validate(root: Path) -> None:
         "P2-HOST-02 is reviewed and merged at `4e7c89b`",
         "Current source therefore has no server-visible host filesystem path",
         "P2-HOST-03A has an E2E implementation candidate under independent review; it is not merged",
-        "P2-TERM-01 has a direct-upload implementation candidate under independent review; it is not merged",
+        "P2-TERM-01 is independently reviewed and merged at `5d99ebb4`",
         "P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged",
         "name the exact reviewed TERM-01 upload and HOST-03A tool protocol/effect-boundary commits",
     )
@@ -844,7 +845,7 @@ def validate(root: Path) -> None:
         root / "docs/TRUST_PHASE2_TASKS.md",
         "P2-HOST-02 | DONE — REVIEWED, MERGED (`4e7c89b`)",
         "P2-HOST-03A | ACTIVE — IMPLEMENTED, REVIEW PENDING",
-        "P2-TERM-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING",
+        "P2-TERM-01 | DONE — REVIEWED, MERGED (`5d99ebb4`)",
         "P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged)",
         "Evidence names the exact reviewed TERM-01/HOST-03A protocol commits and effect boundaries",
     )
@@ -853,8 +854,8 @@ def validate(root: Path) -> None:
     require(
         progress,
         root / "docs/TRUST_PHASE2_PROGRESS.md",
-        "Only after this P2-DATA-01 decision, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged",
-        "name the exact reviewed protocol/effect-boundary commits in its evidence",
+        "Only after P2-DATA-01 and P2-HOST-03A have passed independent review and merged",
+        "TERM-01 at `5d99ebb4` and the future accepted HOST-03A commit",
     )
 
     proto = active_markdown(root / "proto/README.md")
@@ -973,6 +974,14 @@ def self_test(source: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         path.write_text(
             path.read_text(encoding="utf-8") + "\n<!-- broken", encoding="utf-8"
+        )
+
+    def unclosed_commonmark_fence(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + "\n\n```text\nPhase 2 is finished.\nnot-a-close```\n",
+            encoding="utf-8",
         )
 
     def unreadable_input(root: Path) -> None:
@@ -1368,6 +1377,7 @@ def self_test(source: Path) -> None:
                 "data-design-prose",
             ),
             ("malformed Markdown", malformed_markdown, None),
+            ("unclosed CommonMark fence", unclosed_commonmark_fence, None),
             ("missing parser input", unreadable_input, None),
         )
     )

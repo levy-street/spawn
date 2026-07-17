@@ -21,7 +21,6 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcSessions};
-use crate::upload;
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 
@@ -279,35 +278,6 @@ async fn dispatch_loop(
                 }
                 Inbound::AgentKill { agent_id, signal } => {
                     handle_agent_kill(agent_id, signal, registry, rtc_sessions, out_tx).await;
-                }
-                Inbound::AgentUpload {
-                    agent_id,
-                    request_id,
-                    cwd,
-                    name,
-                    mime_type,
-                    bytes_b64,
-                    paste_prefix,
-                    paste,
-                    destination,
-                    client_id,
-                } => {
-                    handle_agent_upload(
-                        agent_id,
-                        request_id,
-                        cwd,
-                        name,
-                        mime_type,
-                        bytes_b64,
-                        paste_prefix,
-                        paste.unwrap_or(true),
-                        destination,
-                        client_id,
-                        registry,
-                        rtc_sessions,
-                        out_tx,
-                    )
-                    .await;
                 }
                 Inbound::RtcOffer {
                     session_id,
@@ -2009,81 +1979,6 @@ async fn handle_agent_kill(
     // The worker reports exit and emits `agent.exit`. We do not
     // remove from the registry here — let the exit handler do it once it has
     // the exit code.
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_agent_upload(
-    agent_id: Uuid,
-    request_id: Option<String>,
-    cwd: String,
-    name: String,
-    mime_type: String,
-    bytes_b64: String,
-    paste_prefix: Option<String>,
-    paste: bool,
-    destination: Option<String>,
-    client_id: Option<String>,
-    registry: &AgentRegistry,
-    rtc_sessions: &RtcSessions,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    if !registry.contains(agent_id) {
-        let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
-        if !registry.contains(agent_id) {
-            tracing::debug!(%agent_id, "ignoring upload for unknown agent");
-            return;
-        }
-    }
-
-    let save_to_cwd = destination.as_deref() == Some("cwd");
-    match upload::save_upload(&cwd, &name, &mime_type, &bytes_b64, save_to_cwd).await {
-        Ok(path) => {
-            if paste {
-                let paste_text = upload::paste_text_for_path(&cwd, &path, paste_prefix.as_deref());
-                let found = registry.with_handle(agent_id, |h| {
-                    if let Err(e) = h.write_stdin(paste_text.as_bytes()) {
-                        tracing::warn!(%agent_id, error = %e, "PTY upload path paste failed");
-                    }
-                });
-                if !found {
-                    tracing::debug!(%agent_id, "agent disappeared before upload paste");
-                }
-            }
-            let uploaded = Outbound::AgentUploaded {
-                agent_id,
-                path: path.to_string_lossy().into_owned(),
-                request_id,
-                client_id,
-            };
-            if let Ok(s) = serde_json::to_string(&uploaded) {
-                let _ = out_tx.send(WsOutbound::json(s)).await;
-            }
-            tracing::info!(%agent_id, path = %path.display(), "upload saved");
-        }
-        Err(e) => {
-            tracing::warn!(%agent_id, error = %e, "upload failed");
-            send_upload_error(out_tx, agent_id, request_id, client_id, &e).await;
-        }
-    }
-}
-
-async fn send_upload_error(
-    out_tx: &mpsc::Sender<WsOutbound>,
-    agent_id: Uuid,
-    request_id: Option<String>,
-    client_id: Option<String>,
-    err: &anyhow::Error,
-) {
-    let frame = Outbound::Error {
-        agent_id: Some(agent_id),
-        code: "upload_failed".into(),
-        message: format!("{err:#}"),
-        request_id,
-        client_id,
-    };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
-    }
 }
 
 async fn send_error(

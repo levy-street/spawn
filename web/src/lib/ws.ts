@@ -46,8 +46,6 @@ export interface DisplayControlState {
 export type InboundMessage =
   | { type: "agent.exit"; exit_code: number | null; signal: string | null }
   | { type: "agent.status"; status: "starting" | "running" | "exited" | "killed" }
-  | { type: "upload.saved"; path: string; client_id?: string }
-  | { type: "upload.error"; message: string }
   | {
       type: "rtc.config";
       enabled: boolean;
@@ -139,15 +137,7 @@ export type OutboundMessage =
       binding_nonce: string;
       candidate: RTCIceCandidateInit;
     })
-  | (AgentRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string })
-  | {
-      type: "upload";
-      name: string;
-      mime_type: string;
-      bytes_b64: string;
-      paste?: boolean;
-      client_id?: string;
-    };
+  | (AgentRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string });
 
 export interface RtcBindingIdentity {
   sessionId: string;

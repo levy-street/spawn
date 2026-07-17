@@ -246,22 +246,6 @@ class AgentRestart(BaseModel):
     create_cwd: bool = True
 
 
-class AgentUploadRequest(BaseModel):
-    name: str | None = Field(default=None, max_length=255)
-    mime_type: str | None = Field(default=None, max_length=128)
-    bytes_b64: str
-    paste: bool = True
-    destination: Literal["cwd"] | None = None
-    client_id: str | None = Field(default=None, max_length=128)
-
-
-class AgentUploadOut(BaseModel):
-    agent_id: str
-    path: str
-    client_id: str
-    pasted: bool
-
-
 class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     archived: bool | None = None

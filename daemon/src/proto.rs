@@ -44,15 +44,6 @@ pub enum Outbound {
     /// is the only metadata it needs to maintain `last_input_at` for v2.
     #[serde(rename = "agent.input_activity")]
     AgentInputActivity { agent_id: Uuid },
-    #[serde(rename = "agent.uploaded")]
-    AgentUploaded {
-        agent_id: Uuid,
-        path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<String>,
-        #[serde(default)]
-        client_id: Option<String>,
-    },
     #[serde(rename = "host.tools.check_result")]
     HostToolsCheckResult {
         request_id: String,
@@ -163,24 +154,6 @@ pub enum Inbound {
         agent_id: Uuid,
         #[serde(default)]
         signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
-    },
-    #[serde(rename = "agent.upload")]
-    AgentUpload {
-        agent_id: Uuid,
-        #[serde(default)]
-        request_id: Option<String>,
-        cwd: String,
-        name: String,
-        mime_type: String,
-        bytes_b64: String,
-        #[serde(default)]
-        paste_prefix: Option<String>,
-        #[serde(default)]
-        paste: Option<bool>,
-        #[serde(default)]
-        destination: Option<String>,
-        #[serde(default)]
-        client_id: Option<String>,
     },
     #[serde(rename = "rtc.offer")]
     RtcOffer {

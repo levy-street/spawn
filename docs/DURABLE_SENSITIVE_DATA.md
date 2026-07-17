@@ -371,9 +371,10 @@ invent an `outcome_unknown` record from untrusted state.
 
 The same endpoint journal must cover all external effects already accepted or
 pending in this wave: merged HOST-02 filesystem mkdir, rename, remove, write,
-and transfer-destination commit; review-pending TERM-01 agent upload commit;
-review-pending HOST-03A tool install; and DATA-02 launch/restart. Before any
-effect it stores an encrypted, versioned record containing at least:
+and transfer-destination commit; independently reviewed TERM-01 agent upload
+commit merged at `5d99ebb4`; review-pending HOST-03A tool install; and DATA-02
+launch/restart. Before any effect it stores an encrypted, versioned record
+containing at least:
 
 - store lineage; exact account ID, authorized user/principal ID, host ID,
   protocol/session binding, operation, request/idempotency ID and fingerprint,
@@ -844,17 +845,19 @@ unit test that never observes the server boundary is not substitute evidence.
 ## Dependency hand-off
 
 P2-HOST-02's reviewed host-scoped filesystem boundary is already merged and is
-an input to this design. The current P2-TERM-01 upload and P2-HOST-03A
-interactive-installer candidates are still independently review-pending; their
-browser retry/ambiguity behavior is not evidence that this ADR's durable
-reconciliation store exists. DATA-02 and HOST-03B must integrate the reviewed
-versions and satisfy the gates below without reviving the removed server paths.
+an input to this design. P2-TERM-01 is independently reviewed and merged at
+`5d99ebb4`; P2-HOST-03A remains an independently review-pending interactive-
+installer candidate. Their browser retry/ambiguity behavior is not evidence
+that this ADR's durable reconciliation store exists. DATA-02 and HOST-03B must
+integrate the reviewed versions and satisfy the gates below without reviving
+the removed server paths.
 
 P2-DATA-02 is schedulable only after P2-DATA-01 and P2-HOST-02 are reviewed and
-merged **and** the P2-TERM-01 upload and P2-HOST-03A interactive-tool candidates
-have each passed independent review and merged. Its effect-wrapper evidence
-must name the exact reviewed TERM-01/HOST-03A protocol commits and demonstrate
-their request/effect boundaries; an unreviewed candidate or documentation-only
+merged **and** the P2-TERM-01 upload and P2-HOST-03A interactive-tool work have
+each passed independent review and merged. TERM-01 satisfies that dependency at
+`5d99ebb4`; HOST-03A remains pending. Effect-wrapper evidence must name the
+exact reviewed TERM-01/HOST-03A protocol commits and demonstrate their
+request/effect boundaries; an unreviewed candidate or documentation-only
 DATA-01 commit is not sufficient dependency evidence.
 
 - **P2-DATA-02** implements this store, host-channel operations, endpoint-only

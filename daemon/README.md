@@ -37,12 +37,17 @@ spawnd --server https://other run    # override
 ```
 
 This is a foreground service. It connects WSS to `<server>/ws/daemon`,
-registers, and processes lifecycle, upload, and bound WebRTC-signaling frames.
-Terminal input/output uses the mandatory ordered `spawn.pty` DataChannel;
-history, snapshots, resize, and display ownership use the mandatory ordered
-`spawn.ctl` DataChannel. The WebSocket is a JSON-only control/signaling path,
-not a PTY relay, transcript, or fallback. If either DataChannel is unavailable,
-the terminal fails closed. On disconnect it reconnects with exponential backoff
+registers, and processes lifecycle and bound WebRTC-signaling frames. Terminal
+input/output uses the mandatory fully reliable ordered `spawn.pty` DataChannel;
+history, snapshots, resize, display ownership, and capability/generation-bound
+agent uploads use the mandatory fully reliable ordered `spawn.ctl` DataChannel.
+The WebSocket is a JSON-only control/signaling path, not a PTY, upload,
+acknowledgement, transcript, or fallback leg. If either DataChannel is
+unavailable or partially reliable, the terminal fails closed. Upload filesystem
+work and cleanup run in owned blocking operations; teardown uses one absolute
+deadline and retains admission charges until descriptor/temp cleanup actually
+finishes. Post-publication failures are `outcome_unknown` and must not be
+retried without reconciliation. On disconnect it reconnects with exponential backoff
 (1s, 2s, 4s, … capped at 60s) and re-registers with `existing_agents = […]`
 so the server resyncs its routing map without disturbing running workers.
 

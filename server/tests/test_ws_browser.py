@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import uuid
 from collections.abc import Callable
@@ -231,92 +230,31 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(clien
 
 
 
-async def test_browser_upload_reports_exact_daemon_error_and_timeout(client, monkeypatch):
-    monkeypatch.setattr("spawn_server.ws.browser.BROWSER_UPLOAD_TIMEOUT_SECONDS", 0.03)
-    user_id, token = await _signup(client, "ws-browser-upload-results@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
+async def test_browser_upload_frame_fails_closed_without_forwarding_content(client, caplog):
+    user_id, token = await _signup(client, "ws-browser-upload-retired@example.com")
+    _, agent_id = await _create_host_and_agent(user_id)
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(
         browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
     )
     await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
 
-    daemon_ws = FakeDaemonWebSocket()
-    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
-    broker = get_broker()
-    await broker.register_daemon(daemon)
-    await _accept_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
-
-    body = base64.b64encode(b"body").decode("ascii")
+    secret_name = "browser-secret-name.txt"
+    secret_body = "YnJvd3Nlci1zZWNyZXQtY29udGVudA=="
     ws.queue_text(
         {
             "type": "upload",
-            "name": "error.txt",
+            "name": secret_name,
             "mime_type": "text/plain",
-            "bytes_b64": body,
+            "bytes_b64": secret_body,
             "destination": "cwd",
-            "client_id": "upload-error",
+            "client_id": "retired-upload",
         }
     )
-    await _wait_until(
-        lambda: any(
-            message.get("type") == "agent.upload"
-            and message.get("client_id") == "upload-error"
-            for message in (json.loads(item) for item in daemon_ws.sent_text)
-        )
-    )
-    request = [
-        json.loads(item)
-        for item in daemon_ws.sent_text
-        if json.loads(item).get("client_id") == "upload-error"
-    ][-1]
-    error = {
-        "type": "error",
-        "code": "upload_failed",
-        "message": "disk full",
-        "request_id": request["request_id"],
-        "client_id": "upload-error",
-    }
-    await broker.resolve_upload(
-        agent_id,
-        request["request_id"],
-        error,
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
-    )
-    await _wait_until(
-        lambda: any(
-            message.get("client_id") == "upload-error"
-            for message in _messages_of_type(ws, "upload.error")
-        )
-    )
-    assert _messages_of_type(ws, "upload.error")[-1] == {
-        "type": "upload.error",
-        "client_id": "upload-error",
-        "message": "disk full",
-    }
-
-    ws.queue_text(
-        {
-            "type": "upload",
-            "name": "timeout.txt",
-            "mime_type": "text/plain",
-            "bytes_b64": body,
-            "destination": "cwd",
-            "client_id": "upload-timeout",
-        }
-    )
-    await _wait_until(
-        lambda: any(
-            message.get("client_id") == "upload-timeout"
-            and message.get("message") == "Upload timed out."
-            for message in _messages_of_type(ws, "upload.error")
-        )
-    )
-
-    ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
+    assert ws.closed == (4002, "agent uploads belong on spawn.ctl")
+    assert secret_name not in caplog.text
+    assert secret_body not in caplog.text
 
 
 

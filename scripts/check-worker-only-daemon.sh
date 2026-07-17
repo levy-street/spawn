@@ -34,12 +34,33 @@ run_guard() {
     [[ -e "$path" ]] && existing_paths+=("$path")
   done
 
+  # In a worktree, scan tracked files plus non-ignored new source. This keeps
+  # generated runtime data (notably server/data transcripts) out of the source
+  # boundary without allowing a newly added, not-yet-staged source file to
+  # evade the guard. Source archives without Git metadata use the same path
+  # inventory with explicit generated-data exclusions below.
+  local scan_paths=()
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mapfile -d '' scan_paths < <(
+      git ls-files -z --cached --others --exclude-standard -- "${existing_paths[@]}"
+    )
+    local filtered_paths=()
+    local scan_path
+    for scan_path in "${scan_paths[@]}"; do
+      [[ "$scan_path" == "scripts/check-worker-only-daemon.sh" ]] || \
+        filtered_paths+=("$scan_path")
+    done
+    scan_paths=("${filtered_paths[@]}")
+  else
+    scan_paths=("${existing_paths[@]}")
+  fi
+
   # Scan every Rust source under daemon, including examples and any future
   # production-ish bin/build/bench trees. Also scan the server, browser,
   # generated-installer source, protocol tests, CI, and operational smokes.
   local matches
   matches="$(rg -n -i "$forbidden" \
-    "${existing_paths[@]}" \
+    "${scan_paths[@]}" \
     --glob '!target/**' \
     --glob '!daemon/target/**' \
     --glob '!node_modules/**' \
@@ -52,6 +73,7 @@ run_guard() {
     --glob '!server/.pytest_cache/**' \
     --glob '!.ruff_cache/**' \
     --glob '!server/.ruff_cache/**' \
+    --glob '!server/data/**' \
     --glob '!test-results/**' \
     --glob '!web/test-results/**' \
     --glob '!check-worker-only-daemon.sh' || true)"
@@ -73,11 +95,20 @@ self_test() {
     "$fixture/web/scripts" \
     "$fixture/scripts"
   printf '%s\n' 'fn main() {}' >"$fixture/daemon/src/main.rs"
+  git -C "$fixture" init -q
+  printf '%s\n' 'server/data/' >"$fixture/.gitignore"
 
   WORKER_ONLY_GUARD_ROOT="$fixture" "$script_path" >/dev/null
 
+  # Ignored runtime transcripts are historical data, not a production source
+  # surface. They must neither fail the guard nor produce unbounded output.
+  mkdir -p "$fixture/server/data/transcripts"
   local retired_word='t'
   retired_word+='mux'
+  printf '%s\n' "$retired_word capture-pane" \
+    >"$fixture/server/data/transcripts/runtime.log"
+  WORKER_ONLY_GUARD_ROOT="$fixture" "$script_path" >/dev/null
+
   local surfaces=(
     daemon/examples/rtc_probe.rs
     server/spawn_server/routes/install.py

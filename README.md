@@ -64,9 +64,10 @@ For CI or smoke tests that should prove the minimal binary path without a Rust
 fallback, add `--prebuilt-only`.
 
 Interactive terminal sessions require direct browser↔daemon WebRTC
-DataChannels: `spawn.pty` for bytes and `spawn.ctl` for endpoint replay and
-viewport control. Server WebSockets carry only auth, disclosed lifecycle, and
-signaling; there is no terminal relay or transcript fallback. Configure STUN/TURN with
+fully reliable, ordered DataChannels: `spawn.pty` for bytes and `spawn.ctl` for
+endpoint replay, viewport control, and capability-bound agent uploads. Server
+WebSockets carry only auth, disclosed lifecycle, and signaling; there is no
+terminal, upload, acknowledgement, or transcript fallback. Configure STUN/TURN with
 `SPAWN_WEBRTC_ICE_SERVERS`; the default is STUN-only. Add TURN credentials for
 reliable off-LAN, mobile, and corporate-network direct transport.
 
@@ -213,18 +214,24 @@ space clear:
 ## Agent file uploads
 
 The agent terminal pane accepts local files through drag and drop or the upload
-button. This upload path still transits the server pending P2-TERM-01, then the
-daemon saves it into the agent working directory using
-sanitized, non-overwriting filenames. Image paste/attachment behavior remains
-separate and stores prompt attachments under `<cwd>/.spawn/attachments/`.
+button. The browser hashes and streams bounded chunks directly to the endpoint
+over `spawn.ctl`; names, bytes, final paths, and detailed errors do not transit
+the application server. Stable upload IDs support exact partial resume and
+completion reconciliation. Once the final chunk has been dispatched the
+browser never retries automatically: a lost acknowledgement, disconnect, or
+abort is `outcome_unknown` and the user must reconcile the endpoint destination
+before retrying. The daemon saves into the agent working directory using
+descriptor-rooted, non-overwriting commits. Image paste/attachment behavior
+remains separate and stores prompt attachments under
+`<cwd>/.spawn/attachments/`.
 
 ## Known limits in this scaffold
 
 - **Single API worker for remaining daemon command/control.** Terminal input,
-  output, replay and viewport state are direct DataChannel traffic, while
-  uploads and some host-management commands still depend on the worker that
-  owns the daemon socket. Keep production on one API worker until those later
-  trust tasks move endpoint operations off server routes.
+  output, replay, viewport state, and agent uploads are direct DataChannel
+  traffic. Some host-management commands still depend on the worker that owns
+  the daemon socket; keep production on one API worker until those later trust
+  tasks move endpoint operations off server routes.
 - **No CSRF protection on cookie auth yet.** Add SameSite=Strict cookies +
   CSRF tokens before any non-localhost deployment.
 - **shadcn components are hand-rolled** (Tailwind v4 + React 19 ergonomics

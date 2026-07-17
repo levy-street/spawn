@@ -35,7 +35,7 @@ import {
   TERMINAL_THEME,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { agents as agentsApi } from "@/lib/api";
+import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -62,6 +62,9 @@ const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_UPLOAD_RECONCILIATIONS = 8;
+const UPLOAD_RECONCILIATION_STORAGE_PREFIX = "spawn.upload-reconciliation.v1";
+const UPLOAD_RECONCILIATION_EVENT = "spawn:upload-reconciliation";
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
 const TOUCH_MOMENTUM_MAX_PX_PER_MS = 4;
@@ -87,7 +90,44 @@ type PendingAttachment = {
   previewUrl: string;
   promptText: string | null;
   status: PendingAttachmentStatus;
+  controller: AbortController;
 };
+
+type UploadReconciliation = {
+  uploadId: string;
+  fileName: string;
+  message: string;
+  recordedAt: number;
+  phase: "reserved" | "blocked" | "outcome_unknown";
+};
+
+type UploadReconciliationState = {
+  records: UploadReconciliation[];
+  fault: string | null;
+};
+
+type UploadReconciliationRuntime = {
+  memory: Map<string, UploadReconciliation[]>;
+  faults: Map<string, string>;
+};
+
+function uploadReconciliationRuntime(): UploadReconciliationRuntime {
+  const root = globalThis as typeof globalThis & {
+    __spawnUploadReconciliationRuntime?: UploadReconciliationRuntime;
+  };
+  root.__spawnUploadReconciliationRuntime ??= {
+    memory: new Map<string, UploadReconciliation[]>(),
+    faults: new Map<string, string>(),
+  };
+  return root.__spawnUploadReconciliationRuntime;
+}
+
+class UploadReconciliationBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UploadReconciliationBlockedError";
+  }
+}
 
 export interface TerminalHandle {
   /** Raw stdin into the agent (binary frame). */
@@ -101,6 +141,11 @@ export interface TerminalHandle {
   /** Capture diagnostics, force a full refit + reseed, capture again.
    *  Returns the before/after bundle for saving. */
   refreshDiagnostics: () => Promise<Record<string, unknown>>;
+  /** Upload a file directly over the bound spawn.ctl channel. */
+  uploadFile: (
+    file: File,
+    options?: { destination?: "attachments" | "cwd"; uploadId?: string },
+  ) => Promise<{ path: string; uploadId: string }>;
   /** Focus the terminal so keystrokes flow there (raw mode). */
   focus: () => void;
   /** Submit the current terminal draft, appending pending image refs first. */
@@ -240,6 +285,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   });
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [uploadReconciliations, setUploadReconciliations] = useState<UploadReconciliation[]>([]);
+  const [uploadReconciliationFault, setUploadReconciliationFault] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const [dropActive, setDropActive] = useState(false);
@@ -835,6 +882,52 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }, 3000);
   }, []);
 
+  const syncUploadReconciliations = useCallback(() => {
+    const state = loadUploadReconciliationState(agentId);
+    setUploadReconciliations(state.records);
+    setUploadReconciliationFault(state.fault);
+  }, [agentId]);
+
+  useEffect(() => syncUploadReconciliations(), [syncUploadReconciliations]);
+
+  useEffect(() => {
+    const sync = (event: Event) => {
+      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      syncUploadReconciliations();
+    };
+    window.addEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
+    return () => window.removeEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
+  }, [agentId, syncUploadReconciliations]);
+
+  const reserveUploadReconciliation = useCallback(
+    (uploadId: string, fileName: string) =>
+      reserveUploadReconciliationSlot(agentId, uploadId, fileName),
+    [agentId],
+  );
+
+  const promoteUploadReconciliation = useCallback(
+    (uploadId: string, fileName: string, message: string) =>
+      promoteUploadReconciliationSlot(agentId, uploadId, fileName, message),
+    [agentId],
+  );
+
+  const assertUploadReconciliation = useCallback(
+    (uploadId: string) => assertUploadReconciliationActive(agentId, uploadId),
+    [agentId],
+  );
+
+  const dismissUploadReconciliation = useCallback(
+    (uploadId: string, recoverFault = false) => {
+      try {
+        dismissUploadReconciliationSlot(agentId, uploadId, recoverFault);
+      } catch {
+        // The store emitted a fault event and retained the record. A later
+        // explicit dismissal after storage recovers is the only safe unlock.
+      }
+    },
+    [agentId],
+  );
+
   const updatePendingAttachments = useCallback(
     (updater: (attachments: PendingAttachment[]) => PendingAttachment[]) => {
       setPendingAttachments((current) => {
@@ -853,6 +946,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         attachments
           .filter((attachment) => attachment.id === id)
           .forEach((attachment) => {
+            attachment.controller.abort();
             URL.revokeObjectURL(attachment.previewUrl);
           });
         return next;
@@ -1000,6 +1094,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         ? pendingAttachmentsRef.current.find((attachment) => attachment.id === clientId)?.id
         : pendingAttachmentsRef.current.find((attachment) => attachment.status === "uploading")?.id;
       if (!targetId) {
+        // A removed/unmounted attachment owns an aborted generation. Ignore a
+        // completion that raced cancellation instead of resurrecting UI state.
+        if (clientId) return;
         showUploadStatus(`Uploaded ${compactPath(path)}`);
         termRef.current?.focus();
         return;
@@ -1240,10 +1337,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       setExitBanner(`Agent exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
     },
-    onUploadError: (message) => {
-      showUploadStatus(message);
-    },
-    onUploadSaved: handleUploadSaved,
   });
 
   // Stash the socket in a ref so the once-on-mount bootstrap useEffect can
@@ -1484,6 +1577,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheRefreshTimerRef.current = null;
       }
       pendingAttachmentsRef.current.forEach((attachment) => {
+        attachment.controller.abort();
         URL.revokeObjectURL(attachment.previewUrl);
       });
       pendingAttachmentsRef.current = [];
@@ -2406,6 +2500,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           continue;
         }
         const clientId = makeClientId();
+        const controller = new AbortController();
         const previewUrl = URL.createObjectURL(file);
         updatePendingAttachments((attachments) => [
           ...attachments,
@@ -2415,25 +2510,57 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             previewUrl,
             promptText: null,
             status: "uploading",
+            controller,
           },
         ]);
         try {
-          const bytes_b64 = await fileToBase64(file);
-          const result = await agentsApi.upload(agentId, {
-            client_id: clientId,
+          reserveUploadReconciliation(clientId, file.name || "Image");
+          const result = await socket.uploadFile(file, {
+            uploadId: clientId,
             name: file.name || defaultImageName(file),
-            mime_type: mimeTypeForFile(file),
-            bytes_b64,
-            paste: false,
+            mimeType: mimeTypeForFile(file),
+            destination: "attachments",
+            signal: controller.signal,
+            beforeUploadStart: () => assertUploadReconciliation(clientId),
+            beforeFinalDispatch: () =>
+              promoteUploadReconciliation(
+                clientId,
+                file.name || "Image",
+                "The final upload frame was dispatched without a durable acknowledgement yet.",
+              ),
           });
+          dismissUploadReconciliation(clientId);
+          if (controller.signal.aborted) continue;
           sent += 1;
-          handleUploadSaved(result.path, result.client_id);
+          handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
-          showUploadStatus(
+          const outcomeUnknown =
+            error instanceof DirectAgentUploadError && error.code === "outcome_unknown";
+          // Removing an attachment is silent only while cancellation still
+          // proves there was no endpoint effect. Once the final chunk was
+          // dispatched, the same abort can race publication; keep the removed
+          // attachment gone, but retain the reconciliation warning.
+          if (controller.signal.aborted && !outcomeUnknown) {
+            dismissUploadReconciliation(clientId);
+            continue;
+          }
+          const message =
             error instanceof Error && error.message
               ? error.message
-              : `${file.name || "Image"} could not be uploaded.`,
-          );
+              : `${file.name || "Image"} could not be uploaded.`;
+          if (outcomeUnknown) {
+            try {
+              promoteUploadReconciliation(clientId, file.name || "Image", message);
+            } catch {
+              // The pre-final record remains in the same-window fallback and
+              // the storage fault keeps all further endpoint effects locked.
+            }
+          } else if (error instanceof UploadReconciliationBlockedError) {
+            showUploadStatus(message);
+          } else {
+            dismissUploadReconciliation(clientId);
+            showUploadStatus(message);
+          }
           updatePendingAttachments((attachments) =>
             attachments.map((attachment) =>
               attachment.id === clientId ? { ...attachment, status: "error" } : attachment,
@@ -2445,7 +2572,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         termRef.current?.focus();
       }
     },
-    [agentId, handleUploadSaved, showUploadStatus, updatePendingAttachments],
+    [
+      handleUploadSaved,
+      assertUploadReconciliation,
+      dismissUploadReconciliation,
+      promoteUploadReconciliation,
+      reserveUploadReconciliation,
+      showUploadStatus,
+      socket,
+      updatePendingAttachments,
+    ],
   );
 
   const uploadFilesToCwd = useCallback(
@@ -2460,31 +2596,56 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           showUploadStatus(`${file.name || "File"} is larger than 20 MB.`);
           continue;
         }
+        const uploadId = makeClientId();
         try {
-          const bytes_b64 = await fileToBase64(file);
-          const result = await agentsApi.upload(agentId, {
-            client_id: makeClientId(),
+          reserveUploadReconciliation(uploadId, file.name || "File");
+          const result = await socket.uploadFile(file, {
+            uploadId,
             destination: "cwd",
             name: file.name || "file",
-            mime_type: mimeTypeForUpload(file),
-            bytes_b64,
-            paste: false,
+            mimeType: mimeTypeForUpload(file),
+            beforeUploadStart: () => assertUploadReconciliation(uploadId),
+            beforeFinalDispatch: () =>
+              promoteUploadReconciliation(
+                uploadId,
+                file.name || "File",
+                "The final upload frame was dispatched without a durable acknowledgement yet.",
+              ),
           });
+          dismissUploadReconciliation(uploadId);
           sent += 1;
           showUploadStatus(`Uploaded ${compactPath(result.path)}`);
         } catch (error) {
-          showUploadStatus(
+          const message =
             error instanceof Error && error.message
               ? error.message
-              : `${file.name || "File"} could not be uploaded.`,
-          );
+              : `${file.name || "File"} could not be uploaded.`;
+          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+            try {
+              promoteUploadReconciliation(uploadId, file.name || "File", message);
+            } catch {
+              // Preserve the already-recorded ambiguity and storage lock.
+            }
+          } else if (error instanceof UploadReconciliationBlockedError) {
+            showUploadStatus(message);
+          } else {
+            dismissUploadReconciliation(uploadId);
+            showUploadStatus(message);
+          }
         }
       }
       if (sent > 0) {
         termRef.current?.focus();
       }
     },
-    [agentId, showUploadStatus],
+    [
+      dismissUploadReconciliation,
+      assertUploadReconciliation,
+      promoteUploadReconciliation,
+      reserveUploadReconciliation,
+      showUploadStatus,
+      socket,
+    ],
   );
 
   const pasteFromClipboard = useCallback(async () => {
@@ -2786,6 +2947,39 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           after,
         };
       },
+      uploadFile: async (file, options) => {
+        const uploadId = options?.uploadId ?? makeClientId();
+        const fileName = file.name || "file";
+        try {
+          reserveUploadReconciliation(uploadId, fileName);
+          const result = await socket.uploadFile(file, {
+            name: fileName,
+            mimeType: mimeTypeForUpload(file),
+            destination: options?.destination ?? "attachments",
+            uploadId,
+            beforeUploadStart: () => assertUploadReconciliation(uploadId),
+            beforeFinalDispatch: () =>
+              promoteUploadReconciliation(
+                uploadId,
+                fileName,
+                "The final upload frame was dispatched without a durable acknowledgement yet.",
+              ),
+          });
+          dismissUploadReconciliation(uploadId);
+          return { path: result.path, uploadId: result.uploadId };
+        } catch (error) {
+          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+            try {
+              promoteUploadReconciliation(uploadId, fileName, error.message);
+            } catch {
+              // Preserve the already-recorded ambiguity and storage lock.
+            }
+          } else if (!(error instanceof UploadReconciliationBlockedError)) {
+            dismissUploadReconciliation(uploadId);
+          }
+          throw error;
+        }
+      },
       focus: () => termRef.current?.focus(),
       submit: () => {
         hideScrollbackOverlay();
@@ -2800,10 +2994,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }),
     [
       appendAttachmentsForSubmit,
+      assertUploadReconciliation,
+      dismissUploadReconciliation,
       hideScrollbackOverlay,
       pasteDataTransfer,
       pasteFromClipboard,
       pasteText,
+      promoteUploadReconciliation,
+      reserveUploadReconciliation,
       socket,
       agentId,
     ],
@@ -2904,6 +3102,55 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           }}
         />
       </div>
+      {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
+        <div
+          data-testid="upload-reconciliation"
+          role="alert"
+          className="pointer-events-auto absolute left-2 top-2 z-40 flex max-w-[min(32rem,calc(100%-1rem))] flex-col gap-2 rounded-md border border-amber-500/60 bg-background/95 p-2 text-xs text-foreground shadow-lg backdrop-blur"
+        >
+          {uploadReconciliationFault && (
+            <div data-testid="upload-reconciliation-fault" className="font-medium text-amber-700">
+              {uploadReconciliationFault} New uploads are locked until storage recovers
+              {uploadReconciliations.length > 0
+                ? " and you dismiss the retained record after checking it."
+                : "."}
+            </div>
+          )}
+          {uploadReconciliations.map((record) => (
+            <div key={record.uploadId} className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="min-w-0 flex-1">
+                {record.phase === "outcome_unknown" ? (
+                  <>
+                    <strong>{record.fileName}</strong> may have been published. Check the endpoint
+                    destination before retrying; this upload will not retry automatically.
+                  </>
+                ) : (
+                  <>
+                    <strong>{record.fileName}</strong> was reserved but its final frame was not
+                    dispatched. Check the endpoint before clearing this safety lock.
+                  </>
+                )}
+              </span>
+              <button
+                type="button"
+                className="rounded border border-border bg-card px-2 py-1 hover:bg-accent"
+                onClick={() => termRef.current?.focus()}
+              >
+                Check in terminal
+              </button>
+              <button
+                type="button"
+                className="rounded border border-border bg-card px-2 py-1 hover:bg-accent"
+                aria-label={`Dismiss ${record.fileName} after checking`}
+                title={record.message}
+                onClick={() => dismissUploadReconciliation(record.uploadId, true)}
+              >
+                I checked — dismiss
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {pendingAttachments.length > 0 && (
         <div className="pointer-events-auto absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] gap-2 overflow-x-auto rounded-md border border-border bg-background/90 p-1 shadow-lg backdrop-blur">
           {pendingAttachments.map((attachment) => (
@@ -3005,6 +3252,322 @@ function wheelEventToPixels(event: WheelEvent, rows: number): number {
     : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
       ? event.deltaY * rows * TERMINAL_LINE_HEIGHT_PX
       : event.deltaY;
+}
+
+function uploadReconciliationStorageKey(agentId: string): string {
+  return `${UPLOAD_RECONCILIATION_STORAGE_PREFIX}:${agentId}`;
+}
+
+function uploadReconciliationStorageFault(): string {
+  return "Upload reconciliation storage is unavailable.";
+}
+
+function blockReservedUploadReconciliations(
+  records: UploadReconciliation[],
+): UploadReconciliation[] {
+  const recordedAt = Date.now();
+  return records.map((record) =>
+    record.phase === "reserved"
+      ? {
+          ...record,
+          message: "Upload durability failed before final dispatch.",
+          recordedAt,
+          phase: "blocked" as const,
+        }
+      : record,
+  );
+}
+
+function dispatchUploadReconciliationEvent(agentId: string): void {
+  try {
+    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { agentId } }));
+  } catch {
+    // The in-memory latch is authoritative for the current call even if a
+    // hostile/broken event target prevents another mounted instance syncing.
+  }
+}
+
+function readUploadReconciliationHistoryFallback(
+  agentId: string,
+): { records: UploadReconciliation[]; fault: string } | null {
+  let state: unknown;
+  try {
+    state = window.history.state;
+  } catch {
+    return null;
+  }
+  if (typeof state !== "object" || state === null) return null;
+  const fallbacks = (state as Record<string, unknown>).__spawnUploadReconciliationFallback;
+  if (typeof fallbacks !== "object" || fallbacks === null) return null;
+  const fallback = (fallbacks as Record<string, unknown>)[agentId];
+  if (typeof fallback !== "object" || fallback === null) return null;
+  const records = (fallback as Record<string, unknown>).records;
+  const fault = (fallback as Record<string, unknown>).fault;
+  if (!Array.isArray(records) || typeof fault !== "string") return null;
+  return { records: records as UploadReconciliation[], fault };
+}
+
+function writeUploadReconciliationHistoryFallback(
+  agentId: string,
+  fallback: UploadReconciliationState | null,
+): void {
+  try {
+    const current =
+      typeof window.history.state === "object" && window.history.state !== null
+        ? window.history.state
+        : {};
+    const existing =
+      typeof current.__spawnUploadReconciliationFallback === "object" &&
+      current.__spawnUploadReconciliationFallback !== null
+        ? current.__spawnUploadReconciliationFallback
+        : {};
+    const fallbacks = { ...existing };
+    if (fallback) fallbacks[agentId] = fallback;
+    else delete fallbacks[agentId];
+    window.history.replaceState(
+      { ...current, __spawnUploadReconciliationFallback: fallbacks },
+      document.title,
+    );
+  } catch {
+    // sessionStorage or the in-memory latch still owns safety. This fallback
+    // must never replace the typed upload-blocking error with a DOM exception.
+  }
+}
+
+function loadUploadReconciliationState(agentId: string): UploadReconciliationState {
+  if (typeof window === "undefined") return { records: [], fault: null };
+  const runtime = uploadReconciliationRuntime();
+  const historyFallback = readUploadReconciliationHistoryFallback(agentId);
+  const memory = mergeUploadReconciliations(
+    runtime.memory.get(agentId) ?? [],
+    historyFallback?.records ?? [],
+  );
+  if (historyFallback) runtime.faults.set(agentId, historyFallback.fault);
+  try {
+    const raw = window.sessionStorage.getItem(uploadReconciliationStorageKey(agentId));
+    let stored: UploadReconciliation[] = [];
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) throw new Error("invalid reconciliation store");
+      stored = parsed.map((record) => {
+        if (
+          typeof record !== "object" ||
+          record === null ||
+          typeof record.uploadId !== "string" ||
+          typeof record.fileName !== "string" ||
+          typeof record.message !== "string" ||
+          typeof record.recordedAt !== "number" ||
+          (record.phase !== undefined &&
+            record.phase !== "reserved" &&
+            record.phase !== "blocked" &&
+            record.phase !== "outcome_unknown")
+        ) {
+          throw new Error("invalid reconciliation record");
+        }
+        return {
+          uploadId: record.uploadId,
+          fileName: record.fileName,
+          message: record.message,
+          recordedAt: record.recordedAt,
+          phase: record.phase ?? "outcome_unknown",
+        };
+      });
+    }
+    const records = mergeUploadReconciliations(memory, stored);
+    if (records.length > MAX_UPLOAD_RECONCILIATIONS) {
+      runtime.faults.set(
+        agentId,
+        "Upload reconciliation capacity was exceeded; no records were discarded.",
+      );
+    }
+    runtime.memory.set(agentId, records);
+    return { records, fault: runtime.faults.get(agentId) ?? null };
+  } catch {
+    const fault = uploadReconciliationStorageFault();
+    const blocked = blockReservedUploadReconciliations(memory);
+    runtime.memory.set(agentId, blocked);
+    runtime.faults.set(agentId, fault);
+    writeUploadReconciliationHistoryFallback(agentId, { records: blocked, fault });
+    return { records: blocked, fault };
+  }
+}
+
+function persistUploadReconciliations(
+  agentId: string,
+  records: UploadReconciliation[],
+  recordsOnFailure: UploadReconciliation[],
+  clearFault = false,
+): void {
+  if (typeof window === "undefined") {
+    throw new UploadReconciliationBlockedError(uploadReconciliationStorageFault());
+  }
+  if (records.length > MAX_UPLOAD_RECONCILIATIONS) {
+    throw new UploadReconciliationBlockedError(
+      "Upload reconciliation capacity is full. Check and dismiss an existing upload first.",
+    );
+  }
+  const runtime = uploadReconciliationRuntime();
+  const existingFault = runtime.faults.get(agentId) ?? null;
+  try {
+    const key = uploadReconciliationStorageKey(agentId);
+    if (records.length === 0) window.sessionStorage.removeItem(key);
+    else window.sessionStorage.setItem(key, JSON.stringify(records));
+    runtime.memory.set(agentId, records);
+    if (clearFault) {
+      runtime.faults.delete(agentId);
+      writeUploadReconciliationHistoryFallback(agentId, null);
+    } else if (existingFault) {
+      runtime.faults.set(agentId, existingFault);
+      writeUploadReconciliationHistoryFallback(agentId, {
+        records,
+        fault: existingFault,
+      });
+    } else {
+      writeUploadReconciliationHistoryFallback(agentId, null);
+    }
+    dispatchUploadReconciliationEvent(agentId);
+  } catch {
+    const blocked = blockReservedUploadReconciliations(recordsOnFailure);
+    runtime.memory.set(agentId, blocked);
+    const fault = uploadReconciliationStorageFault();
+    runtime.faults.set(agentId, fault);
+    writeUploadReconciliationHistoryFallback(agentId, {
+      records: blocked,
+      fault,
+    });
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(fault);
+  }
+}
+
+function reserveUploadReconciliationSlot(
+  agentId: string,
+  uploadId: string,
+  fileName: string,
+): void {
+  const state = loadUploadReconciliationState(agentId);
+  if (state.fault) {
+    const blocked = blockReservedUploadReconciliations(state.records);
+    const existing = blocked.find((record) => record.uploadId === uploadId);
+    const records = existing
+      ? blocked
+      : blocked.length < MAX_UPLOAD_RECONCILIATIONS
+        ? [
+            ...blocked,
+            {
+              uploadId,
+              fileName,
+              message: "Upload durability is unavailable; no endpoint effect was admitted.",
+              recordedAt: Date.now(),
+              phase: "blocked" as const,
+            },
+          ]
+        : state.records;
+    const runtime = uploadReconciliationRuntime();
+    runtime.memory.set(agentId, records);
+    runtime.faults.set(agentId, state.fault);
+    writeUploadReconciliationHistoryFallback(agentId, { records, fault: state.fault });
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
+  if (state.records.some((record) => record.uploadId === uploadId)) {
+    throw new UploadReconciliationBlockedError("This upload already has a reconciliation record.");
+  }
+  if (state.records.length >= MAX_UPLOAD_RECONCILIATIONS) {
+    throw new UploadReconciliationBlockedError(
+      "Upload reconciliation capacity is full. Check and dismiss an existing upload first.",
+    );
+  }
+  const next = [
+    ...state.records,
+    {
+      uploadId,
+      fileName,
+      message: "The upload was reserved before any endpoint effect.",
+      recordedAt: Date.now(),
+      phase: "reserved" as const,
+    },
+  ];
+  // A failed first write still retains the identity in same-window memory,
+  // blocks endpoint dispatch, and survives SPA unmount/remount.
+  uploadReconciliationRuntime().memory.set(agentId, next);
+  persistUploadReconciliations(agentId, next, next);
+}
+
+function promoteUploadReconciliationSlot(
+  agentId: string,
+  uploadId: string,
+  fileName: string,
+  message: string,
+): void {
+  const state = loadUploadReconciliationState(agentId);
+  const existing = state.records.find((record) => record.uploadId === uploadId);
+  if (state.fault) {
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
+  if (!existing) {
+    throw new UploadReconciliationBlockedError(
+      "The upload safety reservation was lost; the final frame was not dispatched.",
+    );
+  }
+  if (existing.phase === "blocked") {
+    throw new UploadReconciliationBlockedError(
+      "This upload was blocked by a reconciliation storage fault; its final frame was not dispatched.",
+    );
+  }
+  const next = state.records.map((record) =>
+    record.uploadId === uploadId
+      ? {
+          ...record,
+          fileName,
+          message,
+          recordedAt: Date.now(),
+          phase: "outcome_unknown" as const,
+        }
+      : record,
+  );
+  // Persist ambiguity before the final frame. On failure the durable reserved
+  // record remains and the caller throws before DataChannel dispatch.
+  persistUploadReconciliations(agentId, next, state.records);
+}
+
+function assertUploadReconciliationActive(agentId: string, uploadId: string): void {
+  const state = loadUploadReconciliationState(agentId);
+  const record = state.records.find((candidate) => candidate.uploadId === uploadId);
+  if (state.fault) {
+    dispatchUploadReconciliationEvent(agentId);
+    throw new UploadReconciliationBlockedError(state.fault);
+  }
+  if (!record || record.phase === "blocked") {
+    throw new UploadReconciliationBlockedError(
+      "This upload no longer has an active durable safety reservation.",
+    );
+  }
+}
+
+function dismissUploadReconciliationSlot(
+  agentId: string,
+  uploadId: string,
+  recoverFault: boolean,
+): void {
+  const state = loadUploadReconciliationState(agentId);
+  const next = state.records.filter((record) => record.uploadId !== uploadId);
+  persistUploadReconciliations(agentId, next, state.records, recoverFault);
+}
+
+function mergeUploadReconciliations(
+  first: UploadReconciliation[],
+  second: UploadReconciliation[],
+): UploadReconciliation[] {
+  const records = new Map<string, UploadReconciliation>();
+  for (const record of [...first, ...second]) {
+    const existing = records.get(record.uploadId);
+    if (!existing || existing.recordedAt <= record.recordedAt) {
+      records.set(record.uploadId, record);
+    }
+  }
+  return [...records.values()].sort((left, right) => left.recordedAt - right.recordedAt);
 }
 
 function wheelEventToPixelsX(event: WheelEvent): number {
@@ -3289,13 +3852,4 @@ function compactPath(path: string): string {
   const idx = path.indexOf(marker);
   if (idx === -1) return path;
   return `.spawn/attachments/${path.slice(idx + marker.length)}`;
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
 }
