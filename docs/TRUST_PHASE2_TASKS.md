@@ -1,6 +1,6 @@
 # Trust Phase 2 — tracked task schedule
 
-Last updated: 2026-07-16. Governing model: `docs/TRUST.md`. Build sequence and
+Last updated: 2026-07-17. Governing model: `docs/TRUST.md`. Build sequence and
 purge runbook: `docs/TRUST_PHASE2.md`.
 
 This is the execution ledger for the trust-model review. It distinguishes
@@ -31,6 +31,10 @@ Every implementation task uses this protocol:
 No task may weaken or silently defer a protected data class merely to avoid a
 merge conflict. Documentation-only review passes do not approve later runtime
 behavior.
+
+Source guards follow [`GUARD_POLICY.md`](GUARD_POLICY.md): they enforce literal
+machine surfaces and never interpret English semantics. Passing a guard does
+not change a task status or replace independent review.
 
 ## Current checkpoint
 
@@ -100,8 +104,9 @@ The reviewed Wave 0 commits were validated together on `master` at `640a2e0`:
 The two transport roots, P2-AGENT-01 and P2-HOST-01, and the P2-TMUX-01
 worker-only cutover are reviewed and integrated on `master` through `1f66d2d`.
 The P2-AGENT-02/P2-TERM-02 server-terminal cut is reviewed and integrated
-through `5722288`; QUAL-FLAKE-01 is integrated through `22c1f0c`; and the
-P2-HOST-02 filesystem cut is reviewed and integrated through `4e7c89b`.
+through `5722288`; QUAL-FLAKE-01 is integrated through `22c1f0c`; the P2-HOST-02
+filesystem cut is reviewed and integrated through `4e7c89b`; and P2-TERM-01 is
+independently reviewed and merged through `5d99ebb4`.
 Work beneath a root may parallelize only where its protocol is reviewed and
 stable.
 
@@ -112,12 +117,12 @@ stable.
 | P2-AGENT-02 | DONE — REVIEWED, MERGED (`5722288`) | Retire `spawn.v1`, daemon `0x01` output and `0x02` input, server transcript writes/history forwarding/pubsub relay; require both agent DataChannels and strict v2 signaling tuples | P2-AGENT-01 | All-target daemon compile, server/web suites, mandatory-channel and old-protocol failure tests, no-content guard, offline-history/cutover documentation, and mergeability review pass |
 | P2-HOST-01 | DONE — REVIEWED, MERGED (`1f66d2d`) | Add host-scoped WebRTC session and versioned `spawn.host.ctl`, independent of any agent | GATE-02–05, QUAL-01 | Host with zero agents can connect; ownership, reconnect, cancellation, limits, request binding, TURN-only, and cross-host session isolation tests pass |
 | P2-HOST-02 | DONE — REVIEWED, MERGED (`4e7c89b`) | Move host list/stat/read/write/mkdir/rename/remove/download/upload/transfer and registration `home_dir` to capability-rooted host channels; browser mediates bounded, bilaterally cancelled cross-host streaming; preserve pre-routing cancel publication, prompt token-based write cancellation, tracked cleanup, read-stream replay rejection, conservative `outcome_unknown`, and bounded close/publication semantics | P2-HOST-01, QUAL-03 | Server inventory has no host path/name/size/mtime/error or byte payload; no-follow/atomic-race tests, bounded dispatcher/page/stream/tombstone/reaper tests, forced fast/normal cancel-order and stalled-I/O control-path tests, browser redeclaration tests, distinct two-host authorization/abort tests, strict/full gates, and mergeability review pass |
-| P2-HOST-03A | PLANNED | Add the parallel interactive tool path on `spawn.host.ctl`: commands, paths, installed/latest versions, detailed errors, and stdout/stderr remain E2E while the legacy route is temporarily retained | P2-HOST-01, QUAL-03 | Interactive check/install works with bounded/cancellable requests and no new server content; compatibility route retention is explicit and Phase 2 remains incomplete |
-| P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
-| P2-TERM-01 | ACTIVE — IMPLEMENTED, REVIEW PENDING | Move agent uploads to capability/generation-bound, hash-checked, bounded/chunked/cancellable `spawn.ctl`; remove REST/WS/broker `bytes_b64`, saved/error, and daemon upload legs; retain the worker's canonical cwd as a no-follow descriptor-rooted destination capability | P2-AGENT-01, QUAL-04 | Large-file/chunk framing, resume/idempotency, cancellation/disconnect/replacement cleanup, checksum/length, capability/generation, symlink/escape/no-clobber, concurrent destination, path-ack confidentiality, old-peer failure, bounded-memory/cache/backpressure/retry tests, full gates, independent review, and current-master mergeability pass |
+| P2-HOST-03A | ACTIVE — IMPLEMENTED, REVIEW PENDING | Add the parallel interactive tool path on `spawn.host.ctl`: commands, paths, installed/latest versions, detailed errors, and stdout/stderr remain E2E while the legacy route is temporarily retained | P2-HOST-01, QUAL-03 | Independent review must prove bounded/cancellable interactive check/install and no new server content; compatibility route retention is explicit and Phase 2 remains incomplete |
+| P2-HOST-03B | BLOCKED | Complete the tool cut: make the interactive endpoint path mandatory, remove the legacy server route, and relocate unattended executable policy/targets to the endpoint | P2-HOST-03A, P2-DATA-02, QUAL-03 | Durable endpoint owns `Preset.install`/default command before route removal; install consumes a durable tool-target effect generation and only conclusive version/package-manager proof resolves ambiguity; acknowledgement cannot authorize retry; server retains only disclosed policy/timestamps/content-free result and cannot persist detail |
+| P2-TERM-01 | DONE — REVIEWED, MERGED (`5d99ebb4`) | Move agent uploads to capability/generation-bound, hash-checked, bounded/chunked/cancellable `spawn.ctl`; remove REST/WS/broker `bytes_b64`, saved/error, and daemon upload legs; retain the worker's canonical cwd as a no-follow descriptor-rooted destination capability | P2-AGENT-01, QUAL-04 | Large-file/chunk framing, resume/idempotency, cancellation/disconnect/replacement cleanup, checksum/length, capability/generation, symlink/escape/no-clobber, concurrent destination, path-ack confidentiality, old-peer failure, bounded-memory/cache/backpressure/retry tests, full gates, independent review, and current-master mergeability pass |
 | P2-TERM-02 | DONE — REVIEWED, MERGED (`5722288`) | Remove REST/WS input/snapshot/resize/scroll/redraw/display-control surfaces and migrate test clients to RTC endpoint harness | P2-AGENT-01, GATE-02 | No server schema/frame carries PTY/snapshot/viewport data or event timing; old clients receive only a content-free protocol-required close; mergeability review passes |
-| P2-DATA-01 | PLANNED | Approve endpoint-local versus opaque client-encrypted durable store for launch manifests, preset operational values/tool targets, and skill bodies | P2-HOST-01 | Threat model covers keys/recovery, multi-device, offline restart, rollback, migration, and ciphertext identifier/size/version/access leakage; server never has decryption keys |
-| P2-DATA-02 | BLOCKED | Move `cwd`, `argv`, `env`, preset default-command/install/environment values, tool targets, and skill bodies over `spawn.host.ctl`; store daemon restart manifest locally; stop cwd-derived names | P2-DATA-01 | Create/restart/preset/skill/tool flows work after plaintext reads are disabled; neutral default name used; legacy derived names scrubbed/reclassified; only disclosed metadata or opaque ciphertext remains |
+| P2-DATA-01 | ACTIVE — BOUNDED DESIGN, REVIEW PENDING | Review the proposed per-host endpoint-local canonical store in `DURABLE_SENSITIVE_DATA.md`; explicitly defer opaque client-encrypted server blobs. This row covers a documentation candidate only, not a runtime migration or accepted design | P2-HOST-01, P2-HOST-02 | Independent review accepts the key hierarchy/ownership, crash-atomic two-slot anchor, browser/endpoint trust, recovery/export/import, multi-device/host and offline behavior, durable effect-generation anti-replay after result expiry, exact HOST-02/TERM-01/HOST-03A/DATA-02 journals, fail-before-effect capacity, rollback/replay limits, migration/cutover, revocation/rotation/deletion, quotas/conflicts, observability, compatibility failures, leakage comparison, rejected alternatives, and falsifiable DATA-02/HOST-03B/PURGE gates; server never receives a store/recovery key |
+| P2-DATA-02 | BLOCKED | Implement the proposed store after DATA-01 review; move `cwd`, `argv`, `env`, preset default-command/install/environment values, tool targets, and skill bodies over `spawn.host.ctl`; store exact daemon restart manifests, monotonic effect heads, and durable ambiguous-effect reconciliation locally; wrap merged HOST-02 plus reviewed TERM-01/HOST-03A/DATA-02 effects; stop cwd-derived names | P2-DATA-01, P2-HOST-02, P2-TERM-01, P2-HOST-03A (all independently reviewed and merged) | Evidence names the exact reviewed TERM-01/HOST-03A protocol commits and effect boundaries; create/restart/preset/skill/tool/export/import/conflict/reconciliation flows work after plaintext reads are disabled; cap+1 fails before effect; replay after result expiry/restart/restore fails; offline daemon restart uses the committed manifest and preserves unresolved locks; acknowledgement never authorizes retry; rotation retains the old epoch until every wrapper and two consecutive A/B new-epoch anchor advances are synced/read-back/authenticated; both anchor modes pass torn-write/disk-full/power-loss tests; neutral default name used; legacy derived names scrubbed/reclassified; only disclosed metadata remains server-side; ADR adversarial gates pass |
 | P2-ERROR-01 | BLOCKED | Replace free-form daemon error/status/exit details with stable server-visible codes and E2E agent/host/pre-launch detail; remove server forwarding/logging | P2-AGENT-01, P2-HOST-01, P2-DATA-02 | Injected cwd/file/tool errors reach browser E2E, while server frames/logs/telemetry contain only codes and disclosed lifecycle metadata |
 | P2-PURGE-01 | BLOCKED | Inventory, migrate, close/drain ingress, restart processes, and purge transcripts, DB/derived names, Redis, memory/queues/swap/core, logs/observability, WAL/AOF, backups, replicas, raw blocks, and snapshots | P2-TMUX-01, P2-AGENT-02, P2-HOST-02, P2-HOST-03B, P2-TERM-01, P2-TERM-02, P2-DATA-02, P2-ERROR-01 | Two-operator evidence follows the eight-step runbook; process/observability and oldest-backup checks find no recoverable plaintext; no content rollback path remains |
 | P2-AUDIT-01 | BLOCKED | Final adversarial server audit and Phase 2 claim gate | P2-PURGE-01 | Code/route/frame/schema inventory; server memory/queue/swap/core/disk/DB/Redis/log/observability scans; backup evidence; TURN-only tests; ciphertext and retained-metadata disclosure all pass |
@@ -135,13 +140,22 @@ because their scope is optional.
 
 Phase 2 is complete when the Phase 2 rows above through `P2-AUDIT-01` and the
 immediate/overlapping quality gates required by their dependency and merge
-rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
+rules are `DONE`. The Phase 3 foundations below may overlap that cleanup, but
+their progress neither satisfies nor weakens any Phase 2 gate.
 
-## Phase 3 follow-on schedule
+## Phase 3 foundation schedule
 
 | ID | Status | Scope | Depends on | Review/acceptance gate |
 |----|--------|-------|------------|------------------------|
-| P3-IDENTITY-01 | PLANNED | Endpoint keys; signed agent/host signaling over a canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; TOFU pinning and fingerprint UX | P2-AUDIT-01 | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
+| P3-IDENTITY-01A | ACTIVE — PARALLEL FOUNDATION | Build the canonical cryptographic foundation: typed Ed25519 keys/signatures, deterministic signed-envelope encoding, domain separation, fingerprint representation, and cross-language test vectors. This does not enable signed signaling | P2-AGENT-01, P2-HOST-01 | Independent review proves deterministic canonical bytes, strict decode/re-encode rejection, key/signature test vectors, domain separation, malformed-input bounds, secret zeroization/permissions where applicable, and no runtime security claim before integration |
+| P3-IDENTITY-01B | ACTIVE — PARALLEL FOUNDATION | Build host identity-key generation, protected persistence, fingerprint display, and explicit host-key pairing/re-pairing flows against the 01A contract while 01A proceeds in parallel | P2-HOST-01; integration requires reviewed P3-IDENTITY-01A | Independent review proves stable host identity, owner-authorized pairing, loud key-change/re-pair UX, cancellation/replay/cross-host isolation, protected key storage, recovery/rotation behavior, and no claim that agent/host signaling is signed yet |
+| P3-IDENTITY-02 | PLANNED | Integrate signed agent/host signaling over the canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; add browser device identity, TOFU pinning, and fingerprint UX | P3-IDENTITY-01A, P3-IDENTITY-01B | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
+
+The 01A and 01B foundations may proceed in parallel with remaining Phase 2
+cleanup because they do not reopen a protected server content path. That
+overlap does not complete Phase 2 or establish a Phase 3 guarantee. Each task,
+and the later signed-signaling integration claim, still requires its own tests,
+independent review, mergeability proof, and accepted gate.
 
 ## Review-finding coverage
 
@@ -170,8 +184,8 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
 | Purge omitted draining/restarts, process memory, swap/core, and observability | P2-PURGE-01, P2-AUDIT-01 |
 | Trust-touched format plus pre-existing global fmt/Ruff/Clippy failures were untracked | QUAL-01–04 |
 | Past-session text conflated recorded DTLS traffic with optional durable opaque blobs | DOC-01, P2-DATA-01, P2-AUDIT-01 |
-| Phase 3 signaling claims did not qualify the trusted/verifiable endpoint-code assumption | DOC-01, P3-IDENTITY-01 |
-| Signed signaling omitted host scope, protocol, role, and cross-scope replay binding | DOC-01, P3-IDENTITY-01 |
+| Phase 3 signaling claims did not qualify the trusted/verifiable endpoint-code assumption | DOC-01, P3-IDENTITY-01A, P3-IDENTITY-01B, P3-IDENTITY-02 |
+| Signed signaling omitted host scope, protocol, role, and cross-scope replay binding | DOC-01, P3-IDENTITY-01A, P3-IDENTITY-02 |
 | Interactive tool transport and final/unattended route removal had one contradictory task | P2-HOST-03A, P2-HOST-03B |
 | Phase 2 completion wording accidentally included the Phase 3 task | DOC-01, P2-AUDIT-01 |
 | Documentation promised a new daemon transcript store without implementation/retention tests | DOC-01, P2-AGENT-01 |
@@ -185,13 +199,17 @@ rules are `DONE`. It does not wait for the Phase 3 follow-on task below.
    `1f66d2d`.
 3. **Wave 2 (active):** P2-AGENT-02/P2-TERM-02 are reviewed and integrated
    through `5722288`; QUAL-FLAKE-01 is reviewed and integrated through
-   `22c1f0c`, and P2-HOST-02 is reviewed and integrated through `4e7c89b`.
-   P2-TERM-01 is implemented on the integrated agent/host protocol and awaits
-   independent review; P2-HOST-03A and P2-DATA-01 design may proceed alongside
-   it where their scopes do not overlap.
+   `22c1f0c`, P2-HOST-02 is reviewed and integrated through `4e7c89b`, and
+   P2-TERM-01 is reviewed and merged through `5d99ebb4`. P2-HOST-03A has an
+   implementation candidate under independent review. P2-DATA-01's
+   endpoint-local design is documentation-only and awaits independent
+   review/merge; it adds no runtime store or Phase 2 claim.
 4. **Wave 3:** P2-DATA-02 after its design pass, then P2-HOST-03B and
    P2-ERROR-01 in parallel once durable preset/tool targets exist.
 5. **Wave 4 (serial change window):** P2-PURGE-01, then P2-AUDIT-01. Historical
    deletion and the final claim cannot safely run in parallel with content-path
    migrations.
-6. **Wave 5:** Phase 3 identity/signaling work after the Phase 2 claim is true.
+6. **Parallel Phase 3 foundation (active):** P3-IDENTITY-01A and
+   P3-IDENTITY-01B may build their bounded crypto/pairing foundations while
+   remaining Phase 2 cleanup proceeds. P3-IDENTITY-02 and every security claim
+   remain separately gated; overlap is not approval, deployment, or completion.
