@@ -684,8 +684,81 @@ Pin add/revoke and token/host-key rotation require a revisioned coherent
 whole-record reload/notification, or a loud enforced restart boundary. The
 canonical server-origin + Host-ID domain is rechecked on every change; token,
 host signing key, and browser pins never mix across revisions. Live tests add
-and revoke a browser pin while `run` is active and prove immediate activation
-and refusal rather than stale reconnect acceptance.
+and revoke a browser pin while `run` is active and prove bounded activation or
+fatal fail-stop rather than stale reconnect acceptance.
+
+**P3-DAEMON-TRUST-RELOAD (implemented, independent review pending):** the
+daemon supervisor now owns exactly one validated current credential generation
+containing its access token, host signing key, canonical server-origin + exact
+Host-ID domain, and bounded browser-pin set. It rereads the complete record
+immediately before every WebSocket attempt and again after handshake but before
+host registration, sink installation, or control/RTC admission. One dedicated
+standard loader thread performs every complete credential read for the daemon
+run. A capacity-one synchronous request boundary and retained pending reply
+make it single-flight even when an async `select!` cancels a watcher future;
+the Tokio runtime never performs the file-lock, filesystem, or native-keyring
+operation and never owns a blocking task that shutdown must join. The monitor
+schedules one complete load every 500 ms while connected or backing off, and
+each request has a two-second absolute reply deadline that cancellation cannot
+reset. Reattachment checks expiry before polling a queued reply, and an
+explicit timer-first biased wait makes expiry win when reply and deadline are
+both observable at the exact boundary. A reply that may have completed earlier
+but was not observed before the deadline is conservatively rejected. An
+unchanged revision must be field-for-field the same decoded record; a
+same-revision substitution, generation rollback/non-advance, reused record
+identity, missing login/key/domain, changed Host ID/origin, or
+corrupt/noncanonical key or pin
+fails closed without keeping the old authorization active. A valid higher
+generation tears down the old WebSocket/RTC authorization before reconnecting
+with its new token. A deadline, backend error/panic, or request/reply-channel
+failure is instead permanent for that daemon run: it first aborts and joins the
+WebSocket I/O tasks, advances the RTC trust epoch and deactivates peers/uploads,
+then returns a redacted fatal error with no reconnect or follow-on load.
+Because Rust panic hooks run before `catch_unwind`, the daemon installs one
+process-wide hook before its loader thread can start. A private thread-local
+marker (not a copyable thread name) selects one fixed payload/location-free
+credential-loader diagnostic; every unrelated panic delegates unchanged to
+the hook that was installed previously. The hook is installed once for the
+process rather than swapped around individual loads or daemon runs.
+
+The application-level detection/fail-stop budget is therefore the next poll
+(at most 500 ms under normal runtime scheduling) plus the two-second load
+deadline. These are daemon scheduler deadlines, not a guarantee while the OS
+has suspended or is not scheduling the process. A backend thread still blocked
+after the deadline is detached from Tokio; the closed single-flight channel
+prevents amplification, and if it eventually returns its complete secret
+record is dropped/zeroized before the thread exits. Process termination may
+end that detached standard thread at the OS boundary. No finite pre/post
+handshake reread claims linearizability with a credential writer: a commit
+immediately after the post-handshake gate is caught by the bounded monitor,
+while stronger ordering would require writer notification/acknowledgement or
+an authenticated generation in the server handshake.
+
+RTC admission captures a trust epoch before expensive peer construction and
+rechecks it inside the serialized insertion boundary. Credential reload first
+advances that epoch while holding the admission fence and then closes all
+agent and host peers, so an offer that began on the stale control connection
+cannot finish admission after pin revocation or whole-record rotation. The
+periodic watcher owns no Tokio background task and missed ticks are skipped;
+the immediate admission reread closes the race where socket end/backoff and a
+credential commit are simultaneously ready. Unit and local-loopback WebSocket
+tests cover add/revoke, atomic token/key/pin replacement, corrupt/unavailable
+load, secret-safe errors, the simultaneous-ready reconnect case, an active
+old-token socket closing before a new-token reconnect, a loader stalled beyond
+deadline, backend panic and channel disconnect, near-deadline success, repeated
+single-flight polling, supervisor cancellation while a load remains active,
+late reply after watcher cancellation, exact reply/deadline precedence, timely
+pre-deadline reattachment, repeated cancellation without deadline extension,
+and active-session I/O completion held in slow cleanup past the retained
+deadline. A captured-stderr subprocess test panics the active loader with token
+and path canaries, proves neither canary nor source detail reaches stdout or
+stderr, observes exactly one fixed diagnostic, verifies WebSocket/RTC teardown
+and no retry, and confirms an unrelated thread still reaches a preexisting
+custom panic hook.
+RTC tests keep both stale agent and host peers present and prove authorization
+is removed before deliberately stalled cleanup. This checkpoint still
+does not wire signed RTC envelopes or turn the locally stored pins into live
+signature verification, so it creates no live Phase 3 MITM-resistance claim.
 
 Live identifiers also become strict before wiring: the Date.now/Math.random
 agent-session fallback is removed. Agent and HostControl session IDs use

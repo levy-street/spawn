@@ -823,6 +823,84 @@ raise SystemExit(f"daemon control path did not become ready: {last}")
 PY
 }
 
+mutate_live_credentials() {
+  local action="$1"
+  python3 - "$daemon_home/.config/spawn/credentials.json" "$action" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+
+path = Path(sys.argv[1])
+action = sys.argv[2]
+extra_device_id = "00000000-0000-0000-0000-0000000000f4"
+extra_public_key = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+public_bytes = base64.urlsafe_b64decode(extra_public_key + "=")
+extra_fingerprint = "SHA256:" + base64.urlsafe_b64encode(
+    hashlib.sha256(public_bytes).digest()[:12]
+).rstrip(b"=").decode()
+
+record = json.loads(path.read_text(encoding="utf-8"))
+pins = record["browser_pins"]
+if action == "add":
+    if any(pin["browser_device_id"] == extra_device_id for pin in pins):
+        raise SystemExit("reload fixture pin already exists")
+    pins.append(
+        {
+            "browser_device_id": extra_device_id,
+            "browser_key_algorithm": "ed25519",
+            "browser_public_key": extra_public_key,
+            "browser_key_fingerprint": extra_fingerprint,
+        }
+    )
+    pins.sort(key=lambda pin: pin["browser_device_id"])
+elif action == "revoke":
+    record["browser_pins"] = [
+        pin for pin in pins if pin["browser_device_id"] != extra_device_id
+    ]
+    if len(record["browser_pins"]) != len(pins) - 1:
+        raise SystemExit("reload fixture pin was not revoked exactly once")
+else:
+    raise SystemExit(f"unknown credential mutation {action!r}")
+
+record["credential_generation"] += 1
+record["credential_record_id"] = str(uuid.uuid4())
+temporary = path.with_name(f".credentials.json.{uuid.uuid4()}.tmp")
+with temporary.open("w", encoding="utf-8") as handle:
+    json.dump(record, handle)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(record["credential_generation"])
+PY
+}
+
+wait_credential_generation() {
+  local generation="$1"
+  for _ in {1..100}; do
+    if grep -q \
+      "credential generation changed; reconnecting with the new whole record generation=$generation" \
+      "$daemon_log"; then
+      wait_host_online
+      wait_daemon_ready
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf 'smoke-local-daemon: generation %s did not activate during live run\n' \
+    "$generation" >&2
+  return 1
+}
+
 delete_all_smoke_agents() {
   python3 - "$base_url" "$smoke_token" "$smoke_host_id" <<'PY'
 import json
@@ -964,6 +1042,7 @@ import sys
 import base64
 import urllib.error
 import urllib.request
+import uuid
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -1088,10 +1167,21 @@ poll = request(
 )
 
 creds = {
+    "credential_record_version": 1,
+    "credential_generation": 1,
+    "credential_record_id": str(uuid.uuid4()),
     "access_token": poll["access_token"],
     "host_id": poll["host_id"],
     "server_url": base_url,
     "host_private_key_seed": base64.urlsafe_b64encode(seed).rstrip(b"=").decode(),
+    "browser_pins": [
+        {
+            "browser_device_id": poll["browser_device_id"],
+            "browser_key_algorithm": poll["browser_key_algorithm"],
+            "browser_public_key": poll["browser_public_key"],
+            "browser_key_fingerprint": poll["browser_key_fingerprint"],
+        }
+    ],
 }
 for config_dir in (
     os.path.join(home, ".config", "spawn"),
@@ -1112,6 +1202,12 @@ smoke_host_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["host_i
 start_daemon
 wait_host_online
 wait_daemon_ready
+
+printf '%s\n' "smoke-local-daemon: activating and revoking pins during a live run"
+added_generation="$(mutate_live_credentials add)"
+wait_credential_generation "$added_generation"
+revoked_generation="$(mutate_live_credentials revoke)"
+wait_credential_generation "$revoked_generation"
 
 printf '%s\n' "smoke-local-daemon: verifying skills reach a real daemon-launched codex agent"
 python3 - "$base_url" "$smoke_token" <<'PY'
