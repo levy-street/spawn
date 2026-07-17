@@ -523,8 +523,11 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 tracing::info!("ws closed cleanly; reconnecting");
                 attempt = 0;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "ws session ended with error");
+            Err(_) => {
+                // Connection/handshake error text can include data supplied
+                // by the remote endpoint. Keep the reconnect diagnostic
+                // class-only at this final WebSocket logging boundary.
+                tracing::warn!("daemon control websocket session ended with error");
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -3376,10 +3379,18 @@ mod tests {
             );
 
             let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+            let agent_id = "11111111-2222-4333-8444-555555555555";
             let frames = [
                 serde_json::json!({
                     "type": "rtc.offer",
                     "session_id": session_id,
+                    "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "binding_generation": 7,
+                    "agent_id": agent_id,
+                    "scope_type": "agent",
+                    "scope_id": agent_id,
+                    "protocol": "spawn.pty",
+                    "protocol_version": 2,
                     "signed_envelope": null,
                     "sdp": "v=0\r\nraw downgrade"
                 })
