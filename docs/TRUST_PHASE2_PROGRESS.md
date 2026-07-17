@@ -461,8 +461,8 @@ delete-versus-start/poll linearizes on SQLite and PostgreSQL without releasing
 the binding. Daemon disconnect is best-effort external cleanup after the
 durable commit, not the revocation boundary.
 
-**P3-LIVE-F7 daemon host-key possession (implemented, independent review
-pending):** `device/start` now returns its existing fresh 32-byte approval nonce
+**P3-LIVE-F7 daemon host-key possession (reviewed and merged at `4b35222`,
+with strict-ingress hardening at `8bc3cdc`):** `device/start` now returns its existing fresh 32-byte approval nonce
 to the daemon, which signs `SPAWN-HOST-PAIR-POSSESSION-V1` over the exact raw
 device code, nonce, and strict Ed25519 host public key before printing the user
 code. The server records a one-way versioned proof state only on that exact
@@ -505,6 +505,57 @@ login updates survive raw keyring get/set failures. The initial pin source is
 still server-mediated, so 02E alone does not supply independently sourced
 expected-peer provenance, connect a pin to live RTC verification, or delete it
 on server revocation.
+
+**P3-LIVE-F4 browser-local host-pin half (reviewed and merged at `bc09105`,
+with route-identity hardening at `856061f`):** the reviewed foundation adds a separate version-1
+IndexedDB store for public daemon identities. Every record is scoped to an
+exact canonical authenticated account UUID plus canonical HTTP(S) server
+origin, identifies a strict Ed25519 public key by its locally derived exact
+fingerprint, and retains explicit active/revoked state with creation, approval,
+and revocation times. The store is bounded to 256 active-or-tombstone key
+records total and eight unique, canonical, sorted observed Host IDs per key;
+it never evicts or deletes a key/tombstone. Exact fields, record/database
+versions, object-store schema, timestamps, origins, IDs, keys, fingerprints,
+and cross-record Host-ID conflicts are validated on every read. Crypto work is
+kept outside IndexedDB write-transaction lifetimes; a validated snapshot plus
+serialized compare/write retry makes concurrent tabs converge without silent
+replacement.
+
+The explicit browser ceremony now persists or exact-key-reactivates the local
+pin only after the user clicks confirmation and before the approval POST. A
+local failure makes zero approval calls; a later signature/API/response failure
+leaves a visible reload-safe local pin with retry guidance. Exact active
+reapproval is idempotent. Only another fresh user-confirmed approval may
+reactivate the same revoked key. Resolver/API reads cannot create or reactivate
+trust: the future-facing resolver strictly derives and compares the claimed
+key/fingerprint, requires an active local match, and only then may bind the
+bounded routing Host ID. Missing/null/mismatched/revoked pins and a previously
+bound Host ID with a new key fail loudly.
+
+Host-detail trust resolution first requires the Host response ID to equal the
+canonical route exactly, then may establish the bounded active Host-ID/key
+binding. Explicit Host deletion cannot discover or add a binding: its response
+ID must again equal the route/DELETE target, and the response key/fingerprint
+must match an existing exact active or already-tombstoned binding. It writes
+that retained tombstone before issuing DELETE to the same route target. Local
+failure aborts DELETE without changing any pin; server failure keeps an
+idempotently retryable tombstone, and Host API disappearance/reappearance does
+not erase or reactivate it. Tests cover first approval, reload and native
+multi-tab convergence, account/origin isolation, cap+1, corruption/version and
+unknown fields, the shared 49-key weak/noncanonical/off-curve corpus,
+split response/route IDs, fingerprint/key substitution, unbound and multiple
+active-unbound identities, partial approval/deletion recovery, strict resolver
+cases, disappearance/reappearance, exact reapproval, and public-only pin
+persistence. Every blocked deletion case proves zero DELETE and byte-equivalent
+local records; the normal path proves resolution binds before tombstone-first
+DELETE.
+
+This is a reviewed browser-local foundation only. RTC, terminal pools,
+HostControl, and server WebSocket admission do not consume the resolver yet;
+the daemon reciprocal OOB activation half and live signaling work remain open.
+It therefore makes no claim that live signaling is signed, that TOFU has been
+eliminated end to end, or that L1 is established. The preserved independent
+audit remains unchanged.
 
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed
@@ -565,9 +616,9 @@ finding a hard live prerequisite:
 - **F6:** null/unkeyed Hosts and missing local identities/pins are refused at
   `/ws/daemon`, `/ws/host`, `/ws/browser`, daemon dispatch, browser agent, and
   HostControl prerequisites. There is no unsigned compatibility path.
-- **F7:** the current candidate adds a fresh non-replayable server challenge
-  and a domain-separated daemon proof bound to the exact ceremony/key before
-  approval or token issue. It remains review pending and makes no live-signaling
+- **F7:** reviewed and merged pairing requires a fresh non-replayable server
+  challenge and a domain-separated daemon proof bound to the exact ceremony/key
+  before approval or token issue. This foundation alone makes no live-signaling
   claim.
 - **F8:** Host deletion retains both a durable key-owner claim and a
   deletion/device-code revocation fence. This work is reviewed and merged at
@@ -667,10 +718,10 @@ until the decision passes review and is merged.
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
 5. After 02E passes combined integration validation, close the foundation
-   findings under P3-AUDIT-01, preserve reviewed F8, independently review F7,
-   then implement the remaining P3-LIVE-F1 through F6 work, browser auth/trust
-   scoping, and the signed-only cutover as independently reviewed hard
-   dependencies. Only after those pass integrate live signed WebSocket
+   findings under P3-AUDIT-01, preserve reviewed F7 and F8, then implement the
+   remaining P3-LIVE-F1 through F6 work, browser auth/trust scoping, and the
+   signed-only cutover as independently reviewed hard dependencies. Only after
+   those pass integrate live signed WebSocket
    signaling bound to SDP, session, agent-or-host scope, protocol version,
    sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and

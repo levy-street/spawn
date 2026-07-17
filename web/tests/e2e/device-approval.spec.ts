@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
@@ -11,6 +11,46 @@ function fingerprint(publicKey: string): string {
   return `SHA256:${digest.subarray(0, 12).toString("base64url")}`;
 }
 
+async function readHostPins(page: Page): Promise<Array<Record<string, unknown>>> {
+  return page.evaluate(async () => {
+    const request = indexedDB.open("spawn-browser-host-pins", 1);
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const transaction = database.transaction("host-pins", "readonly");
+      const records = transaction.objectStore("host-pins").getAll();
+      return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+        records.onsuccess = () => resolve(records.result);
+        records.onerror = () => reject(records.error);
+      });
+    } finally {
+      database.close();
+    }
+  });
+}
+
+async function corruptHostPinStore(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const request = indexedDB.open("spawn-browser-host-pins", 1);
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const transaction = database.transaction("host-pins", "readwrite");
+      transaction.objectStore("host-pins").add({ recordId: "corrupt", unknown: true });
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve();
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  });
+}
+
 test("device approval shows the locally derived fingerprint before confirmation", async ({
   page,
 }) => {
@@ -20,6 +60,7 @@ test("device approval shows the locally derived fingerprint before confirmation"
   let approvalBody: unknown = null;
   let browserPublicKey = "";
   let browserFingerprint = "";
+  let localPinAtServerApproval: Array<Record<string, unknown>> = [];
 
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -71,6 +112,7 @@ test("device approval shows the locally derived fingerprint before confirmation"
       return;
     }
     if (path === "/api/auth/device/approve") {
+      localPinAtServerApproval = await readHostPins(page);
       approved = true;
       approvalBody = request.postDataJSON();
       const body = approvalBody as Record<string, unknown>;
@@ -106,6 +148,16 @@ test("device approval shows the locally derived fingerprint before confirmation"
   await page.getByRole("button", { name: "Confirm approval" }).click();
   await expect(page.getByRole("status")).toContainText("Approved daemon for host build-host");
   expect(approved).toBe(true);
+  expect(localPinAtServerApproval).toMatchObject([
+    {
+      accountId: USER_ID,
+      hostFingerprint,
+      hostPublicKey,
+      origin: new URL(page.url()).origin,
+      state: "active",
+      version: 1,
+    },
+  ]);
   expect(approvalBody).toMatchObject({
     user_code: "QZ4K-7HMT",
     approval_nonce: APPROVAL_NONCE,
@@ -118,6 +170,13 @@ test("device approval shows the locally derived fingerprint before confirmation"
     browser_key_fingerprint: browserFingerprint,
   });
   expect((approvalBody as { signature: string }).signature).toHaveLength(86);
+  const webStorage = await page.evaluate(() => ({
+    localStorage: { ...localStorage },
+    sessionStorage: { ...sessionStorage },
+  }));
+  expect(JSON.stringify(webStorage)).not.toContain(
+    (approvalBody as { signature: string }).signature,
+  );
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({
@@ -188,7 +247,7 @@ test("blocks first contact when the server fingerprint disagrees with the host k
   expect(approveCalled).toBe(false);
 });
 
-test("stale approval failure clears the reviewed identity and requires review again", async ({
+test("server approval failure retains a reload-safe local pin and offers explicit retry", async ({
   page,
 }) => {
   await page.route("**/api/**", async (route) => {
@@ -257,11 +316,23 @@ test("stale approval failure clears the reviewed identity and requires review ag
   await page.getByRole("button", { name: "Confirm approval" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("review the device code again");
-  await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
-  await expect(page.getByRole("button", { name: "Review daemon" })).toBeVisible();
+  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("saved locally");
+  expect(await readHostPins(page)).toMatchObject([
+    { state: "active", hostPublicKey: HOST_PUBLIC_KEY },
+  ]);
+
+  await page.reload();
+  await page.getByLabel("Device code").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Review daemon" }).click();
+  await expect(page.getByTestId("local-pin-state")).toContainText("already active");
+  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
 });
 
-test("substituted approval response fails loudly and requires review again", async ({ page }) => {
+test("substituted approval response fails loudly while preserving retryable local trust", async ({
+  page,
+}) => {
   const hostPublicKey = HOST_PUBLIC_KEY;
   const hostFingerprint = fingerprint(HOST_PUBLIC_KEY);
 
@@ -342,6 +413,156 @@ test("substituted approval response fails loudly and requires review again", asy
   await expect(page.locator("p[role=alert]")).toContainText(
     "Approval response changed the reviewed host or browser identity",
   );
-  await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
-  await expect(page.getByRole("button", { name: "Review daemon" })).toBeVisible();
+  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
+  expect(await readHostPins(page)).toMatchObject([
+    { state: "active", hostPublicKey: HOST_PUBLIC_KEY },
+  ]);
+});
+
+test("local pin write corruption blocks approval before any server call", async ({ page }) => {
+  let approveCalls = 0;
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/pending") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          host_name: "corrupt-local-store-host",
+          approval_nonce: APPROVAL_NONCE,
+          host_key_algorithm: "ed25519",
+          host_public_key: HOST_PUBLIC_KEY,
+          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/approve") approveCalls += 1;
+    await route.fulfill({ status: 500, json: { detail: "must not be called" } });
+  });
+
+  await page.goto("/device");
+  await page.getByLabel("Device code").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Review daemon" }).click();
+  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
+  await corruptHostPinStore(page);
+  await page.getByRole("button", { name: "Confirm approval" }).click();
+
+  await expect(page.locator("p[role=alert]")).toContainText("stored host pin");
+  expect(approveCalls).toBe(0);
+});
+
+test("two native Chromium tabs converge on one exact local pin", async ({ context, page }) => {
+  const secondPage = await context.newPage();
+  const installRoutes = async (target: Page) => {
+    await target.route("**/api/**", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/me") {
+        await route.fulfill({
+          status: 200,
+          json: {
+            user: {
+              id: USER_ID,
+              email: "owner@example.com",
+              created_at: "2026-07-17T00:00:00Z",
+            },
+          },
+        });
+        return;
+      }
+      if (path === "/api/browser-devices/register") {
+        const body = route.request().postDataJSON() as { public_key: string };
+        await route.fulfill({
+          status: 200,
+          json: {
+            id: BROWSER_DEVICE_ID,
+            key_algorithm: "ed25519",
+            public_key: body.public_key,
+            fingerprint: fingerprint(body.public_key),
+            created_at: "2026-07-17T00:00:00Z",
+            revoked_at: null,
+          },
+        });
+        return;
+      }
+      if (path === "/api/auth/device/pending") {
+        await route.fulfill({
+          status: 200,
+          json: {
+            host_name: "concurrent-host",
+            approval_nonce: APPROVAL_NONCE,
+            host_key_algorithm: "ed25519",
+            host_public_key: HOST_PUBLIC_KEY,
+            host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
+          },
+        });
+        return;
+      }
+      if (path === "/api/auth/device/approve") {
+        const body = route.request().postDataJSON() as Record<string, unknown>;
+        await route.fulfill({
+          status: 200,
+          json: {
+            host_name: "concurrent-host",
+            approval_nonce: APPROVAL_NONCE,
+            host_key_algorithm: "ed25519",
+            host_public_key: HOST_PUBLIC_KEY,
+            host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
+            browser_device_id: body.browser_device_id,
+            browser_key_algorithm: body.browser_key_algorithm,
+            browser_public_key: body.browser_public_key,
+            browser_key_fingerprint: body.browser_key_fingerprint,
+          },
+        });
+        return;
+      }
+      await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+    });
+  };
+  await installRoutes(page);
+  await installRoutes(secondPage);
+  await Promise.all([page.goto("/device"), secondPage.goto("/device")]);
+  await Promise.all([
+    page.getByLabel("Device code").fill("QZ4K-7HMT"),
+    secondPage.getByLabel("Device code").fill("QZ4K-7HMT"),
+  ]);
+  await Promise.all([
+    page.getByRole("button", { name: "Review daemon" }).click(),
+    secondPage.getByRole("button", { name: "Review daemon" }).click(),
+  ]);
+  await Promise.all([
+    page.getByRole("button", { name: "Confirm approval" }).click(),
+    secondPage.getByRole("button", { name: "Confirm approval" }).click(),
+  ]);
+  await expect(page.getByRole("status")).toContainText("Approved daemon");
+  await expect(secondPage.getByRole("status")).toContainText("Approved daemon");
+  expect(await readHostPins(page)).toMatchObject([
+    { hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
+  ]);
+  expect(await readHostPins(page)).toHaveLength(1);
+  await secondPage.close();
 });

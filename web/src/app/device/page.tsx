@@ -14,6 +14,12 @@ import {
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import {
+  approveBrowserHostPin,
+  type BrowserHostPinState,
+  browserHostPinServerOrigin,
+  loadBrowserHostPin,
+} from "@/lib/browser-host-pins";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
@@ -34,6 +40,8 @@ function DeviceInner() {
   const [code, setCode] = useState("");
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
+  const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
+  const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -51,12 +59,23 @@ function DeviceInner() {
           "Daemon fingerprint did not match its public key; approval was blocked",
         );
       }
+      if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
+      const existing = await loadBrowserHostPin({
+        accountId: user.id,
+        origin: browserHostPinServerOrigin(),
+        hostPublicKey: r.host_public_key,
+        hostFingerprint: expectedFingerprint,
+      });
       setPending(r);
+      setLocalPinState(existing?.state ?? "new");
+      setLocalPinCommitted(existing?.state === "active");
     } catch (err) {
       const message =
         err instanceof ApiError || err instanceof ApprovalIdentityError
           ? err.message
-          : "Approval failed";
+          : err instanceof Error
+            ? err.message
+            : "Approval failed";
       setError(message);
     } finally {
       setSubmitting(false);
@@ -67,6 +86,7 @@ function DeviceInner() {
     if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
     setSubmitting(true);
+    let localPinPersisted = false;
     try {
       const localIdentity = await loadBrowserDeviceIdentity(user.id);
       if (
@@ -77,6 +97,21 @@ function DeviceInner() {
           "Local browser identity changed; refresh and review the daemon again",
         );
       }
+      const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
+      if (pending.host_key_fingerprint !== expectedFingerprint) {
+        throw new ApprovalIdentityError(
+          "Daemon fingerprint changed after review; approval was blocked",
+        );
+      }
+      await approveBrowserHostPin({
+        accountId: user.id,
+        origin: browserHostPinServerOrigin(),
+        hostPublicKey: pending.host_public_key,
+        hostFingerprint: expectedFingerprint,
+      });
+      localPinPersisted = true;
+      setLocalPinCommitted(true);
+      setLocalPinState("active");
       const signature = await createHostPairApprovalProof(
         localIdentity,
         user.id,
@@ -112,14 +147,21 @@ function DeviceInner() {
       }
       setHostName(r.host_name);
       setPending(null);
+      setLocalPinState(null);
+      setLocalPinCommitted(false);
       setCode("");
     } catch (err) {
       const message =
         err instanceof ApiError || err instanceof ApprovalIdentityError
           ? err.message
-          : "Approval failed";
-      setError(message);
-      setPending(null);
+          : err instanceof Error
+            ? err.message
+            : "Approval failed";
+      setError(
+        localPinPersisted
+          ? `The exact host fingerprint is saved locally, but server approval did not complete: ${message}. Retry server approval or review the code again; the local pin will remain.`
+          : message,
+      );
     } finally {
       setSubmitting(false);
     }
@@ -148,6 +190,8 @@ function DeviceInner() {
                 onChange={(e) => {
                   setCode(e.target.value);
                   setPending(null);
+                  setLocalPinState(null);
+                  setLocalPinCommitted(false);
                   setHostName(null);
                 }}
                 required
@@ -190,6 +234,29 @@ function DeviceInner() {
                 <p className="text-xs text-muted-foreground">
                   Compare this with the fingerprint printed by <code>spawnd login</code>.
                 </p>
+                {localPinState === "active" && (
+                  <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
+                    This exact fingerprint is already active in this browser. Confirm retries or
+                    completes the server approval without replacing local trust.
+                  </p>
+                )}
+                {localPinState === "revoked" && (
+                  <p className="text-xs text-destructive" data-testid="local-pin-state">
+                    This exact fingerprint has a local deletion tombstone. Confirming this fresh
+                    ceremony explicitly reactivates only this same key.
+                  </p>
+                )}
+                {localPinState === "new" && (
+                  <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
+                    Confirmation first saves this exact fingerprint locally, then sends server
+                    approval.
+                  </p>
+                )}
+                {localPinCommitted && (
+                  <p className="text-xs font-medium text-foreground" role="status">
+                    Exact host fingerprint saved locally. Server approval can be retried safely.
+                  </p>
+                )}
                 <p className="text-sm">Approving browser fingerprint:</p>
                 <p
                   className="break-all font-mono text-sm font-semibold"
@@ -206,13 +273,23 @@ function DeviceInner() {
                     disabled={submitting || registration.data?.status !== "ready"}
                     onClick={onApprove}
                   >
-                    {submitting ? "Approving..." : "Confirm approval"}
+                    {submitting
+                      ? "Approving..."
+                      : localPinCommitted
+                        ? "Retry server approval"
+                        : localPinState === "revoked"
+                          ? "Confirm reapproval"
+                          : "Confirm approval"}
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
                     disabled={submitting}
-                    onClick={() => setPending(null)}
+                    onClick={() => {
+                      setPending(null);
+                      setLocalPinState(null);
+                      setLocalPinCommitted(false);
+                    }}
                   >
                     Back
                   </Button>
