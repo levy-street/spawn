@@ -670,6 +670,12 @@ with its new token. A deadline, backend error/panic, or request/reply-channel
 failure is instead permanent for that daemon run: it first aborts and joins the
 WebSocket I/O tasks, advances the RTC trust epoch and deactivates peers/uploads,
 then returns a redacted fatal error with no reconnect or follow-on load.
+Because Rust panic hooks run before `catch_unwind`, the daemon installs one
+process-wide hook before its loader thread can start. A private thread-local
+marker (not a copyable thread name) selects one fixed payload/location-free
+credential-loader diagnostic; every unrelated panic delegates unchanged to
+the hook that was installed previously. The hook is installed once for the
+process rather than swapped around individual loads or daemon runs.
 
 The application-level detection/fail-stop budget is therefore the next poll
 (at most 500 ms under normal runtime scheduling) plus the two-second load
@@ -700,7 +706,11 @@ single-flight polling, supervisor cancellation while a load remains active,
 late reply after watcher cancellation, exact reply/deadline precedence, timely
 pre-deadline reattachment, repeated cancellation without deadline extension,
 and active-session I/O completion held in slow cleanup past the retained
-deadline.
+deadline. A captured-stderr subprocess test panics the active loader with token
+and path canaries, proves neither canary nor source detail reaches stdout or
+stderr, observes exactly one fixed diagnostic, verifies WebSocket/RTC teardown
+and no retry, and confirms an unrelated thread still reaches a preexisting
+custom panic hook.
 RTC tests keep both stale agent and host peers present and prove authorization
 is removed before deliberately stalled cleanup. This checkpoint still
 does not wire signed RTC envelopes or turn the locally stored pins into live

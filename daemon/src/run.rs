@@ -1,11 +1,13 @@
 //! `spawnd run` — foreground service loop. Connects WSS, registers, services
 //! frames forever (with reconnect + exponential backoff).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +46,38 @@ const CREDENTIAL_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 /// filesystem, or a native keyring. Keep that work off Tokio and stop trusting
 /// the active generation if one complete load has not replied by this bound.
 const CREDENTIAL_LOAD_DEADLINE: Duration = Duration::from_secs(2);
+const CREDENTIAL_LOADER_THREAD_NAME: &str = "spawnd-credential-loader";
+const CREDENTIAL_LOADER_PANIC_DIAGNOSTIC: &[u8] =
+    b"spawnd: credential loader failed; trust disabled\n";
+
+thread_local! {
+    /// Private non-user-controlled identity for the one blocking credential
+    /// worker. A thread name alone can be copied by unrelated code; the panic
+    /// hook therefore keys on this internal TLS marker instead.
+    static IS_CREDENTIAL_LOADER_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+static INSTALL_CREDENTIAL_LOADER_PANIC_HOOK: Once = Once::new();
+
+fn install_credential_loader_panic_hook() {
+    INSTALL_CREDENTIAL_LOADER_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_credential_loader = IS_CREDENTIAL_LOADER_THREAD
+                .try_with(Cell::get)
+                .unwrap_or(false);
+            if is_credential_loader {
+                // Panic hooks run before catch_unwind. Never format `info`:
+                // its payload and source location can contain credential
+                // backend secrets. Ignore stderr failures without panicking.
+                let mut stderr = std::io::stderr().lock();
+                let _ = std::io::Write::write_all(&mut stderr, CREDENTIAL_LOADER_PANIC_DIAGNOSTIC);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
 
 enum CredentialLoadReply {
     Loaded(StoredCreds),
@@ -105,13 +139,18 @@ impl CredentialLoader {
     where
         F: FnMut() -> Result<StoredCreds> + Send + 'static,
     {
+        // Install once before the internal thread can possibly panic. The
+        // captured preexisting hook remains the exact delegate for every
+        // unrelated thread; no load/run swaps process-global hooks.
+        install_credential_loader_panic_hook();
         // Capacity one plus the async-side `pending` slot is intentionally
         // conservative: only one request is ever sent, and `try_send` ensures
         // Tokio is never blocked even if the worker has not reached `recv`.
         let (requests, receiver) = std_mpsc::sync_channel::<CredentialLoadRequest>(1);
         thread::Builder::new()
-            .name("spawnd-credential-loader".to_owned())
+            .name(CREDENTIAL_LOADER_THREAD_NAME.to_owned())
             .spawn(move || {
+                IS_CREDENTIAL_LOADER_THREAD.with(|marker| marker.set(true));
                 while let Ok(request) = receiver.recv() {
                     let loaded = catch_unwind(AssertUnwindSafe(&mut load));
                     let (reply, stop) = match loaded {
@@ -2192,6 +2231,9 @@ mod tests {
 
     const TEST_BROWSER_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const TEST_BROWSER_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+    const PANIC_SUBPROCESS_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOADER_PANIC_SUBPROCESS";
+    const PANIC_CANARY_TOKEN: &str = "panic-canary-token-7f9c";
+    const PANIC_CANARY_PATH: &str = "/panic/canary/private/credentials.json";
 
     async fn receive_std_signal(
         receiver: &std_mpsc::Receiver<()>,
@@ -2820,6 +2862,174 @@ mod tests {
             .expect("disconnected request channel must fail closed");
         assert!(channel_error.to_string().contains("request channel failed"));
         assert!(disconnected.load().await.is_err());
+    }
+
+    #[test]
+    fn credential_loader_panic_subprocess_redacts_stderr_and_delegates_unrelated_hook() {
+        let output = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg("run::tests::credential_loader_panic_subprocess_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PANIC_SUBPROCESS_ENV, "1")
+            .output()
+            .expect("run credential loader panic subprocess");
+        assert!(
+            !output.status.success(),
+            "helper must surface one generic daemon failure"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(!combined.contains(PANIC_CANARY_TOKEN));
+        assert!(!combined.contains(PANIC_CANARY_PATH));
+        assert!(!combined.contains("panicked at"));
+        let fixed = std::str::from_utf8(CREDENTIAL_LOADER_PANIC_DIAGNOSTIC)
+            .expect("static diagnostic utf8")
+            .trim_end();
+        assert_eq!(combined.matches(fixed).count(), 1);
+        assert!(combined.contains("preexisting-hook:ordinary-thread-panic"));
+        assert!(combined.contains("credential loader failed"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn credential_loader_panic_subprocess_helper() -> Result<()> {
+        if std::env::var_os(PANIC_SUBPROCESS_ENV).is_none() {
+            return Ok(());
+        }
+
+        // The loader hook must compose with and preserve an already-installed
+        // application hook for every unrelated thread.
+        std::panic::set_hook(Box::new(|info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string-panic");
+            let mut stderr = std::io::stderr().lock();
+            let _ = std::io::Write::write_all(
+                &mut stderr,
+                format!("preexisting-hook:{payload}\n").as_bytes(),
+            );
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket");
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+        let registered_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_registered_state = Arc::clone(&registered_state);
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept daemon socket");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("spawn.control.v2"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("daemon websocket handshake");
+            socket
+                .next()
+                .await
+                .expect("daemon register frame")
+                .expect("valid daemon register frame");
+            server_registered_state.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = registered_tx.send(());
+            while socket.next().await.is_some() {}
+            let _ = closed_tx.send(());
+        });
+
+        let host_id = Uuid::from_u128(10);
+        let record = credential_record(
+            1,
+            1,
+            "panic-active-token",
+            host_id,
+            server_url.as_str(),
+            7,
+            &[],
+        );
+        let active = LiveCredentialSnapshot::initial(record.clone(), &server_url).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let load_registered_state = Arc::clone(&registered_state);
+        let mut loader = CredentialLoader::start(Duration::from_millis(200), move || {
+            load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if load_registered_state.load(std::sync::atomic::Ordering::SeqCst) {
+                panic!("{PANIC_CANARY_TOKEN} {PANIC_CANARY_PATH}");
+            }
+            Ok(record.clone())
+        })
+        .expect("credential loader");
+        let registry = AgentRegistry::new();
+        assert!(registry.claim_discovery());
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+        let epoch_before = rtc_sessions.trust_epoch_for_test();
+
+        {
+            let connection = serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_millis(5),
+                &mut loader,
+            );
+            tokio::pin!(connection);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    registered = registered_rx => {
+                        registered.expect("daemon registration sender");
+                    }
+                    result = &mut connection => {
+                        panic!("connection ended before registration: {}", result.is_ok());
+                    }
+                }
+            })
+            .await
+            .expect("daemon registration timeout");
+            let error = tokio::time::timeout(Duration::from_secs(1), &mut connection)
+                .await
+                .expect("credential panic did not fail active session")
+                .err()
+                .expect("credential panic must return fatal error");
+            let message = format!("{error:#}");
+            assert!(message.contains("credential loader failed"));
+            assert!(!message.contains(PANIC_CANARY_TOKEN));
+            assert!(!message.contains(PANIC_CANARY_PATH));
+        }
+        assert!(rtc_sessions.trust_epoch_for_test() > epoch_before);
+        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .expect("panic did not close stale websocket")
+            .expect("websocket close observation");
+        let calls_at_failure = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(loader.load().await.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_at_failure
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("local websocket server timeout")
+            .expect("local websocket server task");
+
+        let unrelated = std::thread::spawn(|| panic!("ordinary-thread-panic"));
+        assert!(unrelated.join().is_err());
+        Err(anyhow!("credential loader failed"))
     }
 
     #[tokio::test]
