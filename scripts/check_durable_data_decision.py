@@ -1039,18 +1039,19 @@ EXPLICIT_NAMED_SUBJECT_PATTERN = (
     rf"{IDENTIFIER_SUBJECT_PATTERN})"
 )
 SUBORDINATE_CLAUSE_INTRODUCER_PATTERN = (
-    r"(?:although|because|before|despite|if|once|since|unless|when|whereas|while|"
-    r"after|even\s+though|provided(?:\s+that)?)"
+    r"(?:although|because|before|despite|if|notwithstanding|once|since|unless|"
+    r"when|whereas|while|after|even\s+though|provided(?:\s+that)?)"
 )
 SUBJECT_MODIFIER_PATTERN = (
     r"(?:[a-z0-9_-]+ly|also|already|even|just|not|now|only|still|yet)"
 )
 MATRIX_CLAUSE_SUBJECT = re.compile(
     rf"^\s*(?:(?P<introducer>{SUBORDINATE_CLAUSE_INTRODUCER_PATTERN})\s+)?"
+    r"(?:(?P<coordinator>and|but|or|so|yet)\s+)?"
     rf"(?:{SUBJECT_MODIFIER_PATTERN}\s+){{0,4}}"
     rf"(?P<subject>{EXPLICIT_NAMED_SUBJECT_PATTERN})"
     rf"(?=\s+(?:{SUBJECT_MODIFIER_PATTERN}\s+){{0,6}}"
-    r"[a-z][a-z0-9_-]*(?:'[a-z]+)?\b)"
+    r"(?P<predicate>[a-z][a-z0-9_-]*(?:'[a-z]+)?)\b)"
 )
 SUBORDINATE_CLAUSE_INTRODUCER = re.compile(
     rf"\b{SUBORDINATE_CLAUSE_INTRODUCER_PATTERN}\b"
@@ -1062,6 +1063,40 @@ TOPICALIZED_NAMED_SUBJECT = re.compile(
 TRAILING_NAMED_SUBJECT = re.compile(
     rf"(?P<subject>{EXPLICIT_NAMED_SUBJECT_PATTERN})"
     rf"(?:\s+{SUBJECT_MODIFIER_PATTERN}){{0,4}}\s*$"
+)
+RELATIVE_COMMA_CLAUSE_START = re.compile(r"^\s*(?:that|which|who|whom|whose)\b")
+CLAUSE_WORD = re.compile(r"[a-z][a-z0-9_-]*(?:'[a-z]+)?")
+FINITE_AUXILIARY_WORDS = frozenset(
+    {
+        "am",
+        "are",
+        "be",
+        "became",
+        "become",
+        "becomes",
+        "been",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "remain",
+        "remained",
+        "remains",
+        "shall",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+    }
 )
 
 
@@ -1117,6 +1152,41 @@ def comma_segment_spans(text: str):
     yield start, len(text)
 
 
+def blank_relative_comma_clauses(projected: list[str]) -> None:
+    """Blank comma-bounded relative clauses, including both delimiters."""
+
+    snapshot = "".join(projected)
+    for start, end in comma_segment_spans(snapshot):
+        if (
+            start > 0
+            and end < len(snapshot)
+            and RELATIVE_COMMA_CLAUSE_START.match(snapshot[start:end]) is not None
+        ):
+            projected[start - 1 : end + 1] = " " * (end - start + 2)
+
+
+def comma_segment_is_non_matrix_aside(
+    segment: str,
+    match: re.Match[str],
+    *,
+    topic: re.Match[str] | None,
+) -> bool:
+    """Classify bounded subordinate, postpositive, and absolute asides."""
+
+    if topic is not None:
+        return False
+    if match.groupdict().get("introducer") is not None:
+        return True
+
+    words = tuple(word.group() for word in CLAUSE_WORD.finditer(segment))
+    for index, word in enumerate(words):
+        if word in {"despite", "notwithstanding"} or word.endswith("ing"):
+            return not any(
+                prior_word in FINITE_AUXILIARY_WORDS for prior_word in words[:index]
+            )
+    return False
+
+
 def matrix_subject_projection(text: str) -> str:
     """Blank balanced asides and non-matrix introducer-led adjunct spans."""
 
@@ -1124,6 +1194,7 @@ def matrix_subject_projection(text: str) -> str:
     comma_count = projected.count(",")
     if comma_count > MAX_STATUS_COMMAS:
         raise GuardError("status subject prefix has too many comma boundaries")
+    blank_relative_comma_clauses(projected)
 
     matrix_seen = False
     for start, end in comma_segment_spans("".join(projected)):
@@ -1132,8 +1203,9 @@ def matrix_subject_projection(text: str) -> str:
         match = topic or MATRIX_CLAUSE_SUBJECT.match(segment)
         if match is None:
             continue
-        introduced = topic is None and match.groupdict().get("introducer") is not None
-        if matrix_seen and introduced:
+        if matrix_seen and comma_segment_is_non_matrix_aside(
+            segment, match, topic=topic
+        ):
             projected[start:end] = " " * (end - start)
             continue
         matrix_seen = True
@@ -1164,7 +1236,9 @@ def matrix_clause_subject_scope(
             )
             if matrix_scope is None:
                 matrix_scope = scope
-            elif not introduced:
+            elif not introduced and not comma_segment_is_non_matrix_aside(
+                segment, match, topic=topic
+            ):
                 # A later explicit main-clause subject after a comma governs
                 # that clause; an introducer-led segment is an adjunct instead.
                 later_main_scope = scope
@@ -1814,6 +1888,47 @@ def replace_required(path: Path, old: str, new: str) -> None:
 
 def self_test(source: Path) -> None:
     validate(source)
+    matrix_scope_cases = (
+        (
+            True,
+            "while p2-data-01, which p2-host-02 reviewed, remains pending, it",
+        ),
+        (
+            True,
+            "while p2-data-01, who p2-host-02 reviewed, remains pending, it",
+        ),
+        (
+            True,
+            "while p2-data-01, whom p2-host-02 reviewed, remains pending, it",
+        ),
+        (
+            True,
+            "while p2-data-01, whose review p2-host-02 completed, remains pending, it",
+        ),
+        (
+            True,
+            "while p2-data-01, that p2-host-02 reviewed, remains pending, it",
+        ),
+        (
+            True,
+            "although p2-data-01 remains pending, p2-host-02 having reviewed it, it",
+        ),
+        (
+            True,
+            "although p2-data-01 remains pending, despite p2-host-02 objecting, it",
+        ),
+        (
+            False,
+            "although p2-data-01 remains pending, and p2-host-02 says it",
+        ),
+        (
+            True,
+            "although p2-host-02 remains pending, and p2-data-01 says it",
+        ),
+    )
+    for expected_scope, probe in matrix_scope_cases:
+        if matrix_clause_subject_scope(probe) is not expected_scope:
+            raise GuardError("matrix-subject structural classification regressed")
     projection_probe = (
         "may " + ", once reviewers have been consulted, " * 10_000 + "become "
     )
@@ -1825,8 +1940,10 @@ def self_test(source: Path) -> None:
             "main-clause projection violated its linear-runtime regression bound"
         )
     matrix_probe = (
-        "although p2-data-01 awaits review"
-        + ", after p2-host-02 completed review" * 10_000
+        "although p2-data-01"
+        + ", which p2-host-02 reviewed," * 5_000
+        + " awaits review"
+        + ", after p2-host-02 completed review" * 5_000
     )
     matrix_start = time.perf_counter()
     matrix_scope = matrix_clause_subject_scope(matrix_probe)
@@ -2702,6 +2819,26 @@ def self_test(source: Path) -> None:
             "[P2-HOST-02 still awaits review]), it is accepted now.",
         ),
         (
+            "matrix DATA subject governs over a comma-bounded relative clause",
+            "While P2-DATA-01, which P2-HOST-02 reviewed, remains review "
+            "pending, it is accepted now.",
+        ),
+        (
+            "matrix DATA subject governs over a nested relative-clause aside",
+            "While P2-DATA-01, which P2-HOST-02 (the control protocol remaining "
+            "unchanged) reviewed, remains review pending, it is accepted now.",
+        ),
+        (
+            "matrix DATA subject governs over a postpositive notwithstanding aside",
+            "Although P2-DATA-01 remains review pending, P2-HOST-02 "
+            "notwithstanding, it is accepted now.",
+        ),
+        (
+            "matrix DATA subject governs over an absolute-participial aside",
+            "Although P2-DATA-01 remains review pending, the control protocol "
+            "remaining unchanged, it is accepted now.",
+        ),
+        (
             "later DATA main-clause subject overrides leading HOST adjunct",
             "Although P2-HOST-02 remains review pending, P2-DATA-01 says it is "
             "accepted now.",
@@ -3384,6 +3521,26 @@ def self_test(source: Path) -> None:
             "[the durable protected-data store still awaits review]), it is accepted.",
         ),
         (
+            "matrix non-DATA subject governs over a comma-bounded relative clause",
+            "While P2-HOST-02, which P2-DATA-01 reviewed, remains review pending, "
+            "it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject governs over a nested relative-clause aside",
+            "While P2-HOST-02, which P2-DATA-01 (the control protocol remaining "
+            "unchanged) reviewed, remains review pending, it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject governs over a postpositive notwithstanding aside",
+            "Although P2-HOST-02 remains review pending, P2-DATA-01 "
+            "notwithstanding, it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject governs over an absolute-participial DATA aside",
+            "Although P2-HOST-02 remains review pending, the durable protected-data "
+            "store remaining unchanged, it is accepted.",
+        ),
+        (
             "later HOST main-clause subject overrides leading DATA adjunct",
             "Although P2-DATA-01 remains review pending, P2-HOST-02 says it is "
             "accepted.",
@@ -3592,6 +3749,21 @@ def self_test(source: Path) -> None:
         for name, sentence in status_reinventory_accepts
     )
     status_block_reinventory_accepts = (
+        (
+            "comma asides cannot retain inherited DATA scope over a HOST matrix",
+            "P2-DATA-01 remains review pending.\n\n"
+            "While P2-HOST-02, which P2-DATA-01 reviewed, remains review pending, "
+            "it is accepted.\n\n"
+            "P2-DATA-01 remains review pending.\n\n"
+            "While P2-HOST-02, which P2-DATA-01 (the control protocol remaining "
+            "unchanged) reviewed, remains review pending, it is accepted.\n\n"
+            "P2-DATA-01 remains review pending.\n\n"
+            "Although P2-HOST-02 remains review pending, P2-DATA-01 "
+            "notwithstanding, it is accepted.\n\n"
+            "P2-DATA-01 remains review pending.\n\n"
+            "Although P2-HOST-02 remains review pending, the durable protected-data "
+            "store remaining unchanged, it is accepted.",
+        ),
         (
             "as-for non-DATA topic overrides inherited DATA scope",
             "P2-DATA-01 remains review pending.\n\nAs for P2-HOST-02, it is accepted.",
