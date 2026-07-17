@@ -1,5 +1,14 @@
 import { expect, test } from "@playwright/test";
-import { agent, fileEntry, fileListing, HOST_ID, host, mockAuthenticatedApi } from "./app-mocks";
+import {
+  agent,
+  fileEntry,
+  fileListing,
+  HOST_ID,
+  host,
+  hostKeyFingerprint,
+  mockAuthenticatedApi,
+  OTHER_HOST_PUBLIC_KEY,
+} from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
 const otherHost = {
@@ -7,6 +16,8 @@ const otherHost = {
   id: OTHER_HOST_ID,
   name: "Linux box",
   home_dir: "/home/tester",
+  host_public_key: OTHER_HOST_PUBLIC_KEY,
+  host_key_fingerprint: hostKeyFingerprint(OTHER_HOST_PUBLIC_KEY),
 };
 
 /** Home has projects/ + notes.txt; projects/ has spawn/ + readme.md. */

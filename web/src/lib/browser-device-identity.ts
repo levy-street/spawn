@@ -24,7 +24,13 @@ const SELF_CHECK_SESSION_ID = "00000000-0000-4000-8000-000000000001";
 const SELF_CHECK_SCOPE_ID = "00000000-0000-4000-8000-000000000002";
 const SELF_CHECK_SDP = "v=0\r\ns=spawn-browser-device-identity-self-check\r\n";
 const RECORD_KEYS = ["accountId", "privateKey", "publicKey", "publicKeyWire", "version"] as const;
-const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, StoredDeviceIdentityV1>();
+interface PrivateIdentityCapability {
+  readonly record: StoredDeviceIdentityV1;
+  /** Present only on a non-bypassable trust-epoch-scoped identity. */
+  readonly signal?: AbortSignal;
+}
+
+const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, PrivateIdentityCapability>();
 
 interface StoredDeviceIdentityV1 {
   accountId: string;
@@ -43,6 +49,8 @@ export interface BrowserDeviceIdentity {
 export interface BrowserDeviceIdentityStorageOptions {
   /** Test/isolation override. Pass null to require an unavailable-storage failure. */
   readonly indexedDBFactory?: IDBFactory | null;
+  /** Exact browser trust-epoch signal for capability-scoped loads. */
+  readonly signal?: AbortSignal;
 }
 
 export type BrowserDeviceIdentityErrorCode =
@@ -61,6 +69,10 @@ export class BrowserDeviceIdentityError extends Error {
     super(message);
     this.name = "BrowserDeviceIdentityError";
   }
+}
+
+function assertIdentityCapabilityActive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new DOMException("Browser trust epoch ended", "AbortError");
 }
 
 function assertAccountId(accountId: string): void {
@@ -386,7 +398,7 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
     publicKeyWire: record.publicKeyWire,
     sign: (transcript) => signSignedSignalTranscript(record.privateKey, transcript),
   };
-  privateIdentityRecords.set(identity, record);
+  privateIdentityRecords.set(identity, { record });
   return Object.freeze(identity);
 }
 
@@ -399,7 +411,10 @@ export async function createBrowserDeviceRegistrationProof(
   accountId: string,
 ): Promise<string> {
   assertAccountId(accountId);
-  const record = privateIdentityRecords.get(identity);
+  const capability = privateIdentityRecords.get(identity);
+  const capabilitySignal = capability?.signal;
+  assertIdentityCapabilityActive(capabilitySignal);
+  const record = capability?.record;
   if (record === undefined || record.accountId !== accountId) {
     throw new BrowserDeviceIdentityError(
       "key_mismatch",
@@ -409,9 +424,11 @@ export async function createBrowserDeviceRegistrationProof(
   const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, record.publicKeyWire);
   const ownedTranscript = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(ownedTranscript).set(transcript);
+  assertIdentityCapabilityActive(capabilitySignal);
   const signature = new Uint8Array(
     await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
   );
+  assertIdentityCapabilityActive(capabilitySignal);
   if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
@@ -427,9 +444,14 @@ export async function createHostPairApprovalProof(
   accountId: string,
   approvalNonce: string,
   hostPublicKey: string,
+  signal?: AbortSignal,
 ): Promise<string> {
+  assertIdentityCapabilityActive(signal);
   assertAccountId(accountId);
-  const record = privateIdentityRecords.get(identity);
+  const capability = privateIdentityRecords.get(identity);
+  const capabilitySignal = capability?.signal;
+  assertIdentityCapabilityActive(capabilitySignal);
+  const record = capability?.record;
   if (record === undefined || record.accountId !== accountId) {
     throw new BrowserDeviceIdentityError(
       "key_mismatch",
@@ -444,9 +466,15 @@ export async function createHostPairApprovalProof(
   );
   const ownedTranscript = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(ownedTranscript).set(transcript);
+  // WebCrypto signing itself is not abortable, so an epoch change discards the
+  // completed signature before it can escape this capability boundary.
+  assertIdentityCapabilityActive(capabilitySignal);
+  assertIdentityCapabilityActive(signal);
   const signature = new Uint8Array(
     await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
   );
+  assertIdentityCapabilityActive(capabilitySignal);
+  assertIdentityCapabilityActive(signal);
   if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
@@ -490,17 +518,72 @@ export async function loadBrowserDeviceIdentity(
   accountId: string,
   options: BrowserDeviceIdentityStorageOptions = {},
 ): Promise<BrowserDeviceIdentity | null> {
+  assertIdentityCapabilityActive(options.signal);
   assertAccountId(accountId);
   const factory = resolveIndexedDB(options);
+  assertIdentityCapabilityActive(options.signal);
   const database = await openDatabase(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
   try {
+    assertIdentityCapabilityActive(options.signal);
     const stored = await getStoredRecord(database, accountId);
-    return stored === undefined
-      ? null
-      : publicIdentity(await validateStoredRecord(stored, accountId));
+    assertIdentityCapabilityActive(options.signal);
+    if (stored === undefined) return null;
+    const identity = publicIdentity(await validateStoredRecord(stored, accountId));
+    assertIdentityCapabilityActive(options.signal);
+    return identity;
   } finally {
     database.close();
   }
+}
+
+/** Read only the public wire key for display/cleanup paths; exposes no signer closure. */
+export async function loadBrowserDeviceIdentityPublicKey(
+  accountId: string,
+  options: BrowserDeviceIdentityStorageOptions = {},
+): Promise<string | null> {
+  const identity = await loadBrowserDeviceIdentity(accountId, options);
+  assertIdentityCapabilityActive(options.signal);
+  return identity?.publicKeyWire ?? null;
+}
+
+/**
+ * Bind an opaque browser signer closure to one exact epoch signal. The wrapper
+ * remains account-checked by the private identity registry and cannot return a
+ * signature after synchronous epoch revocation.
+ */
+export function scopeBrowserDeviceIdentityToTrustEpoch(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  expectedPublicKeyWire: string,
+  signal: AbortSignal,
+): BrowserDeviceIdentity {
+  assertIdentityCapabilityActive(signal);
+  assertAccountId(accountId);
+  const capability = privateIdentityRecords.get(identity);
+  assertIdentityCapabilityActive(capability?.signal);
+  const record = capability?.record;
+  if (
+    record === undefined ||
+    record.accountId !== accountId ||
+    record.publicKeyWire !== expectedPublicKeyWire
+  ) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not match the active account registration",
+    );
+  }
+  const scoped: BrowserDeviceIdentity = Object.freeze({
+    publicKey: record.publicKey,
+    publicKeyWire: record.publicKeyWire,
+    sign: async (transcript: SignedSignalTranscript) => {
+      assertIdentityCapabilityActive(signal);
+      const signature = await signSignedSignalTranscript(record.privateKey, transcript);
+      assertIdentityCapabilityActive(signal);
+      return signature;
+    },
+  });
+  privateIdentityRecords.set(scoped, { record, signal });
+  return scoped;
 }
 
 /**

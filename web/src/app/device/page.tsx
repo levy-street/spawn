@@ -9,17 +9,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth, type DevicePendingApproval } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import {
-  createHostPairApprovalProof,
-  loadBrowserDeviceIdentity,
-} from "@/lib/browser-device-identity";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
 import {
-  approveBrowserHostPin,
   type BrowserHostPinState,
   browserHostPinServerOrigin,
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { useBrowserTrustEpochCapabilities } from "@/lib/browser-trust-capabilities";
+import {
+  approveDeviceWithinTrustEpoch,
+  BrowserTrustOperationError,
+} from "@/lib/browser-trust-operations";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
@@ -37,6 +37,7 @@ export default function DevicePage() {
 function DeviceInner() {
   const { user } = useAuth();
   const registration = useBrowserDeviceRegistration(user?.id);
+  const capabilities = useBrowserTrustEpochCapabilities();
   const [code, setCode] = useState("");
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
@@ -50,22 +51,34 @@ function DeviceInner() {
     setError(null);
     setSubmitting(true);
     try {
-      const r = await auth.pendingDevice({
-        user_code: code.trim().toUpperCase(),
+      if (!user || registration.data?.status !== "ready") {
+        throw new ApprovalIdentityError("An active browser trust epoch is required");
+      }
+      const lease = capabilities.acquire({
+        accountOwnerUserId: user.id,
+        browserDeviceId: registration.data.device.id,
+        browserPublicKey: registration.data.device.public_key,
+        epochKey: capabilities.expectation.epochKey,
       });
+      const r = await auth.pendingDevice({ user_code: code.trim().toUpperCase() }, lease.signal);
+      lease.assertActive();
       const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
+      lease.assertActive();
       if (r.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
           "Daemon fingerprint did not match its public key; approval was blocked",
         );
       }
-      if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
-      const existing = await loadBrowserHostPin({
-        accountId: user.id,
-        origin: browserHostPinServerOrigin(),
-        hostPublicKey: r.host_public_key,
-        hostFingerprint: expectedFingerprint,
-      });
+      const existing = await loadBrowserHostPin(
+        {
+          accountId: lease.accountOwnerUserId,
+          origin: browserHostPinServerOrigin(),
+          hostPublicKey: r.host_public_key,
+          hostFingerprint: expectedFingerprint,
+        },
+        { signal: lease.signal },
+      );
+      lease.assertActive();
       setPending(r);
       setLocalPinState(existing?.state ?? "new");
       setLocalPinCommitted(existing?.state === "active");
@@ -86,82 +99,46 @@ function DeviceInner() {
     if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
     setSubmitting(true);
-    let localPinPersisted = false;
     try {
-      const localIdentity = await loadBrowserDeviceIdentity(user.id);
-      if (
-        localIdentity === null ||
-        localIdentity.publicKeyWire !== registration.data.device.public_key
-      ) {
-        throw new ApprovalIdentityError(
-          "Local browser identity changed; refresh and review the daemon again",
-        );
-      }
-      const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
-      if (pending.host_key_fingerprint !== expectedFingerprint) {
-        throw new ApprovalIdentityError(
-          "Daemon fingerprint changed after review; approval was blocked",
-        );
-      }
-      await approveBrowserHostPin({
-        accountId: user.id,
-        origin: browserHostPinServerOrigin(),
-        hostPublicKey: pending.host_public_key,
-        hostFingerprint: expectedFingerprint,
+      const lease = capabilities.acquire({
+        accountOwnerUserId: user.id,
+        browserDeviceId: registration.data.device.id,
+        browserPublicKey: registration.data.device.public_key,
+        epochKey: capabilities.expectation.epochKey,
       });
-      localPinPersisted = true;
+      const r = await approveDeviceWithinTrustEpoch({
+        lease,
+        userCode: code.trim().toUpperCase(),
+        pending,
+        origin: browserHostPinServerOrigin(),
+        registration: {
+          deviceId: registration.data.device.id,
+          keyAlgorithm: registration.data.device.key_algorithm,
+          publicKey: registration.data.device.public_key,
+          fingerprint: registration.data.device.fingerprint,
+        },
+      });
       setLocalPinCommitted(true);
       setLocalPinState("active");
-      const signature = await createHostPairApprovalProof(
-        localIdentity,
-        user.id,
-        pending.approval_nonce,
-        pending.host_public_key,
-      );
-      const r = await auth.approveDevice({
-        user_code: code.trim().toUpperCase(),
-        approval_nonce: pending.approval_nonce,
-        host_key_algorithm: pending.host_key_algorithm,
-        host_public_key: pending.host_public_key,
-        host_key_fingerprint: pending.host_key_fingerprint,
-        browser_device_id: registration.data.device.id,
-        browser_key_algorithm: registration.data.device.key_algorithm,
-        browser_public_key: registration.data.device.public_key,
-        browser_key_fingerprint: registration.data.device.fingerprint,
-        signature,
-      });
-      if (
-        r.host_name !== pending.host_name ||
-        r.approval_nonce !== pending.approval_nonce ||
-        r.host_key_algorithm !== pending.host_key_algorithm ||
-        r.host_public_key !== pending.host_public_key ||
-        r.host_key_fingerprint !== pending.host_key_fingerprint ||
-        r.browser_device_id !== registration.data.device.id ||
-        r.browser_key_algorithm !== registration.data.device.key_algorithm ||
-        r.browser_public_key !== registration.data.device.public_key ||
-        r.browser_key_fingerprint !== registration.data.device.fingerprint
-      ) {
-        throw new ApprovalIdentityError(
-          "Approval response changed the reviewed host or browser identity",
-        );
-      }
       setHostName(r.host_name);
       setPending(null);
       setLocalPinState(null);
       setLocalPinCommitted(false);
       setCode("");
     } catch (err) {
+      if (err instanceof BrowserTrustOperationError && err.recovery !== "none") {
+        setLocalPinCommitted(true);
+        setLocalPinState("active");
+      }
       const message =
-        err instanceof ApiError || err instanceof ApprovalIdentityError
+        err instanceof ApiError ||
+        err instanceof ApprovalIdentityError ||
+        err instanceof BrowserTrustOperationError
           ? err.message
           : err instanceof Error
             ? err.message
             : "Approval failed";
-      setError(
-        localPinPersisted
-          ? `The exact host fingerprint is saved locally, but server approval did not complete: ${message}. Retry server approval or review the code again; the local pin will remain.`
-          : message,
-      );
+      setError(message);
     } finally {
       setSubmitting(false);
     }

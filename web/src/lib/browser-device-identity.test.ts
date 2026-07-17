@@ -5,10 +5,14 @@ import {
   BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS,
   BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
   BROWSER_DEVICE_IDENTITY_STORE_NAME,
+  type BrowserDeviceIdentity,
   BrowserDeviceIdentityError,
   createBrowserDeviceRegistrationProof,
+  createHostPairApprovalProof,
   deleteBrowserDeviceIdentity,
+  loadBrowserDeviceIdentityPublicKey,
   loadOrCreateBrowserDeviceIdentity,
+  scopeBrowserDeviceIdentityToTrustEpoch,
 } from "./browser-device-identity";
 import { verifyBrowserDeviceRegistrationProof } from "./browser-device-registration-transcript";
 import {
@@ -17,6 +21,7 @@ import {
   type SignedSignalTranscript,
   verifySignedSignalTranscript,
 } from "./signed-signal";
+import { signRtcSignalWire } from "./signed-signal-wire";
 
 interface RawStoredIdentity {
   accountId: string;
@@ -195,6 +200,68 @@ describe("browser device identity", () => {
     expect(stored?.privateKey.extractable).toBe(false);
     expect(stored?.privateKey.usages).toEqual(["sign"]);
     await expect(crypto.subtle.exportKey("pkcs8", stored!.privateKey)).rejects.toThrow();
+  });
+
+  test("a captured epoch-scoped identity cannot use any exported signing path after abort", async () => {
+    const factory = new IDBFactory();
+    const accountId = "00000000-0000-4000-8000-000000000090";
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const controller = new AbortController();
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      identity,
+      accountId,
+      identity.publicKeyWire,
+      controller.signal,
+    );
+    const value = transcript(identity.publicKeyWire);
+    controller.abort();
+
+    await expect(scoped.sign(value)).rejects.toMatchObject({ name: "AbortError" });
+    await expect(createBrowserDeviceRegistrationProof(scoped, accountId)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await expect(
+      createHostPairApprovalProof(
+        scoped,
+        accountId,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        identity.publicKeyWire,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    await expect(
+      signRtcSignalWire(scoped, { protocol: "spawn.host.ctl", transcript: value }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("the public-only loader exposes no signer and cannot satisfy proof helpers", async () => {
+    const factory = new IDBFactory();
+    const accountId = "00000000-0000-4000-8000-000000000091";
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const publicView = await loadBrowserDeviceIdentityPublicKey(accountId, options(factory));
+    expect(publicView).toBe(identity.publicKeyWire);
+    expect(typeof publicView).toBe("string");
+    await expect(
+      createBrowserDeviceRegistrationProof(
+        publicView as unknown as BrowserDeviceIdentity,
+        accountId,
+      ),
+    ).rejects.toThrow("does not belong");
+  });
+
+  test("production raw identity loading and scoped signing cross one reviewed boundary", async () => {
+    const hits: Array<{ path: string; load: number; scope: number; approval: number }> = [];
+    const glob = new Bun.Glob("src/**/*.{ts,tsx}");
+    for await (const path of glob.scan(".")) {
+      if (path.includes(".test.") || path.endsWith("browser-device-identity.ts")) continue;
+      const source = await Bun.file(path).text();
+      const load = source.match(/\bloadBrowserDeviceIdentity\s*\(/gu)?.length ?? 0;
+      const scope = source.match(/\bscopeBrowserDeviceIdentityToTrustEpoch\b/gu)?.length ?? 0;
+      const approval = source.match(/\bcreateHostPairApprovalProof\b/gu)?.length ?? 0;
+      if (load + scope + approval > 0) hits.push({ path, load, scope, approval });
+    }
+    expect(hits).toEqual([
+      { path: "src/lib/browser-trust-operations.ts", load: 1, scope: 2, approval: 2 },
+    ]);
   });
 
   test("serializes concurrent first creation so every tab-equivalent caller sees one winner", async () => {

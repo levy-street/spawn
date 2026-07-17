@@ -49,6 +49,10 @@ export interface BrowserHostPinStorageOptions {
   readonly indexedDBFactory?: IDBFactory | null;
   /** Test-only deterministic clock override. */
   readonly now?: () => number;
+  /** Exact browser trust-epoch signal; abort prevents any not-yet-committed mutation. */
+  readonly signal?: AbortSignal;
+  /** Test-only deterministic boundary hook invoked after a durable transaction commits. */
+  readonly testOnlyAfterDurableCommit?: () => void;
 }
 
 export type BrowserHostPinErrorCode =
@@ -68,7 +72,8 @@ export type BrowserHostPinErrorCode =
   | "null_key"
   | "revoked_pin"
   | "storage_failure"
-  | "storage_unavailable";
+  | "storage_unavailable"
+  | "trust_epoch_ended";
 
 export class BrowserHostPinError extends Error {
   constructor(
@@ -78,6 +83,22 @@ export class BrowserHostPinError extends Error {
     super(message);
     this.name = "BrowserHostPinError";
   }
+}
+
+export class BrowserHostPinAbortError extends BrowserHostPinError {
+  constructor(readonly durableMutation: boolean) {
+    super(
+      "trust_epoch_ended",
+      durableMutation
+        ? "browser trust ended after the local host-pin mutation committed"
+        : "browser trust ended before the local host-pin mutation committed",
+    );
+    this.name = "AbortError";
+  }
+}
+
+function assertNotAborted(signal: AbortSignal | undefined, durableMutation = false): void {
+  if (signal?.aborted) throw new BrowserHostPinAbortError(durableMutation);
 }
 
 export interface ApproveBrowserHostPinInput {
@@ -323,7 +344,9 @@ function recordId(accountId: string, origin: string, hostPublicKey: string): str
 async function strictIdentity(
   hostPublicKey: string | null,
   hostFingerprint: string | null,
+  signal?: AbortSignal,
 ): Promise<StrictIdentity> {
+  assertNotAborted(signal);
   if (hostPublicKey === null) {
     throw new BrowserHostPinError("null_key", "the Host API did not provide a host public key");
   }
@@ -336,7 +359,9 @@ async function strictIdentity(
   let derived: string;
   try {
     derived = await ed25519PublicKeyFingerprint(hostPublicKey);
+    assertNotAborted(signal);
   } catch {
+    assertNotAborted(signal);
     throw new BrowserHostPinError("invalid_key", "the host public key is not strict Ed25519");
   }
   if (hostFingerprint !== derived) {
@@ -354,7 +379,11 @@ function assertTimestamp(value: unknown, field: string): asserts value is number
   }
 }
 
-async function validateStoredRecord(value: unknown): Promise<StoredBrowserHostPinV1> {
+async function validateStoredRecord(
+  value: unknown,
+  signal?: AbortSignal,
+): Promise<StoredBrowserHostPinV1> {
+  assertNotAborted(signal);
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new BrowserHostPinError("corrupt_record", "stored host pin is not a record");
   }
@@ -429,8 +458,10 @@ async function validateStoredRecord(value: unknown): Promise<StoredBrowserHostPi
   }
   let identity: StrictIdentity;
   try {
-    identity = await strictIdentity(record.hostPublicKey, record.hostFingerprint);
+    identity = await strictIdentity(record.hostPublicKey, record.hostFingerprint, signal);
+    assertNotAborted(signal);
   } catch {
+    assertNotAborted(signal);
     throw new BrowserHostPinError(
       "corrupt_record",
       "stored host pin failed strict key and local fingerprint validation",
@@ -467,37 +498,60 @@ function assertNoConflicts(records: readonly StoredBrowserHostPinV1[]): void {
   }
 }
 
-async function readRawRecords(database: IDBDatabase): Promise<unknown[]> {
+async function readRawRecords(database: IDBDatabase, signal?: AbortSignal): Promise<unknown[]> {
+  assertNotAborted(signal);
   let transaction: IDBTransaction;
   try {
     transaction = database.transaction(BROWSER_HOST_PIN_STORE_NAME, "readonly");
   } catch {
     throw storageFailure("the local host-pin read transaction could not start");
   }
+  const onAbort = () => {
+    try {
+      transaction.abort();
+    } catch {
+      // The transaction may already be complete.
+    }
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
   const completion = transactionResult(transaction);
   try {
     const store = transaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
+    assertNotAborted(signal);
     const count = await requestResult(store.count());
+    assertNotAborted(signal);
     if (count > BROWSER_HOST_PIN_MAX_RECORDS) {
       await completion;
+      assertNotAborted(signal);
       throw new BrowserHostPinError(
         "capacity_exceeded",
         `local host-pin storage exceeds its ${BROWSER_HOST_PIN_MAX_RECORDS}-record limit`,
       );
     }
     const values = await requestResult(store.getAll());
+    assertNotAborted(signal);
     await completion;
+    assertNotAborted(signal);
     return values;
   } catch (error) {
     await completion.catch(() => undefined);
+    assertNotAborted(signal);
     if (error instanceof BrowserHostPinError) throw error;
     throw storageFailure("the local host-pin read failed");
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function readValidatedRecords(database: IDBDatabase): Promise<StoredBrowserHostPinV1[]> {
-  const raw = await readRawRecords(database);
-  const records = await Promise.all(raw.map(validateStoredRecord));
+async function readValidatedRecords(
+  database: IDBDatabase,
+  signal?: AbortSignal,
+): Promise<StoredBrowserHostPinV1[]> {
+  assertNotAborted(signal);
+  const raw = await readRawRecords(database, signal);
+  assertNotAborted(signal);
+  const records = await Promise.all(raw.map((record) => validateStoredRecord(record, signal)));
+  assertNotAborted(signal);
   assertNoConflicts(records);
   return records;
 }
@@ -514,12 +568,16 @@ async function compareAndWrite<T>(
     readonly nextRecord?: StoredBrowserHostPinV1;
     readonly result: T;
   },
+  options: BrowserHostPinStorageOptions,
 ): Promise<T> {
+  const { signal } = options;
   for (let attempt = 0; attempt < MAX_COMPARE_WRITE_RETRIES; attempt += 1) {
     // Strict key/fingerprint derivation happens outside the write transaction.
     // The write transaction then compares this validated snapshot byte-for-byte
     // before making one synchronous state transition.
-    const validated = await readValidatedRecords(database);
+    assertNotAborted(signal);
+    const validated = await readValidatedRecords(database, signal);
+    assertNotAborted(signal);
     const expectedSnapshot = snapshot(validated);
     let transaction: IDBTransaction;
     try {
@@ -527,10 +585,21 @@ async function compareAndWrite<T>(
     } catch {
       throw storageFailure("the local host-pin write transaction could not start");
     }
+    const onAbort = () => {
+      try {
+        transaction.abort();
+      } catch {
+        // A committed transaction leaves durable state which is reported below.
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     const completion = transactionResult(transaction);
+    let durableMutation = false;
     try {
       const store = transaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
+      assertNotAborted(signal);
       const currentCount = await requestResult(store.count());
+      assertNotAborted(signal);
       if (currentCount > BROWSER_HOST_PIN_MAX_RECORDS) {
         const error = new BrowserHostPinError(
           "capacity_exceeded",
@@ -540,21 +609,33 @@ async function compareAndWrite<T>(
         throw error;
       }
       const current = (await requestResult(store.getAll())) as StoredBrowserHostPinV1[];
+      assertNotAborted(signal);
       if (snapshot(current) !== expectedSnapshot) {
         await abortTransaction(transaction, completion);
         throw RETRY_COMPARE_WRITE;
       }
+      assertNotAborted(signal);
       const transition = mutate(validated);
       if (transition.nextRecord !== undefined) {
+        // Last reversible boundary: aborting before transaction completion
+        // cancels this queued durable write.
+        assertNotAborted(signal);
         await requestResult(store.put(transition.nextRecord));
+        assertNotAborted(signal);
       }
       await completion;
+      durableMutation = transition.nextRecord !== undefined;
+      if (durableMutation) options.testOnlyAfterDurableCommit?.();
+      assertNotAborted(signal, durableMutation);
       return transition.result;
     } catch (error) {
       await completion.catch(() => undefined);
+      assertNotAborted(signal, durableMutation);
       if (error === RETRY_COMPARE_WRITE) continue;
       if (error instanceof BrowserHostPinError) throw error;
       throw storageFailure("the local host-pin write failed");
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
   }
   throw new BrowserHostPinError(
@@ -600,48 +681,58 @@ export async function approveBrowserHostPin(
   input: ApproveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
 ): Promise<BrowserHostPin> {
+  assertNotAborted(options.signal);
   assertScope(input.accountId, input.origin);
-  const identity = await strictIdentity(input.hostPublicKey, input.hostFingerprint);
+  const identity = await strictIdentity(input.hostPublicKey, input.hostFingerprint, options.signal);
+  assertNotAborted(options.signal);
   const factory = resolveIndexedDB(options);
+  assertNotAborted(options.signal);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
-      const existing = recordsInScope(records, input.accountId, input.origin).find(
-        (record) => record.hostPublicKey === identity.hostPublicKey,
-      );
-      if (existing?.state === "active") return { result: publicPin(existing) };
+    assertNotAborted(options.signal);
+    const pin = await compareAndWrite(
+      database,
+      (records) => {
+        const existing = recordsInScope(records, input.accountId, input.origin).find(
+          (record) => record.hostPublicKey === identity.hostPublicKey,
+        );
+        if (existing?.state === "active") return { result: publicPin(existing) };
 
-      const now = checkedNow(options);
-      if (existing !== undefined) {
-        const reactivated: StoredBrowserHostPinV1 = {
-          ...existing,
-          approvedAtMs: Math.max(now, existing.approvedAtMs, existing.revokedAtMs ?? 0),
+        const now = checkedNow(options);
+        if (existing !== undefined) {
+          const reactivated: StoredBrowserHostPinV1 = {
+            ...existing,
+            approvedAtMs: Math.max(now, existing.approvedAtMs, existing.revokedAtMs ?? 0),
+            revokedAtMs: null,
+            state: "active",
+          };
+          return { nextRecord: reactivated, result: publicPin(reactivated) };
+        }
+        if (records.length >= BROWSER_HOST_PIN_MAX_RECORDS) {
+          throw new BrowserHostPinError(
+            "capacity_exceeded",
+            `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_RECORDS} records including tombstones`,
+          );
+        }
+        const created: StoredBrowserHostPinV1 = {
+          accountId: input.accountId,
+          approvedAtMs: now,
+          createdAtMs: now,
+          hostFingerprint: identity.hostFingerprint,
+          hostIds: [],
+          hostPublicKey: identity.hostPublicKey,
+          origin: input.origin,
+          recordId: recordId(input.accountId, input.origin, identity.hostPublicKey),
           revokedAtMs: null,
           state: "active",
+          version: BROWSER_HOST_PIN_STORAGE_VERSION,
         };
-        return { nextRecord: reactivated, result: publicPin(reactivated) };
-      }
-      if (records.length >= BROWSER_HOST_PIN_MAX_RECORDS) {
-        throw new BrowserHostPinError(
-          "capacity_exceeded",
-          `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_RECORDS} records including tombstones`,
-        );
-      }
-      const created: StoredBrowserHostPinV1 = {
-        accountId: input.accountId,
-        approvedAtMs: now,
-        createdAtMs: now,
-        hostFingerprint: identity.hostFingerprint,
-        hostIds: [],
-        hostPublicKey: identity.hostPublicKey,
-        origin: input.origin,
-        recordId: recordId(input.accountId, input.origin, identity.hostPublicKey),
-        revokedAtMs: null,
-        state: "active",
-        version: BROWSER_HOST_PIN_STORAGE_VERSION,
-      };
-      return { nextRecord: created, result: publicPin(created) };
-    });
+        return { nextRecord: created, result: publicPin(created) };
+      },
+      options,
+    );
+    assertNotAborted(options.signal);
+    return pin;
   } finally {
     database.close();
   }
@@ -656,47 +747,69 @@ export async function resolveActiveBrowserHostPin(
   input: ResolveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
 ): Promise<string> {
+  return (await resolveActiveBrowserHostPinMaterial(input, options)).hostPublicKey;
+}
+
+/** Resolve the complete exact local destination identity for capability construction. */
+export async function resolveActiveBrowserHostPinMaterial(
+  input: ResolveBrowserHostPinInput,
+  options: BrowserHostPinStorageOptions = {},
+): Promise<BrowserHostPin> {
+  assertNotAborted(options.signal);
   assertScope(input.accountId, input.origin);
   assertCanonicalUuid(input.hostId, "hostId");
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  const identity = await strictIdentity(
+    input.claimedHostPublicKey,
+    input.claimedHostFingerprint,
+    options.signal,
+  );
+  assertNotAborted(options.signal);
   const factory = resolveIndexedDB(options);
+  assertNotAborted(options.signal);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
-      const scoped = recordsInScope(records, input.accountId, input.origin);
-      const bound = scoped.find((record) => record.hostIds.includes(input.hostId));
-      if (bound !== undefined && bound.hostPublicKey !== identity.hostPublicKey) {
-        throw new BrowserHostPinError(
-          "host_id_key_conflict",
-          "this Host ID is already bound to a different local key; explicit re-pair/rotation is required",
-        );
-      }
-      const exact = scoped.find((record) => record.hostPublicKey === identity.hostPublicKey);
-      if (exact === undefined) {
-        throw new BrowserHostPinError(
-          "missing_pin",
-          "no locally approved host pin matches this Host API identity",
-        );
-      }
-      if (exact.state === "revoked") {
-        throw new BrowserHostPinError(
-          "revoked_pin",
-          "the matching local host pin is revoked; a fresh explicit approval is required",
-        );
-      }
-      if (bound !== undefined) return { result: exact.hostPublicKey };
-      if (exact.hostIds.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) {
-        throw new BrowserHostPinError(
-          "capacity_exceeded",
-          `one local key may observe at most ${BROWSER_HOST_PIN_MAX_HOST_IDS} Host IDs`,
-        );
-      }
-      const boundExact: StoredBrowserHostPinV1 = {
-        ...exact,
-        hostIds: [...exact.hostIds, input.hostId].sort(),
-      };
-      return { nextRecord: boundExact, result: boundExact.hostPublicKey };
-    });
+    assertNotAborted(options.signal);
+    const pin = await compareAndWrite(
+      database,
+      (records) => {
+        const scoped = recordsInScope(records, input.accountId, input.origin);
+        const bound = scoped.find((record) => record.hostIds.includes(input.hostId));
+        if (bound !== undefined && bound.hostPublicKey !== identity.hostPublicKey) {
+          throw new BrowserHostPinError(
+            "host_id_key_conflict",
+            "this Host ID is already bound to a different local key; explicit re-pair/rotation is required",
+          );
+        }
+        const exact = scoped.find((record) => record.hostPublicKey === identity.hostPublicKey);
+        if (exact === undefined) {
+          throw new BrowserHostPinError(
+            "missing_pin",
+            "no locally approved host pin matches this Host API identity",
+          );
+        }
+        if (exact.state === "revoked") {
+          throw new BrowserHostPinError(
+            "revoked_pin",
+            "the matching local host pin is revoked; a fresh explicit approval is required",
+          );
+        }
+        if (bound !== undefined) return { result: publicPin(exact) };
+        if (exact.hostIds.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) {
+          throw new BrowserHostPinError(
+            "capacity_exceeded",
+            `one local key may observe at most ${BROWSER_HOST_PIN_MAX_HOST_IDS} Host IDs`,
+          );
+        }
+        const boundExact: StoredBrowserHostPinV1 = {
+          ...exact,
+          hostIds: [...exact.hostIds, input.hostId].sort(),
+        };
+        return { nextRecord: boundExact, result: publicPin(boundExact) };
+      },
+      options,
+    );
+    assertNotAborted(options.signal);
+    return pin;
   } finally {
     database.close();
   }
@@ -714,6 +827,7 @@ export async function revokeBrowserHostPin(
   input: RevokeBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
 ): Promise<BrowserHostPin> {
+  assertNotAborted(options.signal);
   assertScope(input.accountId, input.origin);
   assertCanonicalUuid(input.targetHostId, "hostId");
   assertCanonicalUuid(input.claimedHostId, "hostId");
@@ -723,34 +837,47 @@ export async function revokeBrowserHostPin(
       "the Host API response ID does not exactly match the route and DELETE target",
     );
   }
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  const identity = await strictIdentity(
+    input.claimedHostPublicKey,
+    input.claimedHostFingerprint,
+    options.signal,
+  );
+  assertNotAborted(options.signal);
   const factory = resolveIndexedDB(options);
+  assertNotAborted(options.signal);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
-      const scoped = recordsInScope(records, input.accountId, input.origin);
-      const bound = scoped.find((record) => record.hostIds.includes(input.targetHostId));
-      if (bound === undefined) {
-        throw new BrowserHostPinError(
-          "missing_pin",
-          "server deletion requires an existing exact local Host-ID-to-key binding",
-        );
-      }
-      if (bound.hostPublicKey !== identity.hostPublicKey) {
-        throw new BrowserHostPinError(
-          "host_id_key_conflict",
-          "this Host ID is bound to a different local key; deletion was blocked",
-        );
-      }
-      if (bound.state === "revoked") return { result: publicPin(bound) };
-      const now = checkedNow(options);
-      const revoked: StoredBrowserHostPinV1 = {
-        ...bound,
-        revokedAtMs: Math.max(now, bound.approvedAtMs),
-        state: "revoked",
-      };
-      return { nextRecord: revoked, result: publicPin(revoked) };
-    });
+    assertNotAborted(options.signal);
+    const pin = await compareAndWrite(
+      database,
+      (records) => {
+        const scoped = recordsInScope(records, input.accountId, input.origin);
+        const bound = scoped.find((record) => record.hostIds.includes(input.targetHostId));
+        if (bound === undefined) {
+          throw new BrowserHostPinError(
+            "missing_pin",
+            "server deletion requires an existing exact local Host-ID-to-key binding",
+          );
+        }
+        if (bound.hostPublicKey !== identity.hostPublicKey) {
+          throw new BrowserHostPinError(
+            "host_id_key_conflict",
+            "this Host ID is bound to a different local key; deletion was blocked",
+          );
+        }
+        if (bound.state === "revoked") return { result: publicPin(bound) };
+        const now = checkedNow(options);
+        const revoked: StoredBrowserHostPinV1 = {
+          ...bound,
+          revokedAtMs: Math.max(now, bound.approvedAtMs),
+          state: "revoked",
+        };
+        return { nextRecord: revoked, result: publicPin(revoked) };
+      },
+      options,
+    );
+    assertNotAborted(options.signal);
+    return pin;
   } finally {
     database.close();
   }
@@ -761,12 +888,17 @@ export async function loadBrowserHostPin(
   input: ApproveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
 ): Promise<BrowserHostPin | null> {
+  assertNotAborted(options.signal);
   assertScope(input.accountId, input.origin);
-  const identity = await strictIdentity(input.hostPublicKey, input.hostFingerprint);
+  const identity = await strictIdentity(input.hostPublicKey, input.hostFingerprint, options.signal);
+  assertNotAborted(options.signal);
   const factory = resolveIndexedDB(options);
+  assertNotAborted(options.signal);
   const database = await openDatabase(factory);
   try {
-    const records = await readValidatedRecords(database);
+    assertNotAborted(options.signal);
+    const records = await readValidatedRecords(database, options.signal);
+    assertNotAborted(options.signal);
     const exact = recordsInScope(records, input.accountId, input.origin).find(
       (record) => record.hostPublicKey === identity.hostPublicKey,
     );

@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { LiveTerminalProvider } from "@/components/terminal/LiveTerminalProvider";
 import { BrowserTrustProvider } from "@/lib/browser-trust";
+import { BrowserTrustCapabilityProvider } from "@/lib/browser-trust-capabilities";
 import { HostControlTrustProvider } from "@/lib/host-control-trust";
 import { useViewportInset } from "@/lib/viewport";
 
@@ -47,9 +48,11 @@ export function AppProviders({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <BrowserTrustProvider>
-        <HostControlTrustProvider>
-          <LiveTerminalProvider>{children}</LiveTerminalProvider>
-        </HostControlTrustProvider>
+        <BrowserTrustCapabilityProvider>
+          <HostControlTrustProvider>
+            <LiveTerminalProvider>{children}</LiveTerminalProvider>
+          </HostControlTrustProvider>
+        </BrowserTrustCapabilityProvider>
       </BrowserTrustProvider>
     </QueryClientProvider>
   );

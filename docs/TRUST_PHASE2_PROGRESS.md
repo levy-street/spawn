@@ -532,6 +532,17 @@ key/fingerprint, requires an active local match, and only then may bind the
 bounded routing Host ID. Missing/null/mismatched/revoked pins and a previously
 bound Host ID with a new key fail loudly.
 
+Account, registration, and browser-trust epoch leases now guard every
+asynchronous approval, resolution, deletion, signing, and local-pin boundary.
+Invalidation aborts those leases synchronously. An abort before the local
+transaction commit or request dispatch has zero durable mutation or remote
+call; an abort after a commit reports the retained local pin, resolver binding,
+or tombstone, and an abort after approval/DELETE dispatch reports an explicit
+unknown remote outcome. A signer captured before logout, account replacement,
+registration error, or revocation cannot use any signing entry point after its
+epoch ends. Production settings and cleanup paths receive only the public key,
+not a raw signing capability.
+
 Host-detail trust resolution first requires the Host response ID to equal the
 canonical route exactly, then may establish the bounded active Host-ID/key
 binding. Explicit Host deletion cannot discover or add a binding: its response
@@ -550,12 +561,14 @@ persistence. Every blocked deletion case proves zero DELETE and byte-equivalent
 local records; the normal path proves resolution binds before tombstone-first
 DELETE.
 
-This is a reviewed browser-local foundation only. RTC, terminal pools,
-HostControl, and server WebSocket admission do not consume the resolver yet;
-the daemon reciprocal OOB activation half and live signaling work remain open.
-It therefore makes no claim that live signaling is signed, that TOFU has been
-eliminated end to end, or that L1 is established. The preserved independent
-audit remains unchanged.
+This remains a browser-local foundation only. HostControl now resolves every
+destination through the exact active local account + origin + Host-ID +
+key/fingerprint pin and fails closed on missing, swapped, or revoked material;
+H1 and H2 cannot share an implicit destination identity. RTC peer verification,
+terminal-pool live signing, server WebSocket admission, and the daemon
+reciprocal OOB activation half remain open. It therefore makes no claim that
+live signaling is signed, that TOFU has been eliminated end to end, or that L1
+is established. The preserved independent audit remains unchanged.
 
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed
@@ -650,15 +663,21 @@ sender cap rejects new senders until expired state can be pruned safely.
 Message size and per-epoch HostControl clients are likewise bounded.
 
 All production HostControl construction now crosses one registry that requires
-the account owner, exact epoch, active browser registration, and an explicit
-per-destination trust-material object. Normal close releases the registry lease
-and lifecycle listener; stale reconnect is refused, and H1→H2 transfers combine
-both lifecycle signals and reject owner/epoch mismatch. A source inventory
-guards against reintroducing raw destination construction. The destination
-identity field remains explicitly `unsigned_not_implemented`, because live
-peer pins/signers do not exist until F4/F5. This checkpoint therefore makes no
-signed-signaling, TOFU, or L1 claim and is not merge-ready until independent
-re-review and current-master mergeability pass.
+the account owner, exact browser device ID and public key, exact epoch, active
+browser registration, and a live epoch lease. It fetches the exact requested
+Host, requires the response ID and canonical origin to match, then resolves an
+exact active local Host-ID + key + fingerprint pin into the per-destination
+trust-material object. H1→H2 therefore uses two independently resolved pins;
+missing, swapped, and revoked material fails closed. Normal close releases the
+registry lease and lifecycle listener; stale reconnect and stale captured
+signers are refused, and transfers combine both lifecycle signals and reject
+owner/epoch mismatch. A source inventory guards against reintroducing raw
+destination construction, raw signer escape, or mutable registry authority.
+Deterministic pre/post-boundary tests preserve explicit retained-recovery and
+`outcome_unknown` classifications, while the replay high-water behavior above
+remains unchanged. This checkpoint still makes no live signed-signaling, TOFU,
+or L1 claim and is not merge-ready until independent re-review and
+current-master mergeability pass.
 
 Daemon trust state cannot remain the one-time `run()` credential snapshot.
 Pin add/revoke and token/host-key rotation require a revisioned coherent

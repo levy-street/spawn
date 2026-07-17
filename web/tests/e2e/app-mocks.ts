@@ -10,6 +10,12 @@ export const SCREEN_ID = "00000000-0000-4000-8000-000000000007";
 export const AGENT_B_ID = "00000000-0000-4000-8000-000000000008";
 export const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
+export const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+export const OTHER_HOST_PUBLIC_KEY = "11qYAYdk9Jt0uvL7Tp_5eQK8heP0LOEYVVt4dSK3M3A";
+
+export function hostKeyFingerprint(publicKey: string): string {
+  return `SHA256:${createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest().subarray(0, 12).toString("base64url")}`;
+}
 
 export const user = {
   id: USER_ID,
@@ -23,6 +29,9 @@ export const host = {
   os: "macos",
   arch: "aarch64",
   version: "0.1.0",
+  host_key_algorithm: "ed25519",
+  host_public_key: HOST_PUBLIC_KEY,
+  host_key_fingerprint: hostKeyFingerprint(HOST_PUBLIC_KEY),
   status: "online",
   last_seen_at: CREATED_AT,
   agent_count: 1,
@@ -149,6 +158,63 @@ export async function mockAuthenticatedApi(
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
   const browserDeviceList: Array<Record<string, unknown>> = [];
+  let hostPinsSeeded = false;
+
+  const seedHostPins = async () => {
+    if (hostPinsSeeded) return;
+    hostPinsSeeded = true;
+    const pins = (hostList as Array<Record<string, unknown>>).flatMap((item) =>
+      typeof item.id === "string" &&
+      typeof item.host_public_key === "string" &&
+      typeof item.host_key_fingerprint === "string"
+        ? [
+            {
+              hostId: item.id,
+              hostPublicKey: item.host_public_key,
+              hostFingerprint: item.host_key_fingerprint,
+            },
+          ]
+        : [],
+    );
+    await page.evaluate(
+      async ({ accountId, pins }) => {
+        await new Promise<void>((resolve, reject) => {
+          const request = indexedDB.open("spawn-browser-host-pins", 1);
+          request.onupgradeneeded = () => {
+            request.result.createObjectStore("host-pins", { keyPath: "recordId" });
+          };
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            const database = request.result;
+            const transaction = database.transaction("host-pins", "readwrite");
+            const origin = location.origin;
+            for (const pin of pins) {
+              transaction.objectStore("host-pins").put({
+                accountId,
+                approvedAtMs: 1,
+                createdAtMs: 1,
+                hostFingerprint: pin.hostFingerprint,
+                hostIds: [pin.hostId],
+                hostPublicKey: pin.hostPublicKey,
+                origin,
+                recordId: JSON.stringify([accountId, origin, pin.hostPublicKey]),
+                revokedAtMs: null,
+                state: "active",
+                version: 1,
+              });
+            }
+            transaction.oncomplete = () => {
+              database.close();
+              resolve();
+            };
+            transaction.onerror = () => reject(transaction.error);
+            transaction.onabort = () => reject(transaction.error);
+          };
+        });
+      },
+      { accountId: USER_ID, pins },
+    );
+  };
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -584,6 +650,7 @@ export async function mockAuthenticatedApi(
       return;
     }
     if (path.match(/^\/api\/hosts\/[^/]+$/) && method === "GET") {
+      await seedHostPins();
       const id = path.split("/").at(-1) ?? "";
       const match = (hostList as Array<{ id?: string }>).find((h) => h.id === id);
       await route.fulfill({

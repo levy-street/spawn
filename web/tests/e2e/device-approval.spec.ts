@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
+const HOST_ID = "00000000-0000-4000-8000-000000000002";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
@@ -565,4 +566,174 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
   ]);
   expect(await readHostPins(page)).toHaveLength(1);
   await secondPage.close();
+});
+
+test("peer auth invalidation during approval signing retains the pin and dispatches no approval", async ({
+  context,
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const originalSign = crypto.subtle.sign.bind(crypto.subtle);
+    Object.defineProperty(crypto.subtle, "sign", {
+      configurable: true,
+      value: async (
+        algorithm: AlgorithmIdentifier | RsaPssParams | EcdsaParams,
+        key: CryptoKey,
+        data: BufferSource,
+      ) => {
+        const state = window as typeof window & {
+          __pauseApprovalSign?: boolean;
+          __approvalSignStarted?: boolean;
+          __approvalSignFinished?: boolean;
+          __releaseApprovalSign?: () => void;
+        };
+        const transcriptBytes =
+          data instanceof ArrayBuffer
+            ? new Uint8Array(data)
+            : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        const transcriptPrefix = new TextDecoder().decode(transcriptBytes.slice(0, 32));
+        const paused =
+          state.__pauseApprovalSign && transcriptPrefix.startsWith("SPAWN-HOST-PAIR-APPROVE-V1");
+        if (paused) {
+          state.__approvalSignStarted = true;
+          await new Promise<void>((resolve) => {
+            state.__releaseApprovalSign = resolve;
+          });
+        }
+        const signature = await originalSign(algorithm, key, data);
+        if (paused) state.__approvalSignFinished = true;
+        return signature;
+      },
+    });
+  });
+  let approveCalls = 0;
+  let meRequests = 0;
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      meRequests += 1;
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: {
+            id: USER_ID,
+            email: "owner@example.com",
+            created_at: "2026-07-17T00:00:00Z",
+          },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/pending") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          host_name: "sign-race-host",
+          approval_nonce: APPROVAL_NONCE,
+          host_key_algorithm: "ed25519",
+          host_public_key: HOST_PUBLIC_KEY,
+          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/approve") {
+      approveCalls += 1;
+      await route.fulfill({ status: 500, json: { detail: "must not dispatch" } });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+
+  await page.goto("/device");
+  await page.getByLabel("Device code").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.evaluate(() => {
+    (window as typeof window & { __pauseApprovalSign?: boolean }).__pauseApprovalSign = true;
+  });
+  await page.getByRole("button", { name: "Confirm approval" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as typeof window & { __approvalSignStarted?: boolean }).__approvalSignStarted ??
+          false,
+      ),
+    )
+    .toBe(true);
+  expect(await readHostPins(page)).toMatchObject([
+    { hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
+  ]);
+
+  const peer = await context.newPage();
+  await peer.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: {
+            id: USER_ID,
+            email: "owner@example.com",
+            created_at: "2026-07-17T00:00:00Z",
+          },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    if (path === `/api/hosts/${HOST_ID}`) {
+      await route.fulfill({ status: 401, json: { detail: "expired session" } });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+  await peer.goto(`/hosts/${HOST_ID}`);
+  await expect.poll(() => meRequests).toBeGreaterThanOrEqual(2);
+  await page.evaluate(() => {
+    (window as typeof window & { __releaseApprovalSign?: () => void }).__releaseApprovalSign?.();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as typeof window & { __approvalSignFinished?: boolean }).__approvalSignFinished ??
+          false,
+      ),
+    )
+    .toBe(true);
+  expect(approveCalls).toBe(0);
+  expect(await readHostPins(page)).toMatchObject([
+    { hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
+  ]);
+  await peer.close();
 });

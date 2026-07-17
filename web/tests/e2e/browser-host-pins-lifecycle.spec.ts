@@ -387,7 +387,9 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   await expectExactHostBinding(page);
   await requestHostDeletion(page);
 
-  await expect(page.locator("p[role=alert]")).toContainText("Local host trust is revoked");
+  await expect(page.locator("p[role=alert]")).toContainText(
+    "Server DELETE was dispatched and its final outcome must be reconciled",
+  );
   await expect(page.getByRole("status")).toContainText("retains a revoked host/key tombstone");
   expect(state.deleteCalls).toBe(1);
   expect(await readHostPins(page)).toMatchObject([

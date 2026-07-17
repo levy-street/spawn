@@ -123,7 +123,13 @@ function testTrust(clientHostId = hostId, controller = new AbortController()) {
     },
     destination: {
       hostId: clientHostId,
-      peerIdentity: { status: "unsigned_not_implemented" },
+      serverOrigin: "https://spawn.example",
+      peerIdentity: {
+        status: "local_host_pin",
+        algorithm: "ed25519",
+        publicKey: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        fingerprint: "SHA256:CCCCCCCCCCCCCCCC",
+      },
     },
     lifecycleSignal: controller.signal,
     acquire: () => true,

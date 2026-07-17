@@ -139,8 +139,14 @@ export interface HostControlClientOptions {
 
 export type HostControlDestinationTrustMaterial = {
   hostId: string;
-  /** Reserved for the signed-signal cutover; unsigned operation is explicit. */
-  peerIdentity: { status: "unsigned_not_implemented" };
+  serverOrigin: string;
+  /** Exact reviewed browser-local expected peer identity; live signing remains a later cutover. */
+  peerIdentity: {
+    status: "local_host_pin";
+    algorithm: "ed25519";
+    publicKey: string;
+    fingerprint: string;
+  };
 };
 
 export interface HostControlTrustMaterial {

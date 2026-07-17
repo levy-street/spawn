@@ -19,7 +19,7 @@ import {
   skills as skillApi,
 } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
-import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
+import { loadBrowserDeviceIdentityPublicKey } from "@/lib/browser-device-identity";
 import {
   allowExplicitBrowserIdentityReplacement,
   type BrowserDeviceRegistrationState,
@@ -84,7 +84,7 @@ function BrowserDevicesSettings() {
   });
   const localIdentity = useQuery({
     queryKey: ["browser-device-local-identity", user?.id],
-    queryFn: () => loadBrowserDeviceIdentity(user!.id),
+    queryFn: () => loadBrowserDeviceIdentityPublicKey(user!.id),
     enabled: user !== null,
     retry: false,
   });
@@ -96,8 +96,7 @@ function BrowserDevicesSettings() {
     }
   }, [qc, registration.data?.status]);
 
-  const currentPublicKey =
-    registration.data?.publicKey ?? localIdentity.data?.publicKeyWire ?? null;
+  const currentPublicKey = registration.data?.publicKey ?? localIdentity.data ?? null;
   const currentDevice =
     (devices.data ?? []).find((device) => device.public_key === currentPublicKey) ??
     (registration.data?.status === "ready" ? registration.data.device : undefined);

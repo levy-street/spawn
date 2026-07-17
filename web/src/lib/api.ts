@@ -320,27 +320,32 @@ export const auth = {
       method: "GET",
       schema: AuthProviderListSchema,
     }),
-  approveDevice: (body: {
-    user_code: string;
-    approval_nonce: string;
-    host_key_algorithm: "ed25519";
-    host_public_key: string;
-    host_key_fingerprint: string;
-    browser_device_id: string;
-    browser_key_algorithm: "ed25519";
-    browser_public_key: string;
-    browser_key_fingerprint: string;
-    signature: string;
-  }) =>
+  approveDevice: (
+    body: {
+      user_code: string;
+      approval_nonce: string;
+      host_key_algorithm: "ed25519";
+      host_public_key: string;
+      host_key_fingerprint: string;
+      browser_device_id: string;
+      browser_key_algorithm: "ed25519";
+      browser_public_key: string;
+      browser_key_fingerprint: string;
+      signature: string;
+    },
+    signal?: AbortSignal,
+  ) =>
     api("/api/auth/device/approve", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DeviceApproveResponseSchema,
     }),
-  pendingDevice: (body: { user_code: string }) =>
+  pendingDevice: (body: { user_code: string }, signal?: AbortSignal) =>
     api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DevicePendingResponseSchema,
     }),
 };
@@ -351,9 +356,10 @@ export const hosts = {
       method: "GET",
       schema: z.array(HostSchema),
     }),
-  get: (id: string) =>
+  get: (id: string, signal?: AbortSignal) =>
     api(`/api/hosts/${id}`, {
       method: "GET",
+      signal,
       schema: HostSchema,
     }),
   rename: (id: string, name: string) =>
@@ -362,7 +368,8 @@ export const hosts = {
       body: JSON.stringify({ name }),
       schema: HostSchema,
     }),
-  remove: (id: string) => api<void>(`/api/hosts/${id}`, { method: "DELETE" }),
+  remove: (id: string, signal?: AbortSignal) =>
+    api<void>(`/api/hosts/${id}`, { method: "DELETE", signal }),
   tools: (id: string) =>
     api(`/api/hosts/${id}/tools`, {
       method: "GET",

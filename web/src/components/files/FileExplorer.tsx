@@ -38,10 +38,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
-import {
-  unsignedHostControlDestination,
-  useHostControlClientFactory,
-} from "@/lib/host-control-trust";
+import { useHostControlClientFactory } from "@/lib/host-control-trust";
 import type { HostDirEntry, HostDirList } from "@/lib/hostControl";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
@@ -461,9 +458,7 @@ export function FileExplorer({
     }) => {
       if (!hostControl) throw new Error("Source host is not connected");
       return (async () => {
-        const destination = hostControlFactory.createClient(
-          unsignedHostControlDestination(destHostId),
-        );
+        const destination = await hostControlFactory.createClient(destHostId);
         const operation = new AbortController();
         transferControllersRef.current.add(operation);
         const signal = AbortSignal.any([

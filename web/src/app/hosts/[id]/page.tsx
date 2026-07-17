@@ -30,23 +30,18 @@ import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentCommand, agentTitle, relativeTime } from "@/lib/agents";
 import { ApiError, agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
 import {
   BrowserHostPinError,
   browserHostPinServerOrigin,
   loadBrowserHostPin,
-  resolveActiveBrowserHostPin,
-  revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
-
-class HostDeletionFlowError extends Error {
-  constructor(
-    message: string,
-    readonly localTombstoneWritten: boolean,
-  ) {
-    super(message);
-    this.name = "HostDeletionFlowError";
-  }
-}
+import { useBrowserTrustEpochCapabilities } from "@/lib/browser-trust-capabilities";
+import {
+  BrowserTrustOperationError,
+  deleteHostWithinTrustEpoch,
+  resolveHostWithinTrustEpoch,
+} from "@/lib/browser-trust-operations";
 
 export default function HostDetailPage() {
   return (
@@ -60,6 +55,8 @@ export default function HostDetailPage() {
 
 function HostDetail() {
   const { user } = useAuth();
+  const registration = useBrowserDeviceRegistration(user?.id);
+  const capabilities = useBrowserTrustEpochCapabilities();
   const params = useParams<{ id: string }>();
   const id = params?.id;
   const router = useRouter();
@@ -94,36 +91,25 @@ function HostDetail() {
   });
   const removeM = useMutation({
     mutationFn: async () => {
-      if (!host || !user) {
-        throw new HostDeletionFlowError(
-          "Authenticated host identity is unavailable; deletion was blocked",
-          false,
+      if (!host || !user || registration.data?.status !== "ready") {
+        throw new BrowserTrustOperationError(
+          "Authenticated host identity and browser registration are unavailable; deletion was blocked",
+          "none",
         );
       }
       const targetHostId = id as string;
-      if (host.id !== targetHostId) {
-        throw new HostDeletionFlowError(
-          "Host API response ID does not exactly match the route and DELETE target",
-          false,
-        );
-      }
-      let localTombstoneWritten = false;
-      try {
-        await revokeBrowserHostPin({
-          accountId: user.id,
-          origin: browserHostPinServerOrigin(),
-          targetHostId,
-          claimedHostId: host.id,
-          claimedHostPublicKey: host.host_public_key ?? null,
-          claimedHostFingerprint: host.host_key_fingerprint ?? null,
-        });
-        localTombstoneWritten = true;
-        setLocalDeletionPending(true);
-        await hosts.remove(targetHostId);
-      } catch (err) {
-        const message = err instanceof ApiError || err instanceof Error ? err.message : String(err);
-        throw new HostDeletionFlowError(message, localTombstoneWritten);
-      }
+      const lease = capabilities.acquire({
+        accountOwnerUserId: user.id,
+        browserDeviceId: registration.data.device.id,
+        browserPublicKey: registration.data.device.public_key,
+        epochKey: capabilities.expectation.epochKey,
+      });
+      await deleteHostWithinTrustEpoch({
+        lease,
+        origin: browserHostPinServerOrigin(),
+        targetHostId,
+        host,
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["hosts"] });
@@ -131,11 +117,12 @@ function HostDetail() {
       router.push("/hosts");
     },
     onError: (err) => {
-      if (err instanceof HostDeletionFlowError && err.localTombstoneWritten) {
+      if (
+        err instanceof BrowserTrustOperationError &&
+        (err.recovery === "local_tombstone_retained" || err.recovery === "delete_outcome_unknown")
+      ) {
         setLocalDeletionPending(true);
-        setError(
-          `Local host trust is revoked, but server deletion did not complete: ${err.message}. Retry server deletion; the local tombstone will remain.`,
-        );
+        setError(err.message);
         return;
       }
       setError(
@@ -149,16 +136,25 @@ function HostDetail() {
   useEffect(() => {
     const hostPublicKey = host?.host_public_key;
     const hostFingerprint = host?.host_key_fingerprint;
-    if (!host || !user || !hostPublicKey || !hostFingerprint) return;
+    const activeRegistration = registration.data?.status === "ready" ? registration.data : null;
+    if (!host || !user || !hostPublicKey || !hostFingerprint || activeRegistration === null) {
+      return;
+    }
     let cancelled = false;
     void (async () => {
       try {
+        const lease = capabilities.acquire({
+          accountOwnerUserId: user.id,
+          browserDeviceId: activeRegistration.device.id,
+          browserPublicKey: activeRegistration.device.public_key,
+          epochKey: capabilities.expectation.epochKey,
+        });
         if (host.id !== id) {
           throw new Error("Host API response ID does not exactly match this route");
         }
         try {
-          await resolveActiveBrowserHostPin({
-            accountId: user.id,
+          await resolveHostWithinTrustEpoch({
+            lease,
             origin: browserHostPinServerOrigin(),
             hostId: id,
             claimedHostPublicKey: hostPublicKey,
@@ -167,14 +163,25 @@ function HostDetail() {
         } catch (err) {
           // An already-bound tombstone is expected after a failed server
           // DELETE. Confirm its exact binding below without reactivating it.
-          if (!(err instanceof BrowserHostPinError) || err.code !== "revoked_pin") throw err;
+          if (
+            !(err instanceof BrowserTrustOperationError) ||
+            !(err.cause instanceof BrowserHostPinError) ||
+            err.cause.code !== "revoked_pin"
+          ) {
+            throw err;
+          }
         }
-        const pin = await loadBrowserHostPin({
-          accountId: user.id,
-          origin: browserHostPinServerOrigin(),
-          hostPublicKey,
-          hostFingerprint,
-        });
+        lease.assertActive();
+        const pin = await loadBrowserHostPin(
+          {
+            accountId: lease.accountOwnerUserId,
+            origin: browserHostPinServerOrigin(),
+            hostPublicKey,
+            hostFingerprint,
+          },
+          { signal: lease.signal },
+        );
+        lease.assertActive();
         if (pin === null || !pin.hostIds.includes(id)) {
           throw new Error("No exact local Host-ID-to-key binding exists for this route");
         }
@@ -191,7 +198,7 @@ function HostDetail() {
     return () => {
       cancelled = true;
     };
-  }, [host, user, id]);
+  }, [capabilities, host, user, id, registration.data]);
 
   const submitRename = () => {
     const next = draftName.trim();

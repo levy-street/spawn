@@ -7,6 +7,7 @@ import {
   BROWSER_HOST_PIN_MAX_RECORDS,
   BROWSER_HOST_PIN_STORAGE_VERSION,
   BROWSER_HOST_PIN_STORE_NAME,
+  BrowserHostPinAbortError,
   BrowserHostPinError,
   loadBrowserHostPin,
   resolveActiveBrowserHostPin,
@@ -571,6 +572,41 @@ describe("browser-local host pins", () => {
       approveBrowserHostPin(approvalInput(), { indexedDBFactory: null }),
       "storage_unavailable",
     );
+  });
+
+  test("trust abort before the queued durable write leaves byte-empty storage", async () => {
+    const factory = new IDBFactory();
+    const controller = new AbortController();
+    const operation = approveBrowserHostPin(approvalInput(), {
+      indexedDBFactory: factory,
+      signal: controller.signal,
+      now: () => {
+        controller.abort();
+        return 1_000;
+      },
+    });
+    await expect(operation).rejects.toBeInstanceOf(BrowserHostPinAbortError);
+    await expect(operation).rejects.toMatchObject({ durableMutation: false });
+    expect(await rawRecords(factory)).toEqual([]);
+  });
+
+  test("trust abort after commit reports retained durable state without rollback", async () => {
+    const factory = new IDBFactory();
+    const controller = new AbortController();
+    const operation = approveBrowserHostPin(approvalInput(), {
+      indexedDBFactory: factory,
+      signal: controller.signal,
+      now: () => 1_000,
+      testOnlyAfterDurableCommit: () => controller.abort(),
+    });
+    await expect(operation).rejects.toBeInstanceOf(BrowserHostPinAbortError);
+    await expect(operation).rejects.toMatchObject({ durableMutation: true });
+    expect(await rawRecords(factory)).toHaveLength(1);
+    expect((await rawRecords(factory))[0]).toMatchObject({
+      accountId: ACCOUNT,
+      hostPublicKey: HOST_KEY,
+      state: "active",
+    });
   });
 
   test("rejects conflicting duplicate Host-ID bindings as corruption", async () => {

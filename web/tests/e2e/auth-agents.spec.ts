@@ -73,6 +73,7 @@ test("agent create permission errors are rendered as controlled form errors", as
   });
 
   await page.goto("/agents/new");
+  await expect(page.getByRole("combobox", { name: "Directory" })).toHaveValue("/Users/tester/");
   await page.getByRole("button", { name: "Spawn agent" }).click();
 
   await expect(page.getByText("CSRF token missing or invalid")).toBeVisible();

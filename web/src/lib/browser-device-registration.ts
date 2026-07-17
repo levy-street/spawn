@@ -6,7 +6,7 @@ import { type BrowserDevice, browserDevices } from "./api";
 import {
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
-  loadBrowserDeviceIdentity,
+  loadBrowserDeviceIdentityPublicKey,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
 import { ed25519PublicKeyFingerprint } from "./signed-signal";
@@ -53,12 +53,12 @@ export async function beginBrowserDeviceLocalCleanup(
   userId: string,
   expectedPublicKey: string,
 ): Promise<"cleanup_pending" | "revoked"> {
-  const identity = await loadBrowserDeviceIdentity(userId);
-  if (identity === null) {
+  const publicKey = await loadBrowserDeviceIdentityPublicKey(userId);
+  if (publicKey === null) {
     writeMarker(userId, { status: "revoked", publicKey: expectedPublicKey });
     return "revoked";
   }
-  if (identity.publicKeyWire !== expectedPublicKey) {
+  if (publicKey !== expectedPublicKey) {
     throw new Error("local browser identity does not match the revoked server key");
   }
   writeMarker(userId, {
