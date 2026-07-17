@@ -537,90 +537,119 @@ def all_corpus_sentences(root: Path) -> tuple[CorpusSentence, ...]:
 PREMATURE_DATA_STATUS_WORD = re.compile(
     r"\b(?:approved|accepted|authoritative|selected)\b"
 )
+DATA_STORE_SUBJECT_PATTERN = (
+    r"(?:protected(?:-data)?|durable(?:-data)?|endpoint(?:-local|-owned)?|"
+    r"private|canonical)"
+    r"(?:\s+[a-z0-9-]+){0,4}\s+store"
+)
 DATA_STATUS_SUBJECT_PATTERN = (
     r"\b(?:"
     r"p2-data-(?:01|02)|"
     r"data-(?:01|02)(?: decision| design| target| contract| store)?|"
     r"durable protected(?:-data)? (?:state|target|store)|"
-    r"durable-data store|"
-    r"protected-data store|"
-    r"private store|"
-    r"endpoint-owned store|"
-    r"endpoint(?:-local)? store|"
-    r"(?:endpoint-local|per-host(?: endpoint-local)?) "
-    r"(?:canonical |durable )?store|"
+    rf"{DATA_STORE_SUBJECT_PATTERN}|"
     r"(?:p2-data-02 )?store contract|"
-    r"canonical store"
+    r"per-host(?: endpoint-local)?(?: canonical| durable)? store"
     r")\b"
 )
 DATA_STATUS_SUBJECT = re.compile(DATA_STATUS_SUBJECT_PATTERN)
-DATA_STATUS_CLAUSE_BOUNDARY = re.compile(
-    r"\s*;\s*|\s*,\s*(?=(?:but|however|yet|whereas)\b)|"
-    r"\s+\b(?:but|however|yet|whereas)\b\s+"
+STATUS_LINKING_VERB = re.compile(
+    r"\b(?:is|are|was|were|be|been|being|become|becomes|became|"
+    r"remain|remains|remained)\b"
 )
-EXPLICIT_STATUS_SUBJECT_START = (
-    r"(?:the\s+)?(?:"
-    r"p2-[a-z0-9-]+|"
-    r"data-(?:01|02)(?: decision| design| target| contract| store)?|"
-    r"durable protected(?:-data)? (?:state|target|store)|"
-    r"durable-data store|protected-data store|private store|"
-    r"endpoint-owned store|endpoint(?:-local)? store|"
-    r"(?:endpoint-local|per-host(?: endpoint-local)?) "
-    r"(?:canonical |durable )?store|"
-    r"(?:p2-data-02 )?store contract|canonical store|"
-    r"host protocol|(?:one |a )?prototype"
-    r")\b"
+STATUS_AUXILIARY = re.compile(
+    r"\b(?:do|does|did|may|might|must|will|would|can|could|shall|should)\b"
 )
-EXPLICIT_STATUS_SUBJECT = re.compile(EXPLICIT_STATUS_SUBJECT_START)
+STATUS_PREDICATE = re.compile(
+    rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
+    rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
+)
+GENERIC_NOUN_SUBJECT_PATTERN = r"(?:the|a|an)\s+(?:[a-z0-9-]+\s+){0,7}[a-z0-9-]+"
+IDENTIFIER_SUBJECT_PATTERN = r"(?:p2-[a-z0-9-]+|data-(?:01|02))"
+PRONOUN_SUBJECT_PATTERN = r"(?:it|this|that|they|these|those)"
+EXPLICIT_CLAUSE_SUBJECT_PATTERN = (
+    rf"(?:{GENERIC_NOUN_SUBJECT_PATTERN}|{IDENTIFIER_SUBJECT_PATTERN}|"
+    rf"{PRONOUN_SUBJECT_PATTERN})"
+)
+COMPLETE_CLAUSE_START = re.compile(
+    rf"^\s*(?:either\s+)?{EXPLICIT_CLAUSE_SUBJECT_PATTERN}"
+    rf"(?:\s+(?:and|or)\s+{EXPLICIT_CLAUSE_SUBJECT_PATTERN})*"
+    rf"\s+(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
+    rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
+)
+STRONG_STATUS_CLAUSE_BOUNDARY = re.compile(
+    r"\s*(?:;|:)\s*|\s*,?\s*\b(?:but|however|yet|whereas)\b\s*"
+)
+CONDITIONAL_STATUS_CLAUSE_BOUNDARY = re.compile(r"\b(?:and|or|before|after|while)\b")
+COMPARATIVE_PARENTHETICAL = re.compile(
+    r",\s*(?:unlike|like|compared (?:with|to)|as opposed to)\b[^,]*,"
+)
+EXPLICIT_GENERIC_SUBJECT = re.compile(
+    rf"\b(?:{GENERIC_NOUN_SUBJECT_PATTERN}|{IDENTIFIER_SUBJECT_PATTERN})\b"
+)
+EXPLICIT_PRONOUN_SUBJECT = re.compile(rf"\b{PRONOUN_SUBJECT_PATTERN}\b")
 HISTORICAL_DATA_CONTEXT = re.compile(
     r"\b(?:historical|historically|superseded|former|previous|previously)\b"
 )
 REVIEW_WORD = re.compile(r"\b(?:review|reviewed)\b")
 MERGE_WORD = re.compile(r"\b(?:merge|merged)\b")
+CURRENT_DATA_CONTEXT = re.compile(r"\b(?:now|currently)\b")
 
 
 def status_is_locally_negated(group: str, status_word: re.Match[str]) -> bool:
     prefix = group[: status_word.start()]
     return bool(
         re.search(
-            r"\b(?:not|never|no longer)(?:\s+[a-z0-9_-]+){0,2}\s*$",
+            r"\b(?:not|never|no longer)"
+            r"(?:\s+(?!(?:approved|accepted|authoritative|selected|and|or|nor|but)\b)"
+            r"[a-z0-9_-]+){0,2}\s*$",
             prefix,
         )
     )
 
 
-def status_group_is_negated(
-    group: str, status_words: tuple[re.Match[str], ...]
+def status_is_negated(
+    group: str,
+    status_words: tuple[re.Match[str], ...],
+    status_index: int,
 ) -> bool:
-    if all(status_is_locally_negated(group, status) for status in status_words):
+    status = status_words[status_index]
+    if status_is_locally_negated(group, status):
         return True
 
     first = status_words[0]
-    last = status_words[-1]
     prefix = group[: first.start()]
     shared_negative = re.search(r"\b(?:not|never|no longer)\s*$", prefix)
     shared_neither = re.search(r"\bneither\s*$", prefix)
     if shared_negative is None and shared_neither is None:
         return False
 
-    connectors = PREMATURE_DATA_STATUS_WORD.sub("", group[first.start() : last.end()])
+    connectors = PREMATURE_DATA_STATUS_WORD.sub(
+        "", group[first.start() : status_words[-1].end()]
+    )
     if re.fullmatch(r"(?:\s|,|\band\b|\bor\b|\bnor\b)*", connectors) is None:
         return False
-    return shared_neither is None or bool(re.search(r"\bnor\b", connectors))
+    if shared_neither is not None:
+        return bool(re.search(r"\bnor\b", connectors))
+    if status_index == 0:
+        return False
+    # A bare `not X and Y` normally negates only X. Commas or an alternative
+    # coordinator make `not X, Y, or Z` an explicitly shared negative list.
+    return "," in connectors or bool(re.search(r"\b(?:or|nor)\b", connectors))
 
 
 def status_group_has_historical_context(
     group: str,
     status_words: tuple[re.Match[str], ...],
-    subjects: tuple[re.Match[str], ...],
 ) -> bool:
-    claim_start = min(
-        status_words[0].start(),
-        subjects[0].start() if subjects else status_words[0].start(),
-    )
-    if HISTORICAL_DATA_CONTEXT.search(group[:claim_start]) is None:
+    if CURRENT_DATA_CONTEXT.search(group) is not None:
         return False
-    return re.search(r"\b(?:now|currently)\b", group[claim_start:]) is None
+    first = status_words[0]
+    last = status_words[-1]
+    return (
+        HISTORICAL_DATA_CONTEXT.search(group[: first.start()]) is not None
+        or HISTORICAL_DATA_CONTEXT.search(group[last.end() :]) is not None
+    )
 
 
 def contains_review_and_merge(text: str) -> bool:
@@ -630,18 +659,11 @@ def contains_review_and_merge(text: str) -> bool:
 def status_group_has_future_review_gate(
     group: str,
     status_words: tuple[re.Match[str], ...],
-    subjects: tuple[re.Match[str], ...],
 ) -> bool:
-    claim_start = min(
-        status_words[0].start(),
-        subjects[0].start() if subjects else status_words[0].start(),
-    )
-    claim_end = max(
-        status_words[-1].end(),
-        subjects[-1].end() if subjects else status_words[-1].end(),
-    )
-    before = group[:claim_start]
-    after = group[claim_end:]
+    if CURRENT_DATA_CONTEXT.search(group) is not None:
+        return False
+    before = group[: status_words[0].start()]
+    after = group[status_words[-1].end() :]
 
     before_gate = re.search(r"\bonly (?:when|after)\b", before)
     if before_gate is not None and contains_review_and_merge(
@@ -654,59 +676,150 @@ def status_group_has_future_review_gate(
     return contains_review_and_merge(after[after_gate.start() :])
 
 
-def data_status_claim_groups(sentence: str) -> tuple[tuple[str, bool], ...]:
-    """Return bounded claims and whether each is governed by a DATA subject."""
+def split_conditional_status_clauses(clause: str) -> tuple[str, ...]:
+    """Split only coordinators that start another complete subject/predicate."""
+
+    groups: list[str] = []
+    start = 0
+    for boundary in CONDITIONAL_STATUS_CLAUSE_BOUNDARY.finditer(clause):
+        left = clause[start : boundary.start()]
+        right = clause[boundary.end() :]
+        if STATUS_PREDICATE.search(left) is None:
+            continue
+        if COMPLETE_CLAUSE_START.match(right) is None:
+            continue
+        groups.append(left)
+        start = boundary.end()
+    groups.append(clause[start:])
+    return tuple(group for group in groups if group.strip())
+
+
+def split_data_status_clauses(sentence: str) -> tuple[str, ...]:
+    return tuple(
+        group
+        for strong_clause in STRONG_STATUS_CLAUSE_BOUNDARY.split(sentence)
+        if strong_clause.strip()
+        for group in split_conditional_status_clauses(strong_clause)
+    )
+
+
+def subject_region_for_status_group(
+    group: str, status_words: tuple[re.Match[str], ...]
+) -> str:
+    """Return the grammatical subject region governing a coordinated status list."""
+
+    prefix = group[: status_words[0].start()]
+    links = tuple(STATUS_LINKING_VERB.finditer(prefix))
+    if not links:
+        return prefix
+
+    governing_link = links[-1]
+    before_link = prefix[: governing_link.start()]
+    auxiliaries = tuple(STATUS_AUXILIARY.finditer(before_link))
+    if not auxiliaries:
+        return before_link
+
+    last_auxiliary = auxiliaries[-1]
+    inverted_candidate = before_link[last_auxiliary.end() :]
+    if (
+        DATA_STATUS_SUBJECT.search(inverted_candidate) is not None
+        or EXPLICIT_GENERIC_SUBJECT.search(inverted_candidate) is not None
+        or EXPLICIT_PRONOUN_SUBJECT.search(inverted_candidate) is not None
+    ):
+        return inverted_candidate
+    return before_link[: last_auxiliary.start()]
+
+
+def data_subject_scope(
+    group: str,
+    inherited_data_scope: bool,
+) -> tuple[bool, bool]:
+    """Return DATA scope and whether this claim states an explicit subject."""
+
+    without_comparisons = COMPARATIVE_PARENTHETICAL.sub(" ", group)
+    status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(without_comparisons))
+    subject_region = (
+        subject_region_for_status_group(without_comparisons, status_words)
+        if status_words
+        else without_comparisons
+    )
+    if DATA_STATUS_SUBJECT.search(subject_region) is not None:
+        return True, True
+    if EXPLICIT_GENERIC_SUBJECT.search(subject_region) is not None:
+        return False, True
+    if EXPLICIT_PRONOUN_SUBJECT.search(subject_region) is not None:
+        return inherited_data_scope, True
+    if DATA_STATUS_SUBJECT.search(without_comparisons) is not None:
+        # Conservatively retain an explicit DATA reference when inversion or a
+        # new predicate shape leaves it outside the ordinary subject region.
+        return True, True
+    if (
+        status_words
+        and STATUS_LINKING_VERB.search(without_comparisons[: status_words[0].start()])
+        is not None
+        and re.search(r"[a-z0-9]", subject_region)
+    ):
+        # A linking predicate also makes an unadorned noun phrase explicit
+        # (for example, `server-only transcripts are ...`). Determiners are
+        # useful for clause splitting, but are not required for subjecthood.
+        return False, True
+    return inherited_data_scope, False
+
+
+def data_status_claim_groups(
+    sentence: str, inherited_data_scope: bool
+) -> tuple[tuple[tuple[str, bool], ...], bool]:
+    """Return grammatical claims and the final subject scope for discourse."""
 
     groups: list[tuple[str, bool]] = []
-    data_subject_in_scope = False
-    for clause in DATA_STATUS_CLAUSE_BOUNDARY.split(sentence):
-        explicit_subjects = tuple(EXPLICIT_STATUS_SUBJECT.finditer(clause))
-        if explicit_subjects:
-            subject_groups: list[tuple[str, bool]] = []
-            for index, subject in enumerate(explicit_subjects):
-                start = 0 if index == 0 else subject.start()
-                end = (
-                    explicit_subjects[index + 1].start()
-                    if index + 1 < len(explicit_subjects)
-                    else len(clause)
-                )
-                subject_groups.append(
-                    (
-                        clause[start:end],
-                        DATA_STATUS_SUBJECT.search(subject.group()) is not None,
-                    )
-                )
-        else:
-            subject_groups = ((clause, data_subject_in_scope),)
-
-        for group, subject_is_data in subject_groups:
-            if not group.strip():
-                continue
-            data_subject_in_scope = subject_is_data
-            groups.append((group, data_subject_in_scope))
-    return tuple(groups)
+    current_scope = inherited_data_scope
+    final_subject_is_explicit = False
+    for group in split_data_status_clauses(sentence):
+        current_scope, final_subject_is_explicit = data_subject_scope(
+            group, current_scope
+        )
+        groups.append((group, current_scope))
+    # Ellipsis is claim-local. Cross-sentence inheritance is retained only
+    # when the immediately preceding sentence ends with an explicit subject
+    # (including a pronoun that itself inherited the prior DATA referent).
+    return tuple(groups), current_scope if final_subject_is_explicit else False
 
 
 def enforce_pending_data_review_status(root: Path, status: str) -> None:
     if status != "proposed_independent_review_pending":
         return
+    discourse_location: tuple[str, str] | None = None
+    discourse_sentence_index = 0
+    discourse_data_scope = False
     for record in all_corpus_sentences(root):
-        for group, has_data_subject_scope in data_status_claim_groups(record.sentence):
+        location = (record.path, record.location)
+        if (
+            location != discourse_location
+            or record.sentence_index != discourse_sentence_index + 1
+        ):
+            discourse_data_scope = False
+        groups, discourse_data_scope = data_status_claim_groups(
+            record.sentence, discourse_data_scope
+        )
+        discourse_location = location
+        discourse_sentence_index = record.sentence_index
+        for group, has_data_subject_scope in groups:
             status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(group))
-            subjects = tuple(DATA_STATUS_SUBJECT.finditer(group))
             if not status_words or not has_data_subject_scope:
                 continue
-            if status_group_is_negated(group, status_words):
+            if status_group_has_historical_context(group, status_words):
                 continue
-            if status_group_has_historical_context(group, status_words, subjects):
+            if status_group_has_future_review_gate(group, status_words):
                 continue
-            if status_group_has_future_review_gate(group, status_words, subjects):
-                continue
-            raise ContradictionError(
-                "data-review-status-prose",
-                root / record.path,
-                f"{record.location} sentence {record.sentence_index}: {group.strip()}",
-            )
+            for status_index, _ in enumerate(status_words):
+                if status_is_negated(group, status_words, status_index):
+                    continue
+                raise ContradictionError(
+                    "data-review-status-prose",
+                    root / record.path,
+                    f"{record.location} sentence {record.sentence_index}: "
+                    f"{group.strip()}",
+                )
 
 
 class DuplicateJsonKey(ValueError):
@@ -1886,6 +1999,58 @@ def self_test(source: Path) -> None:
         ("endpoint-owned store selected", "The endpoint-owned store is selected."),
         ("generic canonical store selected", "The canonical store is selected."),
         (
+            "DATA first in a shared coordinated predicate",
+            "P2-DATA-01 and P2-HOST-02 are accepted.",
+        ),
+        (
+            "DATA last in a shared coordinated predicate",
+            "P2-HOST-02 and P2-DATA-01 are accepted.",
+        ),
+        (
+            "DATA first in an or shared predicate",
+            "P2-DATA-01 or P2-HOST-02 is accepted.",
+        ),
+        (
+            "DATA last in an or shared predicate",
+            "P2-HOST-02 or P2-DATA-01 is accepted.",
+        ),
+        (
+            "DATA first in a generic-subject shared predicate",
+            "P2-DATA-01 and the control protocol are accepted.",
+        ),
+        (
+            "DATA last in a generic-subject shared predicate",
+            "The control protocol and P2-DATA-01 are accepted.",
+        ),
+        (
+            "DATA main subject with non-DATA unlike comparison",
+            "P2-DATA-01, unlike P2-HOST-02, is accepted.",
+        ),
+        (
+            "DATA first in an either-or shared predicate",
+            "Either P2-DATA-01 or P2-HOST-02 is accepted.",
+        ),
+        (
+            "DATA last in an either-or shared predicate",
+            "Either P2-HOST-02 or P2-DATA-01 is accepted.",
+        ),
+        (
+            "negative conjunction does not negate current selection",
+            "P2-DATA-01 is not approved and selected now.",
+        ),
+        (
+            "preposed future gate contradicted by current acceptance",
+            "Only after independent review and merge is P2-DATA-01 accepted now.",
+        ),
+        (
+            "postposed future gate contradicted by current acceptance",
+            "P2-DATA-01 is currently accepted only after independent review and merge.",
+        ),
+        (
+            "same-paragraph pronoun inherits DATA subject scope",
+            "P2-DATA-01 remains review pending. It is accepted now.",
+        ),
+        (
             "elided DATA subject after negated adversative",
             "P2-DATA-01 is not approved, but selected now.",
         ),
@@ -2202,6 +2367,10 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 is not approved, accepted, or selected.",
         ),
         (
+            "shared compound and-list negation",
+            "P2-DATA-01 is not approved, accepted, and selected.",
+        ),
+        (
             "neither nor negation",
             "P2-DATA-01 is neither approved nor accepted.",
         ),
@@ -2221,6 +2390,30 @@ def self_test(source: Path) -> None:
         (
             "unrelated host protocol status",
             "P2-DATA-01 remains review pending and the host protocol is accepted.",
+        ),
+        (
+            "unrelated control protocol status",
+            "P2-DATA-01 remains review pending and the control protocol is accepted.",
+        ),
+        (
+            "unrelated parser status after semicolon",
+            "P2-DATA-01 remains review pending; the Markdown parser is accepted.",
+        ),
+        (
+            "unrelated control protocol status before DATA clause",
+            "The control protocol is accepted and P2-DATA-01 remains review pending.",
+        ),
+        (
+            "unrelated parser status before DATA clause",
+            "The Markdown parser is accepted; P2-DATA-01 remains review pending.",
+        ),
+        (
+            "historical marker after DATA status",
+            "A P2-DATA-01 experiment was approved historically.",
+        ),
+        (
+            "non-DATA main subject with DATA unlike comparison",
+            "P2-HOST-02, unlike P2-DATA-01, is accepted.",
         ),
     )
     positive_mutations.extend(
