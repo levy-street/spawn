@@ -6,7 +6,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -120,59 +120,140 @@ async def device_poll(
     body: schemas.DevicePollRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    dc = (
-        await session.execute(select(DeviceCode).where(DeviceCode.device_code == body.device_code))
-    ).scalar_one_or_none()
-    if dc is None:
-        return {"error": "expired_token"}
-
-    if (
-        dc.host_key_algorithm is None
-        or dc.host_public_key is None
-        or dc.host_key_algorithm != body.host_key_algorithm
-        or dc.host_public_key != body.host_public_key
-    ):
-        return {"error": "invalid_device_binding"}
-
     now = _utcnow()
-    last = _aware(dc.last_polled_at)
-    dc.last_polled_at = now
-    expires = _aware(dc.expires_at)
+    poll_cutoff = now - timedelta(seconds=POLL_INTERVAL_SECONDS - 1)
 
-    if expires is not None and expires <= now:
-        dc.status = "expired"
-        await session.commit()
-        return {"error": "expired_token"}
-
-    if last is not None and (now - last).total_seconds() < (POLL_INTERVAL_SECONDS - 1):
-        await session.commit()
-        return {"error": "slow_down"}
-
-    if dc.status == "denied":
-        await session.commit()
-        return {"error": "denied"}
-
-    if dc.status != "approved" or dc.user_id is None:
-        await session.commit()
-        return {"error": "authorization_pending"}
-
-    # Atomically claim the approved row before creating/reusing its Host. This
-    # conditional transition makes concurrent/replayed polls one-shot.
-    claimed = await session.execute(
+    # Claim first, before loading an ORM entity. On SQLite this write-first
+    # transition serializes competing writers without read-to-write upgrade
+    # deadlocks; on PostgreSQL the conditional UPDATE provides the same CAS.
+    # RETURNING supplies the immutable ceremony snapshot without introducing a
+    # tracked DeviceCode that an autoflush could later race against deletion.
+    claim_result = await session.execute(
         update(DeviceCode)
         .where(
             DeviceCode.device_code == body.device_code,
             DeviceCode.status == "approved",
-            DeviceCode.user_id == dc.user_id,
+            DeviceCode.user_id.is_not(None),
             DeviceCode.host_key_algorithm == body.host_key_algorithm,
             DeviceCode.host_public_key == body.host_public_key,
+            DeviceCode.expires_at > now,
+            or_(
+                DeviceCode.last_polled_at.is_(None),
+                DeviceCode.last_polled_at <= poll_cutoff,
+            ),
         )
-        .values(status="consuming")
+        .values(status="consuming", last_polled_at=now)
+        .returning(
+            DeviceCode.user_id,
+            DeviceCode.host_name,
+            DeviceCode.os,
+            DeviceCode.arch,
+            DeviceCode.version,
+        )
         .execution_options(synchronize_session=False)
     )
-    if claimed.rowcount != 1:
+    claimed = claim_result.mappings().one_or_none()
+
+    if claimed is None:
+        # Release the write transaction before examining why the CAS lost. A
+        # concurrent winner may already have deleted the row by the time this
+        # fresh read begins, which is the stable one-shot expired response.
+        await session.rollback()
+        snapshot = (
+            (
+                await session.execute(
+                    select(
+                        DeviceCode.host_key_algorithm,
+                        DeviceCode.host_public_key,
+                        DeviceCode.status,
+                        DeviceCode.user_id,
+                        DeviceCode.expires_at,
+                        DeviceCode.last_polled_at,
+                    ).where(DeviceCode.device_code == body.device_code)
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if snapshot is None:
+            return {"error": "expired_token"}
+
+        if (
+            snapshot["host_key_algorithm"] is None
+            or snapshot["host_public_key"] is None
+            or snapshot["host_key_algorithm"] != body.host_key_algorithm
+            or snapshot["host_public_key"] != body.host_public_key
+        ):
+            return {"error": "invalid_device_binding"}
+
+        expires = _aware(snapshot["expires_at"])
+        if expires is not None and expires <= now:
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.expires_at <= now,
+                )
+                .values(status="expired", last_polled_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "expired_token"}
+
+        # A claimed ceremony is already one-shot even while its winning
+        # transaction is still creating the Host. Never expose that transient
+        # state as pending or slow_down to a losing concurrent poll.
+        if snapshot["status"] in {"consuming", "expired"}:
+            await session.rollback()
+            return {"error": "expired_token"}
+
+        last = _aware(snapshot["last_polled_at"])
+        if last is not None and (now - last).total_seconds() < (POLL_INTERVAL_SECONDS - 1):
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.status != "consuming",
+                )
+                .values(last_polled_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "slow_down"}
+
+        if snapshot["status"] == "denied":
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.status == "denied",
+                )
+                .values(last_polled_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "denied"}
+
+        if snapshot["status"] != "approved" or snapshot["user_id"] is None:
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.status != "consuming",
+                )
+                .values(last_polled_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "authorization_pending"}
+
+        # An eligible approved snapshot can reach this point only by losing the
+        # claim to a concurrent consumer. Keep that loss one-shot and stable.
         await session.rollback()
         return {"error": "expired_token"}
+
+    user_id = claimed["user_id"]
+    assert user_id is not None
 
     host = (
         await session.execute(
@@ -182,7 +263,7 @@ async def device_poll(
             )
         )
     ).scalar_one_or_none()
-    if host is not None and host.owner_user_id != dc.user_id:
+    if host is not None and host.owner_user_id != user_id:
         await session.execute(
             update(DeviceCode)
             .where(DeviceCode.device_code == body.device_code)
@@ -194,11 +275,11 @@ async def device_poll(
 
     if host is None:
         host = Host(
-            owner_user_id=dc.user_id,
-            name=dc.host_name or "host",
-            os=dc.os,
-            arch=dc.arch,
-            version=dc.version,
+            owner_user_id=user_id,
+            name=claimed["host_name"] or "host",
+            os=claimed["os"],
+            arch=claimed["arch"],
+            version=claimed["version"],
             host_key_algorithm=body.host_key_algorithm,
             host_public_key=body.host_public_key,
             status="offline",
@@ -207,11 +288,11 @@ async def device_poll(
         await session.flush()
     else:
         # Re-login preserves both host identity and any user-assigned name.
-        host.os = dc.os
-        host.arch = dc.arch
-        host.version = dc.version
+        host.os = claimed["os"]
+        host.arch = claimed["arch"]
+        host.version = claimed["version"]
 
-    token = auth.issue_daemon_token(host.id, dc.user_id)
+    token = auth.issue_daemon_token(host.id, user_id)
     fingerprint = host_key_fingerprint(body.host_key_algorithm, body.host_public_key)
     await session.execute(
         delete(DeviceCode)

@@ -87,3 +87,34 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
         yield ac
+
+
+@pytest_asyncio.fixture
+async def file_sqlite_client(app, tmp_path):
+    """Exercise real concurrent SQLite connections instead of one shared in-memory connection."""
+
+    from httpx import ASGITransport, AsyncClient
+
+    previous_engine = db_mod._engine
+    previous_sessionmaker = db_mod._sessionmaker
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'spawn-test.db'}",
+        connect_args={"timeout": 30},
+        future=True,
+    )
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    db_mod._engine = engine
+    db_mod._sessionmaker = sessionmaker
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with sessionmaker() as session:
+            await seed_builtin_presets(session)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            yield ac
+    finally:
+        db_mod._engine = previous_engine
+        db_mod._sessionmaker = previous_sessionmaker
+        await engine.dispose()

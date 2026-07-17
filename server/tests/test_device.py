@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,10 +23,7 @@ _KEY_VECTORS = json.loads(
 )
 _ACCEPTED_PUBLIC_KEY_HEX: list[str] = _KEY_VECTORS["accepted_mixed_torsion_public_key_hex"]
 _STRICT_NEGATIVE_KEYS = [
-    *[
-        (f"weak-{item['id']}", item["public_key_hex"])
-        for item in _KEY_VECTORS["weak_public_keys"]
-    ],
+    *[(f"weak-{item['id']}", item["public_key_hex"]) for item in _KEY_VECTORS["weak_public_keys"]],
     *[
         (f"noncanonical-{index}", public_key_hex)
         for index, public_key_hex in enumerate(_KEY_VECTORS["noncanonical_public_key_hex"])
@@ -360,9 +358,7 @@ async def test_approval_rejects_identity_changed_after_review_without_token_or_p
         assert dc.host_public_key == changed_key
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
 
-    assert (await _poll(client, start, reviewed_key)).json() == {
-        "error": "invalid_device_binding"
-    }
+    assert (await _poll(client, start, reviewed_key)).json() == {"error": "invalid_device_binding"}
     assert (await client.get("/api/hosts", headers=auth)).json() == []
     fresh_review = await _review(client, start, auth)
     assert fresh_review["host_public_key"] == changed_key
@@ -403,6 +399,51 @@ async def test_concurrent_approval_and_poll_issue_exactly_one_token_and_pin(clie
         hosts = (await session.execute(select(Host))).scalars().all()
         assert len(hosts) == 1
         assert hosts[0].host_public_key == public_key
+
+
+async def _assert_concurrent_approved_polls_are_one_shot(
+    client, *, email: str, public_key: str
+) -> None:
+    _, auth = await _signup(client, email)
+    start = await _start(client, public_key, name="poll-race")
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, auth, review)
+    assert approval.status_code == 200, approval.text
+
+    responses = await asyncio.gather(*(_poll(client, start, public_key) for _ in range(24)))
+    assert all(response.status_code == 200 for response in responses), [
+        (response.status_code, response.text) for response in responses
+    ]
+    bodies = [response.json() for response in responses]
+    successes = [body for body in bodies if "access_token" in body]
+    failures = [body for body in bodies if "access_token" not in body]
+    assert len(successes) == 1
+    assert failures == [{"error": "expired_token"}] * 23
+    assert successes[0]["host_public_key"] == public_key
+
+    async with get_sessionmaker()() as session:
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 1
+        assert (await session.execute(select(func.count(DeviceCode.device_code)))).scalar_one() == 0
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="the shared-connection in-memory SQLite fixture cannot model concurrent transactions",
+)
+async def test_concurrent_approved_polls_issue_one_token_on_postgresql(client):
+    await _assert_concurrent_approved_polls_are_one_shot(
+        client,
+        email="approved-poll-race@example.com",
+        public_key=_public_key(13),
+    )
+
+
+async def test_concurrent_approved_polls_issue_one_token_on_file_sqlite(file_sqlite_client):
+    await _assert_concurrent_approved_polls_are_one_shot(
+        file_sqlite_client,
+        email="file-sqlite-poll-race@example.com",
+        public_key=_public_key(14),
+    )
 
 
 async def test_same_owner_relogin_reuses_host_and_cross_user_cannot_claim_key(client):

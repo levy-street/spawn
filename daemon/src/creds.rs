@@ -80,21 +80,7 @@ pub fn load() -> Result<StoredCreds> {
         Ok(Some(mut value)) => {
             // Backend unavailability may use the documented file fallback,
             // but malformed stored data must fail closed rather than rotate.
-            let decoded = decode_keyring_value(&value);
-            value.zeroize();
-            let mut secrets = decoded?;
-            if let Some(access_token) = secrets.access_token.take() {
-                if let Some(previous) = from_file.access_token.as_mut() {
-                    previous.zeroize();
-                }
-                from_file.access_token = Some(access_token);
-            }
-            if let Some(seed) = secrets.host_private_key_seed.take() {
-                if let Some(previous) = from_file.host_private_key_seed.as_mut() {
-                    previous.zeroize();
-                }
-                from_file.host_private_key_seed = Some(seed);
-            }
+            merge_keyring_value(&mut from_file, &mut value)?;
         }
         Ok(None) => {}
         Err(e) => {
@@ -136,9 +122,22 @@ fn save_file_for_platform(creds: &StoredCreds, _keyring_saved: bool) -> Result<(
     // Non-Unix platforms do not have this module's audited mode-0600 fallback.
     // Keep public metadata and the legacy token fallback, but the private seed
     // is stored only in the native keyring.
-    let mut metadata = creds.clone();
-    metadata.host_private_key_seed = None;
-    save_file(&metadata)
+    let mut file_creds = file_creds_without_private_seed(creds);
+    let result = save_file(&file_creds);
+    zeroize_stored_creds(&mut file_creds);
+    result
+}
+
+#[cfg(any(not(unix), test))]
+fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
+    // Construct this field-by-field: cloning the whole value would transiently
+    // copy the private seed before replacing it with None.
+    StoredCreds {
+        access_token: creds.access_token.clone(),
+        host_id: creds.host_id,
+        server_url: creds.server_url.clone(),
+        host_private_key_seed: None,
+    }
 }
 
 /// Return the existing host identity, or generate and attach one exactly once.
@@ -340,6 +339,35 @@ fn decode_keyring_value(value: &str) -> Result<StoredSecrets> {
             host_private_key_seed: None,
         })
     }
+}
+
+fn merge_keyring_value(from_file: &mut StoredCreds, value: &mut String) -> Result<()> {
+    let decoded = decode_keyring_value(value);
+    value.zeroize();
+    let mut secrets = match decoded {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            // `from_file` may already contain a fallback token and private seed.
+            // A malformed keyring entry must fail closed without dropping those
+            // loaded secret buffers unwiped on this early return.
+            zeroize_stored_creds(from_file);
+            return Err(error);
+        }
+    };
+    if let Some(access_token) = secrets.access_token.take() {
+        if let Some(previous) = from_file.access_token.as_mut() {
+            previous.zeroize();
+        }
+        from_file.access_token = Some(access_token);
+    }
+    if let Some(seed) = secrets.host_private_key_seed.take() {
+        if let Some(previous) = from_file.host_private_key_seed.as_mut() {
+            previous.zeroize();
+        }
+        from_file.host_private_key_seed = Some(seed);
+    }
+    zeroize_secrets(&mut secrets);
+    Ok(())
 }
 
 fn keyring_set(creds: &StoredCreds) -> Result<()> {
@@ -635,6 +663,46 @@ mod tests {
     #[test]
     fn corrupt_keyring_bundle_fails_closed() {
         assert!(decode_keyring_value("{not-json").is_err());
+    }
+
+    #[test]
+    fn malformed_keyring_bundle_wipes_loaded_fallback_secrets() {
+        let mut fallback = fixed_creds();
+        fallback.access_token = Some("fallback-access-token".into());
+        let mut malformed = "{not-json".to_string();
+
+        assert!(merge_keyring_value(&mut fallback, &mut malformed).is_err());
+        assert!(malformed.bytes().all(|byte| byte == 0));
+        assert!(fallback
+            .access_token
+            .as_deref()
+            .expect("the allocation remains available for inspection")
+            .bytes()
+            .all(|byte| byte == 0));
+        assert!(fallback
+            .host_private_key_seed
+            .as_deref()
+            .expect("the allocation remains available for inspection")
+            .bytes()
+            .all(|byte| byte == 0));
+    }
+
+    #[test]
+    fn metadata_file_credentials_never_copy_the_private_seed() {
+        let mut creds = fixed_creds();
+        creds.access_token = Some("legacy-file-token".into());
+        let mut file_creds = file_creds_without_private_seed(&creds);
+        assert!(file_creds.host_private_key_seed.is_none());
+        assert_eq!(file_creds.access_token, creds.access_token);
+        assert_eq!(file_creds.host_id, creds.host_id);
+        assert_eq!(file_creds.server_url, creds.server_url);
+        zeroize_stored_creds(&mut file_creds);
+        assert!(file_creds
+            .access_token
+            .as_deref()
+            .expect("the allocation remains available for inspection")
+            .bytes()
+            .all(|byte| byte == 0));
     }
 
     #[test]
