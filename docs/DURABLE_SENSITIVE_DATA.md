@@ -63,8 +63,8 @@ to address the endpoint plane:
   allowed by `TRUST.md`;
 - the unattended-policy enabled flag plus content-free check/update/result
   codes and coarse timestamps; and
-- the monotonic per-account/per-host migration state and content-free aggregate
-  migration counts needed to prove cutover.
+- the monotonic per-account/per-host migration epoch, its CAS-protected state,
+  and content-free aggregate migration counts needed to prove cutover.
 
 It may not retain protected values, plaintext digests, exact protected sizes,
 local object existence/revisions/key epochs, request fingerprints or IDs,
@@ -77,9 +77,12 @@ succeeded or failed.
 ### Canonical guarded declarations
 
 These rows are parsed by the durable-data guard; prose cannot silently override
-them. After comments and code fences are removed, every visible sentence in the
-guarded Markdown corpus must exactly match the reviewed path, structural
-location, sentence index, duplicate occurrence, category, and normalized text in
+them. The guard uses the locked, development-only `markdown-it-py==4.2.0`
+CommonMark token tree (with table and strikethrough rules), excludes comment and
+code-block tokens, and inventories rendered prose/inline-code/HTML text nodes.
+Every visible sentence in the guarded Markdown corpus must exactly match the
+reviewed path, structural location, sentence index, duplicate occurrence,
+category, and normalized text in
 [`DURABLE_DATA_PROSE_INVENTORY.jsonl`](DURABLE_DATA_PROSE_INVENTORY.jsonl).
 New documents, wording, relocation, or duplication fail CI until explicitly
 reviewed. Regeneration is an explicit
@@ -634,15 +637,28 @@ lock or authorize retry without conclusive source-side reconciliation.
 Migration is per account and host, and has four fail-closed states recorded as
 disclosed metadata: `legacy`, `copying`, `endpoint_verified`, `scrubbed`.
 
-The state is monotonic and CAS-protected. `legacy` is the old server-readable
-authority. `copying` freezes protected writes and allows only the bounded
-migration reader to consume legacy fields; normal create/edit/restart/tool/skill
-operations are disabled, so there is no dual-read or dual-write. On entry to
-`endpoint_verified`, all protected reads/writes switch to the endpoint and the
-server ingress/egress paths are disabled before scrubbing starts. `scrubbed`
-means the fields/routes are gone and historical purge is in progress/complete.
-Rollback to `legacy` is permitted only from `copying`, before endpoint-only
-ingress is cut; later failure is repaired by roll-forward or endpoint restore.
+Every transition CASes the exact `(migration_epoch, state)` pair and increments
+`migration_epoch`; stale epochs or unexpected source states fail closed. The
+state label has one intentional pre-cutover backward edge, but the epoch is
+strictly monotonic, so an aborted copier cannot resume against a later attempt.
+Only these transitions are permitted:
+
+| From | To | Required condition |
+| --- | --- | --- |
+| `legacy` | `copying` | freeze legacy protected writes before admitting the bounded migration reader |
+| `copying` | `legacy` | abort before endpoint-only ingress is cut; unfreeze only after temporary endpoint copies are invalidated |
+| `copying` | `endpoint_verified` | all selected-host receipts and recovery exercises passed; atomically cut legacy ingress/egress |
+| `endpoint_verified` | `scrubbed` | protected fields/routes are removed and historical purge has begun |
+
+`legacy` is the old server-readable authority. `copying` freezes protected
+writes and allows only the bounded migration reader to consume legacy fields;
+normal create/edit/restart/tool/skill operations are disabled, so there is no
+dual-read or dual-write. On entry to `endpoint_verified`, all protected
+reads/writes switch to the endpoint and the server ingress/egress paths are
+disabled before scrubbing starts. `scrubbed` means the fields/routes are gone
+and historical purge is in progress/complete. No other edge is valid. After
+`endpoint_verified`, failure is repaired only by roll-forward or endpoint
+restore.
 
 1. **Inventory without content.** Record row/object counts for
    agent manifests, preset values/tool targets, skill bodies, derived names,
@@ -789,10 +805,14 @@ of assuming it.
    prove the distinction between rewrap and full reseal. Wipe makes the store
    unrecoverable without a retained native backup/export and does not claim an
    offline remote wipe succeeded.
-9. Migration counts match, endpoint read-back and daemon restart/launch/preset/
-   skill/tool exercises pass, old clients are rejected, neutral agent names are
-   used, no state performs dual-read/write, and the legacy fields remain empty
-   after an old-binary/config rollback attempt.
+9. Migration transition tests accept only `legacy -> copying`, the pre-cutover
+   abort `copying -> legacy`, `copying -> endpoint_verified`, and
+   `endpoint_verified -> scrubbed`. Every success increments
+   `migration_epoch`; a stale epoch/source-state CAS fails without changing the
+   freeze or ingress cut. Counts match, endpoint read-back and daemon
+   restart/launch/preset/skill/tool exercises pass, old clients are rejected,
+   neutral agent names are used, no state performs dual-read/write, and the
+   legacy fields remain empty after an old-binary/config rollback attempt.
 10. An inventory guard fails CI if a protected server model/schema/route/frame,
     cwd-derived label, free-form server-visible error, or built-in operational
     preset value is reintroduced after cutover. P2-PURGE-01 separately verifies

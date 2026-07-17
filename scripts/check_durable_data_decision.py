@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import re
 import shutil
@@ -13,7 +12,11 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
+
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
 
 
 class GuardError(RuntimeError):
@@ -91,88 +94,142 @@ DECISION_LINK_DOCS = (
 PROSE_INVENTORY = "docs/DURABLE_DATA_PROSE_INVENTORY.jsonl"
 
 
-def active_markdown(path: Path) -> str:
+COMMONMARK = MarkdownIt("commonmark", {"html": True}).enable(["strikethrough", "table"])
+
+
+class VisibleHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def visible_html(source: str) -> str:
+    parser = VisibleHtmlParser()
     try:
-        raw = path.read_text(encoding="utf-8")
+        parser.feed(source)
+        parser.close()
+    except Exception as exc:
+        raise GuardError(f"invalid active HTML: {exc}") from exc
+    return " ".join(parser.parts)
+
+
+def markdown_tokens(path: Path) -> list[Token]:
+    try:
+        source = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise GuardError(f"cannot read {path}: {exc}") from exc
-    active: list[str] = []
-    fence: str | None = None
-    html_comment = False
-    inline_ticks: int | None = None
-    for line in raw.splitlines():
-        fence_match = None if html_comment or inline_ticks else re.match(r"^\s*(```+|~~~+)", line)
-        if fence_match:
-            marker = fence_match.group(1)[0]
-            if fence is None:
-                fence = marker
-            elif fence == marker:
-                fence = None
-            active.append("")
-            continue
-        if fence is not None:
-            active.append("")
-            continue
+    try:
+        tokens = COMMONMARK.parse(source)
+    except Exception as exc:
+        raise GuardError(f"cannot parse CommonMark in {path}: {exc}") from exc
+    lines = source.splitlines()
+    for token in tokens:
+        if token.type == "fence" and token.map is not None:
+            _, end = token.map
+            marker = token.markup
+            closing = re.search(
+                rf"{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$",
+                lines[end - 1],
+            )
+            if closing is None:
+                raise GuardError(f"unclosed CommonMark fence in {path}")
+        candidates = [token, *(token.children or [])]
+        for candidate in candidates:
+            if candidate.type in {
+                "html_block",
+                "html_inline",
+            } and candidate.content.count("<!--") != candidate.content.count("-->"):
+                raise GuardError(f"unbalanced HTML comment in {path}")
+    return tokens
 
-        visible: list[str] = []
-        index = 0
-        while index < len(line):
-            if html_comment:
-                if line.startswith("-->", index):
-                    html_comment = False
-                    visible.extend("   ")
-                    index += 3
-                else:
-                    visible.append(" ")
-                    index += 1
-                continue
 
-            if inline_ticks is None and line.startswith("<!--", index):
-                html_comment = True
-                visible.extend("    ")
-                index += 4
-                continue
+def visible_inline_tokens(tokens: list[Token]) -> str:
+    parts: list[str] = []
+    for token in tokens:
+        if token.type in {"text", "code_inline"}:
+            parts.append(token.content)
+        elif token.type in {"softbreak", "hardbreak"}:
+            parts.append(" ")
+        elif token.type == "html_inline":
+            parts.append(visible_html(token.content))
+        elif token.type == "image":
+            parts.append(
+                visible_inline_tokens(token.children)
+                if token.children is not None
+                else token.content
+            )
+        elif token.children is not None:
+            parts.append(visible_inline_tokens(token.children))
+    return canonical_visible_text("".join(parts), casefold=False)
 
-            if line[index] == "`":
-                end = index
-                while end < len(line) and line[end] == "`":
-                    end += 1
-                tick_count = end - index
-                if inline_ticks is None:
-                    inline_ticks = tick_count
-                elif inline_ticks == tick_count:
-                    inline_ticks = None
-                visible.append(line[index:end])
-                index = end
-                continue
 
-            visible.append(line[index])
+def rendered_blocks(tokens: list[Token]) -> tuple[str, ...]:
+    blocks: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.type == "tr_open":
+            cells: list[str] = []
             index += 1
-        active.append("".join(visible))
-    if fence is not None:
-        raise GuardError(f"unclosed Markdown fence in {path}")
-    if html_comment:
-        raise GuardError(f"unbalanced HTML comment in {path}")
-    return "\n".join(active)
+            while index < len(tokens) and tokens[index].type != "tr_close":
+                if (
+                    tokens[index].type == "inline"
+                    and tokens[index].children is not None
+                ):
+                    cells.append(visible_inline_tokens(tokens[index].children))
+                index += 1
+            row = " | ".join(cell for cell in cells if cell)
+            if row:
+                blocks.append(row)
+        elif token.type == "inline" and token.children is not None:
+            visible = visible_inline_tokens(token.children)
+            if visible:
+                blocks.append(visible)
+        elif token.type == "html_block":
+            visible = canonical_visible_text(
+                visible_html(token.content), casefold=False
+            )
+            if visible:
+                blocks.append(visible)
+        index += 1
+    return tuple(blocks)
+
+
+def active_markdown(path: Path) -> str:
+    return "\n".join(rendered_blocks(markdown_tokens(path)))
+
+
+def active_markdown_prefix(path: Path, token_end: int) -> str:
+    return "\n".join(rendered_blocks(markdown_tokens(path)[:token_end]))
 
 
 def sections(path: Path) -> tuple[str, list[Section]]:
-    text = active_markdown(path)
-    lines = text.splitlines()
-    headings: list[tuple[int, str, int]] = []
-    for index, line in enumerate(lines):
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
-        if match:
-            headings.append((len(match.group(1)), match.group(2), index))
+    tokens = markdown_tokens(path)
+    text = "\n".join(rendered_blocks(tokens))
+    headings: list[tuple[int, str, int, int]] = []
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or index + 1 >= len(tokens):
+            continue
+        inline = tokens[index + 1]
+        if inline.type != "inline" or inline.children is None:
+            raise GuardError(f"{path} has a malformed CommonMark heading")
+        level = int(token.tag.removeprefix("h"))
+        headings.append(
+            (level, visible_inline_tokens(inline.children), index, index + 3)
+        )
 
     parsed: list[Section] = []
-    for position, (level, title, start) in enumerate(headings):
-        end = len(lines)
-        for next_level, _, next_start in headings[position + 1 :]:
+    for position, (level, title, start, body_start) in enumerate(headings):
+        end = len(tokens)
+        for next_level, _, next_start, _ in headings[position + 1 :]:
             if next_level <= level:
                 end = next_start
                 break
-        parsed.append(Section(level, title, start, end, "\n".join(lines[start + 1 : end])))
+        body = "\n".join(rendered_blocks(tokens[body_start:end]))
+        parsed.append(Section(level, title, start, end, body))
     return text, parsed
 
 
@@ -234,38 +291,13 @@ _DASH_TRANSLATION = str.maketrans(
 def canonical_visible_text(text: str, *, casefold: bool) -> str:
     text = unicodedata.normalize("NFKC", text).translate(_DASH_TRANSLATION)
     text = text.replace("\u00ad", "")
-    text = "".join(character for character in text if unicodedata.category(character) != "Cf")
+    text = "".join(
+        character for character in text if unicodedata.category(character) != "Cf"
+    )
     text = re.sub(r"(?<=\w)-\s+(?=\w)", "-", text)
     text = re.sub(r"\s*-\s*", "-", text)
     text = normalized(text)
     return text.casefold() if casefold else text
-
-
-def visible_inline_markdown(text: str) -> str:
-    code_spans: list[str] = []
-
-    def stash_code(match: re.Match[str]) -> str:
-        code_spans.append(match.group(2))
-        return f"CODEXINLINECODE{len(code_spans) - 1}TOKEN"
-
-    text = re.sub(r"(`+)(.+?)\1", stash_code, text)
-    text = re.sub(r"!\[([^]]*)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", text)
-    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"</?(?:p|div|li|tr|td|th|details|summary)\b[^>]*>", " ", text, flags=re.IGNORECASE
-    )
-    text = re.sub(r"</?[A-Za-z][^>]*>", "", text)
-    text = html.unescape(text)
-    for delimiter in ("**", "__", "~~"):
-        text = text.replace(delimiter, "")
-    text = re.sub(r"(?<!\w)([*_])(?=\S)", "", text)
-    text = re.sub(r"(?<=\S)([*_])(?!\w)", "", text)
-    text = re.sub(r"\\([\\`*{}\[\]()#+.!_>~-])", r"\1", text)
-    for index, code in enumerate(code_spans):
-        text = text.replace(f"CODEXINLINECODE{index}TOKEN", code)
-    return canonical_visible_text(text, casefold=False)
 
 
 def split_visible_sentences(text: str) -> tuple[str, ...]:
@@ -278,111 +310,79 @@ def split_visible_sentences(text: str) -> tuple[str, ...]:
 
 def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
     path = root / relative
-    text = active_markdown(path)
+    tokens = markdown_tokens(path)
     heading_stack: list[tuple[int, str]] = []
     block_ordinals: Counter[tuple[tuple[str, ...], str]] = Counter()
     blocks: list[tuple[tuple[str, ...], str, int, str]] = []
-    block_lines: list[str] = []
-    block_kind = "paragraph"
-    block_section: tuple[str, ...] = ()
+    list_depth = 0
+    blockquote_depth = 0
 
     def section_path() -> tuple[str, ...]:
         return tuple(title for _, title in heading_stack)
 
-    def add_block(section: tuple[str, ...], kind: str, source: str) -> None:
-        visible = visible_inline_markdown(source)
+    def add_block(section: tuple[str, ...], kind: str, visible: str) -> None:
+        visible = canonical_visible_text(visible, casefold=False)
         if not visible:
             return
         key = (section, kind)
         block_ordinals[key] += 1
         blocks.append((section, kind, block_ordinals[key], visible))
 
-    def flush_block() -> None:
-        nonlocal block_kind, block_section
-        if block_lines:
-            add_block(block_section, block_kind, " ".join(block_lines))
-            block_lines.clear()
-        block_kind = "paragraph"
-        block_section = section_path()
-
-    block_section = section_path()
-    lines = text.splitlines()
     index = 0
-    while index < len(lines):
-        raw_line = lines[index]
-        stripped = raw_line.strip()
-        if not stripped:
-            flush_block()
-            index += 1
-            continue
-
-        heading = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
-        if heading:
-            flush_block()
-            level = len(heading.group(1))
+    while index < len(tokens):
+        token = tokens[index]
+        if token.type == "heading_open":
+            if index + 1 >= len(tokens):
+                raise GuardError(f"{path} has a malformed CommonMark heading")
+            inline = tokens[index + 1]
+            if inline.type != "inline" or inline.children is None:
+                raise GuardError(f"{path} has a malformed CommonMark heading")
+            level = int(token.tag.removeprefix("h"))
             while heading_stack and heading_stack[-1][0] >= level:
                 heading_stack.pop()
-            title = visible_inline_markdown(heading.group(2))
+            title = visible_inline_tokens(inline.children)
             add_block(section_path(), f"heading-{level}", title)
             heading_stack.append((level, canonical_visible_text(title, casefold=True)))
-            block_section = section_path()
-            index += 1
+            index += 3
             continue
-
-        setext = re.fullmatch(r"(=+|-+)", stripped)
-        if setext and block_lines and len(block_lines) == 1 and block_kind == "paragraph":
-            title_source = block_lines.pop()
-            parent = block_section
-            level = 1 if stripped.startswith("=") else 2
-            while heading_stack and heading_stack[-1][0] >= level:
-                heading_stack.pop()
-            title = visible_inline_markdown(title_source)
-            add_block(parent, f"heading-{level}", title)
-            heading_stack.append((level, canonical_visible_text(title, casefold=True)))
-            block_section = section_path()
+        if token.type == "tr_open":
+            cells: list[str] = []
             index += 1
-            continue
-
-        if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", stripped):
-            flush_block()
-            index += 1
-            continue
-        if re.match(r"^\[[^]]+\]:\s+\S+", stripped):
-            flush_block()
-            index += 1
-            continue
-        if stripped.startswith("|") and stripped.endswith("|"):
-            flush_block()
-            if not re.fullmatch(r"\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?", stripped):
-                add_block(section_path(), "table-row", stripped)
-            index += 1
-            continue
-
-        blockquote = re.match(r"^\s*(?:>\s*)+(.+)$", raw_line)
-        if blockquote:
-            if block_lines and block_kind != "blockquote":
-                flush_block()
-            if not block_lines:
-                block_kind = "blockquote"
-                block_section = section_path()
-            block_lines.append(blockquote.group(1).strip())
-            index += 1
-            continue
-
-        list_item = re.match(r"^\s*(?:[-+*]|\d+[.)])\s+(.+)$", raw_line)
-        if list_item:
-            flush_block()
-            block_kind = "list-item"
-            block_section = section_path()
-            block_lines.append(list_item.group(1).strip())
-            index += 1
-            continue
-
-        if not block_lines:
-            block_section = section_path()
-        block_lines.append(stripped)
+            while index < len(tokens) and tokens[index].type != "tr_close":
+                if (
+                    tokens[index].type == "inline"
+                    and tokens[index].children is not None
+                ):
+                    cells.append(visible_inline_tokens(tokens[index].children))
+                index += 1
+            add_block(section_path(), "table-row", " | ".join(cells))
+        elif token.type == "list_item_open":
+            list_depth += 1
+        elif token.type == "list_item_close":
+            list_depth -= 1
+        elif token.type == "blockquote_open":
+            blockquote_depth += 1
+        elif token.type == "blockquote_close":
+            blockquote_depth -= 1
+        elif token.type == "inline" and token.children is not None:
+            kind = (
+                "list-item"
+                if list_depth
+                else "blockquote"
+                if blockquote_depth
+                else "paragraph"
+            )
+            add_block(section_path(), kind, visible_inline_tokens(token.children))
+        elif token.type == "html_block":
+            kind = (
+                "list-item"
+                if list_depth
+                else "blockquote"
+                if blockquote_depth
+                else "html-block"
+            )
+            add_block(section_path(), kind, visible_html(token.content))
         index += 1
-    flush_block()
 
     occurrence_counts: Counter[str] = Counter()
     records: list[CorpusSentence] = []
@@ -413,20 +413,51 @@ def all_corpus_sentences(root: Path) -> tuple[CorpusSentence, ...]:
     )
 
 
+class DuplicateJsonKey(ValueError):
+    pass
+
+
+def unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey(key)
+        result[key] = value
+    return result
+
+
+def canonical_json(payload: object) -> str:
+    return json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+
 def load_prose_inventory(root: Path) -> tuple[InventorySentence, ...]:
     path = root / PROSE_INVENTORY
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        source = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as exc:
         raise GuardError(f"cannot read {path}: {exc}") from exc
+    if not source.endswith("\n") or "\r" in source:
+        raise GuardError(f"{path} must use LF records with exactly one final newline")
+    lines = source[:-1].split("\n")
 
     inventory: list[InventorySentence] = []
     for line_number, line in enumerate(lines, 1):
         try:
-            payload = json.loads(line)
-        except (TypeError, json.JSONDecodeError) as exc:
+            payload = json.loads(line, object_pairs_hook=unique_json_object)
+        except (TypeError, json.JSONDecodeError, DuplicateJsonKey) as exc:
             raise GuardError(f"{path}:{line_number} is not valid JSON") from exc
-        required = {"path", "location", "sentence_index", "occurrence", "categories", "sentence"}
+        if line != canonical_json(payload):
+            raise GuardError(f"{path}:{line_number} is not canonically serialized")
+        required = {
+            "path",
+            "location",
+            "sentence_index",
+            "occurrence",
+            "categories",
+            "sentence",
+        }
         if not isinstance(payload, dict) or set(payload) != required:
             raise GuardError(f"{path}:{line_number} has an invalid inventory schema")
         relative = payload["path"]
@@ -434,9 +465,9 @@ def load_prose_inventory(root: Path) -> tuple[InventorySentence, ...]:
         if (
             not isinstance(relative, str)
             or not isinstance(payload["location"], str)
-            or not isinstance(payload["sentence_index"], int)
+            or type(payload["sentence_index"]) is not int
             or payload["sentence_index"] < 1
-            or not isinstance(payload["occurrence"], int)
+            or type(payload["occurrence"]) is not int
             or payload["occurrence"] < 1
             or not isinstance(payload["sentence"], str)
             or not isinstance(categories, list)
@@ -446,7 +477,9 @@ def load_prose_inventory(root: Path) -> tuple[InventorySentence, ...]:
             raise GuardError(f"{path}:{line_number} has invalid inventory values")
         expected_categories = [prose_category(relative)]
         if categories != expected_categories:
-            raise GuardError(f"{path}:{line_number} categories must equal {expected_categories}")
+            raise GuardError(
+                f"{path}:{line_number} categories must equal {expected_categories}"
+            )
         record = CorpusSentence(
             path=relative,
             location=payload["location"],
@@ -462,13 +495,15 @@ def load_prose_inventory(root: Path) -> tuple[InventorySentence, ...]:
     identities = [entry.record.identity for entry in inventory]
     if len(identities) != len(set(identities)):
         raise GuardError(f"{path} contains duplicate inventory records")
+    if identities != sorted(identities):
+        raise GuardError(f"{path} records are not in canonical identity order")
     return tuple(inventory)
 
 
 def write_prose_inventory(root: Path) -> None:
     path = root / PROSE_INVENTORY
     lines = []
-    for record in all_corpus_sentences(root):
+    for record in sorted(all_corpus_sentences(root), key=lambda item: item.identity):
         payload = {
             "path": record.path,
             "location": record.location,
@@ -477,7 +512,7 @@ def write_prose_inventory(root: Path) -> None:
             "categories": [prose_category(record.path)],
             "sentence": record.sentence,
         }
-        lines.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        lines.append(canonical_json(payload))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -498,7 +533,9 @@ def enforce_prose_inventory(root: Path) -> None:
     expected_by_identity = {entry.record.identity: entry for entry in inventory}
     actual_identities = {record.identity for record in actual}
     expected_identities = set(expected_by_identity)
-    unexpected = [record for record in actual if record.identity not in expected_identities]
+    unexpected = [
+        record for record in actual if record.identity not in expected_identities
+    ]
     if unexpected:
         record = unexpected[0]
         same_location = next(
@@ -522,7 +559,9 @@ def enforce_prose_inventory(root: Path) -> None:
             f"{record.location} sentence {record.sentence_index} occurrence "
             f"{record.occurrence}: {record.sentence}",
         )
-    missing = [entry for entry in inventory if entry.record.identity not in actual_identities]
+    missing = [
+        entry for entry in inventory if entry.record.identity not in actual_identities
+    ]
     if missing:
         entry = missing[0]
         record = entry.record
@@ -534,8 +573,15 @@ def enforce_prose_inventory(root: Path) -> None:
         )
 
 
-def unique_section(parsed: list[Section], level: int, title: str, path: Path) -> Section:
-    found = [section for section in parsed if section.level == level and section.title == title]
+def unique_section(
+    parsed: list[Section], level: int, title: str, path: Path
+) -> Section:
+    visible_title = visible_markdown_fragment(title)
+    found = [
+        section
+        for section in parsed
+        if section.level == level and section.title == visible_title
+    ]
     if len(found) != 1:
         raise GuardError(
             f"{path} requires exactly one level-{level} section {title!r}; found {len(found)}"
@@ -543,17 +589,23 @@ def unique_section(parsed: list[Section], level: int, title: str, path: Path) ->
     return found[0]
 
 
+def visible_markdown_fragment(fragment: str) -> str:
+    return "\n".join(rendered_blocks(COMMONMARK.parse(fragment)))
+
+
 def require(section: Section | str, path: Path, *fragments: str) -> None:
     body = normalized(section.body if isinstance(section, Section) else section)
     for fragment in fragments:
-        if normalized(fragment) not in body:
+        if normalized(visible_markdown_fragment(fragment)) not in body:
             label = section.title if isinstance(section, Section) else "document"
-            raise GuardError(f"{path} section {label!r} lost required decision: {fragment}")
+            raise GuardError(
+                f"{path} section {label!r} lost required decision: {fragment}"
+            )
 
 
 def declaration_map(section: Section, path: Path) -> dict[str, str]:
     declarations: dict[str, str] = {}
-    row = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*$")
+    row = re.compile(r"^([a-z0-9_]+)\s+\|\s+([A-Za-z0-9_,.-]+)$")
     for line in section.body.splitlines():
         match = row.match(line)
         if not match:
@@ -568,12 +620,12 @@ def declaration_map(section: Section, path: Path) -> dict[str, str]:
 def validate(root: Path) -> None:
     enforce_prose_inventory(root)
     adr = root / "docs/DURABLE_SENSITIVE_DATA.md"
-    text, parsed = sections(adr)
+    _, parsed = sections(adr)
     for title in REQUIRED_H2:
         unique_section(parsed, 2, title, adr)
 
     first_h2 = min(section.start for section in parsed if section.level == 2)
-    preamble = "\n".join(text.splitlines()[:first_h2])
+    preamble = active_markdown_prefix(adr, first_h2)
     require(
         preamble,
         adr,
@@ -641,16 +693,20 @@ def validate(root: Path) -> None:
         "`expected_effect_generation`",
         "root head intentionally serializes Spawn filesystem effects",
         "request 4,097 fails `journal_capacity` before",
-        "at least** 24 hours",
+        "at least 24 hours",
         "result-map expiry, daemon restart, or same-lineage restore",
         "### Ambiguous-effect reconciliation",
     )
     anti = unique_section(parsed, 3, "Durable anti-replay heads and admission", adr)
     if not (objects.start < anti.start < objects.end):
-        raise GuardError(f"{adr}: anti-replay section is outside Object/conflict section")
+        raise GuardError(
+            f"{adr}: anti-replay section is outside Object/conflict section"
+        )
     ambiguous = unique_section(parsed, 3, "Ambiguous-effect reconciliation", adr)
     if not (objects.start < ambiguous.start < objects.end):
-        raise GuardError(f"{adr}: reconciliation section is outside Object/conflict section")
+        raise GuardError(
+            f"{adr}: reconciliation section is outside Object/conflict section"
+        )
     require(
         ambiguous,
         adr,
@@ -670,7 +726,9 @@ def validate(root: Path) -> None:
         "dismissal preserves its durable record, anti-replay head, and effect lock",
     )
 
-    limits = unique_section(parsed, 2, "Limits, availability, and denial of service", adr)
+    limits = unique_section(
+        parsed, 2, "Limits, availability, and denial of service", adr
+    )
     require(
         limits,
         adr,
@@ -680,10 +738,26 @@ def validate(root: Path) -> None:
         "Admission reserves all journal/head/disk capacity before",
     )
 
-    migration = unique_section(parsed, 2, "Migration and cutover contract for P2-DATA-02", adr)
-    require(migration, adr, "no dual-read or dual-write", "old binaries fail startup")
+    migration = unique_section(
+        parsed, 2, "Migration and cutover contract for P2-DATA-02", adr
+    )
+    require(
+        migration,
+        adr,
+        "Every transition CASes the exact `(migration_epoch, state)` pair and increments `migration_epoch`",
+        "The state label has one intentional pre-cutover backward edge, but the epoch is strictly monotonic",
+        "`legacy` | `copying`",
+        "`copying` | `legacy`",
+        "`copying` | `endpoint_verified`",
+        "`endpoint_verified` | `scrubbed`",
+        "No other edge is valid.",
+        "no dual-read or dual-write",
+        "old binaries fail startup",
+    )
 
-    rotation = unique_section(parsed, 2, "Rotation, revocation, deletion, and purge", adr)
+    rotation = unique_section(
+        parsed, 2, "Rotation, revocation, deletion, and purge", adr
+    )
     require(
         rotation,
         adr,
@@ -720,6 +794,7 @@ def validate(root: Path) -> None:
         "two consecutive, adjacent A/B slot advances are synced, read back, and authenticated",
         "Mixed-epoch recovery validates the transition under both epoch HMACs.",
         "recorded retire-ready step and deletion read-back must succeed",
+        "Every success increments `migration_epoch`; a stale epoch/source-state CAS fails",
     )
 
     dependency = unique_section(parsed, 2, "Dependency hand-off", adr)
@@ -819,9 +894,13 @@ def self_test(source: Path) -> None:
 
     def append_active_claim(path: Path, claim: str, safe_decoy: str) -> None:
         add_comment_and_fence_decoys(path, safe_decoy)
-        path.write_text(path.read_text(encoding="utf-8") + f"\n\n{claim}\n", encoding="utf-8")
+        path.write_text(
+            path.read_text(encoding="utf-8") + f"\n\n{claim}\n", encoding="utf-8"
+        )
 
-    def claim_fixture(relative: str, claim: str, safe_decoy: str) -> Callable[[Path], None]:
+    def claim_fixture(
+        relative: str, claim: str, safe_decoy: str
+    ) -> Callable[[Path], None]:
         def mutate(root: Path) -> None:
             append_active_claim(root / relative, claim, safe_decoy)
 
@@ -843,7 +922,9 @@ def self_test(source: Path) -> None:
         text = path.read_text(encoding="utf-8")
         marker = "## Rejected alternatives"
         text = text.replace(marker, f"{marker}\n\n{expected}\n", 1)
-        path.write_text(text + "\n\nThe server is the canonical store.\n", encoding="utf-8")
+        path.write_text(
+            text + "\n\nThe server is the canonical store.\n", encoding="utf-8"
+        )
 
     def missing_section(root: Path) -> None:
         replace_required(
@@ -856,7 +937,9 @@ def self_test(source: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         text = path.read_text(encoding="utf-8")
         text = text.replace(
-            "## Rejected alternatives", "## Decision\n\ndecoy\n\n## Rejected alternatives", 1
+            "## Rejected alternatives",
+            "## Decision\n\ndecoy\n\n## Rejected alternatives",
+            1,
         )
         path.write_text(text, encoding="utf-8")
 
@@ -888,7 +971,9 @@ def self_test(source: Path) -> None:
 
     def malformed_markdown(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
-        path.write_text(path.read_text(encoding="utf-8") + "\n<!-- broken", encoding="utf-8")
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n<!-- broken", encoding="utf-8"
+        )
 
     def unreadable_input(root: Path) -> None:
         (root / "docs/INTERFACE_MATRIX.md").unlink()
@@ -903,8 +988,39 @@ def self_test(source: Path) -> None:
         lines = path.read_text(encoding="utf-8").splitlines()
         payload = json.loads(lines[0])
         payload["categories"] = ["wrong-category"]
-        lines[0] = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        lines[0] = canonical_json(payload)
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def inventory_boolean_index(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        payload = json.loads(lines[0])
+        payload["sentence_index"] = True
+        lines[0] = canonical_json(payload)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def inventory_duplicate_json_key(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        lines[0] = '{"path":"duplicate",' + lines[0][1:]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def inventory_noncanonical_serialization(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        lines[0] = json.dumps(json.loads(lines[0]), ensure_ascii=False, sort_keys=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def inventory_noncanonical_order(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        lines[0], lines[1] = lines[1], lines[0]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def inventory_missing_final_newline(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        source = path.read_text(encoding="utf-8")
+        path.write_text(source.removesuffix("\n"), encoding="utf-8")
 
     def new_markdown_fixture(relative: str) -> Callable[[Path], None]:
         def mutate(root: Path) -> None:
@@ -950,18 +1066,16 @@ def self_test(source: Path) -> None:
     adr_path = "docs/DURABLE_SENSITIVE_DATA.md"
     phase2_path = "docs/TRUST_PHASE2.md"
     tasks_path = "docs/TRUST_PHASE2_TASKS.md"
-    runtime_safe = (
-        "Status: proposed for independent review; runtime not implemented; Phase 2 incomplete."
-    )
+    runtime_safe = "Status: proposed for independent review; runtime not implemented; Phase 2 incomplete."
     opaque_safe = (
         "Opaque client-encrypted server blobs are not selected and are forbidden "
         "as a Phase 2 fallback."
     )
     host02_safe = "P2-HOST-02 is reviewed and merged at 4e7c89b."
-    ack_safe = "User acknowledgement is never retry authority; dismissal preserves the lock."
-    rotation_safe = (
-        "The old epoch remains until both new-epoch anchor slots and all wrappers are verified."
+    ack_safe = (
+        "User acknowledgement is never retry authority; dismissal preserves the lock."
     )
+    rotation_safe = "The old epoch remains until both new-epoch anchor slots and all wrappers are verified."
     data02_safe = "P2-DATA-02 remains blocked until reviewed and merged P2-TERM-01 and P2-HOST-03A."
 
     mutations.extend(
@@ -1197,8 +1311,37 @@ def self_test(source: Path) -> None:
                 ),
                 "trust-model-prose",
             ),
-            ("duplicate prose inventory record is rejected", duplicate_inventory_record, None),
-            ("prose inventory category drift is rejected", inventory_category_drift, None),
+            (
+                "duplicate prose inventory record is rejected",
+                duplicate_inventory_record,
+                None,
+            ),
+            (
+                "prose inventory category drift is rejected",
+                inventory_category_drift,
+                None,
+            ),
+            ("boolean sentence index is rejected", inventory_boolean_index, None),
+            (
+                "duplicate JSON inventory key is rejected",
+                inventory_duplicate_json_key,
+                None,
+            ),
+            (
+                "noncanonical JSON inventory serialization is rejected",
+                inventory_noncanonical_serialization,
+                None,
+            ),
+            (
+                "noncanonical prose inventory order is rejected",
+                inventory_noncanonical_order,
+                None,
+            ),
+            (
+                "missing canonical prose inventory final newline is rejected",
+                inventory_missing_final_newline,
+                None,
+            ),
             (
                 "new TRUST override document cannot evade the corpus",
                 new_markdown_fixture("docs/TRUST_PHASE2_OVERRIDE.md"),
@@ -1277,6 +1420,22 @@ def self_test(source: Path) -> None:
             runtime_safe,
             "data-design-prose",
             "phase ii is done.",
+        ),
+        (
+            "four-space-indented backticks do not fence following prose",
+            adr_path,
+            "---\n\n    ```\n\nPhase 2 is finished.",
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "generic angle-bracket prose remains visible",
+            adr_path,
+            "<Phase 2 is finished.>",
+            runtime_safe,
+            "data-design-prose",
+            "<phase 2 is finished.>",
         ),
         (
             "Unicode em-dash and Roman numeral Phase II claim",
@@ -1442,7 +1601,9 @@ def self_test(source: Path) -> None:
                 raise GuardError(
                     f"normalization self-test {name!r} failed for another reason: {exc}"
                 ) from exc
-            raise GuardError(f"normalization self-test mutation unexpectedly passed: {name}")
+            raise GuardError(
+                f"normalization self-test mutation unexpectedly passed: {name}"
+            )
 
         positive_base = base / "positive"
         for index, (name, mutation) in enumerate(positive_mutations):
@@ -1452,7 +1613,9 @@ def self_test(source: Path) -> None:
             try:
                 validate(fixture)
             except GuardError as exc:
-                raise GuardError(f"positive self-test {name!r} unexpectedly failed: {exc}") from exc
+                raise GuardError(
+                    f"positive self-test {name!r} unexpectedly failed: {exc}"
+                ) from exc
 
 
 def main() -> int:
@@ -1475,7 +1638,10 @@ def main() -> int:
             validate(root)
             print("durable protected-data decision guard passed")
     except (GuardError, OSError, UnicodeError, re.error) as exc:
-        print(f"durable protected-data decision guard failed: {exc}", file=__import__("sys").stderr)
+        print(
+            f"durable protected-data decision guard failed: {exc}",
+            file=__import__("sys").stderr,
+        )
         return 1
     return 0
 
