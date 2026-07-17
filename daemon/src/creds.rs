@@ -93,6 +93,10 @@ pub struct BrowserPin {
     browser_key_algorithm: String,
     browser_public_key: String,
     browser_key_fingerprint: String,
+    /// Absent pins predate reciprocal OOB confirmation and are retained only
+    /// as conflict/tombstone-like history until explicitly promoted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oob_confirmation_version: Option<u8>,
 }
 
 impl BrowserPin {
@@ -112,6 +116,22 @@ impl BrowserPin {
 
     pub fn fingerprint(&self) -> &str {
         &self.browser_key_fingerprint
+    }
+
+    pub fn is_oob_confirmed(&self) -> bool {
+        self.oob_confirmation_version == Some(1)
+    }
+
+    fn with_oob_confirmation(mut self) -> Self {
+        self.oob_confirmation_version = Some(1);
+        self
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.browser_device_id == other.browser_device_id
+            && self.browser_key_algorithm == other.browser_key_algorithm
+            && self.browser_public_key == other.browser_public_key
+            && self.browser_key_fingerprint == other.browser_key_fingerprint
     }
 }
 
@@ -150,14 +170,21 @@ impl StoredCreds {
     }
 
     pub fn browser_pins(&self) -> &[BrowserPin] {
+        // Storage/status inventory only. Authorization must use the filtered
+        // selector below so migrated legacy records cannot become trust.
         &self.browser_pins
+    }
+
+    pub fn oob_confirmed_browser_pins(&self) -> impl Iterator<Item = &BrowserPin> {
+        self.browser_pins
+            .iter()
+            .filter(|pin| pin.is_oob_confirmed())
     }
 
     #[allow(dead_code)] // Consumed by the later signed-wire verification hook.
     pub fn browser_pin(&self, device_id: Uuid) -> Option<&BrowserPin> {
         let canonical = device_id.to_string();
-        self.browser_pins
-            .iter()
+        self.oob_confirmed_browser_pins()
             .find(|pin| pin.browser_device_id == canonical)
     }
 
@@ -205,7 +232,12 @@ pub fn browser_pin_from_approval(
         browser_key_algorithm: BROWSER_KEY_ALGORITHM.to_owned(),
         browser_public_key: browser_public_key.to_owned(),
         browser_key_fingerprint: expected_fingerprint,
+        oob_confirmation_version: None,
     })
+}
+
+pub fn confirm_browser_pin(pin: BrowserPin) -> BrowserPin {
+    pin.with_oob_confirmation()
 }
 
 pub fn validate_login_access_token(access_token: &str) -> Result<()> {
@@ -235,12 +267,19 @@ pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
 pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<bool> {
     validate_browser_pins(&creds.browser_pins)?;
     validate_browser_pin(&pin)?;
-    for existing in &creds.browser_pins {
+    for index in 0..creds.browser_pins.len() {
+        let existing = &creds.browser_pins[index];
         if existing.browser_device_id == pin.browser_device_id {
-            if existing == &pin {
+            if !existing.same_identity(&pin) {
+                bail!("browser device ID is already pinned to a different key")
+            }
+            if existing.is_oob_confirmed() || !pin.is_oob_confirmed() {
                 return Ok(false);
             }
-            bail!("browser device ID is already pinned to a different key")
+            // The identity tuple remains immutable. This one-way state change
+            // only records that the operator independently confirmed it.
+            creds.browser_pins[index] = pin;
+            return Ok(true);
         }
         if existing.browser_public_key == pin.browser_public_key {
             bail!("browser public key is already pinned to a different device ID")
@@ -254,6 +293,23 @@ pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<boo
         .browser_pins
         .sort_by(|left, right| left.browser_device_id.cmp(&right.browser_device_id));
     Ok(true)
+}
+
+/// Validate whether a returned browser tuple is already authorized in this
+/// exact local trust domain. `true` means first-contact OOB confirmation is
+/// still required; `false` means the exact device-ID/key pin is already
+/// durable. This function never mutates or persists the credential record.
+pub fn browser_pin_requires_confirmation(
+    current: &StoredCreds,
+    host_id: Uuid,
+    server_url: &str,
+    pin: &BrowserPin,
+) -> Result<bool> {
+    validate_pin_trust_domain(current, host_id, server_url)?;
+    let mut candidate = current.clone();
+    let result = merge_browser_pin(&mut candidate, confirm_browser_pin(pin.clone()));
+    zeroize_stored_creds(&mut candidate);
+    result
 }
 
 pub fn commit_login_update<F>(
@@ -292,6 +348,11 @@ where
     O: FnOnce(&str),
 {
     let mut access_token = Zeroizing::new(access_token);
+    if !browser_pin.is_oob_confirmed() {
+        access_token.zeroize();
+        observe_wiped_token(access_token.as_str());
+        bail!("login commit refused a browser pin without OOB confirmation version 1")
+    }
     if let Err(error) = validate_pin_trust_domain(current, host_id, &server_url) {
         access_token.zeroize();
         observe_wiped_token(access_token.as_str());
@@ -1282,10 +1343,15 @@ fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
     for pin in creds.browser_pins() {
         writeln!(
             &mut output,
-            "browser pin:  {} {} {}",
+            "browser pin:  {} {} {} {}",
             pin.device_id(),
             pin.key_algorithm(),
-            pin.fingerprint()
+            pin.fingerprint(),
+            if pin.is_oob_confirmed() {
+                "oob-confirmed"
+            } else {
+                "confirmation-required"
+            }
         )?;
     }
     Ok(output)
@@ -1608,12 +1674,16 @@ fn validate_persistable_creds(creds: &StoredCreds) -> Result<()> {
 }
 
 fn validate_browser_pin(pin: &BrowserPin) -> Result<()> {
-    let validated = browser_pin_from_approval(
+    if !matches!(pin.oob_confirmation_version, None | Some(1)) {
+        bail!("stored browser pin has an unsupported OOB confirmation version")
+    }
+    let mut validated = browser_pin_from_approval(
         &pin.browser_device_id,
         &pin.browser_key_algorithm,
         &pin.browser_public_key,
         &pin.browser_key_fingerprint,
     )?;
+    validated.oob_confirmation_version = pin.oob_confirmation_version;
     if &validated != pin {
         bail!("stored browser pin is not canonical")
     }
@@ -2341,7 +2411,14 @@ mod tests {
         assert!(merge_browser_pin(&mut creds, first.clone()).unwrap());
         assert_eq!(creds.browser_pins(), &[first.clone(), second.clone()]);
         assert!(!merge_browser_pin(&mut creds, first.clone()).unwrap());
-        assert_eq!(creds.browser_pin(first_id), Some(&first));
+        assert!(creds.browser_pin(first_id).is_none());
+
+        let confirmed_first = confirm_browser_pin(first.clone());
+        assert!(merge_browser_pin(&mut creds, confirmed_first.clone()).unwrap());
+        assert_eq!(creds.browser_pin(first_id), Some(&confirmed_first));
+        assert!(!merge_browser_pin(&mut creds, first.clone()).unwrap());
+        assert_eq!(creds.browser_pin(first_id), Some(&confirmed_first));
+        assert!(!merge_browser_pin(&mut creds, confirmed_first.clone()).unwrap());
 
         let before = creds.browser_pins.clone();
         assert!(merge_browser_pin(&mut creds, browser_pin(first_id, RFC_KEY_TWO)).is_err());
@@ -2370,7 +2447,7 @@ mod tests {
             "new-token".into(),
             Uuid::from_u128(99),
             "https://server.example/".into(),
-            generated_browser_pin(MAX_BROWSER_PINS as u8),
+            confirm_browser_pin(generated_browser_pin(MAX_BROWSER_PINS as u8)),
             |_, _| {
                 persist_called.set(true);
                 Ok(())
@@ -2385,6 +2462,16 @@ mod tests {
     fn legacy_and_pin_records_load_fail_closed_at_the_schema_boundary() {
         let legacy: StoredCreds = serde_json::from_str(r#"{"access_token":"legacy"}"#).unwrap();
         assert!(legacy.browser_pins().is_empty());
+        let legacy_pin = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
+        let legacy_pin_json = serde_json::to_string(&legacy_pin).unwrap();
+        assert!(!legacy_pin_json.contains("oob_confirmation_version"));
+        let restored_legacy_pin: BrowserPin = serde_json::from_str(&legacy_pin_json).unwrap();
+        assert!(!restored_legacy_pin.is_oob_confirmed());
+
+        let mut future_pin = serde_json::to_value(confirm_browser_pin(legacy_pin)).unwrap();
+        future_pin["oob_confirmation_version"] = serde_json::json!(2);
+        let future_pin: BrowserPin = serde_json::from_value(future_pin).unwrap();
+        assert!(validate_browser_pin(&future_pin).is_err());
         let partial = format!(
             r#"{{"browser_pins":[{{"browser_device_id":"{}"}}]}}"#,
             Uuid::from_u128(1)
@@ -2414,7 +2501,7 @@ mod tests {
         use std::cell::Cell;
 
         let old_pin = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
-        let new_pin = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let new_pin = confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO));
         let mut creds = fixed_creds();
         creds.access_token = Some("old-token".into());
         bind_pin_domain(&mut creds, 10, "https://new.example/old-path");
@@ -2469,7 +2556,7 @@ mod tests {
             "returned-poll-secret".into(),
             Uuid::from_u128(10),
             "https://new.example/".into(),
-            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
             |_, _| bail!("injected persistence failure"),
             |wiped| {
                 observed.set(true);
@@ -2501,7 +2588,7 @@ mod tests {
             Some(URL_SAFE_NO_PAD.encode([8_u8; ED25519_SEED_BYTES]));
         merge_browser_pin(
             &mut keyring_first,
-            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
         )
         .unwrap();
         let written_keyring = RefCell::new(None);
@@ -2533,7 +2620,7 @@ mod tests {
         file_first.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode([9_u8; ED25519_SEED_BYTES]));
         merge_browser_pin(
             &mut file_first,
-            browser_pin(Uuid::from_u128(2), RFC_KEY_TWO),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
         )
         .unwrap();
         let written_file = RefCell::new(None);
@@ -2588,8 +2675,19 @@ mod tests {
 
     #[test]
     fn generation_reconciliation_never_hybrids_servers_hosts_or_concurrent_writers() {
-        let older = complete_record(4, 4, "older-token", 40, "https://older.example/", 4);
-        let newer = complete_record(5, 1, "newer-token", 50, "https://newer.example/", 5);
+        let mut older = complete_record(4, 4, "older-token", 40, "https://older.example/", 4);
+        merge_browser_pin(&mut older, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        merge_browser_pin(
+            &mut older,
+            confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
+        )
+        .unwrap();
+        let mut newer = complete_record(5, 1, "newer-token", 50, "https://newer.example/", 5);
+        merge_browser_pin(
+            &mut newer,
+            confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
+        )
+        .unwrap();
         let loaded = reconcile_backend_records(
             Some(older.clone()),
             Some(newer.clone()),
@@ -2597,6 +2695,8 @@ mod tests {
         )
         .unwrap();
         assert_same_coherent_record(&loaded, &older);
+        assert!(!loaded.browser_pins()[0].is_oob_confirmed());
+        assert!(loaded.browser_pins()[1].is_oob_confirmed());
 
         // A split write never promotes the redundant keyring copy. The file
         // remains authoritative even when record IDs sort differently.
@@ -2934,7 +3034,7 @@ mod tests {
             "first-subprocess-token".to_owned(),
             host_id,
             "https://server.example/".to_owned(),
-            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
             |candidate, expected| save_with_forced_keyring_error(&path, candidate, expected),
         )
         .unwrap();
@@ -2944,7 +3044,7 @@ mod tests {
             "second-subprocess-token".to_owned(),
             host_id,
             "https://server.example/same-origin-path".to_owned(),
-            browser_pin(Uuid::from_u128(2), RFC_KEY_TWO),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
             |candidate, expected| save_with_forced_keyring_error(&path, candidate, expected),
         )
         .unwrap();
@@ -2952,8 +3052,8 @@ mod tests {
         assert_eq!(
             final_record.browser_pins(),
             &[
-                browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
-                browser_pin(Uuid::from_u128(2), RFC_KEY_TWO),
+                confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
+                confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
             ]
         );
         assert_eq!(
@@ -3117,7 +3217,7 @@ mod tests {
     #[test]
     fn successful_relogin_preserves_existing_pins_and_redacts_status() {
         let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
-        let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let second = confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO));
         let mut creds = fixed_creds();
         creds.access_token = Some("old-secret-token".into());
         bind_pin_domain(&mut creds, 10, "https://server.example:443/old-path");
@@ -3162,7 +3262,7 @@ mod tests {
         use std::cell::Cell;
 
         let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
-        let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let second = confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO));
         let mut creds = fixed_creds();
         creds.access_token = Some("old-secret-token".into());
         bind_pin_domain(&mut creds, 10, "https://server.example/old-path");
@@ -3372,6 +3472,11 @@ mod tests {
         let mut original = fixed_creds();
         bind_pin_domain(&mut original, 10, "https://server.example/");
         merge_browser_pin(&mut original, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        merge_browser_pin(
+            &mut original,
+            confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
+        )
+        .unwrap();
         advance_credential_generation(&mut original).unwrap();
         let expected = host_identity(&original).unwrap();
         save_file_at(&path, &original).unwrap();
@@ -3383,10 +3488,15 @@ mod tests {
         );
         assert_eq!(host_identity(&restored).unwrap(), expected);
         assert_eq!(restored.browser_pins(), original.browser_pins());
+        assert!(restored.browser_pin(Uuid::from_u128(1)).is_none());
+        assert!(restored.browser_pin(Uuid::from_u128(2)).is_some());
 
         let mut keyring_json = serde_json::to_string(&original).unwrap();
         let keyring_restored = decode_keyring_value_and_wipe(&mut keyring_json).unwrap();
         assert_same_coherent_record(&keyring_restored, &original);
+        assert_eq!(keyring_restored.browser_pins(), original.browser_pins());
+        assert!(keyring_restored.browser_pin(Uuid::from_u128(1)).is_none());
+        assert!(keyring_restored.browser_pin(Uuid::from_u128(2)).is_some());
         assert!(keyring_json.is_empty());
     }
 

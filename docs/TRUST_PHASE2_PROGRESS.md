@@ -552,10 +552,43 @@ DELETE.
 
 This is a review-pending browser-local foundation only. RTC, terminal pools,
 HostControl, and server WebSocket admission do not consume the resolver yet;
-the daemon reciprocal OOB activation half and live signaling work remain open.
+the live signaling work remains open.
 It therefore makes no claim that live signaling is signed, that TOFU has been
 eliminated end to end, or that L1 is established. The preserved independent
 audit remains unchanged.
+
+**P3-LIVE-F4 daemon reciprocal OOB half (candidate; independent review
+pending):** a newly returned strict browser device/key tuple is now only
+eligible for the existing atomic credential commit after the daemon derives
+its fingerprint locally and the operator confirms that exact full value from
+the browser page's locally derived display. First contact accepts either
+bounded interactive exact-line entry or
+`--expect-browser-fingerprint SHA256:...`; non-interactive first contact
+without that argument fails closed. Whitespace, case changes, short forms,
+malformed values, EOF, a substituted server tuple, Host/origin changes,
+device/key reuse conflicts, capacity, and persistence failure all abort before
+the returned token or pin can enter the protected credential record. The
+returned token remains zeroizing across every failure path.
+
+An exact already-durable browser device-ID/key pin in the same canonical
+server-origin + Host-ID domain authorizes re-login without repeating first
+contact. Nothing weaker does. Pins written by the earlier server-mediated 02E
+foundation deserialize with an explicit legacy/unconfirmed state and remain
+inert conflict history: authorization selectors expose only confirmation
+version 1. An exact OOB ceremony may atomically promote only that same tuple;
+save failure leaves the legacy marker unchanged, confirmed records cannot be
+downgraded, and unknown/future marker versions fail closed. The browser approval page derives the displayed
+browser fingerprint again from its non-extractable local identity, compares
+the registration response, and retains that local value through the approval
+success state with exact CLI copy/entry instructions. Rust tests exercise the
+exact-entry matrix, non-TTY/EOF, substitution/token wipe, known-pin re-login,
+device/key/domain conflicts, capacity, and save failure. The real login smoke
+supplies an independently prepared browser fingerprint and proves a different
+approved browser key leaves the byte-identical credential record unchanged;
+native Chromium proves the local display survives approval success. This
+candidate does not wire RTC, does not make server poll data independent, and
+makes no live-L1 or signed-signaling claim until independent review passes and
+the later verified RTC path consumes these pins.
 
 **P3-AUDIT-01 combined foundation gate (active):** after 02E integration, a
 fresh adversarial review must independently cover all five workstreams: signed

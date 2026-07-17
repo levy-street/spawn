@@ -37,6 +37,12 @@ pub struct LoginArgs {
     #[arg(long)]
     pub host_name: Option<String>,
 
+    /// Exact full browser fingerprint copied from the browser approval page.
+    /// Required for non-interactive first contact; known exact local pins do
+    /// not require it on re-login.
+    #[arg(long, value_name = "SHA256:...")]
+    pub expect_browser_fingerprint: Option<String>,
+
     /// Just store the token; don't transition to `run` after login succeeds.
     #[arg(long)]
     pub no_run: bool,

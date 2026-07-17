@@ -147,6 +147,9 @@ test("device approval shows the locally derived fingerprint before confirmation"
 
   await page.getByRole("button", { name: "Confirm approval" }).click();
   await expect(page.getByRole("status")).toContainText("Approved daemon for host build-host");
+  await expect(page.getByTestId("browser-key-fingerprint")).toHaveText(browserFingerprint);
+  await expect(page.getByRole("status")).toContainText("--expect-browser-fingerprint");
+  await expect(page.getByRole("status")).toContainText("exact full value");
   expect(approved).toBe(true);
   expect(localPinAtServerApproval).toMatchObject([
     {

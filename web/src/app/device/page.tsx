@@ -40,6 +40,7 @@ function DeviceInner() {
   const [code, setCode] = useState("");
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
+  const [localBrowserFingerprint, setLocalBrowserFingerprint] = useState<string | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,6 +61,26 @@ function DeviceInner() {
         );
       }
       if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
+      if (registration.data?.status !== "ready") {
+        throw new ApprovalIdentityError("The local browser identity is not ready for approval");
+      }
+      const localIdentity = await loadBrowserDeviceIdentity(user.id);
+      if (
+        localIdentity === null ||
+        localIdentity.publicKeyWire !== registration.data.device.public_key
+      ) {
+        throw new ApprovalIdentityError(
+          "Local browser identity changed; refresh before reviewing the daemon",
+        );
+      }
+      const derivedBrowserFingerprint = await ed25519PublicKeyFingerprint(
+        localIdentity.publicKeyWire,
+      );
+      if (registration.data.device.fingerprint !== derivedBrowserFingerprint) {
+        throw new ApprovalIdentityError(
+          "Browser registration fingerprint did not match the locally stored key",
+        );
+      }
       const existing = await loadBrowserHostPin({
         accountId: user.id,
         origin: browserHostPinServerOrigin(),
@@ -67,6 +88,7 @@ function DeviceInner() {
         hostFingerprint: expectedFingerprint,
       });
       setPending(r);
+      setLocalBrowserFingerprint(derivedBrowserFingerprint);
       setLocalPinState(existing?.state ?? "new");
       setLocalPinCommitted(existing?.state === "active");
     } catch (err) {
@@ -95,6 +117,17 @@ function DeviceInner() {
       ) {
         throw new ApprovalIdentityError(
           "Local browser identity changed; refresh and review the daemon again",
+        );
+      }
+      const derivedBrowserFingerprint = await ed25519PublicKeyFingerprint(
+        localIdentity.publicKeyWire,
+      );
+      if (
+        derivedBrowserFingerprint !== localBrowserFingerprint ||
+        registration.data.device.fingerprint !== derivedBrowserFingerprint
+      ) {
+        throw new ApprovalIdentityError(
+          "Locally derived browser fingerprint changed; refresh and review the daemon again",
         );
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
@@ -126,8 +159,8 @@ function DeviceInner() {
         host_key_fingerprint: pending.host_key_fingerprint,
         browser_device_id: registration.data.device.id,
         browser_key_algorithm: registration.data.device.key_algorithm,
-        browser_public_key: registration.data.device.public_key,
-        browser_key_fingerprint: registration.data.device.fingerprint,
+        browser_public_key: localIdentity.publicKeyWire,
+        browser_key_fingerprint: derivedBrowserFingerprint,
         signature,
       });
       if (
@@ -138,8 +171,8 @@ function DeviceInner() {
         r.host_key_fingerprint !== pending.host_key_fingerprint ||
         r.browser_device_id !== registration.data.device.id ||
         r.browser_key_algorithm !== registration.data.device.key_algorithm ||
-        r.browser_public_key !== registration.data.device.public_key ||
-        r.browser_key_fingerprint !== registration.data.device.fingerprint
+        r.browser_public_key !== localIdentity.publicKeyWire ||
+        r.browser_key_fingerprint !== derivedBrowserFingerprint
       ) {
         throw new ApprovalIdentityError(
           "Approval response changed the reviewed host or browser identity",
@@ -193,6 +226,7 @@ function DeviceInner() {
                   setLocalPinState(null);
                   setLocalPinCommitted(false);
                   setHostName(null);
+                  setLocalBrowserFingerprint(null);
                 }}
                 required
                 disabled={pending !== null}
@@ -215,10 +249,24 @@ function DeviceInner() {
               </p>
             )}
             {hostName && (
-              <p className="text-sm text-foreground" role="status">
-                Approved daemon for host <code>{hostName}</code>. It should connect within a few
-                seconds.
-              </p>
+              <div className="space-y-2 text-sm text-foreground" role="status">
+                <p>
+                  Approved daemon for host <code>{hostName}</code>. It should connect after you
+                  complete reciprocal browser verification on that host.
+                </p>
+                <p>This browser&apos;s locally derived full fingerprint:</p>
+                <p
+                  className="break-all font-mono text-sm font-semibold"
+                  data-testid="browser-key-fingerprint"
+                >
+                  {localBrowserFingerprint ?? "unavailable"}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  At the <code>spawnd login</code> prompt, enter this exact full value. For a
+                  non-interactive login, pass it as <code>--expect-browser-fingerprint</code>. Do
+                  not shorten, retype, or change its case.
+                </p>
+              </div>
             )}
             {pending ? (
               <div className="space-y-3 rounded-md border p-3">
@@ -257,14 +305,16 @@ function DeviceInner() {
                     Exact host fingerprint saved locally. Server approval can be retried safely.
                   </p>
                 )}
-                <p className="text-sm">Approving browser fingerprint:</p>
+                <p className="text-sm">This browser&apos;s locally derived full fingerprint:</p>
                 <p
                   className="break-all font-mono text-sm font-semibold"
                   data-testid="browser-key-fingerprint"
                 >
-                  {registration.data?.status === "ready"
-                    ? registration.data.device.fingerprint
-                    : "unavailable"}
+                  {localBrowserFingerprint ?? "unavailable"}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Keep this exact full value available. After approval, copy it to the waiting
+                  daemon prompt; the daemon will not trust the server to supply it.
                 </p>
                 <div className="flex gap-2">
                   <Button
@@ -289,6 +339,7 @@ function DeviceInner() {
                       setPending(null);
                       setLocalPinState(null);
                       setLocalPinCommitted(false);
+                      setLocalBrowserFingerprint(null);
                     }}
                   >
                     Back

@@ -36,7 +36,7 @@ cleanup() {
     wait "$server_pid" 2>/dev/null || true
   fi
   if [[ "$status" != "0" ]]; then
-    for log in "${server_log:-}" "${login_out:-}" "${login_err:-}" "${login_out_2:-}" "${login_err_2:-}" "${status_out:-}" "${status_err:-}"; do
+    for log in "${server_log:-}" "${login_out:-}" "${login_err:-}" "${login_out_2:-}" "${login_err_2:-}" "${login_out_3:-}" "${login_err_3:-}" "${status_out:-}" "${status_err:-}"; do
       if [[ -n "$log" && -f "$log" ]]; then
         printf '%s\n' "---- $(basename "$log") ----" >&2
         tail -200 "$log" >&2 || true
@@ -68,10 +68,16 @@ login_out="$tmp_dir/login.out"
 login_err="$tmp_dir/login.err"
 login_out_2="$tmp_dir/login-2.out"
 login_err_2="$tmp_dir/login-2.err"
+login_out_3="$tmp_dir/login-3.out"
+login_err_3="$tmp_dir/login-3.err"
 status_out="$tmp_dir/status.out"
 status_err="$tmp_dir/status.err"
 approved_browser="$tmp_dir/approved-browser.json"
 approved_browser_2="$tmp_dir/approved-browser-2.json"
+approved_browser_3="$tmp_dir/approved-browser-3.json"
+browser_identity="$tmp_dir/browser-identity.json"
+browser_identity_2="$tmp_dir/browser-identity-2.json"
+browser_identity_3="$tmp_dir/browser-identity-3.json"
 mkdir -p "$home"
 
 printf '%s\n' "smoke-local-login: building spawnd"
@@ -145,6 +151,53 @@ except urllib.error.HTTPError as error:
 PY
 )"
 
+create_browser_identity() {
+  local output="$1"
+  (
+    cd server
+    uv run python - "$output" <<'PY'
+import base64
+import hashlib
+import json
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+def wire(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+key = Ed25519PrivateKey.generate()
+seed = key.private_bytes_raw()
+public = key.public_key().public_bytes_raw()
+fingerprint = "SHA256:" + wire(hashlib.sha256(public).digest()[:12])
+with open(sys.argv[1], "w", encoding="utf-8") as output_file:
+    json.dump(
+        {"private_seed": wire(seed), "public_key": wire(public), "fingerprint": fingerprint},
+        output_file,
+        sort_keys=True,
+    )
+PY
+  )
+}
+
+identity_fingerprint() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as identity_file:
+    print(json.load(identity_file)["fingerprint"])
+PY
+}
+
+create_browser_identity "$browser_identity"
+create_browser_identity "$browser_identity_2"
+create_browser_identity "$browser_identity_3"
+browser_fingerprint="$(identity_fingerprint "$browser_identity")"
+browser_fingerprint_2="$(identity_fingerprint "$browser_identity_2")"
+
 printf '%s\n' "smoke-local-login: running spawnd login"
 env \
   -u SPAWN_ACCESS_TOKEN \
@@ -156,6 +209,7 @@ env \
   HOME="$home" \
   SPAWN_CONFIG_DIR="$config_dir" \
   daemon/target/debug/spawnd --server "$base_url" login --host-name cli-login-smoke --no-run \
+    --expect-browser-fingerprint "$browser_fingerprint" \
   >"$login_out" 2>"$login_err" &
 login_pid=$!
 
@@ -189,10 +243,11 @@ PY
 
 approve_device_code() {
   local code="$1"
-  local browser_output="$2"
+  local browser_identity_input="$2"
+  local browser_output="$3"
   (
   cd server
-  uv run python - "$base_url" "$user_token" "$code" "$browser_output" <<'PY'
+  uv run python - "$base_url" "$user_token" "$code" "$browser_identity_input" "$browser_output" <<'PY'
 import base64
 import json
 import sys
@@ -208,7 +263,7 @@ from spawn_server.host_pair_approval import (
     encode_host_pair_approval_transcript,
 )
 
-base_url, token, user_code, approved_browser_path = sys.argv[1:]
+base_url, token, user_code, browser_identity_path, approved_browser_path = sys.argv[1:]
 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
@@ -234,8 +289,14 @@ me_req = urllib.request.Request(base_url + "/api/me", headers=headers)
 with urllib.request.urlopen(me_req, timeout=10) as response:
     user_id = json.loads(response.read().decode())["user"]["id"]
 
-browser_key = Ed25519PrivateKey.generate()
+with open(browser_identity_path, encoding="utf-8") as browser_identity_file:
+    browser_identity = json.load(browser_identity_file)
+browser_key = Ed25519PrivateKey.from_private_bytes(
+    base64.urlsafe_b64decode(browser_identity["private_seed"] + "=")
+)
 browser_public = browser_key.public_key().public_bytes_raw()
+if wire(browser_public) != browser_identity["public_key"]:
+    raise SystemExit("prepared browser public key does not match its private seed")
 browser = post(
     "/api/browser-devices/register",
     {
@@ -289,7 +350,7 @@ PY
 }
 
 printf '%s\n' "smoke-local-login: approving first device code"
-approve_device_code "$user_code" "$approved_browser"
+approve_device_code "$user_code" "$browser_identity" "$approved_browser"
 
 wait_for_login() {
   (
@@ -301,6 +362,25 @@ wait_for_login() {
   watchdog_pid=$!
   if ! wait "$login_pid"; then
     login_pid=""
+    exit 1
+  fi
+  login_pid=""
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  watchdog_pid=""
+}
+
+wait_for_login_failure() {
+  (
+    sleep 35
+    if [[ -n "$login_pid" ]]; then
+      kill "$login_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  watchdog_pid=$!
+  if wait "$login_pid"; then
+    login_pid=""
+    printf '%s\n' "smoke-local-login: substituted browser unexpectedly completed login" >&2
     exit 1
   fi
   login_pid=""
@@ -325,6 +405,7 @@ env \
   HOME="$home" \
   SPAWN_CONFIG_DIR="$config_dir" \
   daemon/target/debug/spawnd --server "$base_url" login --host-name cli-login-smoke --no-run \
+  --expect-browser-fingerprint "$browser_fingerprint_2" \
   >"$login_out_2" 2>"$login_err_2" &
 login_pid=$!
 
@@ -356,10 +437,63 @@ PY
 )"
 
 printf '%s\n' "smoke-local-login: approving second device code"
-approve_device_code "$user_code_2" "$approved_browser_2"
+approve_device_code "$user_code_2" "$browser_identity_2" "$approved_browser_2"
 wait_for_login
 grep -F "enter code:" "$login_out_2" >/dev/null
 grep -F "logged in. host_id =" "$login_out_2" >/dev/null
+
+printf '%s\n' "smoke-local-login: rejecting a server-substituted browser before credential write"
+env \
+  -u SPAWN_ACCESS_TOKEN \
+  -u SPAWN_DAEMON_TOKEN \
+  -u SPAWN_HOST_ID \
+  -u SPAWN_SERVER_URL \
+  -u SPAWN_DISABLE_KEYRING \
+  -u XDG_CONFIG_HOME \
+  HOME="$home" \
+  SPAWN_CONFIG_DIR="$config_dir" \
+  daemon/target/debug/spawnd --server "$base_url" login --host-name cli-login-smoke --no-run \
+    --expect-browser-fingerprint "$browser_fingerprint" \
+  >"$login_out_3" 2>"$login_err_3" &
+login_pid=$!
+
+user_code_3="$(
+  python3 - "$db_path" "$user_code" "$user_code_2" <<'PY'
+import sqlite3
+import sys
+import time
+
+db_path, first_code, second_code = sys.argv[1:]
+for _ in range(100):
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "select user_code from device_codes where host_name = ? "
+            "and user_code not in (?, ?) order by expires_at desc limit 1",
+            ("cli-login-smoke", first_code, second_code),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
+    if row:
+        print(row[0])
+        raise SystemExit(0)
+    time.sleep(0.1)
+raise SystemExit("substitution login did not create a fresh device code")
+PY
+)"
+
+credentials_before_substitution="$tmp_dir/credentials-before-substitution.json"
+cp "$config_dir/credentials.json" "$credentials_before_substitution"
+approve_device_code "$user_code_3" "$browser_identity_3" "$approved_browser_3"
+wait_for_login_failure
+grep -F "browser fingerprint confirmation did not exactly match" "$login_err_3" >/dev/null
+cmp "$credentials_before_substitution" "$config_dir/credentials.json"
+if grep -F "logged in. host_id =" "$login_out_3" >/dev/null; then
+  printf '%s\n' "smoke-local-login: substituted browser reached logged-in output" >&2
+  exit 1
+fi
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
 env \
@@ -414,6 +548,8 @@ approved_browsers = sorted(
     ],
     key=lambda pin: pin["browser_device_id"],
 )
+for approved_browser in approved_browsers:
+    approved_browser["oob_confirmation_version"] = 1
 if creds.get("browser_pins") != approved_browsers:
     raise SystemExit(
         "daemon did not preserve both exact approving browser tuples across re-login: "

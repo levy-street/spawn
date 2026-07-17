@@ -7,6 +7,7 @@
 //!   4. Poll /api/auth/device/poll until success / expiry / denial.
 //!   5. On success store {access_token, host_id, server_url}.
 
+use std::io::{self, IsTerminal, Read, Write};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,6 +25,11 @@ use crate::proto::{
 
 pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
     let server = config::server_url(server_cli)?;
+    let expected_browser_fingerprint = args.expect_browser_fingerprint;
+    if let Some(expected) = expected_browser_fingerprint.as_deref() {
+        validate_browser_fingerprint_shape(expected)
+            .context("validating --expect-browser-fingerprint")?;
+    }
 
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
@@ -127,7 +133,15 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
-            let host_id = commit_poll_success(&mut stored, body, &identity, &server, creds::save)?;
+            let host_id = commit_poll_success(
+                &mut stored,
+                body,
+                &identity,
+                &server,
+                expected_browser_fingerprint.as_deref(),
+                prompt_for_browser_fingerprint,
+                creds::save,
+            )?;
             println!("spawn: logged in. host_id = {host_id}");
             return Ok(());
         }
@@ -170,24 +184,44 @@ fn commit_poll_success<F>(
     body: DevicePollResponse,
     identity: &HostIdentity,
     server: &url::Url,
+    expected_browser_fingerprint: Option<&str>,
+    prompt: impl FnOnce() -> Result<String>,
     persist: F,
 ) -> Result<uuid::Uuid>
 where
     F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
 {
-    commit_poll_success_observed(stored, body, identity, server, persist, |_| {})
+    commit_poll_success_observed(
+        stored,
+        body,
+        identity,
+        server,
+        BrowserFingerprintConfirmation {
+            expected: expected_browser_fingerprint,
+            prompt,
+        },
+        persist,
+        |_| {},
+    )
 }
 
-fn commit_poll_success_observed<F, O>(
+struct BrowserFingerprintConfirmation<'a, P> {
+    expected: Option<&'a str>,
+    prompt: P,
+}
+
+fn commit_poll_success_observed<F, P, O>(
     stored: &mut creds::StoredCreds,
     mut body: DevicePollResponse,
     identity: &HostIdentity,
     server: &url::Url,
+    confirmation: BrowserFingerprintConfirmation<'_, P>,
     persist: F,
     observe_wiped_token: O,
 ) -> Result<uuid::Uuid>
 where
     F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
+    P: FnOnce() -> Result<String>,
     O: FnOnce(&str),
 {
     // Take secret ownership before inspecting any other success field. Every
@@ -230,6 +264,20 @@ where
             browser_key_fingerprint,
         )
         .context("validating approved browser identity from device/poll")?;
+        let requires_confirmation = creds::browser_pin_requires_confirmation(
+            stored,
+            host_id,
+            server.as_str(),
+            &browser_pin,
+        )
+        .context("authorizing approved browser identity in the local trust domain")?;
+        if let Some(expected) = confirmation.expected {
+            verify_exact_browser_fingerprint(expected, browser_pin.fingerprint())?;
+        } else if requires_confirmation {
+            let entered = (confirmation.prompt)()?;
+            verify_exact_browser_fingerprint(&entered, browser_pin.fingerprint())?;
+        }
+        let browser_pin = creds::confirm_browser_pin(browser_pin);
         let owned_token = std::mem::take(
             &mut **token
                 .as_mut()
@@ -256,6 +304,90 @@ where
     result
 }
 
+fn verify_exact_browser_fingerprint(entered: &str, locally_derived: &str) -> Result<()> {
+    validate_browser_fingerprint_shape(entered)?;
+    if entered != locally_derived {
+        return Err(anyhow!(
+            "browser fingerprint confirmation did not exactly match the locally derived full fingerprint"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_fingerprint_shape(value: &str) -> Result<()> {
+    const PREFIX: &str = "SHA256:";
+    const SUFFIX_BYTES: usize = 16;
+    if value.len() != PREFIX.len() + SUFFIX_BYTES
+        || !value.starts_with(PREFIX)
+        || !value[PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "browser fingerprint confirmation must be one exact full SHA256: base64url value"
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_for_browser_fingerprint() -> Result<String> {
+    let stdin = io::stdin();
+    prompt_for_browser_fingerprint_from(&mut stdin.lock(), stdin.is_terminal())
+}
+
+fn prompt_for_browser_fingerprint_from(
+    reader: &mut impl Read,
+    is_terminal: bool,
+) -> Result<String> {
+    if !is_terminal {
+        return Err(anyhow!(
+            "first-contact browser trust requires an interactive terminal or --expect-browser-fingerprint with the exact full value shown by the browser"
+        ));
+    }
+    eprintln!("spawn: first contact requires reciprocal browser verification.");
+    eprintln!("spawn: copy the exact full browser fingerprint from the browser approval page.");
+    eprint!("spawn: browser fingerprint: ");
+    io::stderr()
+        .flush()
+        .context("flushing fingerprint prompt")?;
+    read_exact_fingerprint_line(reader)
+}
+
+fn read_exact_fingerprint_line(reader: &mut impl Read) -> Result<String> {
+    // 23 fingerprint bytes plus CRLF. Stop without allocating past the bound.
+    const MAX_LINE_BYTES: usize = 25;
+    let mut bytes = Vec::with_capacity(MAX_LINE_BYTES);
+    for _ in 0..MAX_LINE_BYTES {
+        let mut byte = [0_u8; 1];
+        match reader
+            .read(&mut byte)
+            .context("reading browser fingerprint")?
+        {
+            0 => {
+                return Err(anyhow!(
+                    "browser fingerprint confirmation ended before a complete line was entered"
+                ))
+            }
+            1 => {
+                bytes.push(byte[0]);
+                if byte[0] == b'\n' {
+                    if bytes.len() >= 2 && bytes[bytes.len() - 2] == b'\r' {
+                        bytes.truncate(bytes.len() - 2);
+                    } else {
+                        bytes.pop();
+                    }
+                    return String::from_utf8(bytes)
+                        .context("browser fingerprint confirmation was not UTF-8");
+                }
+            }
+            _ => unreachable!("one-byte read returned more than one byte"),
+        }
+    }
+    Err(anyhow!(
+        "browser fingerprint confirmation exceeded the exact full fingerprint bound"
+    ))
+}
+
 fn verify_poll_identity(body: &DevicePollResponse, identity: &HostIdentity) -> Result<()> {
     if body.host_key_algorithm.as_deref() != Some(identity.algorithm)
         || body.host_public_key.as_deref() != Some(identity.public_key.as_str())
@@ -280,6 +412,7 @@ mod tests {
     use super::*;
 
     const BROWSER_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    const BROWSER_FINGERPRINT: &str = "SHA256:If4x36FUomFia_hU";
 
     fn identity() -> HostIdentity {
         HostIdentity {
@@ -334,6 +467,8 @@ mod tests {
             complete_response(),
             &identity(),
             &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!("explicit confirmation must not prompt"),
             |candidate, _| {
                 persisted.set(true);
                 assert_eq!(candidate.browser_pins().len(), 1);
@@ -360,6 +495,8 @@ mod tests {
             wrong_host,
             &identity(),
             &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!("invalid response must not prompt"),
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -373,6 +510,8 @@ mod tests {
             missing_token,
             &identity(),
             &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!("invalid response must not prompt"),
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -386,6 +525,8 @@ mod tests {
             missing_host_id,
             &identity(),
             &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!("invalid response must not prompt"),
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -400,6 +541,8 @@ mod tests {
                 invalid,
                 &identity(),
                 &server,
+                Some(BROWSER_FINGERPRINT),
+                || unreachable!("invalid response must not prompt"),
                 |_, _| Ok(()),
             )
             .unwrap_err();
@@ -444,6 +587,10 @@ mod tests {
                 body,
                 &identity(),
                 &server,
+                BrowserFingerprintConfirmation {
+                    expected: Some(BROWSER_FINGERPRINT),
+                    prompt: || unreachable!("invalid response must not prompt"),
+                },
                 |_, _| {
                     persisted.set(true);
                     Ok(())
@@ -498,6 +645,8 @@ mod tests {
                 body,
                 &identity(),
                 &server,
+                Some(BROWSER_FINGERPRINT),
+                || unreachable!("invalid response must not prompt"),
                 |_, _| {
                     persisted.set(true);
                     Ok(())
@@ -523,5 +672,312 @@ mod tests {
             error: None,
         };
         assert!(poll_has_success_fields(&body));
+    }
+
+    #[test]
+    fn exact_fingerprint_confirmation_rejects_every_non_exact_form() {
+        assert!(verify_exact_browser_fingerprint(BROWSER_FINGERPRINT, BROWSER_FINGERPRINT).is_ok());
+        for entered in [
+            "SHA256:If4x36FUomFia_h",
+            "sha256:If4x36FUomFia_hU",
+            "SHA256:if4x36FUomFia_hU",
+            "SHA256:If4x36FUomFia_hU ",
+            " SHA256:If4x36FUomFia_hU",
+            "If4x36FUomFia_hU",
+            "SHA256:not-a-fingerprint",
+            "",
+        ] {
+            assert!(verify_exact_browser_fingerprint(entered, BROWSER_FINGERPRINT).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_interactive_entry_accepts_only_an_exact_complete_line() {
+        for line in [
+            format!("{BROWSER_FINGERPRINT}\n"),
+            format!("{BROWSER_FINGERPRINT}\r\n"),
+        ] {
+            assert_eq!(
+                prompt_for_browser_fingerprint_from(&mut line.as_bytes(), true).unwrap(),
+                BROWSER_FINGERPRINT
+            );
+        }
+        for line in [
+            BROWSER_FINGERPRINT.to_owned(),
+            format!("{BROWSER_FINGERPRINT}extra\n"),
+        ] {
+            assert!(prompt_for_browser_fingerprint_from(&mut line.as_bytes(), true).is_err());
+        }
+        for line in [format!("{BROWSER_FINGERPRINT} \n"), "\n".to_owned()] {
+            let entered = prompt_for_browser_fingerprint_from(&mut line.as_bytes(), true).unwrap();
+            assert!(verify_exact_browser_fingerprint(&entered, BROWSER_FINGERPRINT).is_err());
+        }
+        assert!(prompt_for_browser_fingerprint_from(
+            &mut format!("{BROWSER_FINGERPRINT}\n").as_bytes(),
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_contact_requires_confirmation_but_known_exact_pin_relogin_does_not_prompt() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut stored = creds::StoredCreds::default();
+        let prompt_calls = std::cell::Cell::new(0);
+        commit_poll_success(
+            &mut stored,
+            complete_response(),
+            &identity(),
+            &server,
+            None,
+            || {
+                prompt_calls.set(prompt_calls.get() + 1);
+                Ok(BROWSER_FINGERPRINT.to_owned())
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(prompt_calls.get(), 1);
+
+        commit_poll_success(
+            &mut stored,
+            complete_response(),
+            &identity(),
+            &server,
+            None,
+            || {
+                prompt_calls.set(prompt_calls.get() + 1);
+                Err(anyhow!("known pin unexpectedly prompted"))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(prompt_calls.get(), 1);
+        assert_eq!(stored.browser_pins().len(), 1);
+    }
+
+    #[test]
+    fn legacy_server_mediated_pin_promotes_only_after_oob_and_successful_atomic_save() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut legacy = creds::StoredCreds::default();
+        legacy.host_id = Some(uuid::Uuid::nil());
+        legacy.server_url = Some(server.to_string());
+        let unconfirmed = creds::browser_pin_from_approval(
+            "11111111-2222-4333-8444-555555555555",
+            "ed25519",
+            BROWSER_KEY,
+            BROWSER_FINGERPRINT,
+        )
+        .unwrap();
+        assert!(creds::merge_browser_pin(&mut legacy, unconfirmed).unwrap());
+        assert!(legacy
+            .browser_pin(uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap())
+            .is_none());
+
+        let mut failed = legacy.clone();
+        let prompted = std::cell::Cell::new(false);
+        assert!(commit_poll_success(
+            &mut failed,
+            complete_response(),
+            &identity(),
+            &server,
+            None,
+            || {
+                prompted.set(true);
+                Ok(BROWSER_FINGERPRINT.to_owned())
+            },
+            |candidate, _| {
+                assert!(candidate.browser_pins()[0].is_oob_confirmed());
+                Err(anyhow!("injected legacy promotion save failure"))
+            },
+        )
+        .is_err());
+        assert!(prompted.get());
+        assert!(!failed.browser_pins()[0].is_oob_confirmed());
+        assert!(failed
+            .browser_pin(uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap())
+            .is_none());
+        assert!(failed.access_token.is_none());
+
+        commit_poll_success(
+            &mut legacy,
+            complete_response(),
+            &identity(),
+            &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!(),
+            |candidate, _| {
+                assert!(candidate.browser_pins()[0].is_oob_confirmed());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(legacy.browser_pins()[0].is_oob_confirmed());
+        assert!(legacy
+            .browser_pin(uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn substituted_key_and_confirmation_failure_wipe_token_without_persisting() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let substituted_key =
+            spawnd::signed_signal::public_key_to_wire(&signing_key.verifying_key());
+        let mut body = complete_response();
+        body.browser_public_key = Some(substituted_key.clone());
+        body.browser_key_fingerprint =
+            Some(creds::browser_key_fingerprint(&substituted_key).unwrap());
+        let persisted = std::cell::Cell::new(false);
+        let wiped = std::cell::Cell::new(false);
+        assert!(commit_poll_success_observed(
+            &mut creds::StoredCreds::default(),
+            body,
+            &identity(),
+            &server,
+            BrowserFingerprintConfirmation {
+                expected: Some(BROWSER_FINGERPRINT),
+                prompt: || unreachable!("explicit confirmation must not prompt"),
+            },
+            |_, _| {
+                persisted.set(true);
+                Ok(())
+            },
+            |token| {
+                wiped.set(true);
+                assert!(token.is_empty());
+            },
+        )
+        .is_err());
+        assert!(wiped.get());
+        assert!(!persisted.get());
+    }
+
+    #[test]
+    fn known_pin_device_key_and_domain_conflicts_fail_before_prompt_or_persist() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut stored = creds::StoredCreds::default();
+        commit_poll_success(
+            &mut stored,
+            complete_response(),
+            &identity(),
+            &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        let mut id_conflict = complete_response();
+        id_conflict.browser_device_id = Some("22222222-2222-4222-8222-222222222222".into());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        let other_key = spawnd::signed_signal::public_key_to_wire(&signing_key.verifying_key());
+        let mut key_conflict = complete_response();
+        key_conflict.browser_public_key = Some(other_key.clone());
+        key_conflict.browser_key_fingerprint =
+            Some(creds::browser_key_fingerprint(&other_key).unwrap());
+        let mut host_conflict = complete_response();
+        host_conflict.host_id = Some(uuid::Uuid::from_u128(9));
+        for (body, origin) in [
+            (id_conflict, "https://spawn.example/"),
+            (key_conflict, "https://spawn.example/"),
+            (host_conflict, "https://spawn.example/"),
+            (complete_response(), "https://other.example/"),
+        ] {
+            let persisted = std::cell::Cell::new(false);
+            let prompt_called = std::cell::Cell::new(false);
+            assert!(commit_poll_success(
+                &mut stored,
+                body,
+                &identity(),
+                &url::Url::parse(origin).unwrap(),
+                None,
+                || {
+                    prompt_called.set(true);
+                    Ok(BROWSER_FINGERPRINT.to_owned())
+                },
+                |_, _| {
+                    persisted.set(true);
+                    Ok(())
+                },
+            )
+            .is_err());
+            assert!(!prompt_called.get());
+            assert!(!persisted.get());
+        }
+    }
+
+    #[test]
+    fn capacity_and_save_failure_abort_after_confirmation_with_token_wiped() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut full = creds::StoredCreds::default();
+        full.host_id = Some(uuid::Uuid::nil());
+        full.server_url = Some(server.to_string());
+        for index in 0..creds::MAX_BROWSER_PINS {
+            let signing_key =
+                ed25519_dalek::SigningKey::from_bytes(&[(index as u8).saturating_add(50); 32]);
+            let public_key =
+                spawnd::signed_signal::public_key_to_wire(&signing_key.verifying_key());
+            let fingerprint = creds::browser_key_fingerprint(&public_key).unwrap();
+            let pin = creds::browser_pin_from_approval(
+                &uuid::Uuid::from_u128(index as u128 + 1).to_string(),
+                "ed25519",
+                &public_key,
+                &fingerprint,
+            )
+            .unwrap();
+            assert!(creds::merge_browser_pin(&mut full, pin).unwrap());
+        }
+        let prompted = std::cell::Cell::new(false);
+        let persisted = std::cell::Cell::new(false);
+        let wiped = std::cell::Cell::new(false);
+        assert!(commit_poll_success_observed(
+            &mut full,
+            complete_response(),
+            &identity(),
+            &server,
+            BrowserFingerprintConfirmation {
+                expected: None,
+                prompt: || {
+                    prompted.set(true);
+                    Ok(BROWSER_FINGERPRINT.to_owned())
+                },
+            },
+            |_, _| {
+                persisted.set(true);
+                Ok(())
+            },
+            |token| {
+                wiped.set(true);
+                assert!(token.is_empty());
+            },
+        )
+        .is_err());
+        assert!(!prompted.get());
+        assert!(!persisted.get());
+        assert!(wiped.get());
+
+        let mut empty = creds::StoredCreds::default();
+        let wiped = std::cell::Cell::new(false);
+        let error = commit_poll_success_observed(
+            &mut empty,
+            complete_response(),
+            &identity(),
+            &server,
+            BrowserFingerprintConfirmation {
+                expected: Some(BROWSER_FINGERPRINT),
+                prompt: || unreachable!(),
+            },
+            |_, _| Err(anyhow!("injected confirmed-login save failure")),
+            |token| {
+                wiped.set(true);
+                assert!(token.is_empty());
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected confirmed-login save failure"));
+        assert!(wiped.get());
+        assert!(empty.access_token.is_none());
+        assert!(empty.browser_pins().is_empty());
     }
 }
