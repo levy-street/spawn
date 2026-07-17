@@ -8,6 +8,7 @@ export const AGENT_ID = "00000000-0000-4000-8000-000000000004";
 export const SKILL_ID = "00000000-0000-4000-8000-000000000006";
 export const SCREEN_ID = "00000000-0000-4000-8000-000000000007";
 export const AGENT_B_ID = "00000000-0000-4000-8000-000000000008";
+export const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
 
 export const user = {
@@ -147,6 +148,7 @@ export async function mockAuthenticatedApi(
   const hostList = options.hosts ?? [host];
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
+  const browserDeviceList: Array<Record<string, unknown>> = [];
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -526,6 +528,55 @@ export async function mockAuthenticatedApi(
 
     if (path === "/api/me") {
       await route.fulfill({ status: 200, contentType: "application/json", json: { user } });
+      return;
+    }
+    if (path === "/api/browser-devices/register" && method === "POST") {
+      const body = (await request.postDataJSON()) as Record<string, string>;
+      let device = browserDeviceList.find((item) => item.public_key === body.public_key);
+      if (!device) {
+        const digest = createHash("sha256")
+          .update(Buffer.from(body.public_key, "base64url"))
+          .digest()
+          .subarray(0, 12)
+          .toString("base64url");
+        device = {
+          id:
+            browserDeviceList.length === 0
+              ? BROWSER_DEVICE_ID
+              : `00000000-0000-4000-8000-${String(browserDeviceList.length + 9).padStart(12, "0")}`,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: `SHA256:${digest}`,
+          created_at: CREATED_AT,
+          revoked_at: null,
+        };
+        browserDeviceList.push(device);
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      return;
+    }
+    if (path === "/api/browser-devices" && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: browserDeviceList,
+      });
+      return;
+    }
+    const browserRevokeMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/revoke$/);
+    if (browserRevokeMatch && method === "POST") {
+      const body = (await request.postDataJSON()) as { expected_public_key?: string };
+      const device = browserDeviceList.find((item) => item.id === browserRevokeMatch[1]);
+      if (!device) {
+        await route.fulfill({ status: 404, json: { detail: "browser device not found" } });
+        return;
+      }
+      if (device.public_key !== body.expected_public_key) {
+        await route.fulfill({ status: 409, json: { detail: "browser device changed" } });
+        return;
+      }
+      device.revoked_at ??= CREATED_AT;
+      await route.fulfill({ status: 200, contentType: "application/json", json: device });
       return;
     }
     if (path === "/api/hosts") {

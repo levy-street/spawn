@@ -268,6 +268,16 @@ export const AuthProviderListSchema = z.object({
 });
 export type AuthProviderList = z.infer<typeof AuthProviderListSchema>;
 
+export const BrowserDeviceSchema = z.object({
+  id: z.string().uuid(),
+  key_algorithm: z.literal("ed25519"),
+  public_key: z.string().length(43),
+  fingerprint: z.string().startsWith("SHA256:"),
+  created_at: z.string(),
+  revoked_at: z.string().nullable(),
+});
+export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
+
 // ---------- Endpoints ----------
 
 export const auth = {
@@ -346,6 +356,26 @@ export const hosts = {
       method: "PATCH",
       body: JSON.stringify(body),
       schema: HostToolPolicySchema,
+    }),
+};
+
+export const browserDevices = {
+  register: (body: { key_algorithm: "ed25519"; public_key: string; signature: string }) =>
+    api("/api/browser-devices/register", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: BrowserDeviceSchema,
+    }),
+  list: () =>
+    api("/api/browser-devices", {
+      method: "GET",
+      schema: z.array(BrowserDeviceSchema),
+    }),
+  revoke: (deviceId: string, expectedPublicKey: string) =>
+    api(`/api/browser-devices/${deviceId}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ expected_public_key: expectedPublicKey }),
+      schema: BrowserDeviceSchema,
     }),
 };
 

@@ -372,15 +372,13 @@ forbidden sets. They never parse English semantics, render Markdown/HTML, or
 maintain a generated prose inventory. The bounded shell guard can detect a
 missing canonical marker; it cannot approve this ADR or prove a runtime claim.
 
-**Parallel Phase 3 foundations (active):** P3-IDENTITY-01A owns the canonical
-Ed25519/envelope/fingerprint primitives and test vectors. P3-IDENTITY-01B owns
-host identity-key persistence and explicit pairing/re-pairing against that
-contract. Their branches start from reviewed master and may proceed in parallel
-with remaining Phase 2 cleanup. Neither foundation means signaling is signed,
-and each task plus later integration still requires its own tests, independent
-review, mergeability proof, and accepted gate.
+**Parallel Phase 3 foundations:** reviewed P3-IDENTITY-01A is integrated at
+`ab20cbc`; reviewed P3-IDENTITY-01B is integrated through `e34d412`; and
+reviewed P3-IDENTITY-02A is integrated at `37c91d4`. These establish canonical
+Ed25519 transcripts, durable daemon pairing keys, and account-scoped
+non-extractable browser-local keys. They do not make live signaling signed.
 
-**P3-IDENTITY-02A browser identity (implemented, review pending):** the bounded
+**P3-IDENTITY-02A browser identity (reviewed and integrated at `37c91d4`):** the bounded
 browser library now persists one versioned, account-scoped, non-extractable
 Ed25519 private key in IndexedDB and exposes only the public key plus an opaque
 signing operation. Serialized first-writer creation makes concurrent tabs load
@@ -396,8 +394,30 @@ This is a local storage/library foundation only. It is not wired to server
 registration, login, pairing, TOFU, signaling, or any API payload, and it does
 not make agent or host signaling signed. The private key remains an opaque
 non-extractable `CryptoKey`; no private bytes or JWK are exported, logged, put in
-Web Storage, or sent to the server. Independent review and mergeability proof
-are still required before 02A is accepted.
+Web Storage, or sent to the server. Its independent review and mergeability
+gate passed before integration.
+
+**P3-IDENTITY-02B account registry (implemented, review pending):** an
+authenticated browser signs the fixed-width, domain-separated
+`SPAWN-BROWSER-REGISTER-V1` transcript containing the server-authenticated user
+UUID and exact browser public key. The server strictly preflights key/signature
+wire widths, reuses the accepted non-weak Ed25519 contract, verifies possession,
+derives the fingerprint, and records one globally account-bound immutable key
+with a retained revocation tombstone. Same-account/key registration is
+idempotent. Static proof replay is therefore possible only for that same
+authenticated account/key; no challenge or Redis state is required.
+
+Authenticated browser lifecycle registration is loud but does not lock users
+out of logout, settings, device listing, revocation, or recovery. Revocation
+requires both server device ID and expected public key. A current-browser
+revocation records public-key-only local cleanup state, deletes the IndexedDB
+key only after server confirmation, exposes retry after partial failure, and
+requires an explicit action before generating a replacement. No private key,
+JWK, or signature enters Web Storage or logs.
+
+P3-IDENTITY-02B still does **not** bind a browser key into daemon host pairing,
+does not add peer-key discovery or TOFU continuity, and does not wire signatures
+into live agent/host RTC signaling. No live signaling/TOFU security claim exists.
 
 The P2-DATA-01 checkpoint described above remains documentation only. No
 endpoint protected-data store, DataChannel operation, migration, server-column
@@ -410,9 +430,9 @@ until the decision passes review and is merged.
    `5d99ebb4` and the P2-HOST-02 filesystem cut merged at `4e7c89b`; do not
    restore REST/WS compatibility content paths while integrating later work.
 2. Finish independent review of the bounded P2-DATA-01 design and the parallel
-   P2-HOST-03A interactive installer candidate. In parallel, continue the
-   independently gated P3-IDENTITY-01A crypto and P3-IDENTITY-01B host-pairing
-   foundations without claiming signed signaling. Keep the legacy tool route
+   P2-HOST-03A interactive installer candidate. In parallel, independently
+   review P3-IDENTITY-02B without claiming host-pairing integration, TOFU, or
+   signed signaling. Keep the legacy tool route
    until its endpoint-owned durable targets exist; this wave is not the final
    tool cut.
 3. Only after P2-DATA-01 and P2-HOST-03A have passed independent review and
@@ -431,9 +451,9 @@ until the decision passes review and is merged.
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-5. After the active Phase 3 foundations, including bounded browser identity
-   P3-IDENTITY-02A, pass their own reviews, separately integrate registration,
-   TOFU/fingerprint UX, and signed signaling bound to SDP, session,
+5. After browser account registration P3-IDENTITY-02B passes its own review,
+   separately integrate peer-key discovery, TOFU/fingerprint continuity, and
+   signed signaling bound to SDP, session,
    agent-or-host scope, protocol version, sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and
    cross-session/cross-scope replay for both agent- and host-scoped peer

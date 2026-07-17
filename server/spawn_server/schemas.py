@@ -7,7 +7,12 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
-from .host_identity import decode_host_public_key, host_key_fingerprint
+from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
+from .host_identity import (
+    decode_ed25519_public_key,
+    decode_host_public_key,
+    host_key_fingerprint,
+)
 
 # ---------- auth ----------
 
@@ -36,6 +41,47 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     user: UserOut
+
+
+# ---------- browser devices ----------
+
+
+class BrowserDeviceRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key_algorithm: Literal["ed25519"]
+    public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
+
+class BrowserDeviceRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("expected_public_key")
+    @classmethod
+    def validate_expected_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
+
+class BrowserDeviceOut(BaseModel):
+    id: str
+    key_algorithm: Literal["ed25519"]
+    public_key: str
+    fingerprint: str
+    created_at: datetime
+    revoked_at: datetime | None = None
 
 
 class AuthProviderOut(BaseModel):

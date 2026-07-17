@@ -17,6 +17,7 @@ from .redis import lifespan_startup as redis_startup
 from .routes import agents as agents_routes
 from .routes import auth as auth_routes
 from .routes import auth_providers as auth_providers_routes
+from .routes import browser_devices as browser_devices_routes
 from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
 from .routes import hosts as hosts_routes
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)
     app.include_router(auth_providers_routes.router)
+    app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
     app.include_router(hosts_routes.router)

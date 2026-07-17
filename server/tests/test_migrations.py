@@ -80,8 +80,13 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
         device_uniques = {
             constraint["name"] for constraint in inspector.get_unique_constraints("device_codes")
         }
+        browser_device_uniques = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("browser_devices")
+        }
         assert "uq_hosts_host_public_key" in host_uniques
         assert "uq_device_codes_host_public_key" in device_uniques
+        assert "uq_browser_devices_public_key" in browser_device_uniques
 
         with engine.begin() as conn:
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()

@@ -69,11 +69,9 @@ def _decode_strict_ed25519_point(raw: bytes) -> tuple[int, int]:
     return x, y
 
 
-def decode_host_public_key(algorithm: str, encoded: str) -> bytes:
-    """Decode an exact canonical unpadded base64url Ed25519 public key."""
+def decode_ed25519_public_key(encoded: str) -> bytes:
+    """Decode an exact canonical unpadded base64url non-weak Ed25519 public key."""
 
-    if algorithm != HOST_KEY_ALGORITHM:
-        raise HTTPException(status_code=422, detail="unsupported host key algorithm")
     if len(encoded) != ED25519_PUBLIC_KEY_B64URL_LENGTH or "=" in encoded:
         raise HTTPException(status_code=422, detail="invalid Ed25519 public key")
     try:
@@ -90,10 +88,26 @@ def decode_host_public_key(algorithm: str, encoded: str) -> bytes:
     return raw
 
 
-def host_key_fingerprint(algorithm: str, encoded: str) -> str:
-    """Return the server-derived 96-bit short fingerprint shown at approval."""
+def ed25519_key_fingerprint(encoded: str) -> str:
+    """Return the server-derived 96-bit short fingerprint for an Ed25519 key."""
 
-    raw = decode_host_public_key(algorithm, encoded)
+    raw = decode_ed25519_public_key(encoded)
     digest = hashlib.sha256(raw).digest()[:FINGERPRINT_HASH_BYTES]
     short = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return f"SHA256:{short}"
+
+
+def decode_host_public_key(algorithm: str, encoded: str) -> bytes:
+    """Compatibility wrapper for the host-pairing identity contract."""
+
+    if algorithm != HOST_KEY_ALGORITHM:
+        raise HTTPException(status_code=422, detail="unsupported host key algorithm")
+    return decode_ed25519_public_key(encoded)
+
+
+def host_key_fingerprint(algorithm: str, encoded: str) -> str:
+    """Return the server-derived 96-bit short fingerprint shown at approval."""
+
+    if algorithm != HOST_KEY_ALGORITHM:
+        raise HTTPException(status_code=422, detail="unsupported host key algorithm")
+    return ed25519_key_fingerprint(encoded)

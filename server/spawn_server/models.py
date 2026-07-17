@@ -44,6 +44,38 @@ class User(Base):
     skills: Mapped[list[Skill]] = relationship(back_populates="owner")
     auth_identities: Mapped[list[AuthIdentity]] = relationship(back_populates="user")
     auth_provider_states: Mapped[list[AuthProviderState]] = relationship(back_populates="user")
+    browser_devices: Mapped[list[BrowserDevice]] = relationship(back_populates="owner")
+
+
+class BrowserDevice(Base):
+    """Account-bound browser Ed25519 key, retained after revocation as a tombstone."""
+
+    __tablename__ = "browser_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key_algorithm: Mapped[str] = mapped_column(String(16), nullable=False)
+    public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    owner: Mapped[User] = relationship(back_populates="browser_devices")
+
+    __table_args__ = (
+        CheckConstraint(
+            "key_algorithm = 'ed25519' AND length(public_key) = 43",
+            name="ck_browser_devices_ed25519_key",
+        ),
+        UniqueConstraint(
+            "key_algorithm",
+            "public_key",
+            name="uq_browser_devices_public_key",
+        ),
+    )
 
 
 class AuthIdentity(Base):

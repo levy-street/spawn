@@ -1,5 +1,8 @@
+import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import {
   ED25519_PUBLIC_KEY_WIRE_CHARS,
+  ED25519_SIGNATURE_BYTES,
+  encodeBase64Url,
   exportEd25519PublicKey,
   exportEd25519PublicKeyWire,
   generateEd25519IdentityKeyPair,
@@ -20,6 +23,7 @@ const SELF_CHECK_SDP = "v=0\r\ns=spawn-browser-device-identity-self-check\r\n";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const RECORD_KEYS = ["accountId", "privateKey", "publicKey", "publicKeyWire", "version"] as const;
+const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, StoredDeviceIdentityV1>();
 
 interface StoredDeviceIdentityV1 {
   accountId: string;
@@ -391,7 +395,39 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
     publicKeyWire: record.publicKeyWire,
     sign: (transcript) => signSignedSignalTranscript(record.privateKey, transcript),
   };
+  privateIdentityRecords.set(identity, record);
   return Object.freeze(identity);
+}
+
+/**
+ * Produce the one bounded account-registration proof without exposing a raw
+ * private-key handle or a generic byte-signing primitive to callers.
+ */
+export async function createBrowserDeviceRegistrationProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, record.publicKeyWire);
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "browser registration signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
 }
 
 /**
@@ -418,6 +454,24 @@ export async function loadOrCreateBrowserDeviceIdentity(
     const candidate = await createCandidate(accountId);
     const winner = await addCandidateOrLoadWinner(database, accountId, candidate);
     return publicIdentity(await validateStoredRecord(winner, accountId));
+  } finally {
+    database.close();
+  }
+}
+
+/** Load and validate an existing identity without ever generating a replacement. */
+export async function loadBrowserDeviceIdentity(
+  accountId: string,
+  options: BrowserDeviceIdentityStorageOptions = {},
+): Promise<BrowserDeviceIdentity | null> {
+  assertAccountId(accountId);
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+  try {
+    const stored = await getStoredRecord(database, accountId);
+    return stored === undefined
+      ? null
+      : publicIdentity(await validateStoredRecord(stored, accountId));
   } finally {
     database.close();
   }

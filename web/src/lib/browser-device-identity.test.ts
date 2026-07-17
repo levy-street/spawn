@@ -6,9 +6,11 @@ import {
   BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
   BROWSER_DEVICE_IDENTITY_STORE_NAME,
   BrowserDeviceIdentityError,
+  createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
+import { verifyBrowserDeviceRegistrationProof } from "./browser-device-registration-transcript";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
@@ -158,6 +160,19 @@ async function expectIdentityError(
 }
 
 describe("browser device identity", () => {
+  test("creates only the account-bound registration proof for its opaque private key", async () => {
+    const factory = new IDBFactory();
+    const accountId = "00000000-0000-4000-8000-000000000001";
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const signature = await createBrowserDeviceRegistrationProof(identity, accountId);
+    expect(
+      await verifyBrowserDeviceRegistrationProof(accountId, identity.publicKeyWire, signature),
+    ).toBe(true);
+    await expect(
+      createBrowserDeviceRegistrationProof(identity, "00000000-0000-4000-8000-000000000002"),
+    ).rejects.toThrow("does not belong");
+  });
+
   test("persists one non-extractable account key and reloads only its public handle", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);

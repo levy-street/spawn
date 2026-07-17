@@ -10,6 +10,7 @@ import {
   useLayoutEffect,
   useState,
 } from "react";
+import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
 import { Button } from "@/components/ui/button";
@@ -133,6 +134,7 @@ export function AppShell({
 
         {/* Main column */}
         <div className="flex min-w-0 flex-1 flex-col">
+          <BrowserDeviceRegistrationStatus />
           {/* Top bar (mobile only) */}
           <header
             className={cn(

@@ -47,9 +47,6 @@ check_tree() {
 
   require_task_status "$tasks" P2-DATA-01 "ACTIVE — BOUNDED DESIGN, REVIEW PENDING"
   require_task_status "$tasks" P2-DATA-02 BLOCKED
-  require_task_status "$tasks" P3-IDENTITY-01A "ACTIVE — PARALLEL FOUNDATION"
-  require_task_status "$tasks" P3-IDENTITY-01B "ACTIVE — PARALLEL FOUNDATION"
-  require_task_status "$tasks" P3-IDENTITY-02 PLANNED
   require_declaration "$adr" data01_runtime design_only_not_implemented
   require_declaration "$adr" p2_data_01_status proposed_independent_review_pending
   require_declaration "$adr" phase2_completion incomplete
@@ -62,7 +59,6 @@ check_tree() {
   require_literal "$adr" 'Spawn will use an **endpoint-local canonical store per host**'
   require_literal "$adr" 'The server never receives a store root key, object data key, recovery'
   require_literal "$progress" '**P2-DATA-01 bounded design candidate (independent review pending):**'
-  require_literal "$progress" '**Parallel Phase 3 foundations (active):**'
   require_literal "$policy" 'Source guards must not parse or classify English semantics.'
   require_literal "$policy" '`backup/p2-data-guard-interrupted-20260716`'
   require_literal "$root/proto/README.md" 'does not advertise a runtime capability today.'

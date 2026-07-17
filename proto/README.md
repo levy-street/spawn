@@ -7,6 +7,10 @@ The Phase 3 signed RTC offer/answer transcript is specified in
 [`SIGNED_SIGNAL_V1.md`](SIGNED_SIGNAL_V1.md). Shared Rust/WebCrypto golden
 vectors are checked in as [`signed-signal-v1-vectors.json`](signed-signal-v1-vectors.json).
 
+Authenticated browser identity registration uses
+[`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md) and
+the shared `browser-device-registration-v1-vectors.json` corpus.
+
 ## Identifiers
 
 - All IDs are UUIDv4 strings in JSON, raw 16-byte big-endian in binary frames.
@@ -46,6 +50,21 @@ Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
 so a rolling deploy does not invent or silently rotate an identity. Re-pairing
 an existing daemon pins it; a same-owner re-login with the same key reuses the
 Host row, while another owner cannot claim it.
+
+### Browser devices
+
+| Method | Path | Body / response |
+|--------|------|-----------------|
+| POST | `/api/browser-devices/register` | `{key_algorithm:"ed25519", public_key, signature}` → the account-bound device row |
+| GET | `/api/browser-devices` | current account's active and revoked device rows |
+| POST | `/api/browser-devices/{id}/revoke` | `{expected_public_key}` → the retained revoked row |
+
+Registration verifies the exact proof in
+[`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md).
+The response fingerprint is server-derived. A public key is globally immutable
+to its first account; exact active re-registration is idempotent, and a revoked
+key remains a tombstone that cannot be registered again. Revocation is scoped
+by authenticated owner, server row ID, and expected public key.
 
 ### Hosts
 
