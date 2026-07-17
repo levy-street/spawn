@@ -592,6 +592,32 @@ host signing key, and browser pins never mix across revisions. Live tests add
 and revoke a browser pin while `run` is active and prove immediate activation
 and refusal rather than stale reconnect acceptance.
 
+**P3-DAEMON-TRUST-RELOAD (implemented, independent review pending):** the
+daemon supervisor now owns exactly one validated current credential generation
+containing its access token, host signing key, canonical server-origin + exact
+Host-ID domain, and bounded browser-pin set. It rereads the complete record
+immediately before every WebSocket attempt and polls one complete load at a
+bounded 500 ms interval while connected or backing off. An unchanged revision
+must be field-for-field the same decoded record; a same-revision substitution,
+generation rollback/non-advance, reused record identity, missing login/key/domain, changed
+Host ID/origin, or corrupt/noncanonical key or pin fails closed without keeping
+the old authorization active. A valid higher generation tears down the old
+WebSocket/RTC authorization before reconnecting with its new token.
+
+RTC admission captures a trust epoch before expensive peer construction and
+rechecks it inside the serialized insertion boundary. Credential reload first
+advances that epoch while holding the admission fence and then closes all
+agent and host peers, so an offer that began on the stale control connection
+cannot finish admission after pin revocation or whole-record rotation. The
+periodic watcher owns no background task and missed ticks are skipped; the
+immediate admission reread closes the race where socket end/backoff and a
+credential commit are simultaneously ready. Unit and local-loopback WebSocket
+tests cover add/revoke, atomic token/key/pin replacement, corrupt/unavailable
+load, secret-safe errors, the simultaneous-ready reconnect case, and an active
+old-token socket closing before a new-token reconnect. This checkpoint still
+does not wire signed RTC envelopes or turn the locally stored pins into live
+signature verification, so it creates no live Phase 3 MITM-resistance claim.
+
 Live identifiers also become strict before wiring: the Date.now/Math.random
 agent-session fallback is removed. Agent and HostControl session IDs use
 `crypto.randomUUID()` or an RFC 4122 value built from `getRandomValues`, and

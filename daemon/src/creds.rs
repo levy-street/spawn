@@ -171,6 +171,22 @@ impl StoredCreds {
     }
 }
 
+impl CredentialRevision {
+    /// Return the monotonic identity of a complete current record. Live
+    /// authorization refuses legacy revisions because they cannot distinguish
+    /// a legitimate reload from rollback or same-revision substitution.
+    pub(crate) fn current_parts(&self) -> Option<(u64, Uuid)> {
+        match self.kind {
+            CredentialRevisionKind::Current {
+                generation,
+                record_id,
+                ..
+            } => Some((generation, record_id)),
+            CredentialRevisionKind::Legacy(_) => None,
+        }
+    }
+}
+
 impl Drop for StoredCreds {
     fn drop(&mut self) {
         self.wipe_sensitive_fields();
@@ -326,7 +342,7 @@ where
     Ok(inserted)
 }
 
-fn canonical_server_origin(server_url: &str) -> Result<String> {
+pub(crate) fn canonical_server_origin(server_url: &str) -> Result<String> {
     let parsed = url::Url::parse(server_url).context("parsing credential server URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -494,6 +510,15 @@ pub fn credential_revision(creds: &StoredCreds) -> Result<CredentialRevision> {
     Ok(CredentialRevision {
         kind: CredentialRevisionKind::Legacy(digest.into()),
     })
+}
+
+/// Revalidate a complete record at a live authorization boundary. `load()`
+/// already performs these checks, but callers deliberately repeat them before
+/// admitting a revision so injected/test loaders and future backends cannot
+/// bypass canonical pin, key, domain, or generation validation.
+pub(crate) fn validate_live_record(creds: &StoredCreds) -> Result<()> {
+    validate_loaded_creds(creds)?;
+    validate_complete_current_record(creds)
 }
 
 fn reconcile_backend_records(
@@ -838,6 +863,21 @@ pub fn load() -> Result<StoredCreds> {
 }
 
 fn load_unlocked() -> Result<StoredCreds> {
+    load_unlocked_with_keyring_warning(true)
+}
+
+/// Reload for the live supervisor. The ordinary initial load reports a Unix
+/// keyring outage once; a 500 ms monitor must not repeat that same warning
+/// indefinitely when the complete mode-0600 Unix record is the designed
+/// authoritative fallback.
+pub(crate) fn load_for_live_reload() -> Result<StoredCreds> {
+    with_credential_lock(|| {
+        cleanup_stale_credential_temps(config::credentials_path()?.as_path())?;
+        load_unlocked_with_keyring_warning(false)
+    })
+}
+
+fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> Result<StoredCreds> {
     #[cfg(unix)]
     let from_file = load_file_record()?;
     #[cfg(not(unix))]
@@ -858,7 +898,11 @@ fn load_unlocked() -> Result<StoredCreds> {
     let keyring_result = read_scoped_keyring_record(&scope, file_for_migration, platform_policy());
     #[cfg(unix)]
     {
-        resolve_unix_keyring_read(from_file, keyring_result)
+        resolve_unix_keyring_read_with_warning(
+            from_file,
+            keyring_result,
+            _warn_unix_keyring_unavailable,
+        )
     }
     #[cfg(not(unix))]
     {
@@ -880,16 +924,19 @@ fn load_unlocked() -> Result<StoredCreds> {
 }
 
 #[cfg(unix)]
-fn resolve_unix_keyring_read(
+fn resolve_unix_keyring_read_with_warning(
     mut from_file: Option<StoredCreds>,
     keyring_result: std::result::Result<Option<StoredCreds>, KeyringReadFailure>,
+    warn_unavailable: bool,
 ) -> Result<StoredCreds> {
     match keyring_result {
         Ok(from_keyring) => {
             reconcile_backend_records(from_file, from_keyring, BackendPolicy::UnixCompleteFile)
         }
         Err(failure) if failure.unavailable => {
-            tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
+            if warn_unavailable {
+                tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
+            }
             Ok(from_file.unwrap_or_default())
         }
         Err(failure) => {
@@ -2106,7 +2153,7 @@ mod tests {
             |_, _| Err(anyhow::anyhow!("unexpected keyring write during load")),
             |_| Err(anyhow::anyhow!("unexpected keyring delete during load")),
         );
-        resolve_unix_keyring_read(from_file, keyring_result)
+        resolve_unix_keyring_read_with_warning(from_file, keyring_result, true)
     }
 
     #[cfg(unix)]

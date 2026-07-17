@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::agents::AgentRegistry;
 use crate::cli::RunArgs;
 use crate::config;
-use crate::creds::{self, StoredCreds};
+use crate::creds::{self, CredentialRevision, StoredCreds};
 use crate::proto::{
     AgentCreate, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound, Outbound,
 };
@@ -32,12 +32,162 @@ const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_AGENT_COLS: u16 = 120;
 const DEFAULT_AGENT_ROWS: u16 = 32;
+/// Credential storage has no portable cross-process notification primitive.
+/// One bounded poll gives login/revocation a sub-second activation bound while
+/// keeping keyring/file reads serial and avoiding one watcher per connection.
+const CREDENTIAL_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+
+struct LiveCredentialSnapshot {
+    /// Token, host signing key, trust domain, and browser pins are owned as one
+    /// indivisible loaded record. No live code reloads individual fields.
+    record: StoredCreds,
+    revision: CredentialRevision,
+    generation: u64,
+    record_id: Uuid,
+    server_origin: String,
+    host_id: Uuid,
+}
+
+impl LiveCredentialSnapshot {
+    fn initial(record: StoredCreds, configured_server: &url::Url) -> Result<Self> {
+        let server_origin = creds::canonical_server_origin(configured_server.as_str())
+            .context("validating configured server trust origin")?;
+        Self::validated(record, server_origin, None)
+    }
+
+    fn validated(
+        record: StoredCreds,
+        server_origin: String,
+        expected_host_id: Option<Uuid>,
+    ) -> Result<Self> {
+        creds::validate_live_record(&record).context("validating live credential record")?;
+        let access_token = record
+            .access_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("no daemon token; run `spawnd login` first"))?;
+        creds::validate_login_access_token(access_token)
+            .context("validating live daemon access token")?;
+        let host_id = record
+            .host_id
+            .context("stored credentials have no registered Host ID")?;
+        if expected_host_id.is_some_and(|expected| expected != host_id) {
+            return Err(anyhow!(
+                "credential reload changed the registered Host ID; refusing live trust rotation"
+            ));
+        }
+        let stored_server = record
+            .server_url
+            .as_deref()
+            .context("stored credentials have no server trust origin")?;
+        let stored_origin = creds::canonical_server_origin(stored_server)
+            .context("validating stored server trust origin")?;
+        if stored_origin != server_origin {
+            return Err(anyhow!(
+                "stored credential server origin does not match the configured server"
+            ));
+        }
+        creds::host_identity(&record)?
+            .context("stored credentials have no host signing identity")?;
+        let revision = creds::credential_revision(&record)?;
+        let (generation, record_id) = revision.current_parts().ok_or_else(|| {
+            anyhow!(
+                "stored credentials have no revisioned whole-record generation; run `spawnd login` again"
+            )
+        })?;
+        Ok(Self {
+            record,
+            revision,
+            generation,
+            record_id,
+            server_origin,
+            host_id,
+        })
+    }
+
+    fn classify_reload(&self, record: StoredCreds) -> Result<Option<Self>> {
+        let next = Self::validated(record, self.server_origin.clone(), Some(self.host_id))?;
+        if next.revision == self.revision {
+            if next.record == self.record {
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "credential contents changed without a new whole-record revision"
+            ));
+        }
+        if next.generation <= self.generation {
+            return Err(anyhow!(
+                "credential generation rolled back or did not advance"
+            ));
+        }
+        if next.record_id == self.record_id {
+            return Err(anyhow!(
+                "credential generation advanced without a fresh record identity"
+            ));
+        }
+        Ok(Some(next))
+    }
+}
+
+enum ServeOutcome {
+    SessionEnded(Result<()>),
+    CredentialsChanged(Box<LiveCredentialSnapshot>),
+}
+
+enum ActiveSessionEvent {
+    SessionEnded(Result<()>),
+    CredentialReload(Result<Box<LiveCredentialSnapshot>>),
+}
+
+async fn wait_for_credential_change(
+    active: &LiveCredentialSnapshot,
+) -> Result<LiveCredentialSnapshot> {
+    wait_for_credential_change_with(
+        active,
+        CREDENTIAL_RELOAD_INTERVAL,
+        creds::load_for_live_reload,
+    )
+    .await
+}
+
+fn credential_change_now(
+    active: &LiveCredentialSnapshot,
+) -> Result<Option<LiveCredentialSnapshot>> {
+    credential_change_now_with(active, creds::load_for_live_reload)
+}
+
+fn credential_change_now_with<F>(
+    active: &LiveCredentialSnapshot,
+    mut load: F,
+) -> Result<Option<LiveCredentialSnapshot>>
+where
+    F: FnMut() -> Result<StoredCreds>,
+{
+    let record = load().context("reloading credentials before websocket admission")?;
+    active.classify_reload(record)
+}
+
+async fn wait_for_credential_change_with<F>(
+    active: &LiveCredentialSnapshot,
+    poll_interval: Duration,
+    mut load: F,
+) -> Result<LiveCredentialSnapshot>
+where
+    F: FnMut() -> Result<StoredCreds>,
+{
+    let start = tokio::time::Instant::now() + poll_interval;
+    let mut ticker = tokio::time::interval_at(start, poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let record = load().context("reloading the complete credential record")?;
+        if let Some(next) = active.classify_reload(record)? {
+            return Ok(next);
+        }
+    }
+}
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let stored = creds::load().context("loading stored credentials")?;
-    if !stored.is_logged_in() {
-        return Err(anyhow!("no daemon token; run `spawnd login` first"));
-    }
     // Prefer the explicit --server flag, then $SPAWN_SERVER_URL (already
     // wired into clap), then the URL we logged in against.
     let server_url = match server_cli {
@@ -48,28 +198,67 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         },
     };
     let ws_url = config::ws_url(&server_url)?;
+    let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     let registry = AgentRegistry::new();
     let rtc_sessions = RtcSessions::new();
-    if let Some(host_id) = stored.host_id {
-        let _ = rtc_sessions.bind_registered_host_id(host_id).await;
+    if !rtc_sessions
+        .bind_registered_host_id(live_credentials.host_id)
+        .await
+    {
+        return Err(anyhow!("could not bind the stored Host ID"));
     }
 
     // Ctrl-C closes only this supervisor. Session workers remain alive and
     // are adopted by the next `spawnd` process.
     let mut attempt: u32 = 0;
 
-    loop {
-        let session_fut = serve_one_connection(&stored, &ws_url, &registry, &rtc_sessions);
-        tokio::pin!(session_fut);
-
-        let res = tokio::select! {
-            r = &mut session_fut => r,
-            r = tokio::signal::ctrl_c() => {
-                r.context("ctrl-c handler")?;
-                tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
-                return Ok(());
+    'supervisor: loop {
+        // A session close or backoff timer can become ready in the same
+        // scheduler turn as a credential write. Never let that select race
+        // carry the stale snapshot into another socket: synchronously reread
+        // the whole record before every connection attempt.
+        let immediate_reload = match credential_change_now(&live_credentials) {
+            Ok(reload) => reload,
+            Err(error) => {
+                rtc_sessions.invalidate_trust_and_close_all().await;
+                return Err(error);
             }
+        };
+        if let Some(next) = immediate_reload {
+            // The prior socket-end branch may have won over a simultaneously
+            // ready reload. Its ordinary close cannot authorize an offer that
+            // was already waiting at RTC insertion, so advance the trust
+            // epoch here before accepting the newly observed generation.
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            live_credentials = next;
+            attempt = 0;
+        }
+        let outcome = {
+            let session_fut =
+                serve_one_connection(&live_credentials, &ws_url, &registry, &rtc_sessions);
+            tokio::pin!(session_fut);
+
+            tokio::select! {
+                r = &mut session_fut => r,
+                r = tokio::signal::ctrl_c() => {
+                    r.context("ctrl-c handler")?;
+                    tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+                    return Ok(());
+                }
+            }
+        }?;
+        let res = match outcome {
+            ServeOutcome::CredentialsChanged(next) => {
+                tracing::info!(
+                    generation = next.generation,
+                    "credential generation changed; reconnecting with the new whole record"
+                );
+                live_credentials = *next;
+                attempt = 0;
+                continue;
+            }
+            ServeOutcome::SessionEnded(result) => result,
         };
         match res {
             Ok(()) => {
@@ -83,31 +272,104 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         }
         let delay = ws::backoff_for_attempt(attempt);
         tracing::info!(?delay, "reconnecting after backoff");
-        let sleep_fut = tokio::time::sleep(delay);
-        tokio::pin!(sleep_fut);
-        tokio::select! {
-            _ = &mut sleep_fut => {}
-            r = tokio::signal::ctrl_c() => {
-                r.context("ctrl-c handler")?;
-                tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
-                return Ok(());
+        let reloaded = {
+            let sleep_fut = tokio::time::sleep(delay);
+            let reload_fut = wait_for_credential_change(&live_credentials);
+            tokio::pin!(sleep_fut);
+            tokio::pin!(reload_fut);
+            tokio::select! {
+                _ = &mut sleep_fut => None,
+                reloaded = &mut reload_fut => Some(reloaded),
+                r = tokio::signal::ctrl_c() => {
+                    r.context("ctrl-c handler")?;
+                    tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+                    return Ok(());
+                }
             }
+        };
+        if let Some(reloaded) = reloaded {
+            let reloaded = match reloaded {
+                Ok(reloaded) => reloaded,
+                Err(error) => {
+                    rtc_sessions.invalidate_trust_and_close_all().await;
+                    return Err(error);
+                }
+            };
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            live_credentials = reloaded;
+            attempt = 0;
+            continue 'supervisor;
         }
     }
 }
 
 async fn serve_one_connection(
-    stored: &StoredCreds,
+    live_credentials: &LiveCredentialSnapshot,
     ws_url: &url::Url,
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
-) -> Result<()> {
-    let token = stored
+) -> Result<ServeOutcome> {
+    serve_one_connection_with_loader(
+        live_credentials,
+        ws_url,
+        registry,
+        rtc_sessions,
+        CREDENTIAL_RELOAD_INTERVAL,
+        creds::load_for_live_reload,
+    )
+    .await
+}
+
+async fn serve_one_connection_with_loader<F>(
+    live_credentials: &LiveCredentialSnapshot,
+    ws_url: &url::Url,
+    registry: &AgentRegistry,
+    rtc_sessions: &RtcSessions,
+    poll_interval: Duration,
+    load: F,
+) -> Result<ServeOutcome>
+where
+    F: Fn() -> Result<StoredCreds> + Clone,
+{
+    // Keep this boundary self-contained as well as guarding it in `run`: a
+    // caller cannot open a websocket from a snapshot that was already stale
+    // when the connection operation began.
+    match credential_change_now_with(live_credentials, load.clone()) {
+        Ok(Some(next)) => {
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Ok(ServeOutcome::CredentialsChanged(Box::new(next)));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Err(error);
+        }
+    }
+    let token = live_credentials
+        .record
         .access_token
         .as_deref()
         .ok_or_else(|| anyhow!("no access token"))?;
 
-    let stream = ws::connect(ws_url, token).await?;
+    let reload_fut = wait_for_credential_change_with(live_credentials, poll_interval, load.clone());
+    tokio::pin!(reload_fut);
+    let stream = tokio::select! {
+        connected = ws::connect(ws_url, token) => match connected {
+            Ok(stream) => stream,
+            Err(error) => return Ok(ServeOutcome::SessionEnded(Err(error))),
+        },
+        reloaded = &mut reload_fut => {
+            let reloaded = match reloaded {
+                Ok(reloaded) => reloaded,
+                Err(error) => {
+                    rtc_sessions.invalidate_trust_and_close_all().await;
+                    return Err(error);
+                }
+            };
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Ok(ServeOutcome::CredentialsChanged(Box::new(reloaded)));
+        }
+    };
     tracing::info!(%ws_url, "ws connected");
 
     let (write_half, read_half) = stream.split();
@@ -181,21 +443,30 @@ async fn serve_one_connection(
     // kernel/tungstenite layer. Scoped so `dispatch_fut`'s borrow of
     // `out_tx` releases before we drop it below.
     let dispatch_result = {
-        let dispatch_fut = dispatch_loop(&mut in_rx, registry, rtc_sessions, &out_tx);
+        let dispatch_fut = dispatch_loop(
+            &mut in_rx,
+            registry,
+            rtc_sessions,
+            &out_tx,
+            live_credentials,
+        );
         tokio::pin!(dispatch_fut);
         tokio::select! {
-            r = &mut dispatch_fut => r,
+            r = &mut dispatch_fut => ActiveSessionEvent::SessionEnded(r),
             _ = &mut sender_task => {
                 tracing::info!("ws sender task ended (write error); ending session");
-                Ok(())
+                ActiveSessionEvent::SessionEnded(Ok(()))
             }
             _ = &mut reader_task => {
                 tracing::info!("ws reader task ended; ending session");
-                Ok(())
+                ActiveSessionEvent::SessionEnded(Ok(()))
             }
             _ = &mut heartbeat_task => {
                 tracing::info!("heartbeat task ended; ending session");
-                Ok(())
+                ActiveSessionEvent::SessionEnded(Ok(()))
+            }
+            reloaded = &mut reload_fut => {
+                ActiveSessionEvent::CredentialReload(reloaded.map(Box::new))
             }
         }
     };
@@ -209,7 +480,11 @@ async fn serve_one_connection(
     // consumed one task to completion (re-awaiting a finished JoinHandle
     // panics).
     clear_session_sinks(registry).await;
-    rtc_sessions.close_all().await;
+    if matches!(&dispatch_result, ActiveSessionEvent::CredentialReload(_)) {
+        rtc_sessions.invalidate_trust_and_close_all().await;
+    } else {
+        rtc_sessions.close_all().await;
+    }
     heartbeat_task.abort();
     reader_task.abort();
     sender_task.abort();
@@ -217,7 +492,12 @@ async fn serve_one_connection(
     drop(sender_task);
     drop(reader_task);
     drop(heartbeat_task);
-    dispatch_result
+    match dispatch_result {
+        ActiveSessionEvent::SessionEnded(result) => Ok(ServeOutcome::SessionEnded(result)),
+        ActiveSessionEvent::CredentialReload(result) => {
+            Ok(ServeOutcome::CredentialsChanged(result?))
+        }
+    }
 }
 
 /// Install this WS session's outbound sender as the forwarder sink for every
@@ -242,12 +522,16 @@ async fn dispatch_loop(
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
+    live_credentials: &LiveCredentialSnapshot,
 ) -> Result<()> {
     while let Some(msg) = in_rx.recv().await {
         match msg {
             WsInbound::Closed => return Ok(()),
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered { host_id } => {
+                    if host_id != live_credentials.host_id {
+                        return Err(anyhow!("server registered daemon as an unexpected host"));
+                    }
                     if !rtc_sessions.bind_registered_host_id(host_id).await {
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
@@ -1647,6 +1931,457 @@ fn toml_string(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::proto::AgentSkillConfig;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    const TEST_BROWSER_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    const TEST_BROWSER_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+
+    fn credential_record(
+        generation: u64,
+        record_id: u128,
+        token: &str,
+        host_id: Uuid,
+        server_url: &str,
+        seed_byte: u8,
+        pins: &[(Uuid, &str)],
+    ) -> StoredCreds {
+        let pins = pins
+            .iter()
+            .map(|(device_id, public_key)| {
+                serde_json::json!({
+                    "browser_device_id": device_id.to_string(),
+                    "browser_key_algorithm": creds::BROWSER_KEY_ALGORITHM,
+                    "browser_public_key": public_key,
+                    "browser_key_fingerprint": creds::browser_key_fingerprint(public_key)
+                        .expect("test key fingerprint"),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(serde_json::json!({
+            "credential_record_version": 1,
+            "credential_generation": generation,
+            "credential_record_id": Uuid::from_u128(record_id).to_string(),
+            "access_token": token,
+            "host_id": host_id,
+            "server_url": server_url,
+            "host_private_key_seed": URL_SAFE_NO_PAD.encode([seed_byte; 32]),
+            "browser_pins": pins,
+        }))
+        .expect("complete test credential record")
+    }
+
+    fn live_snapshot(record: StoredCreds) -> LiveCredentialSnapshot {
+        LiveCredentialSnapshot::initial(
+            record,
+            &url::Url::parse("https://spawn.example/control").unwrap(),
+        )
+        .expect("live credential snapshot")
+    }
+
+    #[test]
+    fn whole_record_reload_activates_add_revoke_and_atomic_rotation() {
+        let host_id = Uuid::from_u128(10);
+        let browser_one = Uuid::from_u128(101);
+        let browser_two = Uuid::from_u128(102);
+        let active = live_snapshot(credential_record(
+            1,
+            1,
+            "old-token",
+            host_id,
+            "https://spawn.example/login",
+            7,
+            &[(browser_one, TEST_BROWSER_KEY_ONE)],
+        ));
+
+        let added_record = credential_record(
+            2,
+            2,
+            "new-token",
+            host_id,
+            "https://spawn.example/another-path",
+            9,
+            &[
+                (browser_one, TEST_BROWSER_KEY_ONE),
+                (browser_two, TEST_BROWSER_KEY_TWO),
+            ],
+        );
+        let expected_identity = creds::host_identity(&added_record)
+            .unwrap()
+            .unwrap()
+            .public_key;
+        let added = active
+            .classify_reload(added_record)
+            .unwrap()
+            .expect("new generation");
+        assert_eq!(added.record.access_token.as_deref(), Some("new-token"));
+        assert_eq!(added.record.browser_pins().len(), 2);
+        assert_eq!(
+            creds::host_identity(&added.record)
+                .unwrap()
+                .unwrap()
+                .public_key,
+            expected_identity
+        );
+        assert_eq!(added.generation, 2);
+
+        let revoked = added
+            .classify_reload(credential_record(
+                3,
+                3,
+                "rotated-token",
+                host_id,
+                "https://spawn.example/",
+                11,
+                &[(browser_two, TEST_BROWSER_KEY_TWO)],
+            ))
+            .unwrap()
+            .expect("revocation generation");
+        assert_eq!(revoked.record.browser_pins().len(), 1);
+        assert_eq!(revoked.record.browser_pins()[0].device_id(), browser_two);
+        assert_eq!(
+            revoked.record.access_token.as_deref(),
+            Some("rotated-token")
+        );
+        assert_eq!(revoked.generation, 3);
+    }
+
+    #[test]
+    fn reload_rejects_substitution_rollback_domain_and_corruption() {
+        let host_id = Uuid::from_u128(10);
+        let active_record = credential_record(
+            5,
+            50,
+            "secret-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+        let active = live_snapshot(active_record.clone());
+        assert!(active
+            .classify_reload(active_record.clone())
+            .unwrap()
+            .is_none());
+
+        let mut same_revision: serde_json::Value =
+            serde_json::to_value(&active_record).expect("serialize record");
+        same_revision["access_token"] = serde_json::json!("substituted-token");
+        let same_revision: StoredCreds =
+            serde_json::from_value(same_revision).expect("mutated record");
+        let error = active
+            .classify_reload(same_revision)
+            .err()
+            .expect("same-revision substitution must fail");
+        assert!(error
+            .to_string()
+            .contains("without a new whole-record revision"));
+        assert!(!error.to_string().contains("secret-token"));
+        assert!(!error.to_string().contains("substituted-token"));
+
+        let rollback = credential_record(
+            4,
+            40,
+            "rollback-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[],
+        );
+        assert!(active
+            .classify_reload(rollback)
+            .err()
+            .expect("rollback must fail")
+            .to_string()
+            .contains("rolled back"));
+
+        let reused_record_id =
+            credential_record(6, 50, "token", host_id, "https://spawn.example/", 8, &[]);
+        assert!(active
+            .classify_reload(reused_record_id)
+            .err()
+            .expect("record identity reuse must fail")
+            .to_string()
+            .contains("fresh record identity"));
+
+        let wrong_host = credential_record(
+            6,
+            60,
+            "token",
+            Uuid::from_u128(11),
+            "https://spawn.example/",
+            8,
+            &[],
+        );
+        assert!(active
+            .classify_reload(wrong_host)
+            .err()
+            .expect("host change must fail")
+            .to_string()
+            .contains("Host ID"));
+
+        let wrong_origin =
+            credential_record(6, 60, "token", host_id, "https://hostile.example/", 8, &[]);
+        assert!(active
+            .classify_reload(wrong_origin)
+            .err()
+            .expect("origin change must fail")
+            .to_string()
+            .contains("server origin"));
+
+        let mut corrupt: serde_json::Value = serde_json::to_value(credential_record(
+            6,
+            60,
+            "token",
+            host_id,
+            "https://spawn.example/",
+            8,
+            &[(Uuid::from_u128(102), TEST_BROWSER_KEY_TWO)],
+        ))
+        .unwrap();
+        corrupt["browser_pins"][0]["browser_key_fingerprint"] =
+            serde_json::json!("SHA256:AAAAAAAAAAAAAAAA");
+        let corrupt: StoredCreds = serde_json::from_value(corrupt).unwrap();
+        assert!(format!(
+            "{:#}",
+            active
+                .classify_reload(corrupt)
+                .err()
+                .expect("corrupt pin must fail")
+        )
+        .contains("fingerprint"));
+
+        let missing = StoredCreds::default();
+        assert!(format!(
+            "{:#}",
+            active
+                .classify_reload(missing)
+                .err()
+                .expect("missing backend record must fail")
+        )
+        .contains("no daemon token"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_poll_activates_change_and_backend_failure_fails_closed() {
+        let host_id = Uuid::from_u128(10);
+        let old_record = credential_record(
+            1,
+            1,
+            "never-log-this-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[],
+        );
+        let active = live_snapshot(old_record.clone());
+        let next = credential_record(
+            2,
+            2,
+            "new-token",
+            host_id,
+            "https://spawn.example/",
+            8,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+        let mut calls = 0;
+        let changed = wait_for_credential_change_with(&active, Duration::from_millis(10), || {
+            calls += 1;
+            if calls == 1 {
+                Ok(old_record.clone())
+            } else {
+                Ok(next.clone())
+            }
+        })
+        .await
+        .expect("bounded reload");
+        assert_eq!(calls, 2);
+        assert_eq!(changed.generation, 2);
+        assert_eq!(changed.record.browser_pins().len(), 1);
+
+        let error = wait_for_credential_change_with(&active, Duration::from_millis(10), || {
+            Err(anyhow!("credential backend unavailable"))
+        })
+        .await
+        .err()
+        .expect("backend failure must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("backend unavailable"));
+        assert!(!message.contains("never-log-this-token"));
+        assert_eq!(
+            active.generation, 1,
+            "failed reload cannot mutate active trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_gate_catches_commit_when_session_end_wins_ready_race() {
+        let host_id = Uuid::from_u128(10);
+        let active = live_snapshot(credential_record(
+            1,
+            1,
+            "old-token",
+            host_id,
+            "https://spawn.example/",
+            7,
+            &[],
+        ));
+        let committed = credential_record(
+            2,
+            2,
+            "committed-token",
+            host_id,
+            "https://spawn.example/",
+            8,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+
+        // Both futures are ready; model the session-ended branch winning and
+        // therefore dropping the periodic reload future.
+        tokio::select! {
+            biased;
+            _ = async {} => {}
+            _ = async {} => panic!("biased session-end branch should win"),
+        }
+        let admitted = credential_change_now_with(&active, || Ok(committed.clone()))
+            .unwrap()
+            .expect("synchronous pre-connect gate must observe committed generation");
+        assert_eq!(admitted.generation, 2);
+        assert_eq!(
+            admitted.record.access_token.as_deref(),
+            Some("committed-token")
+        );
+    }
+
+    #[tokio::test]
+    // Tungstenite's mandatory handshake callback owns its large HTTP error
+    // response type; this local test never constructs or returns that branch.
+    #[allow(clippy::result_large_err)]
+    async fn local_daemon_connection_reloads_complete_record_before_reconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket");
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (tcp, _) = listener.accept().await.expect("accept daemon socket");
+                let auth_tx = auth_tx.clone();
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    tcp,
+                    move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                          mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        let authorization = request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("(missing)")
+                            .to_owned();
+                        auth_tx.send(authorization).expect("auth observation");
+                        response.headers_mut().insert(
+                            SEC_WEBSOCKET_PROTOCOL,
+                            HeaderValue::from_static("spawn.control.v2"),
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .expect("daemon websocket handshake");
+                if connection_index == 0 {
+                    while socket.next().await.is_some() {}
+                } else {
+                    socket.close(None).await.expect("close second socket");
+                }
+            }
+        });
+
+        let host_id = Uuid::from_u128(10);
+        let initial_record = credential_record(
+            1,
+            1,
+            "old-local-token",
+            host_id,
+            server_url.as_str(),
+            7,
+            &[],
+        );
+        let committed_record = credential_record(
+            2,
+            2,
+            "new-local-token",
+            host_id,
+            server_url.as_str(),
+            8,
+            &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
+        );
+        let active = LiveCredentialSnapshot::initial(initial_record.clone(), &server_url).unwrap();
+        let backend = Arc::new(StdMutex::new(initial_record));
+        let load = {
+            let backend = Arc::clone(&backend);
+            move || Ok(backend.lock().expect("credential backend").clone())
+        };
+        let registry = AgentRegistry::new();
+        assert!(
+            registry.claim_discovery(),
+            "disable ambient worker discovery"
+        );
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+
+        let first = serve_one_connection_with_loader(
+            &active,
+            &ws_url,
+            &registry,
+            &rtc_sessions,
+            Duration::from_millis(10),
+            load.clone(),
+        );
+        tokio::pin!(first);
+        let first_auth = tokio::select! {
+            auth = auth_rx.recv() => auth.expect("first authorization"),
+            result = &mut first => panic!("first connection ended before mutation: {}", result.is_ok()),
+        };
+        assert_eq!(first_auth, "Bearer old-local-token");
+        *backend.lock().expect("credential backend") = committed_record;
+        let first_outcome = tokio::time::timeout(Duration::from_secs(2), &mut first)
+            .await
+            .expect("live reload timeout")
+            .expect("live reload result");
+        let active = match first_outcome {
+            ServeOutcome::CredentialsChanged(next) => next,
+            ServeOutcome::SessionEnded(_) => panic!("credential commit did not end old session"),
+        };
+        assert_eq!(active.generation, 2);
+        assert_eq!(active.record.browser_pins().len(), 1);
+
+        let second_outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_millis(10),
+                load,
+            ),
+        )
+        .await
+        .expect("second local connection timeout")
+        .expect("second local connection result");
+        assert!(matches!(second_outcome, ServeOutcome::SessionEnded(_)));
+        assert_eq!(
+            auth_rx.recv().await.expect("second authorization"),
+            "Bearer new-local-token"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("local websocket server timeout")
+            .expect("local websocket server task");
+    }
 
     fn tool_status(
         version: Option<&str>,

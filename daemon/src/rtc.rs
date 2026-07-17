@@ -4,7 +4,7 @@
 //! signaling plane. Raw PTY input/output and replay are endpoint-only.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -92,6 +92,9 @@ pub struct RtcSessions {
     peers: Arc<Mutex<HashMap<String, RtcPeer>>>,
     host_peers: Arc<Mutex<HashMap<String, HostRtcPeer>>>,
     admission: Arc<Mutex<()>>,
+    /// Changes before trust-reload teardown. Offers capture this value before
+    /// RTC construction and must still match while admission is serialized.
+    trust_epoch: Arc<AtomicU64>,
     registered_host_id: Arc<Mutex<Option<Uuid>>>,
     agent_closers: Arc<Mutex<AgentCloserMap>>,
     controls: AgentControlHub,
@@ -337,6 +340,12 @@ struct BoundRtcSession {
     signaling: RtcSessionBinding,
     agent: AgentBinding,
     control: ForwarderControl,
+    trust_epoch: u64,
+}
+
+struct HostRtcAdmissionContext {
+    trust_epoch: u64,
+    out_tx: mpsc::Sender<WsOutbound>,
 }
 
 #[derive(Clone)]
@@ -481,6 +490,14 @@ impl RtcSessions {
         Self::default()
     }
 
+    fn capture_trust_epoch(&self) -> u64 {
+        self.trust_epoch.load(Ordering::SeqCst)
+    }
+
+    fn trust_epoch_is_current(&self, captured: u64) -> bool {
+        self.capture_trust_epoch() == captured
+    }
+
     #[cfg(test)]
     async fn stall_effect(&self, session_id: &str, point: TestEffectPoint) -> Arc<TestEffectGate> {
         let gate = Arc::new(TestEffectGate::default());
@@ -535,6 +552,7 @@ impl RtcSessions {
         registry: AgentRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
     ) {
+        let trust_epoch = self.capture_trust_epoch();
         let Some(agent) = registry.binding_for(binding.agent_id) else {
             send_status(
                 &out_tx,
@@ -563,6 +581,7 @@ impl RtcSessions {
             signaling: binding,
             agent,
             control,
+            trust_epoch,
         };
 
         if let Err(e) = self
@@ -644,6 +663,10 @@ impl RtcSessions {
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
         let _admission = self.admission.lock().await;
+        if !self.trust_epoch_is_current(binding.trust_epoch) {
+            let _ = pc.close().await;
+            anyhow::bail!("credential trust changed during RTC negotiation");
+        }
         let transition = registry
             .lock_generation_transition(binding.signaling.agent_id)
             .await;
@@ -775,6 +798,7 @@ impl RtcSessions {
         ice_transport_policy: Option<String>,
         out_tx: mpsc::Sender<WsOutbound>,
     ) {
+        let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
             tracing::warn!(session_id = %signal.session_id, "rejecting invalid host rtc offer binding");
             return;
@@ -790,7 +814,10 @@ impl RtcSessions {
                 sdp,
                 ice_servers,
                 ice_transport_policy,
-                out_tx.clone(),
+                HostRtcAdmissionContext {
+                    trust_epoch,
+                    out_tx: out_tx.clone(),
+                },
             )
             .await
         {
@@ -806,7 +833,7 @@ impl RtcSessions {
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
         ice_transport_policy: Option<String>,
-        out_tx: mpsc::Sender<WsOutbound>,
+        admission: HostRtcAdmissionContext,
     ) -> Result<()> {
         let admission_permit = self
             .peer_admission
@@ -839,6 +866,10 @@ impl RtcSessions {
         );
 
         let _admission = self.admission.lock().await;
+        if !self.trust_epoch_is_current(admission.trust_epoch) {
+            let _ = pc.close().await;
+            anyhow::bail!("credential trust changed during host RTC negotiation");
+        }
         let admitted = {
             let mut hosts = self.host_peers.lock().await;
             if hosts.contains_key(&session_id)
@@ -864,12 +895,17 @@ impl RtcSessions {
         }
         drop(_admission);
 
-        install_host_ice_handler(&pc, session_id.clone(), binding.clone(), out_tx.clone());
+        install_host_ice_handler(
+            &pc,
+            session_id.clone(),
+            binding.clone(),
+            admission.out_tx.clone(),
+        );
         install_host_data_channel_handler(
             &pc,
             session_id.clone(),
             binding.clone(),
-            out_tx.clone(),
+            admission.out_tx.clone(),
             None,
         );
         self.install_host_reaper(&pc, session_id.clone());
@@ -882,7 +918,7 @@ impl RtcSessions {
             }
         };
         send_json(
-            &out_tx,
+            &admission.out_tx,
             Outbound::RtcAnswer {
                 session_id,
                 binding_nonce: Some(binding.binding_nonce),
@@ -1525,6 +1561,39 @@ impl RtcSessions {
         for (_, peer) in host_peers {
             let _ = peer.pc.close().await;
         }
+    }
+
+    /// Linearize credential invalidation against both agent and host RTC
+    /// insertion. Once this returns, every peer admitted under the prior
+    /// whole-record credential revision is closed, and any offer that began
+    /// before the revision change will fail its epoch check at admission.
+    pub async fn invalidate_trust_and_close_all(&self) {
+        let _admission = self.admission.lock().await;
+        self.trust_epoch.fetch_add(1, Ordering::SeqCst);
+
+        // Publish fail-closed state to every agent callback before awaiting
+        // any transport/fence cleanup. `close_all` has intentionally careful
+        // bounded per-peer teardown, but a slow first peer must not leave a
+        // later stale peer authorized after credential revocation.
+        let peers = self.peers.lock().await.clone();
+        for (session_id, peer) in &peers {
+            peer.channels.stop();
+            peer.active.store(false, Ordering::Release);
+            let _ = peer.close.initiate();
+            self.uploads
+                .cancel_session_now(peer.agent, &viewer_id(session_id, &peer.generation));
+        }
+
+        // Remove host peers from admission immediately as well. Close their
+        // transports alongside the more involved agent cleanup so neither
+        // class delays fail-closed publication for the other.
+        let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
+        let close_hosts = async move {
+            for (_, peer) in host_peers {
+                let _ = peer.pc.close().await;
+            }
+        };
+        let (_, ()) = tokio::join!(self.close_all(), close_hosts);
     }
 
     #[cfg(test)]
@@ -3209,6 +3278,75 @@ mod tests {
     use std::path::Path;
 
     const DIRECT_ENDPOINT_BYTES_FIELD: &str = concat!("bytes", "_b64");
+
+    #[tokio::test]
+    async fn trust_reload_invalidates_every_pre_reload_admission_capture() {
+        let sessions = RtcSessions::new();
+        let stale = sessions.capture_trust_epoch();
+        assert!(sessions.trust_epoch_is_current(stale));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sessions.invalidate_trust_and_close_all(),
+        )
+        .await
+        .expect("trust invalidation must be bounded");
+
+        assert!(!sessions.trust_epoch_is_current(stale));
+        assert!(sessions.trust_epoch_is_current(sessions.capture_trust_epoch()));
+        assert_eq!(sessions.resident_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn trust_reload_deactivates_all_stale_peers_before_slow_cleanup() {
+        let registry = AgentRegistry::new();
+        let agent_id = Uuid::new_v4();
+        let (agent, _commands) = insert_test_worker(&registry, agent_id);
+        let control = registry.control_for_binding(agent).expect("worker control");
+        let pc = Arc::new(
+            APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let active = Arc::new(AtomicBool::new(true));
+        let sessions = RtcSessions::new();
+        let session_id = "trust-reload-stalled-cleanup";
+        sessions.peers.lock().await.insert(
+            session_id.to_owned(),
+            RtcPeer {
+                pc,
+                agent,
+                generation: "old-generation".to_owned(),
+                active: Arc::clone(&active),
+                control,
+                channels: Arc::new(RequiredAgentChannels::default()),
+                close: Arc::new(PeerCloseCoordinator::default()),
+                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                fence: Arc::new(tokio::sync::RwLock::new(())),
+            },
+        );
+        let cleanup_gate = sessions
+            .stall_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+            .await;
+        let invalidating = sessions.clone();
+        let task = tokio::spawn(async move {
+            invalidating.invalidate_trust_and_close_all().await;
+        });
+        wait_effect_gate(&cleanup_gate).await;
+
+        assert!(
+            !active.load(Ordering::Acquire),
+            "stale callback authorization survived until slow cleanup"
+        );
+        cleanup_gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("trust cleanup timeout")
+            .unwrap();
+        assert_eq!(sessions.resident_session_count().await, 0);
+    }
 
     async fn receive_host_control(
         messages: &mut mpsc::Receiver<(usize, String)>,
