@@ -7,3 +7,4 @@
 
 pub mod sessiond;
 pub mod signed_signal;
+pub mod signed_signal_wire;

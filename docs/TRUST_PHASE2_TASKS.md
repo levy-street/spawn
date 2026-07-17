@@ -151,13 +151,15 @@ their progress neither satisfies nor weakens any Phase 2 gate.
 | P3-IDENTITY-01B | DONE (`e34d412`) | Build host identity-key generation, protected persistence, fingerprint display, and explicit host-key pairing flows against the reviewed 01A contract | P2-HOST-01, P3-IDENTITY-01A | Independent review passed stable protected host identity, owner-authorized immutable pairing, concurrency/replay isolation, and mergeability; live signaling is still unsigned |
 | P3-IDENTITY-02A | DONE (`37c91d4`) | Persist one account-scoped, non-extractable browser device identity in versioned, bounded IndexedDB storage; expose only its public key and bounded signing operations; fail closed on unavailable/corrupt storage; provide expected-public-key-bound local deletion | P3-IDENTITY-01A | Independent unit and native-browser review passed reload stability, first-creation tab convergence, nonextractability, account isolation, corruption failure, bounded records, expected-key deletion, and mergeability |
 | P3-IDENTITY-02B | ACTIVE — IMPLEMENTED, REVIEW PENDING | Bind the browser public key to its authenticated account with a canonical proof-of-possession transcript, durable active/revoked server registry, server-derived fingerprint, loud lifecycle registration, and expected-ID-plus-key revocation/local cleanup recovery. Static proof replay is idempotent only for the same account/key and uses no Redis challenge state | P3-IDENTITY-01A, P3-IDENTITY-02A | Independent review must pass cross-runtime vectors, strict fixed-width input bounds, ownership/uniqueness/revocation tombstones, SQLite/PostgreSQL concurrency, no private-material Web Storage/logging, explicit partial-failure recovery, native browser UX, and mergeability. No browser key is yet bound into host pairing and no live signaling or TOFU claim exists |
-| P3-IDENTITY-02 | PLANNED | Integrate signed agent/host signaling over the canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; consume the registered browser device identity and add TOFU pinning plus fingerprint UX | P3-IDENTITY-01A, P3-IDENTITY-01B, P3-IDENTITY-02A, P3-IDENTITY-02B | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
+| P3-IDENTITY-02C | DONE (`6028b2a`) | Add strict Rust and browser JSON adapters around the signed offer/answer transcript, including exact key pins, bounded parsing, opaque browser-identity signing, and shared cross-language vectors; keep them off live WebSockets | P3-IDENTITY-01A, P3-IDENTITY-02A | Independent review passed exact field validation, sender/recipient pin comparison, all-field mutation and bounds rejection, cross-runtime parity, no secret-key exposure, protocol replay audit, and mergeability; no live signaling/L1 claim exists |
+| P3-IDENTITY-02 | PLANNED | Integrate signed agent/host signaling over the canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; consume the registered browser device identity and add TOFU pinning plus fingerprint UX | P3-IDENTITY-01A, P3-IDENTITY-01B, P3-IDENTITY-02A, P3-IDENTITY-02B, P3-IDENTITY-02C | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
 
-The 01A, 01B, 02A, and bounded 02B foundations may proceed in parallel with
-remaining Phase 2 cleanup because they do not reopen a protected server content
-path. That overlap does not complete Phase 2 or establish a Phase 3 guarantee.
-Each task, and the later signed-signaling integration claim, still requires its
-own tests, independent review, mergeability proof, and accepted gate.
+The reviewed 01A, 01B, 02A, and offline 02C foundations plus bounded 02B may
+proceed in parallel with remaining Phase 2 cleanup because they do not reopen a
+protected server content path. That overlap does not complete Phase 2 or
+establish a Phase 3 guarantee. Each task, and the later signed-signaling
+integration claim, still requires its own tests, independent review,
+mergeability proof, and accepted gate.
 
 ## Review-finding coverage
 
@@ -212,6 +214,7 @@ own tests, independent review, mergeability proof, and accepted gate.
    deletion and the final claim cannot safely run in parallel with content-path
    migrations.
 6. **Parallel Phase 3 foundation (active):** 01A, 01B, and 02A are reviewed and
-   integrated. P3-IDENTITY-02B account registration awaits independent review
-   while remaining Phase 2 cleanup proceeds. Peer discovery, TOFU, live
-   P3-IDENTITY-02 signaling, and every security claim remain separately gated.
+   integrated, as is the offline 02C signed-wire adapter. P3-IDENTITY-02B account
+   registration awaits independent review while remaining Phase 2 cleanup
+   proceeds. Peer discovery, TOFU, live P3-IDENTITY-02 signaling, and every
+   security claim remain separately gated.

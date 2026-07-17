@@ -58,10 +58,31 @@ identity and `S` is zero).
 
 Binding the kind distinguishes an offer from an answer. Binding the protocol
 version, session, scope type and ID prevents a valid signature from being
-replayed into a different negotiated channel or agent/host scope. Binding the
-sender role prevents reflection across the browser and daemon roles. Binding
-the intended peer key prevents redirecting a signed message to another known
-identity. Binding the SDP prevents signaling modification.
+replayed into a different version, RTC session, or agent/host scope. Binding
+the sender role prevents reflection across the browser and daemon roles.
+Binding the intended peer key prevents redirecting a signed message to another
+known identity. Binding the SDP prevents signaling modification.
+
+### Protocol-identifier replay audit
+
+The endpoint wire adapter audits the current signaling identifiers before
+accepting this transcript. Agent signaling has one RTC envelope,
+`scope_type:"agent"`, `protocol:"spawn.pty"`, version 2; that PeerConnection
+requires both the `spawn.pty` and `spawn.ctl` DataChannels. `spawn.ctl` version
+1 is not a separately signaled offer/answer protocol, and current server and
+endpoint parsers reject it in the signaling `protocol` field. Host signaling is
+`scope_type:"host"`, `protocol:"spawn.host.ctl"`, version 1. It is already
+separated from agent signaling by the signed scope type.
+
+There is therefore no pair of accepted current protocol identifiers with the
+same signed scope type and protocol version. V1 does not add a protocol-name
+field merely for a hypothetical future collision. The wire adapter instead
+enforces the exact one-to-one mappings agent to `spawn.pty` and host to
+`spawn.host.ctl`, including their exact current versions 2 and 1 respectively;
+it never treats `spawn.ctl` as a signaling protocol. A future change that
+accepts two protocol identifiers in one signed scope/version must define a new
+transcript version that binds a bounded protocol identifier. It must not widen
+the V1 adapter.
 
 Verification proves only that the holder of the corresponding private key
 signed these exact bytes. It does **not** establish that the client, device,

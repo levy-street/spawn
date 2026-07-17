@@ -6,6 +6,10 @@ All three implementations MUST match.
 The Phase 3 signed RTC offer/answer transcript is specified in
 [`SIGNED_SIGNAL_V1.md`](SIGNED_SIGNAL_V1.md). Shared Rust/WebCrypto golden
 vectors are checked in as [`signed-signal-v1-vectors.json`](signed-signal-v1-vectors.json).
+The strict, still-offline JSON adapter is specified in
+[`SIGNED_SIGNAL_WIRE_V1.md`](SIGNED_SIGNAL_WIRE_V1.md), with shared vectors in
+[`signed-signal-wire-v1-vectors.json`](signed-signal-wire-v1-vectors.json).
+Neither foundation is connected to the live WebSocket routes yet.
 
 Authenticated browser identity registration uses
 [`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md) and
