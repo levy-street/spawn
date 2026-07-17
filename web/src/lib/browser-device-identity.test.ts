@@ -355,6 +355,7 @@ describe("browser device identity", () => {
       rawSign: number;
       wireSign: number;
       testOnlySign: number;
+      signedEnvelope: number;
     }> = [];
     const glob = new Bun.Glob("src/**/*.{ts,tsx}");
     for await (const path of glob.scan(".")) {
@@ -376,8 +377,17 @@ describe("browser device identity", () => {
       const rawSign = source.match(/\bsignSignedSignalTranscript\b/gu)?.length ?? 0;
       const wireSign = source.match(/\bsignRtcSignalWire\b/gu)?.length ?? 0;
       const testOnlySign = source.match(/\bsignRtcSignalWireForTestOnly\b/gu)?.length ?? 0;
+      const signedEnvelope = source.match(/\bsigned_envelope\b/gu)?.length ?? 0;
       if (
-        load + scope + registration + approval + epochSign + rawSign + wireSign + testOnlySign >
+        load +
+          scope +
+          registration +
+          approval +
+          epochSign +
+          rawSign +
+          wireSign +
+          testOnlySign +
+          signedEnvelope >
         0
       ) {
         hits.push({
@@ -390,6 +400,7 @@ describe("browser device identity", () => {
           rawSign,
           wireSign,
           testOnlySign,
+          signedEnvelope,
         });
       }
     }
@@ -405,6 +416,7 @@ describe("browser device identity", () => {
         rawSign: 0,
         wireSign: 0,
         testOnlySign: 0,
+        signedEnvelope: 0,
       },
       {
         path: "src/lib/browser-trust-operations.ts",
@@ -416,18 +428,22 @@ describe("browser device identity", () => {
         rawSign: 0,
         wireSign: 0,
         testOnlySign: 0,
+        signedEnvelope: 0,
       },
     ]);
     const identitySource = await Bun.file("src/lib/browser-device-identity.ts").text();
     expect(identitySource.match(/\bsignSignedSignalTranscript\b/gu)?.length).toBe(3);
+    expect(identitySource).not.toContain("signed_envelope");
     const rawSignerSource = await Bun.file("src/lib/signed-signal.ts").text();
     expect(rawSignerSource.match(/\bsignSignedSignalTranscript\b/gu)?.length).toBe(1);
+    expect(rawSignerSource).not.toContain("signed_envelope");
     const wireSignerSource = await Bun.file("src/lib/signed-signal-wire.ts").text();
     expect(wireSignerSource.match(/\bsignRtcSignalWire\b/gu)?.length).toBe(1);
     expect(
       wireSignerSource.match(/\bsignBrowserDeviceRtcTranscriptWithinTrustEpoch\b/gu)?.length,
     ).toBe(2);
     expect(wireSignerSource).not.toContain("SignedRtcIdentitySigner");
+    expect(wireSignerSource).not.toContain("signed_envelope");
     const testOnlySignerSource = await Bun.file(
       "test-support/signed-signal-wire-test-only.ts",
     ).text();

@@ -704,7 +704,10 @@ nominal, exact-object WeakMap registration for the active epoch; raw identities,
 structural copies, wrappers, proxies, and rebound signing functions fail before
 signing. The structural signer used for shared golden vectors and cross-runtime
 tests exists only under `web/test-support`, and the production source inventory
-rejects imports or calls to it.
+rejects imports or calls to it. F1's new opaque `signed_envelope` relay carrier
+does not add a production browser constructor or caller in this prerequisite
+stage; the same inventory rejects any such web source addition until it is
+reviewed through the exact epoch-capability signing boundary.
 Deterministic pre/post-boundary tests preserve explicit retained-recovery and
 `outcome_unknown` classifications, while the replay high-water behavior above
 remains unchanged. This checkpoint still makes no live signed-signaling, TOFU,
