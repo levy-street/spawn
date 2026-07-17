@@ -25,9 +25,9 @@ MCP tool surface and `/mcp` endpoint were removed entirely — see docs/TRUST.md
 | History/snapshot replay | terminal reconnect/history | none | `spawn.ctl` client | bounded `spawn.ctl` chunk response direct from worker |
 | Upload file/image to agent | terminal upload/drop/paste | none | terminal `spawn.ctl` client | bounded `spawn.ctl` `upload_start`/kind-2 chunks/cancel/completion direct to endpoint |
 
-## Approved durable protected-data target (P2-DATA-01)
+## Proposed durable protected-data target (P2-DATA-01; review pending)
 
-This target is a design contract only; P2-DATA-02 has not implemented it. The
+This candidate is a design contract only; P2-DATA-02 has not implemented it. The
 per-host endpoint store and exact failure/migration semantics are specified in
 `DURABLE_SENSITIVE_DATA.md`.
 

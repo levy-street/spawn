@@ -73,7 +73,7 @@
   replay/scratch, and retained bookkeeping; this is not a durable transcript
   archive. Browsers fetch history over
   the DataChannel at attach. The server keeps no copy.
-- **Durable protected state (approved target, not implemented)**: `spawnd`
+- **Durable protected state (proposed target, review pending; not implemented)**: `spawnd`
   owns one independently keyed, endpoint-local canonical store for launch and
   restart manifests, preset/tool operational values, and skill bodies. It is
   available after daemon restart and exposed only over `spawn.host.ctl`.
@@ -82,7 +82,7 @@
   same-lineage restore; the control plane stores neither their protected detail
   nor their presence. Dismissing an ambiguity never authorizes retry.
   `DURABLE_SENSITIVE_DATA.md` defines its envelope, recovery, conflicts,
-  quotas, migration, and accepted offline/cross-host regressions.
+  quotas, migration, and proposed offline/cross-host regressions.
 
 ### `spawn-web` — Next.js 15 PWA
 
@@ -151,8 +151,8 @@ device_codes(device_code, user_code, host_name, status, user_id|null,
 After P2-DATA-02, Postgres retains the IDs/ownership, names/descriptions,
 grants, policy/lifecycle fields, and neutral/explicit labels allowed by
 `TRUST.md`, but not `cwd`, `argv`, `env`, preset default/install/environment
-values, tool executable targets, or skill bodies. Those values are versioned
-AEAD objects in the per-host store selected by
+values, tool executable targets, or skill bodies. The current design proposes
+versioned AEAD objects in the per-host store specified by
 `DURABLE_SENSITIVE_DATA.md`. Built-in operational preset values move to a
 versioned daemon-local catalog; their IDs/names/kinds may remain disclosed.
 

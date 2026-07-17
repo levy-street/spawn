@@ -534,6 +534,62 @@ def all_corpus_sentences(root: Path) -> tuple[CorpusSentence, ...]:
     )
 
 
+PREMATURE_DATA_STATUS_WORD = re.compile(
+    r"\b(?:approved|accepted|authoritative|selected)\b"
+)
+DATA_STATUS_SUBJECT = re.compile(
+    r"\b(?:"
+    r"p2-data-(?:01|02)|"
+    r"durable protected(?:-data)? (?:state|target)|"
+    r"(?:endpoint-local|per-host(?: endpoint-local)?) "
+    r"(?:canonical |durable )?store|"
+    r"(?:p2-data-02 )?store contract"
+    r")\b"
+)
+EXPLICIT_DATA_STATUS_CONTEXT = (
+    re.compile(r"\bnot (?:approved|accepted|authoritative|selected)\b"),
+    re.compile(
+        r"\b(?:only when|only after|until)\b.{0,200}\b(?:review|reviewed|merge|merged)\b"
+    ),
+    re.compile(
+        r"\b(?:historical|historically|superseded|former|previous|previously)\b"
+        r".{0,200}\b(?:approved|accepted|authoritative|selected)\b"
+    ),
+)
+
+
+def spans_are_near(left: re.Match[str], right: re.Match[str], limit: int = 96) -> bool:
+    if left.end() < right.start():
+        return right.start() - left.end() <= limit
+    if right.end() < left.start():
+        return left.start() - right.end() <= limit
+    return True
+
+
+def enforce_pending_data_review_status(root: Path, status: str) -> None:
+    if status != "proposed_independent_review_pending":
+        return
+    for record in all_corpus_sentences(root):
+        sentence = record.sentence
+        status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(sentence))
+        subjects = tuple(DATA_STATUS_SUBJECT.finditer(sentence))
+        if not status_words or not subjects:
+            continue
+        if not any(
+            spans_are_near(status_word, subject)
+            for status_word in status_words
+            for subject in subjects
+        ):
+            continue
+        if any(pattern.search(sentence) for pattern in EXPLICIT_DATA_STATUS_CONTEXT):
+            continue
+        raise ContradictionError(
+            "data-review-status-prose",
+            root / record.path,
+            f"{record.location} sentence {record.sentence_index}: {sentence}",
+        )
+
+
 class DuplicateJsonKey(ValueError):
     pass
 
@@ -766,6 +822,7 @@ def validate(root: Path) -> None:
     )
     expected_declarations = {
         "data01_runtime": "design_only_not_implemented",
+        "p2_data_01_status": "proposed_independent_review_pending",
         "phase2_completion": "incomplete",
         "phase2_canonical_store": "endpoint_local_per_host",
         "phase2_opaque_server_blob_fallback": "forbidden",
@@ -784,6 +841,7 @@ def validate(root: Path) -> None:
             f"{adr} canonical declarations mismatch: expected {expected_declarations}, "
             f"found {declarations}"
         )
+    enforce_pending_data_review_status(root, declarations["p2_data_01_status"])
     trust = unique_section(parsed, 2, "Trust boundaries and authorization", adr)
     require(
         trust,
@@ -1094,6 +1152,28 @@ def self_test(source: Path) -> None:
 
         return mutate
 
+    def status_claim_fixture(relative: str, claim: str) -> Callable[[Path], None]:
+        def mutate(root: Path) -> None:
+            path = root / relative
+            path.write_text(
+                path.read_text(encoding="utf-8") + f"\n\n{claim}\n",
+                encoding="utf-8",
+            )
+            write_prose_inventory(root)
+
+        return mutate
+
+    def explicit_historical_and_review_status(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + "\n\nHistorical note: a superseded P2-DATA-01 experiment was approved "
+            "before this review-pending ADR and is not current authority.\n\n"
+            "P2-DATA-01 becomes accepted only after independent review and merge.\n",
+            encoding="utf-8",
+        )
+        write_prose_inventory(root)
+
     def canonical_html(root: Path) -> None:
         path = root / "docs/DURABLE_SENSITIVE_DATA.md"
         expected = "Spawn will use an **endpoint-local canonical store per host**"
@@ -1280,6 +1360,38 @@ def self_test(source: Path) -> None:
                 "active canonical-store contradiction with active safe declaration and HTML/fence decoys",
                 canonical_html,
                 "data-design-prose",
+            ),
+            (
+                "premature approved durable-state status survives reinventory",
+                status_claim_fixture(
+                    "docs/DESIGN.md",
+                    "The durable protected state is an approved target.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "premature accepted DATA-01 status survives reinventory",
+                status_claim_fixture(
+                    "docs/INTERFACE_MATRIX.md",
+                    "The P2-DATA-01 decision is accepted.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "premature authoritative DATA-02 contract survives reinventory",
+                status_claim_fixture(
+                    "proto/README.md",
+                    "The P2-DATA-02 store contract is authoritative.",
+                ),
+                "data-review-status-prose",
+            ),
+            (
+                "premature selected DATA-01 status survives reinventory",
+                status_claim_fixture(
+                    "docs/DURABLE_SENSITIVE_DATA.md",
+                    "P2-DATA-01 selected the per-host endpoint-local canonical store.",
+                ),
+                "data-review-status-prose",
             ),
             (
                 "active canonical-store paraphrase with active safe and dead-section decoy",
@@ -1839,6 +1951,12 @@ def self_test(source: Path) -> None:
         (
             "comments and fences do not create active controlled sentences",
             hidden_controlled_claims,
+        )
+    )
+    positive_mutations.append(
+        (
+            "explicit historical and review-gated DATA status remains allowed",
+            explicit_historical_and_review_status,
         )
     )
     positive_mutations.append(

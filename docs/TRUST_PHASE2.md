@@ -350,7 +350,7 @@ skill recovery tests.
    deletion capability, and the oldest restorable point.
 2. **Migrate and verify endpoint copies.** Retire server transcripts in favor of
    the existing bounded worker replay described in Increment 2, and move
-   launch/preset/skill data to the approved endpoint store. Server-only
+   launch/preset/skill data to the then-reviewed endpoint store. Server-only
    offline/archived transcripts are an accepted retirement, not a silent
    migration: announce a bounded export/reconnect window before the cut, let
    users re-establish available history from an online endpoint or export it,

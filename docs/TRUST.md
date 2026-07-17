@@ -116,7 +116,7 @@ lifecycle status; preset and skill names/descriptions; exit codes; presence;
 connection and signaling timing; IP addresses; and per-agent timestamps for
 meaningful output and user input. For unattended tool updates it may also keep
 the enabled policy, host/preset identifiers, check/update/result timestamps,
-and content-free success/failure/exit-code status. The selected endpoint-local
+and content-free success/failure/exit-code status. The proposed endpoint-local
 durable store does not expose its object sizes, revisions, or store-access log
 to the server, although signaling/TURN and metadata API traffic still disclose
 connection timing and approximate transfer volume. Activity frames
@@ -136,7 +136,7 @@ answer for users for whom this metadata is itself sensitive.
 | REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
 | Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-agent `spawn.ctl` only |
 | Agent `env` (may contain real secrets) | current master: `agent.create`, persisted in `agents.env` | DATA-02 target: E2E and endpoint-local only; not implemented |
-| Preset environment templates | current master: `presets.env_template`, merged into agent `env` | DATA-02 target: canonical in selected per-host endpoint store; not implemented |
+| Preset environment templates | current master: `presets.env_template`, merged into agent `env` | DATA-02 proposed target: canonical in a per-host endpoint store; review pending and not implemented |
 | Launch paths/arguments and preset commands | current master: `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | DATA-02 target: canonical per-host launch manifest over `spawn.host.ctl`; not implemented |
 | Default agent names derived from `cwd` | current master: `_default_agent_name` copies the cwd basename into `agents.name` | DATA-02 target: explicit/neutral metadata and scrubbed legacy names; not implemented |
 | Skill bodies | current master: `agent.create`, `skills` table | DATA-02 target: endpoint-local and E2E only; not implemented |
@@ -293,7 +293,7 @@ worthless:
 2. **First-contact key substitution** until L2 verification lands.
 3. **Metadata.** The control plane necessarily learns who owns which hosts,
    when they connect, coarse meaningful-output/user-input times, and the
-   unattended-update metadata listed above. The selected endpoint-local store
+   unattended-update metadata listed above. The proposed endpoint-local store
    avoids durable server-side object/version/access metadata, but its E2E
    transfers still reveal timing and approximate volume. TURN learns IP pairs
    and volumes. We do not claim metadata privacy; self-host if that matters.
@@ -398,7 +398,7 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   paths.
 - Move `env`, `Preset.env_template`, `Preset.install`, `cwd`, `argv`, skill
   bodies, and detailed launch errors out of server-readable persistence and
-  transport into the selected per-host store in
+  transport into the proposed per-host store in
   `DURABLE_SENSITIVE_DATA.md`. REST creates only the metadata row and a neutral
   default name; the launch manifest travels E2E over the host channel. Scrub
   cwd-derived legacy names. (The `/mcp` question is already resolved: the whole

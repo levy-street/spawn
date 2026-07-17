@@ -97,6 +97,11 @@ tokens; both rendering and corpus inventory reject every unknown block token.
 Explicit fence closure is derived from the parser's container-normalized token
 span and content-line count, so valid blockquote/list fences remain inactive
 while unclosed container fences fail closed.
+While `p2_data_01_status` remains `proposed_independent_review_pending`, a
+separate semantic pass rejects nearby `approved`, `accepted`, `authoritative`,
+or `selected` status claims about P2-DATA or its durable store/contract. Only
+explicit negation, historical context, or review-and-merge conditions are
+allowed; regenerating the exact prose inventory cannot bless a premature claim.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in
@@ -109,6 +114,7 @@ diff must be reviewed with the documentation change.
 | Declaration | Value |
 | --- | --- |
 | `data01_runtime` | `design_only_not_implemented` |
+| `p2_data_01_status` | `proposed_independent_review_pending` |
 | `phase2_completion` | `incomplete` |
 | `phase2_canonical_store` | `endpoint_local_per_host` |
 | `phase2_opaque_server_blob_fallback` | `forbidden` |

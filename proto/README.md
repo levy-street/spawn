@@ -773,9 +773,9 @@ streams and awaits cleanup before returning. The former REST
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 
-### Approved P2-DATA-02 store contract (not implemented)
+### Proposed P2-DATA-02 store contract (review pending; not implemented)
 
-P2-DATA-01 selected the per-host endpoint-local canonical store in
+P2-DATA-01 proposes the per-host endpoint-local canonical store in
 `docs/DURABLE_SENSITIVE_DATA.md`. This subsection constrains the later wire
 implementation; it does not advertise a runtime capability today.
 
