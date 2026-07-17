@@ -11,6 +11,11 @@ from typing import Any
 
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..redis import get_backend
+from .signed_signal_relay import (
+    SIGNED_ENVELOPE_FIELD,
+    SignedRtcRelayError,
+    validate_signed_relay_container,
+)
 
 HOST_CONTROL_PROTOCOL = "spawn.host.ctl"
 HOST_CONTROL_VERSION = 1
@@ -189,6 +194,10 @@ def decode_host_owner_revocation(payload: bytes) -> HostOwnerRevocation | None:
 
 
 def encode_rtc_signal_dispatch(dispatch: RtcSignalDispatch) -> bytes:
+    try:
+        validate_signed_relay_container(dispatch.signal)
+    except SignedRtcRelayError as exc:
+        raise ValueError("invalid signed RTC dispatch") from exc
     payload = json.dumps(
         {
             "host_id": dispatch.host_id,
@@ -200,6 +209,7 @@ def encode_rtc_signal_dispatch(dispatch: RtcSignalDispatch) -> bytes:
             "signal": dispatch.signal,
         },
         separators=(",", ":"),
+        ensure_ascii=SIGNED_ENVELOPE_FIELD not in dispatch.signal,
     ).encode()
     if len(payload) > MAX_HOST_SIGNAL_ENVELOPE_BYTES:
         raise ValueError("RTC signal dispatch is too large")
@@ -242,6 +252,10 @@ def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
         or not isinstance(signal, dict)
     ):
         return None
+    try:
+        validate_signed_relay_container(signal)
+    except SignedRtcRelayError:
+        return None
     return RtcSignalDispatch(
         host_id,
         session_connection_id,
@@ -254,6 +268,10 @@ def decode_rtc_signal_dispatch(payload: bytes) -> RtcSignalDispatch | None:
 
 
 def encode_host_signal(envelope: HostSignalEnvelope) -> bytes:
+    try:
+        validate_signed_relay_container(envelope.signal)
+    except SignedRtcRelayError as exc:
+        raise ValueError("invalid signed host signal") from exc
     payload = json.dumps(
         {
             "daemon_connection_id": envelope.daemon_connection_id,
@@ -262,6 +280,7 @@ def encode_host_signal(envelope: HostSignalEnvelope) -> bytes:
             "signal": envelope.signal,
         },
         separators=(",", ":"),
+        ensure_ascii=SIGNED_ENVELOPE_FIELD not in envelope.signal,
     ).encode()
     if len(payload) > MAX_HOST_SIGNAL_ENVELOPE_BYTES:
         raise ValueError("host signal envelope is too large")
@@ -293,6 +312,10 @@ def decode_host_signal(payload: bytes) -> HostSignalEnvelope | None:
         or not valid_daemon_connection_id(browser_channel.removeprefix("spawn:rtc:browser:"))
         or not isinstance(signal, dict)
     ):
+        return None
+    try:
+        validate_signed_relay_container(signal)
+    except SignedRtcRelayError:
         return None
     return HostSignalEnvelope(
         daemon_connection_id,

@@ -588,9 +588,10 @@ finding a hard live prerequisite:
 - **F1:** `ws/browser.py`, `ws/host.py`, and `ws/daemon.py` carry the exact
   signed 12-field envelope in both directions as one bounded opaque/nested
   payload. Routing metadata remains outside and untrusted; the server never
-  parses or reserializes signed bytes. One calculated common bound must fit
-  nesting plus current roughly 1.1/1.2 MiB Host WebSocket/Redis caps and pass
-  exact-limit/+1 and signature-strip tests at every boundary.
+  forwards a parsed or reserialized replacement for the opaque bytes (a
+  separate untrusted structural parse may only reject). One calculated common
+  bound must fit nesting plus current roughly 1.1/1.2 MiB Host WebSocket/Redis
+  caps and pass exact-limit/+1 and signature-strip tests at every boundary.
 - **F2:** daemon and browser RTC entry points accept only verified-signal
   types. Only `verified.transcript.sdp` reaches WebRTC, fingerprint change is
   fatal, and agent/host tests substitute raw relay SDP against verified SDP in
@@ -623,6 +624,30 @@ finding a hard live prerequisite:
 - **F8:** Host deletion retains both a durable key-owner claim and a
   deletion/device-code revocation fence. This work is reviewed and merged at
   `8805622`.
+
+**P3-LIVE-F1 candidate (implemented, independent review pending):** agent and
+HostControl offers now carry the complete signed-wire JSON as one opaque
+`signed_envelope` string; answers use the identical carrier. The server parses
+a separate copy only for strict 12-field shape, duplicate-name, canonical
+key/signature, UUID, kind/role, topology, and exact authorized outer-route
+checks, then forwards the original string unchanged. It does not verify the
+signature, choose a pin, return SDP, or derive a signed field from server
+metadata. Structurally canonical public-key/signature substitutions therefore
+survive exactly for the endpoint verifier to reject.
+
+The live carrier is capped at 512 KiB of strict UTF-8. Worst-case JSON-string
+escaping doubles that to 1,024 KiB; a reserved 64 KiB routing allowance keeps
+the result below both the existing 1,100 KiB WebSocket and 1,200 KiB Redis
+dispatch limits. The same bound is checked at browser/host/daemon WS ingress,
+Redis encode/decode, and daemon protocol decode, with exact-limit and +1 tests.
+An accepted offer freezes signed-versus-legacy mode in its agent or host RTC
+binding, so missing, raw, or mixed answers cannot fall back after signed mode
+was selected. Legacy raw SDP remains only to avoid changing current callers in
+this prerequisite branch. The daemon can receive and preserve the opaque
+string but deliberately refuses it before RTC negotiation: F2 must verify pins
+and feed only `verified.transcript.sdp`. No live MITM-resistance or L1 claim is
+made until F2, reciprocal pins, signed-only cutover, and the remaining live
+gates pass.
 
 The final integration makes verified types mandatory in daemon
 `handle_offer`/`handle_host_offer` and centralized browser remote-description
