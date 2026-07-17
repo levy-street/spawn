@@ -373,6 +373,14 @@ expected_server_attribute_reads = Counter({
     ("server/spawn_server/ws/owner_dispatch.py", "decode_owner_result", "get:payload"): 1,
 })
 
+expected_python_reflection_references = Counter({
+    (
+        "server/spawn_server/ws/broker.py",
+        "register_rtc_session",
+        "name:getattr",
+    ): 1,
+})
+
 
 def python_attrgetter_callable(
     node: ast.AST,
@@ -502,6 +510,7 @@ class LegacyStringVisitor(ast.NodeVisitor):
         self.legacy = Counter()
         self.protected_attributes = Counter()
         self.attrgetter_references = Counter()
+        self.reflection_references = Counter()
 
     def visit(self, node: ast.AST):
         if (
@@ -523,15 +532,26 @@ class LegacyStringVisitor(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module == "operator":
             for name in node.names:
-                if name.name == "attrgetter":
-                    self.attrgetter_references[
-                        (self.relative, self.scope[-1], "import")
-                    ] += 1
+                self.attrgetter_references[
+                    (self.relative, self.scope[-1], f"operator-import:{name.name}")
+                ] += 1
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for name in node.names:
+            if name.name == "operator":
+                self.attrgetter_references[
+                    (self.relative, self.scope[-1], "operator-import")
+                ] += 1
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load) and node.id in self.attrgetter_callables:
             self.attrgetter_references[
+                (self.relative, self.scope[-1], f"name:{node.id}")
+            ] += 1
+        if isinstance(node.ctx, ast.Load) and node.id in {"getattr", "__import__"}:
+            self.reflection_references[
                 (self.relative, self.scope[-1], f"name:{node.id}")
             ] += 1
 
@@ -540,13 +560,18 @@ class LegacyStringVisitor(ast.NodeVisitor):
             self.legacy[(self.relative, self.scope[-1], node.value)] += 1
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if (
-            node.attr == "attrgetter"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in self.operator_modules
-        ):
+        if node.attr == "attrgetter":
             self.attrgetter_references[
-                (self.relative, self.scope[-1], "operator.attrgetter")
+                (self.relative, self.scope[-1], "attribute:attrgetter")
+            ] += 1
+        if node.attr in {
+            "__dict__",
+            "__getattribute__",
+            "getattr",
+            "import_module",
+        }:
+            self.reflection_references[
+                (self.relative, self.scope[-1], f"attribute:{node.attr}")
             ] += 1
         if node.attr in protected_server_attributes:
             self.protected_attributes[(self.relative, self.scope[-1], node.attr)] += 1
@@ -608,6 +633,7 @@ class LegacyStringVisitor(ast.NodeVisitor):
 found_legacy_strings = Counter()
 found_server_attribute_reads = Counter()
 found_attrgetter_references = Counter()
+found_python_reflection_references = Counter()
 for relative, tree in server_trees.items():
     visitor = LegacyStringVisitor(
         relative, tree, server_string_bindings.get(relative, {})
@@ -616,12 +642,18 @@ for relative, tree in server_trees.items():
     found_legacy_strings.update(visitor.legacy)
     found_server_attribute_reads.update(visitor.protected_attributes)
     found_attrgetter_references.update(visitor.attrgetter_references)
+    found_python_reflection_references.update(visitor.reflection_references)
 if found_legacy_strings != expected_legacy_strings:
     die(f"exact legacy server tool frame inventory changed: {found_legacy_strings!r}")
 if found_server_attribute_reads != expected_server_attribute_reads:
     die(f"protected server field access inventory changed: {found_server_attribute_reads!r}")
 if found_attrgetter_references:
     die(f"unreviewed operator.attrgetter reference: {found_attrgetter_references!r}")
+if found_python_reflection_references != expected_python_reflection_references:
+    die(
+        "Python reflection reference inventory changed: "
+        f"{found_python_reflection_references!r}"
+    )
 
 
 # Browser production has its query plus authoritative reconciliation metadata
@@ -833,7 +865,7 @@ def rust_production_source(source: str) -> str:
 
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
-    "daemon/src/host_tools.rs": "9a6478f355ee81b1304506fed2f788d6039fcae96a82cbdfba0ca7032390f372",
+    "daemon/src/host_tools.rs": "ce287fe8e3bb6bb54ebbf2166ca5ca1aacfd016c1cbae201657a12adb3c811e2",
     "daemon/src/main.rs": "74eb113f9acb3746632bdfeb8369e619a34b8fc44f86f7703a1d86bce432b754",
     "daemon/src/run.rs": "331508f7d1f573f2cf1ea9cda7343a3dca2a9e7f818217e0fb06346af5c5b8e6",
     "daemon/src/worker_backend.rs": "085b56874c94ec644c3255ed8b521a032b23564abb7afcd810bc4bb5e46b8105",
@@ -902,7 +934,7 @@ if found_rust_process_inventory != expected_rust_process_inventory:
         "parsed Rust foreign/process launch inventory changed: "
         f"{found_rust_process_inventory!r}"
     )
-expected_rust_structural_digest = "7a252adb47c708b5ab2b7d5f6f6d5694a745935d7faa638cd842c7045a9c5742"
+expected_rust_structural_digest = "11fbc06de8d8add301f74c25bd82fdeaec2b96f6627653d44a5963617ef14f48"
 found_rust_structural_digest = hashlib.sha256(structural.stdout.encode()).hexdigest()
 if found_rust_structural_digest != expected_rust_structural_digest:
     die(
@@ -1614,6 +1646,68 @@ def hidden_reflection(value):
 ''')
 PY
   expect_rejected server-attrgetter-reflection-alias
+
+  new_case server-operator-module-container
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+module_box = ({"module": (operator,)},)
+def hidden_module_container(value):
+    return module_box[0]["module"][0].attrgetter("install")(value)
+''')
+PY
+  expect_rejected server-operator-module-container
+
+  new_case server-operator-module-return
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+def give_operator():
+    return operator
+def hidden_module_return(value):
+    return give_operator().attrgetter("install")(value)
+''')
+PY
+  expect_rejected server-operator-module-return
+
+  new_case server-operator-module-attribute
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+import operator
+class ModuleBox:
+    pass
+module_box = ModuleBox()
+module_box.module = operator
+def hidden_module_attribute(value):
+    return module_box.module.attrgetter("install")(value)
+''')
+PY
+  expect_rejected server-operator-module-attribute
+
+  new_case server-operator-computed-import
+  python3 - "$case_dir/server/spawn_server/auth.py" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text() + '''
+loader_box = (__import__,)
+module_name = bytes((111, 112, 101, 114, 97, 116, 111, 114)).decode()
+selector_name = bytes((97, 116, 116, 114, 103, 101, 116, 116, 101, 114)).decode()
+def hidden_computed_import(value):
+    module = loader_box[0](module_name)
+    return module.__getattribute__(selector_name)("install")(value)
+''')
+PY
+  expect_rejected server-operator-computed-import
 
   new_case web-legacy-alias
   printf '%s\n' 'export const hostToolFallback = hosts["installTool"];' \

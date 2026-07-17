@@ -8,6 +8,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 #[cfg(test)]
@@ -45,11 +49,20 @@ const QUARANTINE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CONTAINMENT_TREE_DEPTH: usize = 64;
 const MAX_CONTAINMENT_TREE_ENTRIES: usize = 4_096;
 const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
+const MAX_CONTAINMENT_PIDS: usize = 64;
+const MAX_CONTAINMENT_PID_BYTES: u64 = (MAX_CONTAINMENT_PIDS * 16) as u64;
+const MAX_MANAGER_CGROUP_PIDS: usize = 4_096;
+const MAX_MANAGER_CGROUP_PID_BYTES: u64 = (MAX_MANAGER_CGROUP_PIDS * 16) as u64;
+const TOOL_CGROUP_MANAGER_NAME: &str = "spawn-manager";
+const TOOL_CGROUP_ATTEMPTS_NAME: &str = "spawn-tool-attempts";
+const TOOL_CGROUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const SPAWN_BUSY_RETRIES: usize = 3;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 pub(crate) const MAX_PROCESSES: usize = 4;
 #[cfg(target_os = "linux")]
 static TOOL_CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+static TOOL_CGROUP_ATTEMPTS_ROOT: StdMutex<Option<PathBuf>> = StdMutex::new(None);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +241,8 @@ struct HostToolLifecycleHooks {
     #[cfg(test)]
     cleanup_remove: AsyncPause,
     #[cfg(test)]
+    cleanup_owned_child: AsyncPause,
+    #[cfg(test)]
     quarantine_reaper: AsyncPause,
     #[cfg(test)]
     fail_pre_spawn: AtomicBool,
@@ -349,6 +364,13 @@ impl HostToolLifecycleHooks {
             self.cleanup_remove.entered.notify_one();
             self.cleanup_remove.release.notified().await;
         }
+    }
+
+    async fn cleanup_owned_child_until(&self, _deadline: tokio::time::Instant) -> bool {
+        #[cfg(test)]
+        return self.cleanup_owned_child.pause_until(_deadline).await;
+        #[cfg(not(test))]
+        true
     }
 
     async fn pause_quarantine_reaper(&self) {
@@ -1750,14 +1772,297 @@ struct ToolContainment {
     path: PathBuf,
     cleaned: bool,
     reap_pids: HashSet<i32>,
+    reaped_owned_pid: Option<i32>,
+    pending_child: Option<Child>,
     pending_inventory: Option<tokio::task::JoinHandle<ContainmentInventory>>,
     pending_removal: Option<tokio::task::JoinHandle<Result<(), String>>>,
     lifecycle_hooks: Arc<HostToolLifecycleHooks>,
 }
 
 #[cfg(target_os = "linux")]
+fn current_cgroup_path() -> Result<PathBuf, String> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|error| format!("endpoint cannot read its cgroup membership: {error}"))?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|value| {
+            value.starts_with('/') && !value.contains("..") && !value.contains(" (deleted)")
+        })
+        .ok_or_else(|| "endpoint is not running in a reviewed cgroup v2 hierarchy".to_string())?;
+    let mount = Path::new("/sys/fs/cgroup");
+    let path = mount.join(relative.trim_start_matches('/'));
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("endpoint cannot resolve its cgroup membership: {error}"))?;
+    if !canonical.starts_with(mount) {
+        return Err("endpoint cgroup membership escaped the cgroup v2 mount".into());
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn service_cgroup_root(current: &Path) -> Result<PathBuf, String> {
+    if current.file_name().and_then(|name| name.to_str()) == Some(TOOL_CGROUP_MANAGER_NAME) {
+        current
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "endpoint manager cgroup has no delegated parent".to_string())
+    } else if current
+        .components()
+        .any(|part| part.as_os_str() == TOOL_CGROUP_ATTEMPTS_NAME)
+    {
+        Err("endpoint process is inside the tool-attempt cgroup subtree".into())
+    } else {
+        Ok(current.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cgroup_owner(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {label} cgroup ownership: {error}"))?;
+    let endpoint_uid = unsafe { nix::libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != endpoint_uid {
+        return Err(format!(
+            "{label} cgroup is not owned by the endpoint uid {endpoint_uid}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_has_token(path: &Path, file: &str, token: &str) -> Result<bool, String> {
+    let contents = std::fs::read_to_string(path.join(file))
+        .map_err(|error| format!("cannot read {file} for {}: {error}", path.display()))?;
+    Ok(contents.split_whitespace().any(|value| value == token))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_pids_subtree_control(path: &Path, label: &str) -> Result<(), String> {
+    if !cgroup_has_token(path, "cgroup.controllers", "pids")? {
+        return Err(format!(
+            "{label} cgroup was not delegated the pids controller"
+        ));
+    }
+    if !cgroup_has_token(path, "cgroup.subtree_control", "pids")? {
+        std::fs::write(path.join("cgroup.subtree_control"), b"+pids\n")
+            .map_err(|error| format!("cannot enable pids for {label} cgroup: {error}"))?;
+    }
+    if !cgroup_has_token(path, "cgroup.subtree_control", "pids")? {
+        return Err(format!(
+            "{label} cgroup did not retain pids subtree delegation"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_manager_cgroup_pids(path: &Path) -> Result<Vec<i32>, String> {
+    let file = File::open(path.join("cgroup.procs"))
+        .map_err(|error| format!("cannot read delegated service cgroup processes: {error}"))?;
+    let mut contents = String::new();
+    file.take(MAX_MANAGER_CGROUP_PID_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| format!("cannot read delegated service cgroup processes: {error}"))?;
+    if contents.len() as u64 > MAX_MANAGER_CGROUP_PID_BYTES {
+        return Err("delegated service cgroup process inventory exceeded its byte limit".into());
+    }
+    let mut pids = Vec::new();
+    for raw in contents.lines() {
+        let pid = raw
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "delegated service cgroup reported an invalid PID".to_string())?;
+        if !pids.contains(&pid) {
+            if pids.len() >= MAX_MANAGER_CGROUP_PIDS {
+                return Err("delegated service cgroup process inventory exceeded its limit".into());
+            }
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn move_service_processes_to_manager(root: &Path, manager: &Path) -> Result<(), String> {
+    for _ in 0..16 {
+        let pids = read_manager_cgroup_pids(root)?;
+        if pids.is_empty() {
+            return Ok(());
+        }
+        for pid in pids {
+            if let Err(error) = std::fs::write(manager.join("cgroup.procs"), format!("{pid}\n")) {
+                if error.raw_os_error() != Some(nix::libc::ESRCH) {
+                    return Err(format!(
+                        "cannot move service process {pid} into the manager leaf: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    if read_manager_cgroup_pids(root)?.is_empty() {
+        Ok(())
+    } else {
+        Err("delegated service cgroup remained internally populated".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stale_tool_attempt_paths(attempts: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(attempts)
+        .map_err(|error| format!("cannot inspect prior tool-attempt cgroups: {error}"))?;
+    let mut entries_seen = 0;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect prior tool attempt: {error}"))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect prior tool-attempt type: {error}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        entries_seen += 1;
+        if entries_seen > MAX_CONTAINMENT_TREE_ENTRIES {
+            return Err("prior tool-attempt inventory exceeded its entry limit".into());
+        }
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("spawn-tool-") {
+            return Err(format!(
+                "delegated attempts subtree contains an unowned cgroup {}",
+                name.to_string_lossy()
+            ));
+        }
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_tool_attempts(
+    attempts: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    for path in stale_tool_attempt_paths(attempts)? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("prior tool-attempt cleanup exceeded its deadline".into());
+        }
+        std::fs::write(path.join("cgroup.kill"), b"1\n")
+            .map_err(|error| format!("cannot kill a prior tool-attempt cgroup: {error}"))?;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("prior tool-attempt cleanup exceeded its deadline".into());
+            }
+            let events = std::fs::read_to_string(path.join("cgroup.events"))
+                .map_err(|error| format!("cannot read prior tool-attempt state: {error}"))?;
+            let populated = events
+                .lines()
+                .find_map(|line| line.strip_prefix("populated "))
+                .ok_or_else(|| "prior tool-attempt state omitted populated".to_string())?;
+            if populated == "0" {
+                break;
+            }
+            if populated != "1" {
+                return Err("prior tool-attempt state reported invalid populated value".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        remove_cgroup_tree_until(&path, deadline)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provision_tool_attempts_root() -> Result<PathBuf, String> {
+    let current = current_cgroup_path()?;
+    let root = service_cgroup_root(&current)?;
+    validate_cgroup_owner(&root, "delegated service")?;
+
+    let manager = root.join(TOOL_CGROUP_MANAGER_NAME);
+    let manager_created = match std::fs::create_dir(&manager) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(format!("cannot create endpoint manager cgroup: {error}")),
+    };
+    if let Err(error) = validate_cgroup_owner(&manager, "endpoint manager")
+        .and_then(|()| move_service_processes_to_manager(&root, &manager))
+    {
+        if manager_created {
+            let _ = std::fs::remove_dir(&manager);
+        }
+        return Err(error);
+    }
+    if current_cgroup_path()? != manager {
+        return Err("endpoint did not enter its stable manager cgroup".into());
+    }
+    ensure_pids_subtree_control(&root, "delegated service")?;
+
+    let attempts = root.join(TOOL_CGROUP_ATTEMPTS_NAME);
+    let attempts_created = match std::fs::create_dir(&attempts) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(format!("cannot create tool-attempts cgroup: {error}")),
+    };
+    let setup = validate_cgroup_owner(&attempts, "tool-attempts")
+        .and_then(|()| {
+            if read_manager_cgroup_pids(&attempts)?.is_empty() {
+                Ok(())
+            } else {
+                Err("tool-attempts cgroup is internally populated".into())
+            }
+        })
+        .and_then(|()| ensure_pids_subtree_control(&attempts, "tool-attempts"))
+        .and_then(|()| {
+            cleanup_stale_tool_attempts(
+                &attempts,
+                tokio::time::Instant::now() + TOOL_CGROUP_RECOVERY_TIMEOUT,
+            )
+        });
+    if let Err(error) = setup {
+        if attempts_created {
+            let _ = std::fs::remove_dir(&attempts);
+        }
+        return Err(error);
+    }
+    Ok(attempts)
+}
+
+#[cfg(target_os = "linux")]
+fn allocate_tool_cgroup() -> Result<PathBuf, String> {
+    let mut cached = TOOL_CGROUP_ATTEMPTS_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let attempts = if let Some(path) = cached.as_ref() {
+        validate_cgroup_owner(path, "tool-attempts")?;
+        if !cgroup_has_token(path, "cgroup.subtree_control", "pids")? {
+            return Err("tool-attempts cgroup lost pids subtree delegation".into());
+        }
+        path.clone()
+    } else {
+        let path = provision_tool_attempts_root()?;
+        *cached = Some(path.clone());
+        path
+    };
+    for _ in 0..16 {
+        let sequence = TOOL_CGROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = attempts.join(format!("spawn-tool-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "endpoint cannot create a delegated tool cgroup: {error}"
+                ));
+            }
+        }
+    }
+    Err("endpoint could not allocate a unique delegated tool cgroup".into())
+}
+
+#[cfg(target_os = "linux")]
 impl ToolContainment {
-    fn create(lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
+    async fn create(lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
         static SUBREAPER: OnceLock<Result<(), String>> = OnceLock::new();
         if let Err(error) = SUBREAPER.get_or_init(|| {
             nix::sys::prctl::set_child_subreaper(true)
@@ -1765,50 +2070,25 @@ impl ToolContainment {
         }) {
             return Err(ToolError::new("containment_unavailable", error.clone()));
         }
-        let membership = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| {
-            ToolError::new(
-                "containment_unavailable",
-                format!("endpoint cannot read its cgroup membership: {error}"),
-            )
-        })?;
-        let relative = membership
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .filter(|value| value.starts_with('/') && !value.contains(".."))
-            .ok_or_else(|| {
+        let path = tokio::task::spawn_blocking(allocate_tool_cgroup)
+            .await
+            .map_err(|error| {
                 ToolError::new(
                     "containment_unavailable",
-                    "endpoint is not running in a reviewed cgroup v2 hierarchy",
+                    format!("endpoint cgroup setup task failed: {error}"),
                 )
-            })?;
-        let parent = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-        for _ in 0..16 {
-            let sequence = TOOL_CGROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!("spawn-tool-{}-{sequence}", std::process::id()));
-            match std::fs::create_dir(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        cleaned: false,
-                        reap_pids: HashSet::new(),
-                        pending_inventory: None,
-                        pending_removal: None,
-                        lifecycle_hooks,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(ToolError::new(
-                        "containment_unavailable",
-                        format!("endpoint cannot create a delegated tool cgroup: {error}"),
-                    ));
-                }
-            }
-        }
-        Err(ToolError::new(
-            "containment_unavailable",
-            "endpoint could not allocate a unique delegated tool cgroup",
-        ))
+            })?
+            .map_err(|error| ToolError::new("containment_unavailable", error))?;
+        Ok(Self {
+            path,
+            cleaned: false,
+            reap_pids: HashSet::new(),
+            reaped_owned_pid: None,
+            pending_child: None,
+            pending_inventory: None,
+            pending_removal: None,
+            lifecycle_hooks,
+        })
     }
 
     fn validate_files(&self) -> Result<(), ToolError> {
@@ -1817,6 +2097,7 @@ impl ToolContainment {
             "cgroup.kill",
             "cgroup.freeze",
             "cgroup.events",
+            "pids.max",
         ] {
             let path = self.path.join(name);
             if !path.is_file() {
@@ -1835,7 +2116,20 @@ impl ToolContainment {
                     format!("delegated tool cgroup cannot be killed: {error}"),
                 )
             })?;
-        Ok(())
+        let pids_max = self.path.join("pids.max");
+        std::fs::write(&pids_max, format!("{MAX_CONTAINMENT_PIDS}\n")).map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("delegated tool cgroup cannot program pids.max: {error}"),
+            )
+        })?;
+        let configured = std::fs::read_to_string(&pids_max).map_err(|error| {
+            ToolError::new(
+                "containment_unavailable",
+                format!("delegated tool cgroup cannot verify pids.max: {error}"),
+            )
+        })?;
+        validate_containment_pids_max(&configured)
     }
 
     fn membership_file(&self) -> Result<File, ToolError> {
@@ -1921,7 +2215,7 @@ impl ToolContainment {
         });
         match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(Ok(inventory)) => {
-                self.reap_pids.extend(inventory.pids);
+                self.merge_inventory_pids(inventory.pids);
                 if tokio::time::Instant::now() >= deadline {
                     Err(
                         "tool containment PID inventory completed after its cleanup deadline"
@@ -1939,6 +2233,61 @@ impl ToolContainment {
             Err(_) => {
                 self.pending_inventory = Some(task);
                 Err("tool containment PID inventory exceeded its cleanup deadline".into())
+            }
+        }
+    }
+
+    fn forget_reaped_owned_pid(&mut self, pid: Option<u32>) {
+        let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+            return;
+        };
+        self.reaped_owned_pid = Some(pid);
+        self.reap_pids.remove(&pid);
+    }
+
+    fn merge_inventory_pids(&mut self, pids: HashSet<i32>) {
+        self.reap_pids.extend(
+            pids.into_iter()
+                .filter(|pid| Some(*pid) != self.reaped_owned_pid),
+        );
+    }
+
+    fn retain_owned_child(&mut self, child: Child) {
+        debug_assert!(self.pending_child.is_none());
+        self.pending_child = Some(child);
+    }
+
+    async fn reap_owned_child_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let Some(mut child) = self.pending_child.take() else {
+            return Ok(());
+        };
+        let pid = child.id();
+        let _ = child.start_kill();
+        if !self
+            .lifecycle_hooks
+            .cleanup_owned_child_until(deadline)
+            .await
+        {
+            self.pending_child = Some(child);
+            return Err("direct tool process was not reaped before the cleanup deadline".into());
+        }
+        match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(_)) => {
+                self.forget_reaped_owned_pid(pid);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.pending_child = Some(child);
+                Err(format!(
+                    "endpoint could not reap direct tool process: {error}"
+                ))
+            }
+            Err(_) => {
+                self.pending_child = Some(child);
+                Err("direct tool process was not reaped before the cleanup deadline".into())
             }
         }
     }
@@ -2020,6 +2369,7 @@ impl ToolContainment {
     }
 
     async fn settle_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        self.reap_owned_child_until(deadline).await?;
         if self.cleaned {
             return Ok(());
         }
@@ -2092,6 +2442,18 @@ impl ToolContainment {
 }
 
 #[cfg(target_os = "linux")]
+fn validate_containment_pids_max(configured: &str) -> Result<(), ToolError> {
+    if configured.trim() == MAX_CONTAINMENT_PIDS.to_string() {
+        Ok(())
+    } else {
+        Err(ToolError::new(
+            "containment_unavailable",
+            "delegated tool cgroup did not retain the reviewed pids.max",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl ToolResidueAdmission {
     fn quarantine(mut self, mut containment: ToolContainment) {
         {
@@ -2148,6 +2510,34 @@ fn inventory_containment_pids_until(
 }
 
 #[cfg(target_os = "linux")]
+fn record_containment_pid(pids: &mut HashSet<i32>, raw: &str) -> Result<(), String> {
+    let pid = raw
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "tool containment reported an invalid PID".to_string())?;
+    if !pids.contains(&pid) && pids.len() >= MAX_CONTAINMENT_PIDS {
+        return Err("tool containment PID inventory exceeded its process limit".into());
+    }
+    pids.insert(pid);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_containment_pids(path: &Path) -> Result<String, String> {
+    let file = File::open(path.join("cgroup.procs"))
+        .map_err(|error| format!("cannot inventory contained tool processes: {error}"))?;
+    let mut procs = String::new();
+    file.take(MAX_CONTAINMENT_PID_BYTES + 1)
+        .read_to_string(&mut procs)
+        .map_err(|error| format!("cannot inventory contained tool processes: {error}"))?;
+    if procs.len() as u64 > MAX_CONTAINMENT_PID_BYTES {
+        return Err("tool containment PID inventory exceeded its byte limit".into());
+    }
+    Ok(procs)
+}
+
+#[cfg(target_os = "linux")]
 fn inventory_cgroup_pids_inner(
     path: &Path,
     pids: &mut HashSet<i32>,
@@ -2161,9 +2551,10 @@ fn inventory_cgroup_pids_inner(
     if depth > MAX_CONTAINMENT_TREE_DEPTH {
         return Err("tool containment PID inventory exceeded its depth limit".into());
     }
-    let procs = std::fs::read_to_string(path.join("cgroup.procs"))
-        .map_err(|error| format!("cannot inventory contained tool processes: {error}"))?;
-    pids.extend(procs.lines().filter_map(|value| value.parse::<i32>().ok()));
+    let procs = read_containment_pids(path)?;
+    for raw_pid in procs.lines() {
+        record_containment_pid(pids, raw_pid)?;
+    }
     if tokio::time::Instant::now() >= deadline {
         return Err("tool containment PID inventory exceeded its cleanup deadline".into());
     }
@@ -2234,7 +2625,7 @@ fn inventory_proc_cgroup_members_until(
             }
         };
         if contents.lines().any(|line| line == membership) {
-            pids.insert(pid);
+            record_containment_pid(pids, &pid.to_string())?;
         }
     }
     Ok(())
@@ -2243,6 +2634,9 @@ fn inventory_proc_cgroup_members_until(
 #[cfg(target_os = "linux")]
 impl Drop for ToolContainment {
     fn drop(&mut self) {
+        if let Some(child) = self.pending_child.as_mut() {
+            let _ = child.start_kill();
+        }
         if self.cleaned {
             return;
         }
@@ -2307,7 +2701,7 @@ struct ToolContainment;
 
 #[cfg(not(target_os = "linux"))]
 impl ToolContainment {
-    fn create(_lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
+    async fn create(_lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
         Err(ToolError::new(
             "containment_unavailable",
             "interactive tool execution requires reviewed Linux cgroup v2 containment",
@@ -2323,6 +2717,12 @@ impl ToolContainment {
 
     fn kill_now(&self) -> Result<(), String> {
         Err("tool containment is unavailable".into())
+    }
+
+    fn forget_reaped_owned_pid(&mut self, _pid: Option<u32>) {}
+
+    fn retain_owned_child(&mut self, mut child: Child) {
+        let _ = child.start_kill();
     }
 
     async fn kill_if_populated_until(
@@ -2366,7 +2766,7 @@ async fn run_program_capture(
     let mut spawn_attempt = 0;
     let (mut child, mut containment) = loop {
         let sandbox = ToolSandbox::create(env)?;
-        let containment = ToolContainment::create(Arc::clone(&lifecycle_hooks))?;
+        let containment = ToolContainment::create(Arc::clone(&lifecycle_hooks)).await?;
         #[cfg(all(test, target_os = "linux"))]
         lifecycle_hooks.record_containment_path(containment.path.clone());
         let validation = if lifecycle_hooks.take_pre_spawn_failure() {
@@ -2479,11 +2879,16 @@ async fn run_program_capture(
             .kill_if_populated_until(cleanup_deadline)
             .await
             .err();
-        kill_process_group(pid);
         let _ = child.start_kill();
         let (status, child_failure) = match wait_child_until(&mut child, cleanup_deadline).await {
-            Ok(status) => (Some(status), None),
-            Err(error) => (None, Some(error)),
+            Ok(status) => {
+                containment.forget_reaped_owned_pid(pid);
+                (Some(status), None)
+            }
+            Err(error) => {
+                containment.retain_owned_child(child);
+                (None, Some(error))
+            }
         };
         let containment_failure = containment_failure
             .or(child_failure)
@@ -2537,7 +2942,10 @@ async fn run_program_capture(
     };
     let cleanup_deadline = tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT;
     let status = match completion {
-        Completion::Exited(Ok(status)) => Some(status),
+        Completion::Exited(Ok(status)) => {
+            containment.forget_reaped_owned_pid(pid);
+            Some(status)
+        }
         Completion::Exited(Err(error)) => {
             failure = Some(format!(
                 "endpoint could not observe tool process completion: {error}"
@@ -2548,12 +2956,15 @@ async fn run_program_capture(
                     failure.get_or_insert(error);
                 }
             }
-            kill_process_group(pid);
             let _ = child.start_kill();
             match wait_child_until(&mut child, cleanup_deadline).await {
-                Ok(status) => Some(status),
+                Ok(status) => {
+                    containment.forget_reaped_owned_pid(pid);
+                    Some(status)
+                }
                 Err(error) => {
                     failure.get_or_insert(error);
+                    containment.retain_owned_child(child);
                     None
                 }
             }
@@ -2566,13 +2977,16 @@ async fn run_program_capture(
                     failure.get_or_insert(error);
                 }
             }
-            kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
             match wait_child_until(&mut child, cleanup_deadline).await {
-                Ok(status) => Some(status),
+                Ok(status) => {
+                    containment.forget_reaped_owned_pid(pid);
+                    Some(status)
+                }
                 Err(error) => {
                     failure.get_or_insert(error);
+                    containment.retain_owned_child(child);
                     None
                 }
             }
@@ -2588,13 +3002,16 @@ async fn run_program_capture(
                     failure.get_or_insert(error);
                 }
             }
-            kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
             match wait_child_until(&mut child, cleanup_deadline).await {
-                Ok(status) => Some(status),
+                Ok(status) => {
+                    containment.forget_reaped_owned_pid(pid);
+                    Some(status)
+                }
                 Err(error) => {
                     failure.get_or_insert(error);
+                    containment.retain_owned_child(child);
                     None
                 }
             }
@@ -2612,7 +3029,6 @@ async fn run_program_capture(
     }
     let (stdout, stderr) = tokio::join!(finish_tail(stdout_task), finish_tail(stderr_task));
     if stdout.1 || stderr.1 {
-        kill_process_group(pid);
         failure.get_or_insert_with(|| "tool output pipes did not close before deadline".into());
     }
     if descendants_remained {
@@ -2737,18 +3153,6 @@ fn empty_tail() -> TailCapture {
     }
 }
 
-#[cfg(unix)]
-fn kill_process_group(pid: Option<u32>) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: Option<u32>) {}
-
 fn first_meaningful_line(output: &str) -> Option<String> {
     output
         .lines()
@@ -2847,6 +3251,34 @@ mod tests {
             ("PATH".into(), dir.to_string_lossy().into_owned()),
             ("HOME".into(), dir.to_string_lossy().into_owned()),
         ])
+    }
+
+    fn tool_pids_controller_is_delegated() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(current) = current_cgroup_path() else {
+                return false;
+            };
+            let Ok(root) = service_cgroup_root(&current) else {
+                return false;
+            };
+            let systemd_manager_leaf = current.file_name().and_then(|name| name.to_str())
+                == Some(TOOL_CGROUP_MANAGER_NAME);
+            cgroup_has_token(&root, "cgroup.subtree_control", "pids").unwrap_or(false)
+                || (systemd_manager_leaf
+                    && cgroup_has_token(&root, "cgroup.controllers", "pids").unwrap_or(false))
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    macro_rules! require_tool_pids_controller {
+        () => {
+            if !tool_pids_controller_is_delegated() {
+                eprintln!("skipped: the test cgroup does not delegate the pids controller");
+                return;
+            }
+        };
     }
 
     #[cfg(unix)]
@@ -3176,6 +3608,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn direct_argv_is_literal_and_output_memory_is_bounded() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "literal", "printf '%s' \"$1\"");
         let marker = dir.path().join("must-not-exist");
@@ -3222,6 +3655,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sandbox_blocks_direct_and_manager_assisted_cgroup_escape_after_fork_and_exec() {
+        require_tool_pids_controller!();
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::AtomicBool;
 
@@ -3322,6 +3756,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn successful_parent_cannot_release_a_closed_pipe_setsid_descendant_or_process_permit() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let child_pid = dir.path().join("child-pid");
         let script = executable(
@@ -3367,6 +3802,12 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
         let containment_path = hooks.containment_path();
         assert!(containment_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(containment_path.join("pids.max"))
+                .expect("configured pids.max")
+                .trim(),
+            MAX_CONTAINMENT_PIDS.to_string()
+        );
         hooks.after_kill.release();
         let capture = task.await.expect("capture task").expect("capture");
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -3394,6 +3835,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn latest_probe_with_exit_zero_setsid_descendant_is_unknown_and_leaves_no_residue() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let child_pid = dir.path().join("latest-child-pid");
         executable(
@@ -3444,6 +3886,8 @@ mod tests {
             path: dir.path().to_path_buf(),
             cleaned: true,
             reap_pids: HashSet::new(),
+            reaped_owned_pid: None,
+            pending_child: None,
             pending_inventory: None,
             pending_removal: None,
             lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
@@ -3456,8 +3900,291 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_pids_controller_fails_closed_before_child_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.freeze",
+            "cgroup.events",
+        ] {
+            std::fs::write(dir.path().join(name), b"").expect("fake cgroup file");
+        }
+        let containment = ToolContainment {
+            path: dir.path().to_path_buf(),
+            cleaned: true,
+            reap_pids: HashSet::new(),
+            reaped_owned_pid: None,
+            pending_child: None,
+            pending_inventory: None,
+            pending_removal: None,
+            lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
+        };
+        let error = containment
+            .validate_files()
+            .expect_err("containment without pids.max must fail closed");
+        assert_eq!(error.code, "containment_unavailable");
+        assert!(error.detail.contains("pids.max"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pids_max_verification_rejects_unlimited_and_write_read_mismatch() {
+        for configured in ["max\n", "63\n"] {
+            let error = validate_containment_pids_max(configured)
+                .expect_err("unlimited or mismatched pids.max must fail closed");
+            assert_eq!(error.code, "containment_unavailable");
+            assert!(error.detail.contains("did not retain"));
+        }
+        validate_containment_pids_max(&format!("{MAX_CONTAINMENT_PIDS}\n"))
+            .expect("the exact reviewed pids.max must be accepted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delegated_layout_requires_pids_and_kernel_style_enable_readback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.controllers"), b"memory\n")
+            .expect("fake controllers");
+        std::fs::write(dir.path().join("cgroup.subtree_control"), b"")
+            .expect("fake subtree control");
+        let error = ensure_pids_subtree_control(dir.path(), "mock service")
+            .expect_err("missing pids delegation must fail closed");
+        assert!(error.contains("was not delegated"));
+
+        std::fs::write(dir.path().join("cgroup.controllers"), b"pids\n").expect("fake controllers");
+        let error = ensure_pids_subtree_control(dir.path(), "mock service")
+            .expect_err("a write without kernel-style readback must fail closed");
+        assert!(error.contains("did not retain"));
+
+        std::fs::write(dir.path().join("cgroup.subtree_control"), b"pids\n")
+            .expect("fake subtree control");
+        ensure_pids_subtree_control(dir.path(), "mock service").expect("verified pids delegation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manager_leaf_and_restart_attempt_inventory_are_strict() {
+        let root = Path::new("/sys/fs/cgroup/example.service");
+        assert_eq!(
+            service_cgroup_root(&root.join(TOOL_CGROUP_MANAGER_NAME)).expect("manager root"),
+            root
+        );
+        assert_eq!(
+            service_cgroup_root(root).expect("pre-subgroup fallback root"),
+            root
+        );
+        assert!(service_cgroup_root(
+            &root
+                .join(TOOL_CGROUP_ATTEMPTS_NAME)
+                .join("spawn-tool-stale")
+        )
+        .is_err());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owned = dir.path().join("spawn-tool-123-1");
+        std::fs::create_dir(&owned).expect("owned stale attempt");
+        assert_eq!(
+            stale_tool_attempt_paths(dir.path()).expect("owned restart inventory"),
+            vec![owned]
+        );
+        std::fs::create_dir(dir.path().join("foreign-control-group"))
+            .expect("foreign cgroup fixture");
+        let error = stale_tool_attempt_paths(dir.path())
+            .expect_err("restart recovery must not mutate an unknown cgroup");
+        assert!(error.contains("unowned cgroup"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_recovery_kills_and_removes_an_owned_stale_attempt() {
+        require_tool_pids_controller!();
+        let allocated = tokio::task::spawn_blocking(allocate_tool_cgroup)
+            .await
+            .expect("cgroup setup task")
+            .expect("delegated tool cgroup");
+        let attempts = allocated.parent().expect("attempts root").to_path_buf();
+        std::fs::remove_dir(&allocated).expect("remove unused allocated attempt");
+        let service_root = attempts.parent().expect("delegated service root");
+        let sequence = TOOL_CGROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let recovery_root = service_root.join(format!(
+            "spawn-recovery-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&recovery_root).expect("recovery root cgroup");
+        let stale = recovery_root.join(format!("spawn-tool-{}-stale", std::process::id()));
+        std::fs::create_dir(&stale).expect("stale attempt cgroup");
+
+        let containment = ToolContainment {
+            path: stale.clone(),
+            cleaned: true,
+            reap_pids: HashSet::new(),
+            reaped_owned_pid: None,
+            pending_child: None,
+            pending_inventory: None,
+            pending_removal: None,
+            lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "while :; do :; done"])
+            .kill_on_drop(true);
+        containment
+            .attach(&mut command)
+            .expect("attach stale child");
+        let mut child = command.spawn().expect("stale child");
+
+        tokio::task::spawn_blocking({
+            let recovery_root = recovery_root.clone();
+            move || {
+                cleanup_stale_tool_attempts(
+                    &recovery_root,
+                    tokio::time::Instant::now() + TOOL_CGROUP_RECOVERY_TIMEOUT,
+                )
+            }
+        })
+        .await
+        .expect("restart recovery task")
+        .expect("restart recovery");
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("stale child wait deadline")
+            .expect("reap stale child");
+        assert!(!stale.exists(), "stale attempt cgroup remained");
+        std::fs::remove_dir(&recovery_root).expect("remove recovery root cgroup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn older_systemd_fallback_moves_service_processes_to_the_manager_leaf() {
+        if std::env::var_os("SPAWN_TEST_MANUAL_CGROUP_FALLBACK").is_none() {
+            eprintln!("skipped: manual manager-leaf fallback test was not requested");
+            return;
+        }
+        let before = current_cgroup_path().expect("initial service cgroup");
+        assert_ne!(
+            before.file_name().and_then(|name| name.to_str()),
+            Some(TOOL_CGROUP_MANAGER_NAME),
+            "fallback fixture unexpectedly started in a systemd manager leaf"
+        );
+        let allocated = tokio::task::spawn_blocking(allocate_tool_cgroup)
+            .await
+            .expect("fallback cgroup setup task")
+            .expect("fallback delegated tool cgroup");
+        let after = current_cgroup_path().expect("manager cgroup membership");
+        assert_eq!(
+            after.file_name().and_then(|name| name.to_str()),
+            Some(TOOL_CGROUP_MANAGER_NAME)
+        );
+        let root = service_cgroup_root(&after).expect("delegated service root");
+        assert!(cgroup_has_token(&root, "cgroup.subtree_control", "pids")
+            .expect("pids subtree readback"));
+        assert!(allocated.join("pids.max").is_file());
+        std::fs::remove_dir(allocated).expect("remove fallback attempt cgroup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn containment_pid_inventory_accepts_the_cap_and_rejects_cap_plus_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at_cap = (1..=MAX_CONTAINMENT_PIDS)
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{at_cap}\n"))
+            .expect("fake cgroup.procs");
+        let mut pids = HashSet::new();
+        inventory_cgroup_pids_inner(
+            dir.path(),
+            &mut pids,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            0,
+            &mut 0,
+        )
+        .expect("the reviewed PID cap must be accepted");
+        assert_eq!(pids.len(), MAX_CONTAINMENT_PIDS);
+
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("{at_cap}\n{}\n", MAX_CONTAINMENT_PIDS + 1),
+        )
+        .expect("fake cgroup.procs");
+        let error = inventory_cgroup_pids_inner(
+            dir.path(),
+            &mut HashSet::new(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            0,
+            &mut 0,
+        )
+        .expect_err("PID cap plus one must fail closed");
+        assert!(error.contains("process limit"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn containment_pid_inventory_rejects_oversized_membership_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            "1\n".repeat((MAX_CONTAINMENT_PID_BYTES as usize / 2) + 1),
+        )
+        .expect("fake cgroup.procs");
+        let error = read_containment_pids(dir.path())
+            .expect_err("oversized cgroup membership must fail closed");
+        assert!(error.contains("byte limit"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_child_handle_survives_timeout_and_stale_pid_inventory_is_filtered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "while :; do :; done"])
+            .kill_on_drop(true);
+        let child = command.spawn().expect("test child");
+        let raw_pid = i32::try_from(child.id().expect("test child pid")).expect("i32 pid");
+        let mut containment = ToolContainment {
+            path: dir.path().to_path_buf(),
+            cleaned: true,
+            reap_pids: HashSet::from([raw_pid]),
+            reaped_owned_pid: None,
+            pending_child: None,
+            pending_inventory: None,
+            pending_removal: None,
+            lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
+        };
+        containment.retain_owned_child(child);
+        containment.lifecycle_hooks.cleanup_owned_child.arm();
+
+        containment
+            .reap_owned_child_until(tokio::time::Instant::now() + Duration::from_millis(20))
+            .await
+            .expect_err("expired cleanup window must retain the owned child");
+        assert!(containment.pending_child.is_some());
+
+        containment
+            .reap_owned_child_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("owned child must be reaped through its stable handle");
+        assert!(containment.pending_child.is_none());
+        assert_eq!(containment.reaped_owned_pid, Some(raw_pid));
+        assert!(!containment.reap_pids.contains(&raw_pid));
+
+        let synthetic_descendant = raw_pid.checked_add(1).expect("synthetic descendant pid");
+        containment.merge_inventory_pids(HashSet::from([raw_pid, synthetic_descendant]));
+        assert!(
+            !containment.reap_pids.contains(&raw_pid),
+            "a delayed inventory must not turn the reaped direct PID into raw waitpid input"
+        );
+        assert!(containment.reap_pids.contains(&synthetic_descendant));
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stalled_cleanup_phases_are_bounded_quarantined_and_capacity_gated() {
+        require_tool_pids_controller!();
         for phase in [
             StalledCleanupPhase::Freeze,
             StalledCleanupPhase::Inventory,
@@ -3472,6 +4199,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pre_spawn_containment_failure_removes_the_empty_cgroup_and_releases_capacity() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let spawn_marker = dir.path().join("must-not-spawn");
         let script = executable(
@@ -3510,6 +4238,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_process_group_is_cancelled_and_reaped_within_a_bound() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "slow", "while :; do :; done");
         let env = test_env(dir.path());
@@ -3545,6 +4274,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn aborted_request_keeps_process_claims_until_owned_reap_finishes() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("installer-pid");
         executable(
@@ -3670,6 +4400,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn process_permit_is_held_until_owned_pipe_drains_finish() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "pipe-drain", "printf output; printf error >&2");
         let processes = Arc::new(Semaphore::new(1));
@@ -3715,6 +4446,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn multi_target_failure_cancels_and_drains_started_siblings() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("check-pid");
         executable(
@@ -3779,6 +4511,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_large_output_checks_obey_one_process_cap_and_reap_descendants_on_close() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let markers = dir.path().join("markers");
         std::fs::create_dir(&markers).expect("marker directory");
@@ -3873,6 +4606,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_process_group_times_out_and_is_reaped_within_a_bound() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "slow", "while :; do :; done");
         let env = test_env(dir.path());
@@ -3931,6 +4665,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_installs_for_the_same_tool_fail_closed() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(dir.path(), "npm", "while :; do :; done");
         executable(dir.path(), "codex", "printf 'codex 1.0.0'");
@@ -3983,6 +4718,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shared_install_gate_blocks_all_paths_until_a_separate_definitive_check() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(
             dir.path(),
@@ -4091,6 +4827,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn older_check_cannot_reconcile_an_effect_that_started_after_its_snapshot() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(dir.path(), "npm", "printf '1.2.4'");
         executable(dir.path(), "codex", "printf 'codex 1.2.4'");
@@ -4161,6 +4898,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn quarantined_effect_cannot_be_reconciled_or_retried_until_drain_and_new_check() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let install_pid = dir.path().join("install-pid");
         executable(
@@ -4276,6 +5014,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn post_spawn_install_failure_is_unknown_and_preserves_bounded_detail() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(
             dir.path(),
@@ -4306,6 +5045,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installer_exit_zero_with_nonzero_version_probe_is_unknown() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(dir.path(), "npm", "printf installed");
         executable(
@@ -4341,6 +5081,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn truncated_installed_version_output_is_not_accepted_as_authoritative() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(dir.path(), "npm", "printf '1.2.4'");
         executable(
@@ -4373,6 +5114,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installer_exit_zero_with_version_timeout_is_unknown_and_reaped() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("version-pid");
         executable(dir.path(), "npm", "printf installed");
@@ -4411,6 +5153,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installer_exit_zero_with_cancelled_version_probe_is_unknown_and_reaped() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("version-pid");
         executable(dir.path(), "npm", "printf installed");
@@ -4462,6 +5205,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installer_exit_zero_with_session_close_during_version_is_unknown_and_reaped() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("version-pid");
         executable(dir.path(), "npm", "printf installed");
@@ -4513,6 +5257,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installer_exit_zero_without_observed_latest_expectation_is_unknown() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(
             dir.path(),
@@ -4543,6 +5288,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_allowlisted_install_is_reconciled_before_acknowledgement() {
+        require_tool_pids_controller!();
         let dir = tempfile::tempdir().expect("tempdir");
         executable(
             dir.path(),

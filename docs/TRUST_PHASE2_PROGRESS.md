@@ -207,10 +207,17 @@ fail closed: unknown payload fields and arbitrary path/argv are rejected; no
 shell evaluates browser input; target/process/output/time limits are fixed;
 same-tool installs across the interactive and retained compatibility paths are
 mutually exclusive; cancellation, close, and timeout kill a per-attempt Linux
-cgroup v2 containment. The generated Linux user service deliberately does not
-request `Delegate=`: delegation alone cannot stop a same-UID tool from moving
-itself into a writable ancestor and is not a trust boundary. Before exec, the
-endpoint instead applies Landlock ABI 3 filesystem mutation confinement and an
+cgroup v2 containment. The generated Linux user service requests only
+`Delegate=pids`, never broad controller delegation, and on systemd 254 or newer
+uses `DelegateSubgroup=spawn-manager`. The daemon validates ownership, moves
+service processes into that stable manager leaf when an older systemd ignores
+the subgroup directive, enables only the PID controller for a separate stable
+attempts subtree, and fails closed if any setup or readback is unavailable.
+Each attempt programs and verifies `pids.max=64` before child admission; PID
+membership reads are independently byte- and count-bounded. Stale attempt
+cgroups from a prior daemon lifetime are killed and removed under a fixed
+deadline before new admission. Before exec, the endpoint applies Landlock ABI
+3 filesystem mutation confinement and an
 inherited, architecture-reviewed seccomp filter. Tool writes are limited to
 HOME, temporary/runtime roots, and `/dev/null`; cgroup hierarchy writes, namespace
 and mount manipulation, ptrace/process-memory and fd-stealing APIs, BPF/perf,
@@ -233,9 +240,13 @@ have finished or been aborted and joined, and the cgroup directory is removed.
 A single absolute cleanup deadline covers freeze, PID inventory, population,
 direct-child wait, raw reap, and recursive removal. Filesystem inventories and
 removal run off the async runtime; a timed-out task stays owned by the
-containment and is awaited without a concurrent retry. Partial PID inventories
-are retained, and a post-kill `/proc` cgroup-membership scan finds adopted
-zombies that `cgroup.procs` no longer reports. Any residual containment is
+containment and is awaited without a concurrent retry. The owned
+`tokio::process::Child` handle likewise moves into quarantine after a bounded
+wait failure and remains the only direct-child reap authority. After that owned
+wait succeeds, its integer PID is removed and filtered from any delayed
+inventory so PID reuse cannot redirect a raw wait. Partial descendant PID
+inventories are retained, and a post-kill `/proc` cgroup-membership scan finds
+adopted zombies that `cgroup.procs` no longer reports. Any residual containment is
 registered atomically in a capped quarantine before process capacity or effect
 claims are released. That quarantine globally rejects new tool processes and
 cannot reconcile an ambiguous install until its tracked reaper drains and a

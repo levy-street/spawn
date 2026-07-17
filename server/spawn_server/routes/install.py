@@ -487,9 +487,12 @@ INSTALL_SCRIPT = dedent(
     # Only kill spawnd itself on stop/restart: per-agent session workers live
     # in this cgroup and must survive supervisor updates.
     KillMode=process
-    # Do not add a Delegate directive here. Endpoint tool containment combines
-    # an available cgroup v2 child with Landlock and seccomp; granting broader
-    # cgroup delegation is not a trust boundary and needlessly expands access.
+    # Delegate only the PID controller required for bounded endpoint tool
+    # attempts. systemd >= 254 places the supervisor and durable workers in the
+    # manager leaf; spawnd performs the same move and validates it fail-closed
+    # when an older manager ignores DelegateSubgroup=.
+    Delegate=pids
+    DelegateSubgroup=spawn-manager
     # Headroom against fd exhaustion taking the host offline.
     LimitNOFILE=65536
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"

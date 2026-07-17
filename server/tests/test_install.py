@@ -509,8 +509,10 @@ async def test_installer_writes_and_starts_linux_systemd_user_service(client, tm
     assert "Restart=always" in text
     assert "RestartSec=2" in text
     assert "KillMode=process" in text
-    assert "Delegate=" not in text
-    assert "Do not add a Delegate directive" in text
+    assert "Delegate=pids" in text
+    assert "DelegateSubgroup=spawn-manager" in text
+    assert "Delegate=yes" not in text
+    assert "Delegate=cpu" not in text
     assert 'Environment="PATH=' in text
     systemctl_log = _log(logs, "systemctl.log")
     assert "--user show-environment" in systemctl_log
