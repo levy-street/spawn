@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import html
+import json
 import re
 import shutil
 import tempfile
+import unicodedata
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +38,28 @@ class Section:
 
 
 @dataclass(frozen=True)
-class ControlledSentencePolicy:
-    category: str
-    controlled_terms: str
+class CorpusSentence:
+    path: str
+    location: str
+    sentence_index: int
+    occurrence: int
+    sentence: str
+
+    @property
+    def identity(self) -> tuple[str, str, int, int, str]:
+        return (
+            self.path,
+            self.location,
+            self.sentence_index,
+            self.occurrence,
+            self.sentence,
+        )
+
+
+@dataclass(frozen=True)
+class InventorySentence:
+    record: CorpusSentence
+    categories: tuple[str, ...]
 
 
 REQUIRED_H2 = (
@@ -55,7 +78,7 @@ REQUIRED_H2 = (
     "Dependency hand-off",
 )
 
-REQUIRED_DOCS = (
+DECISION_LINK_DOCS = (
     "docs/DESIGN.md",
     "docs/INTERFACE_MATRIX.md",
     "docs/TRUST.md",
@@ -65,44 +88,7 @@ REQUIRED_DOCS = (
     "proto/README.md",
 )
 
-CONTROLLED_ALLOWLIST = "docs/DURABLE_DATA_CONTROLLED_SENTENCES.txt"
-
-# These expressions select any sentence that names a guarded subject or effect.
-# Safety is decided by exact normalized allowlist membership, never by trying to
-# enumerate unsafe statuses, claims, or their paraphrases.
-CONTROLLED_SENTENCE_POLICIES = (
-    ControlledSentencePolicy(
-        "runtime-status",
-        r"\b(?:runtime|endpoint-local (?:canonical )?store|durable protected(?:-data)? "
-        r"(?:state|store)|private persistence layer)\b|"
-        r"\b(?:p2-)?data-02\b.{0,80}\b(?:implemented|implementation|production|shipped|live)\b|"
-        r"\b(?:implemented|implementation|production|shipped|live)\b.{0,80}\b(?:p2-)?data-02\b",
-    ),
-    ControlledSentencePolicy(
-        "opaque-fallback",
-        r"\b(?:opaque|server ciphertext|offline encrypted)\b",
-    ),
-    ControlledSentencePolicy(
-        "phase2-status",
-        r"\bphase\s*-?\s*2\b",
-    ),
-    ControlledSentencePolicy(
-        "host02-status",
-        r"\b(?:p2-)?host-02\b",
-    ),
-    ControlledSentencePolicy(
-        "ack-retry",
-        r"\b(?:acknowledg\w*|dismiss\w*)\b",
-    ),
-    ControlledSentencePolicy(
-        "rotation-retirement",
-        r"\b(?:old (?:master[- ]key(?: epoch)?|epoch|key)|previous key)\b",
-    ),
-    ControlledSentencePolicy(
-        "data02-dependencies",
-        r"\b(?:p2-)?data-02\b",
-    ),
-)
+PROSE_INVENTORY = "docs/DURABLE_DATA_PROSE_INVENTORY.jsonl"
 
 
 def active_markdown(path: Path) -> str:
@@ -110,30 +96,63 @@ def active_markdown(path: Path) -> str:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise GuardError(f"cannot read {path}: {exc}") from exc
-    if raw.count("<!--") != raw.count("-->"):
-        raise GuardError(f"unbalanced HTML comment in {path}")
-    raw = re.sub(
-        r"<!--.*?-->",
-        lambda match: "\n" * match.group(0).count("\n"),
-        raw,
-        flags=re.DOTALL,
-    )
-
     active: list[str] = []
     fence: str | None = None
+    html_comment = False
+    inline_ticks: int | None = None
     for line in raw.splitlines():
-        match = re.match(r"^\s*(```+|~~~+)", line)
-        if match:
-            marker = match.group(1)[0]
+        fence_match = None if html_comment or inline_ticks else re.match(r"^\s*(```+|~~~+)", line)
+        if fence_match:
+            marker = fence_match.group(1)[0]
             if fence is None:
                 fence = marker
             elif fence == marker:
                 fence = None
             active.append("")
             continue
-        active.append("" if fence is not None else line)
+        if fence is not None:
+            active.append("")
+            continue
+
+        visible: list[str] = []
+        index = 0
+        while index < len(line):
+            if html_comment:
+                if line.startswith("-->", index):
+                    html_comment = False
+                    visible.extend("   ")
+                    index += 3
+                else:
+                    visible.append(" ")
+                    index += 1
+                continue
+
+            if inline_ticks is None and line.startswith("<!--", index):
+                html_comment = True
+                visible.extend("    ")
+                index += 4
+                continue
+
+            if line[index] == "`":
+                end = index
+                while end < len(line) and line[end] == "`":
+                    end += 1
+                tick_count = end - index
+                if inline_ticks is None:
+                    inline_ticks = tick_count
+                elif inline_ticks == tick_count:
+                    inline_ticks = None
+                visible.append(line[index:end])
+                index = end
+                continue
+
+            visible.append(line[index])
+            index += 1
+        active.append("".join(visible))
     if fence is not None:
         raise GuardError(f"unclosed Markdown fence in {path}")
+    if html_comment:
+        raise GuardError(f"unbalanced HTML comment in {path}")
     return "\n".join(active)
 
 
@@ -161,108 +180,358 @@ def normalized(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def controlled_sentences(text: str) -> tuple[str, ...]:
-    """Return active Markdown headings, table rows, and prose sentences."""
-    sentences: list[str] = []
-    block: list[str] = []
+def discover_guarded_corpus(root: Path) -> tuple[str, ...]:
+    docs = sorted(
+        path.relative_to(root).as_posix()
+        for path in (root / "docs").rglob("*.md")
+        if path.is_file()
+    )
+    proto = root / "proto/README.md"
+    if not proto.is_file():
+        raise GuardError(f"cannot read {proto}: file is missing")
+    return tuple((*docs, "proto/README.md"))
 
-    def clean_structural_prefix(line: str) -> str:
-        line = re.sub(r"^#{1,6}\s+", "", line)
-        line = re.sub(r"^\s*(?:[-+*]|\d+[.)])\s+", "", line)
-        return line.strip()
+
+def prose_category(relative: str) -> str:
+    if relative == "docs/DURABLE_SENSITIVE_DATA.md":
+        return "data-design-prose"
+    if relative.startswith("docs/TRUST"):
+        return "trust-model-prose"
+    if relative == "proto/README.md":
+        return "protocol-prose"
+    return "supporting-design-prose"
+
+
+_DASH_TRANSLATION = str.maketrans(
+    {
+        "\u058a": "-",
+        "\u05be": "-",
+        "\u1400": "-",
+        "\u1806": "-",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2e17": "-",
+        "\u2e1a": "-",
+        "\u2e3a": "-",
+        "\u2e3b": "-",
+        "\u2e40": "-",
+        "\u301c": "-",
+        "\u3030": "-",
+        "\u30a0": "-",
+        "\ufe31": "-",
+        "\ufe32": "-",
+        "\ufe58": "-",
+        "\ufe63": "-",
+        "\uff0d": "-",
+    }
+)
+
+
+def canonical_visible_text(text: str, *, casefold: bool) -> str:
+    text = unicodedata.normalize("NFKC", text).translate(_DASH_TRANSLATION)
+    text = text.replace("\u00ad", "")
+    text = "".join(character for character in text if unicodedata.category(character) != "Cf")
+    text = re.sub(r"(?<=\w)-\s+(?=\w)", "-", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = normalized(text)
+    return text.casefold() if casefold else text
+
+
+def visible_inline_markdown(text: str) -> str:
+    code_spans: list[str] = []
+
+    def stash_code(match: re.Match[str]) -> str:
+        code_spans.append(match.group(2))
+        return f"CODEXINLINECODE{len(code_spans) - 1}TOKEN"
+
+    text = re.sub(r"(`+)(.+?)\1", stash_code, text)
+    text = re.sub(r"!\[([^]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", text)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</?(?:p|div|li|tr|td|th|details|summary)\b[^>]*>", " ", text, flags=re.IGNORECASE
+    )
+    text = re.sub(r"</?[A-Za-z][^>]*>", "", text)
+    text = html.unescape(text)
+    for delimiter in ("**", "__", "~~"):
+        text = text.replace(delimiter, "")
+    text = re.sub(r"(?<!\w)([*_])(?=\S)", "", text)
+    text = re.sub(r"(?<=\S)([*_])(?!\w)", "", text)
+    text = re.sub(r"\\([\\`*{}\[\]()#+.!_>~-])", r"\1", text)
+    for index, code in enumerate(code_spans):
+        text = text.replace(f"CODEXINLINECODE{index}TOKEN", code)
+    return canonical_visible_text(text, casefold=False)
+
+
+def split_visible_sentences(text: str) -> tuple[str, ...]:
+    return tuple(
+        canonical_visible_text(candidate, casefold=True)
+        for candidate in re.split(r"(?<=[.!?])\s+(?=\S)", text)
+        if canonical_visible_text(candidate, casefold=True)
+    )
+
+
+def corpus_sentences(root: Path, relative: str) -> tuple[CorpusSentence, ...]:
+    path = root / relative
+    text = active_markdown(path)
+    heading_stack: list[tuple[int, str]] = []
+    block_ordinals: Counter[tuple[tuple[str, ...], str]] = Counter()
+    blocks: list[tuple[tuple[str, ...], str, int, str]] = []
+    block_lines: list[str] = []
+    block_kind = "paragraph"
+    block_section: tuple[str, ...] = ()
+
+    def section_path() -> tuple[str, ...]:
+        return tuple(title for _, title in heading_stack)
+
+    def add_block(section: tuple[str, ...], kind: str, source: str) -> None:
+        visible = visible_inline_markdown(source)
+        if not visible:
+            return
+        key = (section, kind)
+        block_ordinals[key] += 1
+        blocks.append((section, kind, block_ordinals[key], visible))
 
     def flush_block() -> None:
-        if not block:
-            return
-        paragraph = " ".join(block)
-        block.clear()
-        sentences.extend(
-            candidate.strip()
-            for candidate in re.split(r"(?<=[.!?])\s+(?=(?:[A-Z0-9`*\[]|$))", paragraph)
-            if candidate.strip()
-        )
+        nonlocal block_kind, block_section
+        if block_lines:
+            add_block(block_section, block_kind, " ".join(block_lines))
+            block_lines.clear()
+        block_kind = "paragraph"
+        block_section = section_path()
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
+    block_section = section_path()
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        stripped = raw_line.strip()
+        if not stripped:
             flush_block()
+            index += 1
             continue
-        if line.startswith("#"):
+
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
+        if heading:
             flush_block()
-            sentences.append(clean_structural_prefix(line))
+            level = len(heading.group(1))
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            title = visible_inline_markdown(heading.group(2))
+            add_block(section_path(), f"heading-{level}", title)
+            heading_stack.append((level, canonical_visible_text(title, casefold=True)))
+            block_section = section_path()
+            index += 1
             continue
-        if line.startswith("|") and line.endswith("|"):
+
+        setext = re.fullmatch(r"(=+|-+)", stripped)
+        if setext and block_lines and len(block_lines) == 1 and block_kind == "paragraph":
+            title_source = block_lines.pop()
+            parent = block_section
+            level = 1 if stripped.startswith("=") else 2
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            title = visible_inline_markdown(title_source)
+            add_block(parent, f"heading-{level}", title)
+            heading_stack.append((level, canonical_visible_text(title, casefold=True)))
+            block_section = section_path()
+            index += 1
+            continue
+
+        if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", stripped):
             flush_block()
-            sentences.append(line)
+            index += 1
             continue
-        if re.match(r"^\s*(?:[-+*]|\d+[.)])\s+", raw_line):
+        if re.match(r"^\[[^]]+\]:\s+\S+", stripped):
             flush_block()
-            block.append(clean_structural_prefix(raw_line))
+            index += 1
             continue
-        block.append(line)
+        if stripped.startswith("|") and stripped.endswith("|"):
+            flush_block()
+            if not re.fullmatch(r"\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?", stripped):
+                add_block(section_path(), "table-row", stripped)
+            index += 1
+            continue
+
+        blockquote = re.match(r"^\s*(?:>\s*)+(.+)$", raw_line)
+        if blockquote:
+            if block_lines and block_kind != "blockquote":
+                flush_block()
+            if not block_lines:
+                block_kind = "blockquote"
+                block_section = section_path()
+            block_lines.append(blockquote.group(1).strip())
+            index += 1
+            continue
+
+        list_item = re.match(r"^\s*(?:[-+*]|\d+[.)])\s+(.+)$", raw_line)
+        if list_item:
+            flush_block()
+            block_kind = "list-item"
+            block_section = section_path()
+            block_lines.append(list_item.group(1).strip())
+            index += 1
+            continue
+
+        if not block_lines:
+            block_section = section_path()
+        block_lines.append(stripped)
+        index += 1
     flush_block()
-    return tuple(sentences)
+
+    occurrence_counts: Counter[str] = Counter()
+    records: list[CorpusSentence] = []
+    for section, kind, block_ordinal, visible in blocks:
+        location = (
+            f"{json.dumps(section, ensure_ascii=False, separators=(',', ':'))}"
+            f"::{kind}[{block_ordinal}]"
+        )
+        for sentence_index, sentence in enumerate(split_visible_sentences(visible), 1):
+            occurrence_counts[sentence] += 1
+            records.append(
+                CorpusSentence(
+                    path=relative,
+                    location=location,
+                    sentence_index=sentence_index,
+                    occurrence=occurrence_counts[sentence],
+                    sentence=sentence,
+                )
+            )
+    return tuple(records)
 
 
-def normalize_controlled_sentence(sentence: str) -> str:
-    sentence = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", sentence)
-    sentence = sentence.replace("**", "").replace("__", "").replace("`", "")
-    return normalized(sentence).lower()
+def all_corpus_sentences(root: Path) -> tuple[CorpusSentence, ...]:
+    return tuple(
+        record
+        for relative in discover_guarded_corpus(root)
+        for record in corpus_sentences(root, relative)
+    )
 
 
-def load_controlled_allowlist(root: Path) -> dict[str, frozenset[str]]:
-    path = root / CONTROLLED_ALLOWLIST
+def load_prose_inventory(root: Path) -> tuple[InventorySentence, ...]:
+    path = root / PROSE_INVENTORY
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise GuardError(f"cannot read {path}: {exc}") from exc
 
-    known_categories = {policy.category for policy in CONTROLLED_SENTENCE_POLICIES}
-    allowlist: dict[str, frozenset[str]] = {}
-    for line_number, raw_line in enumerate(lines, 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        category_text, separator, sentence = line.partition(" => ")
-        if not separator or not category_text or not sentence:
-            raise GuardError(f"{path}:{line_number} has malformed controlled sentence")
-        categories = frozenset(category_text.split(","))
-        unknown = categories - known_categories
-        if unknown:
-            raise GuardError(f"{path}:{line_number} has unknown categories: {sorted(unknown)}")
-        if sentence != normalize_controlled_sentence(sentence):
-            raise GuardError(f"{path}:{line_number} controlled sentence is not already normalized")
-        if sentence in allowlist:
-            raise GuardError(
-                f"{path}:{line_number} duplicates controlled sentence from an earlier line"
-            )
-        allowlist[sentence] = categories
-    if not allowlist:
-        raise GuardError(f"{path} has no controlled sentences")
-    return allowlist
+    inventory: list[InventorySentence] = []
+    for line_number, line in enumerate(lines, 1):
+        try:
+            payload = json.loads(line)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise GuardError(f"{path}:{line_number} is not valid JSON") from exc
+        required = {"path", "location", "sentence_index", "occurrence", "categories", "sentence"}
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise GuardError(f"{path}:{line_number} has an invalid inventory schema")
+        relative = payload["path"]
+        categories = payload["categories"]
+        if (
+            not isinstance(relative, str)
+            or not isinstance(payload["location"], str)
+            or not isinstance(payload["sentence_index"], int)
+            or payload["sentence_index"] < 1
+            or not isinstance(payload["occurrence"], int)
+            or payload["occurrence"] < 1
+            or not isinstance(payload["sentence"], str)
+            or not isinstance(categories, list)
+            or not categories
+            or not all(isinstance(category, str) for category in categories)
+        ):
+            raise GuardError(f"{path}:{line_number} has invalid inventory values")
+        expected_categories = [prose_category(relative)]
+        if categories != expected_categories:
+            raise GuardError(f"{path}:{line_number} categories must equal {expected_categories}")
+        record = CorpusSentence(
+            path=relative,
+            location=payload["location"],
+            sentence_index=payload["sentence_index"],
+            occurrence=payload["occurrence"],
+            sentence=payload["sentence"],
+        )
+        if record.sentence != canonical_visible_text(record.sentence, casefold=True):
+            raise GuardError(f"{path}:{line_number} sentence is not normalized")
+        inventory.append(InventorySentence(record, tuple(categories)))
+    if not inventory:
+        raise GuardError(f"{path} has no prose inventory")
+    identities = [entry.record.identity for entry in inventory]
+    if len(identities) != len(set(identities)):
+        raise GuardError(f"{path} contains duplicate inventory records")
+    return tuple(inventory)
 
 
-def enforce_controlled_sentences(
-    text: str,
-    path: Path,
-    allowlist: dict[str, frozenset[str]],
-) -> dict[str, set[str]]:
-    observed: dict[str, set[str]] = {}
-    for sentence in controlled_sentences(text):
-        candidate = normalize_controlled_sentence(sentence)
-        approved_categories = allowlist.get(candidate, frozenset())
-        for policy in CONTROLLED_SENTENCE_POLICIES:
-            if not re.search(policy.controlled_terms, candidate, flags=re.IGNORECASE):
-                continue
-            if policy.category not in approved_categories:
-                raise ContradictionError(policy.category, path, candidate)
-            observed.setdefault(candidate, set()).add(policy.category)
-    return observed
+def write_prose_inventory(root: Path) -> None:
+    path = root / PROSE_INVENTORY
+    lines = []
+    for record in all_corpus_sentences(root):
+        payload = {
+            "path": record.path,
+            "location": record.location,
+            "sentence_index": record.sentence_index,
+            "occurrence": record.occurrence,
+            "categories": [prose_category(record.path)],
+            "sentence": record.sentence,
+        }
+        lines.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def merge_observed_sentences(target: dict[str, set[str]], source: dict[str, set[str]]) -> None:
-    for sentence, categories in source.items():
-        target.setdefault(sentence, set()).update(categories)
+def enforce_prose_inventory(root: Path) -> None:
+    inventory = load_prose_inventory(root)
+    expected_paths = {entry.record.path for entry in inventory}
+    actual_paths = set(discover_guarded_corpus(root))
+    if expected_paths != actual_paths:
+        added = sorted(actual_paths - expected_paths)
+        removed = sorted(expected_paths - actual_paths)
+        raise ContradictionError(
+            "guarded-corpus",
+            root,
+            f"guarded Markdown path inventory changed; added={added}, removed={removed}",
+        )
+
+    actual = all_corpus_sentences(root)
+    expected_by_identity = {entry.record.identity: entry for entry in inventory}
+    actual_identities = {record.identity for record in actual}
+    expected_identities = set(expected_by_identity)
+    unexpected = [record for record in actual if record.identity not in expected_identities]
+    if unexpected:
+        record = unexpected[0]
+        same_location = next(
+            (
+                entry
+                for entry in inventory
+                if entry.record.path == record.path
+                and entry.record.location == record.location
+                and entry.record.sentence_index == record.sentence_index
+            ),
+            None,
+        )
+        category = (
+            same_location.categories[0]
+            if same_location is not None
+            else prose_category(record.path)
+        )
+        raise ContradictionError(
+            category,
+            root / record.path,
+            f"{record.location} sentence {record.sentence_index} occurrence "
+            f"{record.occurrence}: {record.sentence}",
+        )
+    missing = [entry for entry in inventory if entry.record.identity not in actual_identities]
+    if missing:
+        entry = missing[0]
+        record = entry.record
+        raise ContradictionError(
+            entry.categories[0],
+            root / record.path,
+            f"missing or relocated {record.location} sentence {record.sentence_index} "
+            f"occurrence {record.occurrence}: {record.sentence}",
+        )
 
 
 def unique_section(parsed: list[Section], level: int, title: str, path: Path) -> Section:
@@ -282,19 +551,6 @@ def require(section: Section | str, path: Path, *fragments: str) -> None:
             raise GuardError(f"{path} section {label!r} lost required decision: {fragment}")
 
 
-def forbid_patterns(
-    text: str,
-    path: Path,
-    patterns: tuple[str, ...],
-    *,
-    category: str = "active-prose",
-) -> None:
-    body = normalized(text)
-    for pattern in patterns:
-        if re.search(pattern, body, flags=re.IGNORECASE):
-            raise ContradictionError(category, path, pattern)
-
-
 def declaration_map(section: Section, path: Path) -> dict[str, str]:
     declarations: dict[str, str] = {}
     row = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*$")
@@ -310,8 +566,7 @@ def declaration_map(section: Section, path: Path) -> dict[str, str]:
 
 
 def validate(root: Path) -> None:
-    controlled_allowlist = load_controlled_allowlist(root)
-    controlled_observed: dict[str, set[str]] = {}
+    enforce_prose_inventory(root)
     adr = root / "docs/DURABLE_SENSITIVE_DATA.md"
     text, parsed = sections(adr)
     for title in REQUIRED_H2:
@@ -347,8 +602,8 @@ def validate(root: Path) -> None:
         "p2_data_02_required_reviewed_merged_dependencies": (
             "P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A"
         ),
-        "guarded_active_prose_policy": "exact_normalized_sentence_allowlist",
-        "guarded_active_prose_inventory": "exact_no_unused_entries",
+        "guarded_active_prose_policy": "exact_visible_sentence_inventory",
+        "guarded_active_prose_inventory": "path_location_sentence_occurrence_exact",
     }
     declarations = declaration_map(decision, adr)
     if declarations != expected_declarations:
@@ -356,17 +611,6 @@ def validate(root: Path) -> None:
             f"{adr} canonical declarations mismatch: expected {expected_declarations}, "
             f"found {declarations}"
         )
-    forbid_patterns(
-        decision.body,
-        adr,
-        (
-            r"server[- ]readable canonical store",
-            r"server (?:is|as) (?:the )?canonical (?:store|source)",
-            r"server-held (?:decrypt|recovery|store root) key",
-        ),
-        category="canonical-store",
-    )
-
     trust = unique_section(parsed, 2, "Trust boundaries and authorization", adr)
     require(
         trust,
@@ -401,16 +645,6 @@ def validate(root: Path) -> None:
         "result-map expiry, daemon restart, or same-lineage restore",
         "### Ambiguous-effect reconciliation",
     )
-    forbid_patterns(
-        objects.body,
-        adr,
-        (
-            r"expired (?:request )?result.{0,80}(?:is|becomes|may be) (?:new|fresh)",
-            r"(?:evict|remove).{0,80}settled result.{0,80}before 24 hours",
-        ),
-        category="replay-capacity",
-    )
-
     anti = unique_section(parsed, 3, "Durable anti-replay heads and admission", adr)
     if not (objects.start < anti.start < objects.end):
         raise GuardError(f"{adr}: anti-replay section is outside Object/conflict section")
@@ -497,75 +731,10 @@ def validate(root: Path) -> None:
         "must name the exact reviewed TERM-01/HOST-03A protocol commits",
     )
 
-    active_without_rejected = (
-        preamble
-        + "\n"
-        + "\n".join(
-            section.body
-            for section in parsed
-            if section.level == 2 and section.title != "Rejected alternatives"
-        )
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        (
-            r"server[- ]readable canonical store",
-            r"server (?:is|as) (?:the )?canonical (?:store|source)",
-            r"server-held (?:decrypt|recovery|store root) key",
-        ),
-        category="canonical-store",
-    )
-    forbid_patterns(
-        active_without_rejected,
-        adr,
-        (
-            r"(?:may|can) evict (?:an? )?(?:unresolved|anti-replay|effect)",
-            r"(?:may|can) remove (?:an? )?(?:unresolved record|anti-replay head|effect head)",
-            r"request 4,097 (?:may|can) evict (?:an? )?(?:old|settled) result",
-            r"(?:may|can) (?:evict|remove).{0,50}settled result.{0,50}before 24 hours",
-        ),
-        category="replay-capacity",
-    )
-    merge_observed_sentences(
-        controlled_observed,
-        enforce_controlled_sentences(active_without_rejected, adr, controlled_allowlist),
-    )
-
-    for relative in REQUIRED_DOCS:
+    for relative in DECISION_LINK_DOCS:
         doc = root / relative
         doc_text = active_markdown(doc)
         require(doc_text, doc, "DURABLE_SENSITIVE_DATA.md")
-        forbid_patterns(
-            doc_text,
-            doc,
-            (
-                r"endpoint-owned or client-encrypted",
-                r"retained only at endpoints or as opaque",
-                r"opaque endpoint-encrypted blobs are selected",
-                r"server[- ]readable canonical store",
-            ),
-            category="canonical-store",
-        )
-        merge_observed_sentences(
-            controlled_observed,
-            enforce_controlled_sentences(doc_text, doc, controlled_allowlist),
-        )
-
-    observed_allowlist = {
-        sentence: frozenset(categories) for sentence, categories in controlled_observed.items()
-    }
-    if observed_allowlist != controlled_allowlist:
-        unused = sorted(set(controlled_allowlist) - set(observed_allowlist))
-        category_drift = sorted(
-            sentence
-            for sentence in set(controlled_allowlist) & set(observed_allowlist)
-            if controlled_allowlist[sentence] != observed_allowlist[sentence]
-        )
-        raise GuardError(
-            f"{root / CONTROLLED_ALLOWLIST} is not the exact active-sentence inventory; "
-            f"unused={unused[:3]}, category_drift={category_drift[:3]}"
-        )
 
     trust_text = active_markdown(root / "docs/TRUST.md")
     require(
@@ -624,11 +793,7 @@ def validate(root: Path) -> None:
 
 
 def copy_fixture(source: Path, target: Path) -> None:
-    for relative in (
-        "docs/DURABLE_SENSITIVE_DATA.md",
-        *REQUIRED_DOCS,
-        CONTROLLED_ALLOWLIST,
-    ):
+    for relative in (*discover_guarded_corpus(source), PROSE_INVENTORY):
         source_file = source / relative
         target_file = target / relative
         target_file.parent.mkdir(parents=True, exist_ok=True)
@@ -728,20 +893,59 @@ def self_test(source: Path) -> None:
     def unreadable_input(root: Path) -> None:
         (root / "docs/INTERFACE_MATRIX.md").unlink()
 
-    def unused_allowlist_entry(root: Path) -> None:
-        path = root / CONTROLLED_ALLOWLIST
+    def duplicate_inventory_record(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        path.write_text("\n".join((*lines, lines[0])) + "\n", encoding="utf-8")
+
+    def inventory_category_drift(root: Path) -> None:
+        path = root / PROSE_INVENTORY
+        lines = path.read_text(encoding="utf-8").splitlines()
+        payload = json.loads(lines[0])
+        payload["categories"] = ["wrong-category"]
+        lines[0] = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def new_markdown_fixture(relative: str) -> Callable[[Path], None]:
+        def mutate(root: Path) -> None:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Override\n\nPhase II is done.\n", encoding="utf-8")
+
+        return mutate
+
+    def relocate_safe_sentence(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        source_sentence = "User\nacknowledgement is never retry authority."
+        moved_sentence = "User acknowledgement is never retry authority."
+        text = path.read_text(encoding="utf-8")
+        if source_sentence not in text:
+            raise GuardError(f"self-test fixture source missing: {source_sentence}")
         path.write_text(
-            path.read_text(encoding="utf-8")
-            + "\nruntime-status => runtime status placeholder for later prose.\n",
+            text.replace(source_sentence, "", 1) + f"\n\n{moved_sentence}\n",
             encoding="utf-8",
         )
 
-    def allowlist_category_drift(root: Path) -> None:
-        replace_required(
-            root / CONTROLLED_ALLOWLIST,
-            "runtime-status => status: proposed for independent review; runtime not implemented.",
-            "phase2-status,runtime-status => status: proposed for independent review; runtime not implemented.",
+    def duplicate_safe_sentence(root: Path) -> None:
+        append_active_claim(
+            root / "docs/DURABLE_SENSITIVE_DATA.md",
+            "User acknowledgement is never retry authority.",
+            "User acknowledgement is never retry authority.",
         )
+
+    def equivalent_visible_formatting(root: Path) -> None:
+        path = root / "docs/DURABLE_SENSITIVE_DATA.md"
+        old = (
+            "only over the authenticated, host-scoped `spawn.host.ctl` DataChannel. The\n"
+            "browser may copy values between two online hosts, but the control plane is not a\n"
+            "storage or synchronization participant."
+        )
+        new = (
+            "only over the authenticated, host‑scoped `spawn.host.ctl` DataChannel. The browser\n"
+            "may copy values between two online hosts, but the <em>control</em> plane is not a storage\n"
+            "or synchronization participant."
+        )
+        replace_required(path, old, new)
 
     adr_path = "docs/DURABLE_SENSITIVE_DATA.md"
     phase2_path = "docs/TRUST_PHASE2.md"
@@ -765,12 +969,12 @@ def self_test(source: Path) -> None:
             (
                 "active canonical-store contradiction with active safe declaration and HTML/fence decoys",
                 canonical_html,
-                "canonical-store",
+                "data-design-prose",
             ),
             (
                 "active canonical-store paraphrase with active safe and dead-section decoy",
                 canonical_dead_section,
-                "canonical-store",
+                "data-design-prose",
             ),
             ("missing section", missing_section, None),
             ("duplicate section", duplicate_section, None),
@@ -781,7 +985,7 @@ def self_test(source: Path) -> None:
                     "User acknowledgement or dismissal unlocks the effect and permits retry.",
                     ack_safe,
                 ),
-                "ack-retry",
+                "data-design-prose",
             ),
             (
                 "dismiss then try again reviewer paraphrase",
@@ -790,13 +994,13 @@ def self_test(source: Path) -> None:
                     "Dismiss the warning, then try again.",
                     ack_safe,
                 ),
-                "ack-retry",
+                "data-design-prose",
             ),
             ("missing durable replay head", missing_replay, None),
             (
                 "unsafe capacity eviction with active safe declaration and decoys",
                 missing_capacity,
-                "replay-capacity",
+                "data-design-prose",
             ),
             ("missing crash anchor", missing_anchor, None),
             (
@@ -806,7 +1010,7 @@ def self_test(source: Path) -> None:
                     "## Current source reality (P2-HOST-02 review candidate)",
                     host02_safe,
                 ),
-                "host02-status",
+                "trust-model-prose",
             ),
             (
                 "runtime and Phase 2 combined exact reviewer phrase",
@@ -815,7 +1019,7 @@ def self_test(source: Path) -> None:
                     "The endpoint-local store is currently implemented in production and Phase 2 is complete.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
                 "production runtime exact reviewer phrase",
@@ -824,7 +1028,7 @@ def self_test(source: Path) -> None:
                     "The endpoint-local store is currently implemented in production.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
                 "shipped private persistence paraphrase",
@@ -833,7 +1037,7 @@ def self_test(source: Path) -> None:
                     "The private persistence layer has shipped.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
                 "DATA-02 implementation status claim",
@@ -842,7 +1046,7 @@ def self_test(source: Path) -> None:
                     "P2-DATA-02 is implemented and live.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
                 "live store and achieved Phase 2 reviewer paraphrase",
@@ -851,7 +1055,7 @@ def self_test(source: Path) -> None:
                     "The durable protected-data store is live now; Phase 2 has been achieved.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
                 "finished Phase 2 reviewer phrase",
@@ -860,7 +1064,7 @@ def self_test(source: Path) -> None:
                     "Phase 2 is finished.",
                     runtime_safe,
                 ),
-                "phase2-status",
+                "data-design-prose",
             ),
             (
                 "opaque permitted fallback exact reviewer phrases",
@@ -869,7 +1073,7 @@ def self_test(source: Path) -> None:
                     "Opaque server blobs are permitted as a Phase 2 fallback. Phase 2 may fall back to opaque client-encrypted server blobs.",
                     opaque_safe,
                 ),
-                "opaque-fallback",
+                "data-design-prose",
             ),
             (
                 "offline encrypted server fallback paraphrase",
@@ -878,7 +1082,7 @@ def self_test(source: Path) -> None:
                     "Offline encrypted server data is an acceptable fallback.",
                     opaque_safe,
                 ),
-                "opaque-fallback",
+                "data-design-prose",
             ),
             (
                 "HOST-02 awaiting and pending exact reviewer phrases",
@@ -887,7 +1091,7 @@ def self_test(source: Path) -> None:
                     "P2-HOST-02 is awaiting review and remains pending. HOST-02 continues to be an unmerged review candidate.",
                     host02_safe,
                 ),
-                "host02-status",
+                "trust-model-prose",
             ),
             (
                 "HOST-02 review outstanding paraphrase",
@@ -896,7 +1100,7 @@ def self_test(source: Path) -> None:
                     "P2-HOST-02 review is outstanding.",
                     host02_safe,
                 ),
-                "host02-status",
+                "trust-model-prose",
             ),
             (
                 "unsafe one-slot old epoch retirement exact reviewer phrase",
@@ -905,7 +1109,7 @@ def self_test(source: Path) -> None:
                     "The old epoch may be retired after only one slot, before both new-epoch anchor slots are verified.",
                     rotation_safe,
                 ),
-                "rotation-retirement",
+                "data-design-prose",
             ),
             (
                 "previous key either-slot retirement paraphrase",
@@ -914,7 +1118,7 @@ def self_test(source: Path) -> None:
                     "Delete the previous key once either anchor slot is current.",
                     rotation_safe,
                 ),
-                "rotation-retirement",
+                "data-design-prose",
             ),
             (
                 "missing DATA-02 reviewed dependencies with decoys",
@@ -928,95 +1132,234 @@ def self_test(source: Path) -> None:
                     "P2-DATA-02 may start before P2-TERM-01 and P2-HOST-03A pass independent review.",
                     data02_safe,
                 ),
-                "data02-dependencies",
+                "trust-model-prose",
             ),
             (
-                "unknown but safe runtime wording requires allowlist review",
+                "unknown but safe runtime wording requires inventory review",
                 claim_fixture(
                     adr_path,
                     "The endpoint-local store implementation remains design-only under this revised sentence.",
                     runtime_safe,
                 ),
-                "runtime-status",
+                "data-design-prose",
             ),
             (
-                "unknown but safe Phase 2 wording requires allowlist review",
+                "unknown but safe Phase 2 wording requires inventory review",
                 claim_fixture(
                     adr_path,
                     "Phase 2 completion remains governed by the project ledger.",
                     runtime_safe,
                 ),
-                "phase2-status",
+                "data-design-prose",
             ),
             (
-                "unknown but safe opaque wording requires allowlist review",
+                "unknown but safe opaque wording requires inventory review",
                 claim_fixture(
                     adr_path,
                     "Opaque server blob fallback status is restated here as forbidden.",
                     opaque_safe,
                 ),
-                "opaque-fallback",
+                "data-design-prose",
             ),
             (
-                "unknown but safe HOST-02 wording requires allowlist review",
+                "unknown but safe HOST-02 wording requires inventory review",
                 claim_fixture(
                     phase2_path,
                     "P2-HOST-02 remains reviewed and merged according to this new sentence.",
                     host02_safe,
                 ),
-                "host02-status",
+                "trust-model-prose",
             ),
             (
-                "unknown but safe acknowledgement wording requires allowlist review",
+                "unknown but safe acknowledgement wording requires inventory review",
                 claim_fixture(
                     adr_path,
                     "Acknowledgement remains outside retry authority in this newly worded sentence.",
                     ack_safe,
                 ),
-                "ack-retry",
+                "data-design-prose",
             ),
             (
-                "unknown but safe rotation wording requires allowlist review",
+                "unknown but safe rotation wording requires inventory review",
                 claim_fixture(
                     adr_path,
                     "The old key remains through both anchor slots under this new wording.",
                     rotation_safe,
                 ),
-                "rotation-retirement",
+                "data-design-prose",
             ),
             (
-                "unknown but safe DATA-02 wording requires allowlist review",
+                "unknown but safe DATA-02 wording requires inventory review",
                 claim_fixture(
                     tasks_path,
                     "P2-DATA-02 remains blocked pending dependencies under this new sentence.",
                     data02_safe,
                 ),
-                "data02-dependencies",
+                "trust-model-prose",
             ),
-            ("unused controlled sentence is rejected", unused_allowlist_entry, None),
-            ("controlled sentence category drift is rejected", allowlist_category_drift, None),
+            ("duplicate prose inventory record is rejected", duplicate_inventory_record, None),
+            ("prose inventory category drift is rejected", inventory_category_drift, None),
+            (
+                "new TRUST override document cannot evade the corpus",
+                new_markdown_fixture("docs/TRUST_PHASE2_OVERRIDE.md"),
+                "guarded-corpus",
+            ),
+            (
+                "new PHASE2 override document cannot evade the corpus",
+                new_markdown_fixture("docs/PHASE2_OVERRIDE.md"),
+                "guarded-corpus",
+            ),
+            (
+                "new security model document cannot evade the corpus",
+                new_markdown_fixture("docs/SECURITY_MODEL.md"),
+                "guarded-corpus",
+            ),
+            (
+                "approved sentence relocation is rejected",
+                relocate_safe_sentence,
+                "data-design-prose",
+            ),
+            (
+                "approved sentence duplication is rejected",
+                duplicate_safe_sentence,
+                "data-design-prose",
+            ),
             ("malformed Markdown", malformed_markdown, None),
             ("missing parser input", unreadable_input, None),
         )
     )
 
-    approved_forms = "\n\n".join(
+    normalization_cases = (
         (
-            "Status: **proposed for independent review; runtime not implemented**.",
-            "Do not claim Phase 2 complete while any recoverable plaintext copy remains.",
-            "Opaque client-encrypted server blobs are **not selected** for Phase 2.",
-            "P2-HOST-02 is reviewed and merged at `4e7c89b`; current source has no server-visible host filesystem route/frame.",
-            "User acknowledgement is never retry authority.",
-            "Every interruption retains the old key and recovers a safe authenticated slot.",
-            "P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and P2-HOST-03A have each passed independent review and merged.",
-        )
-    )
-    positive_mutations.append(
+            "endpoint-local protected store production claim",
+            adr_path,
+            "The endpoint-local protected store currently runs in production.",
+            runtime_safe,
+            "data-design-prose",
+            "the endpoint-local protected store currently runs in production.",
+        ),
         (
-            "exact reviewed controlled forms remain accepted",
-            claim_fixture(adr_path, approved_forms, runtime_safe),
-        )
+            "Markdown and nonbreaking-hyphen production claim",
+            adr_path,
+            "The **endpoint‑local protected store** currently ~~runs~~ in <strong>production</strong>.",
+            runtime_safe,
+            "data-design-prose",
+            "the endpoint-local protected store currently runs in production.",
+        ),
+        (
+            "durable endpoint store shipped and serving claim",
+            adr_path,
+            "The durable endpoint\nstore shipped and is serving production.",
+            runtime_safe,
+            "data-design-prose",
+            "the durable endpoint store shipped and is serving production.",
+        ),
+        (
+            "former master key first replacement anchor claim",
+            adr_path,
+            "Deleting the `former master key` after the first <em>replacement anchor</em> is permitted.",
+            rotation_safe,
+            "data-design-prose",
+            "deleting the former master key after the first replacement anchor is permitted.",
+        ),
+        (
+            "P2 complete claim",
+            adr_path,
+            "P2 is complete.",
+            runtime_safe,
+            "data-design-prose",
+            "p2 is complete.",
+        ),
+        (
+            "Phase II done claim",
+            adr_path,
+            "Phase II is done.",
+            runtime_safe,
+            "data-design-prose",
+            "phase ii is done.",
+        ),
+        (
+            "Unicode em-dash and Roman numeral Phase II claim",
+            adr_path,
+            "Phase—Ⅱ is done.",
+            runtime_safe,
+            "data-design-prose",
+            "phase-ii is done.",
+        ),
+        (
+            "encrypted control-plane fallback claim",
+            adr_path,
+            "Encrypted control-plane blobs are a fallback.",
+            opaque_safe,
+            "data-design-prose",
+            "encrypted control-plane blobs are a fallback.",
+        ),
+        (
+            "soft-wrap split control-plane fallback claim",
+            adr_path,
+            "Encrypted control-\nplane blobs are a fallback.",
+            opaque_safe,
+            "data-design-prose",
+            "encrypted control-plane blobs are a fallback.",
+        ),
+        (
+            "HOST-02 open claim",
+            phase2_path,
+            "P2-HOST-02 remains open.",
+            host02_safe,
+            "trust-model-prose",
+            "p2-host-02 remains open.",
+        ),
+        (
+            "HTML-split HOST-02 open claim",
+            phase2_path,
+            "<em>P2-HOST</em>‑02 remains open.",
+            host02_safe,
+            "trust-model-prose",
+            "p2-host-02 remains open.",
+        ),
+        (
+            "user confirmation another attempt claim",
+            adr_path,
+            "User confirmation permits another attempt.",
+            ack_safe,
+            "data-design-prose",
+            "user confirmation permits another attempt.",
+        ),
+        (
+            "HTML entity user confirmation claim",
+            adr_path,
+            "User&nbsp;confirmation permits another attempt.",
+            ack_safe,
+            "data-design-prose",
+            "user confirmation permits another attempt.",
+        ),
+        (
+            "legacy epoch slot A claim",
+            adr_path,
+            "The legacy epoch may be deleted after slot A.",
+            rotation_safe,
+            "data-design-prose",
+            "the legacy epoch may be deleted after slot a.",
+        ),
+        (
+            "DATA-02 before HOST-03A claim",
+            tasks_path,
+            "P2-DATA-02 may begin before P2-HOST-03A review.",
+            data02_safe,
+            "trust-model-prose",
+            "p2-data-02 may begin before p2-host-03a review.",
+        ),
+        (
+            "HTML-comment tokens inside visible inline code remain active",
+            adr_path,
+            "The visible code token `<!-- production -->` remains visible.",
+            runtime_safe,
+            "data-design-prose",
+            "the visible code token <!--production--> remains visible.",
+        ),
     )
+
     hidden_hostile_forms = "\n".join(
         (
             "The endpoint-local store is currently implemented in production.",
@@ -1036,6 +1379,12 @@ def self_test(source: Path) -> None:
         (
             "comments and fences do not create active controlled sentences",
             hidden_controlled_claims,
+        )
+    )
+    positive_mutations.append(
+        (
+            "equivalent visible Markdown and Unicode formatting remains accepted",
+            equivalent_visible_formatting,
         )
     )
 
@@ -1063,6 +1412,38 @@ def self_test(source: Path) -> None:
                 continue
             raise GuardError(f"self-test mutation unexpectedly passed: {name}")
 
+        normalization_base = base / "normalization"
+        for index, (
+            name,
+            relative,
+            claim,
+            safe_decoy,
+            expected_category,
+            expected_detail,
+        ) in enumerate(normalization_cases):
+            fixture = normalization_base / str(index)
+            copy_fixture(source, fixture)
+            claim_fixture(relative, claim, safe_decoy)(fixture)
+            try:
+                validate(fixture)
+            except ContradictionError as exc:
+                if exc.category != expected_category:
+                    raise GuardError(
+                        f"normalization self-test {name!r} expected category "
+                        f"{expected_category!r}, got {exc.category!r}"
+                    ) from exc
+                if expected_detail not in str(exc):
+                    raise GuardError(
+                        f"normalization self-test {name!r} expected visible text "
+                        f"{expected_detail!r}, got {exc}"
+                    ) from exc
+                continue
+            except GuardError as exc:
+                raise GuardError(
+                    f"normalization self-test {name!r} failed for another reason: {exc}"
+                ) from exc
+            raise GuardError(f"normalization self-test mutation unexpectedly passed: {name}")
+
         positive_base = base / "positive"
         for index, (name, mutation) in enumerate(positive_mutations):
             fixture = positive_base / str(index)
@@ -1078,10 +1459,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--write-inventory", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
-        if args.self_test:
+        if args.self_test and args.write_inventory:
+            raise GuardError("--self-test and --write-inventory are mutually exclusive")
+        if args.write_inventory:
+            write_prose_inventory(root)
+            print("durable protected-data prose inventory written")
+        elif args.self_test:
             self_test(root)
             print("durable protected-data decision guard self-test passed")
         else:

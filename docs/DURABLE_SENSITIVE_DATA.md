@@ -77,11 +77,14 @@ succeeded or failed.
 ### Canonical guarded declarations
 
 These rows are parsed by the durable-data guard; prose cannot silently override
-them. After comments and code fences are removed, every active sentence using a
-guarded subject/status/effect vocabulary must exactly match the reviewed
-normalized sentence allowlist in
-[`DURABLE_DATA_CONTROLLED_SENTENCES.txt`](DURABLE_DATA_CONTROLLED_SENTENCES.txt).
-Any new wording fails CI until explicitly reviewed.
+them. After comments and code fences are removed, every visible sentence in the
+guarded Markdown corpus must exactly match the reviewed path, structural
+location, sentence index, duplicate occurrence, category, and normalized text in
+[`DURABLE_DATA_PROSE_INVENTORY.jsonl`](DURABLE_DATA_PROSE_INVENTORY.jsonl).
+New documents, wording, relocation, or duplication fail CI until explicitly
+reviewed. Regeneration is an explicit
+`scripts/check-durable-data-decision.sh --write-inventory` operation whose prose
+diff must be reviewed with the documentation change.
 
 | Declaration | Value |
 | --- | --- |
@@ -93,8 +96,8 @@ Any new wording fails CI until explicitly reviewed.
 | `acknowledgement_retry_authority` | `forbidden` |
 | `rotation_new_epoch_anchor_slots_before_old_key_retirement` | `2` |
 | `p2_data_02_required_reviewed_merged_dependencies` | `P2-DATA-01,P2-HOST-02,P2-TERM-01,P2-HOST-03A` |
-| `guarded_active_prose_policy` | `exact_normalized_sentence_allowlist` |
-| `guarded_active_prose_inventory` | `exact_no_unused_entries` |
+| `guarded_active_prose_policy` | `exact_visible_sentence_inventory` |
+| `guarded_active_prose_inventory` | `path_location_sentence_occurrence_exact` |
 
 ### Consequences we accept
 

@@ -11,8 +11,11 @@ case "${1:-}" in
   --self-test)
     exec python3 "$validator" --root "$repo_root" --self-test
     ;;
+  --write-inventory)
+    exec python3 "$validator" --root "$repo_root" --write-inventory
+    ;;
   *)
-    printf 'usage: %s [--self-test]\n' "$0" >&2
+    printf 'usage: %s [--self-test|--write-inventory]\n' "$0" >&2
     exit 2
     ;;
 esac
