@@ -129,6 +129,9 @@
      overlaying keyring secrets onto file metadata. A monotonic generation and
      unique record ID provide deterministic recovery from interrupted or
      concurrent writes without ever constructing a mixed credential set.
+     A short-lived OS credential lock covers an in-lock durable reread, base
+     revision compare-and-swap, and both backend writes. Stale writers abort
+     before writing; the lock is never held during the interactive ceremony.
 - Daemon tokens are scoped: `host:<host_id>:control`. Revocable from the web
   UI (kills the WS).
 - Browser pins are daemon-local first-contact state. Server revocation does not

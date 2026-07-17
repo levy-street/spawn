@@ -26,8 +26,9 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
+    let expected = creds::credential_revision(&stored)?;
     let identity = creds::ensure_host_identity(&mut stored)?;
-    creds::save(&mut stored).context("persisting host identity")?;
+    creds::save(&mut stored, &expected).context("persisting host identity")?;
 
     let host_name = args.host_name.unwrap_or_else(detect_hostname);
     let os = std::env::consts::OS.to_string();
@@ -143,7 +144,7 @@ fn commit_poll_success<F>(
     persist: F,
 ) -> Result<uuid::Uuid>
 where
-    F: FnOnce(&mut creds::StoredCreds) -> Result<()>,
+    F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
 {
     commit_poll_success_observed(stored, body, identity, server, persist, |_| {})
 }
@@ -157,7 +158,7 @@ fn commit_poll_success_observed<F, O>(
     observe_wiped_token: O,
 ) -> Result<uuid::Uuid>
 where
-    F: FnOnce(&mut creds::StoredCreds) -> Result<()>,
+    F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
     O: FnOnce(&str),
 {
     // Take secret ownership before inspecting any other success field. Every
@@ -304,7 +305,7 @@ mod tests {
             complete_response(),
             &identity(),
             &server,
-            |candidate| {
+            |candidate, _| {
                 persisted.set(true);
                 assert_eq!(candidate.browser_pins().len(), 1);
                 assert_eq!(candidate.browser_pins()[0].public_key(), BROWSER_KEY);
@@ -330,7 +331,7 @@ mod tests {
             wrong_host,
             &identity(),
             &server,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("mismatched host identity"));
@@ -343,7 +344,7 @@ mod tests {
             missing_token,
             &identity(),
             &server,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("omitted access_token"));
@@ -356,7 +357,7 @@ mod tests {
             missing_host_id,
             &identity(),
             &server,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("omitted host_id"));
@@ -370,7 +371,7 @@ mod tests {
                 invalid,
                 &identity(),
                 &server,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .unwrap_err();
             assert!(format!("{error:#}").contains("access token"));
@@ -414,7 +415,7 @@ mod tests {
                 body,
                 &identity(),
                 &server,
-                |_| {
+                |_, _| {
                     persisted.set(true);
                     Ok(())
                 },
@@ -468,7 +469,7 @@ mod tests {
                 body,
                 &identity(),
                 &server,
-                |_| {
+                |_, _| {
                     persisted.set(true);
                     Ok(())
                 },

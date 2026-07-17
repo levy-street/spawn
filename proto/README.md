@@ -75,6 +75,11 @@ save. The Unix mode-0600 fallback remains a complete usable record if the
 keyring is unavailable; on native platforms the keyring remains the only
 seed-bearing complete record.
 
+Every credential mutation holds a short-lived cross-process lock from its
+durable reread through both backend writes. It compare-and-swaps the record
+revision captured before the update (and before an interactive device
+ceremony); stale writers fail before writing and must reload before retrying.
+
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
 Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)

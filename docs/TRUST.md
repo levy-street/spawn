@@ -443,6 +443,11 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   The Unix mode-0600 record is independently complete; native platforms keep
   the private seed in the complete keyring record and treat the file as only a
   matching seed-free metadata projection.
+- Credential mutations use an exclusive cross-process lock and reread both
+  durable copies inside it. The pre-ceremony base record must still match
+  before either backend is written, so a delayed login cannot regress a newer
+  generation or discard another login's immutable browser pin. The lock is
+  released before any interactive device approval wait.
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.

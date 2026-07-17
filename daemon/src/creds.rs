@@ -7,7 +7,9 @@
 //! Metadata in that file also supplies `host_id` and the configured server.
 //! Every non-legacy commit has a version, monotonic generation, and unique
 //! record ID. Both backends receive a whole record; load selects one record by
-//! `(generation, record_id)` and never overlays fields across copies.
+//! `(generation, record_id)` and never overlays fields across copies. Writers
+//! take a cross-process lock, reread both backends, and compare the durable
+//! revision with the base used to build the update before writing anything.
 
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
@@ -41,6 +43,7 @@ const MAX_SERVER_URL_BYTES: usize = 2048;
 const CANONICAL_UUID_BYTES: usize = 36;
 const PUBLIC_KEY_WIRE_BYTES: usize = 43;
 const FINGERPRINT_WIRE_BYTES: usize = 23;
+const CREDENTIAL_LOCK_FILE: &str = ".credentials.lock";
 
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StoredCreds {
@@ -111,6 +114,21 @@ const CREDENTIAL_RECORD_VERSION: u8 = 1;
 enum BackendPolicy {
     UnixCompleteFile,
     NativeKeyring,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialRevision {
+    kind: CredentialRevisionKind,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum CredentialRevisionKind {
+    Current {
+        version: u8,
+        generation: u64,
+        record_id: Uuid,
+    },
+    Legacy([u8; 32]),
 }
 
 impl StoredCreds {
@@ -219,7 +237,7 @@ pub fn commit_login_update<F>(
     persist: F,
 ) -> Result<bool>
 where
-    F: FnOnce(&mut StoredCreds) -> Result<()>,
+    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<()>,
 {
     commit_login_update_observed(
         current,
@@ -242,10 +260,11 @@ fn commit_login_update_observed<F, O>(
     observe_wiped_token: O,
 ) -> Result<bool>
 where
-    F: FnOnce(&mut StoredCreds) -> Result<()>,
+    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<()>,
     O: FnOnce(&str),
 {
     let mut access_token = Zeroizing::new(access_token);
+    let expected = credential_revision(current)?;
     let mut candidate = current.clone();
     let inserted = match merge_browser_pin(&mut candidate, browser_pin) {
         Ok(inserted) => inserted,
@@ -262,7 +281,9 @@ where
     candidate.access_token = Some(std::mem::take(&mut *access_token));
     candidate.host_id = Some(host_id);
     candidate.server_url = Some(server_url);
-    if let Err(error) = validate_loaded_creds(&candidate).and_then(|()| persist(&mut candidate)) {
+    if let Err(error) =
+        validate_loaded_creds(&candidate).and_then(|()| persist(&mut candidate, &expected))
+    {
         zeroize_stored_creds(&mut candidate);
         observe_wiped_token(candidate.access_token.as_deref().unwrap_or(""));
         return Err(error);
@@ -328,6 +349,24 @@ fn record_order(creds: &StoredCreds) -> Result<Option<(u64, Uuid)>> {
         }
         _ => bail!("credential record has a partial or malformed generation marker"),
     }
+}
+
+pub fn credential_revision(creds: &StoredCreds) -> Result<CredentialRevision> {
+    if let Some((generation, record_id)) = record_order(creds)? {
+        return Ok(CredentialRevision {
+            kind: CredentialRevisionKind::Current {
+                version: CREDENTIAL_RECORD_VERSION,
+                generation,
+                record_id,
+            },
+        });
+    }
+    let mut encoded = serde_json::to_vec(creds)?;
+    let digest = Sha256::digest(&encoded);
+    encoded.zeroize();
+    Ok(CredentialRevision {
+        kind: CredentialRevisionKind::Legacy(digest.into()),
+    })
 }
 
 fn reconcile_backend_records(
@@ -491,10 +530,70 @@ fn merge_legacy_field<T: PartialEq>(
     Ok(())
 }
 
+fn with_credential_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let path = config::config_dir()?.join(CREDENTIAL_LOCK_FILE);
+    with_credential_lock_at(&path, operation)
+}
+
+fn with_credential_lock_at<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let file = open_credential_lock(path)?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    let outcome = operation();
+    let unlock = file
+        .unlock()
+        .with_context(|| format!("unlocking {}", path.display()));
+    drop(file);
+    match outcome {
+        Ok(value) => {
+            unlock?;
+            Ok(value)
+        }
+        Err(error) => {
+            // Closing the file releases the OS lock even if explicit unlock
+            // itself failed; preserve the operation error as the primary cause.
+            let _ = unlock;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .with_context(|| format!("opening credential lock {}", path.display()))?;
+    let file = std::fs::File::from(fd);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting credential lock {}", path.display()))?;
+    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .with_context(|| format!("opening credential lock {}", path.display()))
+}
+
 /// Load one complete credential generation. Backend records are never overlaid:
 /// reconciliation selects an entire versioned record, so tokens, host metadata,
 /// private identity, and browser pins cannot come from different commits.
 pub fn load() -> Result<StoredCreds> {
+    load_unlocked(false)
+}
+
+fn load_unlocked(require_all_backends: bool) -> Result<StoredCreds> {
     let mut from_file = load_file_record()?;
 
     if keyring_disabled() {
@@ -513,6 +612,12 @@ pub fn load() -> Result<StoredCreds> {
         },
         Ok(None) => None,
         Err(e) => {
+            if require_all_backends {
+                if let Some(record) = from_file.as_mut() {
+                    zeroize_stored_creds(record);
+                }
+                return Err(e).context("rereading keyring inside credential commit lock");
+            }
             #[cfg(unix)]
             {
                 tracing::warn!(error = %e, "keyring read failed; using the complete Unix credential record");
@@ -534,22 +639,69 @@ pub fn load() -> Result<StoredCreds> {
 /// On other platforms the native keyring is required because it is the only
 /// copy containing the host private seed; the metadata file is its generation-
 /// matched seed-free projection.
-pub fn save(creds: &mut StoredCreds) -> Result<()> {
+pub fn save(creds: &mut StoredCreds, expected: &CredentialRevision) -> Result<()> {
     let policy = platform_policy();
-    save_with_backends(
-        creds,
-        policy,
-        |candidate| {
-            if keyring_disabled() {
-                if policy == BackendPolicy::UnixCompleteFile {
-                    return Ok(());
+    with_credential_lock(|| {
+        save_cas_with_backends(
+            creds,
+            expected,
+            || load_unlocked(true),
+            policy,
+            |candidate| {
+                if keyring_disabled() {
+                    if policy == BackendPolicy::UnixCompleteFile {
+                        return Ok(());
+                    }
+                    bail!("OS keyring is disabled")
                 }
-                bail!("OS keyring is disabled")
-            }
-            keyring_set(candidate)
-        },
-        save_file_for_platform,
-    )
+                keyring_set(candidate)
+            },
+            save_file_for_platform,
+        )
+    })
+}
+
+fn save_cas_with_backends<L, K, F>(
+    candidate: &mut StoredCreds,
+    expected: &CredentialRevision,
+    load_current: L,
+    policy: BackendPolicy,
+    set_keyring: K,
+    save_file: F,
+) -> Result<()>
+where
+    L: FnOnce() -> Result<StoredCreds>,
+    K: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&StoredCreds) -> Result<()>,
+{
+    let candidate_matches_base = match &expected.kind {
+        CredentialRevisionKind::Current { .. } => &credential_revision(candidate)? == expected,
+        CredentialRevisionKind::Legacy(_) => record_order(candidate)?.is_none(),
+    };
+    if !candidate_matches_base {
+        bail!("credential update base changed before commit")
+    }
+    let mut durable = load_current().context("rereading credentials inside commit lock")?;
+    let durable_revision = match credential_revision(&durable) {
+        Ok(revision) => revision,
+        Err(error) => {
+            zeroize_stored_creds(&mut durable);
+            return Err(error);
+        }
+    };
+    zeroize_stored_creds(&mut durable);
+    if durable_revision != *expected {
+        bail!("credential update is stale; reload credentials and retry")
+    }
+
+    let mut committed = candidate.clone();
+    if let Err(error) = save_with_backends(&mut committed, policy, set_keyring, save_file) {
+        zeroize_stored_creds(&mut committed);
+        return Err(error);
+    }
+    let mut previous = std::mem::replace(candidate, committed);
+    zeroize_stored_creds(&mut previous);
+    Ok(())
 }
 
 fn save_with_backends<K, F>(
@@ -669,8 +821,10 @@ pub fn host_identity(creds: &StoredCreds) -> Result<Option<HostIdentity>> {
 
 /// Wipe stored creds (file + keyring).
 pub async fn logout() -> Result<()> {
-    let outcome = clear_stored_credentials(config::credentials_path(), keyring_delete, |path| {
-        std::fs::remove_file(path)
+    let outcome = with_credential_lock(|| {
+        clear_stored_credentials(config::credentials_path(), keyring_delete, |path| {
+            std::fs::remove_file(path)
+        })
     })?;
     if outcome.file_removed {
         let path = outcome
@@ -1154,9 +1308,14 @@ fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const RFC_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const RFC_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+    const LOCK_HELPER_PATH_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_PATH";
+    const LOCK_HELPER_READY_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_READY";
+    const LOCK_HELPER_ACQUIRED_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_ACQUIRED";
 
     fn fixed_creds() -> StoredCreds {
         StoredCreds {
@@ -1192,6 +1351,72 @@ mod tests {
         assert_eq!(actual.server_url, expected.server_url);
         assert_eq!(actual.host_private_key_seed, expected.host_private_key_seed);
         assert_eq!(actual.browser_pins, expected.browser_pins);
+    }
+
+    #[derive(Default)]
+    struct MemoryCredentialBackends {
+        file: Mutex<Option<StoredCreds>>,
+        keyring: Mutex<Option<StoredCreds>>,
+        keyring_writes: AtomicUsize,
+        file_writes: AtomicUsize,
+    }
+
+    impl MemoryCredentialBackends {
+        fn with_record(record: &StoredCreds) -> Self {
+            Self {
+                file: Mutex::new(Some(record.clone())),
+                keyring: Mutex::new(Some(record.clone())),
+                ..Self::default()
+            }
+        }
+
+        fn load(&self, policy: BackendPolicy) -> Result<StoredCreds> {
+            let file = self.file.lock().unwrap().clone();
+            let keyring = self.keyring.lock().unwrap().clone();
+            reconcile_backend_records(file, keyring, policy)
+        }
+
+        fn write_keyring(&self, record: &StoredCreds) -> Result<()> {
+            *self.keyring.lock().unwrap() = Some(record.clone());
+            self.keyring_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn write_file(&self, record: &StoredCreds) -> Result<()> {
+            *self.file.lock().unwrap() = Some(record.clone());
+            self.file_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn write_counts(&self) -> (usize, usize) {
+            (
+                self.keyring_writes.load(Ordering::SeqCst),
+                self.file_writes.load(Ordering::SeqCst),
+            )
+        }
+
+        fn set_split(&self, file: StoredCreds, keyring: StoredCreds) {
+            *self.file.lock().unwrap() = Some(file);
+            *self.keyring.lock().unwrap() = Some(keyring);
+        }
+    }
+
+    fn save_to_memory_with_lock(
+        lock_path: &Path,
+        candidate: &mut StoredCreds,
+        expected: &CredentialRevision,
+        backends: &MemoryCredentialBackends,
+    ) -> Result<()> {
+        with_credential_lock_at(lock_path, || {
+            save_cas_with_backends(
+                candidate,
+                expected,
+                || backends.load(BackendPolicy::UnixCompleteFile),
+                BackendPolicy::UnixCompleteFile,
+                |record| backends.write_keyring(record),
+                |record| backends.write_file(record),
+            )
+        })
     }
 
     fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {
@@ -1305,7 +1530,7 @@ mod tests {
             Uuid::from_u128(99),
             "https://server.example/".into(),
             generated_browser_pin(MAX_BROWSER_PINS as u8),
-            |_| {
+            |_, _| {
                 persist_called.set(true);
                 Ok(())
             },
@@ -1358,7 +1583,7 @@ mod tests {
             Uuid::from_u128(10),
             "https://new.example/".into(),
             new_pin.clone(),
-            |candidate| {
+            |candidate, _| {
                 persist_called.set(true);
                 assert_eq!(
                     candidate.browser_pins(),
@@ -1380,7 +1605,7 @@ mod tests {
             Uuid::from_u128(10),
             "https://new.example/".into(),
             new_pin,
-            |_| {
+            |_, _| {
                 persist_called.set(true);
                 Ok(())
             },
@@ -1401,7 +1626,7 @@ mod tests {
             Uuid::from_u128(10),
             "https://new.example/".into(),
             browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
-            |_| bail!("injected persistence failure"),
+            |_, _| bail!("injected persistence failure"),
             |wiped| {
                 observed.set(true);
                 // zeroize's String implementation overwrites its allocation
@@ -1573,6 +1798,262 @@ mod tests {
     }
 
     #[test]
+    fn locked_complete_writers_stale_fail_without_deleting_each_others_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CREDENTIAL_LOCK_FILE);
+        let base = complete_record(1, 1, "base-token", 10, "https://server.example/", 1);
+        let base_revision = credential_revision(&base).unwrap();
+        let backends = MemoryCredentialBackends::with_record(&base);
+
+        let mut first = base.clone();
+        merge_browser_pin(&mut first, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        let mut second = base.clone();
+        merge_browser_pin(&mut second, browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)).unwrap();
+
+        save_to_memory_with_lock(&lock_path, &mut first, &base_revision, &backends).unwrap();
+        let counts_after_first = backends.write_counts();
+        let error = save_to_memory_with_lock(&lock_path, &mut second, &base_revision, &backends)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stale"));
+        assert_eq!(backends.write_counts(), counts_after_first);
+        let winner = backends.load(BackendPolicy::UnixCompleteFile).unwrap();
+        assert_same_coherent_record(&winner, &first);
+        assert_eq!(winner.browser_pins(), first.browser_pins());
+        assert!(winner.browser_pin(Uuid::from_u128(2)).is_none());
+
+        // Reloading the winner creates a valid new base. The retry can merge
+        // the second immutable pin and advances exactly one generation.
+        let mut retry = winner;
+        let retry_base = credential_revision(&retry).unwrap();
+        let before_generation = record_order(&retry).unwrap().unwrap().0;
+        merge_browser_pin(&mut retry, browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)).unwrap();
+        save_to_memory_with_lock(&lock_path, &mut retry, &retry_base, &backends).unwrap();
+        assert_eq!(
+            record_order(&retry).unwrap().unwrap().0,
+            before_generation + 1
+        );
+        assert_eq!(retry.browser_pins().len(), 2);
+        assert_same_coherent_record(
+            &backends.load(BackendPolicy::UnixCompleteFile).unwrap(),
+            &retry,
+        );
+
+        // A delayed generation-N writer remains stale even after N+2 has
+        // completed and cannot regress either durable backend.
+        let before_delayed = backends.write_counts();
+        let error = save_to_memory_with_lock(&lock_path, &mut second, &base_revision, &backends)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stale"));
+        assert_eq!(backends.write_counts(), before_delayed);
+        assert_same_coherent_record(
+            &backends.load(BackendPolicy::UnixCompleteFile).unwrap(),
+            &retry,
+        );
+    }
+
+    #[test]
+    fn concurrent_first_host_identity_writers_serialize_and_one_stale_fails() {
+        use std::sync::Barrier;
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CREDENTIAL_LOCK_FILE);
+        let base = StoredCreds::default();
+        let base_revision = credential_revision(&base).unwrap();
+        let backends = Arc::new(MemoryCredentialBackends::with_record(&base));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let mut candidate = base.clone();
+            ensure_host_identity(&mut candidate).unwrap();
+            let expected = base_revision.clone();
+            let backends = Arc::clone(&backends);
+            let barrier = Arc::clone(&barrier);
+            let lock_path = lock_path.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result =
+                    save_to_memory_with_lock(&lock_path, &mut candidate, &expected, &backends);
+                (result, candidate)
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes.iter().filter(|(result, _)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(result, _)| result.is_err())
+                .count(),
+            1
+        );
+        assert_eq!(backends.write_counts(), (1, 1));
+        let committed = outcomes
+            .iter()
+            .find(|(result, _)| result.is_ok())
+            .map(|(_, candidate)| candidate)
+            .unwrap();
+        assert_same_coherent_record(
+            &backends.load(BackendPolicy::UnixCompleteFile).unwrap(),
+            committed,
+        );
+    }
+
+    #[test]
+    fn stale_base_after_split_reconciliation_fails_then_fresh_retry_converges() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CREDENTIAL_LOCK_FILE);
+        let old = complete_record(1, 1, "old-token", 10, "https://server.example/", 1);
+        let old_revision = credential_revision(&old).unwrap();
+        let mut partial_winner = old.clone();
+        partial_winner.access_token = Some("new-token".into());
+        merge_browser_pin(
+            &mut partial_winner,
+            browser_pin(Uuid::from_u128(1), RFC_KEY_ONE),
+        )
+        .unwrap();
+        advance_credential_generation(&mut partial_winner).unwrap();
+        let backends = MemoryCredentialBackends::default();
+        backends.set_split(old.clone(), partial_winner.clone());
+
+        let mut stale = old;
+        merge_browser_pin(&mut stale, browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)).unwrap();
+        let before = backends.write_counts();
+        assert!(
+            save_to_memory_with_lock(&lock_path, &mut stale, &old_revision, &backends).is_err()
+        );
+        assert_eq!(backends.write_counts(), before);
+        assert_same_coherent_record(
+            &backends.load(BackendPolicy::UnixCompleteFile).unwrap(),
+            &partial_winner,
+        );
+
+        let mut fresh = backends.load(BackendPolicy::UnixCompleteFile).unwrap();
+        let fresh_revision = credential_revision(&fresh).unwrap();
+        merge_browser_pin(&mut fresh, browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)).unwrap();
+        save_to_memory_with_lock(&lock_path, &mut fresh, &fresh_revision, &backends).unwrap();
+        assert_eq!(fresh.browser_pins().len(), 2);
+        assert_same_coherent_record(
+            &backends.load(BackendPolicy::UnixCompleteFile).unwrap(),
+            &fresh,
+        );
+    }
+
+    #[test]
+    fn credential_lock_releases_after_error_and_reacquires() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CREDENTIAL_LOCK_FILE);
+        assert!(with_credential_lock_at(&lock_path, || -> Result<()> {
+            bail!("injected locked-operation error")
+        })
+        .is_err());
+        assert_eq!(
+            with_credential_lock_at(&lock_path, || Ok(42_u8)).unwrap(),
+            42
+        );
+
+        let mut candidate = complete_record(1, 1, "token", 1, "https://server.example/", 1);
+        let expected = credential_revision(&candidate).unwrap();
+        let keyring_written = std::cell::Cell::new(false);
+        let file_written = std::cell::Cell::new(false);
+        assert!(with_credential_lock_at(&lock_path, || {
+            save_cas_with_backends(
+                &mut candidate,
+                &expected,
+                || bail!("injected durable reread failure"),
+                BackendPolicy::UnixCompleteFile,
+                |_| {
+                    keyring_written.set(true);
+                    Ok(())
+                },
+                |_| {
+                    file_written.set(true);
+                    Ok(())
+                },
+            )
+        })
+        .is_err());
+        assert!(!keyring_written.get());
+        assert!(!file_written.get());
+        assert_eq!(with_credential_lock_at(&lock_path, || Ok(7_u8)).unwrap(), 7);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+
+            let unsafe_lock = temp.path().join("unsafe.lock");
+            std::fs::write(&unsafe_lock, b"").unwrap();
+            std::fs::set_permissions(&unsafe_lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(with_credential_lock_at(&unsafe_lock, || Ok(())).is_err());
+
+            let target = temp.path().join("target.lock");
+            std::fs::write(&target, b"").unwrap();
+            let symlink = temp.path().join("symlink.lock");
+            std::os::unix::fs::symlink(&target, &symlink).unwrap();
+            assert!(with_credential_lock_at(&symlink, || Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn credential_lock_excludes_a_real_subprocess() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CREDENTIAL_LOCK_FILE);
+        let ready_path = temp.path().join("child-ready");
+        let acquired_path = temp.path().join("child-acquired");
+        let mut child = None;
+        with_credential_lock_at(&lock_path, || {
+            let spawned = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("creds::tests::credential_lock_subprocess_helper")
+                .env(LOCK_HELPER_PATH_ENV, &lock_path)
+                .env(LOCK_HELPER_READY_ENV, &ready_path)
+                .env(LOCK_HELPER_ACQUIRED_ENV, &acquired_path)
+                .spawn()
+                .context("spawning credential lock helper")?;
+            child = Some(spawned);
+            for _ in 0..100 {
+                if ready_path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready_path.exists());
+            assert!(!acquired_path.exists());
+            assert!(child.as_mut().unwrap().try_wait().unwrap().is_none());
+            Ok(())
+        })
+        .unwrap();
+        let status = child.as_mut().unwrap().wait().unwrap();
+        assert!(status.success());
+        assert!(acquired_path.exists());
+    }
+
+    #[test]
+    fn credential_lock_subprocess_helper() {
+        let Some(lock_path) = std::env::var_os(LOCK_HELPER_PATH_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let ready_path = PathBuf::from(std::env::var_os(LOCK_HELPER_READY_ENV).unwrap());
+        let acquired_path = PathBuf::from(std::env::var_os(LOCK_HELPER_ACQUIRED_ENV).unwrap());
+        std::fs::write(ready_path, b"ready").unwrap();
+        with_credential_lock_at(&lock_path, || {
+            std::fs::write(acquired_path, b"acquired")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn native_keyring_policy_never_uses_a_metadata_projection_as_a_complete_record() {
         use std::cell::{Cell, RefCell};
 
@@ -1691,7 +2172,7 @@ mod tests {
             Uuid::from_u128(10),
             "https://server.example/".into(),
             second.clone(),
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap();
         assert!(inserted);
@@ -1713,7 +2194,7 @@ mod tests {
             Uuid::from_u128(10),
             "https://server.example/".into(),
             second,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap();
         assert!(!exact_repeat);
