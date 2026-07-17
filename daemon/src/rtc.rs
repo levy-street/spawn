@@ -1602,6 +1602,11 @@ impl RtcSessions {
     }
 
     #[cfg(test)]
+    pub(crate) fn trust_epoch_for_test(&self) -> u64 {
+        self.trust_epoch.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
     async fn stall_first_pty_send(&self, session_id: &str) -> Arc<tokio::sync::Notify> {
         let gate = Arc::new(tokio::sync::Notify::new());
         self.pty_send_gates
@@ -3327,6 +3332,26 @@ mod tests {
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
         );
+        let host_pc = Arc::new(
+            APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        sessions.host_peers.lock().await.insert(
+            "trust-reload-stale-host".to_owned(),
+            HostRtcPeer {
+                pc: host_pc,
+                binding: HostRtcBinding {
+                    host_id: Uuid::new_v4(),
+                    binding_nonce: "0".repeat(32),
+                    protocol: HOST_CONTROL_LABEL.to_owned(),
+                    protocol_version: RTC_PROTOCOL_VERSION,
+                },
+                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+            },
+        );
         let cleanup_gate = sessions
             .stall_effect(session_id, TestEffectPoint::CloseAllSnapshot)
             .await;
@@ -3339,6 +3364,10 @@ mod tests {
         assert!(
             !active.load(Ordering::Acquire),
             "stale callback authorization survived until slow cleanup"
+        );
+        assert!(
+            sessions.host_peers.lock().await.is_empty(),
+            "stale host peer remained admitted until slow agent cleanup"
         );
         cleanup_gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(2), task)

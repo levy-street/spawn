@@ -3,13 +3,16 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agents::AgentRegistry;
@@ -33,9 +36,173 @@ const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_AGENT_COLS: u16 = 120;
 const DEFAULT_AGENT_ROWS: u16 = 32;
 /// Credential storage has no portable cross-process notification primitive.
-/// One bounded poll gives login/revocation a sub-second activation bound while
-/// keeping keyring/file reads serial and avoiding one watcher per connection.
+/// One daemon-wide poll schedules detection within 500 ms while keeping
+/// keyring/file reads serial and avoiding one watcher per connection. The
+/// separate load deadline below bounds I/O response or fatal fail-stop.
 const CREDENTIAL_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+/// A synchronous credential backend can block in a cross-process lock, the
+/// filesystem, or a native keyring. Keep that work off Tokio and stop trusting
+/// the active generation if one complete load has not replied by this bound.
+const CREDENTIAL_LOAD_DEADLINE: Duration = Duration::from_secs(2);
+
+enum CredentialLoadReply {
+    Loaded(StoredCreds),
+    Failed,
+}
+
+struct CredentialLoadRequest {
+    reply: oneshot::Sender<CredentialLoadReply>,
+}
+
+struct PendingCredentialLoad {
+    reply: oneshot::Receiver<CredentialLoadReply>,
+    deadline: tokio::time::Instant,
+}
+
+/// One daemon-wide, single-flight boundary around all blocking credential I/O.
+///
+/// The worker is a dedicated standard thread, not a Tokio blocking task, so a
+/// backend that ignores cancellation cannot make runtime shutdown wait or
+/// amplify into abandoned `spawn_blocking` jobs. The async side retains the
+/// pending reply across cancellation (for example, when a WebSocket handshake
+/// wins a `select!`) and never enqueues a second request while it is live. A
+/// hard deadline or any worker/channel failure permanently closes the request
+/// channel: callers must invalidate trust and terminate the daemon run.
+struct CredentialLoader {
+    requests: Option<std_mpsc::SyncSender<CredentialLoadRequest>>,
+    pending: Option<PendingCredentialLoad>,
+    load_deadline: Duration,
+    failed: bool,
+}
+
+impl CredentialLoader {
+    fn for_daemon() -> Result<Self> {
+        // Preserve the ordinary initial-load warning behavior, then keep the
+        // 500 ms live monitor quiet on Unix's designed file fallback.
+        let mut initial = true;
+        Self::start(CREDENTIAL_LOAD_DEADLINE, move || {
+            if std::mem::take(&mut initial) {
+                creds::load()
+            } else {
+                creds::load_for_live_reload()
+            }
+        })
+    }
+
+    fn start<F>(load_deadline: Duration, load: F) -> Result<Self>
+    where
+        F: FnMut() -> Result<StoredCreds> + Send + 'static,
+    {
+        Self::start_inner(load_deadline, load, None)
+    }
+
+    fn start_inner<F>(
+        load_deadline: Duration,
+        mut load: F,
+        worker_exit: Option<std_mpsc::Sender<()>>,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> Result<StoredCreds> + Send + 'static,
+    {
+        // Capacity one plus the async-side `pending` slot is intentionally
+        // conservative: only one request is ever sent, and `try_send` ensures
+        // Tokio is never blocked even if the worker has not reached `recv`.
+        let (requests, receiver) = std_mpsc::sync_channel::<CredentialLoadRequest>(1);
+        thread::Builder::new()
+            .name("spawnd-credential-loader".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let loaded = catch_unwind(AssertUnwindSafe(&mut load));
+                    let (reply, stop) = match loaded {
+                        Ok(Ok(record)) => (CredentialLoadReply::Loaded(record), false),
+                        Ok(Err(_)) | Err(_) => (CredentialLoadReply::Failed, true),
+                    };
+                    // When the supervisor timed out or shut down, this send
+                    // drops the complete StoredCreds reply (whose Drop wipes
+                    // token/private seed) and the closed request channel ends
+                    // the thread without another backend invocation.
+                    if request.reply.send(reply).is_err() || stop {
+                        break;
+                    }
+                }
+                if let Some(worker_exit) = worker_exit {
+                    let _ = worker_exit.send(());
+                }
+            })
+            .context("starting bounded credential loader")?;
+        Ok(Self {
+            requests: Some(requests),
+            pending: None,
+            load_deadline,
+            failed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn start_observed<F>(
+        load_deadline: Duration,
+        load: F,
+        worker_exit: std_mpsc::Sender<()>,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> Result<StoredCreds> + Send + 'static,
+    {
+        Self::start_inner(load_deadline, load, Some(worker_exit))
+    }
+
+    async fn load(&mut self) -> Result<StoredCreds> {
+        if self.failed {
+            return Err(anyhow!("credential loader is permanently unavailable"));
+        }
+        if self.pending.is_none() {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let request = CredentialLoadRequest { reply: reply_tx };
+            let sent = self
+                .requests
+                .as_ref()
+                .ok_or_else(|| anyhow!("credential loader is permanently unavailable"))?
+                .try_send(request);
+            if sent.is_err() {
+                self.fail_permanently();
+                return Err(anyhow!("credential loader request channel failed"));
+            }
+            self.pending = Some(PendingCredentialLoad {
+                reply: reply_rx,
+                deadline: tokio::time::Instant::now() + self.load_deadline,
+            });
+        }
+
+        let deadline = self.pending.as_ref().expect("pending load").deadline;
+        let reply = {
+            let pending = self.pending.as_mut().expect("pending load");
+            tokio::time::timeout_at(deadline, &mut pending.reply).await
+        };
+        match reply {
+            Ok(Ok(CredentialLoadReply::Loaded(record))) => {
+                self.pending = None;
+                Ok(record)
+            }
+            Ok(Ok(CredentialLoadReply::Failed)) => {
+                self.fail_permanently();
+                Err(anyhow!("credential loader failed"))
+            }
+            Ok(Err(_)) => {
+                self.fail_permanently();
+                Err(anyhow!("credential loader reply channel failed"))
+            }
+            Err(_) => {
+                self.fail_permanently();
+                Err(anyhow!("credential reload exceeded its hard deadline"))
+            }
+        }
+    }
+
+    fn fail_permanently(&mut self) {
+        self.failed = true;
+        self.pending = None;
+        self.requests = None;
+    }
+}
 
 struct LiveCredentialSnapshot {
     /// Token, host signing key, trust domain, and browser pins are owned as one
@@ -140,46 +307,43 @@ enum ActiveSessionEvent {
 
 async fn wait_for_credential_change(
     active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
 ) -> Result<LiveCredentialSnapshot> {
-    wait_for_credential_change_with(
-        active,
-        CREDENTIAL_RELOAD_INTERVAL,
-        creds::load_for_live_reload,
-    )
-    .await
+    wait_for_credential_change_with(active, CREDENTIAL_RELOAD_INTERVAL, loader).await
 }
 
-fn credential_change_now(
+async fn credential_change_now(
     active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
 ) -> Result<Option<LiveCredentialSnapshot>> {
-    credential_change_now_with(active, creds::load_for_live_reload)
+    credential_change_now_with(active, loader).await
 }
 
-fn credential_change_now_with<F>(
+async fn credential_change_now_with(
     active: &LiveCredentialSnapshot,
-    mut load: F,
-) -> Result<Option<LiveCredentialSnapshot>>
-where
-    F: FnMut() -> Result<StoredCreds>,
-{
-    let record = load().context("reloading credentials before websocket admission")?;
+    loader: &mut CredentialLoader,
+) -> Result<Option<LiveCredentialSnapshot>> {
+    let record = loader
+        .load()
+        .await
+        .context("reloading credentials before websocket admission")?;
     active.classify_reload(record)
 }
 
-async fn wait_for_credential_change_with<F>(
+async fn wait_for_credential_change_with(
     active: &LiveCredentialSnapshot,
     poll_interval: Duration,
-    mut load: F,
-) -> Result<LiveCredentialSnapshot>
-where
-    F: FnMut() -> Result<StoredCreds>,
-{
+    loader: &mut CredentialLoader,
+) -> Result<LiveCredentialSnapshot> {
     let start = tokio::time::Instant::now() + poll_interval;
     let mut ticker = tokio::time::interval_at(start, poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let record = load().context("reloading the complete credential record")?;
+        let record = loader
+            .load()
+            .await
+            .context("reloading the complete credential record")?;
         if let Some(next) = active.classify_reload(record)? {
             return Ok(next);
         }
@@ -187,7 +351,11 @@ where
 }
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
-    let stored = creds::load().context("loading stored credentials")?;
+    let mut credential_loader = CredentialLoader::for_daemon()?;
+    let stored = credential_loader
+        .load()
+        .await
+        .context("loading stored credentials")?;
     // Prefer the explicit --server flag, then $SPAWN_SERVER_URL (already
     // wired into clap), then the URL we logged in against.
     let server_url = match server_cli {
@@ -216,15 +384,16 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     'supervisor: loop {
         // A session close or backoff timer can become ready in the same
         // scheduler turn as a credential write. Never let that select race
-        // carry the stale snapshot into another socket: synchronously reread
-        // the whole record before every connection attempt.
-        let immediate_reload = match credential_change_now(&live_credentials) {
-            Ok(reload) => reload,
-            Err(error) => {
-                rtc_sessions.invalidate_trust_and_close_all().await;
-                return Err(error);
-            }
-        };
+        // carry the stale snapshot into another socket: reread the whole
+        // record through the hard-deadline loader before every attempt.
+        let immediate_reload =
+            match credential_change_now(&live_credentials, &mut credential_loader).await {
+                Ok(reload) => reload,
+                Err(error) => {
+                    rtc_sessions.invalidate_trust_and_close_all().await;
+                    return Err(error);
+                }
+            };
         if let Some(next) = immediate_reload {
             // The prior socket-end branch may have won over a simultaneously
             // ready reload. Its ordinary close cannot authorize an offer that
@@ -235,8 +404,13 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             attempt = 0;
         }
         let outcome = {
-            let session_fut =
-                serve_one_connection(&live_credentials, &ws_url, &registry, &rtc_sessions);
+            let session_fut = serve_one_connection(
+                &live_credentials,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                &mut credential_loader,
+            );
             tokio::pin!(session_fut);
 
             tokio::select! {
@@ -274,7 +448,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         tracing::info!(?delay, "reconnecting after backoff");
         let reloaded = {
             let sleep_fut = tokio::time::sleep(delay);
-            let reload_fut = wait_for_credential_change(&live_credentials);
+            let reload_fut = wait_for_credential_change(&live_credentials, &mut credential_loader);
             tokio::pin!(sleep_fut);
             tokio::pin!(reload_fut);
             tokio::select! {
@@ -308,6 +482,7 @@ async fn serve_one_connection(
     ws_url: &url::Url,
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
+    loader: &mut CredentialLoader,
 ) -> Result<ServeOutcome> {
     serve_one_connection_with_loader(
         live_credentials,
@@ -315,26 +490,23 @@ async fn serve_one_connection(
         registry,
         rtc_sessions,
         CREDENTIAL_RELOAD_INTERVAL,
-        creds::load_for_live_reload,
+        loader,
     )
     .await
 }
 
-async fn serve_one_connection_with_loader<F>(
+async fn serve_one_connection_with_loader(
     live_credentials: &LiveCredentialSnapshot,
     ws_url: &url::Url,
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
     poll_interval: Duration,
-    load: F,
-) -> Result<ServeOutcome>
-where
-    F: Fn() -> Result<StoredCreds> + Clone,
-{
+    loader: &mut CredentialLoader,
+) -> Result<ServeOutcome> {
     // Keep this boundary self-contained as well as guarding it in `run`: a
     // caller cannot open a websocket from a snapshot that was already stale
     // when the connection operation began.
-    match credential_change_now_with(live_credentials, load.clone()) {
+    match credential_change_now_with(live_credentials, loader).await {
         Ok(Some(next)) => {
             rtc_sessions.invalidate_trust_and_close_all().await;
             return Ok(ServeOutcome::CredentialsChanged(Box::new(next)));
@@ -351,14 +523,24 @@ where
         .as_deref()
         .ok_or_else(|| anyhow!("no access token"))?;
 
-    let reload_fut = wait_for_credential_change_with(live_credentials, poll_interval, load.clone());
-    tokio::pin!(reload_fut);
-    let stream = tokio::select! {
-        connected = ws::connect(ws_url, token) => match connected {
-            Ok(stream) => stream,
-            Err(error) => return Ok(ServeOutcome::SessionEnded(Err(error))),
-        },
-        reloaded = &mut reload_fut => {
+    enum ConnectOutcome<S> {
+        Connected(S),
+        Reloaded(Result<Box<LiveCredentialSnapshot>>),
+    }
+    let connect_outcome = {
+        let reload_fut = wait_for_credential_change_with(live_credentials, poll_interval, loader);
+        tokio::pin!(reload_fut);
+        tokio::select! {
+            connected = ws::connect(ws_url, token) => match connected {
+                Ok(stream) => ConnectOutcome::Connected(stream),
+                Err(error) => return Ok(ServeOutcome::SessionEnded(Err(error))),
+            },
+            reloaded = &mut reload_fut => ConnectOutcome::Reloaded(reloaded.map(Box::new)),
+        }
+    };
+    let stream = match connect_outcome {
+        ConnectOutcome::Connected(stream) => stream,
+        ConnectOutcome::Reloaded(reloaded) => {
             let reloaded = match reloaded {
                 Ok(reloaded) => reloaded,
                 Err(error) => {
@@ -367,7 +549,7 @@ where
                 }
             };
             rtc_sessions.invalidate_trust_and_close_all().await;
-            return Ok(ServeOutcome::CredentialsChanged(Box::new(reloaded)));
+            return Ok(ServeOutcome::CredentialsChanged(reloaded));
         }
     };
     // A durable commit can land while DNS/TCP/TLS/WebSocket negotiation is in
@@ -375,7 +557,7 @@ where
     // registering the host, installing sinks, or accepting any control/RTC
     // frame; a stale handshake is dropped without becoming an admitted daemon
     // session.
-    match credential_change_now_with(live_credentials, load.clone()) {
+    match credential_change_now_with(live_credentials, loader).await {
         Ok(Some(next)) => {
             drop(stream);
             rtc_sessions.invalidate_trust_and_close_all().await;
@@ -483,24 +665,33 @@ where
                 tracing::info!("heartbeat task ended; ending session");
                 ActiveSessionEvent::SessionEnded(Ok(()))
             }
-            reloaded = &mut reload_fut => {
+            reloaded = wait_for_credential_change_with(live_credentials, poll_interval, loader) => {
                 ActiveSessionEvent::CredentialReload(reloaded.map(Box::new))
             }
         }
     };
 
-    // Tear down this session. Clearing the per-agent sinks first stops the
-    // legacy mirror; forwarders continue draining bounded worker output into
-    // direct viewers, and a reconnect catches up from worker replay. We just
-    // abort the IO tasks (rather than awaiting graceful exit)
-    // because `stream_tx.close()` against a half-dead remote can hang on
-    // the final TCP write, AND because the `select!` above may have already
-    // consumed one task to completion (re-awaiting a finished JoinHandle
-    // panics).
-    clear_session_sinks(registry).await;
-    if matches!(&dispatch_result, ActiveSessionEvent::CredentialReload(_)) {
+    // Tear down this session. A trust reload drops and joins the WebSocket I/O
+    // tasks before peer/sink cleanup so a hard loader failure cannot retain a
+    // stale control transport. Ordinary socket endings clear per-agent sinks
+    // first; forwarders keep draining bounded worker output into direct
+    // viewers and reconnect catches up from worker replay. We abort rather
+    // than attempting a graceful WebSocket close because the final TCP write
+    // can hang. Only the reload branch re-awaits the aborted handles: no I/O
+    // handle was the winning `select!` branch there.
+    let credential_reload = matches!(&dispatch_result, ActiveSessionEvent::CredentialReload(_));
+    if credential_reload {
+        // A hard loader failure is fatal. Drop the transport tasks before any
+        // potentially slow sink/peer cleanup so the stale control socket can
+        // no longer deliver work after the reply deadline fires.
+        heartbeat_task.abort();
+        reader_task.abort();
+        sender_task.abort();
+        let _ = tokio::join!(&mut heartbeat_task, &mut reader_task, &mut sender_task);
         rtc_sessions.invalidate_trust_and_close_all().await;
+        clear_session_sinks(registry).await;
     } else {
+        clear_session_sinks(registry).await;
         rtc_sessions.close_all().await;
     }
     heartbeat_task.abort();
@@ -1957,6 +2148,28 @@ mod tests {
     const TEST_BROWSER_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const TEST_BROWSER_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
+    async fn receive_std_signal(
+        receiver: &std_mpsc::Receiver<()>,
+        bound: Duration,
+        description: &str,
+    ) {
+        tokio::time::timeout(bound, async {
+            loop {
+                match receiver.try_recv() {
+                    Ok(()) => break,
+                    Err(std_mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(std_mpsc::TryRecvError::Disconnected) => {
+                        panic!("{description} channel disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+    }
+
     fn credential_record(
         generation: u64,
         record_id: u128,
@@ -2182,7 +2395,7 @@ mod tests {
         .contains("no daemon token"));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn bounded_poll_activates_change_and_backend_failure_fails_closed() {
         let host_id = Uuid::from_u128(10);
         let old_record = credential_record(
@@ -2204,34 +2417,248 @@ mod tests {
             8,
             &[(Uuid::from_u128(101), TEST_BROWSER_KEY_ONE)],
         );
-        let mut calls = 0;
-        let changed = wait_for_credential_change_with(&active, Duration::from_millis(10), || {
-            calls += 1;
-            if calls == 1 {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let mut loader = CredentialLoader::start(Duration::from_millis(200), move || {
+            if load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 Ok(old_record.clone())
             } else {
                 Ok(next.clone())
             }
         })
-        .await
-        .expect("bounded reload");
-        assert_eq!(calls, 2);
+        .expect("credential loader");
+        let changed =
+            wait_for_credential_change_with(&active, Duration::from_millis(10), &mut loader)
+                .await
+                .expect("bounded reload");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(changed.generation, 2);
         assert_eq!(changed.record.browser_pins().len(), 1);
 
-        let error = wait_for_credential_change_with(&active, Duration::from_millis(10), || {
-            Err(anyhow!("credential backend unavailable"))
+        let mut failed_loader = CredentialLoader::start(Duration::from_millis(200), || {
+            Err(anyhow!(
+                "credential backend unavailable with never-log-this-token"
+            ))
         })
-        .await
-        .err()
-        .expect("backend failure must fail closed");
+        .expect("failed credential loader");
+        let error =
+            wait_for_credential_change_with(&active, Duration::from_millis(10), &mut failed_loader)
+                .await
+                .err()
+                .expect("backend failure must fail closed");
         let message = format!("{error:#}");
-        assert!(message.contains("backend unavailable"));
+        assert!(message.contains("credential loader failed"));
         assert!(!message.contains("never-log-this-token"));
         assert_eq!(
             active.generation, 1,
             "failed reload cannot mutate active trust"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_loader_has_one_hard_deadline_no_amplification_and_redacted_error() {
+        let record = credential_record(
+            1,
+            1,
+            "deadline-secret-token",
+            Uuid::from_u128(10),
+            "https://spawn.example/",
+            7,
+            &[],
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (exit_tx, exit_rx) = std_mpsc::channel();
+        let mut loader = CredentialLoader::start_observed(
+            Duration::from_millis(80),
+            move || {
+                load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = started_tx.send(());
+                release_rx.recv().expect("release stalled loader");
+                Ok(record.clone())
+            },
+            exit_tx,
+        )
+        .expect("credential loader");
+
+        let began = tokio::time::Instant::now();
+        let error = loader
+            .load()
+            .await
+            .err()
+            .expect("stalled credential load must fail closed");
+        assert!(began.elapsed() >= Duration::from_millis(70));
+        assert!(began.elapsed() < Duration::from_millis(500));
+        receive_std_signal(&started_rx, Duration::from_secs(1), "loader start").await;
+        let message = format!("{error:#}");
+        assert!(message.contains("hard deadline"));
+        assert!(!message.contains("deadline-secret-token"));
+
+        let second = loader
+            .load()
+            .await
+            .err()
+            .expect("timed-out loader must remain permanently failed");
+        assert!(second.to_string().contains("permanently unavailable"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release_tx.send(()).expect("release loader worker");
+        receive_std_signal(&exit_rx, Duration::from_secs(1), "loader exit").await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn loader_panic_and_disconnected_channel_fail_permanently_without_details() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let (exit_tx, exit_rx) = std_mpsc::channel();
+        let mut panicked = CredentialLoader::start_observed(
+            Duration::from_millis(200),
+            move || -> Result<StoredCreds> {
+                load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("credential loader test panic");
+            },
+            exit_tx,
+        )
+        .expect("credential loader");
+        let panic_error = panicked
+            .load()
+            .await
+            .err()
+            .expect("worker panic must fail closed");
+        assert!(panic_error.to_string().contains("credential loader failed"));
+        assert!(!panic_error.to_string().contains("test panic"));
+        receive_std_signal(&exit_rx, Duration::from_secs(1), "panicked loader exit").await;
+        assert!(panicked.load().await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (requests, receiver) = std_mpsc::sync_channel(1);
+        drop(receiver);
+        let mut disconnected = CredentialLoader {
+            requests: Some(requests),
+            pending: None,
+            load_deadline: Duration::from_millis(200),
+            failed: false,
+        };
+        let channel_error = disconnected
+            .load()
+            .await
+            .err()
+            .expect("disconnected request channel must fail closed");
+        assert!(channel_error.to_string().contains("request channel failed"));
+        assert!(disconnected.load().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loader_accepts_near_deadline_success_and_ordinary_polls_stay_single_flight() {
+        let record = credential_record(
+            1,
+            1,
+            "near-deadline-token",
+            Uuid::from_u128(10),
+            "https://spawn.example/",
+            7,
+            &[],
+        );
+        let near_record = record.clone();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let mut near = CredentialLoader::start(Duration::from_millis(250), move || {
+            release_rx.recv().expect("release near-deadline load");
+            Ok(near_record.clone())
+        })
+        .expect("credential loader");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            release_tx.send(()).expect("release loader");
+        });
+        let began = tokio::time::Instant::now();
+        let loaded = near.load().await.expect("near-deadline load must succeed");
+        assert_eq!(loaded.access_token.as_deref(), Some("near-deadline-token"));
+        assert!(began.elapsed() >= Duration::from_millis(130));
+        release.await.unwrap();
+
+        let active = live_snapshot(record.clone());
+        let next = credential_record(
+            2,
+            2,
+            "single-flight-new-token",
+            Uuid::from_u128(10),
+            "https://spawn.example/",
+            8,
+            &[],
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let load_concurrent = Arc::clone(&concurrent);
+        let load_maximum = Arc::clone(&maximum);
+        let mut ordinary = CredentialLoader::start(Duration::from_millis(200), move || {
+            let in_flight = load_concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            load_maximum.fetch_max(in_flight, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            let index = load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            load_concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if index < 2 {
+                Ok(record.clone())
+            } else {
+                Ok(next.clone())
+            }
+        })
+        .expect("credential loader");
+        let changed =
+            wait_for_credential_change_with(&active, Duration::from_millis(2), &mut ordinary)
+                .await
+                .expect("ordinary polling change");
+        assert_eq!(changed.generation, 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_active_load_detaches_one_worker_and_ends_it_after_completion() {
+        let record = credential_record(
+            1,
+            1,
+            "shutdown-secret-token",
+            Uuid::from_u128(10),
+            "https://spawn.example/",
+            7,
+            &[],
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (exit_tx, exit_rx) = std_mpsc::channel();
+        let loader = CredentialLoader::start_observed(
+            Duration::from_secs(10),
+            move || {
+                load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                started_tx.send(()).expect("announce loader start");
+                release_rx.recv().expect("release loader");
+                Ok(record.clone())
+            },
+            exit_tx,
+        )
+        .expect("credential loader");
+        let task = tokio::spawn(async move {
+            let mut loader = loader;
+            loader.load().await
+        });
+        receive_std_signal(&started_rx, Duration::from_secs(1), "loader start").await;
+        task.abort();
+        assert!(task
+            .await
+            .err()
+            .expect("load task must be cancelled")
+            .is_cancelled());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release_tx.send(()).expect("release loader");
+        receive_std_signal(&exit_rx, Duration::from_secs(1), "loader exit").await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2263,9 +2690,13 @@ mod tests {
             _ = async {} => {}
             _ = async {} => panic!("biased session-end branch should win"),
         }
-        let admitted = credential_change_now_with(&active, || Ok(committed.clone()))
+        let mut loader =
+            CredentialLoader::start(Duration::from_millis(200), move || Ok(committed.clone()))
+                .expect("credential loader");
+        let admitted = credential_change_now_with(&active, &mut loader)
+            .await
             .unwrap()
-            .expect("synchronous pre-connect gate must observe committed generation");
+            .expect("pre-connect gate must observe committed generation");
         assert_eq!(admitted.generation, 2);
         assert_eq!(
             admitted.record.access_token.as_deref(),
@@ -2342,6 +2773,8 @@ mod tests {
             let backend = Arc::clone(&backend);
             move || Ok(backend.lock().expect("credential backend").clone())
         };
+        let mut loader =
+            CredentialLoader::start(Duration::from_secs(1), load).expect("credential loader");
         let registry = AgentRegistry::new();
         assert!(
             registry.claim_discovery(),
@@ -2350,25 +2783,27 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
 
-        let first = serve_one_connection_with_loader(
-            &active,
-            &ws_url,
-            &registry,
-            &rtc_sessions,
-            Duration::from_millis(10),
-            load.clone(),
-        );
-        tokio::pin!(first);
-        let first_auth = tokio::select! {
-            auth = auth_rx.recv() => auth.expect("first authorization"),
-            result = &mut first => panic!("first connection ended before mutation: {}", result.is_ok()),
+        let first_outcome = {
+            let first = serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_millis(10),
+                &mut loader,
+            );
+            tokio::pin!(first);
+            let first_auth = tokio::select! {
+                auth = auth_rx.recv() => auth.expect("first authorization"),
+                result = &mut first => panic!("first connection ended before mutation: {}", result.is_ok()),
+            };
+            assert_eq!(first_auth, "Bearer old-local-token");
+            *backend.lock().expect("credential backend") = committed_record;
+            tokio::time::timeout(Duration::from_secs(2), &mut first)
+                .await
+                .expect("live reload timeout")
+                .expect("live reload result")
         };
-        assert_eq!(first_auth, "Bearer old-local-token");
-        *backend.lock().expect("credential backend") = committed_record;
-        let first_outcome = tokio::time::timeout(Duration::from_secs(2), &mut first)
-            .await
-            .expect("live reload timeout")
-            .expect("live reload result");
         let active = match first_outcome {
             ServeOutcome::CredentialsChanged(next) => next,
             ServeOutcome::SessionEnded(_) => panic!("credential commit did not end old session"),
@@ -2384,7 +2819,7 @@ mod tests {
                 &registry,
                 &rtc_sessions,
                 Duration::from_millis(10),
-                load,
+                &mut loader,
             ),
         )
         .await
@@ -2396,6 +2831,168 @@ mod tests {
             "Bearer new-local-token"
         );
         tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("local websocket server timeout")
+            .expect("local websocket server task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn stalled_live_loader_closes_websocket_invalidates_trust_and_returns_fatal_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket");
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let registered_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_registered_state = Arc::clone(&registered_state);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept daemon socket");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer live-stall-secret-token")
+                    );
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("spawn.control.v2"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("daemon websocket handshake");
+            socket
+                .next()
+                .await
+                .expect("daemon register frame")
+                .expect("valid daemon register frame");
+            server_registered_state.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = registered_tx.send(());
+            while socket.next().await.is_some() {}
+            let _ = closed_tx.send(tokio::time::Instant::now());
+        });
+
+        let host_id = Uuid::from_u128(10);
+        let record = credential_record(
+            1,
+            1,
+            "live-stall-secret-token",
+            host_id,
+            server_url.as_str(),
+            7,
+            &[],
+        );
+        let active = LiveCredentialSnapshot::initial(record.clone(), &server_url).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_calls = Arc::clone(&calls);
+        let load_registered_state = Arc::clone(&registered_state);
+        let (stall_tx, stall_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (exit_tx, exit_rx) = std_mpsc::channel();
+        let mut stall_tx = Some(stall_tx);
+        let mut release_rx = Some(release_rx);
+        let mut loader = CredentialLoader::start_observed(
+            Duration::from_millis(100),
+            move || {
+                load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !load_registered_state.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(record.clone());
+                }
+                stall_tx.take().expect("one stalled load").send(()).ok();
+                release_rx
+                    .take()
+                    .expect("one stalled load release")
+                    .recv()
+                    .expect("release stalled live load");
+                Ok(record.clone())
+            },
+            exit_tx,
+        )
+        .expect("credential loader");
+        let registry = AgentRegistry::new();
+        assert!(registry.claim_discovery());
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+        let epoch_before = rtc_sessions.trust_epoch_for_test();
+
+        {
+            let connection = serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_millis(5),
+                &mut loader,
+            );
+            tokio::pin!(connection);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    registered = registered_rx => {
+                        registered.expect("daemon registration sender");
+                    }
+                    result = &mut connection => {
+                        panic!("daemon connection ended before registration: {}", result.is_ok());
+                    }
+                }
+            })
+            .await
+            .expect("daemon registration timeout");
+            tokio::select! {
+                _ = receive_std_signal(
+                    &stall_rx,
+                    Duration::from_secs(1),
+                    "live loader stall",
+                ) => {}
+                result = &mut connection => {
+                    panic!("daemon connection ended before loader stall: {}", result.is_ok());
+                }
+            }
+            let deadline_started = tokio::time::Instant::now();
+            let error = tokio::time::timeout(Duration::from_millis(500), &mut connection)
+                .await
+                .expect("fatal loader deadline did not return")
+                .err()
+                .expect("loader deadline must be fatal to the supervisor");
+            assert!(deadline_started.elapsed() < Duration::from_millis(250));
+            let message = format!("{error:#}");
+            assert!(message.contains("hard deadline"));
+            assert!(!message.contains("live-stall-secret-token"));
+            assert!(rtc_sessions.trust_epoch_for_test() > epoch_before);
+            let closed_at = tokio::time::timeout(Duration::from_millis(200), closed_rx)
+                .await
+                .expect("stale websocket was not closed after loader deadline")
+                .expect("websocket close observation");
+            assert!(
+                closed_at.duration_since(deadline_started) < Duration::from_millis(250),
+                "stale websocket survived past the loader fail-stop bound"
+            );
+            assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        }
+
+        let calls_at_failure = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let follow_on = loader
+            .load()
+            .await
+            .err()
+            .expect("fatal loader must prohibit reconnect loads");
+        assert!(follow_on.to_string().contains("permanently unavailable"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_at_failure
+        );
+        release_tx.send(()).expect("release stalled live loader");
+        receive_std_signal(&exit_rx, Duration::from_secs(1), "live loader exit").await;
+        tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("local websocket server timeout")
             .expect("local websocket server task");
