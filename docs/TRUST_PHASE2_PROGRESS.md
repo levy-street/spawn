@@ -493,10 +493,13 @@ set to canonical server origin plus Host ID, refuses domain changes before a
 write with explicit reset/separate-config recovery, and treats the complete
 Unix file as the sole commit point; its OS keyring copy is optional redundancy
 (Linux uses kernel keyutils, not Secret Service/DBus). Unix writes the atomic
-file before exposing the new generation to the keyring. Reload always selects
+file before exposing the new generation to the keyring. Every reload selects
 an existing file -- including an empty or legacy file -- over a stale, future,
-or conflicting optional keyring copy, rejects versioned keyring-only state,
-and repairs the redundancy from the file. Keyring accounts are now scoped by
+or conflicting optional keyring copy and rejects versioned keyring-only state.
+Normal interactive load/status repairs the redundancy from the file; the
+bounded 500 ms live-trust reload marks it degraded without repeatedly writing
+or logging, leaving the same authoritative whole record active. Keyring
+accounts are now scoped by
 the canonical config-directory identity; alternate config trees
 cannot cross-load or cross-delete trust, and only the exact default directory
 may perform a conflict-checked one-time migration of the legacy global entry.
@@ -513,8 +516,10 @@ by failed parent-directory sync is reported as committed with uncertain crash
 durability, never as a rollback; failures before rename remain ordinary errors
 and leave the target unchanged. A later optional Unix-keyring failure is also
 typed committed-but-redundancy-degraded: memory and reload retain the file's
-whole generation, fixed redacted status warns, and later load/status retries
-repair without allowing a stale/future keyring to downgrade or advance it. A
+whole generation, fixed redacted status warns, and later interactive
+load/status retries repair without allowing a stale/future keyring to downgrade
+or advance it. Frequent live-trust reloads select that same file and surface
+the degraded state without retry amplification. A
 combined parent-sync plus keyring failure reports both the uncertain crash
 durability and degraded redundancy. Status and smoke failures remain redacted.
 A real two-login proof now runs without the keyring-disable flag and compares
@@ -601,8 +606,10 @@ pre-authoritative save failure leaves the legacy marker unchanged, while a
 post-keyring projection failure retains the committed version-1 promotion in
 memory and on reload. On Unix the authoritative file is committed before its
 optional keyring copy; file failure publishes no new keyring generation, while
-a later keyring failure retains the file-committed version-1 promotion and is
-repaired from that file on reload. Confirmed records cannot be downgraded, and
+a later keyring failure retains the file-committed version-1 promotion. Normal
+load/status repairs from that file; the bounded live-trust reload selects it
+without repeatedly retrying the optional repair. Confirmed records cannot be
+downgraded, and
 unknown/future marker versions fail closed. The browser approval page derives
 the displayed browser fingerprint again from its non-extractable local
 identity, compares the registration response, and retains that local value
@@ -702,8 +709,81 @@ Pin add/revoke and token/host-key rotation require a revisioned coherent
 whole-record reload/notification, or a loud enforced restart boundary. The
 canonical server-origin + Host-ID domain is rechecked on every change; token,
 host signing key, and browser pins never mix across revisions. Live tests add
-and revoke a browser pin while `run` is active and prove immediate activation
-and refusal rather than stale reconnect acceptance.
+and revoke a browser pin while `run` is active and prove bounded activation or
+fatal fail-stop rather than stale reconnect acceptance.
+
+**P3-DAEMON-TRUST-RELOAD (implemented, independent review pending):** the
+daemon supervisor now owns exactly one validated current credential generation
+containing its access token, host signing key, canonical server-origin + exact
+Host-ID domain, and bounded browser-pin set. It rereads the complete record
+immediately before every WebSocket attempt and again after handshake but before
+host registration, sink installation, or control/RTC admission. One dedicated
+standard loader thread performs every complete credential read for the daemon
+run. A capacity-one synchronous request boundary and retained pending reply
+make it single-flight even when an async `select!` cancels a watcher future;
+the Tokio runtime never performs the file-lock, filesystem, or native-keyring
+operation and never owns a blocking task that shutdown must join. The monitor
+schedules one complete load every 500 ms while connected or backing off, and
+each request has a two-second absolute reply deadline that cancellation cannot
+reset. Reattachment checks expiry before polling a queued reply, and an
+explicit timer-first biased wait makes expiry win when reply and deadline are
+both observable at the exact boundary. A reply that may have completed earlier
+but was not observed before the deadline is conservatively rejected. An
+unchanged revision must be field-for-field the same decoded record; a
+same-revision substitution, generation rollback/non-advance, reused record
+identity, missing login/key/domain, changed Host ID/origin, or
+corrupt/noncanonical key or pin
+fails closed without keeping the old authorization active. A valid higher
+generation tears down the old WebSocket/RTC authorization before reconnecting
+with its new token. A deadline, backend error/panic, or request/reply-channel
+failure is instead permanent for that daemon run: it first aborts and joins the
+WebSocket I/O tasks, advances the RTC trust epoch and deactivates peers/uploads,
+then returns a redacted fatal error with no reconnect or follow-on load.
+Because Rust panic hooks run before `catch_unwind`, the daemon installs one
+process-wide hook before its loader thread can start. A private thread-local
+marker (not a copyable thread name) selects one fixed payload/location-free
+credential-loader diagnostic; every unrelated panic delegates unchanged to
+the hook that was installed previously. The hook is installed once for the
+process rather than swapped around individual loads or daemon runs.
+
+The application-level detection/fail-stop budget is therefore the next poll
+(at most 500 ms under normal runtime scheduling) plus the two-second load
+deadline. These are daemon scheduler deadlines, not a guarantee while the OS
+has suspended or is not scheduling the process. A backend thread still blocked
+after the deadline is detached from Tokio; the closed single-flight channel
+prevents amplification, and if it eventually returns its complete secret
+record is dropped/zeroized before the thread exits. Process termination may
+end that detached standard thread at the OS boundary. No finite pre/post
+handshake reread claims linearizability with a credential writer: a commit
+immediately after the post-handshake gate is caught by the bounded monitor,
+while stronger ordering would require writer notification/acknowledgement or
+an authenticated generation in the server handshake.
+
+RTC admission captures a trust epoch before expensive peer construction and
+rechecks it inside the serialized insertion boundary. Credential reload first
+advances that epoch while holding the admission fence and then closes all
+agent and host peers, so an offer that began on the stale control connection
+cannot finish admission after pin revocation or whole-record rotation. The
+periodic watcher owns no Tokio background task and missed ticks are skipped;
+the immediate admission reread closes the race where socket end/backoff and a
+credential commit are simultaneously ready. Unit and local-loopback WebSocket
+tests cover add/revoke, atomic token/key/pin replacement, corrupt/unavailable
+load, secret-safe errors, the simultaneous-ready reconnect case, an active
+old-token socket closing before a new-token reconnect, a loader stalled beyond
+deadline, backend panic and channel disconnect, near-deadline success, repeated
+single-flight polling, supervisor cancellation while a load remains active,
+late reply after watcher cancellation, exact reply/deadline precedence, timely
+pre-deadline reattachment, repeated cancellation without deadline extension,
+and active-session I/O completion held in slow cleanup past the retained
+deadline. A captured-stderr subprocess test panics the active loader with token
+and path canaries, proves neither canary nor source detail reaches stdout or
+stderr, observes exactly one fixed diagnostic, verifies WebSocket/RTC teardown
+and no retry, and confirms an unrelated thread still reaches a preexisting
+custom panic hook.
+RTC tests keep both stale agent and host peers present and prove authorization
+is removed before deliberately stalled cleanup. This checkpoint still
+does not wire signed RTC envelopes or turn the locally stored pins into live
+signature verification, so it creates no live Phase 3 MITM-resistance claim.
 
 Live identifiers also become strict before wiring: the Date.now/Math.random
 agent-session fallback is removed. Agent and HostControl session IDs use

@@ -177,6 +177,7 @@ import sys
 import base64
 import urllib.error
 import urllib.request
+import uuid
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -296,10 +297,21 @@ poll = request(
 )
 
 creds = {
+    "credential_record_version": 1,
+    "credential_generation": 1,
+    "credential_record_id": str(uuid.uuid4()),
     "access_token": poll["access_token"],
     "host_id": poll["host_id"],
     "server_url": base_url,
     "host_private_key_seed": base64.urlsafe_b64encode(seed).rstrip(b"=").decode(),
+    "browser_pins": [
+        {
+            "browser_device_id": poll["browser_device_id"],
+            "browser_key_algorithm": poll["browser_key_algorithm"],
+            "browser_public_key": poll["browser_public_key"],
+            "browser_key_fingerprint": poll["browser_key_fingerprint"],
+        }
+    ],
 }
 for config_dir in (
     os.path.join(home, ".config", "spawn"),

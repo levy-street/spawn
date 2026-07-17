@@ -248,6 +248,22 @@ impl StoredCreds {
     }
 }
 
+impl CredentialRevision {
+    /// Return the monotonic identity of a complete current record. Live
+    /// authorization refuses legacy revisions because they cannot distinguish
+    /// a legitimate reload from rollback or same-revision substitution.
+    pub(crate) fn current_parts(&self) -> Option<(u64, Uuid)> {
+        match self.kind {
+            CredentialRevisionKind::Current {
+                generation,
+                record_id,
+                ..
+            } => Some((generation, record_id)),
+            CredentialRevisionKind::Legacy(_) => None,
+        }
+    }
+}
+
 impl Drop for StoredCreds {
     fn drop(&mut self) {
         self.wipe_sensitive_fields();
@@ -442,7 +458,7 @@ where
     })
 }
 
-fn canonical_server_origin(server_url: &str) -> Result<String> {
+pub(crate) fn canonical_server_origin(server_url: &str) -> Result<String> {
     let parsed = url::Url::parse(server_url).context("parsing credential server URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -610,6 +626,15 @@ pub fn credential_revision(creds: &StoredCreds) -> Result<CredentialRevision> {
     Ok(CredentialRevision {
         kind: CredentialRevisionKind::Legacy(digest.into()),
     })
+}
+
+/// Revalidate a complete record at a live authorization boundary. `load()`
+/// already performs these checks, but callers deliberately repeat them before
+/// admitting a revision so injected/test loaders and future backends cannot
+/// bypass canonical pin, key, domain, or generation validation.
+pub(crate) fn validate_live_record(creds: &StoredCreds) -> Result<()> {
+    validate_loaded_creds(creds)?;
+    validate_complete_current_record(creds)
 }
 
 fn reconcile_backend_records(
@@ -940,6 +965,21 @@ pub fn load() -> Result<StoredCreds> {
 }
 
 fn load_unlocked() -> Result<StoredCreds> {
+    load_unlocked_with_keyring_warning(true)
+}
+
+/// Reload for the live supervisor. The ordinary initial load reports a Unix
+/// keyring outage once; a 500 ms monitor must not repeat that same warning
+/// indefinitely when the complete mode-0600 Unix record is the designed
+/// authoritative fallback.
+pub(crate) fn load_for_live_reload() -> Result<StoredCreds> {
+    with_credential_lock(|| {
+        cleanup_stale_credential_temps(config::credentials_path()?.as_path())?;
+        load_unlocked_with_keyring_warning(false)
+    })
+}
+
+fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> Result<StoredCreds> {
     #[cfg(unix)]
     let from_file = load_file_record()?;
     #[cfg(not(unix))]
@@ -960,9 +1000,12 @@ fn load_unlocked() -> Result<StoredCreds> {
     let keyring_result = read_scoped_keyring_record(&scope, file_for_migration, platform_policy());
     #[cfg(unix)]
     {
-        resolve_unix_keyring_read(from_file, keyring_result, |record| {
-            keyring_set_for_user(&scope.user, record)
-        })
+        resolve_unix_keyring_read_with_warning(
+            from_file,
+            keyring_result,
+            _warn_unix_keyring_unavailable,
+            |record| keyring_set_for_user(&scope.user, record),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -984,15 +1027,20 @@ fn load_unlocked() -> Result<StoredCreds> {
 }
 
 #[cfg(unix)]
-fn resolve_unix_keyring_read(
+fn resolve_unix_keyring_read_with_warning(
     mut from_file: Option<StoredCreds>,
     keyring_result: std::result::Result<Option<StoredCreds>, KeyringReadFailure>,
+    repair_and_warn: bool,
     repair_keyring: impl FnOnce(&StoredCreds) -> Result<()>,
 ) -> Result<StoredCreds> {
     match keyring_result {
-        Ok(from_keyring) => reconcile_unix_redundancy(from_file, from_keyring, repair_keyring),
+        Ok(from_keyring) => {
+            reconcile_unix_redundancy(from_file, from_keyring, repair_and_warn, repair_keyring)
+        }
         Err(failure) if failure.unavailable => {
-            tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
+            if repair_and_warn {
+                tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
+            }
             let mut selected = from_file.unwrap_or_default();
             if !record_is_empty(&selected) {
                 selected.unix_keyring_degraded = true;
@@ -1012,6 +1060,7 @@ fn resolve_unix_keyring_read(
 fn reconcile_unix_redundancy<F>(
     from_file: Option<StoredCreds>,
     from_keyring: Option<StoredCreds>,
+    attempt_repair: bool,
     repair_keyring: F,
 ) -> Result<StoredCreds>
 where
@@ -1025,7 +1074,7 @@ where
     };
     let mut selected =
         reconcile_backend_records(from_file, from_keyring, BackendPolicy::UnixCompleteFile)?;
-    if file_is_authoritative && repair_needed {
+    if file_is_authoritative && repair_needed && attempt_repair {
         match repair_keyring(&selected) {
             Ok(()) => selected.unix_keyring_degraded = false,
             Err(error) => {
@@ -1033,6 +1082,11 @@ where
                 tracing::warn!(error = %error, "optional Unix keyring copy remains degraded; the complete credential file is authoritative");
             }
         }
+    } else if file_is_authoritative && repair_needed {
+        // Live trust reloads are frequent and must not retry a persistently
+        // unavailable optional keyring on every bounded refresh. The normal
+        // interactive load/status path attempts and reports the repair.
+        selected.unix_keyring_degraded = true;
     }
     Ok(selected)
 }
@@ -2352,7 +2406,7 @@ mod tests {
             |_, _| Err(anyhow::anyhow!("unexpected keyring write during load")),
             |_| Err(anyhow::anyhow!("unexpected keyring delete during load")),
         );
-        resolve_unix_keyring_read(from_file, keyring_result, |_| {
+        resolve_unix_keyring_read_with_warning(from_file, keyring_result, true, |_| {
             Err(anyhow::anyhow!(
                 "unexpected keyring repair during forced failure"
             ))
@@ -2866,7 +2920,7 @@ mod tests {
         let repaired_keyring = RefCell::new(Some(future_keyring.clone()));
         let file_snapshot = Some(empty.clone());
         let keyring_snapshot = repaired_keyring.borrow().clone();
-        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, true, |record| {
             *repaired_keyring.borrow_mut() = Some(record.clone());
             Ok(())
         })
@@ -2935,11 +2989,13 @@ mod tests {
         );
         assert_same_coherent_record(keyring.borrow().as_ref().unwrap(), &old);
 
-        let failed_repair =
-            reconcile_unix_redundancy(file.borrow().clone(), keyring.borrow().clone(), |_| {
-                bail!("injected reload repair failure")
-            })
-            .unwrap();
+        let failed_repair = reconcile_unix_redundancy(
+            file.borrow().clone(),
+            keyring.borrow().clone(),
+            true,
+            |_| bail!("injected reload repair failure"),
+        )
+        .unwrap();
         assert!(failed_repair.unix_keyring_degraded);
         assert_eq!(failed_repair.browser_pin(device_id), Some(&confirmed_pin));
         let status = format_status("https://server.example/", &failed_repair).unwrap();
@@ -2953,9 +3009,19 @@ mod tests {
             assert!(!outcome.save.warning_message().unwrap().contains(secret));
         }
 
+        let bounded_live_reload = reconcile_unix_redundancy(
+            file.borrow().clone(),
+            keyring.borrow().clone(),
+            false,
+            |_| panic!("live reload must not retry optional-keyring repair"),
+        )
+        .unwrap();
+        assert!(bounded_live_reload.unix_keyring_degraded);
+        assert_same_coherent_record(&bounded_live_reload, &current);
+
         let file_snapshot = file.borrow().clone();
         let keyring_snapshot = keyring.borrow().clone();
-        let repaired = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+        let repaired = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, true, |record| {
             *keyring.borrow_mut() = Some(record.clone());
             Ok(())
         })
@@ -2974,7 +3040,7 @@ mod tests {
         *keyring.borrow_mut() = Some(future);
         let file_snapshot = file.borrow().clone();
         let keyring_snapshot = keyring.borrow().clone();
-        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, true, |record| {
             *keyring.borrow_mut() = Some(record.clone());
             Ok(())
         })
