@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import tempfile
+import time
 import unicodedata
 from collections import Counter
 from collections.abc import Callable
@@ -742,6 +743,9 @@ def without_non_governing_subject_references(group: str) -> str:
 
 
 CLAUSE_TOKEN = re.compile(r"[a-z0-9_-]+(?:'[a-z]+)?")
+MAX_STATUS_PROJECTION_CHARS = 1_000_000
+MAX_STATUS_ASIDE_NESTING = 256
+MAX_STATUS_COMMAS = 50_000
 
 
 def clause_tokens(text: str) -> tuple[str, ...]:
@@ -755,6 +759,51 @@ def clause_tokens(text: str) -> tuple[str, ...]:
         else:
             tokens.append(token)
     return tuple(tokens)
+
+
+def main_clause_projection(text: str) -> str:
+    """Blank balanced asides so their predicate state cannot leak outward."""
+
+    if len(text) > MAX_STATUS_PROJECTION_CHARS:
+        raise GuardError(
+            f"status predicate prefix exceeds {MAX_STATUS_PROJECTION_CHARS} characters"
+        )
+    projected = list(text)
+    comma_positions: list[int] = []
+    parenthesis_stack: list[str] = []
+    closing_parenthesis = {")": "(", "]": "[", "}": "{"}
+    for index, character in enumerate(text):
+        if parenthesis_stack:
+            projected[index] = " "
+            if character in "([{":
+                parenthesis_stack.append(character)
+                if len(parenthesis_stack) > MAX_STATUS_ASIDE_NESTING:
+                    raise GuardError("status predicate aside exceeds the nesting limit")
+            elif character in closing_parenthesis:
+                if closing_parenthesis[character] != parenthesis_stack[-1]:
+                    raise GuardError("status predicate aside has mismatched delimiters")
+                parenthesis_stack.pop()
+            continue
+        if character in "([{":
+            projected[index] = " "
+            parenthesis_stack.append(character)
+        elif character == ",":
+            comma_positions.append(index)
+            if len(comma_positions) > MAX_STATUS_COMMAS:
+                raise GuardError(
+                    "status predicate prefix has too many comma boundaries"
+                )
+    if parenthesis_stack:
+        raise GuardError("status predicate aside has an unclosed delimiter")
+
+    # Pair from the predicate end. This leaves an unmatched leading-clause
+    # separator intact while isolating balanced comma-delimited asides nearest
+    # the status predicate. The blanked spans are disjoint, keeping this linear.
+    for comma_index in range(len(comma_positions) - 1, 0, -2):
+        start = comma_positions[comma_index - 1]
+        end = comma_positions[comma_index]
+        projected[start : end + 1] = " " * (end - start + 1)
+    return "".join(projected)
 
 
 def has_modal_perfect_aspect(predicate_prefix: str) -> bool:
@@ -786,10 +835,11 @@ def status_predicate_contexts(
     cursor = 0
     for index, status_word in enumerate(status_words):
         predicate_prefix = group[cursor : status_word.start()]
-        linking_verbs = tuple(STATUS_LINKING_VERB.finditer(predicate_prefix))
-        modals = tuple(FUTURE_OR_HYPOTHETICAL_MODAL.finditer(predicate_prefix))
-        past_auxiliaries = tuple(PAST_TENSE_AUXILIARY.finditer(predicate_prefix))
-        has_perfect_aspect = has_modal_perfect_aspect(predicate_prefix)
+        predicate_projection = main_clause_projection(predicate_prefix)
+        linking_verbs = tuple(STATUS_LINKING_VERB.finditer(predicate_projection))
+        modals = tuple(FUTURE_OR_HYPOTHETICAL_MODAL.finditer(predicate_projection))
+        past_auxiliaries = tuple(PAST_TENSE_AUXILIARY.finditer(predicate_projection))
+        has_perfect_aspect = has_modal_perfect_aspect(predicate_projection)
         if linking_verbs:
             linking_verb = linking_verbs[-1].group()
             # A newly stated finite/linking predicate supersedes modality from
@@ -975,28 +1025,114 @@ def subject_region_for_status_group(
     return before_link[: last_auxiliary.start()]
 
 
-def anaphoric_pronoun_subject_region(subject_region: str) -> str | None:
-    """Return a pronoun-led main subject, independent of leading discourse prose."""
+SUBJECT_PREDICATE_START_PATTERN = (
+    rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
+    rf"{PREMATURE_DATA_STATUS_WORD.pattern}|"
+    r"\b(?:has|have|had|remaining|awaiting|completed|completes|finished|"
+    r"finishes|passed|passes|underwent|undergoes|continued|continues|"
+    r"received|receives|required|requires|waited|waits)\b)"
+)
+NAMED_CLAUSE_SUBJECT = re.compile(
+    rf"(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|{GENERIC_NOUN_SUBJECT_PATTERN}|"
+    rf"{IDENTIFIER_SUBJECT_PATTERN})\s+"
+    rf"(?={SUBJECT_PREDICATE_START_PATTERN})"
+)
+TOPICALIZED_NAMED_SUBJECT = re.compile(
+    rf"\bas\s+for\s+(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|"
+    rf"{GENERIC_NOUN_SUBJECT_PATTERN}|{IDENTIFIER_SUBJECT_PATTERN})"
+    rf"(?=\s*[,;:]|\s*$)"
+)
+TRAILING_NAMED_SUBJECT = re.compile(
+    rf"(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|{GENERIC_NOUN_SUBJECT_PATTERN}|"
+    rf"{IDENTIFIER_SUBJECT_PATTERN})(?:\s+(?:alone|only|solely))?\s*$"
+)
+
+
+NON_SUBJECT_REFERENCE_WORDS = frozenset(
+    {
+        "about",
+        "against",
+        "among",
+        "around",
+        "between",
+        "for",
+        "from",
+        "of",
+        "over",
+        "regarding",
+        "than",
+        "to",
+        "under",
+        "versus",
+        "with",
+        "without",
+    }
+)
+
+
+def has_non_subject_reference_prefix(text: str, subject_start: int) -> bool:
+    """Inspect only the immediately preceding word, without rescanning prefixes."""
+
+    cursor = subject_start
+    while cursor and text[cursor - 1].isspace():
+        cursor -= 1
+    end = cursor
+    while cursor and (text[cursor - 1].isalnum() or text[cursor - 1] in "_-"):
+        cursor -= 1
+    return text[cursor:end] in NON_SUBJECT_REFERENCE_WORDS
+
+
+def explicit_subject_scopes(
+    text: str, *, include_trailing_subject: bool = False
+) -> tuple[tuple[int, bool], ...]:
+    """Return explicit DATA/non-DATA clause subjects in lexical order."""
+
+    candidates: list[tuple[int, bool]] = []
+    for match in NAMED_CLAUSE_SUBJECT.finditer(text):
+        if has_non_subject_reference_prefix(text, match.start("subject")):
+            continue
+        subject = match.group("subject")
+        candidates.append(
+            (match.start("subject"), DATA_STATUS_SUBJECT.search(subject) is not None)
+        )
+    for match in TOPICALIZED_NAMED_SUBJECT.finditer(text):
+        subject = match.group("subject")
+        candidates.append(
+            (match.start("subject"), DATA_STATUS_SUBJECT.search(subject) is not None)
+        )
+    if include_trailing_subject:
+        match = TRAILING_NAMED_SUBJECT.search(text)
+        if match is not None and not has_non_subject_reference_prefix(
+            text, match.start("subject")
+        ):
+            subject = match.group("subject")
+            candidates.append(
+                (
+                    match.start("subject"),
+                    DATA_STATUS_SUBJECT.search(subject) is not None,
+                )
+            )
+    return tuple(sorted(candidates, key=lambda candidate: candidate[0]))
+
+
+def anaphoric_pronoun_subject_scope(subject_region: str) -> bool | None | tuple[()]:
+    """Resolve a main pronoun to a nearer explicit subject or inherited scope."""
 
     pronouns = tuple(EXPLICIT_PRONOUN_SUBJECT.finditer(subject_region))
     if not pronouns:
-        return None
+        return ()
     pronoun = pronouns[-1]
-    before_pronoun = subject_region[: pronoun.start()].lstrip()
+    before_pronoun = subject_region[: pronoun.start()]
     after_pronoun = subject_region[pronoun.end() :]
 
-    # A sentence-initial explicit noun/identifier is a reset subject; a later
-    # pronoun can be its object or embedded-clause subject, not inherited DATA.
-    if EXPLICIT_GENERIC_SUBJECT.match(before_pronoun) is not None:
-        return None
-    # Likewise, a noun/identifier after the pronoun is the nearer main subject
-    # (for example, `as it happens, P2-HOST-02 ...`).
-    if (
-        DATA_STATUS_SUBJECT.search(after_pronoun) is not None
-        or EXPLICIT_GENERIC_SUBJECT.search(after_pronoun) is not None
-    ):
-        return None
-    return subject_region[pronoun.start() :]
+    # An explicit subject after the pronoun governs the status predicate. If
+    # none follows, resolve to the nearest explicit clause/topic subject from
+    # the full prefix; only a prefix with no subject inherits discourse scope.
+    after_scopes = explicit_subject_scopes(after_pronoun, include_trailing_subject=True)
+    if after_scopes:
+        return after_scopes[-1][1]
+    before_scopes = explicit_subject_scopes(before_pronoun)
+    return before_scopes[-1][1] if before_scopes else None
 
 
 def sentence_has_anaphoric_status_subject(sentence: str) -> bool:
@@ -1006,7 +1142,7 @@ def sentence_has_anaphoric_status_subject(sentence: str) -> bool:
         if not status_words:
             continue
         subject_region = subject_region_for_status_group(semantic_group, status_words)
-        if anaphoric_pronoun_subject_region(subject_region) is not None:
+        if anaphoric_pronoun_subject_scope(subject_region) != ():
             return True
     return False
 
@@ -1024,9 +1160,14 @@ def data_subject_scope(
         if status_words
         else without_comparisons
     )
-    pronoun_subject_region = anaphoric_pronoun_subject_region(subject_region)
-    if pronoun_subject_region is not None:
-        subject_region = pronoun_subject_region
+    pronoun_subject_scope = anaphoric_pronoun_subject_scope(subject_region)
+    if pronoun_subject_scope != ():
+        return (
+            inherited_data_scope
+            if pronoun_subject_scope is None
+            else pronoun_subject_scope,
+            True,
+        )
     if DATA_STATUS_SUBJECT.search(subject_region) is not None:
         return True, True
     if EXPLICIT_GENERIC_SUBJECT.search(subject_region) is not None:
@@ -1605,6 +1746,35 @@ def replace_required(path: Path, old: str, new: str) -> None:
 
 def self_test(source: Path) -> None:
     validate(source)
+    projection_probe = (
+        "may " + ", once reviewers have been consulted, " * 10_000 + "become "
+    )
+    projection_start = time.perf_counter()
+    projected_probe = main_clause_projection(projection_probe)
+    projection_elapsed = time.perf_counter() - projection_start
+    if len(projected_probe) != len(projection_probe) or projection_elapsed > 5.0:
+        raise GuardError(
+            "main-clause projection violated its linear-runtime regression bound"
+        )
+    for oversized_probe, expected_detail in (
+        (
+            "x" * (MAX_STATUS_PROJECTION_CHARS + 1),
+            "status predicate prefix exceeds",
+        ),
+        (
+            "(" * (MAX_STATUS_ASIDE_NESTING + 1)
+            + "x"
+            + ")" * (MAX_STATUS_ASIDE_NESTING + 1),
+            "nesting limit",
+        ),
+    ):
+        try:
+            main_clause_projection(oversized_probe)
+        except GuardError as exc:
+            if expected_detail not in str(exc):
+                raise
+        else:
+            raise GuardError("main-clause projection resource cap did not fail closed")
     try:
         visible_inline_tokens([Token("future_inline", "", 0)])
     except GuardError as exc:
@@ -2392,6 +2562,40 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 remains review pending. It is accepted now.",
         ),
         (
+            "although-clause DATA subject governs following pronoun",
+            "Although P2-DATA-01 remains review pending, it is accepted now.",
+        ),
+        (
+            "while-clause DATA subject governs following pronoun",
+            "While P2-DATA-01 remains review pending, it is accepted now.",
+        ),
+        (
+            "whereas-clause DATA subject governs following pronoun",
+            "Whereas P2-DATA-01 remains review pending, it is accepted now.",
+        ),
+        (
+            "despite-clause DATA subject governs following pronoun",
+            "Despite P2-DATA-01 remaining review pending, it is accepted now.",
+        ),
+        (
+            "after-clause DATA subject governs following pronoun",
+            "After P2-DATA-01 completed review, it is accepted now.",
+        ),
+        (
+            "as-for DATA topic governs following pronoun",
+            "As for P2-DATA-01, it is accepted now.",
+        ),
+        (
+            "post-pronoun DATA subject overrides preceding non-DATA subject",
+            "Although P2-HOST-02 remains review pending, it follows that "
+            "P2-DATA-01 is accepted now.",
+        ),
+        (
+            "nearest pre-pronoun DATA clause subject governs",
+            "While P2-HOST-02 remains pending after P2-DATA-01 completed review, "
+            "it is accepted now.",
+        ),
+        (
             "incidental former alternative is not historical framing",
             "P2-DATA-01 is selected over the former alternative.",
         ),
@@ -2438,6 +2642,21 @@ def self_test(source: Path) -> None:
         (
             "must-perfect acceptance is completed rather than prospective",
             "P2-DATA-01 must have been accepted only after review and merge.",
+        ),
+        (
+            "must-perfect survives paired-comma subordinate projection",
+            "P2-DATA-01 must have, once reviewers have been consulted, been "
+            "accepted only after review and merge.",
+        ),
+        (
+            "must-perfect survives nested parenthetical projection",
+            "P2-DATA-01 must have (once reviewers [who have been consulted] "
+            "agree) been accepted only after review and merge.",
+        ),
+        (
+            "must-perfect survives adjacent paired-comma asides",
+            "P2-DATA-01 must, after review, have, once reviewers have been "
+            "consulted, been accepted only after review and merge.",
         ),
         (
             "ASCII contracted must-perfect acceptance",
@@ -2989,6 +3208,40 @@ def self_test(source: Path) -> None:
             "The Markdown parser is accepted; P2-DATA-01 remains review pending.",
         ),
         (
+            "although-clause non-DATA subject governs following pronoun",
+            "Although P2-HOST-02 remains review pending, it is accepted.",
+        ),
+        (
+            "while-clause non-DATA subject governs following pronoun",
+            "While P2-HOST-02 remains review pending, it is accepted.",
+        ),
+        (
+            "whereas-clause non-DATA subject governs following pronoun",
+            "Whereas P2-HOST-02 remains review pending, it is accepted.",
+        ),
+        (
+            "despite-clause non-DATA subject governs following pronoun",
+            "Despite P2-HOST-02 remaining review pending, it is accepted.",
+        ),
+        (
+            "after-clause non-DATA subject governs following pronoun",
+            "After P2-HOST-02 completed review, it is accepted.",
+        ),
+        (
+            "as-for non-DATA topic governs following pronoun",
+            "As for P2-HOST-02, it is accepted.",
+        ),
+        (
+            "post-pronoun non-DATA subject overrides preceding DATA subject",
+            "Although P2-DATA-01 remains review pending, it follows that "
+            "P2-HOST-02 is accepted.",
+        ),
+        (
+            "nearest pre-pronoun non-DATA clause subject governs",
+            "While P2-DATA-01 remains pending after P2-HOST-02 completed review, "
+            "it is accepted.",
+        ),
+        (
             "historical marker after DATA status",
             "A P2-DATA-01 experiment was approved historically.",
         ),
@@ -3043,6 +3296,31 @@ def self_test(source: Path) -> None:
         (
             "hypothetical modal review gate with reversed evidence order",
             "P2-DATA-01 may be accepted only after merge and independent review.",
+        ),
+        (
+            "subordinate perfect does not complete main may predicate",
+            "P2-DATA-01 may, once reviewers have been consulted, become accepted "
+            "only after review and merge.",
+        ),
+        (
+            "parenthetical perfect does not complete main may predicate",
+            "P2-DATA-01 may (once reviewers have been consulted) become accepted "
+            "only after review and merge.",
+        ),
+        (
+            "nested parenthetical perfect does not complete main may predicate",
+            "P2-DATA-01 may (once reviewers [who have been consulted] agree) "
+            "become accepted only after review and merge.",
+        ),
+        (
+            "nested paired-comma subordinate perfect stays off main predicate",
+            "P2-DATA-01 may, once reviewers have, after interviews, been "
+            "consulted, become accepted only after review and merge.",
+        ),
+        (
+            "leading comma boundary preserves subordinate projection",
+            "Accordingly, P2-DATA-01 may, once reviewers have been consulted, "
+            "become accepted only after review and merge.",
         ),
         (
             "must prospective review gate",
@@ -3167,6 +3445,15 @@ def self_test(source: Path) -> None:
         for name, sentence in status_reinventory_accepts
     )
     status_block_reinventory_accepts = (
+        (
+            "as-for non-DATA topic overrides inherited DATA scope",
+            "P2-DATA-01 remains review pending.\n\nAs for P2-HOST-02, it is accepted.",
+        ),
+        (
+            "post-pronoun non-DATA subject overrides inherited DATA scope",
+            "P2-DATA-01 remains review pending.\n\n"
+            "Although it remains review pending, P2-HOST-02 is accepted.",
+        ),
         (
             "paragraph non-DATA reset before pronoun",
             "P2-DATA-01 remains review pending.\n\n"
