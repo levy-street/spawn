@@ -96,6 +96,13 @@ PROSE_INVENTORY = "docs/DURABLE_DATA_PROSE_INVENTORY.jsonl"
 
 COMMONMARK = MarkdownIt("commonmark", {"html": True}).enable(["strikethrough", "table"])
 
+# These raw-HTML attributes can render prose visually or expose it through the
+# accessibility tree. Include them conservatively even on elements where a
+# particular browser would hide the value. Every aria-* value is inventoried:
+# some ARIA attributes are identifiers or booleans, but treating those as prose
+# is safer than maintaining a bypass-prone per-role attribute list.
+VISIBLE_HTML_ATTRIBUTES = frozenset({"alt", "label", "placeholder", "title", "value"})
+
 
 class VisibleHtmlParser(HTMLParser):
     def __init__(self) -> None:
@@ -104,6 +111,14 @@ class VisibleHtmlParser(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del tag
+        for name, value in attrs:
+            if value is not None and (
+                name in VISIBLE_HTML_ATTRIBUTES or name.startswith("aria-")
+            ):
+                self.parts.append(value)
 
 
 def visible_html(source: str) -> str:
@@ -1446,6 +1461,46 @@ def self_test(source: Path) -> None:
             runtime_safe,
             "data-design-prose",
             "<phase 2 is finished.>",
+        ),
+        (
+            "image alt prose remains visible",
+            adr_path,
+            '<img alt="Phase 2 is finished." src="missing.png">',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "input value prose remains visible",
+            adr_path,
+            '<input value="Phase 2 is finished.">',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "HTML title prose remains visible",
+            adr_path,
+            '<span title="Phase 2 is finished."></span>',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "ARIA label prose remains visible",
+            adr_path,
+            '<div aria-label="Phase 2 is finished."></div>',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
+        ),
+        (
+            "ARIA description prose remains visible",
+            adr_path,
+            '<div aria-description="Phase 2 is finished."></div>',
+            runtime_safe,
+            "data-design-prose",
+            "phase 2 is finished.",
         ),
         (
             "Unicode em-dash and Roman numeral Phase II claim",

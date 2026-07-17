@@ -80,6 +80,9 @@ These rows are parsed by the durable-data guard; prose cannot silently override
 them. The guard uses the locked, development-only `markdown-it-py==4.2.0`
 CommonMark token tree (with table and strikethrough rules), excludes comment and
 code-block tokens, and inventories rendered prose/inline-code/HTML text nodes.
+Raw HTML also inventories `alt`, `value`, `title`, `label`, `placeholder`, and
+every `aria-*` attribute value; these may expose visual or accessibility prose,
+so the guard treats them conservatively even where one browser hides a value.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in
