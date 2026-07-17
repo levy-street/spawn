@@ -655,7 +655,11 @@ make it single-flight even when an async `select!` cancels a watcher future;
 the Tokio runtime never performs the file-lock, filesystem, or native-keyring
 operation and never owns a blocking task that shutdown must join. The monitor
 schedules one complete load every 500 ms while connected or backing off, and
-each request has a two-second absolute reply deadline. An
+each request has a two-second absolute reply deadline that cancellation cannot
+reset. Reattachment checks expiry before polling a queued reply, and an
+explicit timer-first biased wait makes expiry win when reply and deadline are
+both observable at the exact boundary. A reply that may have completed earlier
+but was not observed before the deadline is conservatively rejected. An
 unchanged revision must be field-for-field the same decoded record; a
 same-revision substitution, generation rollback/non-advance, reused record
 identity, missing login/key/domain, changed Host ID/origin, or
@@ -692,7 +696,11 @@ tests cover add/revoke, atomic token/key/pin replacement, corrupt/unavailable
 load, secret-safe errors, the simultaneous-ready reconnect case, an active
 old-token socket closing before a new-token reconnect, a loader stalled beyond
 deadline, backend panic and channel disconnect, near-deadline success, repeated
-single-flight polling, and supervisor cancellation while a load remains active.
+single-flight polling, supervisor cancellation while a load remains active,
+late reply after watcher cancellation, exact reply/deadline precedence, timely
+pre-deadline reattachment, repeated cancellation without deadline extension,
+and active-session I/O completion held in slow cleanup past the retained
+deadline.
 RTC tests keep both stale agent and host peers present and prove authorization
 is removed before deliberately stalled cleanup. This checkpoint still
 does not wire signed RTC envelopes or turn the locally stored pins into live

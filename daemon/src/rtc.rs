@@ -109,6 +109,8 @@ pub struct RtcSessions {
     #[cfg(test)]
     effect_gates: Arc<Mutex<TestEffectGateMap>>,
     #[cfg(test)]
+    slow_close_all_gate: Arc<Mutex<Option<Arc<TestEffectGate>>>>,
+    #[cfg(test)]
     sender_close_gates: Arc<Mutex<TestSenderCloseGateMap>>,
 }
 
@@ -171,9 +173,20 @@ enum TestEffectPoint {
 
 #[cfg(test)]
 #[derive(Default)]
-struct TestEffectGate {
+pub(crate) struct TestEffectGate {
     entered: Notify,
     release: Notify,
+}
+
+#[cfg(test)]
+impl TestEffectGate {
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +518,13 @@ impl RtcSessions {
             .lock()
             .await
             .insert((session_id.to_string(), point), Arc::clone(&gate));
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stall_next_close_all_for_test(&self) -> Arc<TestEffectGate> {
+        let gate = Arc::new(TestEffectGate::default());
+        *self.slow_close_all_gate.lock().await = Some(Arc::clone(&gate));
         gate
     }
 
@@ -1509,6 +1529,11 @@ impl RtcSessions {
     }
 
     pub async fn close_all(&self) {
+        #[cfg(test)]
+        if let Some(gate) = self.slow_close_all_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let peers = self.peers.lock().await.clone();
         for peer in peers.values() {
             peer.close.initiate();
