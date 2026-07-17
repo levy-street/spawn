@@ -317,6 +317,7 @@ pub struct DeviceStartRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceStartResponse {
     pub device_code: String,
     pub user_code: String,
@@ -337,6 +338,7 @@ pub struct DevicePossessionRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DevicePossessionResponse {
     pub verified: bool,
     pub version: u8,
@@ -365,6 +367,65 @@ pub struct DevicePollResponse {
     pub browser_public_key: Option<String>,
     pub browser_key_fingerprint: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod device_pair_response_tests {
+    use super::*;
+
+    const START: &str = r#"{
+        "device_code":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "user_code":"ABCD-EFGH",
+        "approval_nonce":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+        "verification_uri":"https://spawn.example/device",
+        "interval":5,
+        "expires_in":600
+    }"#;
+
+    #[test]
+    fn device_start_response_accepts_only_its_exact_schema() {
+        let body: DeviceStartResponse = serde_json::from_str(START).unwrap();
+        assert_eq!(body.user_code, "ABCD-EFGH");
+
+        for rejected in [
+            START.replace("\n    }", ",\n        \"error\":\"denied\"\n    }"),
+            START.replace(
+                "\n    }",
+                ",\n        \"verified\":true,\n        \"version\":1\n    }",
+            ),
+            START.replace(
+                "\n    }",
+                ",\n        \"access_token\":\"substituted\"\n    }",
+            ),
+            START.replace("\n    }", ",\n        \"unexpected\":{}\n    }"),
+        ] {
+            assert!(
+                serde_json::from_str::<DeviceStartResponse>(&rejected).is_err(),
+                "accepted an unknown start-response field: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_possession_response_rejects_mixed_authority_and_unknown_fields() {
+        let body: DevicePossessionResponse =
+            serde_json::from_str(r#"{"verified":true,"version":1}"#).unwrap();
+        assert!(body.verified);
+        assert_eq!(body.version, 1);
+
+        for rejected in [
+            r#"{"verified":true,"version":1,"error":"denied"}"#,
+            r#"{"verified":true,"version":1,"access_token":"substituted"}"#,
+            r#"{"verified":true,"version":1,"host_id":"11111111-2222-4333-8444-555555555555"}"#,
+            r#"{"verified":true,"version":1,"unexpected":{}}"#,
+            r#"{"verified":true,"version":1,"verified":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DevicePossessionResponse>(rejected).is_err(),
+                "accepted an ambiguous possession response: {rejected}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
