@@ -55,7 +55,7 @@ so the server resyncs its routing map without disturbing running workers.
 
 ```sh
 spawnd status     # show server URL, host_id, token presence
-spawnd logout     # wipe stored token (and host_id)
+spawnd logout     # wipe stored token, host identity, and host_id
 ```
 
 ## Config
@@ -68,7 +68,13 @@ spawnd logout     # wipe stored token (and host_id)
 | default | `https://localhost:8000` |
 
 Credentials live at `~/.config/spawn/credentials.json` (mode 600) and/or in
-your OS keyring under service `spawn`, user `daemon`.
+your OS keyring under service `spawn`, user `daemon`. On Unix the fallback is
+accepted only as a regular, non-symlink file owned by the effective user with
+no group/other permission bits; malformed, oversized, or insecure files fail
+closed. Other platforms keep the private host seed in the native keyring and
+store only non-seed fallback metadata. `spawnd logout` attempts both backends
+and returns a failure if either cannot be cleared, so it never reports a
+successful reset while credentials may remain.
 
 ## Wire protocol
 

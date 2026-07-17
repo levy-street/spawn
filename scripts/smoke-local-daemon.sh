@@ -960,6 +960,7 @@ creds="$(
 import json
 import os
 import sys
+import base64
 import urllib.error
 import urllib.request
 
@@ -986,6 +987,13 @@ signup = request(
     {"email": "smoke@example.com", "password": "passpasspass"},
 )
 token = signup["access_token"]
+seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+host_public_key = base64.urlsafe_b64encode(public).rstrip(b"=").decode()
+host_binding = {
+    "host_key_algorithm": "ed25519",
+    "host_public_key": host_public_key,
+}
 start = request(
     "POST",
     "/api/auth/device/start",
@@ -994,15 +1002,32 @@ start = request(
         "os": sys.platform,
         "arch": "smoke",
         "version": "smoke",
+        **host_binding,
     },
 )
-request("POST", "/api/auth/device/approve", {"user_code": start["user_code"]}, token)
-poll = request("POST", "/api/auth/device/poll", {"device_code": start["device_code"]})
+reviewed = request("POST", "/api/auth/device/pending", {"user_code": start["user_code"]}, token)
+request(
+    "POST",
+    "/api/auth/device/approve",
+    {
+        "user_code": start["user_code"],
+        "host_key_algorithm": reviewed["host_key_algorithm"],
+        "host_public_key": reviewed["host_public_key"],
+        "host_key_fingerprint": reviewed["host_key_fingerprint"],
+    },
+    token,
+)
+poll = request(
+    "POST",
+    "/api/auth/device/poll",
+    {"device_code": start["device_code"], **host_binding},
+)
 
 creds = {
     "access_token": poll["access_token"],
     "host_id": poll["host_id"],
     "server_url": base_url,
+    "host_private_key_seed": base64.urlsafe_b64encode(seed).rstrip(b"=").decode(),
 }
 for config_dir in (
     os.path.join(home, ".config", "spawn"),
@@ -1011,6 +1036,7 @@ for config_dir in (
     os.makedirs(config_dir, exist_ok=True)
     with open(os.path.join(config_dir, "credentials.json"), "w", encoding="utf-8") as handle:
         json.dump(creds, handle)
+    os.chmod(os.path.join(config_dir, "credentials.json"), 0o600)
 
 print(json.dumps({"token": token, "host_id": poll["host_id"]}))
 PY

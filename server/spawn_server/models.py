@@ -153,7 +153,8 @@ class Host(Base):
     __table_args__ = (
         CheckConstraint(
             "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
-            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            "(host_key_algorithm IS NOT NULL AND host_public_key IS NOT NULL AND "
+            "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
             name="ck_hosts_host_key_pair",
         ),
         UniqueConstraint(
@@ -310,7 +311,8 @@ class DeviceCode(Base):
     __table_args__ = (
         CheckConstraint(
             "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
-            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            "(host_key_algorithm IS NOT NULL AND host_public_key IS NOT NULL AND "
+            "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
             name="ck_device_codes_host_key_pair",
         ),
         UniqueConstraint(

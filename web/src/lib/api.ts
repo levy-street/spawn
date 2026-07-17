@@ -294,7 +294,12 @@ export const auth = {
       method: "GET",
       schema: AuthProviderListSchema,
     }),
-  approveDevice: (body: { user_code: string }) =>
+  approveDevice: (body: {
+    user_code: string;
+    host_key_algorithm: "ed25519";
+    host_public_key: string;
+    host_key_fingerprint: string;
+  }) =>
     api("/api/auth/device/approve", {
       method: "POST",
       body: JSON.stringify(body),

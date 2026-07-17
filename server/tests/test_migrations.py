@@ -13,9 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from spawn_server.db import Base
 
@@ -186,5 +188,64 @@ def test_host_identity_migration_preserves_legacy_rows_as_explicitly_unpaired(tm
             ).one()
             assert host == (None, None)
             assert device == (None, None)
+    finally:
+        engine.dispose()
+
+
+def test_host_identity_migration_rejects_both_partial_null_key_permutations(tmp_path: Path):
+    db_path = tmp_path / "spawn-host-identity-partial-null.db"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+    sync_url = f"sqlite:///{db_path}"
+    _run_python(["-m", "alembic", "upgrade", "head"], env=_migration_env(async_url))
+
+    public_key = "A" * 43
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "insert into users (id, email, password_hash, created_at) "
+                    "values ('partial-owner', 'partial@example.com', 'hash', '2026-07-17')"
+                )
+            )
+
+        cases = [
+            (
+                "insert into hosts "
+                "(id, owner_user_id, name, host_key_algorithm, host_public_key, status, "
+                "daemon_generation, daemon_generation_counter, created_at) "
+                "values ('host-algorithm-only', 'partial-owner', 'partial', 'ed25519', NULL, "
+                "'offline', 0, 0, '2026-07-17')",
+                {},
+            ),
+            (
+                "insert into hosts "
+                "(id, owner_user_id, name, host_key_algorithm, host_public_key, status, "
+                "daemon_generation, daemon_generation_counter, created_at) "
+                "values ('host-key-only', 'partial-owner', 'partial', NULL, :public_key, "
+                "'offline', 0, 0, '2026-07-17')",
+                {"public_key": public_key},
+            ),
+            (
+                "insert into device_codes "
+                "(device_code, user_code, host_name, host_key_algorithm, host_public_key, "
+                "status, expires_at, created_at) "
+                "values ('device-algorithm-only', 'ALG1-ONLY', 'partial', 'ed25519', NULL, "
+                "'pending', '2026-07-18', '2026-07-17')",
+                {},
+            ),
+            (
+                "insert into device_codes "
+                "(device_code, user_code, host_name, host_key_algorithm, host_public_key, "
+                "status, expires_at, created_at) "
+                "values ('device-key-only', 'KEY1-ONLY', 'partial', NULL, :public_key, "
+                "'pending', '2026-07-18', '2026-07-17')",
+                {"public_key": public_key},
+            ),
+        ]
+        for statement, parameters in cases:
+            with pytest.raises(IntegrityError):
+                with engine.begin() as conn:
+                    conn.execute(text(statement), parameters)
     finally:
         engine.dispose()

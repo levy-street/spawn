@@ -6,8 +6,8 @@
 //! token and Ed25519 private seed; neither is ever sent to logs or status.
 //! Metadata in that file also supplies `host_id` and the configured server.
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -25,7 +25,11 @@ const KEYRING_USER: &str = "daemon";
 
 pub const HOST_KEY_ALGORITHM: &str = "ed25519";
 const ED25519_SEED_BYTES: usize = 32;
+const ED25519_SEED_B64URL_LENGTH: usize = 43;
 const FINGERPRINT_HASH_BYTES: usize = 12;
+const MAX_CREDENTIALS_FILE_BYTES: usize = 16 * 1024;
+const MAX_ACCESS_TOKEN_BYTES: usize = 12 * 1024;
+const MAX_SERVER_URL_BYTES: usize = 2048;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct StoredCreds {
@@ -73,21 +77,33 @@ pub fn load() -> Result<StoredCreds> {
     }
 
     match keyring_get() {
-        Ok(Some(value)) => {
+        Ok(Some(mut value)) => {
             // Backend unavailability may use the documented file fallback,
             // but malformed stored data must fail closed rather than rotate.
-            let secrets = decode_keyring_value(&value)?;
-            if secrets.access_token.is_some() {
-                from_file.access_token = secrets.access_token;
+            let decoded = decode_keyring_value(&value);
+            value.zeroize();
+            let mut secrets = decoded?;
+            if let Some(access_token) = secrets.access_token.take() {
+                if let Some(previous) = from_file.access_token.as_mut() {
+                    previous.zeroize();
+                }
+                from_file.access_token = Some(access_token);
             }
-            if secrets.host_private_key_seed.is_some() {
-                from_file.host_private_key_seed = secrets.host_private_key_seed;
+            if let Some(seed) = secrets.host_private_key_seed.take() {
+                if let Some(previous) = from_file.host_private_key_seed.as_mut() {
+                    previous.zeroize();
+                }
+                from_file.host_private_key_seed = Some(seed);
             }
         }
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(error = %e, "keyring read failed; using file-stored token if any");
         }
+    }
+    if let Err(error) = validate_loaded_creds(&from_file) {
+        zeroize_stored_creds(&mut from_file);
+        return Err(error);
     }
     Ok(from_file)
 }
@@ -130,8 +146,11 @@ fn save_file_for_platform(creds: &StoredCreds, _keyring_saved: bool) -> Result<(
 pub fn ensure_host_identity(creds: &mut StoredCreds) -> Result<HostIdentity> {
     if creds.host_private_key_seed.is_none() {
         let mut seed = [0_u8; ED25519_SEED_BYTES];
-        getrandom::getrandom(&mut seed).context("generating Ed25519 host identity")?;
-        creds.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode(&seed));
+        if let Err(error) = getrandom::getrandom(&mut seed) {
+            seed.zeroize();
+            return Err(error).context("generating Ed25519 host identity");
+        }
+        creds.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode(seed));
         seed.zeroize();
     }
     host_identity(creds)?.context("host identity was not generated")
@@ -142,18 +161,24 @@ pub fn host_identity(creds: &StoredCreds) -> Result<Option<HostIdentity>> {
     let Some(encoded_seed) = creds.host_private_key_seed.as_deref() else {
         return Ok(None);
     };
-    let mut decoded = URL_SAFE_NO_PAD
-        .decode(encoded_seed)
-        .context("decoding stored Ed25519 host identity")?;
-    if decoded.len() != ED25519_SEED_BYTES || URL_SAFE_NO_PAD.encode(&decoded) != encoded_seed {
-        decoded.zeroize();
+    if encoded_seed.len() != ED25519_SEED_B64URL_LENGTH {
+        bail!("stored Ed25519 host identity has the wrong encoded length")
+    }
+    let mut seed = [0_u8; ED25519_SEED_BYTES];
+    let decoded_len = match URL_SAFE_NO_PAD.decode_slice(encoded_seed, &mut seed) {
+        Ok(decoded_len) => decoded_len,
+        Err(error) => {
+            seed.zeroize();
+            return Err(error).context("decoding stored Ed25519 host identity");
+        }
+    };
+    let mut canonical = URL_SAFE_NO_PAD.encode(seed);
+    let canonical_matches = decoded_len == ED25519_SEED_BYTES && canonical == encoded_seed;
+    canonical.zeroize();
+    if !canonical_matches {
+        seed.zeroize();
         bail!("stored Ed25519 host identity is not canonical")
     }
-    let mut seed: [u8; ED25519_SEED_BYTES] = decoded
-        .as_slice()
-        .try_into()
-        .context("stored Ed25519 host identity has the wrong length")?;
-    decoded.zeroize();
     let signing_key = SigningKey::from_bytes(&seed);
     seed.zeroize();
     let public_bytes = signing_key.verifying_key().to_bytes();
@@ -172,19 +197,60 @@ pub fn host_identity(creds: &StoredCreds) -> Result<Option<HostIdentity>> {
 
 /// Wipe stored creds (file + keyring).
 pub async fn logout() -> Result<()> {
-    if !keyring_disabled() {
-        if let Err(e) = keyring_delete() {
-            tracing::warn!(error = %e, "keyring delete failed (may simply have been absent)");
-        }
-    }
-    let path = config::credentials_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    let outcome = clear_stored_credentials(config::credentials_path(), keyring_delete, |path| {
+        std::fs::remove_file(path)
+    })?;
+    if outcome.file_removed {
+        let path = outcome
+            .path
+            .expect("a removed credential file always has a path");
         println!("spawn: removed {}", path.display());
     } else {
         println!("spawn: no stored credentials");
     }
     Ok(())
+}
+
+struct ClearOutcome {
+    path: Option<PathBuf>,
+    file_removed: bool,
+}
+
+fn clear_stored_credentials<K, F>(
+    path_result: Result<PathBuf>,
+    delete_keyring: K,
+    remove_file: F,
+) -> Result<ClearOutcome>
+where
+    K: FnOnce() -> Result<()>,
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let mut failures = Vec::new();
+    if let Err(error) = delete_keyring() {
+        failures.push(format!("keyring: {error:#}"));
+    }
+
+    let mut outcome = ClearOutcome {
+        path: None,
+        file_removed: false,
+    };
+    match path_result {
+        Ok(path) => {
+            match remove_file(&path) {
+                Ok(()) => outcome.file_removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+            outcome.path = Some(path);
+        }
+        Err(error) => failures.push(format!("credential file path: {error:#}")),
+    }
+
+    if failures.is_empty() {
+        Ok(outcome)
+    } else {
+        bail!("credential reset incomplete: {}", failures.join("; "))
+    }
 }
 
 fn keyring_disabled() -> bool {
@@ -249,11 +315,26 @@ fn keyring_get() -> Result<Option<String>> {
 }
 
 fn decode_keyring_value(value: &str) -> Result<StoredSecrets> {
+    if value.len() > MAX_CREDENTIALS_FILE_BYTES {
+        bail!("stored keyring credential bundle is too large")
+    }
     // Backward compatibility for keyrings containing the legacy raw daemon
     // token. The next save upgrades it to a secret bundle.
     if value.starts_with('{') {
-        serde_json::from_str(value).context("parsing keyring daemon secret bundle")
+        let mut secrets: StoredSecrets =
+            serde_json::from_str(value).context("parsing keyring daemon secret bundle")?;
+        if let Err(error) = validate_secret_bounds(
+            secrets.access_token.as_deref(),
+            secrets.host_private_key_seed.as_deref(),
+        ) {
+            zeroize_secrets(&mut secrets);
+            return Err(error);
+        }
+        Ok(secrets)
     } else {
+        if value.len() > MAX_ACCESS_TOKEN_BYTES {
+            bail!("stored keyring access token is too large")
+        }
         Ok(StoredSecrets {
             access_token: Some(value.to_owned()),
             host_private_key_seed: None,
@@ -263,13 +344,21 @@ fn decode_keyring_value(value: &str) -> Result<StoredSecrets> {
 
 fn keyring_set(creds: &StoredCreds) -> Result<()> {
     let entry = keyring_entry()?;
-    let bundle = StoredSecrets {
+    let mut bundle = StoredSecrets {
         access_token: creds.access_token.clone(),
         host_private_key_seed: creds.host_private_key_seed.clone(),
     };
-    let encoded = serde_json::to_string(&bundle)?;
-    entry.set_password(&encoded)?;
-    Ok(())
+    let mut encoded = match serde_json::to_string(&bundle) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            zeroize_secrets(&mut bundle);
+            return Err(error.into());
+        }
+    };
+    let result = entry.set_password(&encoded);
+    encoded.zeroize();
+    zeroize_secrets(&mut bundle);
+    result.map_err(Into::into)
 }
 
 fn keyring_delete() -> Result<()> {
@@ -291,13 +380,16 @@ fn load_file() -> Result<StoredCreds> {
 }
 
 fn load_file_at(path: &Path) -> Result<StoredCreds> {
-    if !path.exists() {
+    let Some(mut raw) = read_credentials_file(path)? else {
         return Ok(StoredCreds::default());
+    };
+    let parsed = serde_json::from_slice(&raw);
+    raw.zeroize();
+    let mut creds: StoredCreds = parsed.with_context(|| format!("parsing {}", path.display()))?;
+    if let Err(error) = validate_loaded_creds(&creds) {
+        zeroize_stored_creds(&mut creds);
+        return Err(error);
     }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let creds: StoredCreds =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(creds)
 }
 
@@ -307,9 +399,181 @@ fn save_file(creds: &StoredCreds) -> Result<()> {
 }
 
 fn save_file_at(path: &Path, creds: &StoredCreds) -> Result<()> {
-    let json = serde_json::to_vec_pretty(creds)?;
-    write_secure(path, &json).with_context(|| format!("writing {}", path.display()))?;
+    validate_loaded_creds(creds)?;
+    let mut json = serde_json::to_vec_pretty(creds)?;
+    let result = write_secure(path, &json).with_context(|| format!("writing {}", path.display()));
+    json.zeroize();
+    result
+}
+
+fn validate_secret_bounds(access_token: Option<&str>, encoded_seed: Option<&str>) -> Result<()> {
+    if access_token.is_some_and(|value| value.len() > MAX_ACCESS_TOKEN_BYTES) {
+        bail!("stored access token is too large")
+    }
+    if encoded_seed.is_some_and(|value| value.len() != ED25519_SEED_B64URL_LENGTH) {
+        bail!("stored Ed25519 host identity has the wrong encoded length")
+    }
     Ok(())
+}
+
+fn validate_loaded_creds(creds: &StoredCreds) -> Result<()> {
+    validate_secret_bounds(
+        creds.access_token.as_deref(),
+        creds.host_private_key_seed.as_deref(),
+    )?;
+    if creds
+        .server_url
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_SERVER_URL_BYTES)
+    {
+        bail!("stored server URL is too large")
+    }
+    host_identity(creds)?;
+    Ok(())
+}
+
+fn zeroize_secrets(secrets: &mut StoredSecrets) {
+    if let Some(value) = secrets.access_token.as_mut() {
+        value.zeroize();
+    }
+    if let Some(value) = secrets.host_private_key_seed.as_mut() {
+        value.zeroize();
+    }
+}
+
+fn zeroize_stored_creds(creds: &mut StoredCreds) {
+    if let Some(value) = creds.access_token.as_mut() {
+        value.zeroize();
+    }
+    if let Some(value) = creds.host_private_key_seed.as_mut() {
+        value.zeroize();
+    }
+}
+
+#[cfg(unix)]
+fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+    };
+    let mut file = std::fs::File::from(fd);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
+    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
+        bail!("credential fallback is too large: {}", path.display())
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    let read_result = Read::by_ref(&mut file)
+        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading {}", path.display()));
+    if let Err(error) = read_result {
+        raw.zeroize();
+        return Err(error);
+    }
+    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
+        raw.zeroize();
+        bail!("credential fallback is too large: {}", path.display())
+    }
+    Ok(Some(raw))
+}
+
+#[cfg(unix)]
+fn validate_unix_credentials_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    expected_uid: u32,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !metadata.is_file() {
+        bail!(
+            "credential fallback is not a regular file: {}",
+            path.display()
+        )
+    }
+    if metadata.uid() != expected_uid {
+        bail!(
+            "credential fallback is not owned by the current user: {}",
+            path.display()
+        )
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "credential fallback has group or other permissions: {}",
+            path.display()
+        )
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
+    };
+    if !metadata.is_file() {
+        bail!(
+            "credential fallback is not a regular file: {}",
+            path.display()
+        )
+    }
+    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
+        bail!("credential fallback is too large: {}", path.display())
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    let read_result = std::fs::File::open(path)?
+        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut raw);
+    if let Err(error) = read_result {
+        raw.zeroize();
+        return Err(error.into());
+    }
+    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
+        raw.zeroize();
+        bail!("credential fallback is too large: {}", path.display())
+    }
+    Ok(Some(raw))
+}
+
+#[cfg(unix)]
+fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Write atomically: unique mode-600 temp file in the same directory, then rename.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = parent.to_path_buf();
+    tmp.push(format!(".credentials.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
 }
 
 #[cfg(test)]
@@ -358,6 +622,17 @@ mod tests {
     }
 
     #[test]
+    fn oversized_stored_seed_is_rejected_before_decode() {
+        let creds = StoredCreds {
+            host_private_key_seed: Some("A".repeat(MAX_CREDENTIALS_FILE_BYTES)),
+            ..StoredCreds::default()
+        };
+        let error =
+            host_identity(&creds).expect_err("oversized seed must fail before base64 decoding");
+        assert!(format!("{error:#}").contains("wrong encoded length"));
+    }
+
+    #[test]
     fn corrupt_keyring_bundle_fails_closed() {
         assert!(decode_keyring_value("{not-json").is_err());
     }
@@ -399,30 +674,169 @@ mod tests {
             0o600
         );
     }
-}
 
-#[cfg(unix)]
-fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    // Write atomically: tmp file in same dir + rename.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = parent.to_path_buf();
-    tmp.push(format!(".credentials.{}.tmp", std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    #[test]
+    fn reset_attempts_file_removal_but_fails_when_keyring_cannot_be_cleared() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        std::fs::write(&path, b"secret").unwrap();
+        let keyring_attempted = Cell::new(false);
+        let file_attempted = Cell::new(false);
+        let result = clear_stored_credentials(
+            Ok(path.clone()),
+            || {
+                keyring_attempted.set(true);
+                Err(anyhow::anyhow!("injected keyring delete failure"))
+            },
+            |candidate| {
+                file_attempted.set(true);
+                std::fs::remove_file(candidate)
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(keyring_attempted.get());
+        assert!(file_attempted.get());
+        assert!(!path.exists());
+        let error = result
+            .err()
+            .expect("injected keyring failure must fail reset");
+        assert!(format!("{error:#}").contains("credential reset incomplete"));
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
 
-#[cfg(not(unix))]
-fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, data)
+    #[test]
+    fn reset_attempts_keyring_but_fails_when_file_cannot_be_cleared() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        let keyring_attempted = Cell::new(false);
+        let file_attempted = Cell::new(false);
+        let result = clear_stored_credentials(
+            Ok(path),
+            || {
+                keyring_attempted.set(true);
+                Ok(())
+            },
+            |_| {
+                file_attempted.set(true);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected file delete failure",
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(keyring_attempted.get());
+        assert!(file_attempted.get());
+    }
+
+    #[test]
+    fn reset_treats_absent_backends_as_idempotent_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing.json");
+        let result = clear_stored_credentials(
+            Ok(path),
+            || Ok(()),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .unwrap();
+        assert!(!result.file_removed);
+    }
+
+    #[cfg(unix)]
+    fn write_test_credentials(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_group_or_other_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        save_file_at(&path, &fixed_creds()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = load_file_at(&path)
+            .err()
+            .expect("insecure permissions must fail closed");
+        assert!(format!("{error:#}").contains("group or other permissions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_wrong_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        save_file_at(&path, &fixed_creds()).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let wrong_uid = metadata.uid().wrapping_add(1);
+        let error = validate_unix_credentials_metadata(&path, &metadata, wrong_uid).unwrap_err();
+        assert!(format!("{error:#}").contains("not owned by the current user"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        let link = temp.path().join("credentials.json");
+        save_file_at(&target, &fixed_creds()).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(load_file_at(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_non_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(load_file_at(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_oversize_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        write_test_credentials(&path, &vec![b' '; MAX_CREDENTIALS_FILE_BYTES + 1]);
+        let error = load_file_at(&path)
+            .err()
+            .expect("oversize credentials must fail closed");
+        assert!(format!("{error:#}").contains("too large"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_rejects_corrupt_json_and_seed() {
+        let temp = tempfile::tempdir().unwrap();
+        let corrupt_json = temp.path().join("corrupt.json");
+        write_test_credentials(&corrupt_json, b"{not-json");
+        assert!(load_file_at(&corrupt_json).is_err());
+
+        let corrupt_seed = temp.path().join("corrupt-seed.json");
+        write_test_credentials(
+            &corrupt_seed,
+            br#"{"host_private_key_seed":"not-a-canonical-seed"}"#,
+        );
+        let error = load_file_at(&corrupt_seed)
+            .err()
+            .expect("corrupt seed must fail closed");
+        assert!(format!("{error:#}").contains("wrong encoded length"));
+    }
 }

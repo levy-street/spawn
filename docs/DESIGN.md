@@ -111,15 +111,17 @@
 - **Web users**: email + argon2id password. Sessions are JWTs in HTTP-only
   cookies, 30-day refresh / 15-min access.
 - **Daemons**: device-code flow.
-  1. Daemon `POST /api/auth/device/start` → `{device_code, user_code,
-     verification_uri, interval, expires_in}`.
+  1. Daemon `POST /api/auth/device/start` with its Ed25519 public key →
+     `{device_code, user_code, verification_uri, interval, expires_in}`.
   2. Daemon prints `Open https://spawn.dev/device and enter code QZ4K-7HMT`.
-  3. Daemon polls `POST /api/auth/device/poll {device_code}` until success.
-  4. Browser (logged-in user) opens `/device`, enters `user_code`, hits
-     `POST /api/auth/device/approve {user_code}` → server marks the device
-     code authorized for that user.
-  5. Next poll returns `{access_token: <daemon_token>, host_id}`. Daemon
-     stores token in keyring.
+  3. Daemon polls `POST /api/auth/device/poll` with the device code and exact
+     public-key binding until success.
+  4. Browser (logged-in user) opens `/device`, enters `user_code`, reviews the
+     server-derived host fingerprint, then echoes that exact identity tuple to
+     `POST /api/auth/device/approve`; stale or changed reviews are rejected.
+  5. Next poll returns the daemon token, host ID, and pinned identity. Daemon
+     verifies the binding and stores the token and private identity in its
+     credential backends.
 - Daemon tokens are scoped: `host:<host_id>:control`. Revocable from the web
   UI (kills the WS).
 

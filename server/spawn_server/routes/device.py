@@ -264,7 +264,7 @@ async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceC
 
 @router.post("/pending", response_model=schemas.DevicePendingResponse)
 async def device_pending(
-    body: schemas.DeviceApproveRequest,
+    body: schemas.DevicePendingRequest,
     session: AsyncSession = Depends(get_session),
     _user: User = Depends(auth.current_user),
 ) -> schemas.DevicePendingResponse:
@@ -283,6 +283,16 @@ async def device_approve(
     dc = await _pending_device_code(session, body.user_code)
     assert dc.host_key_algorithm is not None
     assert dc.host_public_key is not None
+    reviewed = _approval_response(dc)
+    if (
+        body.host_key_algorithm != reviewed.host_key_algorithm
+        or body.host_public_key != reviewed.host_public_key
+        or body.host_key_fingerprint != reviewed.host_key_fingerprint
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="host identity changed since review; review the device code again",
+        )
 
     pinned_host = (
         await session.execute(
@@ -303,12 +313,17 @@ async def device_approve(
             DeviceCode.device_code == dc.device_code,
             DeviceCode.status == "pending",
             DeviceCode.user_id.is_(None),
+            DeviceCode.host_key_algorithm == body.host_key_algorithm,
+            DeviceCode.host_public_key == body.host_public_key,
         )
         .values(status="approved", user_id=user.id)
         .execution_options(synchronize_session=False)
     )
     if approved.rowcount != 1:
         await session.rollback()
-        raise HTTPException(status_code=400, detail="user code is no longer pending")
+        raise HTTPException(
+            status_code=409,
+            detail="host identity or approval state changed; review the device code again",
+        )
     await session.commit()
-    return _approval_response(dc)
+    return reviewed

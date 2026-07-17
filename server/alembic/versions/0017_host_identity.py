@@ -25,7 +25,8 @@ def upgrade() -> None:
         batch.create_check_constraint(
             "ck_hosts_host_key_pair",
             "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
-            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            "(host_key_algorithm IS NOT NULL AND host_public_key IS NOT NULL AND "
+            "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
         )
         batch.create_unique_constraint(
             "uq_hosts_host_public_key", ["host_key_algorithm", "host_public_key"]
@@ -37,7 +38,8 @@ def upgrade() -> None:
         batch.create_check_constraint(
             "ck_device_codes_host_key_pair",
             "(host_key_algorithm IS NULL AND host_public_key IS NULL) OR "
-            "(host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
+            "(host_key_algorithm IS NOT NULL AND host_public_key IS NOT NULL AND "
+            "host_key_algorithm = 'ed25519' AND length(host_public_key) = 43)",
         )
         batch.create_unique_constraint(
             "uq_device_codes_host_public_key", ["host_key_algorithm", "host_public_key"]

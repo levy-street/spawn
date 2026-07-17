@@ -188,14 +188,34 @@ import urllib.error
 import urllib.request
 
 base_url, token, user_code = sys.argv[1:]
-req = urllib.request.Request(
-    base_url + "/api/auth/device/approve",
+headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+pending_req = urllib.request.Request(
+    base_url + "/api/auth/device/pending",
     data=json.dumps({"user_code": user_code}).encode(),
     method="POST",
-    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    headers=headers,
 )
 try:
-    with urllib.request.urlopen(req, timeout=10) as response:
+    with urllib.request.urlopen(pending_req, timeout=10) as response:
+        reviewed = json.loads(response.read().decode())
+except urllib.error.HTTPError as error:
+    raise SystemExit(f"pending review failed: {error.code} {error.read().decode()}") from error
+if reviewed.get("host_name") != "cli-login-smoke":
+    raise SystemExit(f"unexpected pending response: {reviewed!r}")
+approval = {
+    "user_code": user_code,
+    "host_key_algorithm": reviewed["host_key_algorithm"],
+    "host_public_key": reviewed["host_public_key"],
+    "host_key_fingerprint": reviewed["host_key_fingerprint"],
+}
+approve_req = urllib.request.Request(
+    base_url + "/api/auth/device/approve",
+    data=json.dumps(approval).encode(),
+    method="POST",
+    headers=headers,
+)
+try:
+    with urllib.request.urlopen(approve_req, timeout=10) as response:
         body = json.loads(response.read().decode())
 except urllib.error.HTTPError as error:
     raise SystemExit(f"approve failed: {error.code} {error.read().decode()}") from error

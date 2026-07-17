@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
-from .host_identity import decode_host_public_key
+from .host_identity import decode_host_public_key, host_key_fingerprint
 
 # ---------- auth ----------
 
@@ -101,10 +101,29 @@ class DevicePollPending(BaseModel):
     error: Literal["authorization_pending", "slow_down", "expired_token", "denied"]
 
 
-class DeviceApproveRequest(BaseModel):
+class DevicePendingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_code: str
+
+
+class DeviceApproveRequest(DevicePendingRequest):
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+    host_key_fingerprint: str = Field(min_length=23, max_length=23)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_fingerprint_binding(self) -> DeviceApproveRequest:
+        expected = host_key_fingerprint(self.host_key_algorithm, self.host_public_key)
+        if self.host_key_fingerprint != expected:
+            raise ValueError("host key fingerprint does not match public key")
+        return self
 
 
 class DeviceApproveResponse(BaseModel):

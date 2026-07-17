@@ -42,16 +42,23 @@ function DeviceInner() {
   };
 
   const onApprove = async () => {
+    if (!pending) return;
     setError(null);
     setSubmitting(true);
     try {
-      const r = await auth.approveDevice({ user_code: code.trim().toUpperCase() });
+      const r = await auth.approveDevice({
+        user_code: code.trim().toUpperCase(),
+        host_key_algorithm: pending.host_key_algorithm,
+        host_public_key: pending.host_public_key,
+        host_key_fingerprint: pending.host_key_fingerprint,
+      });
       setHostName(r.host_name);
       setPending(null);
       setCode("");
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Approval failed";
       setError(message);
+      setPending(null);
     } finally {
       setSubmitting(false);
     }
