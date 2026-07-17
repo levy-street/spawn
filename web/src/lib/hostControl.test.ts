@@ -2,6 +2,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { HOST_CONTROL_PROTOCOL, HostControlClient } from "./hostControl";
+import {
+  decodeEd25519PublicKeyWire,
+  exportEd25519PublicKeyWire,
+  generateEd25519IdentityKeyPair,
+  signSignedSignalTranscript,
+} from "./signed-signal";
+import { signRtcSignalWire } from "./signed-signal-wire";
 
 class FakeDataChannel {
   label: string;
@@ -146,6 +153,41 @@ function framesOf(channel, type) {
   return channel.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === type);
 }
 
+async function signedRtcTrust() {
+  const browser = await generateEd25519IdentityKeyPair();
+  const host = await generateEd25519IdentityKeyPair();
+  const browserPublicKeyWire = await exportEd25519PublicKeyWire(browser.publicKey);
+  const hostPublicKeyWire = await exportEd25519PublicKeyWire(host.publicKey);
+  return {
+    browser,
+    browserPublicKeyWire,
+    host,
+    hostPublicKeyWire,
+    trust: {
+      browserPublicKeyWire,
+      hostPublicKeyWire,
+      assertActive: () => {},
+      signOffer: (input) =>
+        signRtcSignalWire(
+          {
+            publicKeyWire: browserPublicKeyWire,
+            sign: (transcript) => signSignedSignalTranscript(browser.privateKey, transcript),
+          },
+          input,
+        ),
+    },
+  };
+}
+
+async function waitForSentFrame(ws, type) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const frame = ws.sent.map((value) => JSON.parse(value)).find((value) => value.type === type);
+    if (frame) return frame;
+    await Bun.sleep(1);
+  }
+  throw new Error(`timed out waiting for ${type}`);
+}
+
 async function startedTransfer(destinationOptions = {}) {
   const source = await readyClient();
   const destination = await readyClient(destinationOptions, destinationHostId);
@@ -228,6 +270,81 @@ afterEach(() => {
 });
 
 describe("HostControlClient", () => {
+  test("signed HostControl applies only the host-signed transcript SDP", async () => {
+    const signed = await signedRtcTrust();
+    const client = new HostControlClient(hostId, { signedRtcTrust: signed.trust });
+    client.connect();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [{ urls: ["turn:relay.example"] }],
+      ice_transport_policy: "relay",
+      ...metadata,
+    });
+    const offer = await waitForSentFrame(ws, "rtc.offer");
+    expect(offer).toHaveProperty("signed_envelope");
+    expect(offer).not.toHaveProperty("sdp");
+
+    const verifiedSdp = "v=0\r\ns=verified-host-control\r\na=fingerprint:sha-256 11:22\r\n";
+    const rawRelaySdp = "v=0\r\ns=hostile-relay\r\na=fingerprint:sha-256 AA:BB\r\n";
+    const signedEnvelope = await signRtcSignalWire(
+      {
+        publicKeyWire: signed.hostPublicKeyWire,
+        sign: (transcript) => signSignedSignalTranscript(signed.host.privateKey, transcript),
+      },
+      {
+        protocol: HOST_CONTROL_PROTOCOL,
+        transcript: {
+          signalKind: "answer",
+          protocolVersion: 1,
+          sessionId: offer.session_id,
+          scopeType: "host",
+          scopeId: hostId,
+          senderRole: "daemon",
+          intendedPeerPublicKey: decodeEd25519PublicKeyWire(signed.browserPublicKeyWire),
+          sdp: verifiedSdp,
+        },
+      },
+    );
+    ws.receive({
+      type: "rtc.answer",
+      session_id: offer.session_id,
+      signed_envelope: signedEnvelope,
+      sdp: rawRelaySdp,
+      ...metadata,
+    });
+    await Bun.sleep(5);
+
+    const pc = FakePeerConnection.instances.at(-1);
+    expect(pc.remoteDescription).toEqual({ type: "answer", sdp: verifiedSdp });
+    expect(pc.remoteDescription.sdp).not.toBe(rawRelaySdp);
+    client.close();
+  });
+
+  test("signed HostControl tears down stripped answers without legacy fallback", async () => {
+    const signed = await signedRtcTrust();
+    const client = new HostControlClient(hostId, { signedRtcTrust: signed.trust });
+    client.connect();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({ type: "rtc.config", enabled: true, ...metadata });
+    const offer = await waitForSentFrame(ws, "rtc.offer");
+    const pc = FakePeerConnection.instances.at(-1);
+    ws.receive({
+      type: "rtc.answer",
+      session_id: offer.session_id,
+      sdp: "v=0\r\ns=unsigned-fallback\r\n",
+      ...metadata,
+    });
+    await Bun.sleep(5);
+
+    expect(pc.remoteDescription).toBeNull();
+    expect(pc.channel.closed).toBe(true);
+    client.close();
+  });
+
   test("creates a host-bound TURN-only channel and completes a bound ping", async () => {
     const { client, pc, offer } = await readyClient();
     expect(pc.channel.label).toBe(HOST_CONTROL_PROTOCOL);

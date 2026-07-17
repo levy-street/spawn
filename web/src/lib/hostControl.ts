@@ -1,4 +1,5 @@
 import { hashStream, Sha256 } from "@/lib/sha256";
+import { SignedRtcLiveSession, type SignedRtcTrustCapability } from "@/lib/signed-rtc-live";
 import { buildHostWsUrl } from "@/lib/ws";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
@@ -115,7 +116,12 @@ type SignalMessage =
       ice_servers?: RTCIceServer[];
       ice_transport_policy?: RTCIceTransportPolicy;
     } & SignalMetadata)
-  | ({ type: "rtc.answer"; session_id: string; sdp: string } & SignalMetadata)
+  | ({
+      type: "rtc.answer";
+      session_id: string;
+      signed_envelope?: string;
+      sdp?: string;
+    } & SignalMetadata)
   | ({ type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit } & SignalMetadata)
   | ({ type: "rtc.status"; session_id?: string; status: string } & SignalMetadata);
 
@@ -135,6 +141,9 @@ export interface HostControlClientOptions {
   reconnectBaseDelayMs?: number;
   /** Primarily useful for bounded clients and deterministic timeout tests. */
   streamTimeoutMs?: number;
+  /** Exact epoch-scoped browser signer plus the exact active local pin for
+   * this Host. Presence freezes every RTC generation into signed mode. */
+  signedRtcTrust?: SignedRtcTrustCapability;
 }
 
 export class HostControlClient {
@@ -148,6 +157,7 @@ export class HostControlClient {
   private connectionAttempt = 0;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
+  private signedRtcSession: SignedRtcLiveSession | null = null;
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
@@ -661,7 +671,10 @@ export class HostControlClient {
     };
     ws.onmessage = (event) => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
-      if (typeof event.data !== "string") return;
+      if (typeof event.data !== "string") {
+        if (this.signedRtcSession !== null) this.failRtc();
+        return;
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(event.data);
@@ -674,7 +687,10 @@ export class HostControlClient {
         return;
       }
       const message = parsed as unknown as SignalMessage;
-      if (!this.matchesMetadata(message)) return;
+      if (!this.matchesMetadata(message)) {
+        if (message.type === "rtc.answer" && this.signedRtcSession !== null) this.failRtc();
+        return;
+      }
       if (message.type === "rtc.config" && message.enabled) {
         void this.startRtc(
           message.ice_servers ?? [],
@@ -682,9 +698,32 @@ export class HostControlClient {
           ws,
           attempt,
         );
+      } else if (message.type === "rtc.answer" && this.signedRtcSession !== null) {
+        const pc = this.pc;
+        const session = this.signedRtcSession;
+        const expectedSessionId = this.sessionId ?? undefined;
+        if (!pc || expectedSessionId === undefined) {
+          this.failRtc(expectedSessionId);
+          return;
+        }
+        void session
+          .verifyAndApplyAnswer(pc, message)
+          .then(() => {
+            if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
+            for (const candidate of this.pendingRemoteCandidates.splice(0)) {
+              void pc.addIceCandidate(candidate).catch(() => {});
+            }
+          })
+          .catch(() => {
+            if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(expectedSessionId);
+          });
       } else if (message.type === "rtc.answer" && message.session_id === this.sessionId) {
         const pc = this.pc;
         if (!pc) return;
+        if (typeof message.sdp !== "string") {
+          this.failRtc(message.session_id);
+          return;
+        }
         void pc
           .setRemoteDescription({ type: "answer", sdp: message.sdp })
           .then(() => {
@@ -778,11 +817,24 @@ export class HostControlClient {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
-      this.sendSignal(
-        { type: "rtc.offer", session_id: sessionId, sdp: offer.sdp ?? "" },
-        ws,
-        attempt,
-      );
+      const nextSignedRtcSession = this.options.signedRtcTrust
+        ? new SignedRtcLiveSession(
+            {
+              scopeType: "host",
+              scopeId: this.hostId,
+              protocol: HOST_CONTROL_PROTOCOL,
+              protocolVersion: HOST_CONTROL_VERSION,
+            },
+            sessionId,
+            this.options.signedRtcTrust,
+          )
+        : null;
+      const carrier = nextSignedRtcSession
+        ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
+        : { sdp: offer.sdp ?? "" };
+      if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
+      this.signedRtcSession = nextSignedRtcSession;
+      this.sendSignal({ type: "rtc.offer", session_id: sessionId, ...carrier }, ws, attempt);
     } catch {
       if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
     }
@@ -1198,6 +1250,8 @@ export class HostControlClient {
   private cleanupRtc(notifyServer: boolean): void {
     const sessionId = this.sessionId;
     this.sessionId = null;
+    this.signedRtcSession?.abort();
+    this.signedRtcSession = null;
     if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
     const channel = this.channel;
     const pc = this.pc;

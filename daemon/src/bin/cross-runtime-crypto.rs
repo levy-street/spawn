@@ -40,6 +40,7 @@ struct ExchangeArtifact {
     accepted_intended_peer_public_keys: Vec<String>,
     signal: SignalArtifact,
     wire: WireArtifact,
+    live_answer: WireArtifact,
     registration: RegistrationArtifact,
     host_pair: HostPairArtifact,
 }
@@ -151,6 +152,19 @@ fn produce() -> Result<ExchangeArtifact> {
     };
     let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &transcript)
         .context("signing Rust RTC wire envelope")?;
+    let answer_transcript = SignedSignalTranscript::new(
+        SignalKind::Answer,
+        2,
+        transcript.session_id().to_owned(),
+        ScopeType::Agent,
+        transcript.scope_id().to_owned(),
+        SenderRole::Daemon,
+        *browser_key.verifying_key().as_bytes(),
+        exact_sdp.clone(),
+    )
+    .context("constructing Rust live answer transcript")?;
+    let live_answer = sign_rtc_signal_wire(&host_key, RtcProtocol::Agent, &answer_transcript)
+        .context("signing Rust live answer envelope")?;
 
     let user_id = Uuid::new_v4().to_string();
     let registration_bytes = encode_browser_registration(&user_id, &browser_public_key)?;
@@ -197,6 +211,10 @@ fn produce() -> Result<ExchangeArtifact> {
         wire: WireArtifact {
             envelope_sha256: sha256_wire(envelope.as_bytes()),
             envelope,
+        },
+        live_answer: WireArtifact {
+            envelope_sha256: sha256_wire(live_answer.as_bytes()),
+            envelope: live_answer,
         },
         registration,
         host_pair,
@@ -339,6 +357,31 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
         || verified.transcript() != &transcript
     {
         bail!("WebCrypto RTC wire envelope changed the verified tuple");
+    }
+    require_equal(
+        "live answer wire hash",
+        &artifact.live_answer.envelope_sha256,
+        &sha256_wire(artifact.live_answer.envelope.as_bytes()),
+    )?;
+    let expected_answer = SignedSignalTranscript::new(
+        SignalKind::Answer,
+        transcript.protocol_version(),
+        transcript.session_id().to_owned(),
+        ScopeType::Agent,
+        transcript.scope_id().to_owned(),
+        SenderRole::Daemon,
+        *browser_key.as_bytes(),
+        expected_sdp.clone(),
+    )
+    .context("constructing expected WebCrypto live answer")?;
+    let verified_answer =
+        verify_rtc_signal_wire(&artifact.live_answer.envelope, &host_key, &browser_key)
+            .context("verifying WebCrypto live answer envelope in Rust")?;
+    if verified_answer.protocol() != RtcProtocol::Agent
+        || verified_answer.sender_public_key() != &host_key
+        || verified_answer.transcript() != &expected_answer
+    {
+        bail!("WebCrypto live answer changed the verified tuple");
     }
 
     require_equal(

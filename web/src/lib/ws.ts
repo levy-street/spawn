@@ -62,7 +62,10 @@ export type InboundMessage =
       scope_id?: string;
       protocol?: string;
       protocol_version?: number;
-      sdp: string;
+      /** Mutually exclusive relay carriers. A locally signed offer freezes
+       * signed mode, so a raw sibling can never become its answer fallback. */
+      signed_envelope?: string;
+      sdp?: string;
     }
   | {
       type: "rtc.candidate";
@@ -130,6 +133,12 @@ export type OutboundMessage =
       session_id: string;
       binding_nonce: string;
       sdp: string;
+    })
+  | (AgentRtcTuple & {
+      type: "rtc.offer";
+      session_id: string;
+      binding_nonce: string;
+      signed_envelope: string;
     })
   | (AgentRtcTuple & {
       type: "rtc.candidate";

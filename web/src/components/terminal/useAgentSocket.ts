@@ -25,6 +25,7 @@ import {
   sha256Blob,
   slicePtyChunkAfterAnchor,
 } from "@/lib/agent-ctl";
+import { SignedRtcLiveSession, type SignedRtcTrustCapability } from "@/lib/signed-rtc-live";
 import {
   agentRtcTuple,
   buildAgentWsUrl,
@@ -45,6 +46,9 @@ import {
 export interface UseAgentSocketOptions {
   agentId: string;
   enabled?: boolean;
+  /** Exact epoch-scoped browser signer plus exact active local Host pin.
+   * Presence selects signed mode for every RTC generation in this hook. */
+  signedRtcTrust?: SignedRtcTrustCapability;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
@@ -146,6 +150,7 @@ export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): st
 export function useAgentSocket({
   agentId,
   enabled = true,
+  signedRtcTrust,
   initialSize = null,
   onData,
   onHistory,
@@ -235,6 +240,7 @@ export function useAgentSocket({
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
+    let signedRtcSession: SignedRtcLiveSession | null = null;
 
     const isCurrentAgentGeneration = () => agentGenerationRef.current === agentGeneration;
     const isActiveAgentGeneration = () => !cancelled && isCurrentAgentGeneration();
@@ -298,6 +304,8 @@ export function useAgentSocket({
         open: false,
         bytesReceived: 0,
       };
+      signedRtcSession?.abort();
+      signedRtcSession = null;
       try {
         rtc.ptyDc?.close();
         rtc.ctlDc?.close();
@@ -1036,13 +1044,30 @@ export function useAgentSocket({
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         if (!isCurrentRtcGeneration()) return;
+        const nextSignedRtcSession = signedRtcTrust
+          ? new SignedRtcLiveSession(
+              {
+                scopeType: "agent",
+                scopeId: agentId,
+                protocol: "spawn.pty",
+                protocolVersion: 2,
+              },
+              sessionId,
+              signedRtcTrust,
+            )
+          : null;
+        const carrier = nextSignedRtcSession
+          ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
+          : { sdp: offer.sdp };
+        if (!isCurrentRtcGeneration()) return;
+        signedRtcSession = nextSignedRtcSession;
         if (
           !sendJsonOverWs({
             type: "rtc.offer",
             session_id: sessionId,
             binding_nonce: bindingNonce,
             ...boundAgentRtcTuple,
-            sdp: offer.sdp,
+            ...carrier,
           })
         ) {
           cleanupRtc(false, false, rtcGeneration);
@@ -1088,7 +1113,10 @@ export function useAgentSocket({
         if (!h) return;
         if (typeof ev.data === "string") {
           const msg = parseInbound(ev.data);
-          if (!msg) return;
+          if (!msg) {
+            if (signedRtcSession) cleanupRtc(true, true, rtcRef.current.rtcGeneration);
+            return;
+          }
           if (msg.type === "agent.exit") {
             h.onExit?.(msg.exit_code, msg.signal);
           } else if (msg.type === "agent.status") {
@@ -1108,7 +1136,53 @@ export function useAgentSocket({
           } else if (msg.type === "rtc.answer") {
             const current = rtcRef.current;
             const bindingRequired = true;
-            if (
+            if (current.pc && signedRtcSession) {
+              const pc = current.pc;
+              const acceptedBinding = {
+                sessionId: current.sessionId,
+                bindingNonce: current.bindingNonce,
+                bindingGeneration: current.bindingGeneration,
+              };
+              const acceptedRtcGeneration = current.rtcGeneration;
+              if (
+                !current.sessionId ||
+                !current.bindingNonce ||
+                current.bindingGeneration === null ||
+                !rtcBindingFrameMatches(
+                  {
+                    sessionId: current.sessionId,
+                    bindingNonce: current.bindingNonce,
+                    bindingGeneration: current.bindingGeneration,
+                    agentId,
+                  },
+                  msg,
+                )
+              ) {
+                cleanupRtc(true, true, acceptedRtcGeneration);
+                return;
+              }
+              void signedRtcSession
+                .verifyAndApplyAnswer(pc, msg)
+                .then(() => {
+                  const latest = rtcRef.current;
+                  if (
+                    !isCurrentWs() ||
+                    latest.pc !== pc ||
+                    latest.agentId !== agentId ||
+                    latest.agentGeneration !== agentGeneration ||
+                    latest.rtcGeneration !== acceptedRtcGeneration ||
+                    latest.sessionId !== acceptedBinding.sessionId ||
+                    latest.bindingNonce !== acceptedBinding.bindingNonce ||
+                    latest.bindingGeneration !== acceptedBinding.bindingGeneration
+                  )
+                    return;
+                  const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
+                  for (const candidate of pending) {
+                    void pc.addIceCandidate(candidate).catch(() => {});
+                  }
+                })
+                .catch(() => cleanupRtc(true, true, acceptedRtcGeneration));
+            } else if (
               current.sessionId &&
               current.bindingNonce &&
               (!bindingRequired || current.bindingGeneration !== null) &&
@@ -1130,24 +1204,31 @@ export function useAgentSocket({
                 bindingGeneration: current.bindingGeneration,
               };
               const acceptedRtcGeneration = current.rtcGeneration;
-              void pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(() => {
-                const latest = rtcRef.current;
-                if (
-                  !isCurrentWs() ||
-                  latest.pc !== pc ||
-                  latest.agentId !== agentId ||
-                  latest.agentGeneration !== agentGeneration ||
-                  latest.rtcGeneration !== acceptedRtcGeneration ||
-                  latest.sessionId !== acceptedBinding.sessionId ||
-                  latest.bindingNonce !== acceptedBinding.bindingNonce ||
-                  latest.bindingGeneration !== acceptedBinding.bindingGeneration
-                )
-                  return;
-                const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
-                for (const candidate of pending) {
-                  void pc.addIceCandidate(candidate).catch(() => {});
-                }
-              });
+              if (typeof msg.sdp !== "string") {
+                cleanupRtc(true, true, acceptedRtcGeneration);
+                return;
+              }
+              void pc
+                .setRemoteDescription({ type: "answer", sdp: msg.sdp })
+                .then(() => {
+                  const latest = rtcRef.current;
+                  if (
+                    !isCurrentWs() ||
+                    latest.pc !== pc ||
+                    latest.agentId !== agentId ||
+                    latest.agentGeneration !== agentGeneration ||
+                    latest.rtcGeneration !== acceptedRtcGeneration ||
+                    latest.sessionId !== acceptedBinding.sessionId ||
+                    latest.bindingNonce !== acceptedBinding.bindingNonce ||
+                    latest.bindingGeneration !== acceptedBinding.bindingGeneration
+                  )
+                    return;
+                  const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
+                  for (const candidate of pending) {
+                    void pc.addIceCandidate(candidate).catch(() => {});
+                  }
+                })
+                .catch(() => cleanupRtc(true, true, acceptedRtcGeneration));
             }
           } else if (msg.type === "rtc.candidate") {
             const current = rtcRef.current;
@@ -1267,7 +1348,7 @@ export function useAgentSocket({
       pendingInputRef.current.clear();
       if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
     };
-  }, [agentId, enabled]);
+  }, [agentId, enabled, signedRtcTrust]);
 
   // Poll WebRTC stats while the channel is up: the selected candidate pair
   // tells us whether bytes flow direct, via STUN-discovered addresses, or

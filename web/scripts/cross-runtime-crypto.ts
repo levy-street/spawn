@@ -27,6 +27,7 @@ import {
   signRtcSignalWire,
   verifyRtcSignalWire,
 } from "../src/lib/signed-signal-wire";
+import { SignedRtcLiveSession } from "../src/lib/signed-rtc-live";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const rustArgs = [
@@ -54,6 +55,7 @@ interface ExchangeArtifact {
   accepted_intended_peer_public_keys: string[];
   signal: SignalArtifact;
   wire: WireArtifact;
+  live_answer: WireArtifact;
   registration: RegistrationArtifact;
   host_pair: HostPairArtifact;
 }
@@ -332,6 +334,57 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
   assertEqual("wire SDP", verifiedWire.transcript.sdp, expectedSdp);
 
   assertEqual(
+    "live answer wire hash",
+    artifact.live_answer.envelope_sha256,
+    await sha256Wire(new TextEncoder().encode(artifact.live_answer.envelope)),
+  );
+  const appliedDescriptions: RTCSessionDescriptionInit[] = [];
+  let closeCalls = 0;
+  const liveSession = new SignedRtcLiveSession(
+    {
+      scopeType: "agent",
+      scopeId: artifact.signal.scope_id,
+      protocol: "spawn.pty",
+      protocolVersion: 2,
+    },
+    artifact.signal.session_id,
+    {
+      browserPublicKeyWire: artifact.browser_public_key,
+      hostPublicKeyWire: artifact.host_public_key,
+      assertActive: () => {},
+      // The Rust-produced offer is re-verified against this exact input by the
+      // production live adapter before it can select signed mode.
+      signOffer: async () => artifact.wire.envelope,
+    },
+  );
+  await liveSession.createOffer(expectedSdp);
+  await liveSession.verifyAndApplyAnswer(
+    {
+      setRemoteDescription: async (description) => {
+        appliedDescriptions.push(structuredClone(description));
+      },
+      close: () => {
+        closeCalls += 1;
+      },
+    },
+    {
+      session_id: artifact.signal.session_id,
+      scope_type: "agent",
+      scope_id: artifact.signal.scope_id,
+      protocol: "spawn.pty",
+      protocol_version: 2,
+      signed_envelope: artifact.live_answer.envelope,
+      sdp: "v=0\r\ns=hostile-outer-relay-substitution\r\n",
+    },
+  );
+  assertEqual(
+    "live adapter verified SDP",
+    appliedDescriptions[0]?.sdp,
+    expectedSdp,
+  );
+  assertEqual("live adapter peer close count", closeCalls, 0);
+
+  assertEqual(
     "registration browser key",
     artifact.registration.browser_public_key,
     artifact.browser_public_key,
@@ -453,6 +506,25 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     },
     { protocol: "spawn.pty", transcript },
   );
+  const liveAnswer = await signRtcSignalWire(
+    {
+      publicKeyWire: hostPublicKey,
+      sign: (value) => signSignedSignalTranscript(hostKey.privateKey, value),
+    },
+    {
+      protocol: "spawn.pty",
+      transcript: {
+        signalKind: "answer",
+        protocolVersion: transcript.protocolVersion,
+        sessionId: transcript.sessionId,
+        scopeType: transcript.scopeType,
+        scopeId: transcript.scopeId,
+        senderRole: "daemon",
+        intendedPeerPublicKey: decodeEd25519PublicKeyWire(browserPublicKey),
+        sdp,
+      },
+    },
+  );
 
   const userId = crypto.randomUUID();
   const registrationBytes = encodeBrowserDeviceRegistrationTranscript(
@@ -502,6 +574,10 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
       envelope,
       envelope_sha256: await sha256Wire(new TextEncoder().encode(envelope)),
     },
+    live_answer: {
+      envelope: liveAnswer,
+      envelope_sha256: await sha256Wire(new TextEncoder().encode(liveAnswer)),
+    },
     registration: {
       user_id: userId,
       browser_public_key: browserPublicKey,
@@ -529,5 +605,5 @@ if (!rustVerification.includes("Rust verified WebCrypto artifacts")) {
   throw new Error("Rust verification did not emit its success marker");
 }
 console.log(
-  "cross-runtime-crypto: passed fresh Rust <-> WebCrypto exchange for signed signal, signed wire, browser registration, and host pairing",
+  "cross-runtime-crypto: passed fresh Rust <-> WebCrypto exchange for signed signal, signed wire, live verified answer SDP, browser registration, and host pairing",
 );

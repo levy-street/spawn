@@ -36,6 +36,9 @@ printf '%s\n' "== no server agent upload guard =="
 scripts/check-no-server-agent-upload.sh --self-test
 scripts/check-no-server-agent-upload.sh
 
+printf '%s\n' "== signed RTC verified-SDP guard =="
+scripts/check-signed-rtc-live.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

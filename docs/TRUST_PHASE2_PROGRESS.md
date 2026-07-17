@@ -567,7 +567,8 @@ gate requires zero unresolved findings before these foundations are described
 as a combined trusted or done trust model.
 
 The audit's cross-runtime finding now has a bounded executable regression gate:
-fresh Rust and WebCrypto identities exchange signed-signal, signed-wire,
+fresh Rust and WebCrypto identities exchange signed-signal, signed-wire, a
+host-signed answer consumed by the browser live-answer adapter,
 browser-registration, and host-pair artifacts in both directions. Each receiver
 recomputes canonical bytes and SHA-256, verifies the other runtime's signature,
 and checks the exact SDP and derived fingerprint text. This runner is wired into
@@ -648,6 +649,39 @@ string but deliberately refuses it before RTC negotiation: F2 must verify pins
 and feed only `verified.transcript.sdp`. No live MITM-resistance or L1 claim is
 made until F2, reciprocal pins, signed-only cutover, and the remaining live
 gates pass.
+
+**P3-LIVE-F2 browser endpoint candidate (implemented, independent review
+pending):** both browser RTC consumers now have an immutable per-generation
+signed mode. `useAgentSocket` and `HostControlClient` construct the opaque
+offer through one injected epoch-scoped signing operation and exact local Host
+pin; when that capability is present, only `signed_envelope` leaves the
+browser. The matching answer path calls the common live adapter, independently
+verifies the exact daemon pin and browser intended-peer key, compares the
+verified session/scope/protocol/version/kind/role with local state, and passes
+only `verified.transcript.sdp` to `setRemoteDescription`. A raw sibling is
+ignored rather than used as fallback. Missing, malformed, stripped, wrong-pin,
+wrong-peer, mutated, replayed, second, or topology-mismatched answers seal the
+generation and close the peer. A fresh RTC retry must use a fresh session and
+gate.
+
+Deterministic agent and HostControl adapter tests substitute an outer hostile
+fingerprint while the signed transcript remains valid, and assert that only
+the transcript copy reaches the mocked peer. The HostControl production path
+has the same integration regression. The fresh Rust/WebCrypto executable gate
+now also has Rust create a host-signed answer which WebCrypto verifies and
+applies through this production adapter; the reverse WebCrypto answer is
+verified by Rust. A small grep-level source guard inventories the two live
+consumers and every production `setRemoteDescription` site. The exact staged
+caller inventory and remaining dependencies are recorded in
+[`TRUST_PHASE3_F2_INVENTORY.md`](TRUST_PHASE3_F2_INVENTORY.md).
+
+This is only the browser endpoint half of F2 and remains deliberately
+dependency-injected until the independently reviewed browser trust-scope and
+per-destination local pin resolver are integrated. The daemon still refuses a
+signed offer before RTC negotiation and does not yet verify the browser offer
+or sign its live answer. Legacy browser construction remains for the later
+coordinated signed-only cutover. Therefore F2 as a whole, F3/F4/F6, the live
+daemon exchange, the signed-only cutover, and L1 all remain open.
 
 The final integration makes verified types mandatory in daemon
 `handle_offer`/`handle_host_offer` and centralized browser remote-description

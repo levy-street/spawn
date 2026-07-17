@@ -306,11 +306,14 @@ untrusted structural/routing checks, and never verifies its signature or
 supplies a peer-key pin. Its live UTF-8 bound is 512 KiB; JSON nesting is then
 bounded by the existing 1,100 KiB WebSocket and 1,200 KiB Redis limits. The
 initiating offer freezes signed-versus-legacy mode for the RTC generation, so a
-signed offer cannot receive a raw or mixed answer. Current endpoints still use
-the raw examples below until F2 installs verification and feeds only verified
-transcript SDP to WebRTC; the daemon refuses an opaque signed offer before RTC
-negotiation in this intermediate state. Thus these raw examples are staged
-compatibility, not a trusted or downgrade-resistant final mode.
+signed offer cannot receive a raw or mixed answer. The review-pending F2 browser
+candidate selects that mode only when its caller supplies an epoch-scoped
+browser signing operation and exact active local Host pin; its agent and
+HostControl consumers verify the answer and feed only the verified transcript
+SDP to WebRTC. The daemon still refuses an opaque signed offer before RTC
+negotiation, and legacy browser construction remains until the trust-scope,
+daemon, and signed-only-cutover work is integrated. Thus these raw examples are
+staged compatibility, not a trusted or downgrade-resistant final mode.
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",

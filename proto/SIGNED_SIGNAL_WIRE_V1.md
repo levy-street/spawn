@@ -1,10 +1,12 @@
 # Signed RTC JSON wire envelope v1
 
 This adapter carries the accepted signed-signal transcript on an endpoint
-boundary. The F1 relay prerequisite can now carry its exact JSON text as one
-opaque `signed_envelope` string, but endpoint signing, pin verification, and
-verified-SDP consumption are not installed on the live RTC path yet. The
-carrier does not establish key trust, pin distribution, TOFU, or L1.
+boundary. The F1 relay prerequisite can carry its exact JSON text as one opaque
+`signed_envelope` string. A review-pending F2 browser candidate now signs offers
+through an injected trust-epoch operation and makes both browser RTC consumers
+apply only a pin-verified answer transcript; daemon offer verification and live
+answer signing are still absent. The carrier and browser prerequisite do not by
+themselves establish pin provenance, the signed-only cutover, TOFU, or L1.
 
 An envelope is one JSON object containing exactly these fields:
 
