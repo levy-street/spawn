@@ -130,6 +130,8 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
+  /** Immediately close every signaling/WebRTC transport owned by this terminal. */
+  disconnect: () => void;
   /** Raw stdin into the agent (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
   /** Tell the agent the new TTY size. */
@@ -2769,6 +2771,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   useImperativeHandle(
     ref,
     () => ({
+      disconnect: socket.disconnect,
       sendInput: (data) => {
         hideScrollbackOverlay();
         socket.sendBinary(data);

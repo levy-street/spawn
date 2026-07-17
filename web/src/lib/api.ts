@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { invalidateBrowserTrust } from "@/lib/browser-trust-events";
 
 /**
  * Typed REST helpers. Shapes mirror `/proto/README.md` exactly.
@@ -41,6 +42,7 @@ export async function api<T>(
   });
 
   if (!res.ok) {
+    if (res.status === 401) invalidateBrowserTrust("unauthorized");
     let body: { code?: string; message?: string; detail?: unknown } | undefined;
     try {
       body = await res.json();
@@ -303,9 +305,10 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
-  me: () =>
+  me: (signal?: AbortSignal) =>
     api("/api/me", {
       method: "GET",
+      signal,
       schema: z.object({ user: UserSchema }),
     }),
   providers: () =>

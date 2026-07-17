@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth } from "@/lib/api";
+import { commitAuthenticatedUser } from "@/lib/auth";
 
 export default function SignupPage() {
   const router = useRouter();
@@ -25,8 +26,7 @@ export default function SignupPage() {
     setSubmitting(true);
     try {
       const result = await auth.signup({ email, password });
-      queryClient.setQueryData(["me"], { user: result.user });
-      void queryClient.invalidateQueries({ queryKey: ["me"] });
+      commitAuthenticatedUser(queryClient, result.user);
       router.replace("/");
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Signup failed";

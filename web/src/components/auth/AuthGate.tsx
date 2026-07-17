@@ -10,17 +10,27 @@ import { useAuth } from "@/lib/auth";
  * flash the page contents to anonymous users.
  */
 export function AuthGate({ children }: { children: ReactNode }) {
-  const { user, loading } = useAuth();
+  const { user, loading, error } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
-    if (!loading && !user) router.replace("/login");
-  }, [loading, user, router]);
+    if (!loading && !error && !user) router.replace("/login");
+  }, [error, loading, user, router]);
 
   if (loading) {
     return (
       <div className="flex min-h-vv items-center justify-center text-sm text-muted-foreground">
         Loading...
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div
+        className="flex min-h-vv items-center justify-center text-sm text-destructive"
+        role="alert"
+      >
+        Authentication is unavailable. Retry before continuing.
       </div>
     );
   }

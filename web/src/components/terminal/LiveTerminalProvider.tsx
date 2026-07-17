@@ -6,13 +6,20 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { createPortal } from "react-dom";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { destroyLiveTerminalEntries } from "@/components/terminal/live-terminal-pool";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import { useBrowserTrust } from "@/lib/browser-trust";
+import {
+  getBrowserTrustSessionSnapshot,
+  subscribeBrowserTrustSession,
+} from "@/lib/browser-trust-events";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -27,9 +34,10 @@ export type AgentLive = {
   displayState: DisplayControlState | null;
 };
 
-/** Stable actions — this context value never changes, so a placeholder's
- *  `attach` ref callback (which depends on it) never re-fires spuriously. */
+/** Actions stay stable within a trust epoch. The epoch transition deliberately
+ *  changes this value so mounted placeholders try a fresh, gated claim. */
 type Actions = {
+  epochKey: string;
   claim: (agentId: string, container: HTMLElement, token: symbol) => void;
   release: (agentId: string, token: symbol) => void;
   getHandle: (agentId: string) => TerminalHandle | null;
@@ -49,9 +57,14 @@ type PoolEntry = {
   handleRef: { current: TerminalHandle | null };
   token: symbol | null;
   lastAt: number;
+  trustEpochKey: string;
+  accountOwnerUserId: string;
 };
 
 export function LiveTerminalProvider({ children }: { children: ReactNode }) {
+  const trust = useBrowserTrust();
+  const trustRef = useRef(trust);
+  trustRef.current = trust;
   const entriesRef = useRef<Map<string, PoolEntry>>(new Map());
   const parkRef = useRef<HTMLDivElement | null>(null);
   const [warmIds, setWarmIds] = useState<string[]>([]);
@@ -64,11 +77,46 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     return clockRef.current;
   }, []);
 
+  const appliedTrustEpochRef = useRef<string | null>(null);
+  const hardReset = useCallback(() => {
+    destroyLiveTerminalEntries(entriesRef.current.values());
+    entriesRef.current.clear();
+    clockRef.current = 0;
+    setWarmIds([]);
+    setClaimed({});
+    setLive({});
+  }, []);
+
+  useLayoutEffect(() => {
+    const nextEpoch = trust.status === "trusted" ? trust.epochKey : null;
+    if (appliedTrustEpochRef.current === nextEpoch) return;
+    appliedTrustEpochRef.current = null;
+    hardReset();
+    if (nextEpoch !== null && getBrowserTrustSessionSnapshot().status !== "invalidated") {
+      appliedTrustEpochRef.current = nextEpoch;
+    }
+  }, [hardReset, trust.epochKey, trust.status]);
+
+  useEffect(() => {
+    return subscribeBrowserTrustSession(() => {
+      if (getBrowserTrustSessionSnapshot().status !== "invalidated") return;
+      appliedTrustEpochRef.current = null;
+      hardReset();
+    });
+  }, [hardReset]);
+
+  useEffect(() => {
+    return () => {
+      destroyLiveTerminalEntries(entriesRef.current.values());
+      entriesRef.current.clear();
+    };
+  }, []);
+
   const evict = useCallback((agentId: string) => {
     const entry = entriesRef.current.get(agentId);
     if (!entry || entry.token !== null) return; // never evict a claimed terminal
     entriesRef.current.delete(agentId);
-    entry.host.parentElement?.removeChild(entry.host);
+    destroyLiveTerminalEntries([entry]);
     setWarmIds((ids) => ids.filter((id) => id !== agentId));
     setClaimed((m) => {
       if (!(agentId in m)) return m;
@@ -98,11 +146,31 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
 
   const claim = useCallback(
     (agentId: string, container: HTMLElement, token: symbol) => {
+      const currentTrust = trustRef.current;
+      if (
+        currentTrust.status !== "trusted" ||
+        appliedTrustEpochRef.current !== currentTrust.epochKey ||
+        getBrowserTrustSessionSnapshot().status === "invalidated"
+      ) {
+        return;
+      }
       let entry = entriesRef.current.get(agentId);
+      if (entry && entry.trustEpochKey !== currentTrust.epochKey) {
+        hardReset();
+        entry = undefined;
+      }
       if (!entry) {
         const host = document.createElement("div");
         host.style.display = "contents";
-        entry = { host, handleRef: { current: null }, token, lastAt: nextClock() };
+        host.dataset.liveTerminalPoolHost = agentId;
+        entry = {
+          host,
+          handleRef: { current: null },
+          token,
+          lastAt: nextClock(),
+          trustEpochKey: currentTrust.epochKey,
+          accountOwnerUserId: currentTrust.accountOwnerUserId,
+        };
         entriesRef.current.set(agentId, entry);
         setWarmIds((ids) => (ids.includes(agentId) ? ids : [...ids, agentId]));
       }
@@ -112,7 +180,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       setClaimed((m) => (m[agentId] ? m : { ...m, [agentId]: true }));
       enforceLimit();
     },
-    [enforceLimit, nextClock],
+    [enforceLimit, hardReset, nextClock],
   );
 
   const release = useCallback((agentId: string, token: symbol) => {
@@ -124,27 +192,40 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     setClaimed((m) => (m[agentId] ? { ...m, [agentId]: false } : m));
   }, []);
 
-  const getHandle = useCallback(
-    (agentId: string) => entriesRef.current.get(agentId)?.handleRef.current ?? null,
-    [],
-  );
+  const getHandle = useCallback((agentId: string) => {
+    const currentTrust = trustRef.current;
+    const entry = entriesRef.current.get(agentId);
+    if (
+      currentTrust.status !== "trusted" ||
+      appliedTrustEpochRef.current !== currentTrust.epochKey ||
+      entry?.trustEpochKey !== currentTrust.epochKey
+    ) {
+      return null;
+    }
+    return entry.handleRef.current;
+  }, []);
 
-  const onInfo = useCallback((agentId: string, connInfo: AgentConnectionInfo) => {
+  const onInfo = useCallback((agentId: string, epochKey: string, connInfo: AgentConnectionInfo) => {
+    if (entriesRef.current.get(agentId)?.trustEpochKey !== epochKey) return;
     setLive((m) => ({
       ...m,
       [agentId]: { ...m[agentId], connInfo, displayState: m[agentId]?.displayState ?? null },
     }));
   }, []);
-  const onDisplay = useCallback((agentId: string, displayState: DisplayControlState) => {
-    setLive((m) => ({
-      ...m,
-      [agentId]: { ...m[agentId], displayState, connInfo: m[agentId]?.connInfo ?? null },
-    }));
-  }, []);
+  const onDisplay = useCallback(
+    (agentId: string, epochKey: string, displayState: DisplayControlState) => {
+      if (entriesRef.current.get(agentId)?.trustEpochKey !== epochKey) return;
+      setLive((m) => ({
+        ...m,
+        [agentId]: { ...m[agentId], displayState, connInfo: m[agentId]?.connInfo ?? null },
+      }));
+    },
+    [],
+  );
 
   const actions = useMemo<Actions>(
-    () => ({ claim, release, getHandle }),
-    [claim, release, getHandle],
+    () => ({ epochKey: trust.epochKey, claim, release, getHandle }),
+    [claim, release, getHandle, trust.epochKey],
   );
   const warm = useMemo(() => Object.fromEntries(warmIds.map((id) => [id, true])), [warmIds]);
   const state = useMemo<State>(() => ({ live, warm, claimed }), [live, warm, claimed]);
@@ -180,6 +261,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               active={!!claimed[id]}
               host={entry.host}
               handleRef={entry.handleRef}
+              trustEpochKey={entry.trustEpochKey}
               onInfo={onInfo}
               onDisplay={onDisplay}
             />
@@ -195,6 +277,7 @@ function PooledTerminal({
   active,
   host,
   handleRef,
+  trustEpochKey,
   onInfo,
   onDisplay,
 }: {
@@ -202,8 +285,9 @@ function PooledTerminal({
   active: boolean;
   host: HTMLDivElement;
   handleRef: { current: TerminalHandle | null };
-  onInfo: (agentId: string, info: AgentConnectionInfo) => void;
-  onDisplay: (agentId: string, state: DisplayControlState) => void;
+  trustEpochKey: string;
+  onInfo: (agentId: string, epochKey: string, info: AgentConnectionInfo) => void;
+  onDisplay: (agentId: string, epochKey: string, state: DisplayControlState) => void;
 }) {
   return createPortal(
     <div className="size-full @container/term">
@@ -216,8 +300,8 @@ function PooledTerminal({
         imagePasteMode="bracketed-path"
         active={active}
         autoTakeControl={active}
-        onConnectionInfo={(info) => onInfo(agentId, info)}
-        onDisplayControl={(state) => onDisplay(agentId, state)}
+        onConnectionInfo={(info) => onInfo(agentId, trustEpochKey, info)}
+        onDisplayControl={(state) => onDisplay(agentId, trustEpochKey, state)}
       />
     </div>,
     host,

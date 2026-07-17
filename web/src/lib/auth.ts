@@ -1,7 +1,8 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { type QueryClient, useQuery } from "@tanstack/react-query";
 import { ApiError, auth, type User } from "@/lib/api";
+import { establishBrowserTrustSession, invalidateBrowserTrust } from "@/lib/browser-trust-events";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses
@@ -11,9 +12,9 @@ import { ApiError, auth, type User } from "@/lib/api";
 export function useAuth() {
   const q = useQuery<{ user: User } | null>({
     queryKey: ["me"],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       try {
-        return await auth.me();
+        return await auth.me(signal);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) return null;
         throw err;
@@ -31,7 +32,20 @@ export function useAuth() {
   };
 }
 
+/** Commit a new cookie-authenticated account without retaining old-account cache. */
+export function commitAuthenticatedUser(queryClient: QueryClient, user: User): void {
+  invalidateBrowserTrust("account_change");
+  const oldAccountPredicate = (query: { queryKey: readonly unknown[] }) =>
+    query.queryKey[0] !== "me";
+  void queryClient.cancelQueries({ predicate: oldAccountPredicate });
+  queryClient.removeQueries({ predicate: oldAccountPredicate });
+  queryClient.setQueryData(["me"], { user });
+  establishBrowserTrustSession(user.id);
+  void queryClient.invalidateQueries({ queryKey: ["me"] });
+}
+
 export async function logout() {
+  invalidateBrowserTrust("logout");
   await auth.logout();
   if (typeof window !== "undefined") window.location.assign("/login");
 }

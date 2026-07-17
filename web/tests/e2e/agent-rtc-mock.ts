@@ -14,6 +14,7 @@ export async function installAgentRtcMock(
     autoSnapshot?: boolean;
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
+    onChannelClose?: (label: string) => void | Promise<void>;
     onPtyInput?: (bytes: Buffer) => void | Promise<void>;
     onUpload?: (upload: {
       name: string;
@@ -41,6 +42,9 @@ export async function installAgentRtcMock(
       });
     },
   );
+  await page.exposeFunction("__spawnRecordRtcTestClose", async (label: string) => {
+    await options.onChannelClose?.(label);
+  });
   await page.addInitScript(
     ({
       history,
@@ -339,6 +343,11 @@ export async function installAgentRtcMock(
           if (this.readyState === "closed") return;
           this.readyState = "closed";
           this.onclose?.();
+          void (
+            window as unknown as {
+              __spawnRecordRtcTestClose: (label: string) => Promise<void>;
+            }
+          ).__spawnRecordRtcTestClose(this.label);
         }
 
         open() {
@@ -455,6 +464,8 @@ export async function installAgentRtcMock(
             releaseHeldUploadCompletion: () => void;
             queueActiveUploadCompletion: () => boolean;
             replaceRtcGeneration: () => void;
+            connectionCount: () => number;
+            ptyChannelStates: () => RTCDataChannelState[];
           };
         }
       ).__spawnRtcTest = {
@@ -526,6 +537,12 @@ export async function installAgentRtcMock(
         },
         replaceRtcGeneration() {
           state.channels.get("spawn.ctl")?.close();
+        },
+        connectionCount() {
+          return state.connections;
+        },
+        ptyChannelStates() {
+          return state.ptyChannels.map((channel) => channel.readyState);
         },
       };
     },

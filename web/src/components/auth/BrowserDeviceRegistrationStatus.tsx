@@ -9,7 +9,7 @@ export function BrowserDeviceRegistrationStatus() {
   const { user } = useAuth();
   const registration = useBrowserDeviceRegistration(user?.id);
 
-  if (!user || registration.isLoading || registration.data?.status === "ready") return null;
+  if (!user || registration.isLoading) return null;
 
   if (registration.isError) {
     return (
@@ -31,6 +31,8 @@ export function BrowserDeviceRegistrationStatus() {
       </div>
     );
   }
+
+  if (registration.data?.status === "ready") return null;
 
   const cleanupPending = registration.data?.status === "cleanup_pending";
   return (

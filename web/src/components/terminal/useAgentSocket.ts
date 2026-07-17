@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AGENT_CTL_MAX_PENDING_PTY_BYTES,
   AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER,
@@ -162,6 +162,7 @@ export function useAgentSocket({
   const [dcOpen, setDcOpen] = useState(false);
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
   const wsRef = useRef<WebSocket | null>(null);
+  const disconnectRef = useRef<() => void>(() => {});
   const activeAgentIdRef = useRef<string | null>(null);
   const agentGenerationRef = useRef(0);
   const rtcGenerationRef = useRef(0);
@@ -276,12 +277,16 @@ export function useAgentSocket({
       clearRtcConnectTimer();
       clearRtcDisconnectedTimer();
       if (signal && sessionId && bindingNonce) {
-        sendJsonOverWs({
-          type: "rtc.close",
-          session_id: sessionId,
-          binding_nonce: bindingNonce,
-          ...boundAgentRtcTuple,
-        });
+        try {
+          sendJsonOverWs({
+            type: "rtc.close",
+            session_id: sessionId,
+            binding_nonce: bindingNonce,
+            ...boundAgentRtcTuple,
+          });
+        } catch {
+          // Local transport teardown is mandatory even if signaling is broken.
+        }
       }
       rtcRef.current = {
         agentId: null,
@@ -300,6 +305,10 @@ export function useAgentSocket({
       };
       try {
         rtc.ptyDc?.close();
+      } catch {
+        // ignore
+      }
+      try {
         rtc.ctlDc?.close();
       } catch {
         // ignore
@@ -1244,16 +1253,21 @@ export function useAgentSocket({
       reconnectTimer = setTimeout(connect, delay);
     };
 
-    connect();
-
-    return () => {
+    const disconnect = () => {
+      if (cancelled) return;
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
+      if (isCurrentAgentGeneration()) {
+        try {
+          cleanupRtc(true);
+        } catch {
+          // Continue with signaling-socket teardown below.
+        }
+      }
       if (isCurrentAgentGeneration() && wsRef.current) {
         const ws = wsRef.current;
         try {
-          cleanupRtc(true);
           wsRef.current = null;
           ws.onopen = null;
           ws.onmessage = null;
@@ -1266,6 +1280,13 @@ export function useAgentSocket({
       }
       pendingInputRef.current.clear();
       if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
+    };
+    disconnectRef.current = disconnect;
+    connect();
+
+    return () => {
+      disconnect();
+      if (disconnectRef.current === disconnect) disconnectRef.current = () => {};
     };
   }, [agentId, enabled]);
 
@@ -1391,5 +1412,7 @@ export function useAgentSocket({
     return uploadRef.current(blob, options);
   };
 
-  return { state, v2, dcOpen, connInfo, sendBinary, sendJson, uploadFile };
+  const disconnect = useCallback(() => disconnectRef.current(), []);
+
+  return { state, v2, dcOpen, connInfo, sendBinary, sendJson, uploadFile, disconnect };
 }
