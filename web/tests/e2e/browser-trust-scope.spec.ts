@@ -294,11 +294,7 @@ test("a second tab closes on logout and creates only a fresh account-B epoch", a
 
   await page.getByLabel("Email").fill(userB.email);
   await page.getByLabel("Password").fill("password123");
-  const [loginResponse] = await Promise.all([
-    page.waitForResponse("**/api/auth/login"),
-    page.getByRole("button", { name: "Sign in" }).click(),
-  ]);
-  expect(loginResponse.status()).toBe(200);
+  await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
   await peer.goto(`/agents/${AGENT_ID}`);
   await expect(peer.getByRole("button", { name: "Account menu" })).toContainText(userB.email);

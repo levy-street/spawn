@@ -593,7 +593,10 @@ pending requests, and streams. A bounded invalidation-only cross-tab protocol
 uses BroadcastChannel with an independent storage fallback; a receiving tab
 cannot trust the message as identity evidence and must perform fresh `/me` and
 browser-registration reads before establishing a replacement epoch. Replay
-memory, message size, and per-epoch HostControl clients are bounded.
+state uses monotonic per-sender high-water slots retained through the complete
+message-validity and clock-skew window. Live slots are never evicted: a fixed
+sender cap rejects new senders until expired state can be pruned safely.
+Message size and per-epoch HostControl clients are likewise bounded.
 
 All production HostControl construction now crosses one registry that requires
 the account owner, exact epoch, active browser registration, and an explicit
