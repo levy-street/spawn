@@ -19,6 +19,7 @@ mod creds;
 mod host_control;
 mod host_direct;
 mod host_files;
+mod host_signal;
 mod login;
 mod proto;
 mod pty;

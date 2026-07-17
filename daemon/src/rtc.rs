@@ -35,6 +35,7 @@ use crate::agent_ctl::{
 };
 use crate::agents::{AgentBinding, AgentRegistry};
 use crate::host_files::HostFileService;
+use crate::host_signal::HostConnectedSignal;
 use crate::proto::{Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
 use crate::upload::{
@@ -220,27 +221,6 @@ pub(crate) struct HostRtcBinding {
     pub(crate) binding_nonce: String,
     pub(crate) protocol: String,
     pub(crate) protocol_version: u16,
-}
-
-/// The only server-signaling capability exposed to the protected host-control
-/// module. Its private sender and fixed operation prevent that module from
-/// forwarding arbitrary values or host-file content to the server uplink.
-#[derive(Clone)]
-pub(crate) struct HostConnectedSignal {
-    out_tx: mpsc::Sender<WsOutbound>,
-    session_id: String,
-    binding: HostRtcBinding,
-}
-
-impl HostConnectedSignal {
-    pub(crate) fn publish(&self) -> bool {
-        try_send_host_status(
-            &self.out_tx,
-            self.session_id.clone(),
-            &self.binding,
-            "connected",
-        )
-    }
 }
 
 /// Immutable host-scope identity supplied on offer/candidate/close frames.
@@ -3114,11 +3094,7 @@ fn install_host_control_channel(
     out_tx: mpsc::Sender<WsOutbound>,
     files_override: Option<Arc<HostFileService>>,
 ) {
-    let connected_signal = HostConnectedSignal {
-        out_tx,
-        session_id: session_id.clone(),
-        binding: binding.clone(),
-    };
+    let connected_signal = HostConnectedSignal::new(out_tx, session_id, binding);
     crate::host_control::install(dc, connected_signal, files_override);
 }
 

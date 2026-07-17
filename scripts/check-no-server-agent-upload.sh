@@ -163,22 +163,39 @@ import sys
 
 root = sys.argv[1]
 direct_path = os.path.join(root, "daemon/src/host_direct.rs")
+signal_path = os.path.join(root, "daemon/src/host_signal.rs")
 control_path = os.path.join(root, "daemon/src/host_control.rs")
 rtc_path = os.path.join(root, "daemon/src/rtc.rs")
+main_path = os.path.join(root, "daemon/src/main.rs")
 
 with open(direct_path, "rb") as source:
     direct_bytes = source.read()
 direct = direct_bytes.decode()
+with open(signal_path, "rb") as source:
+    signal_bytes = source.read()
+signal = signal_bytes.decode()
 with open(control_path, encoding="utf-8") as source:
     control = source.read()
 with open(rtc_path, encoding="utf-8") as source:
     rtc = source.read()
+with open(main_path, encoding="utf-8") as source:
+    main = source.read()
 
 expected_direct_hash = "f4dbb1951394b94d6327dfb31b62f308e66d636385e077539180ef51024ad32b"
 if hashlib.sha256(direct_bytes).hexdigest() != expected_direct_hash:
     raise SystemExit(
         "no-server-agent-upload: protected host direct module changed; review its complete capability inventory"
     )
+
+expected_signal_hash = "067e64aacd59f2f74749f1dffd9759337b6f62c4dafaaf7c66b78130d769ebc6"
+if hashlib.sha256(signal_bytes).hexdigest() != expected_signal_hash:
+    raise SystemExit(
+        "no-server-agent-upload: fixed host signaling capability changed; review its complete implementation"
+    )
+if main.count("mod host_signal;") != 1 or main.count("mod host_direct;") != 1:
+    raise SystemExit("no-server-agent-upload: protected module resolution changed")
+if re.search(r"#\s*\[\s*path\s*=.*?\]", main, re.DOTALL):
+    raise SystemExit("no-server-agent-upload: path-based module substitution is not allowed")
 
 if "crate::" in direct:
     raise SystemExit("no-server-agent-upload: protected host direct module gained a crate-local dependency")
@@ -195,10 +212,10 @@ use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
 };
-use crate::rtc::HostConnectedSignal;"""
+use crate::host_signal::HostConnectedSignal;"""
 if control.count(expected_control_imports) != 1:
     raise SystemExit("no-server-agent-upload: protected host-control dependency list changed")
-if set(re.findall(r"crate::(\w+)", control)) != {"host_direct", "host_files", "rtc"}:
+if set(re.findall(r"crate::(\w+)", control)) != {"host_direct", "host_files", "host_signal"}:
     raise SystemExit("no-server-agent-upload: protected host-control gained an unreviewed crate dependency")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
@@ -213,48 +230,49 @@ expected_control_export = """pub(crate) fn install(
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
 ) {"""
-control_exports = list(re.finditer(r"(?m)^pub(?:\([^\n)]*\))?\s+", control))
+control_exports = list(
+    re.finditer(r"(?m)^[ \t]*(?P<export>pub(?:\([^\n)]*\))?\s+)", control)
+)
 if len(control_exports) != 1 or not control.startswith(
-    expected_control_export, control_exports[0].start()
+    expected_control_export, control_exports[0].start("export")
 ):
     raise SystemExit(
         "no-server-agent-upload: protected host-control exported surface changed"
     )
 if control.count("connected_signal: HostConnectedSignal") != 1:
     raise SystemExit("no-server-agent-upload: narrow connected signal capability changed")
-if control.count("connected_signal.publish()") != 1:
+if len(re.findall(r"\bconnected_signal\b", control)) != 4:
+    raise SystemExit("no-server-agent-upload: connected signal was aliased or used outside its fixed topology")
+signal_calls = re.findall(r"\bconnected_signal\s*\.\s*(\w+)\s*\(", control)
+if signal_calls != ["clone", "publish"] or control.count("connected_signal.publish()") != 1:
     raise SystemExit("no-server-agent-upload: connected signal publication topology changed")
-
-capability = re.search(
-    r"#\[derive\(Clone\)\]\npub\(crate\) struct HostConnectedSignal \{.*?\n\}\n\n"
-    r"impl HostConnectedSignal \{.*?\n\}\n",
-    rtc,
-    re.DOTALL,
-)
-if capability is None:
-    raise SystemExit("no-server-agent-upload: narrow connected signal capability is missing")
-expected_capability = """#[derive(Clone)]
-pub(crate) struct HostConnectedSignal {
-    out_tx: mpsc::Sender<WsOutbound>,
-    session_id: String,
-    binding: HostRtcBinding,
+expected_symbol_counts = {
+    "daemon/src/host_signal.rs": 2,
+    "daemon/src/host_control.rs": 2,
+    "daemon/src/rtc.rs": 2,
 }
-
-impl HostConnectedSignal {
-    pub(crate) fn publish(&self) -> bool {
-        try_send_host_status(
-            &self.out_tx,
-            self.session_id.clone(),
-            &self.binding,
-            "connected",
-        )
-    }
-}
-"""
-if capability.group(0) != expected_capability:
-    raise SystemExit("no-server-agent-upload: narrow connected signal acquired arbitrary payload power")
-if len(re.findall(r"HostConnectedSignal\s*\{\s*out_tx,", rtc)) != 1:
-    raise SystemExit("no-server-agent-upload: connected signal construction escaped the RTC boundary")
+found_symbol_counts = {}
+daemon_root = os.path.join(root, "daemon/src")
+for directory, names, files in os.walk(daemon_root):
+    names[:] = [name for name in names if name != "target"]
+    for name in files:
+        if not name.endswith(".rs"):
+            continue
+        path = os.path.join(directory, name)
+        with open(path, encoding="utf-8") as source:
+            count = len(re.findall(r"\bHostConnectedSignal\b", source.read()))
+        if count:
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            found_symbol_counts[relative] = count
+if found_symbol_counts != expected_symbol_counts:
+    raise SystemExit(
+        "no-server-agent-upload: host connected capability escaped its fixed module/use inventory: "
+        + repr(found_symbol_counts)
+    )
+if rtc.count("use crate::host_signal::HostConnectedSignal;") != 1 or rtc.count(
+    "HostConnectedSignal::new(out_tx, session_id, binding)"
+) != 1:
+    raise SystemExit("no-server-agent-upload: connected signal construction topology changed")
 PY
 
   for line in "$web_encode" "$web_type" "$web_late" "$web_check" "$web_decode"; do
@@ -553,10 +571,11 @@ self_test() {
     '    log.warning("retired server-visible agent upload error; closing")' \
     '    reason="agent upload errors belong on spawn.ctl"' \
     >"$fixture/server/spawn_server/ws/daemon.py"
-  printf '%s\n' 'fn main() {}' >"$fixture/daemon/src/main.rs"
+  cp "$source_root/daemon/src/main.rs" "$fixture/daemon/src/main.rs"
   cp "$source_root/daemon/src/rtc.rs" "$fixture/daemon/src/rtc.rs"
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
+  cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
   printf '%s\n' \
     'async writeStream() {' \
@@ -681,6 +700,51 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$host_direct_original" >"$fixture/daemon/src/host_direct.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local host_signal_original
+  host_signal_original="$(<"$fixture/daemon/src/host_signal.rs")"
+  printf '%s\n' \
+    "$host_signal_original" \
+    'impl HostConnectedSignal {' \
+    '  pub(crate) fn publish_protected(&self, protected: serde_json::Value) -> bool {' \
+    '    self.out_tx.try_send(WsOutbound::json(protected.to_string())).is_ok()' \
+    '  }' \
+    '}' \
+    >"$fixture/daemon/src/host_signal.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: second connected-signal inherent impl passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_signal_original" >"$fixture/daemon/src/host_signal.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$host_signal_original" \
+    'pub(crate) trait ArbitraryPublisher {' \
+    '  fn emit(&self, protected: serde_json::Value) -> bool;' \
+    '}' \
+    'impl ArbitraryPublisher for HostConnectedSignal {' \
+    '  fn emit(&self, protected: serde_json::Value) -> bool {' \
+    '    self.out_tx.try_send(WsOutbound::json(protected.to_string())).is_ok()' \
+    '  }' \
+    '}' \
+    >"$fixture/daemon/src/host_signal.rs"
+  printf '%s\n' \
+    "$host_control_original" \
+    'use crate::host_signal::ArbitraryPublisher as OpaquePublisher;' \
+    'fn relay_via_trait_alias(capability: &HostConnectedSignal, protected: Value) -> bool {' \
+    '  OpaquePublisher::emit(capability, protected)' \
+    '}' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: connected-signal trait impl alias passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_signal_original" >"$fixture/daemon/src/host_signal.rs"
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   printf '%s\n' \

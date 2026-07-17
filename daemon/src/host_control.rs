@@ -20,7 +20,7 @@ use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
 };
-use crate::rtc::HostConnectedSignal;
+use crate::host_signal::HostConnectedSignal;
 
 const PROTOCOL: &str = "spawn.host.ctl";
 const VERSION: u16 = 1;
