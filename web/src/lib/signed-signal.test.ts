@@ -1,15 +1,17 @@
 import { describe, expect, test } from "bun:test";
-
+import negativeKeysJson from "../../../proto/ed25519-public-key-negative-vectors.json";
 import goldenJson from "../../../proto/signed-signal-v1-vectors.json";
 import {
   decodeBase64Url,
   decodeSignedSignalTranscript,
   ED25519_PUBLIC_KEY_BYTES,
+  ED25519_PUBLIC_KEY_WIRE_CHARS,
+  ED25519_SIGNATURE_WIRE_CHARS,
   encodeBase64Url,
   encodeSignedSignalTranscript,
   exportEd25519PublicKeyWire,
   generateEd25519IdentityKeyPair,
-  importEd25519PrivateKeyPkcs8,
+  importEd25519PublicKey,
   importEd25519PublicKeyWire,
   MAX_SCOPE_ID_BYTES,
   MAX_SDP_BYTES,
@@ -56,6 +58,25 @@ interface GoldenFile {
 }
 
 const golden = goldenJson as GoldenFile;
+
+interface NegativeKeyVector {
+  id: string;
+  public_key_hex: string;
+}
+
+interface NegativeKeyFile {
+  format: string;
+  weak_public_keys: NegativeKeyVector[];
+  noncanonical_public_key_hex: string[];
+  invalid_encodings: NegativeKeyVector[];
+  accepted_mixed_torsion_public_key_hex: string[];
+  universal_forgery: {
+    public_key_id: string;
+    signature_hex: string;
+  };
+}
+
+const negativeKeys = negativeKeysJson as NegativeKeyFile;
 
 function hexToBytes(value: string): Uint8Array {
   if (value.length % 2 !== 0 || !/^[0-9a-f]*$/u.test(value)) throw new Error("invalid test hex");
@@ -118,6 +139,21 @@ function mutate(original: SignedSignalTranscript, field: string): SignedSignalTr
 function privateKeyPkcs8(seedHex: string): Uint8Array {
   // RFC 8410 OneAsymmetricKey prefix for a 32-byte Ed25519 seed.
   return hexToBytes(`302e020100300506032b657004220420${seedHex}`);
+}
+
+async function importTestEd25519PrivateKey(seedHex: string): Promise<CryptoKey> {
+  const pkcs8 = privateKeyPkcs8(seedHex);
+  try {
+    return await crypto.subtle.importKey(
+      "pkcs8",
+      pkcs8.buffer as ArrayBuffer,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+  } finally {
+    pkcs8.fill(0);
+  }
 }
 
 describe("signed signaling transcript", () => {
@@ -219,6 +255,13 @@ describe("signed signaling transcript", () => {
     expect(() => decodeBase64Url(golden.signing_key.public_key_wire, 31)).toThrow(
       "canonical base64url",
     );
+    expect(ED25519_PUBLIC_KEY_WIRE_CHARS).toBe(43);
+    expect(ED25519_SIGNATURE_WIRE_CHARS).toBe(86);
+  });
+
+  test("rejects oversized fixed-width wire values before base64 decoding", () => {
+    const huge = "A".repeat(16 * 1024 * 1024);
+    expect(() => decodeBase64Url(huge, ED25519_PUBLIC_KEY_BYTES)).toThrow("canonical base64url");
   });
 });
 
@@ -235,9 +278,7 @@ describe("shared Rust/WebCrypto Ed25519 vectors", () => {
       "intended_peer_public_key",
       "sdp",
     ]);
-    const privateKey = await importEd25519PrivateKeyPkcs8(
-      privateKeyPkcs8(golden.signing_key.seed_hex),
-    );
+    const privateKey = await importTestEd25519PrivateKey(golden.signing_key.seed_hex);
     const publicKey = await importEd25519PublicKeyWire(golden.signing_key.public_key_wire);
     expect(privateKey.extractable).toBe(false);
 
@@ -279,5 +320,61 @@ describe("shared Rust/WebCrypto Ed25519 vectors", () => {
     const value = transcript(golden.vectors[0]);
     const signature = await signSignedSignalTranscript(generated.privateKey, value);
     expect(await verifySignedSignalTranscript(importedPublic, value, signature)).toBe(true);
+  });
+
+  test("rejects the complete small-order corpus and malformed point encodings", async () => {
+    expect(negativeKeys.format).toBe("spawn-ed25519-public-key-negative-v1");
+    expect(negativeKeys.weak_public_keys).toHaveLength(8);
+    expect(negativeKeys.noncanonical_public_key_hex).toHaveLength(40);
+    const rejected = [
+      ...negativeKeys.weak_public_keys,
+      ...negativeKeys.noncanonical_public_key_hex.map((public_key_hex, index) => ({
+        id: `noncanonical-${index}`,
+        public_key_hex,
+      })),
+      ...negativeKeys.invalid_encodings,
+    ];
+    for (const vector of rejected) {
+      const raw = hexToBytes(vector.public_key_hex);
+      expect(raw).toHaveLength(ED25519_PUBLIC_KEY_BYTES);
+      await expect(importEd25519PublicKey(raw), vector.id).rejects.toThrow("Ed25519 public key");
+    }
+    expect(negativeKeys.accepted_mixed_torsion_public_key_hex).toHaveLength(7);
+    for (const publicKeyHex of negativeKeys.accepted_mixed_torsion_public_key_hex) {
+      await expect(importEd25519PublicKey(hexToBytes(publicKeyHex))).resolves.toBeDefined();
+    }
+  });
+
+  test("blocks the identity-key universal forgery even for externally imported keys", async () => {
+    const identity = negativeKeys.weak_public_keys.find(
+      ({ id }) => id === negativeKeys.universal_forgery.public_key_id,
+    );
+    expect(identity).toBeDefined();
+    const raw = hexToBytes(identity!.public_key_hex);
+    const signature = hexToBytes(negativeKeys.universal_forgery.signature_hex);
+    const value = transcript(golden.vectors[0]);
+    const encoded = encodeSignedSignalTranscript(value);
+
+    // Node/Bun WebCrypto imports this weak key and accepts R=identity,S=0 for
+    // arbitrary messages. The project verifier must reject a CryptoKey even
+    // when a caller bypasses importEd25519PublicKey.
+    const externallyImported = await crypto.subtle.importKey(
+      "raw",
+      raw.buffer as ArrayBuffer,
+      { name: "Ed25519" },
+      true,
+      ["verify"],
+    );
+    expect(
+      await crypto.subtle.verify(
+        { name: "Ed25519" },
+        externallyImported,
+        signature.buffer as ArrayBuffer,
+        encoded.buffer as ArrayBuffer,
+      ),
+    ).toBe(true);
+    await expect(
+      verifySignedSignalTranscript(externallyImported, value, encodeBase64Url(signature)),
+    ).rejects.toThrow("weak Ed25519 public key");
   });
 });

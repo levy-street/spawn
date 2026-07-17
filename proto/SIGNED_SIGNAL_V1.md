@@ -38,8 +38,21 @@ a canonical-JSON representation.
 
 Public keys and signatures use canonical unpadded base64url on a JSON/wire
 boundary. A public key decodes to exactly 32 bytes and a signature to exactly
-64 bytes. Padded, non-URL-alphabet, non-canonical, or wrong-length strings are
+64 bytes, so their encoded widths are exactly 43 and 86 characters. Decoders
+reject any other encoded width before scanning, transforming, or decoding the
+input. Padded, non-URL-alphabet, non-canonical, or wrong-length strings are
 invalid. Private key bytes have no signaling wire representation.
+
+Before import and again before verification, a public key must pass strict RFC
+8032 compressed-point decoding and must not be any of the eight points in the
+Ed25519 small-order subgroup. This check is required even when the platform
+WebCrypto implementation accepts the raw key. Matching dalek `is_weak` does
+not mean requiring the whole point to be torsion-free; canonical mixed-torsion
+points with a non-small-order component remain accepted. The shared corpus in
+`ed25519-public-key-negative-vectors.json` covers the complete subgroup,
+all 40 noncanonical encodings, an off-curve encoding, seven accepted
+mixed-torsion controls, and the identity-key universal forgery (`R` is the
+identity and `S` is zero).
 
 ## Security properties and limits
 

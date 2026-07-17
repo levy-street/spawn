@@ -5,6 +5,7 @@
 //! sign and verify.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
@@ -281,7 +282,8 @@ pub fn generate_signing_key() -> Result<SigningKey, SignedSignalError> {
     Ok(signing_key)
 }
 
-pub fn signing_key_from_seed(seed: &[u8]) -> Result<SigningKey, SignedSignalError> {
+#[cfg(test)]
+fn signing_key_from_seed(seed: &[u8]) -> Result<SigningKey, SignedSignalError> {
     let seed: &[u8; 32] = seed
         .try_into()
         .map_err(|_| SignedSignalError::InvalidLength {
@@ -316,6 +318,16 @@ pub fn public_key_to_wire(verifying_key: &VerifyingKey) -> String {
 
 pub fn public_key_from_wire(value: &str) -> Result<VerifyingKey, SignedSignalError> {
     let decoded = decode_wire_exact::<ED25519_PUBLIC_KEY_BYTES>(value, "public_key")?;
+    let compressed = CompressedEdwardsY(decoded);
+    let point = compressed
+        .decompress()
+        .ok_or(SignedSignalError::InvalidPublicKey)?;
+    // ed25519-dalek intentionally accepts ZIP-215 encodings. Recompressing the
+    // decoded point makes the RFC 8032 canonical-encoding requirement explicit
+    // without maintaining field arithmetic here.
+    if point.compress().to_bytes() != decoded {
+        return Err(SignedSignalError::InvalidPublicKey);
+    }
     let key =
         VerifyingKey::from_bytes(&decoded).map_err(|_| SignedSignalError::InvalidPublicKey)?;
     if key.is_weak() {
@@ -388,7 +400,15 @@ fn decode_wire_exact<const N: usize>(
     value: &str,
     field: &'static str,
 ) -> Result<[u8; N], SignedSignalError> {
-    if value.is_empty()
+    let encoded_length = (N / 3) * 4
+        + match N % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        };
+    // Reject wrong widths before alphabet scanning, transformation, or decode.
+    // Public keys are exactly 43 characters and signatures exactly 86.
+    if value.len() != encoded_length
         || value.contains('=')
         || !value
             .bytes()
@@ -396,15 +416,14 @@ fn decode_wire_exact<const N: usize>(
     {
         return Err(SignedSignalError::InvalidBase64Url(field));
     }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
+    let mut decoded = [0_u8; N];
+    let decoded_length = URL_SAFE_NO_PAD
+        .decode_slice(value, &mut decoded)
         .map_err(|_| SignedSignalError::InvalidBase64Url(field))?;
-    if decoded.len() != N || URL_SAFE_NO_PAD.encode(&decoded) != value {
+    if decoded_length != N || URL_SAFE_NO_PAD.encode(decoded) != value {
         return Err(SignedSignalError::InvalidBase64Url(field));
     }
-    decoded
-        .try_into()
-        .map_err(|_| SignedSignalError::InvalidBase64Url(field))
+    Ok(decoded)
 }
 
 struct Reader<'a> {
@@ -516,8 +535,37 @@ mod tests {
         replay_signature_from: String,
     }
 
+    #[derive(Deserialize)]
+    struct NegativeKeyFile {
+        format: String,
+        weak_public_keys: Vec<NegativeKeyVector>,
+        noncanonical_public_key_hex: Vec<String>,
+        invalid_encodings: Vec<NegativeKeyVector>,
+        accepted_mixed_torsion_public_key_hex: Vec<String>,
+        universal_forgery: UniversalForgery,
+    }
+
+    #[derive(Deserialize)]
+    struct NegativeKeyVector {
+        id: String,
+        public_key_hex: String,
+    }
+
+    #[derive(Deserialize)]
+    struct UniversalForgery {
+        public_key_id: String,
+        signature_hex: String,
+    }
+
     fn golden() -> GoldenFile {
         serde_json::from_str(include_str!("../../proto/signed-signal-v1-vectors.json")).unwrap()
+    }
+
+    fn negative_keys() -> NegativeKeyFile {
+        serde_json::from_str(include_str!(
+            "../../proto/ed25519-public-key-negative-vectors.json"
+        ))
+        .unwrap()
     }
 
     fn hex(value: &str) -> Vec<u8> {
@@ -818,6 +866,83 @@ mod tests {
         assert!(signature_from_wire("not+base64url").is_err());
         assert!(signing_key_from_seed(&[0; 31]).is_err());
         assert!(public_key_from_wire("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+    }
+
+    #[test]
+    fn fixed_width_wire_decode_rejects_large_input_before_decode() {
+        let huge = "A".repeat(16 * 1024 * 1024);
+        assert_eq!(
+            public_key_from_wire(&huge),
+            Err(SignedSignalError::InvalidBase64Url("public_key"))
+        );
+        assert_eq!(
+            signature_from_wire(&huge),
+            Err(SignedSignalError::InvalidBase64Url("signature"))
+        );
+    }
+
+    #[test]
+    fn shared_negative_public_key_corpus_is_strict_and_complete() {
+        use ed25519_dalek::Verifier;
+
+        let corpus = negative_keys();
+        assert_eq!(corpus.format, "spawn-ed25519-public-key-negative-v1");
+        assert_eq!(corpus.weak_public_keys.len(), 8);
+        assert_eq!(corpus.noncanonical_public_key_hex.len(), 40);
+        for vector in &corpus.weak_public_keys {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] =
+                hex(&vector.public_key_hex).try_into().unwrap();
+            let weak = VerifyingKey::from_bytes(&raw).unwrap();
+            assert!(weak.is_weak(), "{} was not a weak dalek key", vector.id);
+            assert_eq!(
+                public_key_from_wire(&URL_SAFE_NO_PAD.encode(raw)),
+                Err(SignedSignalError::InvalidPublicKey),
+                "{}",
+                vector.id
+            );
+        }
+        for (index, public_key_hex) in corpus.noncanonical_public_key_hex.iter().enumerate() {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] = hex(public_key_hex).try_into().unwrap();
+            assert_eq!(
+                public_key_from_wire(&URL_SAFE_NO_PAD.encode(raw)),
+                Err(SignedSignalError::InvalidPublicKey),
+                "noncanonical-{index}"
+            );
+        }
+        for vector in &corpus.invalid_encodings {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] =
+                hex(&vector.public_key_hex).try_into().unwrap();
+            assert_eq!(
+                public_key_from_wire(&URL_SAFE_NO_PAD.encode(raw)),
+                Err(SignedSignalError::InvalidPublicKey),
+                "{}",
+                vector.id
+            );
+        }
+        assert_eq!(corpus.accepted_mixed_torsion_public_key_hex.len(), 7);
+        for public_key_hex in &corpus.accepted_mixed_torsion_public_key_hex {
+            let raw: [u8; ED25519_PUBLIC_KEY_BYTES] = hex(public_key_hex).try_into().unwrap();
+            let point = CompressedEdwardsY(raw).decompress().unwrap();
+            assert!(!point.is_torsion_free());
+            let accepted = public_key_from_wire(&URL_SAFE_NO_PAD.encode(raw)).unwrap();
+            assert!(!accepted.is_weak());
+        }
+
+        let identity = corpus
+            .weak_public_keys
+            .iter()
+            .find(|vector| vector.id == corpus.universal_forgery.public_key_id)
+            .unwrap();
+        let weak =
+            VerifyingKey::from_bytes(&hex(&identity.public_key_hex).try_into().unwrap()).unwrap();
+        let signature = Signature::from_bytes(
+            &hex(&corpus.universal_forgery.signature_hex)
+                .try_into()
+                .unwrap(),
+        );
+        let encoded = example().encode().unwrap();
+        assert!(weak.verify(&encoded, &signature).is_ok());
+        assert!(weak.verify_strict(&encoded, &signature).is_err());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+import { Point as Ed25519Point } from "@noble/ed25519";
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -5,6 +7,8 @@ export const SIGNED_SIGNAL_MAGIC = textEncoder.encode("SPAWN-RTC-SIGNAL-SIG-V1")
 export const SIGNED_SIGNAL_VERSION = 1;
 export const ED25519_PUBLIC_KEY_BYTES = 32;
 export const ED25519_SIGNATURE_BYTES = 64;
+export const ED25519_PUBLIC_KEY_WIRE_CHARS = 43;
+export const ED25519_SIGNATURE_WIRE_CHARS = 86;
 export const MAX_SESSION_ID_BYTES = 256;
 export const MAX_SCOPE_ID_BYTES = 256;
 export const MAX_SDP_BYTES = 1024 * 1024;
@@ -105,6 +109,22 @@ function ownedArrayBuffer(value: Uint8Array): ArrayBuffer {
   const buffer = new ArrayBuffer(value.byteLength);
   new Uint8Array(buffer).set(value);
   return buffer;
+}
+
+function assertValidEd25519PublicKey(raw: Uint8Array): void {
+  ensureBytes(raw, "publicKey", ED25519_PUBLIC_KEY_BYTES);
+  try {
+    // WebCrypto implementations can import invalid and small-order Ed25519
+    // encodings. Use noble's strict RFC 8032 point decoder before handing a
+    // key to WebCrypto, then match ed25519-dalek's VerifyingKey::is_weak.
+    // This deliberately does not implement curve arithmetic locally.
+    if (Ed25519Point.fromBytes(raw, false).isSmallOrder()) {
+      throw new SignedSignalError("invalid_key", "weak Ed25519 public key");
+    }
+  } catch (error) {
+    if (error instanceof SignedSignalError) throw error;
+    throw new SignedSignalError("invalid_key", "invalid Ed25519 public key");
+  }
 }
 
 export function encodeSignedSignalTranscript(transcript: SignedSignalTranscript): Uint8Array {
@@ -297,7 +317,7 @@ export async function generateEd25519IdentityKeyPair(): Promise<CryptoKeyPair> {
 }
 
 export async function importEd25519PublicKey(raw: Uint8Array): Promise<CryptoKey> {
-  ensureBytes(raw, "publicKey", ED25519_PUBLIC_KEY_BYTES);
+  assertValidEd25519PublicKey(raw);
   try {
     const key = await subtleCrypto().importKey(
       "raw",
@@ -314,34 +334,12 @@ export async function importEd25519PublicKey(raw: Uint8Array): Promise<CryptoKey
   }
 }
 
-export async function importEd25519PrivateKeyPkcs8(pkcs8: Uint8Array): Promise<CryptoKey> {
-  if (!(pkcs8 instanceof Uint8Array) || pkcs8.byteLength === 0) {
-    throw new SignedSignalError("invalid_length", "PKCS#8 private key must not be empty");
-  }
-  try {
-    const key = await subtleCrypto().importKey(
-      "pkcs8",
-      ownedArrayBuffer(pkcs8),
-      { name: "Ed25519" },
-      false,
-      ["sign"],
-    );
-    assertEd25519Key(key, "private", "sign");
-    if (key.extractable) {
-      throw new SignedSignalError("invalid_key", "private key must be non-extractable");
-    }
-    return key;
-  } catch (error) {
-    if (error instanceof CryptoUnavailableError || error instanceof SignedSignalError) throw error;
-    throw new SignedSignalError("invalid_key", "invalid Ed25519 PKCS#8 private key");
-  }
-}
-
 export async function exportEd25519PublicKey(publicKey: CryptoKey): Promise<Uint8Array> {
   assertEd25519Key(publicKey, "public", "verify");
   try {
     const raw = new Uint8Array(await subtleCrypto().exportKey("raw", publicKey));
-    return ensureBytes(raw, "publicKey", ED25519_PUBLIC_KEY_BYTES);
+    assertValidEd25519PublicKey(raw);
+    return raw;
   } catch (error) {
     if (error instanceof CryptoUnavailableError || error instanceof SignedSignalError) throw error;
     throw new SignedSignalError("invalid_key", "Ed25519 public key is not exportable");
@@ -375,6 +373,10 @@ export async function verifySignedSignalTranscript(
   const signature = decodeBase64Url(signatureWire, ED25519_SIGNATURE_BYTES);
   const encoded = encodeSignedSignalTranscript(transcript);
   try {
+    // Callers can supply a CryptoKey imported outside this module. Re-export
+    // and validate it so bypassing importEd25519PublicKey cannot reintroduce a
+    // WebCrypto small-order-key forgery.
+    await exportEd25519PublicKey(publicKey);
     return await subtleCrypto().verify(
       { name: "Ed25519" },
       publicKey,
@@ -382,7 +384,7 @@ export async function verifySignedSignalTranscript(
       ownedArrayBuffer(encoded),
     );
   } catch (error) {
-    if (error instanceof CryptoUnavailableError) throw error;
+    if (error instanceof CryptoUnavailableError || error instanceof SignedSignalError) throw error;
     throw new SignedSignalError("invalid_key", "Ed25519 verification failed");
   }
 }
@@ -401,13 +403,20 @@ export function encodeBase64Url(value: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-export function decodeBase64Url(value: string, expectedLength?: number): Uint8Array {
+function base64UrlEncodedLength(byteLength: number): number {
+  return Math.ceil((byteLength * 4) / 3);
+}
+
+export function decodeBase64Url(value: string, expectedLength: number): Uint8Array {
   if (
-    value.length === 0 ||
-    value.includes("=") ||
-    !/^[A-Za-z0-9_-]+$/u.test(value) ||
-    value.length % 4 === 1
+    !Number.isSafeInteger(expectedLength) ||
+    expectedLength < 1 ||
+    typeof value !== "string" ||
+    value.length !== base64UrlEncodedLength(expectedLength)
   ) {
+    throw new SignedSignalError("invalid_base64url", "invalid canonical base64url");
+  }
+  if (value.includes("=") || !/^[A-Za-z0-9_-]+$/u.test(value) || value.length % 4 === 1) {
     throw new SignedSignalError("invalid_base64url", "invalid canonical base64url");
   }
   const padded = value
@@ -420,10 +429,7 @@ export function decodeBase64Url(value: string, expectedLength?: number): Uint8Ar
   } catch {
     throw new SignedSignalError("invalid_base64url", "invalid canonical base64url");
   }
-  if (
-    encodeBase64Url(decoded) !== value ||
-    (expectedLength !== undefined && decoded.byteLength !== expectedLength)
-  ) {
+  if (encodeBase64Url(decoded) !== value || decoded.byteLength !== expectedLength) {
     throw new SignedSignalError("invalid_base64url", "invalid canonical base64url");
   }
   return decoded;
