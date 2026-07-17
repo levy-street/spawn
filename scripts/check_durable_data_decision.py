@@ -761,40 +761,49 @@ def clause_tokens(text: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-def main_clause_projection(text: str) -> str:
-    """Blank balanced asides so their predicate state cannot leak outward."""
+def balanced_aside_projection(text: str) -> str:
+    """Blank balanced delimiter spans with fixed input and nesting bounds."""
 
     if len(text) > MAX_STATUS_PROJECTION_CHARS:
         raise GuardError(
             f"status predicate prefix exceeds {MAX_STATUS_PROJECTION_CHARS} characters"
         )
     projected = list(text)
-    comma_positions: list[int] = []
-    parenthesis_stack: list[str] = []
+    parenthesis_stack: list[tuple[str, int]] = []
     closing_parenthesis = {")": "(", "]": "[", "}": "{"}
     for index, character in enumerate(text):
         if parenthesis_stack:
             projected[index] = " "
             if character in "([{":
-                parenthesis_stack.append(character)
+                parenthesis_stack.append((character, index))
                 if len(parenthesis_stack) > MAX_STATUS_ASIDE_NESTING:
                     raise GuardError("status predicate aside exceeds the nesting limit")
             elif character in closing_parenthesis:
-                if closing_parenthesis[character] != parenthesis_stack[-1]:
+                if closing_parenthesis[character] != parenthesis_stack[-1][0]:
                     raise GuardError("status predicate aside has mismatched delimiters")
                 parenthesis_stack.pop()
             continue
         if character in "([{":
             projected[index] = " "
-            parenthesis_stack.append(character)
-        elif character == ",":
-            comma_positions.append(index)
-            if len(comma_positions) > MAX_STATUS_COMMAS:
-                raise GuardError(
-                    "status predicate prefix has too many comma boundaries"
-                )
+            parenthesis_stack.append((character, index))
     if parenthesis_stack:
-        raise GuardError("status predicate aside has an unclosed delimiter")
+        # A subject/predicate prefix can end inside an otherwise balanced span
+        # whose closing delimiter follows the status word. Only fully balanced
+        # spans are asides; restore a truncated span for conservative analysis.
+        restore_start = parenthesis_stack[0][1]
+        projected[restore_start:] = text[restore_start:]
+    return "".join(projected)
+
+
+def main_clause_projection(text: str) -> str:
+    """Blank balanced asides so their predicate state cannot leak outward."""
+
+    projected = list(balanced_aside_projection(text))
+    comma_positions = [
+        index for index, character in enumerate(projected) if character == ","
+    ]
+    if len(comma_positions) > MAX_STATUS_COMMAS:
+        raise GuardError("status predicate prefix has too many comma boundaries")
 
     # Pair from the predicate end. This leaves an unmatched leading-clause
     # separator intact while isolating balanced comma-delimited asides nearest
@@ -1025,26 +1034,34 @@ def subject_region_for_status_group(
     return before_link[: last_auxiliary.start()]
 
 
-SUBJECT_PREDICATE_START_PATTERN = (
-    rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
-    rf"{PREMATURE_DATA_STATUS_WORD.pattern}|"
-    r"\b(?:has|have|had|remaining|awaiting|completed|completes|finished|"
-    r"finishes|passed|passes|underwent|undergoes|continued|continues|"
-    r"received|receives|required|requires|waited|waits)\b)"
+EXPLICIT_NAMED_SUBJECT_PATTERN = (
+    rf"(?:{DATA_STATUS_SUBJECT_PATTERN}|{GENERIC_NOUN_SUBJECT_PATTERN}|"
+    rf"{IDENTIFIER_SUBJECT_PATTERN})"
 )
-NAMED_CLAUSE_SUBJECT = re.compile(
-    rf"(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|{GENERIC_NOUN_SUBJECT_PATTERN}|"
-    rf"{IDENTIFIER_SUBJECT_PATTERN})\s+"
-    rf"(?={SUBJECT_PREDICATE_START_PATTERN})"
+SUBORDINATE_CLAUSE_INTRODUCER_PATTERN = (
+    r"(?:although|because|before|despite|if|once|since|unless|when|whereas|while|"
+    r"after|even\s+though|provided(?:\s+that)?)"
+)
+SUBJECT_MODIFIER_PATTERN = (
+    r"(?:[a-z0-9_-]+ly|also|already|even|just|not|now|only|still|yet)"
+)
+MATRIX_CLAUSE_SUBJECT = re.compile(
+    rf"^\s*(?:(?P<introducer>{SUBORDINATE_CLAUSE_INTRODUCER_PATTERN})\s+)?"
+    rf"(?:{SUBJECT_MODIFIER_PATTERN}\s+){{0,4}}"
+    rf"(?P<subject>{EXPLICIT_NAMED_SUBJECT_PATTERN})"
+    rf"(?=\s+(?:{SUBJECT_MODIFIER_PATTERN}\s+){{0,6}}"
+    r"[a-z][a-z0-9_-]*(?:'[a-z]+)?\b)"
+)
+SUBORDINATE_CLAUSE_INTRODUCER = re.compile(
+    rf"\b{SUBORDINATE_CLAUSE_INTRODUCER_PATTERN}\b"
 )
 TOPICALIZED_NAMED_SUBJECT = re.compile(
-    rf"\bas\s+for\s+(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|"
-    rf"{GENERIC_NOUN_SUBJECT_PATTERN}|{IDENTIFIER_SUBJECT_PATTERN})"
-    rf"(?=\s*[,;:]|\s*$)"
+    rf"^\s*as\s+for\s+(?P<subject>{EXPLICIT_NAMED_SUBJECT_PATTERN})"
+    r"(?:\s+[a-z0-9_-]+){0,4}\s*$"
 )
 TRAILING_NAMED_SUBJECT = re.compile(
-    rf"(?P<subject>{DATA_STATUS_SUBJECT_PATTERN}|{GENERIC_NOUN_SUBJECT_PATTERN}|"
-    rf"{IDENTIFIER_SUBJECT_PATTERN})(?:\s+(?:alone|only|solely))?\s*$"
+    rf"(?P<subject>{EXPLICIT_NAMED_SUBJECT_PATTERN})"
+    rf"(?:\s+{SUBJECT_MODIFIER_PATTERN}){{0,4}}\s*$"
 )
 
 
@@ -1082,37 +1099,86 @@ def has_non_subject_reference_prefix(text: str, subject_start: int) -> bool:
     return text[cursor:end] in NON_SUBJECT_REFERENCE_WORDS
 
 
-def explicit_subject_scopes(
-    text: str, *, include_trailing_subject: bool = False
-) -> tuple[tuple[int, bool], ...]:
-    """Return explicit DATA/non-DATA clause subjects in lexical order."""
+def named_subject_has_data_scope(subject: str) -> bool:
+    """Distinguish a DATA subject from a generic subject referring to DATA."""
 
-    candidates: list[tuple[int, bool]] = []
-    for match in NAMED_CLAUSE_SUBJECT.finditer(text):
-        if has_non_subject_reference_prefix(text, match.start("subject")):
+    return any(
+        not has_non_subject_reference_prefix(subject, match.start())
+        for match in DATA_STATUS_SUBJECT.finditer(subject)
+    )
+
+
+def comma_segment_spans(text: str):
+    start = 0
+    for index, character in enumerate(text):
+        if character == ",":
+            yield start, index
+            start = index + 1
+    yield start, len(text)
+
+
+def matrix_subject_projection(text: str) -> str:
+    """Blank balanced asides and non-matrix introducer-led adjunct spans."""
+
+    projected = list(balanced_aside_projection(text))
+    comma_count = projected.count(",")
+    if comma_count > MAX_STATUS_COMMAS:
+        raise GuardError("status subject prefix has too many comma boundaries")
+
+    matrix_seen = False
+    for start, end in comma_segment_spans("".join(projected)):
+        segment = "".join(projected[start:end])
+        topic = TOPICALIZED_NAMED_SUBJECT.match(segment)
+        match = topic or MATRIX_CLAUSE_SUBJECT.match(segment)
+        if match is None:
             continue
-        subject = match.group("subject")
-        candidates.append(
-            (match.start("subject"), DATA_STATUS_SUBJECT.search(subject) is not None)
-        )
-    for match in TOPICALIZED_NAMED_SUBJECT.finditer(text):
-        subject = match.group("subject")
-        candidates.append(
-            (match.start("subject"), DATA_STATUS_SUBJECT.search(subject) is not None)
-        )
-    if include_trailing_subject:
-        match = TRAILING_NAMED_SUBJECT.search(text)
-        if match is not None and not has_non_subject_reference_prefix(
-            text, match.start("subject")
-        ):
-            subject = match.group("subject")
-            candidates.append(
-                (
-                    match.start("subject"),
-                    DATA_STATUS_SUBJECT.search(subject) is not None,
-                )
+        introduced = topic is None and match.groupdict().get("introducer") is not None
+        if matrix_seen and introduced:
+            projected[start:end] = " " * (end - start)
+            continue
+        matrix_seen = True
+        adjunct = SUBORDINATE_CLAUSE_INTRODUCER.search(segment, match.end())
+        if adjunct is not None:
+            adjunct_start = start + adjunct.start()
+            projected[adjunct_start:end] = " " * (end - adjunct_start)
+    return "".join(projected)
+
+
+def matrix_clause_subject_scope(
+    text: str, *, include_trailing_subject: bool = False
+) -> bool | None:
+    """Resolve the matrix subject while excluding asides and subordinate adjuncts."""
+
+    projected = matrix_subject_projection(text)
+
+    matrix_scope: bool | None = None
+    later_main_scope: bool | None = None
+    for segment_start, segment_end in comma_segment_spans(projected):
+        segment = projected[segment_start:segment_end]
+        topic = TOPICALIZED_NAMED_SUBJECT.match(segment)
+        match = topic or MATRIX_CLAUSE_SUBJECT.match(segment)
+        if match is not None:
+            scope = named_subject_has_data_scope(match.group("subject"))
+            introduced = (
+                topic is None and match.groupdict().get("introducer") is not None
             )
-    return tuple(sorted(candidates, key=lambda candidate: candidate[0]))
+            if matrix_scope is None:
+                matrix_scope = scope
+            elif not introduced:
+                # A later explicit main-clause subject after a comma governs
+                # that clause; an introducer-led segment is an adjunct instead.
+                later_main_scope = scope
+    if later_main_scope is not None:
+        return later_main_scope
+    if matrix_scope is not None:
+        return matrix_scope
+    if include_trailing_subject:
+        match = TRAILING_NAMED_SUBJECT.search(projected)
+        if match is not None and not has_non_subject_reference_prefix(
+            projected, match.start("subject")
+        ):
+            return named_subject_has_data_scope(match.group("subject"))
+    return None
 
 
 def anaphoric_pronoun_subject_scope(subject_region: str) -> bool | None | tuple[()]:
@@ -1126,13 +1192,15 @@ def anaphoric_pronoun_subject_scope(subject_region: str) -> bool | None | tuple[
     after_pronoun = subject_region[pronoun.end() :]
 
     # An explicit subject after the pronoun governs the status predicate. If
-    # none follows, resolve to the nearest explicit clause/topic subject from
-    # the full prefix; only a prefix with no subject inherits discourse scope.
-    after_scopes = explicit_subject_scopes(after_pronoun, include_trailing_subject=True)
-    if after_scopes:
-        return after_scopes[-1][1]
-    before_scopes = explicit_subject_scopes(before_pronoun)
-    return before_scopes[-1][1] if before_scopes else None
+    # none follows, resolve the projected matrix/topic subject, allowing a
+    # later non-adjunct main clause to override it. Only a subject-free prefix
+    # inherits discourse scope.
+    after_scope = matrix_clause_subject_scope(
+        after_pronoun, include_trailing_subject=True
+    )
+    if after_scope is not None:
+        return after_scope
+    return matrix_clause_subject_scope(before_pronoun)
 
 
 def sentence_has_anaphoric_status_subject(sentence: str) -> bool:
@@ -1755,6 +1823,17 @@ def self_test(source: Path) -> None:
     if len(projected_probe) != len(projection_probe) or projection_elapsed > 5.0:
         raise GuardError(
             "main-clause projection violated its linear-runtime regression bound"
+        )
+    matrix_probe = (
+        "although p2-data-01 awaits review"
+        + ", after p2-host-02 completed review" * 10_000
+    )
+    matrix_start = time.perf_counter()
+    matrix_scope = matrix_clause_subject_scope(matrix_probe)
+    matrix_elapsed = time.perf_counter() - matrix_start
+    if matrix_scope is not True or matrix_elapsed > 5.0:
+        raise GuardError(
+            "matrix-subject projection violated its linear-runtime regression bound"
         )
     for oversized_probe, expected_detail in (
         (
@@ -2566,6 +2645,18 @@ def self_test(source: Path) -> None:
             "Although P2-DATA-01 remains review pending, it is accepted now.",
         ),
         (
+            "matrix DATA subject supports an adverb before its predicate",
+            "Although P2-DATA-01 still remains review pending, it is accepted now.",
+        ),
+        (
+            "matrix DATA subject supports an unlisted predicate verb",
+            "Although P2-DATA-01 awaits review, it is accepted now.",
+        ),
+        (
+            "matrix DATA subject supports adverb plus unlisted predicate",
+            "Although P2-DATA-01 currently awaits review, it is accepted now.",
+        ),
+        (
             "while-clause DATA subject governs following pronoun",
             "While P2-DATA-01 remains review pending, it is accepted now.",
         ),
@@ -2586,14 +2677,34 @@ def self_test(source: Path) -> None:
             "As for P2-DATA-01, it is accepted now.",
         ),
         (
+            "as-for DATA topic permits a bounded topic modifier",
+            "As for P2-DATA-01 specifically, it is accepted now.",
+        ),
+        (
             "post-pronoun DATA subject overrides preceding non-DATA subject",
             "Although P2-HOST-02 remains review pending, it follows that "
             "P2-DATA-01 is accepted now.",
         ),
         (
-            "nearest pre-pronoun DATA clause subject governs",
-            "While P2-HOST-02 remains pending after P2-DATA-01 completed review, "
+            "matrix DATA subject governs over embedded non-DATA adjunct subject",
+            "While P2-DATA-01 remains pending after P2-HOST-02 completed review, "
             "it is accepted now.",
+        ),
+        (
+            "matrix DATA subject governs over parenthetical non-DATA subject",
+            "Although P2-DATA-01 remains review pending "
+            "(the control protocol remains unchanged), it is accepted now.",
+        ),
+        (
+            "matrix DATA subject governs over nested parenthetical subjects",
+            "Although P2-DATA-01 remains review pending "
+            "(the control protocol remains unchanged "
+            "[P2-HOST-02 still awaits review]), it is accepted now.",
+        ),
+        (
+            "later DATA main-clause subject overrides leading HOST adjunct",
+            "Although P2-HOST-02 remains review pending, P2-DATA-01 says it is "
+            "accepted now.",
         ),
         (
             "incidental former alternative is not historical framing",
@@ -3212,6 +3323,18 @@ def self_test(source: Path) -> None:
             "Although P2-HOST-02 remains review pending, it is accepted.",
         ),
         (
+            "matrix non-DATA subject supports an adverb before its predicate",
+            "Although P2-HOST-02 still remains review pending, it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject supports an unlisted predicate verb",
+            "Although P2-HOST-02 awaits review, it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject supports adverb plus unlisted predicate",
+            "Although P2-HOST-02 currently awaits review, it is accepted.",
+        ),
+        (
             "while-clause non-DATA subject governs following pronoun",
             "While P2-HOST-02 remains review pending, it is accepted.",
         ),
@@ -3232,14 +3355,38 @@ def self_test(source: Path) -> None:
             "As for P2-HOST-02, it is accepted.",
         ),
         (
+            "as-for non-DATA topic permits a bounded topic modifier",
+            "As for P2-HOST-02 specifically, it is accepted.",
+        ),
+        (
+            "as-for non-DATA topic permits a multiword modifier",
+            "As for P2-HOST-02 in particular, it is accepted.",
+        ),
+        (
             "post-pronoun non-DATA subject overrides preceding DATA subject",
             "Although P2-DATA-01 remains review pending, it follows that "
             "P2-HOST-02 is accepted.",
         ),
         (
-            "nearest pre-pronoun non-DATA clause subject governs",
-            "While P2-DATA-01 remains pending after P2-HOST-02 completed review, "
+            "matrix non-DATA subject governs over embedded DATA adjunct subject",
+            "While P2-HOST-02 remains pending after P2-DATA-01 completed review, "
             "it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject governs over parenthetical DATA subject",
+            "Although P2-HOST-02 remains review pending "
+            "(P2-DATA-01 remains unchanged), it is accepted.",
+        ),
+        (
+            "matrix non-DATA subject governs over nested parenthetical DATA subjects",
+            "Although P2-HOST-02 remains review pending "
+            "(P2-DATA-01 remains unchanged "
+            "[the durable protected-data store still awaits review]), it is accepted.",
+        ),
+        (
+            "later HOST main-clause subject overrides leading DATA adjunct",
+            "Although P2-DATA-01 remains review pending, P2-HOST-02 says it is "
+            "accepted.",
         ),
         (
             "historical marker after DATA status",
