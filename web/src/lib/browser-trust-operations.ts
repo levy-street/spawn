@@ -2,6 +2,7 @@ import { auth, type DeviceApproval, type DevicePendingApproval, type Host, hosts
 import {
   type BrowserDeviceIdentity,
   createHostPairApprovalProof,
+  type EpochScopedBrowserDeviceIdentity,
   loadBrowserDeviceIdentity,
   scopeBrowserDeviceIdentityToTrustEpoch,
 } from "./browser-device-identity";
@@ -83,11 +84,11 @@ export interface ApprovalTrustDependencies {
     accountId: string,
     expectedPublicKey: string,
     signal: AbortSignal,
-  ): BrowserDeviceIdentity;
+  ): EpochScopedBrowserDeviceIdentity;
   fingerprint(publicKey: string): Promise<string>;
   persistPin(input: ApproveBrowserHostPinInput, signal: AbortSignal): Promise<BrowserHostPin>;
   signApproval(
-    identity: BrowserDeviceIdentity,
+    identity: EpochScopedBrowserDeviceIdentity,
     accountId: string,
     approvalNonce: string,
     hostPublicKey: string,

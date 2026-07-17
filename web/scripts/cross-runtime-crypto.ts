@@ -24,9 +24,9 @@ import {
   verifySignedSignalTranscript,
 } from "../src/lib/signed-signal";
 import {
-  signRtcSignalWire,
   verifyRtcSignalWire,
 } from "../src/lib/signed-signal-wire";
+import { signRtcSignalWireForTestOnly } from "../test-support/signed-signal-wire-test-only";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const rustArgs = [
@@ -446,7 +446,7 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     browserKey.privateKey,
     transcript,
   );
-  const envelope = await signRtcSignalWire(
+  const envelope = await signRtcSignalWireForTestOnly(
     {
       publicKeyWire: browserPublicKey,
       sign: (value) => signSignedSignalTranscript(browserKey.privateKey, value),

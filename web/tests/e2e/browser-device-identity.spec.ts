@@ -93,7 +93,7 @@ test("persists a non-extractable identity across real browser page sessions", as
     };
   });
 
-  expect(first.keys).toEqual(["publicKey", "publicKeyWire", "sign"]);
+  expect(first.keys).toEqual(["publicKey", "publicKeyWire"]);
   expect(reloaded.publicKeyWire).toBe(first.publicKeyWire);
   expect(reloaded.privateExtractable).toBe(false);
   expect(reloaded.privateUsages).toEqual(["sign"]);

@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import goldenJson from "../../../proto/signed-signal-wire-v1-vectors.json";
-import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
+import {
+  signRtcSignalWireForTestOnly,
+  type TestOnlySignedRtcIdentitySigner,
+} from "../../test-support/signed-signal-wire-test-only";
+import {
+  loadOrCreateBrowserDeviceIdentity,
+  scopeBrowserDeviceIdentityToTrustEpoch,
+  signBrowserDeviceRtcTranscriptWithinTrustEpoch,
+} from "./browser-device-identity";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
@@ -16,7 +24,6 @@ import {
 import {
   MAX_SIGNED_RTC_WIRE_CHARS,
   type RtcSignalProtocol,
-  type SignedRtcIdentitySigner,
   SignedRtcWireError,
   signRtcSignalWire,
   verifyRtcSignalWire,
@@ -152,13 +159,13 @@ describe("signed RTC JSON wire adapter", () => {
   test("shares exact vectors with Rust and returns only verified transcripts", async () => {
     expect(golden.format).toBe("spawn-signed-signal-wire-v1");
     const privateKey = await importTestEd25519PrivateKey(golden.signing_seed_hex);
-    const signer: SignedRtcIdentitySigner = {
+    const signer: TestOnlySignedRtcIdentitySigner = {
       publicKeyWire: golden.sender_public_key_wire,
       sign: (value) => signSignedSignalTranscript(privateKey, value),
     };
     for (const vector of golden.vectors) {
       const value = transcript(vector.envelope);
-      const wire = await signRtcSignalWire(signer, {
+      const wire = await signRtcSignalWireForTestOnly(signer, {
         protocol: vector.envelope.protocol,
         transcript: value,
       });
@@ -174,7 +181,7 @@ describe("signed RTC JSON wire adapter", () => {
     }
   });
 
-  test("accepts the persisted public-only browser identity handle", async () => {
+  test("accepts only the exact epoch-scoped browser identity handle", async () => {
     const identity = await loadOrCreateBrowserDeviceIdentity(
       "00000000-0000-0000-0000-000000000101",
       {
@@ -194,7 +201,14 @@ describe("signed RTC JSON wire adapter", () => {
       ),
       sdp: "v=0\r\ns=persisted-browser-identity\r\n",
     };
-    const wire = await signRtcSignalWire(identity, {
+    const controller = new AbortController();
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      identity,
+      "00000000-0000-0000-0000-000000000101",
+      identity.publicKeyWire,
+      controller.signal,
+    );
+    const wire = await signRtcSignalWire(scoped, {
       protocol: "spawn.pty",
       transcript: value,
     });
@@ -204,10 +218,11 @@ describe("signed RTC JSON wire adapter", () => {
       golden.intended_peer_public_key_wire,
     );
     expect(verified.transcript).toEqual(value);
-    expect(Object.keys(identity).sort()).toEqual(["publicKey", "publicKeyWire", "sign"]);
+    expect(Object.keys(identity).sort()).toEqual(["publicKey", "publicKeyWire"]);
+    expect(Object.keys(scoped).sort()).toEqual(["publicKey", "publicKeyWire"]);
   });
 
-  test("rejects mismatched opaque signer closure and declared public handle", async () => {
+  test("rejects raw identities, frozen copies, wrappers, proxies, and rebound sign methods", async () => {
     const factory = new IDBFactory();
     const first = await loadOrCreateBrowserDeviceIdentity("00000000-0000-0000-0000-000000000102", {
       indexedDBFactory: factory,
@@ -215,17 +230,39 @@ describe("signed RTC JSON wire adapter", () => {
     const second = await loadOrCreateBrowserDeviceIdentity("00000000-0000-0000-0000-000000000103", {
       indexedDBFactory: factory,
     });
-    const mismatch: SignedRtcIdentitySigner = {
-      publicKeyWire: second.publicKeyWire,
-      sign: first.sign,
-    };
-    await expectWireError(
-      signRtcSignalWire(mismatch, {
-        protocol: golden.vectors[0].envelope.protocol,
-        transcript: transcript(golden.vectors[0].envelope),
-      }),
-      "signature_mismatch",
+    const controller = new AbortController();
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      first,
+      "00000000-0000-0000-0000-000000000102",
+      first.publicKeyWire,
+      controller.signal,
     );
+    const input = {
+      protocol: golden.vectors[0].envelope.protocol,
+      transcript: transcript(golden.vectors[0].envelope),
+    } as const;
+    expect("sign" in first).toBe(false);
+    expect("sign" in scoped).toBe(false);
+    const reboundSign = signBrowserDeviceRtcTranscriptWithinTrustEpoch.bind(undefined, scoped);
+    let reboundInvoked = false;
+    const observedReboundSign = async (value: SignedSignalTranscript) => {
+      reboundInvoked = true;
+      return reboundSign(value);
+    };
+    const rejected = [
+      first,
+      Object.freeze({ ...scoped }),
+      Object.freeze({ ...scoped, publicKeyWire: second.publicKeyWire }),
+      Object.freeze({ ...scoped, sign: reboundSign }),
+      Object.freeze({ ...scoped, sign: observedReboundSign }),
+      new Proxy(scoped, {}),
+    ];
+    for (const value of rejected) {
+      await expect(signRtcSignalWire(value as typeof scoped, input)).rejects.toMatchObject({
+        code: "key_mismatch",
+      });
+    }
+    expect(reboundInvoked).toBe(false);
   });
 
   test("snapshots mutable caller input across opaque asynchronous signing", async () => {
@@ -236,7 +273,7 @@ describe("signed RTC JSON wire adapter", () => {
     const waiting = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const signing = signRtcSignalWire(
+    const signing = signRtcSignalWireForTestOnly(
       {
         publicKeyWire: golden.sender_public_key_wire,
         sign: async (snapshot) => {
@@ -289,7 +326,7 @@ describe("signed RTC JSON wire adapter", () => {
 
   test("rejects noncanonical session and scope UUID text at signed wire ingress", async () => {
     const privateKey = await importTestEd25519PrivateKey(golden.signing_seed_hex);
-    const signer: SignedRtcIdentitySigner = {
+    const signer: TestOnlySignedRtcIdentitySigner = {
       publicKeyWire: golden.sender_public_key_wire,
       sign: (value) => signSignedSignalTranscript(privateKey, value),
     };
@@ -302,13 +339,13 @@ describe("signed RTC JSON wire adapter", () => {
       "not-a-uuid-not-a-uuid-not-a-uuid!!!",
     ]) {
       await expect(
-        signRtcSignalWire(signer, {
+        signRtcSignalWireForTestOnly(signer, {
           protocol: base.protocol,
           transcript: { ...transcript(base), sessionId: invalid },
         }),
       ).rejects.toThrow("canonical UUID");
       await expect(
-        signRtcSignalWire(signer, {
+        signRtcSignalWireForTestOnly(signer, {
           protocol: base.protocol,
           transcript: { ...transcript(base), scopeId: invalid },
         }),
@@ -384,7 +421,7 @@ describe("signed RTC JSON wire adapter", () => {
         "inconsistent_tuple",
       );
       await expectWireError(
-        signRtcSignalWire(
+        signRtcSignalWireForTestOnly(
           {
             publicKeyWire: golden.sender_public_key_wire,
             sign: async () => vector.envelope.signature,
@@ -448,7 +485,7 @@ describe("signed RTC JSON wire adapter", () => {
       "wire_too_large",
     );
     await expect(
-      signRtcSignalWire(
+      signRtcSignalWireForTestOnly(
         {
           publicKeyWire: golden.sender_public_key_wire,
           sign: async () => golden.vectors[0].envelope.signature,

@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { DeviceApproval, Host } from "./api";
-import type { BrowserDeviceIdentity } from "./browser-device-identity";
+import type {
+  BrowserDeviceIdentity,
+  EpochScopedBrowserDeviceIdentity,
+} from "./browser-device-identity";
 import { type BrowserHostPin, BrowserHostPinAbortError } from "./browser-host-pins";
 import type { BrowserTrustStatus } from "./browser-trust";
 import {
@@ -68,7 +71,6 @@ async function reached(promise: Promise<unknown>, marker: () => boolean): Promis
 const identity = {
   publicKey: {} as CryptoKey,
   publicKeyWire: PUBLIC_KEY,
-  sign: async () => "signature",
 } satisfies BrowserDeviceIdentity;
 
 const activePin: BrowserHostPin = {
@@ -122,7 +124,7 @@ function approvalDeps(
 ): ApprovalTrustDependencies {
   return {
     loadIdentity: async () => identity,
-    scopeIdentity: (value) => value,
+    scopeIdentity: (value) => value as EpochScopedBrowserDeviceIdentity,
     fingerprint: async () => HOST_FINGERPRINT,
     persistPin: async () => activePin,
     signApproval: async () => "signature",

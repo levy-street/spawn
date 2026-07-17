@@ -1,4 +1,8 @@
-import { assertBrowserDeviceIdentitySignerActive } from "./browser-device-identity";
+import {
+  assertBrowserDeviceIdentitySignerActive,
+  type EpochScopedBrowserDeviceIdentity,
+  signBrowserDeviceRtcTranscriptWithinTrustEpoch,
+} from "./browser-device-identity";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
@@ -21,12 +25,6 @@ export const MAX_SIGNED_RTC_WIRE_CHARS =
   6 * (MAX_SESSION_ID_BYTES + MAX_SCOPE_ID_BYTES + MAX_SDP_BYTES) + 2048;
 
 export type RtcSignalProtocol = "spawn.pty" | "spawn.host.ctl";
-
-/** The public-only capability exposed by the persisted browser identity. */
-export interface SignedRtcIdentitySigner {
-  readonly publicKeyWire: string;
-  sign(transcript: SignedSignalTranscript): Promise<string>;
-}
 
 export interface SignedRtcSignalInput {
   protocol: RtcSignalProtocol;
@@ -90,9 +88,13 @@ const envelopeFields = [
 ] as const;
 
 export async function signRtcSignalWire(
-  signer: SignedRtcIdentitySigner,
+  signer: EpochScopedBrowserDeviceIdentity,
   input: SignedRtcSignalInput,
 ): Promise<string> {
+  // This check intentionally precedes every field access or validation. A raw
+  // identity, structural copy, wrapper, proxy, or rebound signing method is
+  // not the exact epoch capability and must never reach the signing boundary.
+  assertBrowserDeviceIdentitySignerActive(signer);
   const transcript = copyTranscript(input.transcript);
   validateTuple(input.protocol, transcript);
   const senderPublicKey = await importEd25519PublicKeyWire(signer.publicKeyWire);
@@ -100,11 +102,14 @@ export async function signRtcSignalWire(
   const intendedPeerWire = encodeKey(transcript.intendedPeerPublicKey);
   // Re-import so signing cannot emit an invalid or weak intended-peer key.
   await importEd25519PublicKeyWire(intendedPeerWire);
-  const signature = await signer.sign(copyTranscript(transcript));
+  const signature = await signBrowserDeviceRtcTranscriptWithinTrustEpoch(
+    signer,
+    copyTranscript(transcript),
+  );
   assertBrowserDeviceIdentitySignerActive(signer);
-  // The accepted browser identity intentionally exposes no private CryptoKey.
-  // This proof binds its public handle to the opaque signing closure and fails
-  // closed if a caller combines halves from different identities.
+  // The accepted browser identity intentionally exposes no signer or private
+  // CryptoKey. This proof binds its public view to the private exact-object
+  // capability and fails closed if a caller combines identity halves.
   const signatureVerified = await verifySignedSignalTranscript(
     senderPublicKey,
     transcript,

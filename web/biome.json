@@ -9,6 +9,7 @@
     "includes": [
       "src/**",
       "tests/**",
+      "test-support/**",
       "*.ts",
       "*.tsx",
       "*.js",

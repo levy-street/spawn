@@ -24,11 +24,18 @@ const SELF_CHECK_SESSION_ID = "00000000-0000-4000-8000-000000000001";
 const SELF_CHECK_SCOPE_ID = "00000000-0000-4000-8000-000000000002";
 const SELF_CHECK_SDP = "v=0\r\ns=spawn-browser-device-identity-self-check\r\n";
 const RECORD_KEYS = ["accountId", "privateKey", "publicKey", "publicKeyWire", "version"] as const;
-interface PrivateIdentityCapability {
+interface RawIdentityCapability {
+  readonly kind: "raw";
   readonly record: StoredDeviceIdentityV1;
-  /** Present only on a non-bypassable trust-epoch-scoped identity. */
-  readonly signal?: AbortSignal;
 }
+
+interface EpochIdentityCapability {
+  readonly kind: "epoch";
+  readonly record: StoredDeviceIdentityV1;
+  readonly signal: AbortSignal;
+}
+
+type PrivateIdentityCapability = RawIdentityCapability | EpochIdentityCapability;
 
 const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, PrivateIdentityCapability>();
 
@@ -43,7 +50,13 @@ interface StoredDeviceIdentityV1 {
 export interface BrowserDeviceIdentity {
   readonly publicKey: CryptoKey;
   readonly publicKeyWire: string;
-  sign(transcript: SignedSignalTranscript): Promise<string>;
+}
+
+declare const epochScopedBrowserDeviceIdentityBrand: unique symbol;
+
+/** Nominal at compile time and exact-WeakMap-registered at runtime. */
+export interface EpochScopedBrowserDeviceIdentity extends BrowserDeviceIdentity {
+  readonly [epochScopedBrowserDeviceIdentityBrand]: true;
 }
 
 export interface BrowserDeviceIdentityStorageOptions {
@@ -75,19 +88,24 @@ function assertIdentityCapabilityActive(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new DOMException("Browser trust epoch ended", "AbortError");
 }
 
+function epochIdentityCapability(identity: object): EpochIdentityCapability {
+  const capability = privateIdentityRecords.get(identity as BrowserDeviceIdentity);
+  if (capability?.kind !== "epoch") {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "signing requires the exact registered browser trust-epoch identity",
+    );
+  }
+  assertIdentityCapabilityActive(capability.signal);
+  return capability;
+}
+
 /**
- * Reassert the private trust-epoch capability associated with an opaque
- * browser signer. Generic interop signers have no browser epoch to assert;
- * production use of those low-level signers is separately inventory-guarded.
- *
- * This deliberately exposes neither the capability nor its AbortSignal. It is
- * an unconditional return-boundary check for helpers that must await work
- * after invoking the opaque signer.
+ * Reassert an exact, privately registered trust-epoch identity. WeakMap misses,
+ * raw identities, structural copies, wrappers, and proxies all fail closed.
  */
 export function assertBrowserDeviceIdentitySignerActive(identity: object): void {
-  assertIdentityCapabilityActive(
-    privateIdentityRecords.get(identity as BrowserDeviceIdentity)?.signal,
-  );
+  epochIdentityCapability(identity);
 }
 
 function assertAccountId(accountId: string): void {
@@ -411,13 +429,8 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
   const identity: BrowserDeviceIdentity = {
     publicKey: record.publicKey,
     publicKeyWire: record.publicKeyWire,
-    sign: async (transcript) => {
-      const signature = await signSignedSignalTranscript(record.privateKey, transcript);
-      assertBrowserDeviceIdentitySignerActive(identity);
-      return signature;
-    },
   };
-  privateIdentityRecords.set(identity, { record });
+  privateIdentityRecords.set(identity, { kind: "raw", record });
   return Object.freeze(identity);
 }
 
@@ -431,9 +444,8 @@ export async function createBrowserDeviceRegistrationProof(
 ): Promise<string> {
   assertAccountId(accountId);
   const capability = privateIdentityRecords.get(identity);
-  const capabilitySignal = capability?.signal;
-  assertIdentityCapabilityActive(capabilitySignal);
-  const record = capability?.record;
+  if (capability?.kind === "epoch") assertIdentityCapabilityActive(capability.signal);
+  const record = capability?.kind === "raw" ? capability.record : undefined;
   if (record === undefined || record.accountId !== accountId) {
     throw new BrowserDeviceIdentityError(
       "key_mismatch",
@@ -443,11 +455,12 @@ export async function createBrowserDeviceRegistrationProof(
   const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, record.publicKeyWire);
   const ownedTranscript = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(ownedTranscript).set(transcript);
-  assertIdentityCapabilityActive(capabilitySignal);
   const signature = new Uint8Array(
     await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
   );
-  assertIdentityCapabilityActive(capabilitySignal);
+  if (privateIdentityRecords.get(identity) !== capability) {
+    throw new BrowserDeviceIdentityError("key_mismatch", "browser registration identity changed");
+  }
   if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
@@ -455,13 +468,15 @@ export async function createBrowserDeviceRegistrationProof(
     );
   }
   const encodedSignature = encodeBase64Url(signature);
-  assertBrowserDeviceIdentitySignerActive(identity);
+  if (privateIdentityRecords.get(identity) !== capability) {
+    throw new BrowserDeviceIdentityError("key_mismatch", "browser registration identity changed");
+  }
   return encodedSignature;
 }
 
 /** Sign only the bounded host-pair approval contract with this opaque identity. */
 export async function createHostPairApprovalProof(
-  identity: BrowserDeviceIdentity,
+  identity: EpochScopedBrowserDeviceIdentity,
   accountId: string,
   approvalNonce: string,
   hostPublicKey: string,
@@ -469,11 +484,9 @@ export async function createHostPairApprovalProof(
 ): Promise<string> {
   assertIdentityCapabilityActive(signal);
   assertAccountId(accountId);
-  const capability = privateIdentityRecords.get(identity);
-  const capabilitySignal = capability?.signal;
-  assertIdentityCapabilityActive(capabilitySignal);
-  const record = capability?.record;
-  if (record === undefined || record.accountId !== accountId) {
+  const capability = epochIdentityCapability(identity);
+  const record = capability.record;
+  if (record.accountId !== accountId) {
     throw new BrowserDeviceIdentityError(
       "key_mismatch",
       "browser device identity does not belong to the authenticated account",
@@ -489,12 +502,12 @@ export async function createHostPairApprovalProof(
   new Uint8Array(ownedTranscript).set(transcript);
   // WebCrypto signing itself is not abortable, so an epoch change discards the
   // completed signature before it can escape this capability boundary.
-  assertIdentityCapabilityActive(capabilitySignal);
+  assertBrowserDeviceIdentitySignerActive(identity);
   assertIdentityCapabilityActive(signal);
   const signature = new Uint8Array(
     await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
   );
-  assertIdentityCapabilityActive(capabilitySignal);
+  assertBrowserDeviceIdentitySignerActive(identity);
   assertIdentityCapabilityActive(signal);
   if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
     throw new BrowserDeviceIdentityError(
@@ -571,21 +584,20 @@ export async function loadBrowserDeviceIdentityPublicKey(
 }
 
 /**
- * Bind an opaque browser signer closure to one exact epoch signal. The wrapper
- * remains account-checked by the private identity registry and cannot return a
- * signature after synchronous epoch revocation.
+ * Bind an opaque browser identity to one exact epoch signal. The returned
+ * frozen public view has no signing method; bounded live proof helpers recover
+ * its private capability only through the exact-object WeakMap registration.
  */
 export function scopeBrowserDeviceIdentityToTrustEpoch(
   identity: BrowserDeviceIdentity,
   accountId: string,
   expectedPublicKeyWire: string,
   signal: AbortSignal,
-): BrowserDeviceIdentity {
+): EpochScopedBrowserDeviceIdentity {
   assertIdentityCapabilityActive(signal);
   assertAccountId(accountId);
   const capability = privateIdentityRecords.get(identity);
-  assertIdentityCapabilityActive(capability?.signal);
-  const record = capability?.record;
+  const record = capability?.kind === "raw" ? capability.record : undefined;
   if (
     record === undefined ||
     record.accountId !== accountId ||
@@ -596,18 +608,23 @@ export function scopeBrowserDeviceIdentityToTrustEpoch(
       "browser device identity does not match the active account registration",
     );
   }
-  const scoped: BrowserDeviceIdentity = Object.freeze({
+  const scoped = Object.freeze({
     publicKey: record.publicKey,
     publicKeyWire: record.publicKeyWire,
-    sign: async (transcript: SignedSignalTranscript) => {
-      assertIdentityCapabilityActive(signal);
-      const signature = await signSignedSignalTranscript(record.privateKey, transcript);
-      assertBrowserDeviceIdentitySignerActive(scoped);
-      return signature;
-    },
-  });
-  privateIdentityRecords.set(scoped, { record, signal });
+  }) as EpochScopedBrowserDeviceIdentity;
+  privateIdentityRecords.set(scoped, { kind: "epoch", record, signal });
   return scoped;
+}
+
+/** Sign one RTC transcript only through an exact active epoch capability. */
+export async function signBrowserDeviceRtcTranscriptWithinTrustEpoch(
+  identity: EpochScopedBrowserDeviceIdentity,
+  transcript: SignedSignalTranscript,
+): Promise<string> {
+  const capability = epochIdentityCapability(identity);
+  const signature = await signSignedSignalTranscript(capability.record.privateKey, transcript);
+  assertBrowserDeviceIdentitySignerActive(identity);
+  return signature;
 }
 
 /**

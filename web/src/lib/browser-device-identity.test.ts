@@ -13,13 +13,13 @@ import {
   loadBrowserDeviceIdentityPublicKey,
   loadOrCreateBrowserDeviceIdentity,
   scopeBrowserDeviceIdentityToTrustEpoch,
+  signBrowserDeviceRtcTranscriptWithinTrustEpoch,
 } from "./browser-device-identity";
 import { verifyBrowserDeviceRegistrationProof } from "./browser-device-registration-transcript";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
   type SignedSignalTranscript,
-  verifySignedSignalTranscript,
 } from "./signed-signal";
 import { signRtcSignalWire } from "./signed-signal-wire";
 
@@ -190,16 +190,62 @@ describe("browser device identity", () => {
     const reloaded = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
 
     expect(reloaded.publicKeyWire).toBe(first.publicKeyWire);
-    expect(Object.keys(first).sort()).toEqual(["publicKey", "publicKeyWire", "sign"]);
-    const value = transcript(first.publicKeyWire);
-    const signature = await reloaded.sign(value);
-    expect(await verifySignedSignalTranscript(first.publicKey, value, signature)).toBe(true);
+    expect(Object.keys(first).sort()).toEqual(["publicKey", "publicKeyWire"]);
+    expect("sign" in first).toBe(false);
 
     const stored = await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId);
     expect(stored?.version).toBe(BROWSER_DEVICE_IDENTITY_STORAGE_VERSION);
     expect(stored?.privateKey.extractable).toBe(false);
     expect(stored?.privateKey.usages).toEqual(["sign"]);
     await expect(crypto.subtle.exportKey("pkcs8", stored!.privateKey)).rejects.toThrow();
+  });
+
+  test("bounded proof routes reject raw/scoped capability substitution", async () => {
+    const factory = new IDBFactory();
+    const accountId = "00000000-0000-4000-8000-000000000089";
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const controller = new AbortController();
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      identity,
+      accountId,
+      identity.publicKeyWire,
+      controller.signal,
+    );
+    const nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const rtcTranscript = transcript(identity.publicKeyWire);
+
+    await expectIdentityError(
+      createBrowserDeviceRegistrationProof(Object.freeze({ ...identity }), accountId),
+      "key_mismatch",
+    );
+    await expectIdentityError(
+      createHostPairApprovalProof(
+        identity as typeof scoped,
+        accountId,
+        nonce,
+        identity.publicKeyWire,
+      ),
+      "key_mismatch",
+    );
+    await expectIdentityError(
+      signBrowserDeviceRtcTranscriptWithinTrustEpoch(identity as typeof scoped, rtcTranscript),
+      "key_mismatch",
+    );
+    for (const substituted of [Object.freeze({ ...scoped }), new Proxy(scoped, {})]) {
+      await expectIdentityError(
+        createHostPairApprovalProof(
+          substituted as typeof scoped,
+          accountId,
+          nonce,
+          identity.publicKeyWire,
+        ),
+        "key_mismatch",
+      );
+      await expectIdentityError(
+        signBrowserDeviceRtcTranscriptWithinTrustEpoch(substituted as typeof scoped, rtcTranscript),
+        "key_mismatch",
+      );
+    }
   });
 
   test("a captured epoch-scoped identity cannot use any exported signing path after abort", async () => {
@@ -216,7 +262,9 @@ describe("browser device identity", () => {
     const value = transcript(identity.publicKeyWire);
     controller.abort();
 
-    await expect(scoped.sign(value)).rejects.toMatchObject({ name: "AbortError" });
+    await expect(
+      signBrowserDeviceRtcTranscriptWithinTrustEpoch(scoped, value),
+    ).rejects.toMatchObject({ name: "AbortError" });
     await expect(createBrowserDeviceRegistrationProof(scoped, accountId)).rejects.toMatchObject({
       name: "AbortError",
     });
@@ -301,9 +349,12 @@ describe("browser device identity", () => {
       path: string;
       load: number;
       scope: number;
+      registration: number;
       approval: number;
+      epochSign: number;
       rawSign: number;
       wireSign: number;
+      testOnlySign: number;
     }> = [];
     const glob = new Bun.Glob("src/**/*.{ts,tsx}");
     for await (const path of glob.scan(".")) {
@@ -316,31 +367,72 @@ describe("browser device identity", () => {
         continue;
       }
       const source = await Bun.file(path).text();
-      const load = source.match(/\bloadBrowserDeviceIdentity\s*\(/gu)?.length ?? 0;
+      const load = source.match(/\bloadBrowserDeviceIdentity\b/gu)?.length ?? 0;
       const scope = source.match(/\bscopeBrowserDeviceIdentityToTrustEpoch\b/gu)?.length ?? 0;
+      const registration = source.match(/\bcreateBrowserDeviceRegistrationProof\b/gu)?.length ?? 0;
       const approval = source.match(/\bcreateHostPairApprovalProof\b/gu)?.length ?? 0;
-      const rawSign = source.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length ?? 0;
-      const wireSign = source.match(/\bsignRtcSignalWire\s*\(/gu)?.length ?? 0;
-      if (load + scope + approval + rawSign + wireSign > 0) {
-        hits.push({ path, load, scope, approval, rawSign, wireSign });
+      const epochSign =
+        source.match(/\bsignBrowserDeviceRtcTranscriptWithinTrustEpoch\b/gu)?.length ?? 0;
+      const rawSign = source.match(/\bsignSignedSignalTranscript\b/gu)?.length ?? 0;
+      const wireSign = source.match(/\bsignRtcSignalWire\b/gu)?.length ?? 0;
+      const testOnlySign = source.match(/\bsignRtcSignalWireForTestOnly\b/gu)?.length ?? 0;
+      if (
+        load + scope + registration + approval + epochSign + rawSign + wireSign + testOnlySign >
+        0
+      ) {
+        hits.push({
+          path,
+          load,
+          scope,
+          registration,
+          approval,
+          epochSign,
+          rawSign,
+          wireSign,
+          testOnlySign,
+        });
       }
     }
+    hits.sort((left, right) => left.path.localeCompare(right.path));
     expect(hits).toEqual([
       {
-        path: "src/lib/browser-trust-operations.ts",
-        load: 1,
-        scope: 2,
-        approval: 2,
+        path: "src/lib/browser-device-registration.ts",
+        load: 0,
+        scope: 0,
+        registration: 2,
+        approval: 0,
+        epochSign: 0,
         rawSign: 0,
         wireSign: 0,
+        testOnlySign: 0,
+      },
+      {
+        path: "src/lib/browser-trust-operations.ts",
+        load: 2,
+        scope: 2,
+        registration: 0,
+        approval: 2,
+        epochSign: 0,
+        rawSign: 0,
+        wireSign: 0,
+        testOnlySign: 0,
       },
     ]);
     const identitySource = await Bun.file("src/lib/browser-device-identity.ts").text();
-    expect(identitySource.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length).toBe(3);
+    expect(identitySource.match(/\bsignSignedSignalTranscript\b/gu)?.length).toBe(3);
     const rawSignerSource = await Bun.file("src/lib/signed-signal.ts").text();
-    expect(rawSignerSource.match(/\bsignSignedSignalTranscript\s*\(/gu)?.length).toBe(1);
+    expect(rawSignerSource.match(/\bsignSignedSignalTranscript\b/gu)?.length).toBe(1);
     const wireSignerSource = await Bun.file("src/lib/signed-signal-wire.ts").text();
-    expect(wireSignerSource.match(/\bsignRtcSignalWire\s*\(/gu)?.length).toBe(1);
+    expect(wireSignerSource.match(/\bsignRtcSignalWire\b/gu)?.length).toBe(1);
+    expect(
+      wireSignerSource.match(/\bsignBrowserDeviceRtcTranscriptWithinTrustEpoch\b/gu)?.length,
+    ).toBe(2);
+    expect(wireSignerSource).not.toContain("SignedRtcIdentitySigner");
+    const testOnlySignerSource = await Bun.file(
+      "test-support/signed-signal-wire-test-only.ts",
+    ).text();
+    expect(testOnlySignerSource).toContain("TEST/INTEROP ONLY");
+    expect(testOnlySignerSource.match(/\bsignRtcSignalWireForTestOnly\s*\(/gu)?.length).toBe(1);
   });
 
   test("serializes concurrent first creation so every tab-equivalent caller sees one winner", async () => {

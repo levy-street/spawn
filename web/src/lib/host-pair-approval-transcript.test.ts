@@ -5,6 +5,7 @@ import vectorsJson from "../../../proto/host-pair-approval-v1-vectors.json";
 import {
   createHostPairApprovalProof,
   loadOrCreateBrowserDeviceIdentity,
+  scopeBrowserDeviceIdentityToTrustEpoch,
 } from "./browser-device-identity";
 import {
   encodeHostPairApprovalTranscript,
@@ -80,8 +81,14 @@ describe("host-pair browser approval transcript", () => {
     const identity = await loadOrCreateBrowserDeviceIdentity(accountId, {
       indexedDBFactory: new IDBFactory(),
     });
-    const signature = await createHostPairApprovalProof(
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
       identity,
+      accountId,
+      identity.publicKeyWire,
+      new AbortController().signal,
+    );
+    const signature = await createHostPairApprovalProof(
+      scoped,
       accountId,
       vectors.positive.approval_nonce,
       vectors.positive.host_public_key,
@@ -97,7 +104,7 @@ describe("host-pair browser approval transcript", () => {
     ).toBe(true);
     await expect(
       createHostPairApprovalProof(
-        identity,
+        scoped,
         vectors.mutations.user_id,
         vectors.positive.approval_nonce,
         vectors.positive.host_public_key,
@@ -120,6 +127,12 @@ describe("host-pair browser approval transcript", () => {
     const identity = await loadOrCreateBrowserDeviceIdentity(positive.user_id, {
       indexedDBFactory: new IDBFactory(),
     });
+    const scoped = scopeBrowserDeviceIdentityToTrustEpoch(
+      identity,
+      positive.user_id,
+      identity.publicKeyWire,
+      new AbortController().signal,
+    );
 
     for (const vector of rejected) {
       const invalidWire = encodeBase64Url(bytesFromHex(vector.public_key_hex));
@@ -144,12 +157,7 @@ describe("host-pair browser approval transcript", () => {
         `${vector.id} accepted as browser key`,
       ).toThrow("Ed25519 public key");
       await expect(
-        createHostPairApprovalProof(
-          identity,
-          positive.user_id,
-          positive.approval_nonce,
-          invalidWire,
-        ),
+        createHostPairApprovalProof(scoped, positive.user_id, positive.approval_nonce, invalidWire),
         `${vector.id} host identity was signed`,
       ).rejects.toThrow("Ed25519 public key");
       await expect(

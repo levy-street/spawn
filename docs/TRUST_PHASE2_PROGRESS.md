@@ -673,6 +673,13 @@ registry lease and lifecycle listener; stale reconnect and stale captured
 signers are refused, and transfers combine both lifecycle signals and reject
 owner/epoch mismatch. A source inventory guards against reintroducing raw
 destination construction, raw signer escape, or mutable registry authority.
+Raw and epoch-scoped browser identity views now expose public key material only,
+with no reusable signing method. Every live signing entry point requires the
+nominal, exact-object WeakMap registration for the active epoch; raw identities,
+structural copies, wrappers, proxies, and rebound signing functions fail before
+signing. The structural signer used for shared golden vectors and cross-runtime
+tests exists only under `web/test-support`, and the production source inventory
+rejects imports or calls to it.
 Deterministic pre/post-boundary tests preserve explicit retained-recovery and
 `outcome_unknown` classifications, while the replay high-water behavior above
 remains unchanged. This checkpoint still makes no live signed-signaling, TOFU,
