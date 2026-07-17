@@ -650,10 +650,11 @@ Host-ID domain, and bounded browser-pin set. It rereads the complete record
 immediately before every WebSocket attempt and polls one complete load at a
 bounded 500 ms interval while connected or backing off. An unchanged revision
 must be field-for-field the same decoded record; a same-revision substitution,
-generation rollback/non-advance, reused record identity, missing login/key/domain, changed
-Host ID/origin, or corrupt/noncanonical key or pin fails closed without keeping
-the old authorization active. A valid higher generation tears down the old
-WebSocket/RTC authorization before reconnecting with its new token.
+generation rollback/non-advance, reused record identity, missing
+login/key/domain, changed Host ID/origin, or corrupt/noncanonical key or pin
+fails closed without keeping the old authorization active. A valid higher
+generation tears down the old WebSocket/RTC authorization before reconnecting
+with its new token.
 
 RTC admission captures a trust epoch before expensive peer construction and
 rechecks it inside the serialized insertion boundary. Credential reload first
