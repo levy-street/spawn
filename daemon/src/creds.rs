@@ -82,6 +82,10 @@ pub struct StoredCreds {
     /// persisted or allowed to affect its schema.
     #[serde(skip)]
     native_projection_degraded: bool,
+    /// Runtime-only health for Unix's optional redundant keyring copy. The
+    /// complete mode-0600 file remains authoritative.
+    #[serde(skip)]
+    unix_keyring_degraded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +167,9 @@ pub struct CredentialRevision {
 pub enum CredentialSaveOutcome {
     Committed,
     CommittedProjectionDegraded,
+    CommittedRedundancyDegraded,
     CommittedDurabilityDegraded,
+    CommittedDurabilityAndRedundancyDegraded,
 }
 
 impl CredentialSaveOutcome {
@@ -173,8 +179,14 @@ impl CredentialSaveOutcome {
             Self::CommittedProjectionDegraded => Some(
                 "credentials committed to the OS keyring, but the local metadata projection is degraded; run `spawnd status` to validate or repair it",
             ),
+            Self::CommittedRedundancyDegraded => Some(
+                "credentials committed to the complete credential file, but the optional OS-keyring copy is degraded; run `spawnd status` to retry repair",
+            ),
             Self::CommittedDurabilityDegraded => Some(
                 "credentials were committed, but the credential directory durability sync failed; verify storage health before reboot",
+            ),
+            Self::CommittedDurabilityAndRedundancyDegraded => Some(
+                "credentials are visible in the complete credential file, but its directory durability is uncertain and the optional OS-keyring copy is degraded; verify storage health before reboot, then run `spawnd status` to retry keyring repair",
             ),
         }
     }
@@ -601,8 +613,8 @@ pub fn credential_revision(creds: &StoredCreds) -> Result<CredentialRevision> {
 }
 
 fn reconcile_backend_records(
-    from_file: Option<StoredCreds>,
-    from_keyring: Option<StoredCreds>,
+    mut from_file: Option<StoredCreds>,
+    mut from_keyring: Option<StoredCreds>,
     policy: BackendPolicy,
 ) -> Result<StoredCreds> {
     let file_order = from_file.as_ref().map(record_order).transpose()?.flatten();
@@ -611,67 +623,71 @@ fn reconcile_backend_records(
         .map(record_order)
         .transpose()?
         .flatten();
+
+    if policy == BackendPolicy::UnixCompleteFile {
+        // The complete mode-0600 file is the sole Unix commit point. An
+        // optional keyring record is only a redundant projection and can
+        // never select, advance, or merge over an existing file -- even when
+        // it carries a higher generation or the file is an empty legacy
+        // record. A versioned keyring without any file has no authoritative
+        // commit evidence and is rejected; only pre-versioning keyring-only
+        // credentials remain eligible for one-time migration on next save.
+        return match (from_file.take(), from_keyring.take(), keyring_order) {
+            (Some(file), Some(mut keyring), _) => {
+                zeroize_stored_creds(&mut keyring);
+                Ok(file)
+            }
+            (Some(file), None, _) => Ok(file),
+            (None, None, _) => Ok(StoredCreds::default()),
+            (None, Some(mut keyring), Some(_)) => {
+                zeroize_stored_creds(&mut keyring);
+                bail!("versioned Unix keyring record has no authoritative complete credential file")
+            }
+            (None, Some(keyring), None) => Ok(keyring),
+        };
+    }
+
     match (from_file, from_keyring, file_order, keyring_order) {
         (None, None, _, _) => Ok(StoredCreds::default()),
-        (Some(file), None, _, _) => match policy {
-            BackendPolicy::UnixCompleteFile => Ok(file),
-            BackendPolicy::NativeKeyring if record_is_empty(&file) => Ok(file),
-            BackendPolicy::NativeKeyring => {
+        (Some(file), None, _, _) => {
+            if record_is_empty(&file) {
+                Ok(file)
+            } else {
                 let mut file = file;
                 zeroize_stored_creds(&mut file);
                 bail!("versioned native credential file has no matching complete keyring record")
             }
-        },
+        }
         (None, Some(keyring), _, _) => Ok(keyring),
-        (Some(file), Some(keyring), None, None) => reconcile_legacy_records(file, keyring, policy),
-        (Some(mut file), Some(keyring), Some(_), None) => match policy {
-            BackendPolicy::UnixCompleteFile => {
-                let mut keyring = keyring;
-                zeroize_stored_creds(&mut keyring);
-                Ok(file)
-            }
-            BackendPolicy::NativeKeyring => {
-                zeroize_stored_creds(&mut file);
-                let mut keyring = keyring;
-                zeroize_stored_creds(&mut keyring);
-                bail!("native keyring is legacy while its metadata file is versioned")
-            }
-        },
-        (Some(mut file), Some(keyring), None, Some(_)) => match policy {
-            BackendPolicy::UnixCompleteFile
-                if file.access_token.is_some() || file.host_private_key_seed.is_some() =>
-            {
-                let mut keyring = keyring;
-                zeroize_stored_creds(&mut keyring);
-                Ok(file)
-            }
-            _ => {
-                zeroize_stored_creds(&mut file);
-                Ok(keyring)
-            }
-        },
-        (Some(file), Some(keyring), Some(file_order), Some(keyring_order)) => match policy {
-            BackendPolicy::UnixCompleteFile => {
-                choose_complete_record(file, keyring, file_order, keyring_order)
-            }
-            BackendPolicy::NativeKeyring => {
-                if file_order == keyring_order {
-                    let mut projection = file_creds_without_private_seed(&keyring);
-                    let matches = projection == file;
-                    zeroize_stored_creds(&mut projection);
-                    if !matches {
-                        let mut file = file;
-                        let mut keyring = keyring;
-                        zeroize_stored_creds(&mut file);
-                        zeroize_stored_creds(&mut keyring);
-                        bail!("native credential backends disagree within one generation")
-                    }
+        (Some(file), Some(keyring), None, None) => {
+            reconcile_legacy_records(file, keyring, BackendPolicy::NativeKeyring)
+        }
+        (Some(mut file), Some(mut keyring), Some(_), None) => {
+            zeroize_stored_creds(&mut file);
+            zeroize_stored_creds(&mut keyring);
+            bail!("native keyring is legacy while its metadata file is versioned")
+        }
+        (Some(mut file), Some(keyring), None, Some(_)) => {
+            zeroize_stored_creds(&mut file);
+            Ok(keyring)
+        }
+        (Some(file), Some(keyring), Some(file_order), Some(keyring_order)) => {
+            if file_order == keyring_order {
+                let mut projection = file_creds_without_private_seed(&keyring);
+                let matches = projection == file;
+                zeroize_stored_creds(&mut projection);
+                if !matches {
+                    let mut file = file;
+                    let mut keyring = keyring;
+                    zeroize_stored_creds(&mut file);
+                    zeroize_stored_creds(&mut keyring);
+                    bail!("native credential backends disagree within one generation")
                 }
-                let mut file = file;
-                zeroize_stored_creds(&mut file);
-                Ok(keyring)
             }
-        },
+            let mut file = file;
+            zeroize_stored_creds(&mut file);
+            Ok(keyring)
+        }
     }
 }
 
@@ -684,24 +700,6 @@ fn record_is_empty(creds: &StoredCreds) -> bool {
         && creds.server_url.is_none()
         && creds.host_private_key_seed.is_none()
         && creds.browser_pins.is_empty()
-}
-
-fn choose_complete_record(
-    mut file: StoredCreds,
-    mut keyring: StoredCreds,
-    file_order: (u64, Uuid),
-    keyring_order: (u64, Uuid),
-) -> Result<StoredCreds> {
-    if file_order == keyring_order && file != keyring {
-        zeroize_stored_creds(&mut file);
-        zeroize_stored_creds(&mut keyring);
-        bail!("credential backends disagree within one record identity")
-    }
-    // The complete mode-0600 Unix file is the commit point. A keyring write can
-    // succeed before the atomic file replacement fails, so a higher keyring
-    // generation is only a partial attempt and must never roll the file forward.
-    zeroize_stored_creds(&mut keyring);
-    Ok(file)
 }
 
 fn reconcile_legacy_records(
@@ -962,7 +960,9 @@ fn load_unlocked() -> Result<StoredCreds> {
     let keyring_result = read_scoped_keyring_record(&scope, file_for_migration, platform_policy());
     #[cfg(unix)]
     {
-        resolve_unix_keyring_read(from_file, keyring_result)
+        resolve_unix_keyring_read(from_file, keyring_result, |record| {
+            keyring_set_for_user(&scope.user, record)
+        })
     }
     #[cfg(not(unix))]
     {
@@ -987,14 +987,17 @@ fn load_unlocked() -> Result<StoredCreds> {
 fn resolve_unix_keyring_read(
     mut from_file: Option<StoredCreds>,
     keyring_result: std::result::Result<Option<StoredCreds>, KeyringReadFailure>,
+    repair_keyring: impl FnOnce(&StoredCreds) -> Result<()>,
 ) -> Result<StoredCreds> {
     match keyring_result {
-        Ok(from_keyring) => {
-            reconcile_backend_records(from_file, from_keyring, BackendPolicy::UnixCompleteFile)
-        }
+        Ok(from_keyring) => reconcile_unix_redundancy(from_file, from_keyring, repair_keyring),
         Err(failure) if failure.unavailable => {
             tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
-            Ok(from_file.unwrap_or_default())
+            let mut selected = from_file.unwrap_or_default();
+            if !record_is_empty(&selected) {
+                selected.unix_keyring_degraded = true;
+            }
+            Ok(selected)
         }
         Err(failure) => {
             if let Some(record) = from_file.as_mut() {
@@ -1003,6 +1006,35 @@ fn resolve_unix_keyring_read(
             Err(failure.error)
         }
     }
+}
+
+#[cfg(any(unix, test))]
+fn reconcile_unix_redundancy<F>(
+    from_file: Option<StoredCreds>,
+    from_keyring: Option<StoredCreds>,
+    repair_keyring: F,
+) -> Result<StoredCreds>
+where
+    F: FnOnce(&StoredCreds) -> Result<()>,
+{
+    let file_is_authoritative = from_file.is_some();
+    let repair_needed = match (&from_file, &from_keyring) {
+        (Some(file), Some(keyring)) => file != keyring,
+        (Some(file), None) => !record_is_empty(file),
+        (None, _) => false,
+    };
+    let mut selected =
+        reconcile_backend_records(from_file, from_keyring, BackendPolicy::UnixCompleteFile)?;
+    if file_is_authoritative && repair_needed {
+        match repair_keyring(&selected) {
+            Ok(()) => selected.unix_keyring_degraded = false,
+            Err(error) => {
+                selected.unix_keyring_degraded = true;
+                tracing::warn!(error = %error, "optional Unix keyring copy remains degraded; the complete credential file is authoritative");
+            }
+        }
+    }
+    Ok(selected)
 }
 
 #[cfg(any(not(unix), test))]
@@ -1166,21 +1198,40 @@ where
     // bounds, before either backend can observe an update.
     validate_persistable_creds(creds)?;
     validate_complete_current_record(creds)?;
-    let keyring_result = set_keyring(creds);
     match policy {
         BackendPolicy::UnixCompleteFile => {
-            if let Err(error) = keyring_result {
-                tracing::warn!(error = %error, "keyring write failed; committing the complete Unix file fallback");
-            }
-            match save_file(creds)? {
-                CredentialFileWriteOutcome::Committed => Ok(CredentialSaveOutcome::Committed),
-                CredentialFileWriteOutcome::CommittedDirectorySyncDegraded => {
-                    Ok(CredentialSaveOutcome::CommittedDurabilityDegraded)
+            // The complete file is authoritative on Unix. Do not expose N+1
+            // to the optional keyring until the atomic file replacement has
+            // crossed its commit point.
+            let file_outcome = save_file(creds)?;
+            match set_keyring(creds) {
+                Ok(()) => {
+                    creds.unix_keyring_degraded = false;
+                    match file_outcome {
+                        CredentialFileWriteOutcome::Committed => {
+                            Ok(CredentialSaveOutcome::Committed)
+                        }
+                        CredentialFileWriteOutcome::CommittedDirectorySyncDegraded => {
+                            Ok(CredentialSaveOutcome::CommittedDurabilityDegraded)
+                        }
+                    }
+                }
+                Err(error) => {
+                    creds.unix_keyring_degraded = true;
+                    tracing::warn!(error = %error, "optional Unix keyring update failed after the complete credential file committed");
+                    match file_outcome {
+                        CredentialFileWriteOutcome::Committed => {
+                            Ok(CredentialSaveOutcome::CommittedRedundancyDegraded)
+                        }
+                        CredentialFileWriteOutcome::CommittedDirectorySyncDegraded => {
+                            Ok(CredentialSaveOutcome::CommittedDurabilityAndRedundancyDegraded)
+                        }
+                    }
                 }
             }
         }
         BackendPolicy::NativeKeyring => {
-            keyring_result.context("persisting required native-keyring credential record")?;
+            set_keyring(creds).context("persisting required native-keyring credential record")?;
             match save_file(creds) {
                 Ok(CredentialFileWriteOutcome::Committed) => {
                     creds.native_projection_degraded = false;
@@ -1227,6 +1278,7 @@ fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
         host_private_key_seed: None,
         browser_pins: creds.browser_pins.clone(),
         native_projection_degraded: false,
+        unix_keyring_degraded: false,
     }
 }
 
@@ -1453,6 +1505,12 @@ fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
         writeln!(
             &mut output,
             "warning:     native credential metadata projection is degraded; the complete OS-keyring record remains authoritative and a later status/load will retry repair"
+        )?;
+    }
+    if creds.unix_keyring_degraded {
+        writeln!(
+            &mut output,
+            "warning:     optional OS-keyring copy is degraded; the complete credential file remains authoritative and a later status/load will retry repair"
         )?;
     }
     Ok(output)
@@ -2131,6 +2189,7 @@ mod tests {
             host_private_key_seed: Some(URL_SAFE_NO_PAD.encode([seed_byte; ED25519_SEED_BYTES])),
             browser_pins: Vec::new(),
             native_projection_degraded: false,
+            unix_keyring_degraded: false,
         }
     }
 
@@ -2293,7 +2352,11 @@ mod tests {
             |_, _| Err(anyhow::anyhow!("unexpected keyring write during load")),
             |_| Err(anyhow::anyhow!("unexpected keyring delete during load")),
         );
-        resolve_unix_keyring_read(from_file, keyring_result)
+        resolve_unix_keyring_read(from_file, keyring_result, |_| {
+            Err(anyhow::anyhow!(
+                "unexpected keyring repair during forced failure"
+            ))
+        })
     }
 
     #[cfg(unix)]
@@ -2689,14 +2752,246 @@ mod tests {
     }
 
     #[test]
-    fn unix_partial_backend_orders_select_one_whole_generation_and_retry_converges() {
+    fn unix_first_save_failure_never_publishes_n_plus_one_to_the_optional_keyring() {
+        use std::cell::{Cell, RefCell};
+
+        // No file yet: a legacy keyring-only record may be read for migration,
+        // but a failed first authoritative file write must happen before any
+        // N+1 keyring update. Restart therefore sees the old legacy record.
+        let mut old = fixed_creds();
+        old.access_token = Some("old-token".into());
+        bind_pin_domain(&mut old, 10, "https://server.example/");
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+        let file = RefCell::new(None);
+        let keyring = RefCell::new(Some(old.clone()));
+        let keyring_called = Cell::new(false);
+        let file_called = Cell::new(false);
+        let mut current = old.clone();
+        let error = commit_login_update(
+            &mut current,
+            "new-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
+            |candidate, expected| {
+                save_cas_with_backends(
+                    candidate,
+                    expected,
+                    || {
+                        reconcile_backend_records(
+                            file.borrow().clone(),
+                            keyring.borrow().clone(),
+                            BackendPolicy::UnixCompleteFile,
+                        )
+                    },
+                    BackendPolicy::UnixCompleteFile,
+                    |_| {
+                        keyring_called.set(true);
+                        Ok(())
+                    },
+                    |_| {
+                        file_called.set(true);
+                        bail!("injected first authoritative file failure")
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("authoritative file failure"));
+        assert!(file_called.get());
+        assert!(!keyring_called.get());
+        assert!(file.borrow().is_none());
+        assert_eq!(serde_json::to_vec(&current).unwrap(), old_bytes);
+        assert_eq!(
+            serde_json::to_vec(keyring.borrow().as_ref().unwrap()).unwrap(),
+            old_bytes
+        );
+        let restarted = reconcile_backend_records(
+            file.borrow().clone(),
+            keyring.borrow().clone(),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&restarted).unwrap(), old_bytes);
+        assert!(record_order(&restarted).unwrap().is_none());
+        assert!(restarted.browser_pins().is_empty());
+
+        // An existing empty legacy file is still authoritative. Even a
+        // well-formed future keyring generation cannot become the base or win
+        // after another failed first file write.
+        let empty = StoredCreds::default();
+        let future_keyring =
+            complete_record(99, 99, "future-token", 99, "https://future.example/", 9);
+        let file = RefCell::new(Some(empty.clone()));
+        let keyring = RefCell::new(Some(future_keyring.clone()));
+        let selected = reconcile_backend_records(
+            file.borrow().clone(),
+            keyring.borrow().clone(),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&selected, &empty);
+        let expected = credential_revision(&selected).unwrap();
+        let mut first_identity = selected;
+        ensure_host_identity(&mut first_identity).unwrap();
+        let keyring_called = Cell::new(false);
+        assert!(save_cas_with_backends(
+            &mut first_identity,
+            &expected,
+            || {
+                reconcile_backend_records(
+                    file.borrow().clone(),
+                    keyring.borrow().clone(),
+                    BackendPolicy::UnixCompleteFile,
+                )
+            },
+            BackendPolicy::UnixCompleteFile,
+            |_| {
+                keyring_called.set(true);
+                Ok(())
+            },
+            |_| bail!("injected empty-file first commit failure"),
+        )
+        .is_err());
+        assert!(!keyring_called.get());
+        assert_same_coherent_record(file.borrow().as_ref().unwrap(), &empty);
+        assert_same_coherent_record(keyring.borrow().as_ref().unwrap(), &future_keyring);
+        let restarted = reconcile_backend_records(
+            file.into_inner(),
+            keyring.into_inner(),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .unwrap();
+        assert_same_coherent_record(&restarted, &empty);
+        let repaired_keyring = RefCell::new(Some(future_keyring.clone()));
+        let file_snapshot = Some(empty.clone());
+        let keyring_snapshot = repaired_keyring.borrow().clone();
+        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+            *repaired_keyring.borrow_mut() = Some(record.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_same_coherent_record(&selected, &empty);
+        assert_same_coherent_record(repaired_keyring.borrow().as_ref().unwrap(), &empty);
+        assert!(reconcile_backend_records(
+            None,
+            Some(future_keyring),
+            BackendPolicy::UnixCompleteFile,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unix_file_commit_survives_keyring_failure_and_reload_repairs_without_downgrade() {
         use std::cell::RefCell;
+
+        let device_id = Uuid::from_u128(1);
+        let legacy_pin = browser_pin(device_id, RFC_KEY_ONE);
+        let confirmed_pin = confirm_browser_pin(legacy_pin.clone());
+        let mut old = complete_record(1, 1, "old-token", 10, "https://server.example/", 1);
+        merge_browser_pin(&mut old, legacy_pin).unwrap();
+        let file = RefCell::new(Some(old.clone()));
+        let keyring = RefCell::new(Some(old.clone()));
+        let mut current = old.clone();
+
+        let outcome = commit_login_update(
+            &mut current,
+            "new-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            confirmed_pin.clone(),
+            |candidate, expected| {
+                save_cas_with_backends(
+                    candidate,
+                    expected,
+                    || {
+                        reconcile_backend_records(
+                            file.borrow().clone(),
+                            keyring.borrow().clone(),
+                            BackendPolicy::UnixCompleteFile,
+                        )
+                    },
+                    BackendPolicy::UnixCompleteFile,
+                    |_| bail!("injected optional keyring update failure"),
+                    |record| {
+                        *file.borrow_mut() = Some(record.clone());
+                        Ok(CredentialFileWriteOutcome::Committed)
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.save,
+            CredentialSaveOutcome::CommittedRedundancyDegraded
+        );
+        assert!(outcome.pin_inserted);
+        assert!(current.unix_keyring_degraded);
+        assert_eq!(current.access_token.as_deref(), Some("new-token"));
+        assert_eq!(current.browser_pin(device_id), Some(&confirmed_pin));
+        assert_eq!(
+            serde_json::to_vec(file.borrow().as_ref().unwrap()).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_same_coherent_record(keyring.borrow().as_ref().unwrap(), &old);
+
+        let failed_repair =
+            reconcile_unix_redundancy(file.borrow().clone(), keyring.borrow().clone(), |_| {
+                bail!("injected reload repair failure")
+            })
+            .unwrap();
+        assert!(failed_repair.unix_keyring_degraded);
+        assert_eq!(failed_repair.browser_pin(device_id), Some(&confirmed_pin));
+        let status = format_status("https://server.example/", &failed_repair).unwrap();
+        assert!(status.contains("optional OS-keyring copy is degraded"));
+        for secret in [
+            "new-token",
+            failed_repair.host_private_key_seed.as_deref().unwrap(),
+            confirmed_pin.public_key(),
+        ] {
+            assert!(!status.contains(secret));
+            assert!(!outcome.save.warning_message().unwrap().contains(secret));
+        }
+
+        let file_snapshot = file.borrow().clone();
+        let keyring_snapshot = keyring.borrow().clone();
+        let repaired = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+            *keyring.borrow_mut() = Some(record.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!repaired.unix_keyring_degraded);
+        assert_same_coherent_record(&repaired, &current);
+        assert_same_coherent_record(keyring.borrow().as_ref().unwrap(), &current);
+
+        let mut future =
+            complete_record(500, 500, "future-token", 500, "https://future.example/", 5);
+        merge_browser_pin(
+            &mut future,
+            confirm_browser_pin(browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)),
+        )
+        .unwrap();
+        *keyring.borrow_mut() = Some(future);
+        let file_snapshot = file.borrow().clone();
+        let keyring_snapshot = keyring.borrow().clone();
+        let selected = reconcile_unix_redundancy(file_snapshot, keyring_snapshot, |record| {
+            *keyring.borrow_mut() = Some(record.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_same_coherent_record(&selected, &current);
+        assert_eq!(selected.browser_pin(device_id), Some(&confirmed_pin));
+        assert_same_coherent_record(keyring.borrow().as_ref().unwrap(), &current);
+    }
+
+    #[test]
+    fn unix_partial_backend_orders_select_one_whole_generation_and_retry_converges() {
+        use std::cell::{Cell, RefCell};
 
         let old = complete_record(1, 1, "old-token", 10, "https://old.example/", 7);
 
-        // Keyring observes N+1 but the required Unix file write fails. The
-        // complete file remains the commit point, so the partial keyring
-        // attempt cannot roll the durable record forward.
+        // A required Unix file failure happens before the optional keyring can
+        // observe N+1. Reload therefore sees only the old complete generation.
         let mut keyring_first = old.clone();
         keyring_first.access_token = Some("keyring-new-token".into());
         keyring_first.host_id = Some(Uuid::from_u128(20));
@@ -2708,21 +3003,21 @@ mod tests {
             confirm_browser_pin(browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)),
         )
         .unwrap();
-        let written_keyring = RefCell::new(None);
+        let keyring_called = Cell::new(false);
         assert!(save_with_backends(
             &mut keyring_first,
             BackendPolicy::UnixCompleteFile,
-            |record| {
-                *written_keyring.borrow_mut() = Some(record.clone());
+            |_| {
+                keyring_called.set(true);
                 Ok(())
             },
             |_| bail!("injected file failure"),
         )
         .is_err());
-        let keyring_new = written_keyring.into_inner().unwrap();
+        assert!(!keyring_called.get());
         let loaded = reconcile_backend_records(
             Some(old.clone()),
-            Some(keyring_new.clone()),
+            Some(old.clone()),
             BackendPolicy::UnixCompleteFile,
         )
         .unwrap();
@@ -2741,16 +3036,24 @@ mod tests {
         )
         .unwrap();
         let written_file = RefCell::new(None);
-        save_with_backends(
+        let write_order = RefCell::new(Vec::new());
+        let outcome = save_with_backends(
             &mut file_first,
             BackendPolicy::UnixCompleteFile,
-            |_| bail!("injected keyring failure"),
+            |_| {
+                write_order.borrow_mut().push("keyring");
+                bail!("injected keyring failure")
+            },
             |record| {
+                write_order.borrow_mut().push("file");
                 *written_file.borrow_mut() = Some(record.clone());
                 Ok(CredentialFileWriteOutcome::Committed)
             },
         )
         .unwrap();
+        assert_eq!(outcome, CredentialSaveOutcome::CommittedRedundancyDegraded);
+        assert_eq!(&*write_order.borrow(), &["file", "keyring"]);
+        assert!(file_first.unix_keyring_degraded);
         let file_new = written_file.into_inner().unwrap();
         let loaded = reconcile_backend_records(
             Some(file_new.clone()),
@@ -2848,14 +3151,15 @@ mod tests {
         assert_same_coherent_record(&first, &writer_file);
         assert_same_coherent_record(&second, &writer_file);
 
-        let mut corrupt_same_id = writer_keyring.clone();
-        corrupt_same_id.server_url = Some("https://corrupt.example/".into());
-        assert!(reconcile_backend_records(
-            Some(corrupt_same_id),
-            Some(writer_keyring),
+        let mut conflicting_keyring = writer_keyring.clone();
+        conflicting_keyring.server_url = Some("https://corrupt.example/".into());
+        let selected = reconcile_backend_records(
+            Some(writer_keyring.clone()),
+            Some(conflicting_keyring),
             BackendPolicy::UnixCompleteFile,
         )
-        .is_err());
+        .unwrap();
+        assert_same_coherent_record(&selected, &writer_keyring);
     }
 
     #[test]
@@ -3395,6 +3699,35 @@ mod tests {
         assert!(warning.contains("durability sync failed"));
         assert!(!warning.contains("new-token"));
         assert!(!warning.contains(candidate.host_private_key_seed.as_deref().unwrap()));
+
+        let combined_file = RefCell::new(old.clone());
+        let mut combined_candidate = old.clone();
+        combined_candidate.access_token = Some("combined-new-token".into());
+        let combined = save_cas_with_backends(
+            &mut combined_candidate,
+            &expected,
+            || Ok(combined_file.borrow().clone()),
+            BackendPolicy::UnixCompleteFile,
+            |_| bail!("injected optional keyring failure after degraded file commit"),
+            |record| {
+                *combined_file.borrow_mut() = record.clone();
+                Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            combined,
+            CredentialSaveOutcome::CommittedDurabilityAndRedundancyDegraded
+        );
+        assert!(combined_candidate.unix_keyring_degraded);
+        assert_eq!(
+            serde_json::to_vec(&combined_candidate).unwrap(),
+            serde_json::to_vec(&*combined_file.borrow()).unwrap()
+        );
+        let warning = combined.warning_message().unwrap();
+        assert!(warning.contains("directory durability is uncertain"));
+        assert!(warning.contains("optional OS-keyring copy is degraded"));
+        assert!(!warning.contains("combined-new-token"));
     }
 
     #[test]

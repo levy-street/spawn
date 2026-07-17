@@ -491,9 +491,13 @@ credential lock across a durable reread and revision compare-and-swap, so stale
 writers fail before either backend write. The correction binds any nonempty pin
 set to canonical server origin plus Host ID, refuses domain changes before a
 write with explicit reset/separate-config recovery, and treats the complete
-Unix file as the commit point when its OS keyring is genuinely unavailable
-(Linux uses kernel keyutils, not Secret Service/DBus). Keyring accounts are
-now scoped by the canonical config-directory identity; alternate config trees
+Unix file as the sole commit point; its OS keyring copy is optional redundancy
+(Linux uses kernel keyutils, not Secret Service/DBus). Unix writes the atomic
+file before exposing the new generation to the keyring. Reload always selects
+an existing file -- including an empty or legacy file -- over a stale, future,
+or conflicting optional keyring copy, rejects versioned keyring-only state,
+and repairs the redundancy from the file. Keyring accounts are now scoped by
+the canonical config-directory identity; alternate config trees
 cannot cross-load or cross-delete trust, and only the exact default directory
 may perform a conflict-checked one-time migration of the legacy global entry.
 Strict outer-schema, parent-sync, atomic projection, EOF-only torn-projection
@@ -507,8 +511,13 @@ later load/status repairs or validates the seed-free projection without
 rolling back a version-1 OOB marker. Likewise, a complete-file rename followed
 by failed parent-directory sync is reported as committed with uncertain crash
 durability, never as a rollback; failures before rename remain ordinary errors
-and leave the target unchanged. Status and smoke failures remain redacted. A
-real two-login proof now runs without the keyring-disable flag and compares
+and leave the target unchanged. A later optional Unix-keyring failure is also
+typed committed-but-redundancy-degraded: memory and reload retain the file's
+whole generation, fixed redacted status warns, and later load/status retries
+repair without allowing a stale/future keyring to downgrade or advance it. A
+combined parent-sync plus keyring failure reports both the uncertain crash
+durability and degraded redundancy. Status and smoke failures remain redacted.
+A real two-login proof now runs without the keyring-disable flag and compares
 both exact four-field browser tuples after re-login; a backend-injected
 subprocess also proves two login updates survive raw keyring get/set failures.
 The initial pin source is still server-mediated, so 02E alone does not supply
@@ -590,7 +599,10 @@ inert conflict history: authorization selectors expose only confirmation
 version 1. An exact OOB ceremony may atomically promote only that same tuple;
 pre-authoritative save failure leaves the legacy marker unchanged, while a
 post-keyring projection failure retains the committed version-1 promotion in
-memory and on reload. Confirmed records cannot be downgraded, and
+memory and on reload. On Unix the authoritative file is committed before its
+optional keyring copy; file failure publishes no new keyring generation, while
+a later keyring failure retains the file-committed version-1 promotion and is
+repaired from that file on reload. Confirmed records cannot be downgraded, and
 unknown/future marker versions fail closed. The browser approval page derives
 the displayed browser fingerprint again from its non-extractable local
 identity, compares the registration response, and retains that local value
@@ -598,7 +610,8 @@ through the approval success state with exact CLI copy/entry instructions.
 Rust tests exercise the exact-entry matrix, non-TTY/EOF, substitution/token
 wipe, known-pin re-login, device/key/domain conflicts, capacity, pre-commit
 failure, committed-degraded projection repair, and post-rename durability
-uncertainty. The real login smoke
+uncertainty, including absent/empty/legacy file first-save and stale/future
+optional-keyring regressions. The real login smoke
 supplies an independently prepared browser fingerprint and proves a different
 approved browser key leaves the byte-identical credential record unchanged;
 native Chromium proves the local display survives approval success. This
