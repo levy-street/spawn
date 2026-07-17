@@ -26,7 +26,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +40,8 @@ pub(crate) const OUTPUT_TAIL_BYTES: usize = 4 * 1024;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTAINMENT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+const QUARANTINE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SPAWN_BUSY_RETRIES: usize = 3;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 pub(crate) const MAX_PROCESSES: usize = 4;
@@ -185,6 +187,7 @@ fn policy_for(tool: &str) -> Option<ToolPolicy> {
 
 pub(crate) struct HostToolService {
     processes: Arc<Semaphore>,
+    residue_supervisor: Arc<ToolResidueSupervisor>,
     install_state: StdMutex<ToolInstallState>,
     operations: Arc<HostToolOperations>,
     lifecycle_hooks: Arc<HostToolLifecycleHooks>,
@@ -211,6 +214,14 @@ struct HostToolLifecycleHooks {
     pipe_drain: AsyncPause,
     #[cfg(test)]
     reconciliation_clear: AsyncPause,
+    #[cfg(test)]
+    cleanup_freeze: AsyncPause,
+    #[cfg(test)]
+    cleanup_populated: AsyncPause,
+    #[cfg(test)]
+    cleanup_reap: AsyncPause,
+    #[cfg(test)]
+    quarantine_reaper: AsyncPause,
     #[cfg(all(test, target_os = "linux"))]
     containment_path: StdMutex<Option<PathBuf>>,
 }
@@ -235,6 +246,16 @@ impl AsyncPause {
 
     fn release(&self) {
         self.release.notify_one();
+    }
+
+    async fn pause_until(&self, deadline: tokio::time::Instant) -> bool {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        self.entered.notify_one();
+        tokio::time::timeout_at(deadline, self.release.notified())
+            .await
+            .is_ok()
     }
 }
 
@@ -283,6 +304,35 @@ impl HostToolLifecycleHooks {
             self.reconciliation_clear.release.notified().await;
         }
     }
+
+    async fn cleanup_freeze_until(&self, _deadline: tokio::time::Instant) -> bool {
+        #[cfg(test)]
+        return self.cleanup_freeze.pause_until(_deadline).await;
+        #[cfg(not(test))]
+        true
+    }
+
+    async fn cleanup_populated_until(&self, _deadline: tokio::time::Instant) -> bool {
+        #[cfg(test)]
+        return self.cleanup_populated.pause_until(_deadline).await;
+        #[cfg(not(test))]
+        true
+    }
+
+    async fn cleanup_reap_until(&self, _deadline: tokio::time::Instant) -> bool {
+        #[cfg(test)]
+        return self.cleanup_reap.pause_until(_deadline).await;
+        #[cfg(not(test))]
+        true
+    }
+
+    async fn pause_quarantine_reaper(&self) {
+        #[cfg(test)]
+        if self.quarantine_reaper.armed.swap(false, Ordering::AcqRel) {
+            self.quarantine_reaper.entered.notify_one();
+            self.quarantine_reaper.release.notified().await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -296,6 +346,91 @@ struct HostToolOperationPermit {
 }
 
 struct CancelOperationOnDrop(CancellationToken);
+
+#[derive(Default)]
+struct ToolResidueState {
+    admissions: usize,
+    quarantined: usize,
+}
+
+#[derive(Default)]
+struct ToolResidueSupervisor {
+    state: StdMutex<ToolResidueState>,
+    idle: Notify,
+}
+
+struct ToolResidueAdmission {
+    supervisor: Arc<ToolResidueSupervisor>,
+    active: bool,
+}
+
+impl ToolResidueSupervisor {
+    fn admit(self: &Arc<Self>) -> Result<ToolResidueAdmission, ToolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ToolError::new("closed", "tool residue registry is unavailable"))?;
+        if state.quarantined != 0 {
+            return Err(ToolError::new(
+                "containment_failed",
+                "tool execution is blocked while prior containment residue is quarantined",
+            ));
+        }
+        if state.admissions >= MAX_PROCESSES {
+            return Err(ToolError::new(
+                "tool_busy",
+                "endpoint tool process capacity is exhausted",
+            ));
+        }
+        state.admissions += 1;
+        Ok(ToolResidueAdmission {
+            supervisor: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.quarantined == 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn quarantined(&self) -> usize {
+        self.state
+            .lock()
+            .expect("tool residue registry")
+            .quarantined
+    }
+
+    #[cfg(test)]
+    async fn wait_for_idle_until(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.idle.notified();
+            if self.is_idle() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.is_idle();
+            }
+        }
+    }
+}
+
+impl Drop for ToolResidueAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.admissions = state.admissions.saturating_sub(1);
+            if state.admissions == 0 && state.quarantined == 0 {
+                self.supervisor.idle.notify_waiters();
+            }
+        }
+    }
+}
 
 impl HostToolOperations {
     pub(crate) fn new() -> Arc<Self> {
@@ -345,6 +480,7 @@ impl HostToolService {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             processes: Arc::new(Semaphore::new(MAX_PROCESSES)),
+            residue_supervisor: Arc::new(ToolResidueSupervisor::default()),
             install_state: StdMutex::new(ToolInstallState::default()),
             operations: HostToolOperations::new(),
             lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
@@ -576,6 +712,7 @@ impl HostToolService {
         self.require_reconciliation(policy.tool)?;
         let capture = match run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.residue_supervisor),
             Arc::clone(&self.lifecycle_hooks),
             &resolved,
             &args,
@@ -767,6 +904,7 @@ impl HostToolService {
             .unwrap_or_default();
         if !state.active.contains(reconciliation.tool)
             && generation == reconciliation.effect_generation
+            && self.residue_supervisor.is_idle()
         {
             state.reconciliation_required.remove(reconciliation.tool);
         }
@@ -820,6 +958,7 @@ impl HostToolService {
         };
         let capture = run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.residue_supervisor),
             Arc::clone(&self.lifecycle_hooks),
             &path,
             policy.version_args,
@@ -916,6 +1055,7 @@ impl HostToolService {
         })?;
         let capture = run_program_capture(
             Arc::clone(&self.processes),
+            Arc::clone(&self.residue_supervisor),
             Arc::clone(&self.lifecycle_hooks),
             &path,
             &args,
@@ -1377,23 +1517,92 @@ fn set_close_on_exec(file: &File) -> std::io::Result<()> {
 const TOOL_AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const TOOL_AUDIT_ARCH: u32 = 0xc000_00b7;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const BPF_LD_W_ABS: u16 = 0x20;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const BPF_ALU_AND_K: u16 = 0x54;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const BPF_JMP_JEQ_K: u16 = 0x15;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const BPF_JMP_JSET_K: u16 = 0x45;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const BPF_RET_K: u16 = 0x06;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_NR_OFFSET: u32 = 0;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_ARCH_OFFSET: u32 = 4;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SECCOMP_ARG0_OFFSET: u32 = 16;
 
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn install_tool_seccomp_filter() -> std::io::Result<()> {
-    const BPF_LD_W_ABS: u16 = 0x20;
-    const BPF_ALU_AND_K: u16 = 0x54;
-    const BPF_JMP_JEQ_K: u16 = 0x15;
-    const BPF_RET_K: u16 = 0x06;
-    const RET_KILL_PROCESS: u32 = 0x8000_0000;
-    const RET_ERRNO: u32 = 0x0005_0000;
-    const RET_ALLOW: u32 = 0x7fff_0000;
-    const NR_OFFSET: u32 = 0;
-    const ARCH_OFFSET: u32 = 4;
-    const ARG0_OFFSET: u32 = 16;
+    let mut filters = tool_seccomp_filter();
+    let program = nix::libc::sock_fprog {
+        len: filters.len().try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seccomp filter too large")
+        })?,
+        filter: filters.as_mut_ptr(),
+    };
+    if unsafe {
+        nix::libc::prctl(
+            nix::libc::PR_SET_SECCOMP,
+            nix::libc::SECCOMP_MODE_FILTER,
+            &program as *const nix::libc::sock_fprog,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn tool_seccomp_filter() -> Vec<nix::libc::sock_filter> {
     fn stmt(code: u16, k: u32) -> nix::libc::sock_filter {
         nix::libc::sock_filter {
             code,
@@ -1407,15 +1616,22 @@ fn install_tool_seccomp_filter() -> std::io::Result<()> {
     }
     fn deny(filters: &mut Vec<nix::libc::sock_filter>, syscall: i64, errno: i32) {
         filters.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
-        filters.push(stmt(BPF_RET_K, RET_ERRNO | errno as u32));
+        filters.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | errno as u32));
     }
 
     let mut filters = vec![
-        stmt(BPF_LD_W_ABS, ARCH_OFFSET),
+        stmt(BPF_LD_W_ABS, SECCOMP_ARCH_OFFSET),
         jump(BPF_JMP_JEQ_K, TOOL_AUDIT_ARCH, 1, 0),
-        stmt(BPF_RET_K, RET_KILL_PROCESS),
-        stmt(BPF_LD_W_ABS, NR_OFFSET),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD_W_ABS, SECCOMP_NR_OFFSET),
     ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x32 uses the x86_64 audit architecture with this tag in the syscall
+        // number. Reject it before any native-number dispatch or default allow.
+        filters.push(jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1));
+        filters.push(stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+    }
     deny(&mut filters, nix::libc::SYS_clone3, nix::libc::ENOSYS);
     let namespace_flags = (nix::libc::CLONE_NEWNS
         | nix::libc::CLONE_NEWCGROUP
@@ -1426,11 +1642,11 @@ fn install_tool_seccomp_filter() -> std::io::Result<()> {
         | nix::libc::CLONE_NEWNET
         | nix::libc::CLONE_NEWTIME) as u32;
     filters.push(jump(BPF_JMP_JEQ_K, nix::libc::SYS_clone as u32, 0, 4));
-    filters.push(stmt(BPF_LD_W_ABS, ARG0_OFFSET));
+    filters.push(stmt(BPF_LD_W_ABS, SECCOMP_ARG0_OFFSET));
     filters.push(stmt(BPF_ALU_AND_K, namespace_flags));
     filters.push(jump(BPF_JMP_JEQ_K, 0, 1, 0));
-    filters.push(stmt(BPF_RET_K, RET_ERRNO | nix::libc::EPERM as u32));
-    filters.push(stmt(BPF_LD_W_ABS, NR_OFFSET));
+    filters.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | nix::libc::EPERM as u32));
+    filters.push(stmt(BPF_LD_W_ABS, SECCOMP_NR_OFFSET));
     for syscall in [
         nix::libc::SYS_unshare,
         nix::libc::SYS_setns,
@@ -1456,29 +1672,13 @@ fn install_tool_seccomp_filter() -> std::io::Result<()> {
     }
     for syscall in [nix::libc::SYS_socket, nix::libc::SYS_socketpair] {
         filters.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 3));
-        filters.push(stmt(BPF_LD_W_ABS, ARG0_OFFSET));
+        filters.push(stmt(BPF_LD_W_ABS, SECCOMP_ARG0_OFFSET));
         filters.push(jump(BPF_JMP_JEQ_K, nix::libc::AF_UNIX as u32, 0, 1));
-        filters.push(stmt(BPF_RET_K, RET_ERRNO | nix::libc::EPERM as u32));
-        filters.push(stmt(BPF_LD_W_ABS, NR_OFFSET));
+        filters.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | nix::libc::EPERM as u32));
+        filters.push(stmt(BPF_LD_W_ABS, SECCOMP_NR_OFFSET));
     }
-    filters.push(stmt(BPF_RET_K, RET_ALLOW));
-    let program = nix::libc::sock_fprog {
-        len: filters.len().try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seccomp filter too large")
-        })?,
-        filter: filters.as_mut_ptr(),
-    };
-    if unsafe {
-        nix::libc::prctl(
-            nix::libc::PR_SET_SECCOMP,
-            nix::libc::SECCOMP_MODE_FILTER,
-            &program as *const nix::libc::sock_fprog,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    filters.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+    filters
 }
 
 #[cfg(all(
@@ -1512,11 +1712,12 @@ struct ToolContainment {
     path: PathBuf,
     cleaned: bool,
     reap_pids: HashSet<i32>,
+    lifecycle_hooks: Arc<HostToolLifecycleHooks>,
 }
 
 #[cfg(target_os = "linux")]
 impl ToolContainment {
-    fn create() -> Result<Self, ToolError> {
+    fn create(lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
         static SUBREAPER: OnceLock<Result<(), String>> = OnceLock::new();
         if let Err(error) = SUBREAPER.get_or_init(|| {
             nix::sys::prctl::set_child_subreaper(true)
@@ -1550,6 +1751,7 @@ impl ToolContainment {
                         path,
                         cleaned: false,
                         reap_pids: HashSet::new(),
+                        lifecycle_hooks,
                     };
                     containment.validate_files()?;
                     return Ok(containment);
@@ -1656,46 +1858,130 @@ impl ToolContainment {
             .map_err(|error| format!("cannot kill tool containment: {error}"))
     }
 
-    async fn kill_if_populated(&mut self) -> Result<bool, String> {
+    async fn kill_if_populated_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, String> {
         let populated = self.populated()?;
         if populated {
             std::fs::write(self.path.join("cgroup.freeze"), b"1\n")
                 .map_err(|error| format!("cannot freeze tool containment: {error}"))?;
-            while !self.event("frozen")? {
+            let freeze_hook_completed = self.lifecycle_hooks.cleanup_freeze_until(deadline).await;
+            let mut freeze_timed_out = !freeze_hook_completed;
+            while !freeze_timed_out && !self.event("frozen")? {
+                if tokio::time::Instant::now() >= deadline {
+                    freeze_timed_out = true;
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            inventory_cgroup_pids(&self.path, &mut self.reap_pids)?;
-            self.kill_now()?;
+            let inventory_result = inventory_cgroup_pids(&self.path, &mut self.reap_pids);
+            let kill_result = self.kill_now();
+            if freeze_timed_out {
+                let suffix = kill_result
+                    .err()
+                    .map(|error| format!("; cgroup.kill also failed: {error}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "tool containment freeze did not complete before the cleanup deadline{suffix}"
+                ));
+            }
+            inventory_result?;
+            kill_result?;
         }
         Ok(populated)
     }
 
-    async fn settle(&mut self) -> Result<(), String> {
-        let _ = self.kill_if_populated().await?;
+    async fn settle_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let initial_kill = self.kill_if_populated_until(deadline).await;
+        if !self.lifecycle_hooks.cleanup_populated_until(deadline).await {
+            let _ = self.kill_now();
+            return Err("tool containment remained populated past the cleanup deadline".into());
+        }
         loop {
             if !self.populated()? {
                 break;
             }
             self.kill_now()?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err("tool containment remained populated past the cleanup deadline".into());
+            }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        for pid in self.reap_pids.drain() {
-            let pid = nix::unistd::Pid::from_raw(pid);
+        if let Err(error) = initial_kill {
+            return Err(error);
+        }
+        if !self.lifecycle_hooks.cleanup_reap_until(deadline).await {
+            return Err("tool descendants were not reaped before the cleanup deadline".into());
+        }
+        let reap_pids = self.reap_pids.iter().copied().collect::<Vec<_>>();
+        for raw_pid in reap_pids {
+            let pid = nix::unistd::Pid::from_raw(raw_pid);
             loop {
                 match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
                     Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(
+                                "tool descendants were not reaped before the cleanup deadline"
+                                    .into(),
+                            );
+                        }
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
-                    Ok(_) | Err(nix::errno::Errno::ECHILD) => break,
+                    Ok(_) | Err(nix::errno::Errno::ECHILD) => {
+                        self.reap_pids.remove(&raw_pid);
+                        break;
+                    }
                     Err(error) => {
                         return Err(format!("cannot reap contained tool process: {error}"));
                     }
                 }
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("tool containment cleanup exceeded its deadline".into());
+        }
         remove_cgroup_tree(&self.path)?;
         self.cleaned = true;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ToolResidueAdmission {
+    fn quarantine(mut self, mut containment: ToolContainment) {
+        {
+            let mut state = self
+                .supervisor
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.admissions = state.admissions.saturating_sub(1);
+            state.quarantined += 1;
+            debug_assert!(
+                state.quarantined <= MAX_PROCESSES,
+                "tool residue quarantine exceeded process capacity"
+            );
+            self.active = false;
+        }
+        let supervisor = Arc::clone(&self.supervisor);
+        tokio::spawn(async move {
+            containment.lifecycle_hooks.pause_quarantine_reaper().await;
+            loop {
+                let deadline = tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT;
+                if containment.settle_until(deadline).await.is_ok() {
+                    break;
+                }
+                let _ = containment.kill_now();
+                tokio::time::sleep(QUARANTINE_RETRY_INTERVAL).await;
+            }
+            if let Ok(mut state) = supervisor.state.lock() {
+                state.quarantined = state.quarantined.saturating_sub(1);
+                if state.admissions == 0 && state.quarantined == 0 {
+                    supervisor.idle.notify_waiters();
+                }
+            }
+        });
     }
 }
 
@@ -1753,7 +2039,7 @@ struct ToolContainment;
 
 #[cfg(not(target_os = "linux"))]
 impl ToolContainment {
-    fn create() -> Result<Self, ToolError> {
+    fn create(_lifecycle_hooks: Arc<HostToolLifecycleHooks>) -> Result<Self, ToolError> {
         Err(ToolError::new(
             "containment_unavailable",
             "interactive tool execution requires reviewed Linux cgroup v2 containment",
@@ -1771,11 +2057,14 @@ impl ToolContainment {
         Err("tool containment is unavailable".into())
     }
 
-    async fn kill_if_populated(&mut self) -> Result<bool, String> {
+    async fn kill_if_populated_until(
+        &mut self,
+        _deadline: tokio::time::Instant,
+    ) -> Result<bool, String> {
         Err("tool containment is unavailable".into())
     }
 
-    async fn settle(&mut self) -> Result<(), String> {
+    async fn settle_until(&mut self, _deadline: tokio::time::Instant) -> Result<(), String> {
         Err("tool containment is unavailable".into())
     }
 }
@@ -1788,6 +2077,7 @@ struct ProgramCancellation<'a> {
 
 async fn run_program_capture(
     processes: Arc<Semaphore>,
+    residue_supervisor: Arc<ToolResidueSupervisor>,
     lifecycle_hooks: Arc<HostToolLifecycleHooks>,
     program: &Path,
     args: &[&str],
@@ -1800,12 +2090,13 @@ async fn run_program_capture(
         shutdown,
     } = cancellation;
     let _permit = acquire_process_permit(processes, cancelled, shutdown).await?;
+    let mut residue_admission = Some(residue_supervisor.admit()?);
     if cancelled.is_cancelled() || shutdown.is_cancelled() {
         return Err(ToolError::new("cancelled", "tool operation was cancelled"));
     }
     let mut spawn_attempt = 0;
     let (mut child, mut containment) = loop {
-        let mut containment = ToolContainment::create()?;
+        let containment = ToolContainment::create(Arc::clone(&lifecycle_hooks))?;
         let sandbox = ToolSandbox::create(env)?;
         let mut command = Command::new(program);
         command
@@ -1826,7 +2117,13 @@ async fn run_program_capture(
             Err(error)
                 if error.raw_os_error() == Some(26) && spawn_attempt < SPAWN_BUSY_RETRIES =>
             {
-                containment.settle().await.map_err(|failure| {
+                settle_or_quarantine(
+                    containment,
+                    tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT,
+                    &mut residue_admission,
+                )
+                .await
+                .map_err(|failure| {
                     ToolError::new(
                         "containment_failed",
                         format!("endpoint could not settle a failed spawn: {failure}"),
@@ -1840,7 +2137,13 @@ async fn run_program_capture(
                 }
             }
             Err(error) => {
-                containment.settle().await.map_err(|failure| {
+                settle_or_quarantine(
+                    containment,
+                    tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT,
+                    &mut residue_admission,
+                )
+                .await
+                .map_err(|failure| {
                     ToolError::new(
                         "containment_failed",
                         format!("endpoint could not settle a failed spawn: {failure}"),
@@ -1859,11 +2162,24 @@ async fn run_program_capture(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-        let containment_failure = containment.kill_if_populated().await.err();
+        let cleanup_deadline = tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT;
+        let containment_failure = containment
+            .kill_if_populated_until(cleanup_deadline)
+            .await
+            .err();
         kill_process_group(pid);
         let _ = child.start_kill();
-        let status = child.wait().await.ok();
-        let containment_failure = containment_failure.or(containment.settle().await.err());
+        let (status, child_failure) = match wait_child_until(&mut child, cleanup_deadline).await {
+            Ok(status) => (Some(status), None),
+            Err(error) => (None, Some(error)),
+        };
+        let containment_failure = containment_failure
+            .or(child_failure)
+            .or(
+                settle_or_quarantine(containment, cleanup_deadline, &mut residue_admission)
+                    .await
+                    .err(),
+            );
         return Ok(ProgramCapture {
             status,
             stdout: empty_tail(),
@@ -1907,13 +2223,14 @@ async fn run_program_capture(
             Completion::TimedOut
         }
     };
+    let cleanup_deadline = tokio::time::Instant::now() + CONTAINMENT_CLEANUP_TIMEOUT;
     let status = match completion {
         Completion::Exited(Ok(status)) => Some(status),
         Completion::Exited(Err(error)) => {
             failure = Some(format!(
                 "endpoint could not observe tool process completion: {error}"
             ));
-            match containment.kill_if_populated().await {
+            match containment.kill_if_populated_until(cleanup_deadline).await {
                 Ok(populated) => containment_was_populated |= populated,
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -1921,11 +2238,17 @@ async fn run_program_capture(
             }
             kill_process_group(pid);
             let _ = child.start_kill();
-            child.wait().await.ok()
+            match wait_child_until(&mut child, cleanup_deadline).await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    None
+                }
+            }
         }
         Completion::Cancelled(detail) => {
             failure = Some(detail.into());
-            match containment.kill_if_populated().await {
+            match containment.kill_if_populated_until(cleanup_deadline).await {
                 Ok(populated) => containment_was_populated |= populated,
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -1934,18 +2257,20 @@ async fn run_program_capture(
             kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
-            // The service-owned operation deliberately waits without a second
-            // timeout. Session close may stop waiting at its one absolute
-            // deadline, but this task retains the process permit and install
-            // claim until the child has actually been reaped.
-            child.wait().await.ok()
+            match wait_child_until(&mut child, cleanup_deadline).await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    None
+                }
+            }
         }
         Completion::TimedOut => {
             failure = Some(format!(
                 "tool operation timed out after {} seconds",
                 timeout.as_secs()
             ));
-            match containment.kill_if_populated().await {
+            match containment.kill_if_populated_until(cleanup_deadline).await {
                 Ok(populated) => containment_was_populated |= populated,
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -1954,10 +2279,16 @@ async fn run_program_capture(
             kill_process_group(pid);
             let _ = child.start_kill();
             lifecycle_hooks.pause_after_kill().await;
-            child.wait().await.ok()
+            match wait_child_until(&mut child, cleanup_deadline).await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    None
+                }
+            }
         }
     };
-    let descendants_remained = match containment.kill_if_populated().await {
+    let descendants_remained = match containment.kill_if_populated_until(cleanup_deadline).await {
         Ok(remained) => containment_was_populated || remained,
         Err(containment_failure) => {
             failure.get_or_insert(containment_failure);
@@ -1977,8 +2308,15 @@ async fn run_program_capture(
             "tool containment remained populated after the direct command exited".into()
         });
     }
-    if let Err(containment_failure) = containment.settle().await {
-        failure.get_or_insert(containment_failure);
+    if let Err(containment_failure) =
+        settle_or_quarantine(containment, cleanup_deadline, &mut residue_admission).await
+    {
+        failure = Some(match failure.take() {
+            Some(prior) => {
+                format!("containment_failed: {containment_failure}; prior tool outcome: {prior}")
+            }
+            None => format!("containment_failed: {containment_failure}"),
+        });
     }
     Ok(ProgramCapture {
         status,
@@ -1986,6 +2324,48 @@ async fn run_program_capture(
         stderr: stderr.0,
         failure,
     })
+}
+
+async fn wait_child_until(
+    child: &mut Child,
+    deadline: tokio::time::Instant,
+) -> Result<ExitStatus, String> {
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(format!(
+            "endpoint could not reap direct tool process: {error}"
+        )),
+        Err(_) => Err("direct tool process was not reaped before the cleanup deadline".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn settle_or_quarantine(
+    mut containment: ToolContainment,
+    deadline: tokio::time::Instant,
+    residue_admission: &mut Option<ToolResidueAdmission>,
+) -> Result<(), String> {
+    match containment.settle_until(deadline).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let admission = residue_admission
+                .take()
+                .ok_or_else(|| "tool containment residue was already quarantined".to_string())?;
+            admission.quarantine(containment);
+            Err(format!(
+                "{error}; residual cgroup and PIDs were quarantined for background reaping"
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn settle_or_quarantine(
+    mut containment: ToolContainment,
+    deadline: tokio::time::Instant,
+    _residue_admission: &mut Option<ToolResidueAdmission>,
+) -> Result<(), String> {
+    containment.settle_until(deadline).await
 }
 
 async fn finish_tail(mut task: tokio::task::JoinHandle<TailCapture>) -> (TailCapture, bool) {
@@ -2171,6 +2551,125 @@ mod tests {
         .expect("process marker was not written");
     }
 
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    enum StalledCleanupPhase {
+        Freeze,
+        Populated,
+        Reap,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_stalled_cleanup_is_quarantined(phase: StalledCleanupPhase) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("tool-pid");
+        let spawn_marker = dir.path().join("blocked-spawn");
+        let script = executable(
+            dir.path(),
+            "stalled-cleanup",
+            &format!(
+                "printf '%s' $$ > '{}'; while :; do :; done",
+                pid_file.display()
+            ),
+        );
+        let blocked_script = executable(
+            dir.path(),
+            "must-not-spawn",
+            &format!("printf spawned > '{}'", spawn_marker.display()),
+        );
+        let hooks = Arc::new(HostToolLifecycleHooks::default());
+        match phase {
+            StalledCleanupPhase::Freeze => hooks.cleanup_freeze.arm(),
+            StalledCleanupPhase::Populated => hooks.cleanup_populated.arm(),
+            StalledCleanupPhase::Reap => hooks.cleanup_reap.arm(),
+        }
+        hooks.quarantine_reaper.arm();
+        let processes = Arc::new(Semaphore::new(1));
+        let supervisor = Arc::new(ToolResidueSupervisor::default());
+        let started = std::time::Instant::now();
+        let capture = run_program_capture(
+            Arc::clone(&processes),
+            Arc::clone(&supervisor),
+            Arc::clone(&hooks),
+            &script,
+            &[],
+            &test_env(dir.path()),
+            Duration::from_millis(20),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("post-effect cleanup failure must be structured");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{phase:?} cleanup exceeded its request bound"
+        );
+        assert!(capture.failure.as_deref().is_some_and(|error| {
+            error.contains("containment_failed") && error.contains("quarantined")
+        }));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            hooks.quarantine_reaper.wait_until_entered(),
+        )
+        .await
+        .expect("background quarantine reaper was not scheduled");
+        assert_eq!(supervisor.quarantined(), 1);
+        assert_eq!(processes.available_permits(), 1);
+
+        for _ in 0..(MAX_PROCESSES * 2) {
+            let error = run_program_capture(
+                Arc::clone(&processes),
+                Arc::clone(&supervisor),
+                Arc::clone(&hooks),
+                &blocked_script,
+                &[],
+                &test_env(dir.path()),
+                Duration::from_secs(1),
+                ProgramCancellation {
+                    request: &CancellationToken::new(),
+                    shutdown: &CancellationToken::new(),
+                },
+            )
+            .await
+            .expect_err("quarantine must gate every new process admission");
+            assert_eq!(error.code, "containment_failed");
+        }
+        assert_eq!(supervisor.quarantined(), 1);
+        assert!(!spawn_marker.exists());
+
+        let containment_path = hooks.containment_path();
+        hooks.quarantine_reaper.release();
+        assert!(
+            supervisor
+                .wait_for_idle_until(tokio::time::Instant::now() + Duration::from_secs(2),)
+                .await,
+            "{phase:?} quarantine did not eventually drain"
+        );
+        assert!(!containment_path.exists());
+        let pid = std::fs::read_to_string(pid_file).expect("tool pid");
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+
+        let capture = run_program_capture(
+            processes,
+            supervisor,
+            hooks,
+            &blocked_script,
+            &[],
+            &test_env(dir.path()),
+            Duration::from_secs(1),
+            ProgramCancellation {
+                request: &CancellationToken::new(),
+                shutdown: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("process admission must resume only after quarantine drain");
+        assert!(capture.status.is_some_and(|status| status.success()));
+        assert!(spawn_marker.exists());
+    }
+
     #[test]
     fn payloads_reject_arbitrary_execution_fields_and_invalid_targets() {
         assert!(HostToolService::parse_check(&json!({
@@ -2219,6 +2718,89 @@ mod tests {
             &HostToolService::shared(),
             &HostToolService::shared()
         ));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn evaluate_seccomp_filter(arch: u32, syscall: u32, arg0: u32) -> u32 {
+        let filters = tool_seccomp_filter();
+        let mut accumulator = 0u32;
+        let mut index = 0usize;
+        loop {
+            let instruction = filters
+                .get(index)
+                .unwrap_or_else(|| panic!("seccomp program fell through at instruction {index}"));
+            match instruction.code {
+                BPF_LD_W_ABS => {
+                    accumulator = match instruction.k {
+                        SECCOMP_NR_OFFSET => syscall,
+                        SECCOMP_ARCH_OFFSET => arch,
+                        SECCOMP_ARG0_OFFSET => arg0,
+                        offset => panic!("unexpected seccomp data offset {offset}"),
+                    };
+                    index += 1;
+                }
+                BPF_ALU_AND_K => {
+                    accumulator &= instruction.k;
+                    index += 1;
+                }
+                BPF_JMP_JEQ_K => {
+                    index += 1 + if accumulator == instruction.k {
+                        instruction.jt as usize
+                    } else {
+                        instruction.jf as usize
+                    };
+                }
+                #[cfg(target_arch = "x86_64")]
+                BPF_JMP_JSET_K => {
+                    index += 1 + if accumulator & instruction.k != 0 {
+                        instruction.jt as usize
+                    } else {
+                        instruction.jf as usize
+                    };
+                }
+                BPF_RET_K => return instruction.k,
+                code => panic!("unexpected seccomp BPF opcode {code:#x}"),
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_dispatch_accepts_only_the_reviewed_native_abi() {
+        assert_eq!(
+            evaluate_seccomp_filter(TOOL_AUDIT_ARCH, nix::libc::SYS_getpid as u32, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_seccomp_filter(TOOL_AUDIT_ARCH ^ 1, nix::libc::SYS_getpid as u32, 0),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                evaluate_seccomp_filter(
+                    TOOL_AUDIT_ARCH,
+                    X32_SYSCALL_BIT | nix::libc::SYS_getpid as u32,
+                    0,
+                ),
+                SECCOMP_RET_KILL_PROCESS
+            );
+            assert_eq!(
+                evaluate_seccomp_filter(
+                    TOOL_AUDIT_ARCH,
+                    X32_SYSCALL_BIT | nix::libc::SYS_ptrace as u32,
+                    0,
+                ),
+                SECCOMP_RET_KILL_PROCESS,
+                "x32-tagged calls must die before native deny/allow dispatch"
+            );
+        }
     }
 
     #[test]
@@ -2273,6 +2855,7 @@ mod tests {
         let env = test_env(dir.path());
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(ToolResidueSupervisor::default()),
             Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[&malicious],
@@ -2291,6 +2874,7 @@ mod tests {
         let oversized = "x".repeat(OUTPUT_TAIL_BYTES + 511);
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(ToolResidueSupervisor::default()),
             Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[&oversized],
@@ -2371,6 +2955,7 @@ mod tests {
         let hooks = Arc::new(HostToolLifecycleHooks::default());
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(ToolResidueSupervisor::default()),
             Arc::clone(&hooks),
             &script,
             &[],
@@ -2422,6 +3007,7 @@ mod tests {
             ),
         );
         let permits = Arc::new(Semaphore::new(1));
+        let residue = Arc::new(ToolResidueSupervisor::default());
         let hooks = Arc::new(HostToolLifecycleHooks::default());
         hooks.after_kill.arm();
         let cancelled = CancellationToken::new();
@@ -2429,11 +3015,13 @@ mod tests {
         let started = std::time::Instant::now();
         let task = tokio::spawn({
             let permits = Arc::clone(&permits);
+            let residue = Arc::clone(&residue);
             let hooks = Arc::clone(&hooks);
             let env = test_env(dir.path());
             async move {
                 run_program_capture(
                     permits,
+                    residue,
                     hooks,
                     &script,
                     &[],
@@ -2528,12 +3116,25 @@ mod tests {
             path: dir.path().to_path_buf(),
             cleaned: true,
             reap_pids: HashSet::new(),
+            lifecycle_hooks: Arc::new(HostToolLifecycleHooks::default()),
         };
         let error = containment
             .validate_files()
             .expect_err("ordinary directory must not be accepted as delegated containment");
         assert_eq!(error.code, "containment_unavailable");
         assert!(error.detail.contains("cgroup.procs"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stalled_cleanup_phases_are_bounded_quarantined_and_capacity_gated() {
+        for phase in [
+            StalledCleanupPhase::Freeze,
+            StalledCleanupPhase::Populated,
+            StalledCleanupPhase::Reap,
+        ] {
+            assert_stalled_cleanup_is_quarantined(phase).await;
+        }
     }
 
     #[cfg(unix)]
@@ -2551,6 +3152,7 @@ mod tests {
         let started = std::time::Instant::now();
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(ToolResidueSupervisor::default()),
             Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[],
@@ -2701,15 +3303,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let script = executable(dir.path(), "pipe-drain", "printf output; printf error >&2");
         let processes = Arc::new(Semaphore::new(1));
+        let residue = Arc::new(ToolResidueSupervisor::default());
         let hooks = Arc::new(HostToolLifecycleHooks::default());
         hooks.pipe_drain.arm();
         let task = {
             let processes = Arc::clone(&processes);
+            let residue = Arc::clone(&residue);
             let hooks = Arc::clone(&hooks);
             let env = test_env(dir.path());
             tokio::spawn(async move {
                 run_program_capture(
                     processes,
+                    residue,
                     hooks,
                     &script,
                     &[],
@@ -2904,6 +3509,7 @@ mod tests {
         let started = std::time::Instant::now();
         let capture = run_program_capture(
             Arc::new(Semaphore::new(1)),
+            Arc::new(ToolResidueSupervisor::default()),
             Arc::new(HostToolLifecycleHooks::default()),
             &script,
             &[],
@@ -3179,6 +3785,121 @@ mod tests {
             service
                 .claim_install("codex")
                 .expect("newer definitive check clears reconciliation"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn quarantined_effect_cannot_be_reconciled_or_retried_until_drain_and_new_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install_pid = dir.path().join("install-pid");
+        executable(
+            dir.path(),
+            "npm",
+            &format!(
+                "if [ \"$1\" = view ]; then printf '1.2.4'; else printf '%s' $$ > '{}'; while :; do :; done; fi",
+                install_pid.display()
+            ),
+        );
+        executable(dir.path(), "codex", "printf 'codex 1.2.4'");
+        let service = HostToolService::new();
+        service.lifecycle_hooks.cleanup_reap.arm();
+        service.lifecycle_hooks.quarantine_reaper.arm();
+        let cancelled = CancellationToken::new();
+        let install = {
+            let service = Arc::clone(&service);
+            let cancelled = cancelled.clone();
+            let env = test_env(dir.path());
+            tokio::spawn(async move {
+                service
+                    .install_with_env(
+                        ToolTarget {
+                            target_id: "quarantined-effect".into(),
+                            tool: "codex".into(),
+                        },
+                        &env,
+                        cancelled,
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        wait_for_nonempty_file(&install_pid).await;
+        cancelled.cancel();
+        let result = install
+            .await
+            .expect("install task")
+            .expect("post-effect quarantine result");
+        assert_eq!(result.outcome, "unknown");
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("containment_failed")));
+        service
+            .lifecycle_hooks
+            .quarantine_reaper
+            .wait_until_entered()
+            .await;
+        assert_eq!(service.residue_supervisor.quarantined(), 1);
+
+        let retry = service
+            .claim_install("codex")
+            .err()
+            .expect("effect ambiguity must block retry");
+        assert_eq!(retry.code, "reconciliation_required");
+        let check = service
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "blocked-check".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(test_env(dir.path())),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("quarantine must gate reconciliation process admission");
+        assert_eq!(check.code, "containment_failed");
+        assert_eq!(
+            service
+                .claim_install("codex")
+                .err()
+                .expect("blocked check cannot clear ambiguity")
+                .code,
+            "reconciliation_required"
+        );
+
+        service.lifecycle_hooks.quarantine_reaper.release();
+        assert!(
+            service
+                .residue_supervisor
+                .wait_for_idle_until(tokio::time::Instant::now() + Duration::from_secs(2),)
+                .await
+        );
+        assert_eq!(
+            service
+                .claim_install("codex")
+                .err()
+                .expect("drain alone cannot certify the effect")
+                .code,
+            "reconciliation_required"
+        );
+        service
+            .check_inner(
+                vec![ToolTarget {
+                    target_id: "post-drain-check".into(),
+                    tool: "codex".into(),
+                }],
+                Arc::new(test_env(dir.path())),
+                CancellationToken::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("new post-drain check reconciles effect");
+        drop(
+            service
+                .claim_install("codex")
+                .expect("post-drain definitive check unlocks retry"),
         );
     }
 

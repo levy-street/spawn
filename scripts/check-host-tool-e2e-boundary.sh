@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+rust_guard_manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host-tool-rust-guard/Cargo.toml"
 repo_root="${HOST_TOOL_E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 rg_bin="${HOST_TOOL_E2E_RG:-rg}"
 
@@ -19,6 +20,7 @@ run_guard() {
   require_tool node
   require_tool python3
   require_tool rustc
+  require_tool cargo
   require_tool "$rg_bin"
   "$rg_bin" --version >/dev/null 2>&1 || fail "ripgrep health check failed"
   [[ -d "$repo_root" ]] || fail "root does not exist: $repo_root"
@@ -38,7 +40,8 @@ run_guard() {
   fi
   [[ -s "$inventory" ]] || fail "production inventory is empty"
 
-  python3 - "$repo_root" "$inventory" <<'PY'
+  [[ -f "$rust_guard_manifest" ]] || fail "Rust structural guard manifest is missing"
+  python3 - "$repo_root" "$inventory" "$rust_guard_manifest" <<'PY'
 from __future__ import annotations
 
 import ast
@@ -53,6 +56,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
 inventory_path = Path(sys.argv[2])
+rust_guard_manifest = Path(sys.argv[3]).resolve()
 prefixes = ("server/spawn_server/", "daemon/src/", "web/src/")
 extensions = {".py", ".rs", ".ts", ".tsx"}
 
@@ -373,16 +377,52 @@ expected_server_attribute_reads = Counter({
 })
 
 
+def python_attrgetter_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    operator_modules = {"operator"}
+    callables = {"attrgetter"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                if name.name == "operator":
+                    operator_modules.add(name.asname or name.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "operator":
+            for name in node.names:
+                if name.name == "attrgetter":
+                    callables.add(name.asname or name.name)
+    for _ in range(16):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(node, ast.Assign):
+                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                    continue
+                target, value = node.targets[0].id, node.value
+            else:
+                if not isinstance(node.target, ast.Name) or node.value is None:
+                    continue
+                target, value = node.target.id, node.value
+            resolved = (
+                isinstance(value, ast.Name) and value.id in callables
+            ) or (
+                isinstance(value, ast.Attribute)
+                and value.attr == "attrgetter"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in operator_modules
+            )
+            if resolved and target not in callables:
+                callables.add(target)
+                changed = True
+        if not changed:
+            break
+    return operator_modules, callables
+
+
 class LegacyStringVisitor(ast.NodeVisitor):
     def __init__(self, relative: str, tree: ast.Module, bindings: dict[str, str]) -> None:
         self.relative = relative
         self.bindings = bindings
-        self.attrgetter_names = {"attrgetter"}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "operator":
-                for name in node.names:
-                    if name.name == "attrgetter":
-                        self.attrgetter_names.add(name.asname or name.name)
+        self.operator_modules, self.attrgetter_callables = python_attrgetter_bindings(tree)
         self.scope = ["<module>"]
         self.legacy = Counter()
         self.protected_attributes = Counter()
@@ -412,9 +452,12 @@ class LegacyStringVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         is_attrgetter = (
-            isinstance(node.func, ast.Name) and node.func.id in self.attrgetter_names
+            isinstance(node.func, ast.Name) and node.func.id in self.attrgetter_callables
         ) or (
-            isinstance(node.func, ast.Attribute) and node.func.attr == "attrgetter"
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "attrgetter"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.operator_modules
         )
         if is_attrgetter:
             for argument in node.args:
@@ -670,28 +713,77 @@ def rust_production_source(source: str) -> str:
 
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
-    "daemon/src/host_tools.rs": "4b4418ab7218e49c522013fb7c1b7a55d80fd1f5580512c8cc7ab7dd769cf8ef",
+    "daemon/src/host_tools.rs": "43f116f6b38d0e14f988a386d88b45a96ebfdd43713a74ba3476adbd70b2a881",
     "daemon/src/main.rs": "b96fa7f9a1ad9f52e4be6a98923ca643d37da2e0be0d97d487ec77d25b6f3e05",
     "daemon/src/run.rs": "8368b2552f9e556565126e077da47e2e755e222f4abfb659fcb29f1bad182b74",
     "daemon/src/worker_backend.rs": "7b3d600b3ba7e0553a405e50c3b35e9120b3f000198efd7ed90541fef8b99baa",
 }
-rust_exec_api = re.compile(
-    r"\b(?:execl|execle|execlp|execv|execve|execveat|execvp|execvpe|fexecve|posix_spawn|posix_spawnp)\b"
-    r"|\bSYS_execve(?:at)?\b"
-    r"|\b(?:nix::)?libc::(?:system|popen)\b"
-)
-found_command_sources = {
+rust_sources = sorted(
     relative
-    for relative, source in sources.items()
-    if relative.startswith("daemon/src/")
-    and relative.endswith(".rs")
-    and (
-        re.search(r"\bCommand\b", rust_production_source(source))
-        or rust_exec_api.search(rust_production_source(source))
-    )
+    for relative in sources
+    if relative.startswith("daemon/src/") and relative.endswith(".rs")
+)
+rust_guard_root = rust_guard_manifest.parent
+expected_rust_guard_hashes = {
+    "Cargo.toml": "f6f0fbd99fe844b2b94a83d7d150a35dc52b00cab395b681133867712d365d14",
+    "Cargo.lock": "0a1cdcd7d34c1226af937fa16daaf8a3ac4e96cdd39d38f58c3f254675744e73",
+    "src/main.rs": "db4143dfdb814b084c7d8b9a5b09a8a177c67197f1dada7ed486b14c496df4ed",
 }
-if found_command_sources != expected_command_ast_hashes.keys():
-    die(f"daemon process-launch source inventory changed: {sorted(found_command_sources)!r}")
+found_rust_guard_files = {
+    path.relative_to(rust_guard_root).as_posix()
+    for path in rust_guard_root.rglob("*")
+    if path.is_file() and "target" not in path.relative_to(rust_guard_root).parts
+}
+if found_rust_guard_files != expected_rust_guard_hashes.keys():
+    die(f"locked Rust guard source inventory changed: {sorted(found_rust_guard_files)!r}")
+for relative, expected_hash in expected_rust_guard_hashes.items():
+    found_hash = hashlib.sha256((rust_guard_root / relative).read_bytes()).hexdigest()
+    if found_hash != expected_hash:
+        die(
+            f"locked Rust guard source changed for {relative}: "
+            f"expected {expected_hash}, found {found_hash}"
+        )
+try:
+    structural = subprocess.run(
+        [
+            "cargo", "run", "--locked", "--quiet", "--manifest-path",
+            str(rust_guard_manifest), "--", str(root), *rust_sources,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+except OSError as exc:
+    die(f"cannot run locked Rust process-launch guard: {exc}")
+if structural.returncode != 0:
+    die(f"locked Rust process-launch guard failed: {structural.stderr.strip()}")
+found_rust_inventory = structural.stdout.splitlines()
+found_rust_process_inventory = [
+    record
+    for record in found_rust_inventory
+    if record.startswith(("process-call\t", "foreign-decl\t", "foreign-call\t"))
+]
+expected_rust_process_inventory = [
+    "process-call\tdaemon/src/host_tools.rs\tcommand-new",
+    "process-call\tdaemon/src/run.rs\tcommand-new",
+    "process-call\tdaemon/src/run.rs\tcommand-new",
+    "process-call\tdaemon/src/run.rs\tcommand-new",
+    "process-call\tdaemon/src/run.rs\tcommand-new",
+    "process-call\tdaemon/src/run.rs\tcommand-new",
+    "process-call\tdaemon/src/worker_backend.rs\tcommand-new",
+]
+if found_rust_process_inventory != expected_rust_process_inventory:
+    die(
+        "parsed Rust foreign/process launch inventory changed: "
+        f"{found_rust_process_inventory!r}"
+    )
+expected_rust_structural_digest = "681c520e39e1afd214cf9fd338d285c262a2bee7b03cbf79591365848ca38fe0"
+found_rust_structural_digest = hashlib.sha256(structural.stdout.encode()).hexdigest()
+if found_rust_structural_digest != expected_rust_structural_digest:
+    die(
+        "parsed Rust macro/attribute/launch structure changed: expected "
+        f"{expected_rust_structural_digest}, found {found_rust_structural_digest}"
+    )
 for relative, expected_hash in expected_command_ast_hashes.items():
     production = rust_production_source(sources[relative])
     try:
@@ -774,13 +866,18 @@ if daemon_tools != ["claude-code", "codex", "opencode", "aider", "shell"]:
 for needle in (
     "struct HostToolOperations",
     "struct CancelOperationOnDrop",
+    "struct ToolResidueSupervisor",
     "async fn run_owned",
     "async fn finish_tail",
+    "async fn wait_child_until",
 ):
     require_count(host_tools_relative, needle)
-for needle in ("wait_for_idle_until", "child.wait().await"):
+require_count(host_tools_relative, "async fn settle_or_quarantine", 2)
+for needle in ("wait_for_idle_until", "CONTAINMENT_CLEANUP_TIMEOUT"):
     require_present(host_tools_relative, needle)
 host_tools_production = rust_production_source(sources[host_tools_relative])
+if "child.wait().await" in host_tools_production:
+    die("endpoint host-tools path regained an unbounded direct-child wait")
 for forbidden in (
     "resolved_command_env", "shell_path_entries", "probe_shell_path", "candidate_shells",
 ):
@@ -1336,6 +1433,19 @@ PY
     >"$case_dir/server/spawn_server/routes/relay.py"
   expect_rejected server-attrgetter-access
 
+  new_case server-attrgetter-callable-alias
+  python3 - "$case_dir/server/spawn_server/routes/relay.py" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''import operator as ops
+selector = ops.attrgetter
+relay = selector
+def indirect(value):
+    return relay("in" + "stall")(value)
+''')
+PY
+  expect_rejected server-attrgetter-callable-alias
+
   new_case web-legacy-alias
   printf '%s\n' 'export const hostToolFallback = hosts["installTool"];' \
     >"$case_dir/web/src/lib/hostToolFallback.ts"
@@ -1453,6 +1563,86 @@ Path(sys.argv[1]).write_text('''fn dormant() {
 ''')
 PY
   expect_rejected daemon-raw-exec
+
+  new_case daemon-escaped-ffi-link-name
+  python3 - "$case_dir/daemon/src/escaped_ffi.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text(r'''unsafe extern "C" {
+    #[link_name = "\x65xecl"]
+    fn harmless(path: *const i8, arg: *const i8) -> i32;
+}
+fn dormant() {
+    let launch = harmless;
+    unsafe { launch(std::ptr::null(), std::ptr::null()); }
+}
+''')
+PY
+  expect_rejected daemon-escaped-ffi-link-name
+
+  new_case daemon-shadowed-command-alias
+  python3 - "$case_dir/daemon/src/shadowed_command.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''use tokio::process::Command as Runner;
+fn harmless() {}
+fn shadow_only_here() {
+    let Runner = harmless;
+    Runner();
+}
+fn dormant() {
+    Runner::new("sh");
+}
+''')
+PY
+  expect_rejected daemon-shadowed-command-alias
+
+  new_case daemon-glob-command-alias
+  python3 - "$case_dir/daemon/src/glob_command.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''use tokio::process::*;
+fn dormant() { Command::new("sh"); }
+''')
+PY
+  expect_rejected daemon-glob-command-alias
+
+  new_case daemon-type-command-alias
+  python3 - "$case_dir/daemon/src/type_command.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''type Runner = tokio::process::Command;
+fn dormant() { Runner::new("sh"); }
+''')
+PY
+  expect_rejected daemon-type-command-alias
+
+  new_case daemon-extern-crate-command-alias
+  python3 - "$case_dir/daemon/src/extern_command.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('''extern crate tokio as runtime;
+fn dormant() { runtime::process::Command::new("sh"); }
+''')
+PY
+  expect_rejected daemon-extern-crate-command-alias
+
+  new_case daemon-macro-generated-ffi
+  python3 - "$case_dir/daemon/src/macro_ffi.rs" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text(r'''macro_rules! hidden_launch {
+    () => {
+        unsafe extern "C" {
+            #[link_name = "\x65xecl"]
+            fn harmless(path: *const i8, arg: *const i8) -> i32;
+        }
+    };
+}
+hidden_launch!();
+''')
+PY
+  expect_rejected daemon-macro-generated-ffi
 
   new_case daemon-args-shell
   python3 - "$case_dir/daemon/src/helpers.rs" <<'PY'
