@@ -3,6 +3,10 @@
 This is the contract between `spawn-server`, `spawnd`, and the browser PWA.
 All three implementations MUST match.
 
+The Phase 3 signed RTC offer/answer transcript is specified in
+[`SIGNED_SIGNAL_V1.md`](SIGNED_SIGNAL_V1.md). Shared Rust/WebCrypto golden
+vectors are checked in as [`signed-signal-v1-vectors.json`](signed-signal-v1-vectors.json).
+
 ## Identifiers
 
 - All IDs are UUIDv4 strings in JSON, raw 16-byte big-endian in binary frames.

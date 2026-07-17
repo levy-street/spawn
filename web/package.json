@@ -16,6 +16,7 @@
     "audit:terminal:headed": "SPAWN_TERMINAL_AUDIT=1 playwright test tests/e2e/terminal-usability.audit.spec.ts --project=chromium --headed --reporter=line,html"
   },
   "dependencies": {
+    "@noble/ed25519": "3.1.0",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-slot": "^1.2.4",
     "@radix-ui/react-tabs": "^1.1.13",
