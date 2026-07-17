@@ -721,11 +721,17 @@ the daemon therefore maps every post-boundary mutation failure to stable code
 `outcome_unknown`. The browser uses the same code if a dispatched mutation
 loses its acknowledgement to timeout, local cancellation, or session loss. It
 never automatically retries that operation and must be conservative even when
-a cancellation frame may have won. Reconcile before any manual retry:
+a cancellation frame may have won. Reconcile before any manual retry, and retry
+only if the inspection conclusively proves the original effect was not applied:
 list/stat the mkdir target; inspect both source and destination for rename;
 stat/list the removal target; and stat/read the write destination, verifying
 its expected length and SHA-256 where applicable. These details and the error
 remain inside the encrypted host DataChannel.
+
+This is the reviewed HOST-02 session/effect boundary merged at `4e7c89b`; it is
+not a claim that the later DATA-01 durable journal exists. Until DATA-02 wraps
+these mutations with anchored effect generations and cross-restart locks, a
+closed browser can lose its reconciliation hint and Phase 2 remains incomplete.
 
 Reads start with:
 
@@ -770,6 +776,92 @@ streams and awaits cleanup before returning. The former REST
 `/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
+
+### Proposed P2-DATA-02 store contract (review pending; not implemented)
+
+P2-DATA-01 proposes the per-host endpoint-local canonical store in
+`docs/DURABLE_SENSITIVE_DATA.md`. This subsection constrains the later wire
+implementation; it does not advertise a runtime capability today.
+
+An implementation-ready daemon adds a separately negotiated
+`private-store-v1` capability to the existing `spawn.host.ctl` hello. Until
+both endpoints advertise it, every protected store/create/restart request fails
+with `upgrade_required`; the browser must not retry through REST or a daemon
+WebSocket frame.
+
+The operation families are:
+
+```text
+private.list         object_type, authenticated cursor, limit (max 256)
+private.get          object_type, object_id, optional revision
+private.put.begin    object_type, object_id, expected_revision,
+                     total_bytes, sha256
+private.delete       object_type, object_id, expected_revision
+private.export       selected object IDs or whole-store selection
+private.import.begin archive length/hash and explicit preview/commit phase
+private.reconcile.list authenticated cursor, limit (max 256)
+private.reconcile.get  request_id
+private.reconcile.check request_id, expected_record_revision
+private.reconcile.dismiss request_id, expected_record_revision
+agent.launch         agent_id, committed manifest revision,
+                     expected_effect_generation, geometry
+agent.restart        agent_id, committed manifest revision,
+                     expected_effect_generation, geometry
+```
+
+`object_type` is one of `agent_manifest`, `preset_values`, or `skill_body`.
+The exact resolved restart manifest uses the `agent_manifest` type; there is no
+terminal transcript/history type. Built-in operational preset values come from
+the daemon-local catalog rather than a server frame.
+
+Protected bodies are never placed in server REST/WS JSON. On the DataChannel,
+`put`/`get`/export/import use request-bound bounded binary chunks rather than
+one unbounded JSON allocation. The begin message declares aggregate length and
+SHA-256; the final chunk must match both before the daemon atomically commits.
+Control messages remain below 16 KiB. The ADR caps object sizes, concurrent
+streams, buffered plaintext, and progress time. Cancel, timeout, disconnect,
+hash mismatch, quota failure, or AEAD failure preserves the previous revision
+and erases the partial temporary value.
+
+Create requires `expected_revision:0`; update and delete require the exact
+current unsigned 64-bit revision. A successful mutation returns the committed
+revision. Stale revisions return E2E `revision_conflict`. Identical retries with
+the same random request ID return the original result; reuse with different
+authenticated bytes returns `request_id_reused`. Responses remain bound to the
+host/session/account/protocol/request/object tuple. There is no timestamp or
+server-order last-write-wins rule.
+
+The endpoint, not the browser or server, durably owns unresolved mutation and
+anti-replay records. A store-only mutation commits its head/result/journal
+atomically. Every external-effect operation—including host filesystem writes,
+agent upload, launch/restart, and install—carries its current durable
+`expected_effect_generation`; admission consumes the next generation and
+anchors `prepared` and then `effect_started` before invocation. Capacity,
+disk-full, or persistence failure before that boundary prevents the effect.
+Loss of acknowledgement or post-effect persistence failure thereafter yields
+`outcome_unknown` and locks a duplicate mutation across result-map expiry,
+browser/daemon restart, and same-lineage restore.
+
+`private.reconcile.check` runs the ADR's target-specific proof and releases the
+lock only when it conclusively proves `not_applied`; an `applied` proof settles
+the record but permanently consumes its generation. `dismiss` only hides the
+default UI item and preserves the record/head/lock. There is no user-asserted
+resolution or acknowledgement that authorizes retry. Protected identity,
+target, command, output, proof, and error detail stays E2E.
+
+Human-readable conflicts, paths, commands, values, integrity failures, and
+recovery diagnostics exist only in these E2E responses. Server-visible paths
+receive stable lifecycle/result codes only. Store keys, wrapped DEKs, recovery
+passphrases, plaintext/ciphertext bodies, hashes, sizes, and revisions are never
+copied into a server frame or telemetry event. Host/TURN traffic timing and
+volume remain disclosed traffic-analysis metadata.
+
+The metadata reservation and endpoint write are two explicit planes, not a
+distributed transaction. Launch is allowed only after the exact manifest
+revision commits locally. If metadata reservation or endpoint commit fails, the
+browser reports/compensates without a plaintext server fallback. Missing key,
+unknown envelope/schema, missing referenced preset/skill revision, corruption,
+or offline host fails closed as defined by the ADR.
 
 ## Versioning
 

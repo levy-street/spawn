@@ -6,7 +6,7 @@ be independently reviewed and shippable, but the Phase 2 claim is made only
 after the historical-data purge and final inventory pass. Grep is one check,
 not proof that old plaintext has left disks, databases, Redis, or backups.
 
-## Current source reality (P2-TERM-01 review candidate)
+## Current source reality (reviewed master through `5d99ebb4`)
 
 - `spawn-worker` is the only session backend. Its bounded encrypted-at-rest
   replay log is the live endpoint's only history source; tmux execution and
@@ -28,24 +28,29 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   socket requires `spawn.v2`. Both are text/JSON-only signaling and disclosed
   lifecycle. Binary terminal frames,
   `spawn.v1`, the `0x01`/`0x02` relay, transcripts, agent-content Redis pubsub,
-  and server history/snapshot/display relay are removed in the reviewed
-  P2-AGENT-02 cut. Browser RTC offer/candidate/close frames bind
-  the exact agent/scope/protocol/version/nonce tuple.
+  and server history/snapshot/display relay are removed in the reviewed and
+  merged P2-AGENT-02/P2-TERM-02 cut at `5722288`. Browser RTC
+  offer/candidate/close frames bind the exact
+  agent/scope/protocol/version/nonce tuple.
 - A reviewed host-scoped `spawn.host.ctl` transport root is integrated and
-  works independently of any agent. The merged P2-HOST-02 implementation moves
-  host list/stat/read/write/mkdir/rename/remove, browser download/upload, and
-  browser-mediated cross-host transfer onto bounded capability-rooted streams
-  on that channel.
+  works independently of any agent. P2-HOST-02 is reviewed and merged at
+  `4e7c89b`: host list/stat/read/write/mkdir/rename/remove, browser
+  download/upload, and browser-mediated cross-host transfer use bounded
+  capability-rooted streams on that channel.
 - Host directory/file REST routes, server broker waiters/result schemas,
-  daemon `host.fs.*` frames, and registration `home_dir` are removed in the
-  merged source. Host paths, entry metadata, file bytes, hashes, and
-  detailed filesystem errors therefore remain endpoint-to-endpoint.
-- Tool checks and installs also use server↔daemon control frames. Installer
-  `output` and `error` can contain arbitrary commands, paths, and secrets;
+  daemon `host.fs.*` frames, and registration `home_dir` are absent from merged
+  master. Current source therefore has no server-visible host filesystem path;
+  host paths, entry metadata, file bytes, hashes, and detailed filesystem
+  errors remain endpoint-to-endpoint.
+- Merged master still sends tool checks and installs through server↔daemon
+  control frames. Installer `output` and `error` can contain arbitrary
+  commands, paths, and secrets;
   `HostToolPolicy.last_auto_update_error` persists a detailed error derived
-  from the result.
+  from the result. P2-HOST-03A has an E2E implementation candidate under
+  independent review; it is not merged and the legacy route remains.
 - REST and WebSocket terminal input/snapshot/resize/scroll/redraw/display
-  surfaces are removed. The P2-TERM-01 candidate also removes both agent-upload
+  surfaces are removed. P2-TERM-01 is independently reviewed and merged at
+  `5d99ebb4`; it also removes both agent-upload
   routes, browser/daemon upload WebSocket frames, broker waiters, schemas, and
   base64 payloads; old upload frames close fail-closed without logging content.
   Upload names, bytes, endpoint paths, hashes, cancellation, and detailed
@@ -58,9 +63,9 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   `cwd` basename into the retained `Agent.name` column. Existing rows do not
   record whether a name was explicit or derived.
 - Daemon `Outbound::Error.message` frames contain full `anyhow` chains (often
-  including cwd/file paths). Upload-specific frames are removed in the
-  P2-TERM-01 candidate, but other detailed status/exit strings can still be
-  forwarded or logged.
+  including cwd/file paths). Upload-specific frames are removed in merged
+  P2-TERM-01, but other detailed status/exit strings can still be forwarded or
+  logged.
 - Removing current and future writes is insufficient: existing transcript files, database
   values, derived names, server/observability logs, legacy
   `spawn:agent:*:ring` Redis keys, and infrastructure backups/snapshots remain
@@ -201,7 +206,8 @@ is restricted to stable content-free values.
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
 The filesystem portion is **REVIEWED AND MERGED** in P2-HOST-02 at `4e7c89b`.
-The interactive tool portion remains planned separately as P2-HOST-03A.
+The interactive tool portion is **IMPLEMENTED, REVIEW PENDING** separately as
+P2-HOST-03A; it is not current-master behavior.
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
@@ -232,9 +238,10 @@ The interactive tool portion remains planned separately as P2-HOST-03A.
   after the web client and daemon path is live. Tool route deletion remains
   deferred to Increment 7.
 
-### 6 — agent uploads and terminal control-plane retirement (review candidate)
+### 6 — agent uploads and terminal control-plane retirement (reviewed and merged)
 
-P2-TERM-01 replaces the agent `bytes_b64` REST/WS/broker legs with a bounded
+P2-TERM-01 is independently reviewed and merged at `5d99ebb4`. It replaces the
+agent `bytes_b64` REST/WS/broker legs with a bounded
 per-agent `spawn.ctl` stream. The `ready` event carries a fresh per-channel
 capability, the exact agent-backend generation, and the 20 MiB/48 KiB endpoint
 limits. A stable upload UUID binds an immutable manifest and enables bounded
@@ -275,16 +282,33 @@ server↔daemon frames. The daemon keeps a local launch manifest so restart does
 not require server plaintext. Pre-launch and host-scoped detailed errors travel
 back on `spawn.host.ctl`; the server receives only a stable lifecycle code.
 
-Before implementation, choose and threat-model the durable endpoint store:
+P2-DATA-01 selects a **per-host endpoint-local canonical store**. The normative
+decision is `docs/DURABLE_SENSITIVE_DATA.md`: `spawnd` owns independently keyed
+AEAD object envelopes, exact-revision conflict semantics, local restart
+manifests, fail-closed compatibility, and passphrase-encrypted export/import.
+It also requires endpoint-durable `outcome_unknown` reconciliation for
+mutations whose acknowledgement or external effect is ambiguous; browser or
+server lifecycle state cannot authorize an automatic retry. Monotonic
+per-object/agent/tool/root effect generations remain after retry-result expiry,
+and exact prepared/effect-started records cover HOST-02 filesystem mutations,
+TERM-01 uploads, HOST-03A installs, and DATA-02 launch/restart. Only a
+target-specific conclusive `not_applied` proof unlocks retry; user dismissal or
+acknowledgement does not.
+The browser copies presets/skills only between online hosts over two host
+channels. Account recovery does not recover a lost endpoint, and no protected
+server sync queue exists. Opaque client-encrypted server blobs are deferred,
+not an allowed Phase 2 fallback.
 
-1. endpoint-local canonical storage (simpler, with a documented temporary
-   cross-device/cross-host synchronization regression), or
-2. opaque client-encrypted server blobs with versioned AEAD envelopes and a
-   recovery/key-distribution design in which the server never receives keys.
+P2-DATA-02 must follow that ADR's migration states, quotas, authenticated
+metadata, rotation/revocation/deletion rules, rollback limitations,
+observability contract, and falsifiable gates. It must not claim that this
+documentation implements the store.
 
-The second option still leaks object identifiers, ciphertext sizes, version
-counts, and create/update/access timing/patterns. Its design and UI must disclose
-that metadata and test that no key or plaintext reaches server logs/telemetry.
+P2-DATA-02 remains blocked until P2-DATA-01, P2-HOST-02, P2-TERM-01, and
+P2-HOST-03A have each passed independent review and merged. Its evidence must
+name the exact reviewed TERM-01 upload and HOST-03A tool protocol/effect-boundary
+commits before it wraps those operations in durable journals; an unreviewed
+candidate is not an implementation dependency.
 
 The security invariant is non-negotiable: no plaintext `Agent.env`,
 `Skill.content`, or `Preset.env_template` remains server-readable. Existing
@@ -326,7 +350,7 @@ skill recovery tests.
    deletion capability, and the oldest restorable point.
 2. **Migrate and verify endpoint copies.** Retire server transcripts in favor of
    the existing bounded worker replay described in Increment 2, and move
-   launch/preset/skill data to the approved endpoint store. Server-only
+   launch/preset/skill data to the then-reviewed endpoint store. Server-only
    offline/archived transcripts are an accepted retirement, not a silent
    migration: announce a bounded export/reconnect window before the cut, let
    users re-establish available history from an online endpoint or export it,
@@ -396,8 +420,10 @@ with the Increment 8 purge runbook before the purge begins.
 
 All Phase 2 tasks through `P2-AUDIT-01`, plus the immediate and overlapping
 quality gates required by their dependency/merge rules in
-`docs/TRUST_PHASE2_TASKS.md`, are complete. The Phase 3 follow-on identity task
-is explicitly excluded from this completion condition. A route/frame/schema
+`docs/TRUST_PHASE2_TASKS.md`, are complete. The Phase 3 identity tasks are
+explicitly excluded from this completion condition; their bounded crypto and
+host-pairing foundations may proceed in parallel without satisfying a Phase 2
+gate. A route/frame/schema
 inventory and adversarial tests show no server path can
 receive or return PTY/history/snapshot bytes, agent or host file data, directory
 entries/paths/sizes/mtimes/errors, tool commands/paths/installed/latest
