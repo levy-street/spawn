@@ -431,6 +431,12 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   its own task, tests, independent review, and merge gate.
 - Ed25519 host keys minted at `spawnd login`, registered through the
   device-code flow; WebCrypto device keys per browser.
+- Successful device login locally retains the approving browser's strict
+  device/key/fingerprint tuple in the protected daemon credential record (32
+  pins maximum). Status shows device IDs and fingerprints, never browser keys
+  or credential secrets. This is not live signaling trust yet; server
+  revocation cannot silently remove a local pin, and explicit re-pair/local
+  management remains required.
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.

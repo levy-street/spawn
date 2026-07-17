@@ -119,11 +119,17 @@
   4. Browser (logged-in user) opens `/device`, enters `user_code`, reviews the
      server-derived host fingerprint, then echoes that exact identity tuple to
      `POST /api/auth/device/approve`; stale or changed reviews are rejected.
-  5. Next poll returns the daemon token, host ID, and pinned identity. Daemon
-     verifies the binding and stores the token and private identity in its
-     credential backends.
+  5. Next poll returns the daemon token, host ID, pinned host identity, and the
+     approving browser's canonical device ID/key/fingerprint tuple. Daemon
+     verifies the host binding first, independently validates and fingerprints
+     the browser key second, then atomically stores the token, private host
+     identity, and bounded immutable browser pin in its credential backends.
+     Existing local pins survive explicit relogin.
 - Daemon tokens are scoped: `host:<host_id>:control`. Revocable from the web
   UI (kills the WS).
+- Browser pins are daemon-local first-contact state. Server revocation does not
+  erase one; explicit re-pair/local pin management is future work. Pins are not
+  consumed by live signaling yet.
 
 ## Multi-tenancy
 

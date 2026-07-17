@@ -6,6 +6,8 @@
 //! token and Ed25519 private seed; neither is ever sent to logs or status.
 //! Metadata in that file also supplies `host_id` and the configured server.
 
+use std::collections::HashSet;
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -19,17 +21,23 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::config;
+use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire};
 
 const KEYRING_SERVICE: &str = "spawn";
 const KEYRING_USER: &str = "daemon";
 
 pub const HOST_KEY_ALGORITHM: &str = "ed25519";
+pub const BROWSER_KEY_ALGORITHM: &str = "ed25519";
+pub const MAX_BROWSER_PINS: usize = 32;
 const ED25519_SEED_BYTES: usize = 32;
 const ED25519_SEED_B64URL_LENGTH: usize = 43;
 const FINGERPRINT_HASH_BYTES: usize = 12;
 const MAX_CREDENTIALS_FILE_BYTES: usize = 16 * 1024;
 const MAX_ACCESS_TOKEN_BYTES: usize = 12 * 1024;
 const MAX_SERVER_URL_BYTES: usize = 2048;
+const CANONICAL_UUID_BYTES: usize = 36;
+const PUBLIC_KEY_WIRE_BYTES: usize = 43;
+const FINGERPRINT_WIRE_BYTES: usize = 23;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct StoredCreds {
@@ -43,6 +51,10 @@ pub struct StoredCreds {
     /// never sent to the server or included in debug/log output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_private_key_seed: Option<String>,
+    /// Browser identities explicitly approved during successful device login.
+    /// Private fields keep mutation behind the conflict/cap validation API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    browser_pins: Vec<BrowserPin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,18 +64,174 @@ pub struct HostIdentity {
     pub fingerprint: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserPin {
+    browser_device_id: String,
+    browser_key_algorithm: String,
+    browser_public_key: String,
+    browser_key_fingerprint: String,
+}
+
+impl BrowserPin {
+    pub fn device_id(&self) -> Uuid {
+        // Construction and credential loading validate this exact field.
+        Uuid::parse_str(&self.browser_device_id).expect("validated browser device UUID")
+    }
+
+    pub fn key_algorithm(&self) -> &str {
+        &self.browser_key_algorithm
+    }
+
+    #[allow(dead_code)] // Consumed by the later signed-wire verification hook.
+    pub fn public_key(&self) -> &str {
+        &self.browser_public_key
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.browser_key_fingerprint
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredSecrets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_private_key_seed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_pins: Option<Vec<BrowserPin>>,
 }
 
 impl StoredCreds {
     pub fn is_logged_in(&self) -> bool {
         self.access_token.as_deref().is_some_and(|t| !t.is_empty())
     }
+
+    pub fn browser_pins(&self) -> &[BrowserPin] {
+        &self.browser_pins
+    }
+
+    #[allow(dead_code)] // Consumed by the later signed-wire verification hook.
+    pub fn browser_pin(&self, device_id: Uuid) -> Option<&BrowserPin> {
+        let canonical = device_id.to_string();
+        self.browser_pins
+            .iter()
+            .find(|pin| pin.browser_device_id == canonical)
+    }
+}
+
+pub fn browser_pin_from_approval(
+    browser_device_id: &str,
+    browser_key_algorithm: &str,
+    browser_public_key: &str,
+    supplied_fingerprint: &str,
+) -> Result<BrowserPin> {
+    if browser_device_id.len() != CANONICAL_UUID_BYTES {
+        bail!("approved browser device ID is not a canonical UUID")
+    }
+    let device_id =
+        Uuid::parse_str(browser_device_id).context("parsing approved browser device ID")?;
+    if device_id.to_string() != browser_device_id {
+        bail!("approved browser device ID is not canonical")
+    }
+    if browser_key_algorithm != BROWSER_KEY_ALGORITHM {
+        bail!("approved browser key algorithm is unsupported")
+    }
+    let expected_fingerprint = browser_key_fingerprint(browser_public_key)?;
+    if supplied_fingerprint.len() != FINGERPRINT_WIRE_BYTES
+        || supplied_fingerprint != expected_fingerprint
+    {
+        bail!("approved browser key fingerprint does not match its public key")
+    }
+    Ok(BrowserPin {
+        browser_device_id: device_id.to_string(),
+        browser_key_algorithm: BROWSER_KEY_ALGORITHM.to_owned(),
+        browser_public_key: browser_public_key.to_owned(),
+        browser_key_fingerprint: expected_fingerprint,
+    })
+}
+
+pub fn validate_login_access_token(access_token: &str) -> Result<()> {
+    if access_token.is_empty() || access_token.len() > MAX_ACCESS_TOKEN_BYTES {
+        bail!("device/poll access token has an invalid length")
+    }
+    Ok(())
+}
+
+pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
+    if public_key.len() != PUBLIC_KEY_WIRE_BYTES {
+        bail!("approved browser public key has the wrong encoded length")
+    }
+    let verifying_key =
+        public_key_from_wire(public_key).context("decoding approved browser Ed25519 public key")?;
+    // Re-encoding makes canonicality an explicit part of the local trust input.
+    if public_key_to_wire(&verifying_key) != public_key {
+        bail!("approved browser public key is not canonical")
+    }
+    let digest = Sha256::digest(verifying_key.as_bytes());
+    Ok(format!(
+        "SHA256:{}",
+        URL_SAFE_NO_PAD.encode(&digest[..FINGERPRINT_HASH_BYTES])
+    ))
+}
+
+pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<bool> {
+    validate_browser_pins(&creds.browser_pins)?;
+    validate_browser_pin(&pin)?;
+    for existing in &creds.browser_pins {
+        if existing.browser_device_id == pin.browser_device_id {
+            if existing == &pin {
+                return Ok(false);
+            }
+            bail!("browser device ID is already pinned to a different key")
+        }
+        if existing.browser_public_key == pin.browser_public_key {
+            bail!("browser public key is already pinned to a different device ID")
+        }
+    }
+    if creds.browser_pins.len() >= MAX_BROWSER_PINS {
+        bail!("browser pin capacity of {MAX_BROWSER_PINS} is exhausted")
+    }
+    creds.browser_pins.push(pin);
+    creds
+        .browser_pins
+        .sort_by(|left, right| left.browser_device_id.cmp(&right.browser_device_id));
+    Ok(true)
+}
+
+pub fn commit_login_update<F>(
+    current: &mut StoredCreds,
+    access_token: String,
+    host_id: Uuid,
+    server_url: String,
+    browser_pin: BrowserPin,
+    persist: F,
+) -> Result<bool>
+where
+    F: FnOnce(&StoredCreds) -> Result<()>,
+{
+    let mut candidate = current.clone();
+    let inserted = match merge_browser_pin(&mut candidate, browser_pin) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            zeroize_stored_creds(&mut candidate);
+            return Err(error);
+        }
+    };
+    if let Some(previous) = candidate.access_token.as_mut() {
+        previous.zeroize();
+    }
+    candidate.access_token = Some(access_token);
+    candidate.host_id = Some(host_id);
+    candidate.server_url = Some(server_url);
+    if let Err(error) = validate_persistable_creds(&candidate).and_then(|()| persist(&candidate)) {
+        zeroize_stored_creds(&mut candidate);
+        return Err(error);
+    }
+    let mut previous = std::mem::replace(current, candidate);
+    zeroize_stored_creds(&mut previous);
+    Ok(inserted)
 }
 
 /// Load stored creds. Tries keyring first for the token; reads the file for
@@ -97,6 +265,9 @@ pub fn load() -> Result<StoredCreds> {
 /// Persist credentials. The existing 0600 headless fallback stores the same
 /// token/private-seed bundle that is written to the OS keyring when available.
 pub fn save(creds: &StoredCreds) -> Result<()> {
+    // Validate the complete coherent record, including both serialized backend
+    // bounds, before either backend can observe an update.
+    validate_persistable_creds(creds)?;
     let keyring_saved = if keyring_disabled() {
         false
     } else if let Err(e) = keyring_set(creds) {
@@ -137,6 +308,7 @@ fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
         host_id: creds.host_id,
         server_url: creds.server_url.clone(),
         host_private_key_seed: None,
+        browser_pins: creds.browser_pins.clone(),
     }
 }
 
@@ -266,34 +438,56 @@ fn keyring_disabled() -> bool {
 pub async fn status(server_cli: Option<String>) -> Result<()> {
     let server = config::server_url(server_cli.clone())?;
     let creds = load().context("loading stored credentials")?;
+    print!("{}", format_status(server.as_ref(), &creds)?);
+    Ok(())
+}
 
-    println!("server:     {}", server);
-    println!(
+fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
+    let mut output = String::new();
+    writeln!(&mut output, "server:     {server}")?;
+    writeln!(
+        &mut output,
         "configured: {}",
         creds.server_url.as_deref().unwrap_or("(none)")
-    );
-    println!(
+    )?;
+    writeln!(
+        &mut output,
         "logged in:  {}",
         if creds.is_logged_in() { "yes" } else { "no" }
-    );
-    println!(
+    )?;
+    writeln!(
+        &mut output,
         "host_id:    {}",
         creds
             .host_id
-            .map(|h| h.to_string())
+            .map(|host_id| host_id.to_string())
             .unwrap_or_else(|| "(none)".into())
-    );
-    match host_identity(&creds)? {
+    )?;
+    match host_identity(creds)? {
         Some(identity) => {
-            println!("host key:   {} {}", identity.algorithm, identity.public_key);
-            println!("fingerprint: {}", identity.fingerprint);
+            writeln!(
+                &mut output,
+                "host key:   {} {}",
+                identity.algorithm, identity.public_key
+            )?;
+            writeln!(&mut output, "fingerprint: {}", identity.fingerprint)?;
         }
         None => {
-            println!("host key:   (none; run `spawnd login`)");
-            println!("fingerprint: (none)");
+            writeln!(&mut output, "host key:   (none; run `spawnd login`)")?;
+            writeln!(&mut output, "fingerprint: (none)")?;
         }
     }
-    Ok(())
+    writeln!(&mut output, "browser pins: {}", creds.browser_pins().len())?;
+    for pin in creds.browser_pins() {
+        writeln!(
+            &mut output,
+            "browser pin:  {} {} {}",
+            pin.device_id(),
+            pin.key_algorithm(),
+            pin.fingerprint()
+        )?;
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +531,7 @@ fn decode_keyring_value(value: &str) -> Result<StoredSecrets> {
         Ok(StoredSecrets {
             access_token: Some(value.to_owned()),
             host_private_key_seed: None,
+            browser_pins: None,
         })
     }
 }
@@ -366,6 +561,23 @@ fn merge_keyring_value(from_file: &mut StoredCreds, value: &mut String) -> Resul
         }
         from_file.host_private_key_seed = Some(seed);
     }
+    if let Some(pins) = secrets.browser_pins.take() {
+        if let Err(error) = validate_browser_pins(&pins) {
+            zeroize_secrets(&mut secrets);
+            zeroize_stored_creds(from_file);
+            return Err(error);
+        }
+        // A process interruption or temporarily unavailable backend may leave
+        // one protected copy one successful login behind the other. Merge only
+        // exact compatible records; ID/key conflicts still fail closed.
+        for pin in pins {
+            if let Err(error) = merge_browser_pin(from_file, pin) {
+                zeroize_secrets(&mut secrets);
+                zeroize_stored_creds(from_file);
+                return Err(error).context("merging keyring browser pins");
+            }
+        }
+    }
     zeroize_secrets(&mut secrets);
     Ok(())
 }
@@ -375,6 +587,7 @@ fn keyring_set(creds: &StoredCreds) -> Result<()> {
     let mut bundle = StoredSecrets {
         access_token: creds.access_token.clone(),
         host_private_key_seed: creds.host_private_key_seed.clone(),
+        browser_pins: Some(creds.browser_pins.clone()),
     };
     let mut encoded = match serde_json::to_string(&bundle) {
         Ok(encoded) => encoded,
@@ -383,6 +596,11 @@ fn keyring_set(creds: &StoredCreds) -> Result<()> {
             return Err(error.into());
         }
     };
+    if encoded.len() > MAX_CREDENTIALS_FILE_BYTES {
+        encoded.zeroize();
+        zeroize_secrets(&mut bundle);
+        bail!("keyring credential bundle is too large")
+    }
     let result = entry.set_password(&encoded);
     encoded.zeroize();
     zeroize_secrets(&mut bundle);
@@ -427,7 +645,7 @@ fn save_file(creds: &StoredCreds) -> Result<()> {
 }
 
 fn save_file_at(path: &Path, creds: &StoredCreds) -> Result<()> {
-    validate_loaded_creds(creds)?;
+    validate_persistable_creds(creds)?;
     let mut json = serde_json::to_vec_pretty(creds)?;
     let result = write_secure(path, &json).with_context(|| format!("writing {}", path.display()));
     json.zeroize();
@@ -457,6 +675,72 @@ fn validate_loaded_creds(creds: &StoredCreds) -> Result<()> {
         bail!("stored server URL is too large")
     }
     host_identity(creds)?;
+    validate_browser_pins(&creds.browser_pins)?;
+    Ok(())
+}
+
+fn validate_persistable_creds(creds: &StoredCreds) -> Result<()> {
+    validate_loaded_creds(creds)?;
+    let mut file_json = serde_json::to_vec_pretty(creds)?;
+    let file_len = file_json.len();
+    file_json.zeroize();
+    if file_len > MAX_CREDENTIALS_FILE_BYTES {
+        bail!("credential record is too large")
+    }
+    let mut bundle = StoredSecrets {
+        access_token: creds.access_token.clone(),
+        host_private_key_seed: creds.host_private_key_seed.clone(),
+        browser_pins: Some(creds.browser_pins.clone()),
+    };
+    let mut keyring_json = match serde_json::to_string(&bundle) {
+        Ok(json) => json,
+        Err(error) => {
+            zeroize_secrets(&mut bundle);
+            return Err(error.into());
+        }
+    };
+    let keyring_len = keyring_json.len();
+    keyring_json.zeroize();
+    zeroize_secrets(&mut bundle);
+    if keyring_len > MAX_CREDENTIALS_FILE_BYTES {
+        bail!("keyring credential bundle is too large")
+    }
+    Ok(())
+}
+
+fn validate_browser_pin(pin: &BrowserPin) -> Result<()> {
+    let validated = browser_pin_from_approval(
+        &pin.browser_device_id,
+        &pin.browser_key_algorithm,
+        &pin.browser_public_key,
+        &pin.browser_key_fingerprint,
+    )?;
+    if &validated != pin {
+        bail!("stored browser pin is not canonical")
+    }
+    Ok(())
+}
+
+fn validate_browser_pins(pins: &[BrowserPin]) -> Result<()> {
+    if pins.len() > MAX_BROWSER_PINS {
+        bail!("stored browser pin capacity exceeds {MAX_BROWSER_PINS}")
+    }
+    let mut device_ids = HashSet::with_capacity(pins.len());
+    let mut public_keys = HashSet::with_capacity(pins.len());
+    let mut previous_device_id: Option<&str> = None;
+    for pin in pins {
+        validate_browser_pin(pin)?;
+        if previous_device_id.is_some_and(|previous| previous >= pin.browser_device_id.as_str()) {
+            bail!("stored browser pins are duplicated or not deterministically ordered")
+        }
+        if !device_ids.insert(pin.browser_device_id.as_str()) {
+            bail!("stored browser pin has a duplicate device ID")
+        }
+        if !public_keys.insert(pin.browser_public_key.as_str()) {
+            bail!("stored browser pin has a duplicate public key")
+        }
+        previous_device_id = Some(pin.browser_device_id.as_str());
+    }
     Ok(())
 }
 
@@ -608,11 +892,253 @@ fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    const RFC_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    const RFC_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+
     fn fixed_creds() -> StoredCreds {
         StoredCreds {
             host_private_key_seed: Some(URL_SAFE_NO_PAD.encode([7_u8; ED25519_SEED_BYTES])),
             ..StoredCreds::default()
         }
+    }
+
+    fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {
+        let fingerprint = browser_key_fingerprint(public_key).unwrap();
+        browser_pin_from_approval(
+            &device_id.to_string(),
+            BROWSER_KEY_ALGORITHM,
+            public_key,
+            &fingerprint,
+        )
+        .unwrap()
+    }
+
+    fn generated_browser_pin(index: u8) -> BrowserPin {
+        let signing_key = SigningKey::from_bytes(&[index.saturating_add(1); 32]);
+        let public_key = public_key_to_wire(&signing_key.verifying_key());
+        browser_pin(Uuid::from_u128(u128::from(index) + 1), &public_key)
+    }
+
+    #[test]
+    fn browser_pin_approval_is_strict_and_recomputes_fingerprint() {
+        let device_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let expected = browser_key_fingerprint(RFC_KEY_ONE).unwrap();
+        let pin =
+            browser_pin_from_approval(&device_id.to_string(), "ed25519", RFC_KEY_ONE, &expected)
+                .unwrap();
+        assert_eq!(pin.device_id(), device_id);
+        assert_eq!(pin.public_key(), RFC_KEY_ONE);
+        assert_eq!(pin.fingerprint(), expected);
+
+        for (id, algorithm, key, fingerprint) in [
+            (
+                "11111111222243338444555555555555",
+                "ed25519",
+                RFC_KEY_ONE,
+                expected.as_str(),
+            ),
+            (
+                "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+                "ed25519",
+                RFC_KEY_ONE,
+                expected.as_str(),
+            ),
+            (
+                "11111111-2222-4333-8444-555555555555",
+                "Ed25519",
+                RFC_KEY_ONE,
+                expected.as_str(),
+            ),
+            (
+                "11111111-2222-4333-8444-555555555555",
+                "ed25519",
+                "short",
+                expected.as_str(),
+            ),
+            (
+                "11111111-2222-4333-8444-555555555555",
+                "ed25519",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                expected.as_str(),
+            ),
+            (
+                "11111111-2222-4333-8444-555555555555",
+                "ed25519",
+                RFC_KEY_ONE,
+                "SHA256:wrong",
+            ),
+        ] {
+            assert!(browser_pin_from_approval(id, algorithm, key, fingerprint).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_pin_merge_is_sorted_idempotent_and_conflict_safe() {
+        let first_id = Uuid::from_u128(1);
+        let second_id = Uuid::from_u128(2);
+        let first = browser_pin(first_id, RFC_KEY_ONE);
+        let second = browser_pin(second_id, RFC_KEY_TWO);
+        let mut creds = fixed_creds();
+        assert!(merge_browser_pin(&mut creds, second.clone()).unwrap());
+        assert!(merge_browser_pin(&mut creds, first.clone()).unwrap());
+        assert_eq!(creds.browser_pins(), &[first.clone(), second.clone()]);
+        assert!(!merge_browser_pin(&mut creds, first.clone()).unwrap());
+        assert_eq!(creds.browser_pin(first_id), Some(&first));
+
+        let before = creds.browser_pins.clone();
+        assert!(merge_browser_pin(&mut creds, browser_pin(first_id, RFC_KEY_TWO)).is_err());
+        assert_eq!(creds.browser_pins, before);
+        assert!(
+            merge_browser_pin(&mut creds, browser_pin(Uuid::from_u128(3), RFC_KEY_ONE)).is_err()
+        );
+        assert_eq!(creds.browser_pins, before);
+    }
+
+    #[test]
+    fn browser_pin_capacity_fails_before_mutation() {
+        let mut creds = fixed_creds();
+        for index in 0..MAX_BROWSER_PINS as u8 {
+            assert!(merge_browser_pin(&mut creds, generated_browser_pin(index)).unwrap());
+        }
+        let before = creds.browser_pins.clone();
+        let error = merge_browser_pin(&mut creds, generated_browser_pin(MAX_BROWSER_PINS as u8))
+            .expect_err("cap plus one must fail");
+        assert!(format!("{error:#}").contains("capacity"));
+        assert_eq!(creds.browser_pins, before);
+
+        let persist_called = std::cell::Cell::new(false);
+        assert!(commit_login_update(
+            &mut creds,
+            "new-token".into(),
+            Uuid::from_u128(99),
+            "https://server.example/".into(),
+            generated_browser_pin(MAX_BROWSER_PINS as u8),
+            |_| {
+                persist_called.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!persist_called.get());
+        assert_eq!(creds.browser_pins, before);
+    }
+
+    #[test]
+    fn legacy_and_pin_records_load_fail_closed_at_the_schema_boundary() {
+        let legacy: StoredCreds = serde_json::from_str(r#"{"access_token":"legacy"}"#).unwrap();
+        assert!(legacy.browser_pins().is_empty());
+        let partial = format!(
+            r#"{{"browser_pins":[{{"browser_device_id":"{}"}}]}}"#,
+            Uuid::from_u128(1)
+        );
+        assert!(serde_json::from_str::<StoredCreds>(&partial).is_err());
+
+        let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
+        let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        for pins in [
+            vec![first.clone(), first.clone()],
+            vec![second.clone(), first.clone()],
+            vec![first.clone(), browser_pin(Uuid::from_u128(3), RFC_KEY_ONE)],
+        ] {
+            let creds = StoredCreds {
+                browser_pins: pins,
+                ..fixed_creds()
+            };
+            assert!(validate_loaded_creds(&creds).is_err());
+        }
+    }
+
+    #[test]
+    fn login_update_is_atomic_on_validation_and_save_failure() {
+        use std::cell::Cell;
+
+        let old_pin = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
+        let new_pin = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let mut creds = fixed_creds();
+        creds.access_token = Some("old-token".into());
+        creds.host_id = Some(Uuid::from_u128(9));
+        merge_browser_pin(&mut creds, old_pin.clone()).unwrap();
+
+        let persist_called = Cell::new(false);
+        let failure = commit_login_update(
+            &mut creds,
+            "new-token".into(),
+            Uuid::from_u128(10),
+            "https://new.example/".into(),
+            new_pin.clone(),
+            |candidate| {
+                persist_called.set(true);
+                assert_eq!(
+                    candidate.browser_pins(),
+                    &[old_pin.clone(), new_pin.clone()]
+                );
+                Err(anyhow::anyhow!("injected save failure"))
+            },
+        );
+        assert!(failure.is_err());
+        assert!(persist_called.get());
+        assert_eq!(creds.access_token.as_deref(), Some("old-token"));
+        assert_eq!(creds.host_id, Some(Uuid::from_u128(9)));
+        assert_eq!(creds.browser_pins(), std::slice::from_ref(&old_pin));
+
+        let persist_called = Cell::new(false);
+        assert!(commit_login_update(
+            &mut creds,
+            "x".repeat(MAX_ACCESS_TOKEN_BYTES + 1),
+            Uuid::from_u128(10),
+            "https://new.example/".into(),
+            new_pin,
+            |_| {
+                persist_called.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!persist_called.get());
+        assert_eq!(creds.access_token.as_deref(), Some("old-token"));
+        assert_eq!(creds.browser_pins(), std::slice::from_ref(&old_pin));
+    }
+
+    #[test]
+    fn successful_relogin_preserves_existing_pins_and_redacts_status() {
+        let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
+        let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let mut creds = fixed_creds();
+        creds.access_token = Some("old-secret-token".into());
+        merge_browser_pin(&mut creds, first.clone()).unwrap();
+        let inserted = commit_login_update(
+            &mut creds,
+            "new-secret-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            second.clone(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(inserted);
+        assert_eq!(creds.browser_pins(), &[first.clone(), second.clone()]);
+        let output = format_status("https://server.example/", &creds).unwrap();
+        assert!(output.contains(&first.device_id().to_string()));
+        assert!(output.contains(first.fingerprint()));
+        assert!(output.contains(&second.device_id().to_string()));
+        assert!(output.contains(second.fingerprint()));
+        assert!(!output.contains(first.public_key()));
+        assert!(!output.contains(second.public_key()));
+        assert!(!output.contains("new-secret-token"));
+        assert!(!output.contains(creds.host_private_key_seed.as_deref().unwrap()));
+        assert_eq!(output.matches("browser pin:").count(), 2);
+
+        let exact_repeat = commit_login_update(
+            &mut creds,
+            "third-secret-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            second,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!exact_repeat);
+        assert_eq!(creds.browser_pins().len(), 2);
     }
 
     #[test]
@@ -715,10 +1241,11 @@ mod tests {
     }
 
     #[test]
-    fn file_fallback_round_trip_preserves_identity() {
+    fn file_fallback_round_trip_preserves_identity_and_browser_pins() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("credentials.json");
-        let original = fixed_creds();
+        let mut original = fixed_creds();
+        merge_browser_pin(&mut original, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
         let expected = host_identity(&original).unwrap();
         save_file_at(&path, &original).unwrap();
         let restored = load_file_at(&path).unwrap();
@@ -727,6 +1254,57 @@ mod tests {
             original.host_private_key_seed
         );
         assert_eq!(host_identity(&restored).unwrap(), expected);
+        assert_eq!(restored.browser_pins(), original.browser_pins());
+    }
+
+    #[test]
+    fn keyring_bundle_merges_compatible_pins_and_rejects_conflicts() {
+        let first = browser_pin(Uuid::from_u128(1), RFC_KEY_ONE);
+        let second = browser_pin(Uuid::from_u128(2), RFC_KEY_TWO);
+        let mut fallback = fixed_creds();
+        merge_browser_pin(&mut fallback, first.clone()).unwrap();
+        let bundle = StoredSecrets {
+            access_token: Some("keyring-token".into()),
+            host_private_key_seed: None,
+            browser_pins: Some(vec![first.clone(), second.clone()]),
+        };
+        let mut encoded = serde_json::to_string(&bundle).unwrap();
+        merge_keyring_value(&mut fallback, &mut encoded).unwrap();
+        assert_eq!(fallback.access_token.as_deref(), Some("keyring-token"));
+        assert_eq!(fallback.browser_pins(), &[first.clone(), second]);
+        assert!(encoded.bytes().all(|byte| byte == 0));
+
+        let mut conflicting = fixed_creds();
+        merge_browser_pin(&mut conflicting, first.clone()).unwrap();
+        let bundle = StoredSecrets {
+            access_token: None,
+            host_private_key_seed: None,
+            browser_pins: Some(vec![browser_pin(Uuid::from_u128(1), RFC_KEY_TWO)]),
+        };
+        let mut encoded = serde_json::to_string(&bundle).unwrap();
+        assert!(merge_keyring_value(&mut conflicting, &mut encoded).is_err());
+    }
+
+    #[test]
+    fn reset_removes_the_complete_record_containing_browser_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        let mut creds = fixed_creds();
+        merge_browser_pin(&mut creds, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        save_file_at(&path, &creds).unwrap();
+        let keyring_deleted = std::cell::Cell::new(false);
+        let outcome = clear_stored_credentials(
+            Ok(path.clone()),
+            || {
+                keyring_deleted.set(true);
+                Ok(())
+            },
+            |candidate| std::fs::remove_file(candidate),
+        )
+        .unwrap();
+        assert!(keyring_deleted.get());
+        assert!(outcome.file_removed);
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

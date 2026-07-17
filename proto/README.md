@@ -35,7 +35,7 @@ also accepts `Bearer` for API testing).
 | POST   | `/api/auth/logout`         | —                                   | 204                                                                                                               |
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
 | POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, verification_uri, interval, expires_in}` |
-| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint}` on success; otherwise a device-flow `error` |
+| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint, browser_device_id, browser_key_algorithm:"ed25519", browser_public_key, browser_key_fingerprint}` on success; otherwise a device-flow `error` |
 | POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
 | POST   | `/api/auth/device/approve` | `{user_code, host_key_algorithm, host_public_key, host_key_fingerprint}` | the same server-derived host identity presentation after one-shot approval |
 
@@ -47,6 +47,24 @@ successful poll whose returned binding does not exactly match its persisted
 identity. Approval echoes the exact server-derived identity tuple returned by
 `pending`; the server conditionally approves only that still-pending key. A
 stale or changed tuple is rejected and must be reviewed again.
+
+A successful poll also identifies the browser device that performed the
+approval using the four exact `browser_*` fields in the table. The daemon first
+requires the complete existing host tuple, token, and host ID. Only then does
+it treat the browser tuple as first-contact input: it requires a canonical UUID
+device ID, strictly decodes the canonical Ed25519 key, independently derives
+`browser_key_fingerprint` using the same 12-byte SHA-256 presentation rule, and
+compares it exactly. A legacy success response without this tuple fails closed;
+pending/error responses remain backward compatible.
+
+The daemon stores at most 32 immutable browser device/key pins in deterministic
+device-ID order alongside its protected credential record. Exact repeats are
+idempotent. Reusing a device ID for another key or a key for another device is
+a local conflict and never overwrites the existing pin. This storage is an
+offline foundation only: the pin is not connected to live RTC verification
+yet. Server-side browser revocation does not silently delete a daemon-local
+pin; explicit re-pairing and local pin-management commands are required future
+work.
 
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
