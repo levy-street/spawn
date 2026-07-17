@@ -110,9 +110,15 @@ historical context, or review-and-merge conditions are allowed. Historical
 context requires a past-tense predicate with explicit historical framing;
 review-and-merge conditions require a prospective modal or non-realized
 transition and never excuse present-time, completed-past, or perfect-aspect
-claims. Bare and discourse-connective-led anaphoric pronouns retain their subject
-across adjacent visible blocks, while explicit non-DATA subjects, document edges,
-thematic breaks, and inactive code reset that scope.
+claims. Apostrophes are normalized before full-clause token analysis, so
+contracted modals and arbitrarily separated perfect auxiliaries cannot evade the
+aspect check. Clause-initial past/once frames are punctuation-flexible but still
+require a past predicate. Anaphoric pronoun subjects retain their referent across
+adjacent visible blocks regardless of the leading discourse phrase, while
+explicit non-DATA subjects, document edges, thematic breaks, and inactive code
+reset that scope. Comparison preambles are excluded only when the post-comma
+clause supplies its own explicit predicate subject, including exclusivity
+modifiers.
 Regenerating the exact prose inventory cannot bless a premature claim.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,

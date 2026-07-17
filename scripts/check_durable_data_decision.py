@@ -417,10 +417,23 @@ _DASH_TRANSLATION = str.maketrans(
         "\uff0d": "-",
     }
 )
+_APOSTROPHE_TRANSLATION = str.maketrans(
+    {
+        "\u02bc": "'",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201b": "'",
+        "\uff07": "'",
+    }
+)
 
 
 def canonical_visible_text(text: str, *, casefold: bool) -> str:
-    text = unicodedata.normalize("NFKC", text).translate(_DASH_TRANSLATION)
+    text = (
+        unicodedata.normalize("NFKC", text)
+        .translate(_DASH_TRANSLATION)
+        .translate(_APOSTROPHE_TRANSLATION)
+    )
     text = text.replace("\u00ad", "")
     text = "".join(
         character for character in text if unicodedata.category(character) != "Cf"
@@ -598,14 +611,13 @@ STATUS_LINKING_VERB = re.compile(
 STATUS_AUXILIARY = re.compile(
     r"\b(?:do|does|did|may|might|must|will|would|can|could|shall|should)\b"
 )
+FUTURE_OR_HYPOTHETICAL_MODALS = frozenset(
+    {"may", "might", "must", "will", "would", "can", "could", "shall", "should"}
+)
 FUTURE_OR_HYPOTHETICAL_MODAL = re.compile(
-    r"\b(?:may|might|must|will|would|can|could|shall|should)\b"
+    rf"\b(?:{'|'.join(sorted(FUTURE_OR_HYPOTHETICAL_MODALS))})\b"
 )
 PAST_TENSE_AUXILIARY = re.compile(r"\b(?:did|had)\b")
-PERFECT_STATUS_ASPECT = re.compile(
-    r"\b(?:have|has|had)\b(?:\s+[a-z0-9_-]+){0,3}\s+"
-    r"(?:been|become)\b"
-)
 STATUS_PREDICATE = re.compile(
     rf"(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}|"
     rf"{PREMATURE_DATA_STATUS_WORD.pattern})"
@@ -636,8 +648,9 @@ NON_GOVERNING_SUBJECT_REFERENCE = re.compile(
     r"^\s*(?:unlike|compared (?:with|to)|in contrast (?:with|to))\b[^,]*,|"
     rf"-\s*(?:unlike|like|compared (?:with|to)|as opposed to|not)\b.*?-"
     rf"(?=(?:{STATUS_LINKING_VERB.pattern}|{STATUS_AUXILIARY.pattern}))|"
-    rf"^\s*(?:between|among)\b.*,\s*(?=(?:only\s+)?"
-    rf"{EXPLICIT_CLAUSE_SUBJECT_PATTERN}\s+(?:{STATUS_LINKING_VERB.pattern}|"
+    rf"^\s*(?:between|among)\b.*,\s*(?=(?:(?:only|solely)\s+)?"
+    rf"{EXPLICIT_CLAUSE_SUBJECT_PATTERN}(?:\s+(?:alone|only|solely))?\s+"
+    rf"(?:{STATUS_LINKING_VERB.pattern}|"
     rf"{STATUS_AUXILIARY.pattern}|{PREMATURE_DATA_STATUS_WORD.pattern}))|"
     rf"\b(?:rather than|instead of)\s+(?:the\s+)?{DATA_STATUS_SUBJECT_PATTERN}"
 )
@@ -649,20 +662,15 @@ HISTORICAL_DATA_SUBJECT_MODIFIER = re.compile(
     rf"\b(?:historical|superseded|former|previous)\s+"
     rf"{DATA_STATUS_SUBJECT_PATTERN}"
 )
+LEADING_HISTORICAL_DATA_FRAME = re.compile(
+    rf"^\s*(?:(?:in the past|at one time|once)\s*,?\s+)"
+    rf"(?:(?:a|an|the)\s+)?{DATA_STATUS_SUBJECT_PATTERN}"
+)
 PAST_STATUS_LINKING_VERBS = frozenset({"was", "were", "became", "remained"})
 NON_REALIZED_STATUS_LINKING_VERBS = frozenset({"become", "becomes"})
 REVIEW_WORD = re.compile(r"\b(?:review|reviewed)\b")
 MERGE_WORD = re.compile(r"\b(?:merge|merged)\b")
 CURRENT_DATA_CONTEXT = re.compile(r"\b(?:now|currently)\b")
-DISCOURSE_CONNECTIVE_PATTERN = (
-    r"(?:however|nevertheless|nonetheless|moreover|furthermore|therefore|thus|"
-    r"consequently|meanwhile|likewise|similarly|instead|still|then|also|yet|"
-    r"and|but|so)"
-)
-ANAPHORIC_SUBJECT_START = re.compile(
-    rf"^\s*(?:{DISCOURSE_CONNECTIVE_PATTERN}\s*,?\s+)*"
-    rf"{PRONOUN_SUBJECT_PATTERN}\b"
-)
 NEGATION_MODIFIER_PATTERN = (
     r"(?!(?:approved|accepted|authoritative|selected|and|or|nor|but)\b)"
     r"[a-z0-9_-]+"
@@ -733,6 +741,38 @@ def without_non_governing_subject_references(group: str) -> str:
     )
 
 
+CLAUSE_TOKEN = re.compile(r"[a-z0-9_-]+(?:'[a-z]+)?")
+
+
+def clause_tokens(text: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for match in CLAUSE_TOKEN.finditer(text):
+        token = match.group()
+        if token.endswith("'ve") and token[:-3] in FUTURE_OR_HYPOTHETICAL_MODALS:
+            tokens.extend((token[:-3], "have"))
+        elif token == "ve" and tokens and tokens[-1] in FUTURE_OR_HYPOTHETICAL_MODALS:
+            tokens.append("have")
+        else:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def has_modal_perfect_aspect(predicate_prefix: str) -> bool:
+    """Recognize modal + have/'ve + modifiers + been/become clause tokens."""
+
+    modal_seen = False
+    have_seen = False
+    for token in clause_tokens(predicate_prefix):
+        if token in FUTURE_OR_HYPOTHETICAL_MODALS:
+            modal_seen = True
+            have_seen = False
+        elif modal_seen and token == "have":
+            have_seen = True
+        elif have_seen and token in {"been", "become"}:
+            return True
+    return False
+
+
 def status_predicate_contexts(
     group: str, status_words: tuple[re.Match[str], ...]
 ) -> tuple[StatusPredicateContext, ...]:
@@ -749,7 +789,7 @@ def status_predicate_contexts(
         linking_verbs = tuple(STATUS_LINKING_VERB.finditer(predicate_prefix))
         modals = tuple(FUTURE_OR_HYPOTHETICAL_MODAL.finditer(predicate_prefix))
         past_auxiliaries = tuple(PAST_TENSE_AUXILIARY.finditer(predicate_prefix))
-        has_perfect_aspect = PERFECT_STATUS_ASPECT.search(predicate_prefix) is not None
+        has_perfect_aspect = has_modal_perfect_aspect(predicate_prefix)
         if linking_verbs:
             linking_verb = linking_verbs[-1].group()
             # A newly stated finite/linking predicate supersedes modality from
@@ -818,10 +858,8 @@ def status_has_historical_context(
     shared_postfix = temporal_group[status_words[-1].end() :]
 
     leading_frame = re.match(
-        r"\s*(?:(?:historically|previously|formerly)\b|"
-        r"(?:in the past|at one time)\s*,)",
-        shared_prefix,
-    )
+        r"\s*(?:historically|previously|formerly)\b", shared_prefix
+    ) or LEADING_HISTORICAL_DATA_FRAME.match(temporal_group)
     predicate_prefix_frame = re.search(
         r"\b(?:was|were|became|remained)\s+"
         r"(?:historically|previously|formerly|once)\s*$",
@@ -937,6 +975,42 @@ def subject_region_for_status_group(
     return before_link[: last_auxiliary.start()]
 
 
+def anaphoric_pronoun_subject_region(subject_region: str) -> str | None:
+    """Return a pronoun-led main subject, independent of leading discourse prose."""
+
+    pronouns = tuple(EXPLICIT_PRONOUN_SUBJECT.finditer(subject_region))
+    if not pronouns:
+        return None
+    pronoun = pronouns[-1]
+    before_pronoun = subject_region[: pronoun.start()].lstrip()
+    after_pronoun = subject_region[pronoun.end() :]
+
+    # A sentence-initial explicit noun/identifier is a reset subject; a later
+    # pronoun can be its object or embedded-clause subject, not inherited DATA.
+    if EXPLICIT_GENERIC_SUBJECT.match(before_pronoun) is not None:
+        return None
+    # Likewise, a noun/identifier after the pronoun is the nearer main subject
+    # (for example, `as it happens, P2-HOST-02 ...`).
+    if (
+        DATA_STATUS_SUBJECT.search(after_pronoun) is not None
+        or EXPLICIT_GENERIC_SUBJECT.search(after_pronoun) is not None
+    ):
+        return None
+    return subject_region[pronoun.start() :]
+
+
+def sentence_has_anaphoric_status_subject(sentence: str) -> bool:
+    for group in split_data_status_clauses(sentence):
+        semantic_group = without_non_governing_subject_references(group)
+        status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(semantic_group))
+        if not status_words:
+            continue
+        subject_region = subject_region_for_status_group(semantic_group, status_words)
+        if anaphoric_pronoun_subject_region(subject_region) is not None:
+            return True
+    return False
+
+
 def data_subject_scope(
     group: str,
     inherited_data_scope: bool,
@@ -950,6 +1024,9 @@ def data_subject_scope(
         if status_words
         else without_comparisons
     )
+    pronoun_subject_region = anaphoric_pronoun_subject_region(subject_region)
+    if pronoun_subject_region is not None:
+        subject_region = pronoun_subject_region
     if DATA_STATUS_SUBJECT.search(subject_region) is not None:
         return True, True
     if EXPLICIT_GENERIC_SUBJECT.search(subject_region) is not None:
@@ -1014,7 +1091,7 @@ def enforce_pending_data_review_status(root: Path, status: str) -> None:
         if not same_block_continuation and not (
             adjacent_semantic_block
             and not record.hard_boundary_before
-            and ANAPHORIC_SUBJECT_START.match(record.sentence) is not None
+            and sentence_has_anaphoric_status_subject(record.sentence)
         ):
             discourse_data_scope = False
         groups, discourse_data_scope = data_status_claim_groups(
@@ -2363,6 +2440,43 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 must have been accepted only after review and merge.",
         ),
         (
+            "ASCII contracted must-perfect acceptance",
+            "P2-DATA-01 must've been accepted only after review and merge.",
+        ),
+        (
+            "Unicode contracted could-perfect acceptance",
+            "P2-DATA-01 could’ve been accepted only after review and merge.",
+        ),
+        (
+            "contracted may-perfect acceptance",
+            "P2-DATA-01 may've been accepted only after review and merge.",
+        ),
+        (
+            "Unicode contracted might-perfect acceptance",
+            "P2-DATA-01 might’ve become accepted only after review and merge.",
+        ),
+        (
+            "contracted should-perfect acceptance",
+            "P2-DATA-01 should've been accepted only after review and merge.",
+        ),
+        (
+            "Unicode contracted would-perfect acceptance",
+            "P2-DATA-01 would’ve become accepted only after review and merge.",
+        ),
+        (
+            "contracted will-perfect acceptance",
+            "P2-DATA-01 will've been accepted only after review and merge.",
+        ),
+        (
+            "Unicode contracted shall-perfect acceptance",
+            "P2-DATA-01 shall’ve become accepted only after review and merge.",
+        ),
+        (
+            "perfect aspect has no small modifier window",
+            "P2-DATA-01 must have apparently already formally perhaps been "
+            "accepted only after review and merge.",
+        ),
+        (
             "may-perfect acceptance is completed rather than prospective",
             "P2-DATA-01 may have been accepted only after review and merge.",
         ),
@@ -2426,6 +2540,15 @@ def self_test(source: Path) -> None:
             "among comparison leaves DATA as explicit main subject",
             "Among P2-HOST-02, P2-TERM-01, and P2-DATA-01, only "
             "P2-DATA-01 is accepted.",
+        ),
+        (
+            "between comparison DATA main subject with alone modifier",
+            "Between P2-HOST-02 and P2-DATA-01, P2-DATA-01 alone is accepted.",
+        ),
+        (
+            "among comparison DATA main subject with solely modifier",
+            "Among P2-HOST-02, P2-TERM-01, and P2-DATA-01, P2-DATA-01 "
+            "solely is accepted.",
         ),
         (
             "past-review noun phrase is not explicit historical framing",
@@ -2506,6 +2629,24 @@ def self_test(source: Path) -> None:
             "nested discourse connectives retain anaphoric DATA scope",
             "P2-DATA-01 remains review pending.\n\n"
             "However, therefore, it is accepted now.",
+        ),
+        (
+            "multiword discourse phrase retains anaphoric DATA scope",
+            "P2-DATA-01 remains review pending.\n\nAs a result, it is accepted now.",
+        ),
+        (
+            "unlisted discourse phrase retains anaphoric DATA scope",
+            "P2-DATA-01 remains review pending.\n\nEven so it is accepted now.",
+        ),
+        (
+            "punctuated arbitrary phrase retains anaphoric DATA scope",
+            "P2-DATA-01 remains review pending.\n\n"
+            "For reasons recorded elsewhere—surprisingly—it is accepted now.",
+        ),
+        (
+            "parenthetical discourse phrase retains demonstrative DATA scope",
+            "P2-DATA-01 remains review pending.\n\n"
+            "Regardless of the outcome (unexpectedly), this is selected now.",
         ),
     )
     mutations.extend(
@@ -2872,8 +3013,20 @@ def self_test(source: Path) -> None:
             "In the past, P2-DATA-01 was accepted.",
         ),
         (
+            "explicit in-the-past frame without comma",
+            "In the past P2-DATA-01 was accepted.",
+        ),
+        (
             "predicate-local once frame",
             "P2-DATA-01 was once selected.",
+        ),
+        (
+            "leading once frame with comma",
+            "Once, P2-DATA-01 was selected.",
+        ),
+        (
+            "leading once frame without comma",
+            "Once P2-DATA-01 was selected.",
         ),
         (
             "explicit at-one-time frame",
@@ -2981,6 +3134,23 @@ def self_test(source: Path) -> None:
             "P2-HOST-02 is accepted.",
         ),
         (
+            "between comparison supports post-subject alone exclusivity",
+            "Between P2-DATA-01 and P2-HOST-02, P2-HOST-02 alone is accepted.",
+        ),
+        (
+            "between comparison object order preserves post-subject exclusivity",
+            "Between P2-HOST-02 and P2-DATA-01, P2-HOST-02 only is accepted.",
+        ),
+        (
+            "among comparison supports post-subject solely exclusivity",
+            "Among P2-DATA-01, P2-TERM-01, and P2-HOST-02, P2-HOST-02 "
+            "solely is accepted.",
+        ),
+        (
+            "between comparison supports predicate-local solely exclusivity",
+            "Between P2-DATA-01 and P2-HOST-02, P2-HOST-02 is solely accepted.",
+        ),
+        (
             "non-DATA main subject uses instead-of DATA object",
             "The control protocol instead of P2-DATA-01 is accepted.",
         ),
@@ -3041,6 +3211,22 @@ def self_test(source: Path) -> None:
             "P2-DATA-01 remains review pending.\n\n"
             "The control protocol remains review pending.\n\n"
             "Nevertheless, it is accepted.",
+        ),
+        (
+            "explicit non-DATA reset governs arbitrary-phrase pronoun",
+            "P2-DATA-01 remains review pending.\n\n"
+            "The control protocol remains review pending.\n\n"
+            "As a result, it is accepted.",
+        ),
+        (
+            "arbitrary discourse phrase can introduce non-DATA reset subject",
+            "P2-DATA-01 remains review pending.\n\n"
+            "As a result, the control protocol is accepted.",
+        ),
+        (
+            "fence resets arbitrary-phrase anaphora",
+            "P2-DATA-01 remains review pending.\n\n```text\n"
+            "inactive boundary\n```\n\nAs a result, it is accepted.",
         ),
     )
     positive_mutations.extend(
