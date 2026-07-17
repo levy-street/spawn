@@ -256,7 +256,7 @@ export const DevicePendingResponseSchema = z.object({
   approval_nonce: z.string().length(43),
   host_key_algorithm: z.literal("ed25519"),
   host_public_key: z.string(),
-  host_key_fingerprint: z.string(),
+  host_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
 });
 export type DevicePendingApproval = z.infer<typeof DevicePendingResponseSchema>;
 
@@ -264,7 +264,7 @@ export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
   browser_device_id: z.string().uuid(),
   browser_key_algorithm: z.literal("ed25519"),
   browser_public_key: z.string().length(43),
-  browser_key_fingerprint: z.string(),
+  browser_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
 });
 export type DeviceApproval = z.infer<typeof DeviceApproveResponseSchema>;
 
@@ -283,7 +283,7 @@ export const BrowserDeviceSchema = z.object({
   id: z.string().uuid(),
   key_algorithm: z.literal("ed25519"),
   public_key: z.string().length(43),
-  fingerprint: z.string().startsWith("SHA256:"),
+  fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
   created_at: z.string(),
   revoked_at: z.string().nullable(),
 });
@@ -509,7 +509,12 @@ export const screens = {
     }),
   update: (
     id: string,
-    body: { name?: string; layout?: ScreenLayout; ephemeral?: boolean; pinned?: boolean },
+    body: {
+      name?: string;
+      layout?: ScreenLayout;
+      ephemeral?: boolean;
+      pinned?: boolean;
+    },
   ) =>
     api(`/api/screens/${id}`, {
       method: "PATCH",

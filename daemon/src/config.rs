@@ -26,7 +26,14 @@ pub fn config_dir() -> Result<PathBuf> {
             .context("cannot resolve user config dir")?
             .join("spawn"),
     };
+    let existed = dir.exists();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", dir.display()))?;
+    }
     Ok(dir)
 }
 

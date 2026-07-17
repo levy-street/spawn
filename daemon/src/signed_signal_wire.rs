@@ -505,6 +505,34 @@ mod tests {
     }
 
     #[test]
+    fn wire_ingress_rejects_noncanonical_session_and_scope_uuid_text() {
+        let golden = golden();
+        let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
+        let intended = public_key_from_wire(&golden.intended_peer_public_key_wire).unwrap();
+        for invalid in [
+            "018F0F77-86D2-7A8E-9B1C-1F3B847CA2A1",
+            "018f0f7786d27a8e9b1c1f3b847ca2a1",
+            "{018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1}",
+            " 018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1 ",
+            "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+        ] {
+            for field in ["session_id", "scope_id"] {
+                let mut envelope = golden.vectors[0].envelope.clone();
+                envelope[field] = json!(invalid);
+                assert!(
+                    verify_rtc_signal_wire(
+                        &serde_json::to_string(&envelope).unwrap(),
+                        &sender,
+                        &intended
+                    )
+                    .is_err(),
+                    "accepted noncanonical {field} {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn protocol_version_json_value_semantics_match_shared_cases() {
         let golden = golden();
         let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();

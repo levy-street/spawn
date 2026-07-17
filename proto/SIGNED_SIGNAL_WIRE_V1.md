@@ -14,9 +14,9 @@ An envelope is one JSON object containing exactly these fields:
 | `intended_peer_identity_public_key` | canonical 43-character Ed25519 public-key wire value |
 | `protocol` | `spawn.pty` for an agent scope or `spawn.host.ctl` for a host scope |
 | `protocol_version` | exact `2` for `spawn.pty`; exact `1` for `spawn.host.ctl` |
-| `session_id` | exact transcript text |
+| `session_id` | exact 36-character lowercase-hyphenated canonical UUID transcript text |
 | `scope_type` | `agent` or `host` |
-| `scope_id` | exact transcript text |
+| `scope_id` | exact 36-character lowercase-hyphenated canonical UUID transcript text |
 | `sender_role` | `browser` or `daemon` |
 | `sdp` | exact transcript text |
 | `signature` | canonical 86-character Ed25519 signature wire value |
@@ -29,6 +29,12 @@ versions; mismatched kind/role or protocol/scope/version tuples; malformed
 keys/signatures; and over-bound input are rejected. Parsers cap the complete
 JSON input before JSON parsing and reject wrong fixed-width key/signature
 strings before base64 decoding.
+
+Both identifier fields are syntax-only UUIDs in V1; no UUID version is
+required. Uppercase, unhyphenated, braced, whitespace-padded, and arbitrary
+spellings are rejected before signature acceptance. Future live routing must
+use and compare the exact verified strings without trimming or
+parse-and-reserialize normalization.
 
 Protocol versions use JSON value semantics consistently across runtimes. After
 the runtime JSON number conversion, the value must be finite, exactly integral,
@@ -44,6 +50,9 @@ key pins. It strictly validates both envelope keys and both expected pins,
 compares each corresponding key, reconstructs the binary transcript, and
 verifies the signature before returning a trusted signal value. The JSON bytes
 and property order are not signed; the reconstructed binary transcript is.
+The core transcript also independently applies the shared strict Ed25519 point
+contract to its raw intended-peer bytes at construction, encode, decode, sign,
+and verify boundaries.
 
 Rust signing derives the sender public key from its `SigningKey`. Browser
 signing consumes the persisted identity's public-only opaque handle containing

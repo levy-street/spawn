@@ -175,15 +175,18 @@ describe("signed RTC JSON wire adapter", () => {
   });
 
   test("accepts the persisted public-only browser identity handle", async () => {
-    const identity = await loadOrCreateBrowserDeviceIdentity("wire-adapter-account", {
-      indexedDBFactory: new IDBFactory(),
-    });
+    const identity = await loadOrCreateBrowserDeviceIdentity(
+      "00000000-0000-0000-0000-000000000101",
+      {
+        indexedDBFactory: new IDBFactory(),
+      },
+    );
     const value: SignedSignalTranscript = {
       signalKind: "offer",
       protocolVersion: 2,
-      sessionId: "persisted-identity-session",
+      sessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
       scopeType: "agent",
-      scopeId: "agent-persisted-identity",
+      scopeId: "11111111-2222-4333-8444-555555555555",
       senderRole: "browser",
       intendedPeerPublicKey: decodeBase64Url(
         golden.intended_peer_public_key_wire,
@@ -191,7 +194,10 @@ describe("signed RTC JSON wire adapter", () => {
       ),
       sdp: "v=0\r\ns=persisted-browser-identity\r\n",
     };
-    const wire = await signRtcSignalWire(identity, { protocol: "spawn.pty", transcript: value });
+    const wire = await signRtcSignalWire(identity, {
+      protocol: "spawn.pty",
+      transcript: value,
+    });
     const verified = await verifyRtcSignalWire(
       wire,
       identity.publicKeyWire,
@@ -203,10 +209,10 @@ describe("signed RTC JSON wire adapter", () => {
 
   test("rejects mismatched opaque signer closure and declared public handle", async () => {
     const factory = new IDBFactory();
-    const first = await loadOrCreateBrowserDeviceIdentity("wire-signer-first", {
+    const first = await loadOrCreateBrowserDeviceIdentity("00000000-0000-0000-0000-000000000102", {
       indexedDBFactory: factory,
     });
-    const second = await loadOrCreateBrowserDeviceIdentity("wire-signer-second", {
+    const second = await loadOrCreateBrowserDeviceIdentity("00000000-0000-0000-0000-000000000103", {
       indexedDBFactory: factory,
     });
     const mismatch: SignedRtcIdentitySigner = {
@@ -279,6 +285,49 @@ describe("signed RTC JSON wire adapter", () => {
       verifyRtcSignalWire(wire, golden.sender_public_key_wire, golden.sender_public_key_wire),
       "peer_pin_mismatch",
     );
+  });
+
+  test("rejects noncanonical session and scope UUID text at signed wire ingress", async () => {
+    const privateKey = await importTestEd25519PrivateKey(golden.signing_seed_hex);
+    const signer: SignedRtcIdentitySigner = {
+      publicKeyWire: golden.sender_public_key_wire,
+      sign: (value) => signSignedSignalTranscript(privateKey, value),
+    };
+    const base = golden.vectors[0].envelope;
+    for (const invalid of [
+      "018F0F77-86D2-7A8E-9B1C-1F3B847CA2A1",
+      "018f0f7786d27a8e9b1c1f3b847ca2a1",
+      "{018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1}",
+      " 018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1 ",
+      "not-a-uuid-not-a-uuid-not-a-uuid!!!",
+    ]) {
+      await expect(
+        signRtcSignalWire(signer, {
+          protocol: base.protocol,
+          transcript: { ...transcript(base), sessionId: invalid },
+        }),
+      ).rejects.toThrow("canonical UUID");
+      await expect(
+        signRtcSignalWire(signer, {
+          protocol: base.protocol,
+          transcript: { ...transcript(base), scopeId: invalid },
+        }),
+      ).rejects.toThrow("canonical UUID");
+      await expect(
+        verifyRtcSignalWire(
+          JSON.stringify({ ...base, session_id: invalid }),
+          golden.sender_public_key_wire,
+          golden.intended_peer_public_key_wire,
+        ),
+      ).rejects.toThrow("canonical UUID");
+      await expect(
+        verifyRtcSignalWire(
+          JSON.stringify({ ...base, scope_id: invalid }),
+          golden.sender_public_key_wire,
+          golden.intended_peer_public_key_wire,
+        ),
+      ).rejects.toThrow("canonical UUID");
+    }
   });
 
   test("uses the shared value-semantic JSON number contract", async () => {
@@ -406,7 +455,10 @@ describe("signed RTC JSON wire adapter", () => {
         },
         {
           protocol: "spawn.pty",
-          transcript: { ...transcript(vector), sdp: "x".repeat(MAX_SDP_BYTES + 1) },
+          transcript: {
+            ...transcript(vector),
+            sdp: "x".repeat(MAX_SDP_BYTES + 1),
+          },
         },
       ),
     ).rejects.toThrow("sdp");

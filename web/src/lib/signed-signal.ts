@@ -9,8 +9,8 @@ export const ED25519_PUBLIC_KEY_BYTES = 32;
 export const ED25519_SIGNATURE_BYTES = 64;
 export const ED25519_PUBLIC_KEY_WIRE_CHARS = 43;
 export const ED25519_SIGNATURE_WIRE_CHARS = 86;
-export const MAX_SESSION_ID_BYTES = 256;
-export const MAX_SCOPE_ID_BYTES = 256;
+export const MAX_SESSION_ID_BYTES = 36;
+export const MAX_SCOPE_ID_BYTES = 36;
 export const MAX_SDP_BYTES = 1024 * 1024;
 
 export type SignalKind = "offer" | "answer";
@@ -37,6 +37,7 @@ export class SignedSignalError extends Error {
       | "invalid_length"
       | "invalid_magic"
       | "invalid_number"
+      | "invalid_uuid"
       | "invalid_utf8"
       | "trailing_bytes"
       | "truncated"
@@ -58,6 +59,7 @@ export class CryptoUnavailableError extends Error {
 const signalKindCode: Record<SignalKind, number> = { offer: 1, answer: 2 };
 const scopeTypeCode: Record<ScopeType, number> = { agent: 1, host: 2 };
 const senderRoleCode: Record<SenderRole, number> = { browser: 1, daemon: 2 };
+const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 function enumCode<T extends string>(
   value: string,
@@ -93,6 +95,24 @@ function strictUtf8(value: string, field: string, max: number): Uint8Array {
     throw new SignedSignalError("invalid_utf8", `${field} is not strict Unicode scalar text`);
   }
   return encoded;
+}
+
+function canonicalUuidText(value: string, field: string, exactLength: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length !== exactLength ||
+    !CANONICAL_UUID_PATTERN.test(value)
+  ) {
+    throw new SignedSignalError(
+      "invalid_uuid",
+      `${field} must be an exact lowercase-hyphenated canonical UUID`,
+    );
+  }
+  return value;
+}
+
+function canonicalUuidBytes(value: string, field: string, exactLength: number): Uint8Array {
+  return textEncoder.encode(canonicalUuidText(value, field, exactLength));
 }
 
 function ensureBytes(value: Uint8Array, field: string, expected: number): Uint8Array {
@@ -138,14 +158,15 @@ export function encodeSignedSignalTranscript(transcript: SignedSignalTranscript)
       "protocolVersion must be an integer in 1..=2^32-1",
     );
   }
-  const sessionId = strictUtf8(transcript.sessionId, "sessionId", MAX_SESSION_ID_BYTES);
-  const scopeId = strictUtf8(transcript.scopeId, "scopeId", MAX_SCOPE_ID_BYTES);
+  const sessionId = canonicalUuidBytes(transcript.sessionId, "sessionId", MAX_SESSION_ID_BYTES);
+  const scopeId = canonicalUuidBytes(transcript.scopeId, "scopeId", MAX_SCOPE_ID_BYTES);
   const sdp = strictUtf8(transcript.sdp, "sdp", MAX_SDP_BYTES);
   const peerKey = ensureBytes(
     transcript.intendedPeerPublicKey,
     "intendedPeerPublicKey",
     ED25519_PUBLIC_KEY_BYTES,
   );
+  assertValidEd25519PublicKey(peerKey);
   const length =
     SIGNED_SIGNAL_MAGIC.byteLength +
     1 +
@@ -256,15 +277,24 @@ export function decodeSignedSignalTranscript(input: Uint8Array): SignedSignalTra
   if (protocolVersion === 0) {
     throw new SignedSignalError("invalid_number", "protocolVersion must be nonzero");
   }
-  const sessionId = reader.utf8(reader.u16("sessionIdLength"), "sessionId", MAX_SESSION_ID_BYTES);
+  const sessionId = canonicalUuidText(
+    reader.utf8(reader.u16("sessionIdLength"), "sessionId", MAX_SESSION_ID_BYTES),
+    "sessionId",
+    MAX_SESSION_ID_BYTES,
+  );
   const scopeType = enumValue(reader.u8("scopeType"), { 1: "agent", 2: "host" }, "scopeType");
-  const scopeId = reader.utf8(reader.u16("scopeIdLength"), "scopeId", MAX_SCOPE_ID_BYTES);
+  const scopeId = canonicalUuidText(
+    reader.utf8(reader.u16("scopeIdLength"), "scopeId", MAX_SCOPE_ID_BYTES),
+    "scopeId",
+    MAX_SCOPE_ID_BYTES,
+  );
   const senderRole = enumValue(
     reader.u8("senderRole"),
     { 1: "browser", 2: "daemon" },
     "senderRole",
   );
   const intendedPeerPublicKey = reader.take(ED25519_PUBLIC_KEY_BYTES, "intendedPeerPublicKey");
+  assertValidEd25519PublicKey(intendedPeerPublicKey);
   const sdp = reader.utf8(reader.u32("sdpLength"), "sdp", MAX_SDP_BYTES);
   if (reader.remaining() !== 0) {
     throw new SignedSignalError(
@@ -402,6 +432,19 @@ export function decodeEd25519PublicKeyWire(value: string): Uint8Array {
   const raw = decodeBase64Url(value, ED25519_PUBLIC_KEY_BYTES);
   assertValidEd25519PublicKey(raw);
   return raw;
+}
+
+/** Derive the only display/pin fingerprint accepted for an Ed25519 wire key. */
+export async function ed25519PublicKeyFingerprint(value: string): Promise<string> {
+  const publicKey = decodeEd25519PublicKeyWire(value);
+  let digest: Uint8Array;
+  try {
+    digest = new Uint8Array(await subtleCrypto().digest("SHA-256", ownedArrayBuffer(publicKey)));
+  } catch (error) {
+    if (error instanceof CryptoUnavailableError || error instanceof SignedSignalError) throw error;
+    throw new CryptoUnavailableError();
+  }
+  return `SHA256:${encodeBase64Url(digest.slice(0, 12))}`;
 }
 
 export function encodeBase64Url(value: Uint8Array): string {

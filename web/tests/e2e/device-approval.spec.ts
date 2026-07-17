@@ -11,8 +11,10 @@ function fingerprint(publicKey: string): string {
   return `SHA256:${digest.subarray(0, 12).toString("base64url")}`;
 }
 
-test("device approval shows the server fingerprint before confirmation", async ({ page }) => {
-  const hostFingerprint = "SHA256:0123456789abcdef";
+test("device approval shows the locally derived fingerprint before confirmation", async ({
+  page,
+}) => {
+  const hostFingerprint = fingerprint(HOST_PUBLIC_KEY);
   const hostPublicKey = HOST_PUBLIC_KEY;
   let approved = false;
   let approvalBody: unknown = null;
@@ -118,6 +120,74 @@ test("device approval shows the server fingerprint before confirmation", async (
   expect((approvalBody as { signature: string }).signature).toHaveLength(86);
 });
 
+test("blocks first contact when the server fingerprint disagrees with the host key", async ({
+  page,
+}) => {
+  let approveCalled = false;
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          user: {
+            id: USER_ID,
+            email: "owner@example.com",
+            created_at: "2026-07-17T00:00:00Z",
+          },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = request.postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/pending") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          host_name: "substituted-fingerprint-host",
+          approval_nonce: APPROVAL_NONCE,
+          host_key_algorithm: "ed25519",
+          host_public_key: HOST_PUBLIC_KEY,
+          host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAA",
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/approve") {
+      approveCalled = true;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+
+  await page.goto("/device");
+  await page.getByLabel("Device code").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Review daemon" }).click();
+
+  await expect(page.locator("p[role=alert]")).toContainText(
+    "fingerprint did not match its public key",
+  );
+  await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
+  expect(approveCalled).toBe(false);
+});
+
 test("stale approval failure clears the reviewed identity and requires review again", async ({
   page,
 }) => {
@@ -162,7 +232,7 @@ test("stale approval failure clears the reviewed identity and requires review ag
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: HOST_PUBLIC_KEY,
-          host_key_fingerprint: "SHA256:0123456789abcdef",
+          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
         },
       });
       return;
@@ -171,7 +241,9 @@ test("stale approval failure clears the reviewed identity and requires review ag
       await route.fulfill({
         status: 409,
         contentType: "application/json",
-        json: { detail: "host identity changed since review; review the device code again" },
+        json: {
+          detail: "host identity changed since review; review the device code again",
+        },
       });
       return;
     }
@@ -191,7 +263,7 @@ test("stale approval failure clears the reviewed identity and requires review ag
 
 test("substituted approval response fails loudly and requires review again", async ({ page }) => {
   const hostPublicKey = HOST_PUBLIC_KEY;
-  const hostFingerprint = "SHA256:0123456789abcdef";
+  const hostFingerprint = fingerprint(HOST_PUBLIC_KEY);
 
   await page.route("**/api/**", async (route) => {
     const request = route.request();

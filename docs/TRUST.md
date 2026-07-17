@@ -155,8 +155,10 @@ derived names are scrubbed before their source columns disappear.
 
 ## Identity and pairing
 
-The device-code flow now binds the host key lifecycle described below. Browser
-device identity and signed signaling remain the subsequent Phase 3 work:
+The device-code flow now binds the host and approving browser keys described
+below. Browser identity registration and bounded first-contact pins are Phase 3
+foundations; live signaling remains unsigned at L0 until the separately gated
+signed-WebSocket and TOFU integration is implemented and reviewed:
 
 - **Host identity**: `spawnd login` generates an Ed25519 keypair, stored
   beside the daemon token in the OS keyring (or the existing mode-0600 Unix
@@ -165,22 +167,26 @@ device identity and signed signaling remain the subsequent Phase 3 work:
   submitted with `device/start` and shown (as a short fingerprint) on the
   `/device` approval page, binding it to the user at approval time. Same-owner
   re-login reuses the pinned Host; host deletion revokes its token authority and
-  removes the pin. Private key material never enters a request, log, or
-  status/API response.
+  removes the server-side Host pin. It does not silently erase a daemon-local
+  browser pin. Private key material never enters a request, log, or status/API
+  response.
 - **Browser device identity**: on first login, the browser generates a
   non-extractable WebCrypto keypair (IndexedDB). The public key is
   registered with the account.
-- **Signed signaling**: every `rtc.offer` / `rtc.answer` carries a signature by
-  the sender's identity key over an unambiguous, versioned canonical transcript:
-  `(protocol_version, session_id, scope_type, scope_id, sender_role,
-  peer_identity_public_key, SDP)`. `scope_type` is `agent` or `host`, and
-  `scope_id` is the corresponding agent or host UUID; the role distinguishes
-  browser from daemon. Binding all of these fields prevents a valid offer or
-  answer from being replayed across sessions, agents, hosts, protocol versions,
-  roles, or intended peers. Each side verifies against keys pinned at pairing,
-  so the DTLS fingerprints inside the signed SDP inherit endpoint identity.
-  The forwarding server cannot alter this transcript undetected **provided the
-  endpoint verifier and its delivered build are themselves trusted/verifiable**.
+- **Signed signaling target (not live yet)**: after P3-IDENTITY-02 is
+  implemented and independently reviewed, every `rtc.offer` / `rtc.answer`
+  will carry a signature by the sender's identity key over an unambiguous,
+  versioned canonical transcript: `(protocol_version, session_id, scope_type,
+  scope_id, sender_role, peer_identity_public_key, SDP)`. `scope_type` will be
+  `agent` or `host`, and `scope_id` the corresponding agent or host UUID; the
+  role will distinguish browser from daemon. Binding all of these fields is
+  intended to prevent a valid offer or answer from being replayed across
+  sessions, agents, hosts, protocol versions, roles, or intended peers. Each
+  ingress must verify through the live adapter against an independently pinned
+  expected peer key before L1 can be claimed. Only then will the DTLS
+  fingerprints inside the signed SDP inherit endpoint identity and server
+  transcript changes be detectable, **provided the endpoint verifier and its
+  delivered build are themselves trusted/verifiable**.
 - **Assurance levels** (mirror how Tailscale layers tailnet lock):
   - **L0 (today)** — trust the server for introductions. No content
     visibility once Phases 1–2 land, but a malicious server could MITM
@@ -435,6 +441,35 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   its own task, tests, independent review, and merge gate.
 - Ed25519 host keys minted at `spawnd login`, registered through the
   device-code flow; WebCrypto device keys per browser.
+- Successful device login locally retains the approving browser's strict
+  device/key/fingerprint tuple in the protected daemon credential record (32
+  pins maximum). Status shows device IDs and fingerprints, never browser keys
+  or credential secrets. This is not live signaling trust yet; server
+  revocation cannot silently remove a local pin, and explicit re-pair/local
+  management remains required. The initial tuple is server-mediated and is not
+  an independently sourced expected-peer pin until a later explicit OOB
+  fingerprint comparison/activation gate passes.
+- Keyring and fallback copies use a shared whole-record commit identity. Loads
+  select one complete `(generation, record ID)` and never combine its token,
+  host identity/server metadata, or browser pins with another generation.
+  The Unix mode-0600 record is independently complete and is the commit point;
+  keyring read/write failure automatically uses that complete file without a
+  disable flag. Native platforms keep
+  the private seed in the complete keyring record and treat the file as only a
+  matching seed-free metadata projection.
+- Keyring accounts are scoped to the SHA-256 identity of the canonical config
+  directory, so separate `SPAWN_CONFIG_DIR` trees cannot inherit or delete one
+  another's host/browser trust. Linux's native backend is kernel keyutils.
+  Only the exact default directory may perform a conflict-checked one-time
+  migration from the pre-scoping global account.
+- Credential mutations use an exclusive cross-process lock and reread both
+  durable copies inside it. The pre-ceremony base record must still match
+  before either backend is written, so a delayed login cannot regress a newer
+  generation or discard another login's immutable browser pin. The lock is
+  released before any interactive device approval wait. A nonempty pin set is
+  bound to canonical server origin plus Host ID; relogin across either domain
+  fails before writing and requires explicit `spawnd logout` or a separate
+  `SPAWN_CONFIG_DIR`.
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.

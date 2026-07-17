@@ -24,9 +24,9 @@ pub enum Command {
     Login(LoginArgs),
     /// Foreground; connects WSS and services frames.
     Run(RunArgs),
-    /// Wipe stored token.
+    /// Wipe the complete stored credential record, including browser pins.
     Logout,
-    /// Print stored token state, server URL, and host_id.
+    /// Print credential state and redacted host/browser fingerprints.
     Status,
 }
 
