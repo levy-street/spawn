@@ -1066,6 +1066,8 @@ TRAILING_NAMED_SUBJECT = re.compile(
 )
 RELATIVE_COMMA_CLAUSE_START = re.compile(r"^\s*(?:that|which|who|whom|whose)\b")
 CLAUSE_WORD = re.compile(r"[a-z][a-z0-9_-]*(?:'[a-z]+)?")
+MAX_GENERIC_SUBJECT_WORDS = 8
+MAX_PREDICATE_MODIFIER_WORDS = 6
 FINITE_AUXILIARY_WORDS = frozenset(
     {
         "am",
@@ -1165,6 +1167,76 @@ def blank_relative_comma_clauses(projected: list[str]) -> None:
             projected[start - 1 : end + 1] = " " * (end - start + 2)
 
 
+def is_predicate_modifier(word: str) -> bool:
+    return re.fullmatch(SUBJECT_MODIFIER_PATTERN, word) is not None
+
+
+def has_finite_predicate_inflection(word: str) -> bool:
+    """Recognize productive finite present/past morphology without a verb list."""
+
+    return word.endswith("ed") or word.endswith("s")
+
+
+def resolved_matrix_subject_end(segment: str, match: re.Match[str]) -> int:
+    """Resolve a bounded generic noun phrase before classifying its predicate."""
+
+    subject_start = match.start("subject")
+    subject_words = tuple(CLAUSE_WORD.finditer(segment, subject_start))
+    if not subject_words or subject_words[0].group() not in {"a", "an", "the"}:
+        return match.end("subject")
+
+    bounded_words = subject_words[
+        : 1
+        + MAX_GENERIC_SUBJECT_WORDS
+        + MAX_PREDICATE_MODIFIER_WORDS
+        + 1
+    ]
+    candidates: list[tuple[int, int, int]] = []
+    max_boundary = min(1 + MAX_GENERIC_SUBJECT_WORDS, len(bounded_words) - 1)
+    for boundary in range(2, max_boundary + 1):
+        head = boundary
+        modifier_count = 0
+        while (
+            head < len(bounded_words)
+            and modifier_count < MAX_PREDICATE_MODIFIER_WORDS
+            and is_predicate_modifier(bounded_words[head].group())
+        ):
+            head += 1
+            modifier_count += 1
+        if head >= len(bounded_words):
+            continue
+        predicate_head = bounded_words[head].group()
+        if (
+            predicate_head in FINITE_AUXILIARY_WORDS
+            or has_finite_predicate_inflection(predicate_head)
+        ):
+            rank = 2
+        elif predicate_head in {"despite", "notwithstanding"} or predicate_head.endswith(
+            "ing"
+        ):
+            rank = 1
+        else:
+            continue
+        candidates.append((rank, head, -boundary))
+
+    if candidates:
+        _rank, _head, negative_boundary = max(candidates)
+        boundary = -negative_boundary
+        return bounded_words[boundary - 1].end()
+
+    # With no finite or participial head, expose a bounded nominal/adjectival
+    # predicate such as `review complete` or `work unfinished`.
+    if len(bounded_words) >= 4:
+        predicate_start = len(bounded_words) - 2
+        while (
+            predicate_start > 2
+            and is_predicate_modifier(bounded_words[predicate_start].group())
+        ):
+            predicate_start -= 1
+        return bounded_words[predicate_start - 1].end()
+    return match.end("subject")
+
+
 def comma_segment_is_non_matrix_aside(
     segment: str,
     match: re.Match[str],
@@ -1178,13 +1250,21 @@ def comma_segment_is_non_matrix_aside(
     if match.groupdict().get("introducer") is not None:
         return True
 
-    words = tuple(word.group() for word in CLAUSE_WORD.finditer(segment))
-    for index, word in enumerate(words):
-        if word in {"despite", "notwithstanding"} or word.endswith("ing"):
-            return not any(
-                prior_word in FINITE_AUXILIARY_WORDS for prior_word in words[:index]
-            )
-    return False
+    subject_end = resolved_matrix_subject_end(segment, match)
+    predicate_words = tuple(
+        word.group() for word in CLAUSE_WORD.finditer(segment, subject_end)
+    )
+    predicate_head = next(
+        (word for word in predicate_words if not is_predicate_modifier(word)),
+        None,
+    )
+    if predicate_head is None:
+        return True
+    if predicate_head in FINITE_AUXILIARY_WORDS:
+        return False
+    if has_finite_predicate_inflection(predicate_head):
+        return False
+    return True
 
 
 def matrix_subject_projection(text: str) -> str:
@@ -1209,7 +1289,12 @@ def matrix_subject_projection(text: str) -> str:
             projected[start:end] = " " * (end - start)
             continue
         matrix_seen = True
-        adjunct = SUBORDINATE_CLAUSE_INTRODUCER.search(segment, match.end())
+        subject_end = (
+            match.end()
+            if topic is not None
+            else resolved_matrix_subject_end(segment, match)
+        )
+        adjunct = SUBORDINATE_CLAUSE_INTRODUCER.search(segment, subject_end)
         if adjunct is not None:
             adjunct_start = start + adjunct.start()
             projected[adjunct_start:end] = " " * (end - adjunct_start)
@@ -1230,7 +1315,14 @@ def matrix_clause_subject_scope(
         topic = TOPICALIZED_NAMED_SUBJECT.match(segment)
         match = topic or MATRIX_CLAUSE_SUBJECT.match(segment)
         if match is not None:
-            scope = named_subject_has_data_scope(match.group("subject"))
+            subject_end = (
+                match.end("subject")
+                if topic is not None
+                else resolved_matrix_subject_end(segment, match)
+            )
+            scope = named_subject_has_data_scope(
+                segment[match.start("subject") : subject_end]
+            )
             introduced = (
                 topic is None and match.groupdict().get("introducer") is not None
             )
