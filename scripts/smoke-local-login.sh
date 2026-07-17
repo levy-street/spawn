@@ -67,6 +67,7 @@ login_out="$tmp_dir/login.out"
 login_err="$tmp_dir/login.err"
 status_out="$tmp_dir/status.out"
 status_err="$tmp_dir/status.err"
+approved_browser="$tmp_dir/approved-browser.json"
 mkdir -p "$home"
 
 printf '%s\n' "smoke-local-login: building spawnd"
@@ -181,47 +182,102 @@ PY
 )"
 
 printf '%s\n' "smoke-local-login: approving device code"
-python3 - "$base_url" "$user_token" "$user_code" <<'PY'
+(
+  cd server
+  uv run python - "$base_url" "$user_token" "$user_code" "$approved_browser" <<'PY'
+import base64
 import json
 import sys
 import urllib.error
 import urllib.request
 
-base_url, token, user_code = sys.argv[1:]
-headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-pending_req = urllib.request.Request(
-    base_url + "/api/auth/device/pending",
-    data=json.dumps({"user_code": user_code}).encode(),
-    method="POST",
-    headers=headers,
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from spawn_server.browser_registration import encode_browser_registration_transcript
+from spawn_server.host_identity import decode_ed25519_public_key
+from spawn_server.host_pair_approval import (
+    decode_approval_nonce,
+    encode_host_pair_approval_transcript,
 )
-try:
-    with urllib.request.urlopen(pending_req, timeout=10) as response:
-        reviewed = json.loads(response.read().decode())
-except urllib.error.HTTPError as error:
-    raise SystemExit(f"pending review failed: {error.code} {error.read().decode()}") from error
+
+base_url, token, user_code, approved_browser_path = sys.argv[1:]
+headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def post(path: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        base_url + path,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        raise SystemExit(f"{path} failed: {error.code} {error.read().decode()}") from error
+
+
+def wire(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+me_req = urllib.request.Request(base_url + "/api/me", headers=headers)
+with urllib.request.urlopen(me_req, timeout=10) as response:
+    user_id = json.loads(response.read().decode())["user"]["id"]
+
+browser_key = Ed25519PrivateKey.generate()
+browser_public = browser_key.public_key().public_bytes_raw()
+browser = post(
+    "/api/browser-devices/register",
+    {
+        "key_algorithm": "ed25519",
+        "public_key": wire(browser_public),
+        "signature": wire(
+            browser_key.sign(encode_browser_registration_transcript(user_id, browser_public))
+        ),
+    },
+)
+reviewed = post("/api/auth/device/pending", {"user_code": user_code})
 if reviewed.get("host_name") != "cli-login-smoke":
     raise SystemExit(f"unexpected pending response: {reviewed!r}")
+host_public = decode_ed25519_public_key(reviewed["host_public_key"])
+approval_transcript = encode_host_pair_approval_transcript(
+    user_id,
+    decode_approval_nonce(reviewed["approval_nonce"]),
+    host_public,
+    browser_public,
+)
 approval = {
     "user_code": user_code,
+    "approval_nonce": reviewed["approval_nonce"],
     "host_key_algorithm": reviewed["host_key_algorithm"],
     "host_public_key": reviewed["host_public_key"],
     "host_key_fingerprint": reviewed["host_key_fingerprint"],
+    "browser_device_id": browser["id"],
+    "browser_key_algorithm": browser["key_algorithm"],
+    "browser_public_key": browser["public_key"],
+    "browser_key_fingerprint": browser["fingerprint"],
+    "signature": wire(browser_key.sign(approval_transcript)),
 }
-approve_req = urllib.request.Request(
-    base_url + "/api/auth/device/approve",
-    data=json.dumps(approval).encode(),
-    method="POST",
-    headers=headers,
-)
-try:
-    with urllib.request.urlopen(approve_req, timeout=10) as response:
-        body = json.loads(response.read().decode())
-except urllib.error.HTTPError as error:
-    raise SystemExit(f"approve failed: {error.code} {error.read().decode()}") from error
+body = post("/api/auth/device/approve", approval)
 if body.get("host_name") != "cli-login-smoke":
     raise SystemExit(f"unexpected approve response: {body!r}")
+if any(body.get(field) != approval[field] for field in approval if field != "user_code" and field != "signature"):
+    raise SystemExit(f"approval response changed reviewed identity: {body!r}")
+with open(approved_browser_path, "w", encoding="utf-8") as approved_browser_file:
+    json.dump(
+        {
+            "browser_device_id": browser["id"],
+            "browser_key_algorithm": browser["key_algorithm"],
+            "browser_public_key": browser["public_key"],
+            "browser_key_fingerprint": browser["fingerprint"],
+        },
+        approved_browser_file,
+        sort_keys=True,
+    )
 PY
+)
 
 (
   sleep 35
@@ -257,7 +313,7 @@ env \
 grep -F "logged in:  yes" "$status_out" >/dev/null
 grep -F "configured: $base_url/" "$status_out" >/dev/null
 
-python3 - "$home" "$base_url" "$user_token" <<'PY'
+python3 - "$home" "$base_url" "$user_token" "$approved_browser" <<'PY'
 import json
 import os
 import stat
@@ -266,7 +322,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-home, base_url, token = sys.argv[1:]
+home, base_url, token, approved_browser_path = sys.argv[1:]
 candidates = [
     Path(home) / ".config" / "spawn" / "credentials.json",
     Path(home) / "Library" / "Application Support" / "spawn" / "credentials.json",
@@ -279,6 +335,12 @@ if not creds.get("access_token") or not creds.get("host_id"):
     raise SystemExit(f"credentials are incomplete: {creds!r}")
 if creds.get("server_url") != base_url + "/":
     raise SystemExit(f"unexpected stored server URL: {creds!r}")
+approved_browser = json.loads(Path(approved_browser_path).read_text(encoding="utf-8"))
+if creds.get("browser_pins") != [approved_browser]:
+    raise SystemExit(
+        "daemon did not persist the exact approving browser tuple: "
+        f"expected {[approved_browser]!r}, got {creds.get('browser_pins')!r}"
+    )
 if os.name == "posix":
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode != 0o600:

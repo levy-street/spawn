@@ -14,6 +14,9 @@ Neither foundation is connected to the live WebSocket routes yet.
 Authenticated browser identity registration uses
 [`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md) and
 the shared `browser-device-registration-v1-vectors.json` corpus.
+Browser-authorized host pairing uses
+[`HOST_PAIR_APPROVAL_V1.md`](HOST_PAIR_APPROVAL_V1.md) and the shared
+`host-pair-approval-v1-vectors.json` corpus.
 
 ## Identifiers
 
@@ -35,9 +38,9 @@ also accepts `Bearer` for API testing).
 | POST   | `/api/auth/logout`         | —                                   | 204                                                                                                               |
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
 | POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, verification_uri, interval, expires_in}` |
-| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint, browser_device_id, browser_key_algorithm:"ed25519", browser_public_key, browser_key_fingerprint}` on success; otherwise a device-flow `error` |
-| POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
-| POST   | `/api/auth/device/approve` | `{user_code, host_key_algorithm, host_public_key, host_key_fingerprint}` | the same server-derived host identity presentation after one-shot approval |
+| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint, browser_device_id, browser_key_algorithm:"ed25519", browser_public_key, browser_key_fingerprint}` containing the exact approving browser tuple on success; otherwise a device-flow `error` |
+| POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, approval_nonce, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
+| POST   | `/api/auth/device/approve` | reviewed host tuple/nonce plus `{browser_device_id, browser_key_algorithm, browser_public_key, browser_key_fingerprint, signature}` | the exact reviewed host and browser presentation after one-shot approval |
 
 `host_public_key` is the canonical unpadded base64url encoding of the exact
 32-byte Ed25519 public key. The server derives `host_key_fingerprint` as
@@ -46,7 +49,12 @@ bytes. Start and poll require the key binding, and the daemon rejects a
 successful poll whose returned binding does not exactly match its persisted
 identity. Approval echoes the exact server-derived identity tuple returned by
 `pending`; the server conditionally approves only that still-pending key. A
-stale or changed tuple is rejected and must be reviewed again.
+stale or changed tuple is rejected and must be reviewed again. Approval verifies
+the exact proof in `HOST_PAIR_APPROVAL_V1.md` against an active same-owner
+browser device before atomically binding that browser snapshot to the ceremony.
+Poll rechecks that it is still active, creates/reuses the Host, and inserts an
+immutable Host/browser pin. An existing Host is locked while admitting at most
+32 pins; a full host returns stable `pin_limit` without a partial pin or token.
 
 A successful poll also identifies the browser device that performed the
 approval using the four exact `browser_*` fields in the table. The daemon first
@@ -83,9 +91,12 @@ ceremony); stale writers fail before writing and must reload before retrying.
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
 Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
-so a rolling deploy does not invent or silently rotate an identity. Re-pairing
+so a rolling deploy does not invent or silently rotate an identity. Migration
+0019 likewise leaves interrupted pre-nonce codes visibly unapproved so they
+must restart. Re-pairing
 an existing daemon pins it; a same-owner re-login with the same key reuses the
-Host row, while another owner cannot claim it.
+Host row, while another owner cannot claim it. Multiple explicit ceremonies may
+independently add immutable browser pins to that Host.
 
 ### Browser devices
 

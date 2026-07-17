@@ -249,11 +249,20 @@ export const DeviceStartResponseSchema = z.object({
   expires_in: z.number(),
 });
 
-export const DeviceApproveResponseSchema = z.object({
+export const DevicePendingResponseSchema = z.object({
   host_name: z.string(),
+  approval_nonce: z.string().length(43),
   host_key_algorithm: z.literal("ed25519"),
   host_public_key: z.string(),
   host_key_fingerprint: z.string(),
+});
+export type DevicePendingApproval = z.infer<typeof DevicePendingResponseSchema>;
+
+export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
+  browser_device_id: z.string().uuid(),
+  browser_key_algorithm: z.literal("ed25519"),
+  browser_public_key: z.string().length(43),
+  browser_key_fingerprint: z.string(),
 });
 export type DeviceApproval = z.infer<typeof DeviceApproveResponseSchema>;
 
@@ -306,9 +315,15 @@ export const auth = {
     }),
   approveDevice: (body: {
     user_code: string;
+    approval_nonce: string;
     host_key_algorithm: "ed25519";
     host_public_key: string;
     host_key_fingerprint: string;
+    browser_device_id: string;
+    browser_key_algorithm: "ed25519";
+    browser_public_key: string;
+    browser_key_fingerprint: string;
+    signature: string;
   }) =>
     api("/api/auth/device/approve", {
       method: "POST",
@@ -319,7 +334,7 @@ export const auth = {
     api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),
-      schema: DeviceApproveResponseSchema,
+      schema: DevicePendingResponseSchema,
     }),
 };
 

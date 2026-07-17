@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import secrets
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +15,8 @@ from .. import auth, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..host_identity import host_key_fingerprint
-from ..models import DeviceCode, Host, User
+from ..host_pair_approval import verify_host_pair_approval_proof
+from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
 
@@ -23,6 +25,7 @@ DEVICE_CODE_TTL_SECONDS = (
 )  # 30 minutes — comfortable for "see code, switch to phone, approve".
 POLL_INTERVAL_SECONDS = 5
 USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
+MAX_BROWSER_PINS_PER_HOST = 32
 
 
 def _utcnow() -> datetime:
@@ -48,6 +51,10 @@ def _gen_device_code() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _gen_approval_nonce() -> str:
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
 @router.post("/start", response_model=schemas.DeviceStartResponse)
 async def device_start(
     body: schemas.DeviceStartRequest,
@@ -55,26 +62,6 @@ async def device_start(
 ) -> schemas.DeviceStartResponse:
     now = _utcnow()
     expires_at = now + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
-
-    # Only one live approval ceremony may exist for a key. Stale rows can be
-    # replaced; successful rows are deleted by poll, while the Host pin is the
-    # durable identity authority.
-    existing_key = (
-        await session.execute(
-            select(DeviceCode).where(
-                DeviceCode.host_key_algorithm == body.host_key_algorithm,
-                DeviceCode.host_public_key == body.host_public_key,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing_key is not None:
-        existing_expiry = _aware(existing_key.expires_at)
-        if existing_key.status in {"pending", "approved", "consuming"} and (
-            existing_expiry is None or existing_expiry > now
-        ):
-            raise HTTPException(status_code=409, detail="host key pairing already in progress")
-        await session.delete(existing_key)
-        await session.flush()
 
     # Retry user_code generation on rare collision.
     for _ in range(8):
@@ -96,6 +83,7 @@ async def device_start(
         version=body.version,
         host_key_algorithm=body.host_key_algorithm,
         host_public_key=body.host_public_key,
+        approval_nonce=_gen_approval_nonce(),
         status="pending",
         expires_at=expires_at,
     )
@@ -104,7 +92,7 @@ async def device_start(
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="host key pairing already in progress") from exc
+        raise HTTPException(status_code=409, detail="could not allocate device code; retry") from exc
 
     return schemas.DeviceStartResponse(
         device_code=dc.device_code,
@@ -136,6 +124,10 @@ async def device_poll(
             DeviceCode.user_id.is_not(None),
             DeviceCode.host_key_algorithm == body.host_key_algorithm,
             DeviceCode.host_public_key == body.host_public_key,
+            DeviceCode.browser_device_id.is_not(None),
+            DeviceCode.browser_key_algorithm == "ed25519",
+            DeviceCode.browser_public_key.is_not(None),
+            DeviceCode.browser_key_fingerprint.is_not(None),
             DeviceCode.expires_at > now,
             or_(
                 DeviceCode.last_polled_at.is_(None),
@@ -149,6 +141,10 @@ async def device_poll(
             DeviceCode.os,
             DeviceCode.arch,
             DeviceCode.version,
+            DeviceCode.browser_device_id,
+            DeviceCode.browser_key_algorithm,
+            DeviceCode.browser_public_key,
+            DeviceCode.browser_key_fingerprint,
         )
         .execution_options(synchronize_session=False)
     )
@@ -207,6 +203,20 @@ async def device_poll(
             await session.rollback()
             return {"error": "expired_token"}
 
+        if snapshot["status"] in {"denied", "pin_conflict", "pin_limit"}:
+            terminal_error = snapshot["status"]
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.status == terminal_error,
+                )
+                .values(last_polled_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": terminal_error}
+
         last = _aware(snapshot["last_polled_at"])
         if last is not None and (now - last).total_seconds() < (POLL_INTERVAL_SECONDS - 1):
             await session.execute(
@@ -220,19 +230,6 @@ async def device_poll(
             )
             await session.commit()
             return {"error": "slow_down"}
-
-        if snapshot["status"] == "denied":
-            await session.execute(
-                update(DeviceCode)
-                .where(
-                    DeviceCode.device_code == body.device_code,
-                    DeviceCode.status == "denied",
-                )
-                .values(last_polled_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            await session.commit()
-            return {"error": "denied"}
 
         if snapshot["status"] != "approved" or snapshot["user_id"] is None:
             await session.execute(
@@ -255,12 +252,49 @@ async def device_poll(
     user_id = claimed["user_id"]
     assert user_id is not None
 
+    browser_active = (
+        await session.execute(
+            update(BrowserDevice)
+            .where(
+                BrowserDevice.id == claimed["browser_device_id"],
+                BrowserDevice.owner_user_id == user_id,
+                BrowserDevice.key_algorithm == claimed["browser_key_algorithm"],
+                BrowserDevice.public_key == claimed["browser_public_key"],
+                BrowserDevice.revoked_at.is_(None),
+            )
+            .values(public_key=claimed["browser_public_key"])
+            .returning(BrowserDevice.id)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one_or_none()
+    if browser_active is None:
+        await session.execute(
+            update(DeviceCode)
+            .where(
+                DeviceCode.device_code == body.device_code,
+                DeviceCode.status == "consuming",
+            )
+            .values(
+                status="pending",
+                user_id=None,
+                browser_device_id=None,
+                browser_key_algorithm=None,
+                browser_public_key=None,
+                browser_key_fingerprint=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return {"error": "authorization_pending"}
+
     host = (
         await session.execute(
-            select(Host).where(
+            select(Host)
+            .where(
                 Host.host_key_algorithm == body.host_key_algorithm,
                 Host.host_public_key == body.host_public_key,
             )
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if host is not None and host.owner_user_id != user_id:
@@ -274,7 +308,7 @@ async def device_poll(
         return {"error": "key_conflict"}
 
     if host is None:
-        host = Host(
+        candidate = Host(
             owner_user_id=user_id,
             name=claimed["host_name"] or "host",
             os=claimed["os"],
@@ -284,13 +318,99 @@ async def device_poll(
             host_public_key=body.host_public_key,
             status="offline",
         )
-        session.add(host)
-        await session.flush()
+        try:
+            # An absent-row SELECT cannot serialize first contact. Keep the
+            # claimed DeviceCode transaction alive while a nested savepoint
+            # absorbs the expected unique-key race, then lock/reuse the
+            # committed winner instead of leaking an IntegrityError as a 500.
+            async with session.begin_nested():
+                session.add(candidate)
+                await session.flush()
+            host = candidate
+        except IntegrityError:
+            host = (
+                await session.execute(
+                    select(Host)
+                    .where(
+                        Host.host_key_algorithm == body.host_key_algorithm,
+                        Host.host_public_key == body.host_public_key,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if host is None:
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == body.device_code)
+                    .values(status="denied")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                return {"error": "key_conflict"}
+            if host.owner_user_id != user_id:
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == body.device_code)
+                    .values(status="denied")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                return {"error": "key_conflict"}
     else:
         # Re-login preserves both host identity and any user-assigned name.
         host.os = claimed["os"]
         host.arch = claimed["arch"]
         host.version = claimed["version"]
+
+    existing_pin = await session.get(
+        HostBrowserPin, (host.id, claimed["browser_device_id"])
+    )
+    pin_values = (
+        claimed["browser_key_algorithm"],
+        claimed["browser_public_key"],
+        claimed["browser_key_fingerprint"],
+    )
+    if existing_pin is not None:
+        existing_values = (
+            existing_pin.browser_key_algorithm,
+            existing_pin.browser_public_key,
+            existing_pin.browser_key_fingerprint,
+        )
+        if existing_values != pin_values:
+            await session.execute(
+                update(DeviceCode)
+                .where(DeviceCode.device_code == body.device_code)
+                .values(status="pin_conflict")
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "pin_conflict"}
+    else:
+        pin_count = (
+            await session.execute(
+                select(func.count(HostBrowserPin.browser_device_id)).where(
+                    HostBrowserPin.host_id == host.id
+                )
+            )
+        ).scalar_one()
+        if pin_count >= MAX_BROWSER_PINS_PER_HOST:
+            await session.execute(
+                update(DeviceCode)
+                .where(DeviceCode.device_code == body.device_code)
+                .values(status="pin_limit")
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return {"error": "pin_limit"}
+        session.add(
+            HostBrowserPin(
+                host_id=host.id,
+                browser_device_id=claimed["browser_device_id"],
+                browser_key_algorithm=pin_values[0],
+                browser_public_key=pin_values[1],
+                browser_key_fingerprint=pin_values[2],
+            )
+        )
 
     token = auth.issue_daemon_token(host.id, user_id)
     fingerprint = host_key_fingerprint(body.host_key_algorithm, body.host_public_key)
@@ -313,14 +433,19 @@ async def device_poll(
         "host_key_algorithm": body.host_key_algorithm,
         "host_public_key": body.host_public_key,
         "host_key_fingerprint": fingerprint,
+        "browser_device_id": claimed["browser_device_id"],
+        "browser_key_algorithm": claimed["browser_key_algorithm"],
+        "browser_public_key": claimed["browser_public_key"],
+        "browser_key_fingerprint": claimed["browser_key_fingerprint"],
     }
 
 
-def _approval_response(dc: DeviceCode) -> schemas.DeviceApproveResponse:
-    if dc.host_key_algorithm is None or dc.host_public_key is None:
+def _pending_response(dc: DeviceCode) -> schemas.DevicePendingResponse:
+    if dc.host_key_algorithm is None or dc.host_public_key is None or dc.approval_nonce is None:
         raise HTTPException(status_code=400, detail="legacy device code must be restarted")
-    return schemas.DeviceApproveResponse(
+    return schemas.DevicePendingResponse(
         host_name=dc.host_name or "host",
+        approval_nonce=dc.approval_nonce,
         host_key_algorithm=dc.host_key_algorithm,
         host_public_key=dc.host_public_key,
         host_key_fingerprint=host_key_fingerprint(dc.host_key_algorithm, dc.host_public_key),
@@ -339,7 +464,7 @@ async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceC
         raise HTTPException(status_code=400, detail="user code expired")
     if dc.status != "pending":
         raise HTTPException(status_code=400, detail=f"user code is {dc.status}")
-    _approval_response(dc)
+    _pending_response(dc)
     return dc
 
 
@@ -352,7 +477,7 @@ async def device_pending(
     """Inspect the server-derived identity before the user confirms approval."""
 
     dc = await _pending_device_code(session, body.user_code)
-    return schemas.DevicePendingResponse(**_approval_response(dc).model_dump())
+    return _pending_response(dc)
 
 
 @router.post("/approve", response_model=schemas.DeviceApproveResponse)
@@ -364,9 +489,10 @@ async def device_approve(
     dc = await _pending_device_code(session, body.user_code)
     assert dc.host_key_algorithm is not None
     assert dc.host_public_key is not None
-    reviewed = _approval_response(dc)
+    reviewed = _pending_response(dc)
     if (
-        body.host_key_algorithm != reviewed.host_key_algorithm
+        body.approval_nonce != reviewed.approval_nonce
+        or body.host_key_algorithm != reviewed.host_key_algorithm
         or body.host_public_key != reviewed.host_public_key
         or body.host_key_fingerprint != reviewed.host_key_fingerprint
     ):
@@ -375,29 +501,71 @@ async def device_approve(
             detail="host identity changed since review; review the device code again",
         )
 
+    user_id = user.id
+    verify_host_pair_approval_proof(
+        user_id=user_id,
+        approval_nonce_wire=body.approval_nonce,
+        host_public_key_wire=body.host_public_key,
+        browser_public_key_wire=body.browser_public_key,
+        signature_wire=body.signature,
+    )
+
+    device_code = dc.device_code
+    await session.rollback()
+    browser_claim = (
+        await session.execute(
+            update(BrowserDevice)
+            .where(
+                BrowserDevice.id == body.browser_device_id,
+                BrowserDevice.owner_user_id == user_id,
+                BrowserDevice.key_algorithm == body.browser_key_algorithm,
+                BrowserDevice.public_key == body.browser_public_key,
+                BrowserDevice.revoked_at.is_(None),
+            )
+            .values(public_key=body.browser_public_key)
+            .returning(BrowserDevice.id)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one_or_none()
+    if browser_claim is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="browser identity changed or was revoked; review the device code again",
+        )
+
     pinned_host = (
         await session.execute(
             select(Host).where(
-                Host.host_key_algorithm == dc.host_key_algorithm,
-                Host.host_public_key == dc.host_public_key,
+                Host.host_key_algorithm == body.host_key_algorithm,
+                Host.host_public_key == body.host_public_key,
             )
         )
     ).scalar_one_or_none()
-    if pinned_host is not None and pinned_host.owner_user_id != user.id:
-        await session.delete(dc)
+    if pinned_host is not None and pinned_host.owner_user_id != user_id:
+        await session.execute(delete(DeviceCode).where(DeviceCode.device_code == device_code))
         await session.commit()
         raise HTTPException(status_code=409, detail="host key is already paired")
 
     approved = await session.execute(
         update(DeviceCode)
         .where(
-            DeviceCode.device_code == dc.device_code,
+            DeviceCode.device_code == device_code,
             DeviceCode.status == "pending",
             DeviceCode.user_id.is_(None),
+            DeviceCode.approval_nonce == body.approval_nonce,
             DeviceCode.host_key_algorithm == body.host_key_algorithm,
             DeviceCode.host_public_key == body.host_public_key,
+            DeviceCode.browser_device_id.is_(None),
         )
-        .values(status="approved", user_id=user.id)
+        .values(
+            status="approved",
+            user_id=user_id,
+            browser_device_id=body.browser_device_id,
+            browser_key_algorithm=body.browser_key_algorithm,
+            browser_public_key=body.browser_public_key,
+            browser_key_fingerprint=body.browser_key_fingerprint,
+        )
         .execution_options(synchronize_session=False)
     )
     if approved.rowcount != 1:
@@ -407,4 +575,10 @@ async def device_approve(
             detail="host identity or approval state changed; review the device code again",
         )
     await session.commit()
-    return reviewed
+    return schemas.DeviceApproveResponse(
+        **reviewed.model_dump(),
+        browser_device_id=body.browser_device_id,
+        browser_key_algorithm=body.browser_key_algorithm,
+        browser_public_key=body.browser_public_key,
+        browser_key_fingerprint=body.browser_key_fingerprint,
+    )

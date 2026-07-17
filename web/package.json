@@ -10,7 +10,8 @@
     "start:spawn": "node scripts/next-with-proxy-target.mjs start -H 0.0.0.0 -p 3001",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "test:unit": "bun test src",
+    "test:unit": "bun test src && bun run test:interop",
+    "test:interop": "bun run scripts/cross-runtime-crypto.ts",
     "test:e2e": "playwright test",
     "audit:terminal": "SPAWN_TERMINAL_AUDIT=1 playwright test tests/e2e/terminal-usability.audit.spec.ts --project=chromium --reporter=line,html",
     "audit:terminal:headed": "SPAWN_TERMINAL_AUDIT=1 playwright test tests/e2e/terminal-usability.audit.spec.ts --project=chromium --headed --reporter=line,html"
