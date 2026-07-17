@@ -4,7 +4,11 @@
 //! envelope on a WebSocket route or establish trust in either endpoint key.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::fmt;
 use thiserror::Error;
 
 use crate::signed_signal::{
@@ -124,6 +128,7 @@ struct SignedRtcEnvelope {
     sender_identity_public_key: String,
     intended_peer_identity_public_key: String,
     protocol: String,
+    #[serde(deserialize_with = "deserialize_protocol_version")]
     protocol_version: u32,
     session_id: String,
     scope_type: String,
@@ -131,6 +136,61 @@ struct SignedRtcEnvelope {
     sender_role: String,
     sdp: String,
     signature: String,
+}
+
+fn deserialize_protocol_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ProtocolVersionVisitor;
+
+    impl Visitor<'_> for ProtocolVersionVisitor {
+        type Value = u32;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a finite integral JSON number in 1..=2^32-1")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| E::invalid_value(de::Unexpected::Unsigned(value), &self))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| E::invalid_value(de::Unexpected::Signed(value), &self))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.is_finite()
+                && value.fract() == 0.0
+                && value >= 1.0
+                && value <= f64::from(u32::MAX)
+            {
+                Ok(value as u32)
+            } else {
+                Err(E::invalid_value(de::Unexpected::Float(value), &self))
+            }
+        }
+    }
+
+    // This deliberately follows JSON value semantics rather than retaining
+    // the source token: 2, 2.0, and 2e0 all deserialize to the same u32. The
+    // serializer remains canonical and emits a bare integer token.
+    deserializer.deserialize_any(ProtocolVersionVisitor)
 }
 
 /// Sign and serialize a trusted local transcript. The sender identity is
@@ -222,6 +282,15 @@ fn validate_tuple(
     transcript: &SignedSignalTranscript,
 ) -> Result<(), SignedRtcWireError> {
     protocol.validate_scope(transcript.scope_type())?;
+    let exact_version = match protocol {
+        RtcProtocol::Agent => 2,
+        RtcProtocol::Host => 1,
+    };
+    if transcript.protocol_version() != exact_version {
+        return Err(SignedRtcWireError::InconsistentTuple(
+            "protocol_version does not match the current protocol",
+        ));
+    }
     match (transcript.signal_kind(), transcript.sender_role()) {
         (SignalKind::Offer, SenderRole::Browser) | (SignalKind::Answer, SenderRole::Daemon) => {
             Ok(())
@@ -295,7 +364,16 @@ mod tests {
         sender_public_key_wire: String,
         intended_peer_public_key_wire: String,
         mutation_fields: Vec<String>,
+        protocol_version_json_tokens: ProtocolVersionJsonTokens,
         vectors: Vec<GoldenVector>,
+        wrong_topology_vectors: Vec<GoldenVector>,
+    }
+
+    #[derive(Deserialize)]
+    struct ProtocolVersionJsonTokens {
+        agent_accepted: Vec<String>,
+        host_accepted: Vec<String>,
+        rejected: Vec<String>,
     }
 
     #[derive(Deserialize)]
@@ -427,6 +505,78 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_json_value_semantics_match_shared_cases() {
+        let golden = golden();
+        let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
+        let intended = public_key_from_wire(&golden.intended_peer_public_key_wire).unwrap();
+        for (vector, tokens) in [
+            (
+                &golden.vectors[0],
+                &golden.protocol_version_json_tokens.agent_accepted,
+            ),
+            (
+                &golden.vectors[1],
+                &golden.protocol_version_json_tokens.host_accepted,
+            ),
+        ] {
+            let canonical = serde_json::to_string(&vector.envelope).unwrap();
+            let version = vector.envelope["protocol_version"].as_u64().unwrap();
+            let needle = format!("\"protocol_version\":{version}");
+            assert_eq!(canonical.matches(&needle).count(), 1);
+            for token in tokens {
+                let wire = canonical.replacen(&needle, &format!("\"protocol_version\":{token}"), 1);
+                assert!(
+                    verify_rtc_signal_wire(&wire, &sender, &intended).is_ok(),
+                    "{} rejected equivalent JSON number {token}",
+                    vector.id
+                );
+            }
+        }
+
+        let canonical = serde_json::to_string(&golden.vectors[0].envelope).unwrap();
+        let needle = "\"protocol_version\":2";
+        for token in &golden.protocol_version_json_tokens.rejected {
+            let wire = canonical.replacen(needle, &format!("\"protocol_version\":{token}"), 1);
+            assert!(
+                verify_rtc_signal_wire(&wire, &sender, &intended).is_err(),
+                "accepted invalid JSON number {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_signatures_cannot_widen_the_current_protocol_topology() {
+        let golden = golden();
+        let signing_key = SigningKey::from_bytes(&decode_hex_32(&golden.signing_seed_hex));
+        let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
+        let intended = public_key_from_wire(&golden.intended_peer_public_key_wire).unwrap();
+        assert_eq!(golden.wrong_topology_vectors.len(), 2);
+        for vector in &golden.wrong_topology_vectors {
+            let value = transcript(&vector.envelope);
+            let signature = vector.envelope["signature"].as_str().unwrap();
+            verify_transcript_wire(&sender, &value, signature).unwrap();
+            let protocol =
+                RtcProtocol::parse(vector.envelope["protocol"].as_str().unwrap()).unwrap();
+            assert!(matches!(
+                sign_rtc_signal_wire(&signing_key, protocol, &value),
+                Err(SignedRtcWireError::InconsistentTuple(
+                    "protocol_version does not match the current protocol"
+                ))
+            ));
+            assert!(matches!(
+                verify_rtc_signal_wire(
+                    &serde_json::to_string(&vector.envelope).unwrap(),
+                    &sender,
+                    &intended
+                ),
+                Err(SignedRtcWireError::InconsistentTuple(
+                    "protocol_version does not match the current protocol"
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn pins_shape_duplicates_and_bounds_fail_before_trust() {
         let golden = golden();
         let wire = serde_json::to_string(&golden.vectors[0].envelope).unwrap();
@@ -531,6 +681,23 @@ mod tests {
             sign_rtc_signal_wire(&signing_key, RtcProtocol::Host, &agent),
             Err(SignedRtcWireError::InconsistentTuple(
                 "protocol does not match scope_type"
+            ))
+        );
+        let wrong_version = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            1,
+            agent.session_id(),
+            agent.scope_type(),
+            agent.scope_id(),
+            SenderRole::Browser,
+            *agent.intended_peer_public_key(),
+            agent.sdp(),
+        )
+        .unwrap();
+        assert_eq!(
+            sign_rtc_signal_wire(&signing_key, RtcProtocol::Agent, &wrong_version),
+            Err(SignedRtcWireError::InconsistentTuple(
+                "protocol_version does not match the current protocol"
             ))
         );
         assert_eq!(

@@ -5,11 +5,13 @@ import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
+  importEd25519PublicKeyWire,
   MAX_SDP_BYTES,
   type ScopeType,
   type SenderRole,
   type SignedSignalTranscript,
   signSignedSignalTranscript,
+  verifySignedSignalTranscript,
 } from "./signed-signal";
 import {
   MAX_SIGNED_RTC_WIRE_CHARS,
@@ -42,7 +44,13 @@ interface GoldenFile {
   sender_public_key_wire: string;
   intended_peer_public_key_wire: string;
   mutation_fields: string[];
+  protocol_version_json_tokens: {
+    agent_accepted: string[];
+    host_accepted: string[];
+    rejected: string[];
+  };
   vectors: Array<{ id: string; envelope: WireEnvelope }>;
+  wrong_topology_vectors: Array<{ id: string; envelope: WireEnvelope }>;
 }
 
 const golden = goldenJson as GoldenFile;
@@ -271,6 +279,72 @@ describe("signed RTC JSON wire adapter", () => {
       verifyRtcSignalWire(wire, golden.sender_public_key_wire, golden.sender_public_key_wire),
       "peer_pin_mismatch",
     );
+  });
+
+  test("uses the shared value-semantic JSON number contract", async () => {
+    for (const [vector, tokens] of [
+      [golden.vectors[0], golden.protocol_version_json_tokens.agent_accepted],
+      [golden.vectors[1], golden.protocol_version_json_tokens.host_accepted],
+    ] as const) {
+      const canonical = JSON.stringify(vector.envelope);
+      const needle = `"protocol_version":${vector.envelope.protocol_version}`;
+      expect(canonical.split(needle)).toHaveLength(2);
+      for (const token of tokens) {
+        const wire = canonical.replace(needle, `"protocol_version":${token}`);
+        await expect(
+          verifyRtcSignalWire(
+            wire,
+            golden.sender_public_key_wire,
+            golden.intended_peer_public_key_wire,
+          ),
+          `${vector.id} rejected equivalent JSON number ${token}`,
+        ).resolves.toBeDefined();
+      }
+    }
+
+    const canonical = JSON.stringify(golden.vectors[0].envelope);
+    const needle = '"protocol_version":2';
+    for (const token of golden.protocol_version_json_tokens.rejected) {
+      const wire = canonical.replace(needle, `"protocol_version":${token}`);
+      await expect(
+        verifyRtcSignalWire(
+          wire,
+          golden.sender_public_key_wire,
+          golden.intended_peer_public_key_wire,
+        ),
+        `accepted invalid JSON number ${token}`,
+      ).rejects.toThrow();
+    }
+  });
+
+  test("rejects correctly signed agent v1 and host v2 envelopes", async () => {
+    const sender = await importEd25519PublicKeyWire(golden.sender_public_key_wire);
+    expect(golden.wrong_topology_vectors).toHaveLength(2);
+    for (const vector of golden.wrong_topology_vectors) {
+      const value = transcript(vector.envelope);
+      expect(
+        await verifySignedSignalTranscript(sender, value, vector.envelope.signature),
+        `${vector.id} fixture signature is not valid`,
+      ).toBe(true);
+      await expectWireError(
+        verifyRtcSignalWire(
+          JSON.stringify(vector.envelope),
+          golden.sender_public_key_wire,
+          golden.intended_peer_public_key_wire,
+        ),
+        "inconsistent_tuple",
+      );
+      await expectWireError(
+        signRtcSignalWire(
+          {
+            publicKeyWire: golden.sender_public_key_wire,
+            sign: async () => vector.envelope.signature,
+          },
+          { protocol: vector.envelope.protocol, transcript: value },
+        ),
+        "inconsistent_tuple",
+      );
+    }
   });
 
   test("rejects duplicate, missing, unknown, malformed, enum, and bounded input", async () => {

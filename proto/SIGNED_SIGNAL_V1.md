@@ -78,10 +78,11 @@ There is therefore no pair of accepted current protocol identifiers with the
 same signed scope type and protocol version. V1 does not add a protocol-name
 field merely for a hypothetical future collision. The wire adapter instead
 enforces the exact one-to-one mappings agent to `spawn.pty` and host to
-`spawn.host.ctl`; it never treats `spawn.ctl` as a signaling protocol. A future
-change that accepts two protocol identifiers in one signed scope/version must
-define a new transcript version that binds a bounded protocol identifier. It
-must not widen the V1 adapter.
+`spawn.host.ctl`, including their exact current versions 2 and 1 respectively;
+it never treats `spawn.ctl` as a signaling protocol. A future change that
+accepts two protocol identifiers in one signed scope/version must define a new
+transcript version that binds a bounded protocol identifier. It must not widen
+the V1 adapter.
 
 Verification proves only that the holder of the corresponding private key
 signed these exact bytes. It does **not** establish that the client, device,

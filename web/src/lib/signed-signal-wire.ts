@@ -242,6 +242,13 @@ function validateTuple(protocol: RtcSignalProtocol, transcript: SignedSignalTran
   if (!protocolMatchesScope) {
     throw new SignedRtcWireError("inconsistent_tuple", "protocol does not match scope_type");
   }
+  const exactVersion = protocol === "spawn.pty" ? 2 : 1;
+  if (transcript.protocolVersion !== exactVersion) {
+    throw new SignedRtcWireError(
+      "inconsistent_tuple",
+      "protocol_version does not match the current protocol",
+    );
+  }
   if (
     !(
       (transcript.signalKind === "offer" && transcript.senderRole === "browser") ||
