@@ -1,6 +1,10 @@
 // @ts-nocheck -- focused browser transport fakes; production code remains type-checked.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
+import {
+  hostControlInventoryViolations,
+  loadProductionSourceFiles,
+} from "../../test-support/production-source-guard";
 import type { Host } from "./api";
 import {
   approveBrowserHostPin,
@@ -297,14 +301,7 @@ describe("HostControl browser trust registry", () => {
   });
 
   test("production construction has one mandatory registry boundary and no raw callers", async () => {
-    const hits: Array<{ path: string; count: number }> = [];
-    const glob = new Bun.Glob("src/**/*.{ts,tsx}");
-    for await (const path of glob.scan(".")) {
-      if (path.includes(".test.") || path.includes("/hostControl.ts")) continue;
-      const source = await Bun.file(path).text();
-      const count = source.match(/new\s+HostControlClient\s*\(/gu)?.length ?? 0;
-      if (count > 0) hits.push({ path, count });
-    }
-    expect(hits).toEqual([{ path: "src/lib/host-control-trust.tsx", count: 1 }]);
+    const sources = await loadProductionSourceFiles();
+    expect(hostControlInventoryViolations(sources)).toEqual([]);
   });
 });

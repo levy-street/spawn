@@ -707,7 +707,11 @@ tests exists only under `web/test-support`, and the production source inventory
 rejects imports or calls to it. F1's new opaque `signed_envelope` relay carrier
 does not add a production browser constructor or caller in this prerequisite
 stage; the same inventory rejects any such web source addition until it is
-reviewed through the exact epoch-capability signing boundary.
+reviewed through the exact epoch-capability signing boundary. That grep-level
+inventory enumerates every production `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`,
+and `.tsx` source without sensitive-module exemptions, and fixture self-tests
+prove the test-only signer, carrier, and raw HostControl prohibitions across
+each extension and approved source module.
 Deterministic pre/post-boundary tests preserve explicit retained-recovery and
 `outcome_unknown` classifications, while the replay high-water behavior above
 remains unchanged. This checkpoint still makes no live signed-signaling, TOFU,
