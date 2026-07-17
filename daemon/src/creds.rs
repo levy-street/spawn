@@ -77,6 +77,11 @@ pub struct StoredCreds {
     /// Private fields keep mutation behind the conflict/cap validation API.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     browser_pins: Vec<BrowserPin>,
+    /// Runtime-only health for the native seed-free metadata projection. The
+    /// complete keyring record remains authoritative and this flag is never
+    /// persisted or allowed to affect its schema.
+    #[serde(skip)]
+    native_projection_degraded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +157,39 @@ struct KeyringScope {
 #[derive(Clone, PartialEq, Eq)]
 pub struct CredentialRevision {
     kind: CredentialRevisionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialSaveOutcome {
+    Committed,
+    CommittedProjectionDegraded,
+    CommittedDurabilityDegraded,
+}
+
+impl CredentialSaveOutcome {
+    pub fn warning_message(self) -> Option<&'static str> {
+        match self {
+            Self::Committed => None,
+            Self::CommittedProjectionDegraded => Some(
+                "credentials committed to the OS keyring, but the local metadata projection is degraded; run `spawnd status` to validate or repair it",
+            ),
+            Self::CommittedDurabilityDegraded => Some(
+                "credentials were committed, but the credential directory durability sync failed; verify storage health before reboot",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialFileWriteOutcome {
+    Committed,
+    CommittedDirectorySyncDegraded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoginCommitOutcome {
+    pub pin_inserted: bool,
+    pub save: CredentialSaveOutcome,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -319,9 +357,9 @@ pub fn commit_login_update<F>(
     server_url: String,
     browser_pin: BrowserPin,
     persist: F,
-) -> Result<bool>
+) -> Result<LoginCommitOutcome>
 where
-    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<()>,
+    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<CredentialSaveOutcome>,
 {
     commit_login_update_observed(
         current,
@@ -342,9 +380,9 @@ fn commit_login_update_observed<F, O>(
     browser_pin: BrowserPin,
     persist: F,
     observe_wiped_token: O,
-) -> Result<bool>
+) -> Result<LoginCommitOutcome>
 where
-    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<()>,
+    F: FnOnce(&mut StoredCreds, &CredentialRevision) -> Result<CredentialSaveOutcome>,
     O: FnOnce(&str),
 {
     let mut access_token = Zeroizing::new(access_token);
@@ -375,16 +413,21 @@ where
     candidate.access_token = Some(std::mem::take(&mut *access_token));
     candidate.host_id = Some(host_id);
     candidate.server_url = Some(server_url);
-    if let Err(error) =
-        validate_loaded_creds(&candidate).and_then(|()| persist(&mut candidate, &expected))
-    {
-        zeroize_stored_creds(&mut candidate);
-        observe_wiped_token(candidate.access_token.as_deref().unwrap_or(""));
-        return Err(error);
-    }
+    let save =
+        match validate_loaded_creds(&candidate).and_then(|()| persist(&mut candidate, &expected)) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                zeroize_stored_creds(&mut candidate);
+                observe_wiped_token(candidate.access_token.as_deref().unwrap_or(""));
+                return Err(error);
+            }
+        };
     let mut previous = std::mem::replace(current, candidate);
     zeroize_stored_creds(&mut previous);
-    Ok(inserted)
+    Ok(LoginCommitOutcome {
+        pin_inserted: inserted,
+        save,
+    })
 }
 
 fn canonical_server_origin(server_url: &str) -> Result<String> {
@@ -969,11 +1012,30 @@ fn reconcile_native_projection<F>(
     save_projection: F,
 ) -> Result<StoredCreds>
 where
-    F: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&StoredCreds) -> Result<CredentialFileWriteOutcome>,
 {
     match from_file {
         Ok(from_file) => {
-            reconcile_backend_records(from_file, from_keyring, BackendPolicy::NativeKeyring)
+            let mut selected = reconcile_backend_records(
+                from_file.clone(),
+                from_keyring,
+                BackendPolicy::NativeKeyring,
+            )?;
+            let mut expected_projection = file_creds_without_private_seed(&selected);
+            let projection_matches = from_file.as_ref() == Some(&expected_projection);
+            zeroize_stored_creds(&mut expected_projection);
+            if !record_is_empty(&selected) && !projection_matches {
+                match save_projection(&selected) {
+                    Ok(CredentialFileWriteOutcome::Committed) => {
+                        selected.native_projection_degraded = false;
+                    }
+                    Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded) | Err(_) => {
+                        selected.native_projection_degraded = true;
+                        tracing::warn!("native credential metadata projection remains degraded; the complete OS-keyring record is authoritative");
+                    }
+                }
+            }
+            Ok(selected)
         }
         Err(file_error) => {
             let recoverable_torn_projection = file_error.chain().any(|cause| {
@@ -993,11 +1055,20 @@ where
                     "native credential projection is corrupt and no complete keyring record exists",
                 );
             };
-            if let Err(error) = save_projection(keyring) {
-                zeroize_stored_creds(keyring);
-                return Err(error).context("rebuilding native credential projection from keyring");
+            let rebuilt = match save_projection(keyring) {
+                Ok(CredentialFileWriteOutcome::Committed) => {
+                    keyring.native_projection_degraded = false;
+                    true
+                }
+                Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded) | Err(_) => {
+                    keyring.native_projection_degraded = true;
+                    tracing::warn!("native credential metadata projection remains degraded; the complete OS-keyring record is authoritative");
+                    false
+                }
+            };
+            if rebuilt {
+                tracing::warn!(error = %file_error, "rebuilt torn native credential projection from the complete keyring record");
             }
-            tracing::warn!(error = %file_error, "rebuilt torn native credential projection from the complete keyring record");
             Ok(from_keyring.expect("validated complete keyring record remains present"))
         }
     }
@@ -1008,7 +1079,10 @@ where
 /// On other platforms the native keyring is required because it is the only
 /// copy containing the host private seed; the metadata file is its generation-
 /// matched seed-free projection.
-pub fn save(creds: &mut StoredCreds, expected: &CredentialRevision) -> Result<()> {
+pub fn save(
+    creds: &mut StoredCreds,
+    expected: &CredentialRevision,
+) -> Result<CredentialSaveOutcome> {
     let policy = platform_policy();
     with_credential_lock(|| {
         cleanup_stale_credential_temps(config::credentials_path()?.as_path())?;
@@ -1038,11 +1112,11 @@ fn save_cas_with_backends<L, K, F>(
     policy: BackendPolicy,
     set_keyring: K,
     save_file: F,
-) -> Result<()>
+) -> Result<CredentialSaveOutcome>
 where
     L: FnOnce() -> Result<StoredCreds>,
     K: FnOnce(&StoredCreds) -> Result<()>,
-    F: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&StoredCreds) -> Result<CredentialFileWriteOutcome>,
 {
     let candidate_matches_base = match &expected.kind {
         CredentialRevisionKind::Current { .. } => &credential_revision(candidate)? == expected,
@@ -1065,13 +1139,16 @@ where
     }
 
     let mut committed = candidate.clone();
-    if let Err(error) = save_with_backends(&mut committed, policy, set_keyring, save_file) {
-        zeroize_stored_creds(&mut committed);
-        return Err(error);
-    }
+    let outcome = match save_with_backends(&mut committed, policy, set_keyring, save_file) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            zeroize_stored_creds(&mut committed);
+            return Err(error);
+        }
+    };
     let mut previous = std::mem::replace(candidate, committed);
     zeroize_stored_creds(&mut previous);
-    Ok(())
+    Ok(outcome)
 }
 
 fn save_with_backends<K, F>(
@@ -1079,10 +1156,10 @@ fn save_with_backends<K, F>(
     policy: BackendPolicy,
     set_keyring: K,
     save_file: F,
-) -> Result<()>
+) -> Result<CredentialSaveOutcome>
 where
     K: FnOnce(&StoredCreds) -> Result<()>,
-    F: FnOnce(&StoredCreds) -> Result<()>,
+    F: FnOnce(&StoredCreds) -> Result<CredentialFileWriteOutcome>,
 {
     advance_credential_generation(creds)?;
     // Validate the complete coherent record, including both serialized backend
@@ -1095,22 +1172,39 @@ where
             if let Err(error) = keyring_result {
                 tracing::warn!(error = %error, "keyring write failed; committing the complete Unix file fallback");
             }
-            save_file(creds)
+            match save_file(creds)? {
+                CredentialFileWriteOutcome::Committed => Ok(CredentialSaveOutcome::Committed),
+                CredentialFileWriteOutcome::CommittedDirectorySyncDegraded => {
+                    Ok(CredentialSaveOutcome::CommittedDurabilityDegraded)
+                }
+            }
         }
         BackendPolicy::NativeKeyring => {
             keyring_result.context("persisting required native-keyring credential record")?;
-            save_file(creds)
+            match save_file(creds) {
+                Ok(CredentialFileWriteOutcome::Committed) => {
+                    creds.native_projection_degraded = false;
+                    Ok(CredentialSaveOutcome::Committed)
+                }
+                Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded) | Err(_) => {
+                    // The complete keyring write above is the authoritative
+                    // commit point. A projection error cannot roll it back or
+                    // be returned as a failed credential commit.
+                    creds.native_projection_degraded = true;
+                    Ok(CredentialSaveOutcome::CommittedProjectionDegraded)
+                }
+            }
         }
     }
 }
 
 #[cfg(unix)]
-fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
+fn save_file_for_platform(creds: &StoredCreds) -> Result<CredentialFileWriteOutcome> {
     save_file(creds)
 }
 
 #[cfg(not(unix))]
-fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
+fn save_file_for_platform(creds: &StoredCreds) -> Result<CredentialFileWriteOutcome> {
     // Non-Unix platforms do not have this module's audited mode-0600 fallback.
     // Keep public metadata and the legacy token fallback, but the private seed
     // is stored only in the native keyring.
@@ -1132,6 +1226,7 @@ fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
         server_url: creds.server_url.clone(),
         host_private_key_seed: None,
         browser_pins: creds.browser_pins.clone(),
+        native_projection_degraded: false,
     }
 }
 
@@ -1352,6 +1447,12 @@ fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
             } else {
                 "confirmation-required"
             }
+        )?;
+    }
+    if creds.native_projection_degraded {
+        writeln!(
+            &mut output,
+            "warning:     native credential metadata projection is degraded; the complete OS-keyring record remains authoritative and a later status/load will retry repair"
         )?;
     }
     Ok(output)
@@ -1589,12 +1690,12 @@ fn load_file_record_at(path: &Path) -> Result<Option<StoredCreds>> {
     Ok(Some(creds))
 }
 
-fn save_file(creds: &StoredCreds) -> Result<()> {
+fn save_file(creds: &StoredCreds) -> Result<CredentialFileWriteOutcome> {
     let path = config::credentials_path()?;
     save_file_at(&path, creds)
 }
 
-fn save_file_at(path: &Path, creds: &StoredCreds) -> Result<()> {
+fn save_file_at(path: &Path, creds: &StoredCreds) -> Result<CredentialFileWriteOutcome> {
     validate_persistable_creds(creds)?;
     let mut json = serde_json::to_vec_pretty(creds)?;
     let result = write_secure(path, &json).with_context(|| format!("writing {}", path.display()));
@@ -1911,11 +2012,15 @@ fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(raw))
 }
 
-fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
+fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<CredentialFileWriteOutcome> {
     write_secure_with_parent_sync(path, data, sync_parent_directory)
 }
 
-fn write_secure_with_parent_sync<S>(path: &Path, data: &[u8], sync_parent: S) -> std::io::Result<()>
+fn write_secure_with_parent_sync<S>(
+    path: &Path,
+    data: &[u8],
+    sync_parent: S,
+) -> std::io::Result<CredentialFileWriteOutcome>
 where
     S: Fn(&Path) -> std::io::Result<()>,
 {
@@ -1935,8 +2040,10 @@ where
         f.write_all(data)?;
         f.sync_all()?;
         durable_replace(&tmp, path)?;
-        sync_parent(parent)?;
-        Ok(())
+        match sync_parent(parent) {
+            Ok(()) => Ok(CredentialFileWriteOutcome::Committed),
+            Err(_) => Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded),
+        }
     })();
     if result.is_err() {
         match std::fs::remove_file(&tmp) {
@@ -2023,11 +2130,18 @@ mod tests {
             server_url: Some(server.into()),
             host_private_key_seed: Some(URL_SAFE_NO_PAD.encode([seed_byte; ED25519_SEED_BYTES])),
             browser_pins: Vec::new(),
+            native_projection_degraded: false,
         }
     }
 
     fn assert_same_coherent_record(actual: &StoredCreds, expected: &StoredCreds) {
-        assert!(actual == expected);
+        // Runtime-only backend health is deliberately outside the coherent
+        // serialized credential record and is asserted separately where it
+        // matters.
+        assert_eq!(
+            serde_json::to_vec(actual).unwrap(),
+            serde_json::to_vec(expected).unwrap()
+        );
         assert_eq!(actual.access_token, expected.access_token);
         assert_eq!(actual.host_id, expected.host_id);
         assert_eq!(actual.server_url, expected.server_url);
@@ -2088,7 +2202,7 @@ mod tests {
         candidate: &mut StoredCreds,
         expected: &CredentialRevision,
         backends: &MemoryCredentialBackends,
-    ) -> Result<()> {
+    ) -> Result<CredentialSaveOutcome> {
         with_credential_lock_at(lock_path, || {
             save_cas_with_backends(
                 candidate,
@@ -2096,7 +2210,10 @@ mod tests {
                 || backends.load(BackendPolicy::UnixCompleteFile),
                 BackendPolicy::UnixCompleteFile,
                 |record| backends.write_keyring(record),
-                |record| backends.write_file(record),
+                |record| {
+                    backends.write_file(record)?;
+                    Ok(CredentialFileWriteOutcome::Committed)
+                },
             )
         })
     }
@@ -2184,7 +2301,7 @@ mod tests {
         path: &Path,
         candidate: &mut StoredCreds,
         expected: &CredentialRevision,
-    ) -> Result<()> {
+    ) -> Result<CredentialSaveOutcome> {
         save_cas_with_backends(
             candidate,
             expected,
@@ -2450,7 +2567,7 @@ mod tests {
             confirm_browser_pin(generated_browser_pin(MAX_BROWSER_PINS as u8)),
             |_, _| {
                 persist_called.set(true);
-                Ok(())
+                Ok(CredentialSaveOutcome::Committed)
             },
         )
         .is_err());
@@ -2538,7 +2655,7 @@ mod tests {
             new_pin,
             |_, _| {
                 persist_called.set(true);
-                Ok(())
+                Ok(CredentialSaveOutcome::Committed)
             },
         )
         .is_err());
@@ -2630,7 +2747,7 @@ mod tests {
             |_| bail!("injected keyring failure"),
             |record| {
                 *written_file.borrow_mut() = Some(record.clone());
-                Ok(())
+                Ok(CredentialFileWriteOutcome::Committed)
             },
         )
         .unwrap();
@@ -2657,7 +2774,7 @@ mod tests {
             },
             |record| {
                 *retry_file.borrow_mut() = Some(record.clone());
-                Ok(())
+                Ok(CredentialFileWriteOutcome::Committed)
             },
         )
         .unwrap();
@@ -2918,7 +3035,7 @@ mod tests {
                 },
                 |_| {
                     file_written.set(true);
-                    Ok(())
+                    Ok(CredentialFileWriteOutcome::Committed)
                 },
             )
         })
@@ -3065,74 +3182,219 @@ mod tests {
     }
 
     #[test]
-    fn native_keyring_policy_never_uses_a_metadata_projection_as_a_complete_record() {
+    fn native_commit_outcomes_keep_memory_keyring_projection_and_oob_marker_coherent() {
         use std::cell::{Cell, RefCell};
 
-        let old = complete_record(1, 1, "old-token", 10, "https://old.example/", 1);
+        let device_id = Uuid::from_u128(1);
+        let legacy_pin = browser_pin(device_id, RFC_KEY_ONE);
+        let confirmed_pin = confirm_browser_pin(legacy_pin.clone());
+        let mut old = complete_record(1, 1, "old-token", 10, "https://server.example/", 1);
+        merge_browser_pin(&mut old, legacy_pin.clone()).unwrap();
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+
+        // A failure before the authoritative keyring write is an actual Err:
+        // the projection is not attempted, memory remains byte-equivalent to
+        // the legacy record, and a reload selects that same old generation.
+        let keyring = RefCell::new(Some(old.clone()));
+        let projection = RefCell::new(Some(file_creds_without_private_seed(&old)));
+        let projection_called = Cell::new(false);
+        let mut current = old.clone();
+        let error = commit_login_update(
+            &mut current,
+            "new-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            confirmed_pin.clone(),
+            |candidate, expected| {
+                save_cas_with_backends(
+                    candidate,
+                    expected,
+                    || {
+                        reconcile_backend_records(
+                            projection.borrow().clone(),
+                            keyring.borrow().clone(),
+                            BackendPolicy::NativeKeyring,
+                        )
+                    },
+                    BackendPolicy::NativeKeyring,
+                    |_| bail!("injected pre-authoritative keyring failure"),
+                    |_| {
+                        projection_called.set(true);
+                        Ok(CredentialFileWriteOutcome::Committed)
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pre-authoritative"));
+        assert!(!projection_called.get());
+        assert_eq!(serde_json::to_vec(&current).unwrap(), old_bytes);
+        assert!(!current.browser_pins()[0].is_oob_confirmed());
+        let reloaded_old = reconcile_backend_records(
+            projection.borrow().clone(),
+            keyring.borrow().clone(),
+            BackendPolicy::NativeKeyring,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&reloaded_old).unwrap(), old_bytes);
+
+        // Once the complete keyring write succeeds, projection failure is a
+        // committed-degraded success. Memory advances to the exact durable
+        // generation and the v1 OOB marker; an old projection cannot roll it
+        // back or turn the login into a reported failure.
+        let outcome = commit_login_update(
+            &mut current,
+            "new-token".into(),
+            Uuid::from_u128(10),
+            "https://server.example/".into(),
+            confirmed_pin.clone(),
+            |candidate, expected| {
+                save_cas_with_backends(
+                    candidate,
+                    expected,
+                    || {
+                        reconcile_backend_records(
+                            projection.borrow().clone(),
+                            keyring.borrow().clone(),
+                            BackendPolicy::NativeKeyring,
+                        )
+                    },
+                    BackendPolicy::NativeKeyring,
+                    |record| {
+                        *keyring.borrow_mut() = Some(record.clone());
+                        Ok(())
+                    },
+                    |_| bail!("injected post-keyring projection failure"),
+                )
+            },
+        )
+        .unwrap();
+        assert!(outcome.pin_inserted);
+        assert_eq!(
+            outcome.save,
+            CredentialSaveOutcome::CommittedProjectionDegraded
+        );
+        assert!(current.native_projection_degraded);
+        assert_eq!(current.access_token.as_deref(), Some("new-token"));
+        assert!(current.browser_pins()[0].is_oob_confirmed());
+        assert_eq!(current.browser_pin(device_id), Some(&confirmed_pin));
+        let durable_keyring = keyring.borrow().clone().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&durable_keyring).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(
+            projection.borrow().as_ref().unwrap().credential_generation,
+            old.credential_generation
+        );
+
+        let reload_with_failed_repair = reconcile_native_projection(
+            Ok(projection.borrow().clone()),
+            Some(durable_keyring.clone()),
+            |_| bail!("injected projection repair failure"),
+        )
+        .unwrap();
+        assert!(reload_with_failed_repair.native_projection_degraded);
+        assert_eq!(
+            serde_json::to_vec(&reload_with_failed_repair).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        let status = format_status("https://server.example/", &reload_with_failed_repair).unwrap();
+        assert!(status.contains("metadata projection is degraded"));
+        for secret in [
+            "new-token",
+            reload_with_failed_repair
+                .host_private_key_seed
+                .as_deref()
+                .unwrap(),
+            confirmed_pin.public_key(),
+        ] {
+            assert!(!status.contains(secret));
+            assert!(!outcome.save.warning_message().unwrap().contains(secret));
+        }
+
+        // A later load can repair the seed-free projection from the complete
+        // keyring. Exact legacy or v1 repeats cannot downgrade or promote the
+        // already-v1 marker a second time.
+        let repaired_projection = RefCell::new(None);
+        let repaired = reconcile_native_projection(
+            Ok(projection.borrow().clone()),
+            Some(durable_keyring.clone()),
+            |record| {
+                *repaired_projection.borrow_mut() = Some(file_creds_without_private_seed(record));
+                Ok(CredentialFileWriteOutcome::Committed)
+            },
+        )
+        .unwrap();
+        assert!(!repaired.native_projection_degraded);
+        assert!(repaired.browser_pins()[0].is_oob_confirmed());
+        let generation_after_promotion = repaired.credential_generation;
+        let mut idempotent = repaired.clone();
+        assert!(!merge_browser_pin(&mut idempotent, legacy_pin).unwrap());
+        assert!(!merge_browser_pin(&mut idempotent, confirmed_pin).unwrap());
+        assert_eq!(idempotent.credential_generation, generation_after_promotion);
+        assert!(idempotent.browser_pins()[0].is_oob_confirmed());
+        let converged = reconcile_native_projection(
+            Ok(repaired_projection.into_inner()),
+            Some(durable_keyring),
+            |_| panic!("matching repaired projection must not be rewritten"),
+        )
+        .unwrap();
+        assert!(!converged.native_projection_degraded);
+        assert!(converged.browser_pins()[0].is_oob_confirmed());
+    }
+
+    #[test]
+    fn unix_file_commit_outcomes_distinguish_precommit_error_from_postrename_degradation() {
+        use std::cell::RefCell;
+
+        let old = complete_record(4, 4, "old-token", 10, "https://server.example/", 4);
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+        let file = RefCell::new(old.clone());
         let mut candidate = old.clone();
         candidate.access_token = Some("new-token".into());
-        candidate.host_id = Some(Uuid::from_u128(20));
-        candidate.server_url = Some("https://new.example/".into());
-        let file_called = Cell::new(false);
-        assert!(save_with_backends(
+        let expected = credential_revision(&old).unwrap();
+
+        let error = save_cas_with_backends(
             &mut candidate,
-            BackendPolicy::NativeKeyring,
-            |_| bail!("injected required keyring failure"),
-            |_| {
-                file_called.set(true);
-                Ok(())
-            },
+            &expected,
+            || Ok(file.borrow().clone()),
+            BackendPolicy::UnixCompleteFile,
+            |_| Ok(()),
+            |_| bail!("injected pre-rename file failure"),
         )
-        .is_err());
-        assert!(!file_called.get());
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pre-rename"));
+        assert_eq!(serde_json::to_vec(&candidate).unwrap(), {
+            let mut intended = old.clone();
+            intended.access_token = Some("new-token".into());
+            serde_json::to_vec(&intended).unwrap()
+        });
+        assert_eq!(serde_json::to_vec(&*file.borrow()).unwrap(), old_bytes);
 
-        // Once the required complete keyring write succeeds, a later metadata
-        // projection failure is still reported. The next load uses the whole
-        // new keyring generation, never old-file metadata.
-        let mut keyring_first = old.clone();
-        keyring_first.access_token = Some("keyring-new-token".into());
-        keyring_first.host_id = Some(Uuid::from_u128(30));
-        keyring_first.server_url = Some("https://keyring-new.example/".into());
-        let written_keyring = RefCell::new(None);
-        assert!(save_with_backends(
-            &mut keyring_first,
-            BackendPolicy::NativeKeyring,
+        let outcome = save_cas_with_backends(
+            &mut candidate,
+            &expected,
+            || Ok(file.borrow().clone()),
+            BackendPolicy::UnixCompleteFile,
+            |_| Ok(()),
             |record| {
-                *written_keyring.borrow_mut() = Some(record.clone());
-                Ok(())
+                *file.borrow_mut() = record.clone();
+                Ok(CredentialFileWriteOutcome::CommittedDirectorySyncDegraded)
             },
-            |_| bail!("injected metadata file failure"),
-        )
-        .is_err());
-        let keyring_new = written_keyring.into_inner().unwrap();
-        let old_projection = file_creds_without_private_seed(&old);
-        let loaded = reconcile_backend_records(
-            Some(old_projection),
-            Some(keyring_new.clone()),
-            BackendPolicy::NativeKeyring,
         )
         .unwrap();
-        assert_same_coherent_record(&loaded, &keyring_new);
-
-        let mut newer_file = file_creds_without_private_seed(&candidate);
-        newer_file.credential_generation = Some(99);
-        newer_file.credential_record_id = Some(Uuid::from_u128(99).to_string());
-        let loaded = reconcile_backend_records(
-            Some(newer_file),
-            Some(old.clone()),
-            BackendPolicy::NativeKeyring,
-        )
-        .unwrap();
-        assert_same_coherent_record(&loaded, &old);
-
-        let projection = file_creds_without_private_seed(&old);
-        let loaded = reconcile_backend_records(
-            Some(projection),
-            Some(old.clone()),
-            BackendPolicy::NativeKeyring,
-        )
-        .unwrap();
-        assert_same_coherent_record(&loaded, &old);
+        assert_eq!(outcome, CredentialSaveOutcome::CommittedDurabilityDegraded);
+        assert_eq!(
+            serde_json::to_vec(&candidate).unwrap(),
+            serde_json::to_vec(&*file.borrow()).unwrap()
+        );
+        assert_eq!(candidate.access_token.as_deref(), Some("new-token"));
+        assert!(candidate.credential_generation.unwrap() > old.credential_generation.unwrap());
+        let warning = outcome.warning_message().unwrap();
+        assert!(warning.contains("durability sync failed"));
+        assert!(!warning.contains("new-token"));
+        assert!(!warning.contains(candidate.host_private_key_seed.as_deref().unwrap()));
     }
 
     #[test]
@@ -3153,7 +3415,7 @@ mod tests {
             Some(keyring.clone()),
             |record| {
                 *written_projection.borrow_mut() = Some(file_creds_without_private_seed(record));
-                Ok(())
+                Ok(CredentialFileWriteOutcome::Committed)
             },
         )
         .unwrap();
@@ -3165,6 +3427,18 @@ mod tests {
             record_order(&keyring).unwrap()
         );
 
+        let degraded =
+            reconcile_native_projection(Err(parse_error("")), Some(keyring.clone()), |_| {
+                bail!("injected torn-projection repair failure")
+            })
+            .unwrap();
+        assert!(degraded.native_projection_degraded);
+        assert_same_coherent_record(&degraded, &keyring);
+        let status = format_status("https://server.example/", &degraded).unwrap();
+        assert!(status.contains("metadata projection is degraded"));
+        assert!(!status.contains("token"));
+        assert!(!status.contains(degraded.host_private_key_seed.as_deref().unwrap()));
+
         let write_called = Cell::new(false);
         let result = reconcile_native_projection(
             Err(parse_error(
@@ -3173,7 +3447,7 @@ mod tests {
             Some(keyring),
             |_| {
                 write_called.set(true);
-                Ok(())
+                Ok(CredentialFileWriteOutcome::Committed)
             },
         );
         let error = result.err().expect("unknown projection fields must fail");
@@ -3228,10 +3502,11 @@ mod tests {
             Uuid::from_u128(10),
             "https://server.example/".into(),
             second.clone(),
-            |_, _| Ok(()),
+            |_, _| Ok(CredentialSaveOutcome::Committed),
         )
         .unwrap();
-        assert!(inserted);
+        assert!(inserted.pin_inserted);
+        assert_eq!(inserted.save, CredentialSaveOutcome::Committed);
         assert_eq!(creds.browser_pins(), &[first.clone(), second.clone()]);
         let output = format_status("https://server.example/", &creds).unwrap();
         assert!(output.contains(&first.device_id().to_string()));
@@ -3250,10 +3525,11 @@ mod tests {
             Uuid::from_u128(10),
             "https://server.example/".into(),
             second,
-            |_, _| Ok(()),
+            |_, _| Ok(CredentialSaveOutcome::Committed),
         )
         .unwrap();
-        assert!(!exact_repeat);
+        assert!(!exact_repeat.pin_inserted);
+        assert_eq!(exact_repeat.save, CredentialSaveOutcome::Committed);
         assert_eq!(creds.browser_pins().len(), 2);
     }
 
@@ -3281,7 +3557,7 @@ mod tests {
                 second.clone(),
                 |_, _| {
                     persist_called.set(true);
-                    Ok(())
+                    Ok(CredentialSaveOutcome::Committed)
                 },
             )
             .unwrap_err();
@@ -3331,7 +3607,7 @@ mod tests {
             },
             |_| {
                 file_written.set(true);
-                Ok(())
+                Ok(CredentialFileWriteOutcome::Committed)
             },
         )
         .is_err());
@@ -3575,23 +3851,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_replace_reports_post_rename_directory_sync_failure() {
+    fn atomic_replace_types_post_rename_directory_sync_failure_as_committed_degraded() {
         use std::cell::Cell;
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("credentials.json");
         std::fs::write(&path, b"old-secret").unwrap();
         let sync_called = Cell::new(false);
-        let error = write_secure_with_parent_sync(&path, b"new-secret", |_| {
+        let outcome = write_secure_with_parent_sync(&path, b"new-secret", |_| {
             sync_called.set(true);
             Err(std::io::Error::other("injected directory sync failure"))
         })
-        .unwrap_err();
+        .unwrap();
         assert!(sync_called.get());
-        assert!(error
-            .to_string()
-            .contains("injected directory sync failure"));
+        assert_eq!(
+            outcome,
+            CredentialFileWriteOutcome::CommittedDirectorySyncDegraded
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"new-secret");
+        assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".credentials.")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_pre_rename_failure_leaves_authoritative_target_unchanged() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("old-generation"), b"old-secret").unwrap();
+        let sync_called = Cell::new(false);
+        assert!(write_secure_with_parent_sync(&path, b"new-secret", |_| {
+            sync_called.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(!sync_called.get());
+        assert_eq!(
+            std::fs::read(path.join("old-generation")).unwrap(),
+            b"old-secret"
+        );
         assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()

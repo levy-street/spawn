@@ -36,7 +36,8 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
     let mut stored = creds::load().context("loading stored credentials")?;
     let expected = creds::credential_revision(&stored)?;
     let identity = creds::ensure_host_identity(&mut stored)?;
-    creds::save(&mut stored, &expected).context("persisting host identity")?;
+    let identity_save = creds::save(&mut stored, &expected).context("persisting host identity")?;
+    report_save_warning(identity_save);
 
     let host_name = args.host_name.unwrap_or_else(detect_hostname);
     let os = std::env::consts::OS.to_string();
@@ -133,7 +134,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
-            let host_id = commit_poll_success(
+            let committed = commit_poll_success(
                 &mut stored,
                 body,
                 &identity,
@@ -142,7 +143,8 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 prompt_for_browser_fingerprint,
                 creds::save,
             )?;
-            println!("spawn: logged in. host_id = {host_id}");
+            report_save_warning(committed.save);
+            println!("spawn: logged in. host_id = {}", committed.host_id);
             return Ok(());
         }
 
@@ -187,9 +189,12 @@ fn commit_poll_success<F>(
     expected_browser_fingerprint: Option<&str>,
     prompt: impl FnOnce() -> Result<String>,
     persist: F,
-) -> Result<uuid::Uuid>
+) -> Result<PollCommitOutcome>
 where
-    F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
+    F: FnOnce(
+        &mut creds::StoredCreds,
+        &creds::CredentialRevision,
+    ) -> Result<creds::CredentialSaveOutcome>,
 {
     commit_poll_success_observed(
         stored,
@@ -210,6 +215,12 @@ struct BrowserFingerprintConfirmation<'a, P> {
     prompt: P,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PollCommitOutcome {
+    host_id: uuid::Uuid,
+    save: creds::CredentialSaveOutcome,
+}
+
 fn commit_poll_success_observed<F, P, O>(
     stored: &mut creds::StoredCreds,
     mut body: DevicePollResponse,
@@ -218,9 +229,12 @@ fn commit_poll_success_observed<F, P, O>(
     confirmation: BrowserFingerprintConfirmation<'_, P>,
     persist: F,
     observe_wiped_token: O,
-) -> Result<uuid::Uuid>
+) -> Result<PollCommitOutcome>
 where
-    F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
+    F: FnOnce(
+        &mut creds::StoredCreds,
+        &creds::CredentialRevision,
+    ) -> Result<creds::CredentialSaveOutcome>,
     P: FnOnce() -> Result<String>,
     O: FnOnce(&str),
 {
@@ -283,7 +297,7 @@ where
                 .as_mut()
                 .expect("validated poll access token remains owned"),
         );
-        creds::commit_login_update(
+        let committed = creds::commit_login_update(
             stored,
             owned_token,
             host_id,
@@ -291,7 +305,10 @@ where
             browser_pin,
             persist,
         )?;
-        Ok(host_id)
+        Ok(PollCommitOutcome {
+            host_id,
+            save: committed.save,
+        })
     })();
     if result.is_err() {
         if let Some(token) = token.as_mut() {
@@ -302,6 +319,12 @@ where
         }
     }
     result
+}
+
+fn report_save_warning(outcome: creds::CredentialSaveOutcome) {
+    if let Some(message) = outcome.warning_message() {
+        eprintln!("spawn: warning: {message}");
+    }
 }
 
 fn verify_exact_browser_fingerprint(entered: &str, locally_derived: &str) -> Result<()> {
@@ -462,7 +485,7 @@ mod tests {
         let server = url::Url::parse("https://spawn.example/").unwrap();
         let mut stored = creds::StoredCreds::default();
         let persisted = std::cell::Cell::new(false);
-        let host_id = commit_poll_success(
+        let committed = commit_poll_success(
             &mut stored,
             complete_response(),
             &identity(),
@@ -473,15 +496,43 @@ mod tests {
                 persisted.set(true);
                 assert_eq!(candidate.browser_pins().len(), 1);
                 assert_eq!(candidate.browser_pins()[0].public_key(), BROWSER_KEY);
-                Ok(())
+                Ok(creds::CredentialSaveOutcome::Committed)
             },
         )
         .unwrap();
         assert!(persisted.get());
-        assert_eq!(host_id, uuid::Uuid::nil());
+        assert_eq!(committed.host_id, uuid::Uuid::nil());
+        assert_eq!(committed.save, creds::CredentialSaveOutcome::Committed);
         assert_eq!(stored.access_token.as_deref(), Some("token"));
         assert_eq!(stored.server_url.as_deref(), Some("https://spawn.example/"));
         assert_eq!(stored.browser_pins().len(), 1);
+    }
+
+    #[test]
+    fn poll_success_propagates_committed_degraded_storage_without_rollback() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let mut stored = creds::StoredCreds::default();
+        let committed = commit_poll_success(
+            &mut stored,
+            complete_response(),
+            &identity(),
+            &server,
+            Some(BROWSER_FINGERPRINT),
+            || unreachable!("explicit confirmation must not prompt"),
+            |_, _| Ok(creds::CredentialSaveOutcome::CommittedProjectionDegraded),
+        )
+        .unwrap();
+        assert_eq!(committed.host_id, uuid::Uuid::nil());
+        assert_eq!(
+            committed.save,
+            creds::CredentialSaveOutcome::CommittedProjectionDegraded
+        );
+        assert_eq!(stored.access_token.as_deref(), Some("token"));
+        assert_eq!(stored.browser_pins().len(), 1);
+        let warning = committed.save.warning_message().unwrap();
+        assert!(warning.contains("OS keyring"));
+        assert!(!warning.contains("token"));
+        assert!(!warning.contains(BROWSER_KEY));
     }
 
     #[test]
@@ -497,7 +548,7 @@ mod tests {
             &server,
             Some(BROWSER_FINGERPRINT),
             || unreachable!("invalid response must not prompt"),
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("mismatched host identity"));
@@ -512,7 +563,7 @@ mod tests {
             &server,
             Some(BROWSER_FINGERPRINT),
             || unreachable!("invalid response must not prompt"),
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("omitted access_token"));
@@ -527,7 +578,7 @@ mod tests {
             &server,
             Some(BROWSER_FINGERPRINT),
             || unreachable!("invalid response must not prompt"),
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("omitted host_id"));
@@ -543,7 +594,7 @@ mod tests {
                 &server,
                 Some(BROWSER_FINGERPRINT),
                 || unreachable!("invalid response must not prompt"),
-                |_, _| Ok(()),
+                |_, _| Ok(creds::CredentialSaveOutcome::Committed),
             )
             .unwrap_err();
             assert!(format!("{error:#}").contains("access token"));
@@ -593,7 +644,7 @@ mod tests {
                 },
                 |_, _| {
                     persisted.set(true);
-                    Ok(())
+                    Ok(creds::CredentialSaveOutcome::Committed)
                 },
                 |wiped| {
                     observed.set(true);
@@ -649,7 +700,7 @@ mod tests {
                 || unreachable!("invalid response must not prompt"),
                 |_, _| {
                     persisted.set(true);
-                    Ok(())
+                    Ok(creds::CredentialSaveOutcome::Committed)
                 },
             )
             .is_err());
@@ -734,7 +785,7 @@ mod tests {
                 prompt_calls.set(prompt_calls.get() + 1);
                 Ok(BROWSER_FINGERPRINT.to_owned())
             },
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap();
         assert_eq!(prompt_calls.get(), 1);
@@ -749,7 +800,7 @@ mod tests {
                 prompt_calls.set(prompt_calls.get() + 1);
                 Err(anyhow!("known pin unexpectedly prompted"))
             },
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap();
         assert_eq!(prompt_calls.get(), 1);
@@ -808,7 +859,7 @@ mod tests {
             || unreachable!(),
             |candidate, _| {
                 assert!(candidate.browser_pins()[0].is_oob_confirmed());
-                Ok(())
+                Ok(creds::CredentialSaveOutcome::Committed)
             },
         )
         .unwrap();
@@ -841,7 +892,7 @@ mod tests {
             },
             |_, _| {
                 persisted.set(true);
-                Ok(())
+                Ok(creds::CredentialSaveOutcome::Committed)
             },
             |token| {
                 wiped.set(true);
@@ -864,7 +915,7 @@ mod tests {
             &server,
             Some(BROWSER_FINGERPRINT),
             || unreachable!(),
-            |_, _| Ok(()),
+            |_, _| Ok(creds::CredentialSaveOutcome::Committed),
         )
         .unwrap();
 
@@ -898,7 +949,7 @@ mod tests {
                 },
                 |_, _| {
                     persisted.set(true);
-                    Ok(())
+                    Ok(creds::CredentialSaveOutcome::Committed)
                 },
             )
             .is_err());
@@ -945,7 +996,7 @@ mod tests {
             },
             |_, _| {
                 persisted.set(true);
-                Ok(())
+                Ok(creds::CredentialSaveOutcome::Committed)
             },
             |token| {
                 wiped.set(true);

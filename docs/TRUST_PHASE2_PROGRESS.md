@@ -498,13 +498,22 @@ cannot cross-load or cross-delete trust, and only the exact default directory
 may perform a conflict-checked one-time migration of the legacy global entry.
 Strict outer-schema, parent-sync, atomic projection, EOF-only torn-projection
 rebuild, locked stale-temp cleanup, and automatic secret-drop protections are
-covered. Status and smoke failures remain redacted. A real two-login proof now
-runs without the keyring-disable flag and compares both exact four-field
-browser tuples after re-login; a backend-injected subprocess also proves two
-login updates survive raw keyring get/set failures. The initial pin source is
-still server-mediated, so 02E alone does not supply independently sourced
-expected-peer provenance, connect a pin to live RTC verification, or delete it
-on server revocation.
+covered. Persistence has an explicit commit boundary: an error before the
+authoritative backend changes leaves memory and durable credentials on the old
+whole record, while a native-keyring commit followed by metadata-projection
+failure is a committed-but-degraded success. The daemon advances its in-memory
+record to that exact keyring generation, reports a fixed redacted warning, and
+later load/status repairs or validates the seed-free projection without
+rolling back a version-1 OOB marker. Likewise, a complete-file rename followed
+by failed parent-directory sync is reported as committed with uncertain crash
+durability, never as a rollback; failures before rename remain ordinary errors
+and leave the target unchanged. Status and smoke failures remain redacted. A
+real two-login proof now runs without the keyring-disable flag and compares
+both exact four-field browser tuples after re-login; a backend-injected
+subprocess also proves two login updates survive raw keyring get/set failures.
+The initial pin source is still server-mediated, so 02E alone does not supply
+independently sourced expected-peer provenance, connect a pin to live RTC
+verification, or delete it on server revocation.
 
 **P3-LIVE-F4 browser-local host-pin half (candidate; independent review
 pending):** branch `impl/p3-browser-host-pins` adds a separate version-1
@@ -566,9 +575,12 @@ bounded interactive exact-line entry or
 `--expect-browser-fingerprint SHA256:...`; non-interactive first contact
 without that argument fails closed. Whitespace, case changes, short forms,
 malformed values, EOF, a substituted server tuple, Host/origin changes,
-device/key reuse conflicts, capacity, and persistence failure all abort before
-the returned token or pin can enter the protected credential record. The
-returned token remains zeroizing across every failure path.
+device/key reuse conflicts, capacity, and every pre-commit persistence failure
+all abort before the returned token or pin can enter the protected credential
+record. A failure after the authoritative complete record has committed returns
+a typed degraded-success outcome instead, keeps memory on that committed
+generation, and emits only a fixed redacted recovery warning. The returned
+token remains zeroizing across every actual failure path.
 
 An exact already-durable browser device-ID/key pin in the same canonical
 server-origin + Host-ID domain authorizes re-login without repeating first
@@ -576,13 +588,17 @@ contact. Nothing weaker does. Pins written by the earlier server-mediated 02E
 foundation deserialize with an explicit legacy/unconfirmed state and remain
 inert conflict history: authorization selectors expose only confirmation
 version 1. An exact OOB ceremony may atomically promote only that same tuple;
-save failure leaves the legacy marker unchanged, confirmed records cannot be
-downgraded, and unknown/future marker versions fail closed. The browser approval page derives the displayed
-browser fingerprint again from its non-extractable local identity, compares
-the registration response, and retains that local value through the approval
-success state with exact CLI copy/entry instructions. Rust tests exercise the
-exact-entry matrix, non-TTY/EOF, substitution/token wipe, known-pin re-login,
-device/key/domain conflicts, capacity, and save failure. The real login smoke
+pre-authoritative save failure leaves the legacy marker unchanged, while a
+post-keyring projection failure retains the committed version-1 promotion in
+memory and on reload. Confirmed records cannot be downgraded, and
+unknown/future marker versions fail closed. The browser approval page derives
+the displayed browser fingerprint again from its non-extractable local
+identity, compares the registration response, and retains that local value
+through the approval success state with exact CLI copy/entry instructions.
+Rust tests exercise the exact-entry matrix, non-TTY/EOF, substitution/token
+wipe, known-pin re-login, device/key/domain conflicts, capacity, pre-commit
+failure, committed-degraded projection repair, and post-rename durability
+uncertainty. The real login smoke
 supplies an independently prepared browser fingerprint and proves a different
 approved browser key leaves the byte-identical credential record unchanged;
 native Chromium proves the local display survives approval success. This
