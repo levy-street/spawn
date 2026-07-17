@@ -17,9 +17,9 @@ the shared `browser-device-registration-v1-vectors.json` corpus.
 Browser-authorized host pairing uses
 [`HOST_PAIR_APPROVAL_V1.md`](HOST_PAIR_APPROVAL_V1.md) and the shared
 `host-pair-approval-v1-vectors.json` corpus.
-Daemon host-key possession before browser approval uses
-[`HOST_PAIR_POSSESSION_V1.md`](HOST_PAIR_POSSESSION_V1.md) and the shared
-Rust-produced `host-pair-possession-v1-vectors.json` corpus.
+Daemon host-key proof during pairing uses
+[`HOST_PAIR_POSSESSION_V1.md`](HOST_PAIR_POSSESSION_V1.md) and the Rust-produced
+`host-pair-possession-v1-vectors.json` corpus.
 
 ## Identifiers
 
@@ -42,7 +42,7 @@ also accepts `Bearer` for API testing).
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
 | POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, approval_nonce, verification_uri, interval, expires_in}` |
 | POST   | `/api/auth/device/possession` | `{device_code, approval_nonce, host_key_algorithm:"ed25519", host_public_key, signature}` | `{verified:true, version:1}` after exact unexpired host-key proof |
-| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | host tuple plus the exact approving browser device/key/fingerprint on success; otherwise a device-flow `error` |
+| POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint, browser_device_id, browser_key_algorithm:"ed25519", browser_public_key, browser_key_fingerprint}` containing the exact approving browser tuple on success; otherwise a device-flow `error` |
 | POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, approval_nonce, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
 | POST   | `/api/auth/device/approve` | reviewed host tuple/nonce plus `{browser_device_id, browser_key_algorithm, browser_public_key, browser_key_fingerprint, signature}` | the exact reviewed host and browser presentation after one-shot approval |
 
@@ -64,13 +64,51 @@ Before exposing the user code, the daemon signs the fixed-width transcript in
 host public key. Pending review, approval, and token-producing poll fail closed
 until that exact unexpired ceremony records possession version 1.
 
+A successful poll also identifies the browser device that performed the
+approval using the four exact `browser_*` fields in the table. The daemon first
+requires the complete existing host tuple, token, and host ID. Only then does
+it treat the browser tuple as first-contact input: it requires a canonical UUID
+device ID, strictly decodes the canonical Ed25519 key, independently derives
+`browser_key_fingerprint` using the same 12-byte SHA-256 presentation rule, and
+compares it exactly. A legacy success response without this tuple fails closed;
+pending/error responses remain backward compatible.
+
+The daemon stores at most 32 immutable browser device/key pins in deterministic
+device-ID order alongside its protected credential record, bound as one set to
+the canonical server origin plus returned Host ID. Exact repeats are
+idempotent. Reusing a device ID for another key or a key for another device is
+a local conflict and never overwrites the existing pin. Relogin to another
+origin/Host fails before persistence; explicit reset or a separate config
+directory is required. This storage is an offline, server-mediated foundation
+only: the pin is not connected to live RTC verification and does not yet meet
+independent expected-peer provenance. Server-side browser revocation does not
+silently delete a daemon-local pin; explicit re-pairing and local pin-management
+commands are required future work.
+
+The protected credential copies are generation-bound whole records. It never
+overlays a token, host ID/server, private host seed, or browser pins from
+different commits. On Unix the atomically replaced, parent-synced mode-0600
+file is the commit point; a higher redundant keyring generation after a failed
+file replacement is not promoted.
+Legacy records without a generation are migrated on their next successful
+save. Keyring accounts are scoped to the canonical config-directory identity;
+only the exact default directory may conflict-check and migrate the old global
+account, while alternate config trees never read or clear it. Genuine keyring read/write unavailability automatically falls back to
+the complete Unix record without requiring `SPAWN_DISABLE_KEYRING`; on native
+platforms the keyring remains the only seed-bearing complete record and an
+EOF-truncated seed-free projection is atomically rebuilt from it.
+
+Every credential mutation holds a short-lived cross-process lock from its
+durable reread through both backend writes. It compare-and-swaps the record
+revision captured before the update (and before an interactive device
+ceremony); stale writers fail before writing and must reload before retrying.
+
 This is an intentionally fail-closed device-flow protocol upgrade: legacy
 daemons that omit the key receive request validation errors and must upgrade.
 Migration 0017 leaves existing Host rows visibly unpaired (`null` key fields)
 so a rolling deploy does not invent or silently rotate an identity. Migration
 0019 likewise leaves interrupted pre-nonce codes visibly unapproved so they
-must restart. Migration 0021 leaves every pre-upgrade code visibly unproved, so
-it also must restart or submit a valid proof before approval. Re-pairing
+must restart. Re-pairing
 an existing daemon pins it; a same-owner re-login with the same key reuses the
 Host row, while another owner cannot claim it. Multiple explicit ceremonies may
 independently add immutable browser pins to that Host.

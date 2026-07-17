@@ -353,11 +353,65 @@ pub struct DevicePollRequest<'a> {
 /// or an error body (`error`). We deserialize as a flat struct with all
 /// fields optional and discriminate at the call site.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DevicePollResponse {
     pub access_token: Option<String>,
     pub host_id: Option<Uuid>,
     pub host_key_algorithm: Option<String>,
     pub host_public_key: Option<String>,
     pub host_key_fingerprint: Option<String>,
+    pub browser_device_id: Option<String>,
+    pub browser_key_algorithm: Option<String>,
+    pub browser_public_key: Option<String>,
+    pub browser_key_fingerprint: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod device_poll_tests {
+    use super::*;
+
+    #[test]
+    fn success_response_uses_the_exact_browser_binding_field_names() {
+        let body: DevicePollResponse = serde_json::from_str(
+            r#"{
+                "access_token":"token",
+                "host_id":"11111111-2222-4333-8444-555555555555",
+                "host_key_algorithm":"ed25519",
+                "host_public_key":"host-key",
+                "host_key_fingerprint":"SHA256:host",
+                "browser_device_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "browser_key_algorithm":"ed25519",
+                "browser_public_key":"browser-key",
+                "browser_key_fingerprint":"SHA256:browser"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.browser_device_id.as_deref(),
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        );
+        assert_eq!(body.browser_key_algorithm.as_deref(), Some("ed25519"));
+        assert_eq!(body.browser_public_key.as_deref(), Some("browser-key"));
+        assert_eq!(
+            body.browser_key_fingerprint.as_deref(),
+            Some("SHA256:browser")
+        );
+    }
+
+    #[test]
+    fn legacy_error_shape_remains_valid_but_aliases_and_duplicates_fail() {
+        let pending: DevicePollResponse =
+            serde_json::from_str(r#"{"error":"authorization_pending"}"#).unwrap();
+        assert_eq!(pending.error.as_deref(), Some("authorization_pending"));
+        assert!(pending.browser_device_id.is_none());
+        assert!(serde_json::from_str::<DevicePollResponse>(
+            r#"{"browser_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<DevicePollResponse>(
+            r#"{"browser_device_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","browser_device_id":"11111111-2222-4333-8444-555555555555"}"#
+        )
+        .is_err());
+    }
 }

@@ -27,6 +27,9 @@ interface RawStoredIdentity {
   [key: string]: unknown;
 }
 
+const accountUuid = (suffix: number): string =>
+  `00000000-0000-0000-0000-${suffix.toString().padStart(12, "0")}`;
+
 function options(factory: IDBFactory) {
   return { indexedDBFactory: factory } as const;
 }
@@ -132,13 +135,13 @@ async function rawRecords(factory: IDBFactory): Promise<unknown[]> {
   }
 }
 
-function transcript(accountId: string, publicKeyWire: string): SignedSignalTranscript {
+function transcript(publicKeyWire: string): SignedSignalTranscript {
   return {
     signalKind: "offer",
     protocolVersion: 1,
-    sessionId: "browser-identity-unit-test",
+    sessionId: "00000000-0000-4000-8000-000000000003",
     scopeType: "host",
-    scopeId: accountId,
+    scopeId: "00000000-0000-4000-8000-000000000004",
     senderRole: "browser",
     intendedPeerPublicKey: decodeBase64Url(publicKeyWire, ED25519_PUBLIC_KEY_BYTES),
     sdp: "v=0\r\ns=browser-identity-unit-test\r\n",
@@ -176,14 +179,14 @@ describe("browser device identity", () => {
   test("persists one non-extractable account key and reloads only its public handle", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    const accountId = "account-persistence";
+    const accountId = accountUuid(10);
 
     const first = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
     const reloaded = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
 
     expect(reloaded.publicKeyWire).toBe(first.publicKeyWire);
     expect(Object.keys(first).sort()).toEqual(["publicKey", "publicKeyWire", "sign"]);
-    const value = transcript(accountId, first.publicKeyWire);
+    const value = transcript(first.publicKeyWire);
     const signature = await reloaded.sign(value);
     expect(await verifySignedSignalTranscript(first.publicKey, value, signature)).toBe(true);
 
@@ -198,12 +201,12 @@ describe("browser device identity", () => {
     const factory = new IDBFactory();
     const storage = options(factory);
     const identities = await Promise.all(
-      Array.from({ length: 12 }, () => loadOrCreateBrowserDeviceIdentity("account-race", storage)),
+      Array.from({ length: 12 }, () => loadOrCreateBrowserDeviceIdentity(accountUuid(11), storage)),
     );
 
     expect(new Set(identities.map((identity) => identity.publicKeyWire)).size).toBe(1);
     expect(
-      (await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, "account-race"))
+      (await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountUuid(11)))
         ?.publicKeyWire,
     ).toBe(identities[0].publicKeyWire);
   });
@@ -211,11 +214,11 @@ describe("browser device identity", () => {
   test("keeps accounts separate in the same bounded database", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    const alpha = await loadOrCreateBrowserDeviceIdentity("account-alpha", storage);
-    const beta = await loadOrCreateBrowserDeviceIdentity("account-beta", storage);
+    const alpha = await loadOrCreateBrowserDeviceIdentity(accountUuid(12), storage);
+    const beta = await loadOrCreateBrowserDeviceIdentity(accountUuid(13), storage);
 
     expect(alpha.publicKeyWire).not.toBe(beta.publicKeyWire);
-    expect((await loadOrCreateBrowserDeviceIdentity("account-alpha", storage)).publicKeyWire).toBe(
+    expect((await loadOrCreateBrowserDeviceIdentity(accountUuid(12), storage)).publicKeyWire).toBe(
       alpha.publicKeyWire,
     );
   });
@@ -223,7 +226,7 @@ describe("browser device identity", () => {
   test("fails closed on corrupt shape and does not replace the record", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    const accountId = "account-corrupt";
+    const accountId = accountUuid(14);
     const identity = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
     const stored = (await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId))!;
     stored.unexpected = true;
@@ -241,19 +244,23 @@ describe("browser device identity", () => {
   test("rejects a valid public key paired with a different private key", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    await loadOrCreateBrowserDeviceIdentity("account-one", storage);
-    await loadOrCreateBrowserDeviceIdentity("account-two", storage);
-    const first = (await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, "account-one"))!;
+    await loadOrCreateBrowserDeviceIdentity(accountUuid(15), storage);
+    await loadOrCreateBrowserDeviceIdentity(accountUuid(16), storage);
+    const first = (await rawRecord(
+      factory,
+      BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
+      accountUuid(15),
+    ))!;
     const second = (await rawRecord(
       factory,
       BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
-      "account-two",
+      accountUuid(16),
     ))!;
     first.privateKey = second.privateKey;
     await putRawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, first);
 
     await expectIdentityError(
-      loadOrCreateBrowserDeviceIdentity("account-one", storage),
+      loadOrCreateBrowserDeviceIdentity(accountUuid(15), storage),
       "corrupt_record",
     );
   });
@@ -261,7 +268,7 @@ describe("browser device identity", () => {
   test("rejects stored keys with altered algorithm or usages", async () => {
     const usageFactory = new IDBFactory();
     const usageStorage = options(usageFactory);
-    const usageAccount = "account-invalid-usage";
+    const usageAccount = accountUuid(17);
     await loadOrCreateBrowserDeviceIdentity(usageAccount, usageStorage);
     const usageRecord = (await rawRecord(
       usageFactory,
@@ -284,7 +291,7 @@ describe("browser device identity", () => {
 
     const algorithmFactory = new IDBFactory();
     const algorithmStorage = options(algorithmFactory);
-    const algorithmAccount = "account-invalid-algorithm";
+    const algorithmAccount = accountUuid(18);
     await loadOrCreateBrowserDeviceIdentity(algorithmAccount, algorithmStorage);
     const algorithmRecord = (await rawRecord(
       algorithmFactory,
@@ -306,7 +313,9 @@ describe("browser device identity", () => {
 
   test("fails closed when IndexedDB is unavailable", async () => {
     await expectIdentityError(
-      loadOrCreateBrowserDeviceIdentity("account-unavailable", { indexedDBFactory: null }),
+      loadOrCreateBrowserDeviceIdentity(accountUuid(19), {
+        indexedDBFactory: null,
+      }),
       "storage_unavailable",
     );
   });
@@ -321,7 +330,11 @@ describe("browser device identity", () => {
       {
         autoIncrement: false,
         keyPath: ["tenant", "account"],
-        seedRecord: { account: "seed", marker: "compound-key-path", tenant: "test" },
+        seedRecord: {
+          account: "seed",
+          marker: "compound-key-path",
+          tenant: "test",
+        },
       },
       {
         autoIncrement: false,
@@ -343,11 +356,11 @@ describe("browser device identity", () => {
       const before = await rawRecords(factory);
 
       await expectIdentityError(
-        loadOrCreateBrowserDeviceIdentity("account-schema-check", storage),
+        loadOrCreateBrowserDeviceIdentity(accountUuid(20), storage),
         "corrupt_record",
       );
       await expectIdentityError(
-        loadOrCreateBrowserDeviceIdentity("account-schema-check", storage),
+        loadOrCreateBrowserDeviceIdentity(accountUuid(20), storage),
         "corrupt_record",
       );
 
@@ -358,9 +371,9 @@ describe("browser device identity", () => {
   test("deletes only when the expected public key matches", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    const accountId = "account-delete";
+    const accountId = accountUuid(21);
     const identity = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
-    const other = await loadOrCreateBrowserDeviceIdentity("account-other", storage);
+    const other = await loadOrCreateBrowserDeviceIdentity(accountUuid(22), storage);
 
     await expectIdentityError(
       deleteBrowserDeviceIdentity(accountId, other.publicKeyWire, storage),
@@ -378,27 +391,35 @@ describe("browser device identity", () => {
     );
   });
 
-  test("bounds account identifiers and total stored account records", async () => {
+  test("requires canonical account UUIDs and bounds total stored account records", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
-    await expectIdentityError(
-      loadOrCreateBrowserDeviceIdentity("x".repeat(257), storage),
-      "invalid_account",
-    );
+    for (const invalid of [
+      "account-arbitrary",
+      "00000000000000000000000000000000",
+      "{00000000-0000-0000-0000-000000000001}",
+      "00000000-0000-0000-0000-000000000001 ",
+      "00000000-0000-0000-0000-00000000000A",
+    ]) {
+      await expectIdentityError(
+        loadOrCreateBrowserDeviceIdentity(invalid, storage),
+        "invalid_account",
+      );
+    }
 
-    await loadOrCreateBrowserDeviceIdentity("occupied-0", storage);
+    await loadOrCreateBrowserDeviceIdentity(accountUuid(100), storage);
     const database = await requestResult(factory.open(BROWSER_DEVICE_IDENTITY_DATABASE_NAME));
     const transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readwrite");
     const completion = transactionResult(transaction);
     const store = transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
     for (let index = 1; index < BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS; index += 1) {
-      store.add({ accountId: `occupied-${index}` });
+      store.add({ accountId: accountUuid(100 + index) });
     }
     await completion;
     database.close();
 
     await expectIdentityError(
-      loadOrCreateBrowserDeviceIdentity("account-over-capacity", storage),
+      loadOrCreateBrowserDeviceIdentity(accountUuid(200), storage),
       "capacity_exceeded",
     );
   });

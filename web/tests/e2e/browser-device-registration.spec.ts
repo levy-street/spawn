@@ -134,6 +134,31 @@ test("rejects a substituted registration response", async ({ page }) => {
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
 });
 
+test("rejects a server fingerprint that does not match the submitted browser key", async ({
+  page,
+}) => {
+  await mockAuthenticatedApi(page);
+  await page.route("**/api/browser-devices/register", async (route) => {
+    const body = route.request().postDataJSON() as { public_key: string };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: {
+        id: "00000000-0000-4000-8000-000000000098",
+        key_algorithm: "ed25519",
+        public_key: body.public_key,
+        fingerprint: "SHA256:AAAAAAAAAAAAAAAA",
+        created_at: "2026-07-17T00:00:00Z",
+        revoked_at: null,
+      },
+    });
+  });
+  await page.goto("/settings");
+
+  await expect(page.getByRole("alert").first()).toContainText("registration failed");
+  await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
+});
+
 test("rejects a substituted revocation response without deleting the local key", async ({
   page,
 }) => {

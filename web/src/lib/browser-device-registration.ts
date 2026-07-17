@@ -9,6 +9,7 @@ import {
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
+import { ed25519PublicKeyFingerprint } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -60,7 +61,10 @@ export async function beginBrowserDeviceLocalCleanup(
   if (identity.publicKeyWire !== expectedPublicKey) {
     throw new Error("local browser identity does not match the revoked server key");
   }
-  writeMarker(userId, { status: "cleanup_pending", publicKey: expectedPublicKey });
+  writeMarker(userId, {
+    status: "cleanup_pending",
+    publicKey: expectedPublicKey,
+  });
   return "cleanup_pending";
 }
 
@@ -102,9 +106,11 @@ async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegis
     public_key: identity.publicKeyWire,
     signature,
   });
+  const expectedFingerprint = await ed25519PublicKeyFingerprint(identity.publicKeyWire);
   if (
     device.key_algorithm !== "ed25519" ||
     device.public_key !== identity.publicKeyWire ||
+    device.fingerprint !== expectedFingerprint ||
     device.revoked_at !== null
   ) {
     throw new Error("browser registration response did not match the submitted active key");

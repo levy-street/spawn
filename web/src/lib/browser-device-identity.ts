@@ -8,7 +8,6 @@ import {
   exportEd25519PublicKeyWire,
   generateEd25519IdentityKeyPair,
   importEd25519PublicKeyWire,
-  MAX_SCOPE_ID_BYTES,
   type SignedSignalTranscript,
   signSignedSignalTranscript,
   verifySignedSignalTranscript,
@@ -19,10 +18,11 @@ export const BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS = 32;
 export const BROWSER_DEVICE_IDENTITY_STORE_NAME = "device-identities";
 export const BROWSER_DEVICE_IDENTITY_DATABASE_NAME = "spawn-browser-device-identity";
 
-const SELF_CHECK_SESSION_ID = "spawn-browser-device-identity-self-check-v1";
+const CANONICAL_ACCOUNT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const SELF_CHECK_SESSION_ID = "00000000-0000-4000-8000-000000000001";
+const SELF_CHECK_SCOPE_ID = "00000000-0000-4000-8000-000000000002";
 const SELF_CHECK_SDP = "v=0\r\ns=spawn-browser-device-identity-self-check\r\n";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const RECORD_KEYS = ["accountId", "privateKey", "publicKey", "publicKeyWire", "version"] as const;
 const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, StoredDeviceIdentityV1>();
 
@@ -63,25 +63,13 @@ export class BrowserDeviceIdentityError extends Error {
   }
 }
 
-function assertBoundedScalarText(value: string, field: string, maxBytes: number): void {
-  if (typeof value !== "string") {
-    throw new BrowserDeviceIdentityError("invalid_account", `${field} must be a string`);
-  }
-  const encoded = textEncoder.encode(value);
-  if (
-    encoded.byteLength < 1 ||
-    encoded.byteLength > maxBytes ||
-    textDecoder.decode(encoded) !== value
-  ) {
+function assertAccountId(accountId: string): void {
+  if (typeof accountId !== "string" || !CANONICAL_ACCOUNT_ID_PATTERN.test(accountId)) {
     throw new BrowserDeviceIdentityError(
       "invalid_account",
-      `${field} must be 1..=${maxBytes} bytes of strict Unicode scalar text`,
+      "accountId must be an exact lowercase-hyphenated canonical UUID",
     );
   }
-}
-
-function assertAccountId(accountId: string): void {
-  assertBoundedScalarText(accountId, "accountId", MAX_SCOPE_ID_BYTES);
 }
 
 function resolveIndexedDB(options: BrowserDeviceIdentityStorageOptions): IDBFactory {
@@ -179,7 +167,9 @@ function openDatabase(factory: IDBFactory, databaseName: string): Promise<IDBDat
         request.transaction?.abort();
         return;
       }
-      database.createObjectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME, { keyPath: "accountId" });
+      database.createObjectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME, {
+        keyPath: "accountId",
+      });
     };
     request.onerror = () =>
       fail(upgradeError ?? storageFailure("browser device identity database open failed"));
@@ -296,13 +286,13 @@ function assertStoredRecordShape(value: unknown, accountId: string): StoredDevic
   return record as StoredDeviceIdentityV1;
 }
 
-function selfCheckTranscript(accountId: string, publicKey: Uint8Array): SignedSignalTranscript {
+function selfCheckTranscript(publicKey: Uint8Array): SignedSignalTranscript {
   return {
     signalKind: "offer",
     protocolVersion: 1,
     sessionId: SELF_CHECK_SESSION_ID,
     scopeType: "host",
-    scopeId: accountId,
+    scopeId: SELF_CHECK_SCOPE_ID,
     senderRole: "browser",
     intendedPeerPublicKey: publicKey,
     sdp: SELF_CHECK_SDP,
@@ -323,7 +313,7 @@ async function validateStoredRecord(
         "stored public key does not match its canonical wire value",
       );
     }
-    const transcript = selfCheckTranscript(accountId, exported);
+    const transcript = selfCheckTranscript(exported);
     const signature = await signSignedSignalTranscript(record.privateKey, transcript);
     if (!(await verifySignedSignalTranscript(record.publicKey, transcript, signature))) {
       throw new BrowserDeviceIdentityError(

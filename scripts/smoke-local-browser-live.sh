@@ -306,6 +306,7 @@ for config_dir in (
     os.path.join(home, "Library", "Application Support", "spawn"),
 ):
     os.makedirs(config_dir, exist_ok=True)
+    os.chmod(config_dir, 0o700)
     with open(os.path.join(config_dir, "credentials.json"), "w", encoding="utf-8") as handle:
         json.dump(creds, handle)
     os.chmod(os.path.join(config_dir, "credentials.json"), 0o600)

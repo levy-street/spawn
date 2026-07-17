@@ -22,19 +22,22 @@ by the stated byte length. Fields occur exactly once in this fixed order:
 | 2 | Transcript version | `u8`; exactly `1` |
 | 3 | Signal kind | `u8`; offer `1`, answer `2` |
 | 4 | Protocol version | `u32`; `1..=2^32-1` |
-| 5 | Session ID | `u16` byte length, then `1..=256` bytes of strict UTF-8 |
+| 5 | Session ID | `u16` byte length, then exactly 36 ASCII bytes of lowercase-hyphenated canonical UUID text |
 | 6 | Scope type | `u8`; agent `1`, host `2` |
-| 7 | Scope ID | `u16` byte length, then `1..=256` bytes of strict UTF-8 |
+| 7 | Scope ID | `u16` byte length, then exactly 36 ASCII bytes of lowercase-hyphenated canonical UUID text |
 | 8 | Sender role | `u8`; browser `1`, daemon `2` |
 | 9 | Intended peer public key | exactly 32 raw Ed25519 public-key bytes |
 | 10 | SDP | `u32` byte length, then `1..=1,048,576` bytes of strict UTF-8 |
 
 Decoders reject an incorrect domain or version, unknown enum values, zero
-protocol versions, empty/oversized fields, truncated fields, malformed UTF-8,
-and any trailing byte. JavaScript encoders also reject lone UTF-16 surrogates
-instead of allowing `TextEncoder` to replace them. No implementation may infer
-defaults, normalize Unicode or line endings, ignore trailing data, or substitute
-a canonical-JSON representation.
+protocol versions, noncanonical session/scope UUID text, empty/oversized fields,
+truncated fields, malformed UTF-8, and any trailing byte. UUID validation is
+syntax-only in V1: it does not impose a UUID version policy, but uppercase,
+unhyphenated, braced, whitespace-padded, and arbitrary text are invalid.
+JavaScript encoders also reject lone UTF-16 surrogates instead of allowing
+`TextEncoder` to replace them. No implementation may infer defaults, trim or
+normalize identifiers, normalize Unicode or line endings, ignore trailing data,
+or substitute a canonical-JSON representation.
 
 Public keys and signatures use canonical unpadded base64url on a JSON/wire
 boundary. A public key decodes to exactly 32 bytes and a signature to exactly
@@ -54,6 +57,13 @@ all 40 noncanonical encodings, an off-curve encoding, seven accepted
 mixed-torsion controls, and the identity-key universal forgery (`R` is the
 identity and `S` is zero).
 
+The 32 raw `intended peer public key` transcript bytes use that same strict
+point contract even though they are not base64url inside the binary transcript.
+Construction, encode, decode, sign, and verify all reject the complete 49-key
+invalid corpus; all seven canonical mixed-torsion controls remain accepted.
+An endpoint adapter's later wire validation is defense in depth, not the first
+point-validity boundary.
+
 ## Security properties and limits
 
 Binding the kind distinguishes an offer from an answer. Binding the protocol
@@ -62,6 +72,12 @@ replayed into a different version, RTC session, or agent/host scope. Binding
 the sender role prevents reflection across the browser and daemon roles.
 Binding the intended peer key prevents redirecting a signed message to another
 known identity. Binding the SDP prevents signaling modification.
+
+The future live-routing integration must consume and compare the exact verified
+canonical `session_id` and `scope_id` text. It must not trim, accept alternate
+UUID spellings, or parse and reserialize either field between verification and
+routing/ownership checks; a route identifier that is not byte-for-byte equal to
+the verified text fails closed.
 
 ### Protocol-identifier replay audit
 
