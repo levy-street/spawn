@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostToolsPanel } from "@/components/hosts/HostToolsPanel";
@@ -29,6 +29,24 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { AgentStatusDot } from "@/components/ui/status";
 import { agentActivityDetail, agentCommand, agentTitle, relativeTime } from "@/lib/agents";
 import { ApiError, agents, hosts } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import {
+  BrowserHostPinError,
+  browserHostPinServerOrigin,
+  loadBrowserHostPin,
+  resolveActiveBrowserHostPin,
+  revokeBrowserHostPin,
+} from "@/lib/browser-host-pins";
+
+class HostDeletionFlowError extends Error {
+  constructor(
+    message: string,
+    readonly localTombstoneWritten: boolean,
+  ) {
+    super(message);
+    this.name = "HostDeletionFlowError";
+  }
+}
 
 export default function HostDetailPage() {
   return (
@@ -41,6 +59,7 @@ export default function HostDetailPage() {
 }
 
 function HostDetail() {
+  const { user } = useAuth();
   const params = useParams<{ id: string }>();
   const id = params?.id;
   const router = useRouter();
@@ -48,6 +67,7 @@ function HostDetail() {
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [localDeletionPending, setLocalDeletionPending] = useState(false);
 
   const q = useQuery({
     queryKey: ["host", id],
@@ -73,16 +93,105 @@ function HostDetail() {
     onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
   });
   const removeM = useMutation({
-    mutationFn: () => hosts.remove(id as string),
+    mutationFn: async () => {
+      if (!host || !user) {
+        throw new HostDeletionFlowError(
+          "Authenticated host identity is unavailable; deletion was blocked",
+          false,
+        );
+      }
+      const targetHostId = id as string;
+      if (host.id !== targetHostId) {
+        throw new HostDeletionFlowError(
+          "Host API response ID does not exactly match the route and DELETE target",
+          false,
+        );
+      }
+      let localTombstoneWritten = false;
+      try {
+        await revokeBrowserHostPin({
+          accountId: user.id,
+          origin: browserHostPinServerOrigin(),
+          targetHostId,
+          claimedHostId: host.id,
+          claimedHostPublicKey: host.host_public_key ?? null,
+          claimedHostFingerprint: host.host_key_fingerprint ?? null,
+        });
+        localTombstoneWritten = true;
+        setLocalDeletionPending(true);
+        await hosts.remove(targetHostId);
+      } catch (err) {
+        const message = err instanceof ApiError || err instanceof Error ? err.message : String(err);
+        throw new HostDeletionFlowError(message, localTombstoneWritten);
+      }
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["hosts"] });
       qc.invalidateQueries({ queryKey: ["agents"] });
       router.push("/hosts");
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+    onError: (err) => {
+      if (err instanceof HostDeletionFlowError && err.localTombstoneWritten) {
+        setLocalDeletionPending(true);
+        setError(
+          `Local host trust is revoked, but server deletion did not complete: ${err.message}. Retry server deletion; the local tombstone will remain.`,
+        );
+        return;
+      }
+      setError(
+        `Host deletion was blocked before any server DELETE: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    },
   });
 
   const host = q.data;
+
+  useEffect(() => {
+    const hostPublicKey = host?.host_public_key;
+    const hostFingerprint = host?.host_key_fingerprint;
+    if (!host || !user || !hostPublicKey || !hostFingerprint) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        if (host.id !== id) {
+          throw new Error("Host API response ID does not exactly match this route");
+        }
+        try {
+          await resolveActiveBrowserHostPin({
+            accountId: user.id,
+            origin: browserHostPinServerOrigin(),
+            hostId: id,
+            claimedHostPublicKey: hostPublicKey,
+            claimedHostFingerprint: hostFingerprint,
+          });
+        } catch (err) {
+          // An already-bound tombstone is expected after a failed server
+          // DELETE. Confirm its exact binding below without reactivating it.
+          if (!(err instanceof BrowserHostPinError) || err.code !== "revoked_pin") throw err;
+        }
+        const pin = await loadBrowserHostPin({
+          accountId: user.id,
+          origin: browserHostPinServerOrigin(),
+          hostPublicKey,
+          hostFingerprint,
+        });
+        if (pin === null || !pin.hostIds.includes(id)) {
+          throw new Error("No exact local Host-ID-to-key binding exists for this route");
+        }
+        if (!cancelled) setLocalDeletionPending(pin.state === "revoked");
+      } catch (err) {
+        if (!cancelled) {
+          setLocalDeletionPending(false);
+          setError(
+            `Local host trust status is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [host, user, id]);
 
   const submitRename = () => {
     const next = draftName.trim();
@@ -194,7 +303,7 @@ function HostDetail() {
             }}
           >
             <Trash2 className="size-4" aria-hidden />
-            Remove host
+            {localDeletionPending ? "Retry server deletion" : "Remove host"}
           </DropdownMenuItem>
         </DropdownMenu>
       </header>
@@ -202,6 +311,12 @@ function HostDetail() {
       {error && (
         <p className="mb-3 text-sm text-destructive" role="alert">
           {error}
+        </p>
+      )}
+      {localDeletionPending && (
+        <p className="mb-3 text-sm text-foreground" role="status">
+          This browser retains a revoked host/key tombstone. Server deletion is retryable and server
+          disappearance will not clear local trust state.
         </p>
       )}
       {q.error && (
