@@ -236,3 +236,190 @@ test("revoking this browser closes a parked warm terminal", async ({ page }) => 
   await expect.poll(() => ptyChannelStates(page)).toEqual(["closed"]);
   await expect.poll(() => pooledHostCount(page)).toBe(0);
 });
+
+test("a second tab closes on logout and creates only a fresh account-B epoch", async ({
+  context,
+  page,
+}) => {
+  test.setTimeout(60_000);
+  const peer = await context.newPage();
+  const sourceRtc = await installTerminalScenario(page);
+  const peerRtc = await installTerminalScenario(peer);
+  let currentUser: typeof user | typeof userB | null = user;
+  for (const tab of [page, peer]) {
+    await tab.route("**/api/me", async (route) => {
+      if (currentUser === null) {
+        await route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          json: { detail: "expired" },
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { user: currentUser },
+      });
+    });
+  }
+  await page.route("**/api/auth/logout", async (route) => {
+    currentUser = null;
+    await route.fulfill({ status: 204 });
+  });
+  await page.route("**/api/auth/login", async (route) => {
+    currentUser = userB;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: { access_token: "test-token", user: userB },
+    });
+  });
+
+  await Promise.all([page.goto(`/agents/${AGENT_ID}`), peer.goto(`/agents/${AGENT_ID}`)]);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(peer.getByLabel("Agent terminal")).toBeVisible();
+
+  await page.getByRole("button", { name: "Account menu" }).click();
+  await page.getByRole("menuitem", { name: "Log out" }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(peer).toHaveURL(/\/login$/);
+  await expect
+    .poll(() => sourceRtc.closedChannels.filter((label) => label === "spawn.pty").length)
+    .toBe(1);
+  await expect
+    .poll(() => peerRtc.closedChannels.filter((label) => label === "spawn.pty").length)
+    .toBe(1);
+  await expect.poll(() => pooledHostCount(peer)).toBe(0);
+
+  await page.getByLabel("Email").fill(userB.email);
+  await page.getByLabel("Password").fill("password123");
+  const [loginResponse] = await Promise.all([
+    page.waitForResponse("**/api/auth/login"),
+    page.getByRole("button", { name: "Sign in" }).click(),
+  ]);
+  expect(loginResponse.status()).toBe(200);
+  await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
+  await peer.goto(`/agents/${AGENT_ID}`);
+  await expect(peer.getByRole("button", { name: "Account menu" })).toContainText(userB.email);
+  await expect(peer.getByLabel("Agent terminal")).toBeVisible();
+  await expect.poll(() => rtcConnectionCount(peer)).toBe(1);
+  await expect.poll(() => ptyChannelStates(peer)).toEqual(["open"]);
+});
+
+test("an authoritative expiry in one tab invalidates a second tab", async ({ context, page }) => {
+  const peer = await context.newPage();
+  await installTerminalScenario(page);
+  await installTerminalScenario(peer);
+  let expired = false;
+  for (const tab of [page, peer]) {
+    await tab.route("**/api/me", async (route) => {
+      if (expired) {
+        await route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          json: { detail: "expired" },
+        });
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", json: { user } });
+    });
+  }
+  await page.route("**/api/agents", async (route) => {
+    if (!expired) return await route.fallback();
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      json: { detail: "expired" },
+    });
+  });
+
+  await Promise.all([page.goto(`/agents/${AGENT_ID}`), peer.goto(`/agents/${AGENT_ID}`)]);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(peer.getByLabel("Agent terminal")).toBeVisible();
+  expired = true;
+
+  await expect(page).toHaveURL(/\/login$/, { timeout: 10_000 });
+  await expect(peer).toHaveURL(/\/login$/, { timeout: 10_000 });
+  await expect.poll(() => ptyChannelStates(peer)).toEqual(["closed"]);
+  await expect.poll(() => pooledHostCount(peer)).toBe(0);
+});
+
+test("a peer tab revalidates after registration error instead of retaining its old epoch", async ({
+  context,
+  page,
+}) => {
+  const peer = await context.newPage();
+  await installTerminalScenario(page);
+  const peerRtc = await installTerminalScenario(peer);
+  let failRegistration = false;
+  await page.route("**/api/browser-devices/register", async (route) => {
+    if (!failRegistration) return await route.fallback();
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      json: { detail: "registration unavailable" },
+    });
+  });
+
+  await Promise.all([page.goto(`/agents/${AGENT_ID}`), peer.goto(`/agents/${AGENT_ID}`)]);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(peer.getByLabel("Agent terminal")).toBeVisible();
+  failRegistration = true;
+  await page.evaluate((userId) => {
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: `spawn.browser-device.revocation.v1.${userId}` }),
+    );
+  }, USER_ID);
+
+  await expect(page.getByRole("alert").first()).toContainText("registration failed");
+  await expect
+    .poll(() => peerRtc.closedChannels.filter((label) => label === "spawn.pty").length)
+    .toBe(1);
+  await expect.poll(() => rtcConnectionCount(peer)).toBe(2);
+  await expect.poll(() => ptyChannelStates(peer)).toEqual(["closed", "open"]);
+});
+
+test("revocation reaches a peer even when the source tab cannot write its cleanup marker", async ({
+  context,
+  page,
+}) => {
+  const peer = await context.newPage();
+  await installTerminalScenario(page);
+  await installTerminalScenario(peer);
+  let revoked = false;
+  await page.route(/\/api\/browser-devices\/[^/]+\/revoke$/, async (route) => {
+    revoked = true;
+    await route.fallback();
+  });
+  await peer.route("**/api/browser-devices/register", async (route) => {
+    if (!revoked) return await route.fallback();
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      json: { detail: "browser key is revoked" },
+    });
+  });
+
+  await Promise.all([page.goto(`/agents/${AGENT_ID}`), peer.goto(`/agents/${AGENT_ID}`)]);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(peer.getByLabel("Agent terminal")).toBeVisible();
+  await page.getByRole("button", { name: "Account menu" }).click();
+  await page.getByRole("menuitem", { name: "Settings" }).click();
+  await page.evaluate((userId) => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function setItem(key: string, value: string) {
+      if (key === `spawn.browser-device.revocation.v1.${userId}`) {
+        throw new DOMException("marker unavailable", "QuotaExceededError");
+      }
+      return original.call(this, key, value);
+    };
+  }, USER_ID);
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "Revoke" }).click();
+
+  await expect(page.getByText(/server revocation succeeded/i)).toBeVisible();
+  await expect.poll(() => ptyChannelStates(page)).toEqual(["closed"]);
+  await expect.poll(() => ptyChannelStates(peer)).toEqual(["closed"]);
+  await expect.poll(() => pooledHostCount(peer)).toBe(0);
+});
