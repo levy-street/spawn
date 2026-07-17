@@ -18,6 +18,7 @@ interface RegistrationVectors {
     signature: string;
   };
   mutations: { user_id: string; public_key: string; signature: string };
+  malformed_user_ids: string[];
   malformed_public_keys: string[];
   malformed_signatures: string[];
 }
@@ -95,12 +96,11 @@ describe("browser device registration transcript", () => {
     }
   });
 
-  test("rejects noncanonical UUID text before signing", () => {
-    expect(() =>
-      encodeBrowserDeviceRegistrationTranscript(
-        "ABCDEFAB-0000-4000-8000-000000000001",
-        vectors.positive.public_key,
-      ),
-    ).toThrow("canonical lowercase UUID");
+  test("rejects the shared noncanonical UUID text corpus before signing", () => {
+    for (const userId of vectors.malformed_user_ids) {
+      expect(() =>
+        encodeBrowserDeviceRegistrationTranscript(userId, vectors.positive.public_key),
+      ).toThrow("canonical lowercase UUID");
+    }
   });
 });

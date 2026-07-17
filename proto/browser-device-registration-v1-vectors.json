@@ -13,6 +13,15 @@
     "public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
     "signature": "MxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5DAA"
   },
+  "malformed_user_ids": [
+    "ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF",
+    "abcdefab12344abc8defabcdefabcdef",
+    "{abcdefab-1234-4abc-8def-abcdefabcdef}",
+    "urn:uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    "uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    " abcdefab-1234-4abc-8def-abcdefabcdef",
+    "abcdefab-1234-4abc-8def-abcdefabcdef "
+  ],
   "malformed_public_keys": [
     "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHUR",
     "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo=",

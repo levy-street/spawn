@@ -63,6 +63,10 @@ def test_shared_registration_vectors_pin_bytes_and_reject_mutations_and_malforme
         signature_wire=positive["signature"],
     )
 
+    for malformed in vectors["malformed_user_ids"]:
+        with pytest.raises(ValueError, match="user id must be"):
+            encode_browser_registration_transcript(malformed, public_key)
+
     with pytest.raises(HTTPException, match="proof is invalid"):
         verify_browser_registration_proof(
             user_id=vectors["mutations"]["user_id"],

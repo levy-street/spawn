@@ -22,12 +22,19 @@ def encode_browser_registration_transcript(user_id: str, public_key: bytes) -> b
     """Encode the fixed-width v1 transcript bound to one authenticated UUID and key."""
 
     try:
-        user_bytes = uuid.UUID(user_id).bytes
+        parsed_user_id = uuid.UUID(user_id)
     except (ValueError, AttributeError) as exc:
         raise ValueError("user id must be a UUID") from exc
+    if user_id != str(parsed_user_id):
+        raise ValueError("user id must be a canonical lowercase UUID")
     if len(public_key) != 32:
         raise ValueError("public key must contain exactly 32 bytes")
-    return BROWSER_REGISTRATION_MAGIC + bytes([BROWSER_REGISTRATION_VERSION]) + user_bytes + public_key
+    return (
+        BROWSER_REGISTRATION_MAGIC
+        + bytes([BROWSER_REGISTRATION_VERSION])
+        + parsed_user_id.bytes
+        + public_key
+    )
 
 
 def decode_ed25519_signature(encoded: str) -> bytes:

@@ -15,8 +15,10 @@ The transcript is fixed-width and contains, in order:
 | Authenticated user ID | 16 UUID bytes in RFC 4122/network order |
 | Browser public key | exactly 32 raw Ed25519 public-key bytes |
 
-The user ID comes only from the authenticated server session. The request does
-not carry an account ID. Public keys and signatures are canonical unpadded
+The user ID comes only from the authenticated server session. Before encoding,
+both runtimes require its exact canonical lowercase, hyphenated UUID text;
+alternate spellings are rejected. The request does not carry an account ID.
+Public keys and signatures are canonical unpadded
 base64url at the HTTP boundary and are rejected unless their encoded widths are
 exactly 43 and 86 characters before decoding. Public keys use the same strict
 RFC 8032, canonical, non-small-order acceptance contract as signed signaling
