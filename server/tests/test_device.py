@@ -448,6 +448,104 @@ async def test_orm_key_pair_constraints_reject_both_partial_null_permutations(
         await session.rollback()
 
 
+async def _assert_browser_binding_constraint_is_exact(client, *, email: str) -> None:
+    user_id, auth = await _signup(client, email)
+    browser = (await _register_browser(client, user_id, auth))[0]
+    now = datetime.now(UTC)
+    insert = text(
+        "insert into device_codes "
+        "(device_code, user_code, host_name, approval_nonce, browser_device_id, "
+        "browser_key_algorithm, browser_public_key, browser_key_fingerprint, status, "
+        "expires_at, created_at) values "
+        "(:device_code, :user_code, 'binding-check', :approval_nonce, "
+        ":browser_device_id, :browser_key_algorithm, :browser_public_key, "
+        ":browser_key_fingerprint, 'pending', :expires_at, :created_at)"
+    )
+    full = {
+        "browser_device_id": browser["id"],
+        "browser_key_algorithm": "ed25519",
+        "browser_public_key": browser["public_key"],
+        "browser_key_fingerprint": browser["fingerprint"],
+    }
+
+    async with get_sessionmaker()() as session:
+        for index, binding in enumerate(({field: None for field in full}, full)):
+            await session.execute(
+                insert,
+                {
+                    "device_code": f"valid-binding-{index}",
+                    "user_code": f"VBND-000{index}",
+                    "approval_nonce": _wire(bytes([index]) * 32),
+                    "expires_at": now + timedelta(minutes=5),
+                    "created_at": now,
+                    **binding,
+                },
+            )
+        await session.commit()
+
+    fields = list(full)
+    for mask in range(1, (1 << len(fields)) - 1):
+        binding = {
+            field: value if mask & (1 << index) else None
+            for index, (field, value) in enumerate(full.items())
+        }
+        async with get_sessionmaker()() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(
+                    insert,
+                    {
+                        "device_code": f"partial-binding-{mask}",
+                        "user_code": f"PBND-{mask:04d}",
+                        "approval_nonce": _wire(bytes([mask]) * 32),
+                        "expires_at": now + timedelta(minutes=5),
+                        "created_at": now,
+                        **binding,
+                    },
+                )
+                await session.commit()
+            await session.rollback()
+
+    invalid_full_bindings = [
+        {**full, "browser_key_algorithm": "rsa"},
+        {**full, "browser_public_key": full["browser_public_key"][:-1]},
+        {**full, "browser_key_fingerprint": full["browser_key_fingerprint"][:-1]},
+    ]
+    for index, binding in enumerate(invalid_full_bindings):
+        async with get_sessionmaker()() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(
+                    insert,
+                    {
+                        "device_code": f"invalid-full-binding-{index}",
+                        "user_code": f"IBND-000{index}",
+                        "approval_nonce": _wire(bytes([index + 20]) * 32),
+                        "expires_at": now + timedelta(minutes=5),
+                        "created_at": now,
+                        **binding,
+                    },
+                )
+                await session.commit()
+            await session.rollback()
+
+
+async def test_file_sqlite_browser_binding_constraint_rejects_every_partial_permutation(
+    file_sqlite_client,
+):
+    await _assert_browser_binding_constraint_is_exact(
+        file_sqlite_client, email="sqlite-browser-binding-constraint@example.com"
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires PostgreSQL constraint semantics",
+)
+async def test_postgresql_browser_binding_constraint_rejects_every_partial_permutation(client):
+    await _assert_browser_binding_constraint_is_exact(
+        client, email="postgres-browser-binding-constraint@example.com"
+    )
+
+
 async def test_legacy_unkeyed_device_client_fails_closed(client):
     response = await client.post(
         "/api/auth/device/start",
@@ -606,6 +704,63 @@ async def test_concurrent_approved_polls_issue_one_token_on_file_sqlite(file_sql
         file_sqlite_client,
         email="file-sqlite-poll-race@example.com",
         public_key=_public_key(14),
+    )
+
+
+async def _assert_concurrent_first_host_ceremonies_all_reuse_one_host(
+    client, *, email: str, public_key: str
+) -> None:
+    user_id, auth = await _signup(client, email)
+    browsers = [await _register_browser(client, user_id, auth) for _ in range(12)]
+    starts = [await _start(client, public_key, name="first-host-race") for _ in range(12)]
+    reviews = [await _review(client, start, auth) for start in starts]
+    approvals = await asyncio.gather(
+        *(
+            _approve(client, start, user_id, auth, review, browser)
+            for start, review, browser in zip(starts, reviews, browsers, strict=True)
+        )
+    )
+    assert [response.status_code for response in approvals] == [200] * 12
+
+    polls = await asyncio.gather(*(_poll(client, start, public_key) for start in starts))
+    assert [response.status_code for response in polls] == [200] * 12
+    bodies = [response.json() for response in polls]
+    assert all("access_token" in body for body in bodies), bodies
+    host_ids = {body["host_id"] for body in bodies}
+    assert len(host_ids) == 1
+    assert {body["browser_device_id"] for body in bodies} == {
+        browser[0]["id"] for browser in browsers
+    }
+
+    async with get_sessionmaker()() as session:
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 1
+        assert (
+            await session.execute(select(func.count(HostBrowserPin.browser_device_id)))
+        ).scalar_one() == 12
+        assert (
+            await session.execute(select(func.count(DeviceCode.device_code)))
+        ).scalar_one() == 0
+
+
+async def test_file_sqlite_concurrent_first_host_ceremonies_reuse_one_host(
+    file_sqlite_client,
+):
+    await _assert_concurrent_first_host_ceremonies_all_reuse_one_host(
+        file_sqlite_client,
+        email="sqlite-first-host-race@example.com",
+        public_key=_public_key(26),
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPAWN_TEST_EXTERNAL_SERVICES") != "1",
+    reason="requires independent PostgreSQL transactions",
+)
+async def test_postgresql_concurrent_first_host_ceremonies_reuse_one_host(client):
+    await _assert_concurrent_first_host_ceremonies_all_reuse_one_host(
+        client,
+        email="postgres-first-host-race@example.com",
+        public_key=_public_key(27),
     )
 
 

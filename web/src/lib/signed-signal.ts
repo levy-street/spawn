@@ -394,7 +394,14 @@ export async function exportEd25519PublicKeyWire(publicKey: CryptoKey): Promise<
 }
 
 export async function importEd25519PublicKeyWire(value: string): Promise<CryptoKey> {
-  return importEd25519PublicKey(decodeBase64Url(value, ED25519_PUBLIC_KEY_BYTES));
+  return importEd25519PublicKey(decodeEd25519PublicKeyWire(value));
+}
+
+/** Decode one canonical wire key and apply the shared strict point contract. */
+export function decodeEd25519PublicKeyWire(value: string): Uint8Array {
+  const raw = decodeBase64Url(value, ED25519_PUBLIC_KEY_BYTES);
+  assertValidEd25519PublicKey(raw);
+  return raw;
 }
 
 export function encodeBase64Url(value: Uint8Array): string {

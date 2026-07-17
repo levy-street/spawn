@@ -4,6 +4,7 @@ import { expect, test } from "@playwright/test";
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
 function fingerprint(publicKey: string): string {
   const digest = createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest();
@@ -12,7 +13,7 @@ function fingerprint(publicKey: string): string {
 
 test("device approval shows the server fingerprint before confirmation", async ({ page }) => {
   const hostFingerprint = "SHA256:0123456789abcdef";
-  const hostPublicKey = "A".repeat(43);
+  const hostPublicKey = HOST_PUBLIC_KEY;
   let approved = false;
   let approvalBody: unknown = null;
   let browserPublicKey = "";
@@ -160,7 +161,7 @@ test("stale approval failure clears the reviewed identity and requires review ag
           host_name: "changed-host",
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
-          host_public_key: "A".repeat(43),
+          host_public_key: HOST_PUBLIC_KEY,
           host_key_fingerprint: "SHA256:0123456789abcdef",
         },
       });
@@ -189,7 +190,7 @@ test("stale approval failure clears the reviewed identity and requires review ag
 });
 
 test("substituted approval response fails loudly and requires review again", async ({ page }) => {
-  const hostPublicKey = "A".repeat(43);
+  const hostPublicKey = HOST_PUBLIC_KEY;
   const hostFingerprint = "SHA256:0123456789abcdef";
 
   await page.route("**/api/**", async (route) => {

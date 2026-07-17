@@ -397,8 +397,10 @@ class DeviceCode(Base):
         CheckConstraint(
             "(browser_device_id IS NULL AND browser_key_algorithm IS NULL AND "
             "browser_public_key IS NULL AND browser_key_fingerprint IS NULL) OR "
-            "(browser_device_id IS NOT NULL AND browser_key_algorithm = 'ed25519' AND "
-            "length(browser_public_key) = 43 AND length(browser_key_fingerprint) = 23)",
+            "(browser_device_id IS NOT NULL AND browser_key_algorithm IS NOT NULL AND "
+            "browser_public_key IS NOT NULL AND browser_key_fingerprint IS NOT NULL AND "
+            "browser_key_algorithm = 'ed25519' AND length(browser_public_key) = 43 AND "
+            "length(browser_key_fingerprint) = 23)",
             name="ck_device_codes_browser_binding",
         ),
     )

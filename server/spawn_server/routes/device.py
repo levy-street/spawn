@@ -308,7 +308,7 @@ async def device_poll(
         return {"error": "key_conflict"}
 
     if host is None:
-        host = Host(
+        candidate = Host(
             owner_user_id=user_id,
             name=claimed["host_name"] or "host",
             os=claimed["os"],
@@ -318,8 +318,44 @@ async def device_poll(
             host_public_key=body.host_public_key,
             status="offline",
         )
-        session.add(host)
-        await session.flush()
+        try:
+            # An absent-row SELECT cannot serialize first contact. Keep the
+            # claimed DeviceCode transaction alive while a nested savepoint
+            # absorbs the expected unique-key race, then lock/reuse the
+            # committed winner instead of leaking an IntegrityError as a 500.
+            async with session.begin_nested():
+                session.add(candidate)
+                await session.flush()
+            host = candidate
+        except IntegrityError:
+            host = (
+                await session.execute(
+                    select(Host)
+                    .where(
+                        Host.host_key_algorithm == body.host_key_algorithm,
+                        Host.host_public_key == body.host_public_key,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if host is None:
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == body.device_code)
+                    .values(status="denied")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                return {"error": "key_conflict"}
+            if host.owner_user_id != user_id:
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == body.device_code)
+                    .values(status="denied")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                return {"error": "key_conflict"}
     else:
         # Re-login preserves both host identity and any user-assigned name.
         host.os = claimed["os"]

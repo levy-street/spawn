@@ -1,5 +1,6 @@
 import {
   decodeBase64Url,
+  decodeEd25519PublicKeyWire,
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_BYTES,
   importEd25519PublicKeyWire,
@@ -34,8 +35,8 @@ export function encodeHostPairApprovalTranscript(
   browserPublicKeyWire: string,
 ): Uint8Array {
   const nonce = decodeBase64Url(approvalNonceWire, APPROVAL_NONCE_BYTES);
-  const hostPublicKey = decodeBase64Url(hostPublicKeyWire, ED25519_PUBLIC_KEY_BYTES);
-  const browserPublicKey = decodeBase64Url(browserPublicKeyWire, ED25519_PUBLIC_KEY_BYTES);
+  const hostPublicKey = decodeEd25519PublicKeyWire(hostPublicKeyWire);
+  const browserPublicKey = decodeEd25519PublicKeyWire(browserPublicKeyWire);
   const output = new Uint8Array(HOST_PAIR_APPROVAL_TRANSCRIPT_BYTES);
   let offset = 0;
   for (const field of [

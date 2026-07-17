@@ -39,8 +39,10 @@ def upgrade() -> None:
             "ck_device_codes_browser_binding",
             "(browser_device_id IS NULL AND browser_key_algorithm IS NULL AND "
             "browser_public_key IS NULL AND browser_key_fingerprint IS NULL) OR "
-            "(browser_device_id IS NOT NULL AND browser_key_algorithm = 'ed25519' AND "
-            "length(browser_public_key) = 43 AND length(browser_key_fingerprint) = 23)",
+            "(browser_device_id IS NOT NULL AND browser_key_algorithm IS NOT NULL AND "
+            "browser_public_key IS NOT NULL AND browser_key_fingerprint IS NOT NULL AND "
+            "browser_key_algorithm = 'ed25519' AND length(browser_public_key) = 43 AND "
+            "length(browser_key_fingerprint) = 23)",
         )
 
     op.create_table(
@@ -66,6 +68,21 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("host_browser_pins")
+    # 0019 permits parallel ephemeral ceremonies for one host key, while 0018
+    # had a unique constraint. Device codes are disposable: deterministically
+    # keep the lexicographically smallest device_code in each keyed group and
+    # discard the other unconsumed ceremonies before restoring that constraint.
+    op.execute(
+        sa.text(
+            "DELETE FROM device_codes WHERE device_code IN ("
+            "SELECT device_code FROM ("
+            "SELECT device_code, row_number() OVER ("
+            "PARTITION BY host_key_algorithm, host_public_key ORDER BY device_code"
+            ") AS duplicate_rank FROM device_codes "
+            "WHERE host_key_algorithm IS NOT NULL AND host_public_key IS NOT NULL"
+            ") AS ranked WHERE duplicate_rank > 1)"
+        )
+    )
     with op.batch_alter_table("device_codes") as batch:
         batch.drop_constraint("ck_device_codes_browser_binding", type_="check")
         batch.drop_constraint("ck_device_codes_approval_nonce", type_="check")
