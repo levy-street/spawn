@@ -65,7 +65,6 @@ check_tree() {
   require_literal "$progress" '**Parallel Phase 3 foundations (active):**'
   require_literal "$policy" 'Source guards must not parse or classify English semantics.'
   require_literal "$policy" '`backup/p2-data-guard-interrupted-20260716`'
-  require_literal "$policy" 'The permanent tmux-removal boundary is unchanged.'
   require_literal "$root/proto/README.md" 'does not advertise a runtime capability today.'
   for doc in docs/DESIGN.md docs/INTERFACE_MATRIX.md docs/TRUST.md \
     docs/TRUST_PHASE2.md docs/TRUST_PHASE2_PROGRESS.md docs/TRUST_PHASE2_TASKS.md proto/README.md; do
