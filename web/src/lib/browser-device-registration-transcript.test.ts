@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import vectorsJson from "../../../proto/browser-device-registration-v1-vectors.json";
+import negativeKeysJson from "../../../proto/ed25519-public-key-negative-vectors.json";
 import {
   BROWSER_DEVICE_REGISTRATION_MAGIC,
   BROWSER_DEVICE_REGISTRATION_TRANSCRIPT_BYTES,
   encodeBrowserDeviceRegistrationTranscript,
   verifyBrowserDeviceRegistrationProof,
 } from "./browser-device-registration-transcript";
+import { encodeBase64Url } from "./signed-signal";
 
 interface RegistrationVectors {
   contract: string;
@@ -24,9 +26,16 @@ interface RegistrationVectors {
 }
 
 const vectors = vectorsJson as RegistrationVectors;
+const negativeKeys = negativeKeysJson;
 
 function bytesToHex(value: Uint8Array): string {
   return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesFromHex(value: string): Uint8Array {
+  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
+    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
+  );
 }
 
 describe("browser device registration transcript", () => {
@@ -101,6 +110,38 @@ describe("browser device registration transcript", () => {
       expect(() =>
         encodeBrowserDeviceRegistrationTranscript(userId, vectors.positive.public_key),
       ).toThrow("canonical lowercase UUID");
+    }
+  });
+
+  test("rejects the complete shared strict public-key corpus before signing", () => {
+    expect(negativeKeys.weak_public_keys).toHaveLength(8);
+    expect(negativeKeys.noncanonical_public_key_hex).toHaveLength(40);
+    expect(negativeKeys.invalid_encodings.length).toBeGreaterThanOrEqual(1);
+    const rejected = [
+      ...negativeKeys.weak_public_keys,
+      ...negativeKeys.noncanonical_public_key_hex.map((public_key_hex, index) => ({
+        id: `noncanonical-${index}`,
+        public_key_hex,
+      })),
+      ...negativeKeys.invalid_encodings,
+    ];
+
+    for (const vector of rejected) {
+      const invalidWire = encodeBase64Url(bytesFromHex(vector.public_key_hex));
+      expect(
+        () => encodeBrowserDeviceRegistrationTranscript(vectors.positive.user_id, invalidWire),
+        `${vector.id} was accepted by the registration encoder`,
+      ).toThrow("Ed25519 public key");
+    }
+  });
+
+  test("accepts every shared canonical mixed-torsion key", () => {
+    expect(negativeKeys.accepted_mixed_torsion_public_key_hex).toHaveLength(7);
+    for (const publicKeyHex of negativeKeys.accepted_mixed_torsion_public_key_hex) {
+      const publicKeyWire = encodeBase64Url(bytesFromHex(publicKeyHex));
+      expect(() =>
+        encodeBrowserDeviceRegistrationTranscript(vectors.positive.user_id, publicKeyWire),
+      ).not.toThrow();
     }
   });
 });
