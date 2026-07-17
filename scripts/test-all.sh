@@ -32,6 +32,10 @@ printf '%s\n' "== host tool E2E boundary guard =="
 scripts/check-host-tool-e2e-boundary.sh --self-test
 scripts/check-host-tool-e2e-boundary.sh
 
+printf '%s\n' "== no server agent upload guard =="
+scripts/check-no-server-agent-upload.sh --self-test
+scripts/check-no-server-agent-upload.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

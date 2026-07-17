@@ -716,6 +716,9 @@ impl AgentLifecycle {
 /// Per-agent runtime handle.
 pub struct AgentHandle {
     pub agent_id: Uuid,
+    /// Canonical cwd capability root reported by the worker that owns this
+    /// exact backend generation.
+    pub cwd: Arc<str>,
     /// Last size applied through this handle.
     size: Arc<Mutex<(u16, u16)>>,
     /// Held alive while the agent is alive; when dropped, the per-agent
@@ -734,6 +737,7 @@ pub struct AgentHandle {
 /// Everything `worker_backend` needs to assemble a worker-backed handle.
 pub struct WorkerHandleParts {
     pub agent_id: Uuid,
+    pub cwd: String,
     pub cmd_tx: mpsc::Sender<WorkerCmd>,
     pub lifecycle: AgentLifecycle,
     pub alive: Arc<AtomicBool>,
@@ -747,6 +751,7 @@ impl AgentHandle {
     pub fn new_worker(parts: WorkerHandleParts) -> Self {
         Self {
             agent_id: parts.agent_id,
+            cwd: Arc::from(parts.cwd),
             size: Arc::new(Mutex::new((parts.cols, parts.rows))),
             outbox_tx: parts.outbox_tx,
             control: parts.control,
@@ -1045,6 +1050,7 @@ mod tests {
         let (outbox_tx, _outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         AgentHandle::new_worker(WorkerHandleParts {
             agent_id: Uuid::new_v4(),
+            cwd: "/".into(),
             cmd_tx,
             lifecycle: AgentLifecycle::new(
                 PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),

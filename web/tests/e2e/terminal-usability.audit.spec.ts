@@ -231,7 +231,12 @@ async function openAuditedTerminal(
   const messages: WireMessage[] = [];
   const sockets: WebSocketRoute[] = [];
   const socketEvents: SocketEvent[] = [];
-  const restUploads: Array<Record<string, unknown>> = [];
+  const directUploads: Array<{
+    name: string;
+    mimeType: string;
+    destination: "attachments" | "cwd";
+    bytes: Buffer;
+  }> = [];
   let commandBuffer = "";
 
   const write = async (value: string) => sendPty(page, value);
@@ -301,26 +306,12 @@ async function openAuditedTerminal(
       inputChain = inputChain.then(() => handleInput(bytes));
       return inputChain;
     },
+    onUpload: async (upload) => {
+      directUploads.push(upload);
+      await write(`\r\nuploaded:${upload.name}\r\n$ `);
+    },
   });
   await mockAuthenticatedApi(page, { agents: [agent()] });
-
-  // Uploads travel over REST; mirror the endpoint and let the fake worker
-  // emit its acknowledgement over the mandatory spawn.pty DataChannel.
-  await page.route(`**/api/agents/${AGENT_ID}/upload`, async (route) => {
-    const body = route.request().postDataJSON() as Record<string, unknown>;
-    restUploads.push(body);
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      json: {
-        agent_id: AGENT_ID,
-        path: `/Users/tester/projects/spawn/${String(body.name ?? "upload.bin")}`,
-        client_id: String(body.client_id ?? ""),
-        pasted: false,
-      },
-    });
-    await write(`\r\nuploaded:${String(body.name ?? "")}\r\n$ `);
-  });
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     sockets.push(ws);
@@ -350,7 +341,7 @@ async function openAuditedTerminal(
 
   await page.goto(`/agents/${AGENT_ID}`);
   await expect(page.getByLabel("Agent terminal")).toBeVisible();
-  return { messages, restUploads, sockets, socketEvents };
+  return { messages, directUploads, sockets, socketEvents };
 }
 
 test.use({
@@ -368,7 +359,7 @@ test.describe("terminal usability audit", () => {
   }, testInfo) => {
     const health = await watchPageHealth(page);
     const observations: Observation[] = [];
-    const { messages, restUploads, sockets, socketEvents } = await openAuditedTerminal(page, {
+    const { messages, directUploads, sockets, socketEvents } = await openAuditedTerminal(page, {
       history: `${longHistory(180)}audit-ready\n$ `,
     });
 
@@ -410,11 +401,12 @@ test.describe("terminal usability audit", () => {
       buffer: Buffer.from("uploaded from terminal usability audit\n"),
     });
     await expect
-      .poll(() => restUploads.at(-1))
+      .poll(() => directUploads.at(-1))
       .toMatchObject({
         name: "audit-note.txt",
-        mime_type: "text/plain",
-        bytes_b64: Buffer.from("uploaded from terminal usability audit\n").toString("base64"),
+        mimeType: "text/plain",
+        destination: "cwd",
+        bytes: Buffer.from("uploaded from terminal usability audit\n"),
       });
     await expect(liveTerminalRows(page)).toContainText("uploaded:audit-note.txt");
     observations.push(await observeTerminal(page, "file uploaded"));

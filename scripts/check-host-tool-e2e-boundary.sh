@@ -350,7 +350,6 @@ expected_server_attribute_reads = Counter({
     ("server/spawn_server/presets.py", "seed_builtin_presets", "install"): 2,
     ("server/spawn_server/presets.py", "seed_builtin_presets", "subscript:default_argv"): 1,
     ("server/spawn_server/presets.py", "seed_builtin_presets", "get:install"): 2,
-    ("server/spawn_server/agent_control.py", "upload_agent_file", "subscript:path"): 1,
     ("server/spawn_server/routes/agents.py", "_dispatch_agent_launch", "install"): 1,
     ("server/spawn_server/routes/agents.py", "create_agent", "default_argv"): 1,
     ("server/spawn_server/routes/device.py", "device_poll", "version"): 1,
@@ -370,8 +369,6 @@ expected_server_attribute_reads = Counter({
     ("server/spawn_server/routes/presets.py", "update_preset", "default_argv"): 2,
     ("server/spawn_server/routes/presets.py", "update_preset", "install"): 2,
     ("server/spawn_server/ws/broker.py", "_request_owner_result", "payload"): 1,
-    ("server/spawn_server/ws/browser.py", "browser_ws", "get:path"): 1,
-    ("server/spawn_server/ws/daemon.py", "daemon_ws", "get:path"): 1,
     ("server/spawn_server/ws/owner_dispatch.py", "encode_owner_result", "payload"): 1,
     ("server/spawn_server/ws/owner_dispatch.py", "decode_owner_result", "get:payload"): 1,
 })
@@ -714,9 +711,9 @@ def rust_production_source(source: str) -> str:
 expected_command_ast_hashes = {
     "daemon/src/cli.rs": "5dacbe4dd7415f7bdc2f6a6f2a37aaec914dc13a3863e7a27e5036474187ca09",
     "daemon/src/host_tools.rs": "43f116f6b38d0e14f988a386d88b45a96ebfdd43713a74ba3476adbd70b2a881",
-    "daemon/src/main.rs": "b96fa7f9a1ad9f52e4be6a98923ca643d37da2e0be0d97d487ec77d25b6f3e05",
-    "daemon/src/run.rs": "8368b2552f9e556565126e077da47e2e755e222f4abfb659fcb29f1bad182b74",
-    "daemon/src/worker_backend.rs": "7b3d600b3ba7e0553a405e50c3b35e9120b3f000198efd7ed90541fef8b99baa",
+    "daemon/src/main.rs": "74eb113f9acb3746632bdfeb8369e619a34b8fc44f86f7703a1d86bce432b754",
+    "daemon/src/run.rs": "331508f7d1f573f2cf1ea9cda7343a3dca2a9e7f818217e0fb06346af5c5b8e6",
+    "daemon/src/worker_backend.rs": "085b56874c94ec644c3255ed8b521a032b23564abb7afcd810bc4bb5e46b8105",
 }
 rust_sources = sorted(
     relative
@@ -777,7 +774,7 @@ if found_rust_process_inventory != expected_rust_process_inventory:
         "parsed Rust foreign/process launch inventory changed: "
         f"{found_rust_process_inventory!r}"
     )
-expected_rust_structural_digest = "681c520e39e1afd214cf9fd338d285c262a2bee7b03cbf79591365848ca38fe0"
+expected_rust_structural_digest = "4fa199dcd84deacbef63cc5807405fb21daa88c5799bd309a25fb5d3e5fb7422"
 found_rust_structural_digest = hashlib.sha256(structural.stdout.encode()).hexdigest()
 if found_rust_structural_digest != expected_rust_structural_digest:
     die(

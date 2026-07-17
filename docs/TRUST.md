@@ -62,14 +62,14 @@ not come for free:
    session. Fixing this requires endpoint identity keys that sign the
    SDP (Phase 3).
 2. **Historical relay data and the remaining content surfaces.** The
-   P2-AGENT-02 implementation checkpoint removes `spawn.v1`, daemon WS PTY
-   binary frames, transcripts, content pubsub, snapshots/history, and viewport
-   routes; review, merge, coordinated deployment, and historical purge remain.
-   Uploads, launch manifests, skill bodies, and detailed errors still have
-   server-readable paths tracked in the Phase 2 ledger. Host files and
-   interactive tool detail now have separate E2E implementation candidates,
-   but both still require independent review/integration; the legacy and
-   unattended tool path also remains until P2-HOST-03B.
+   The reviewed P2-AGENT-02 cut removes `spawn.v1`, daemon WS PTY binary frames,
+   transcripts, content pubsub, snapshots/history, and viewport routes. The
+   reviewed P2-HOST-02 cut removes host filesystem operations. The current
+   P2-TERM-01 review candidate removes agent uploads, and the current
+   P2-HOST-03A review candidate moves interactive tool detail E2E. The legacy
+   and unattended tool route, launch manifests, skill bodies, detailed errors,
+   coordinated deployment, and historical purge remain tracked in the Phase 2
+   ledger.
 3. **Client code delivery.** See "Residual risks" — end-to-end
    encryption where one endpoint is JavaScript served by the operator is
    only as trustworthy as the code delivery.
@@ -131,7 +131,7 @@ answer for users for whom this metadata is itself sensitive.
 | PTY bytes (retired live relay) | former binary frames on `/ws/browser`, `/ws/daemon` | removed in P2-AGENT-02 implementation; mandatory DataChannels; review/deploy pending |
 | Transcripts (~64 MB/agent historically on server disk) | retired `transcript.py`; historical files/Redis/backups may remain | code path deleted; bounded endpoint replay; historical copies still require P2-PURGE-01 |
 | History replay | former `{"type":"history"}` on `/ws/browser` | removed from server; `spawn.ctl` endpoint stream |
-| Agent file uploads | `upload` frames, `bytes_b64` through both WS legs and REST | per-agent DataChannel file stream |
+| Agent file uploads | retired `upload`/`agent.upload` frames and REST `bytes_b64`; historical logs/backups may remain | bounded, hash-checked per-agent `spawn.ctl` file stream in P2-TERM-01 candidate; review/deploy/purge pending |
 | Terminal snapshots / card previews | retired `agent.snapshot` frames | removed from server; rendered from endpoint replay/output |
 | REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
 | Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-agent `spawn.ctl` only |
@@ -224,8 +224,12 @@ What moves where, and the regressions we accept:
 - **Multi-viewer / multi-device** → daemon fans out to N browser peers
   directly. Cost: upstream bandwidth from residential hosts; realistic N
   is small.
-- **File upload** → DataChannel file stream (also removes today's
-  base64-over-JSON overhead and server memory spike).
+- **File upload** → a bounded/chunked/cancellable `spawn.ctl` stream, bound to
+  a fresh channel capability and exact agent-backend generation. Stable upload
+  UUIDs make bounded retries resumable/idempotent; exact length and SHA-256 are
+  checked before an atomic no-clobber commit beneath the worker-retained cwd.
+  Paths and detailed results remain endpoint-to-browser only. This also removes
+  base64-over-JSON overhead and the server memory spike.
 - **Host filesystem operations** → a host-scoped browser↔daemon WebRTC
   connection with a `spawn.host.ctl` DataChannel. It exists independently of
   any agent, because the file browser must work on a host with no running
@@ -375,7 +379,8 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 - Add per-agent `spawn.ctl` beside `spawn.pty` for history, snapshots, viewport
   controls/display ownership, agent uploads, and detailed agent errors. The
   P2-AGENT-02 checkpoint completes the terminal mirror/history/viewport cut;
-  uploads and detailed errors remain later tasks.
+  the P2-TERM-01 candidate completes the agent-upload transport cut pending
+  independent review, while detailed errors remain a later task.
 - Add a separate host-scoped WebRTC session and `spawn.host.ctl` DataChannel
   for directory listings, host file read/write/transfer, tool installer output,
   and launch manifests. A per-agent channel is insufficient because these

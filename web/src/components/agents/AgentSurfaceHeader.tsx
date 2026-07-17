@@ -67,7 +67,7 @@ export function AgentSurfaceHeader({
     setDiagBusy(true);
     setDiagSaved(false);
     try {
-      await runDiagnosticRefresh(handle, agent.id);
+      await runDiagnosticRefresh(handle);
       setDiagSaved(true);
       setTimeout(() => setDiagSaved(false), 2500);
     } catch (err) {

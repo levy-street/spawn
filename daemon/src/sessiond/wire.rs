@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 /// The worker lifecycle endpoint accepts exactly one instance token and one
 /// small signal code. No caller-provided string enters its bounded path.
@@ -67,6 +67,10 @@ pub struct Hello {
     pub cols: u16,
     #[serde(default)]
     pub rows: u16,
+    /// Canonical absolute cwd retained by this worker. Required for
+    /// capability-rooted direct uploads after supervisor adoption.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// daemon → worker: spawn the agent. Sent over the private socket rather than
@@ -94,6 +98,7 @@ impl Drop for StartSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Started {
     pub pid: u32,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

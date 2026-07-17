@@ -3,14 +3,21 @@ import {
   AGENT_CTL_CHUNK_PAYLOAD_BYTES,
   AGENT_CTL_MAX_OUTSTANDING_REQUESTS,
   AGENT_CTL_MAX_REPLAY_BYTES,
+  AGENT_CTL_MAX_UPLOAD_BYTES,
+  AGENT_CTL_UPLOAD_CHUNK_BYTES,
   AgentCtlRequestTracker,
   AgentGenerationInputQueue,
   combineAgentCtlChunks,
   decodeAgentCtlChunk,
+  encodeAgentCtlUploadChunk,
   isAgentCtlRequestId,
   makeAgentCtlRequest,
+  makeAgentCtlUploadCancel,
+  makeAgentCtlUploadStart,
   OrderedAsyncQueue,
   parseAgentCtlText,
+  parseAgentCtlUploadResponse,
+  sha256Blob,
   slicePtyChunkAfterAnchor,
 } from "./agent-ctl";
 
@@ -45,11 +52,30 @@ describe("spawn.ctl browser protocol", () => {
   });
 
   test("parses readiness and display events and rejects other protocol versions", () => {
-    assert.deepEqual(parseAgentCtlText('{"version":1,"kind":"event","event":"ready"}'), {
-      version: 1,
-      kind: "event",
-      event: "ready",
-    });
+    const capability = "00112233-4455-4677-8899-aabbccddeeff";
+    assert.equal(parseAgentCtlText('{"version":1,"kind":"event","event":"ready"}'), null);
+    assert.deepEqual(
+      parseAgentCtlText(
+        JSON.stringify({
+          version: 1,
+          kind: "event",
+          event: "ready",
+          upload_capability: capability,
+          agent_generation: 7,
+          upload_max_bytes: AGENT_CTL_MAX_UPLOAD_BYTES,
+          upload_chunk_bytes: AGENT_CTL_UPLOAD_CHUNK_BYTES,
+        }),
+      ),
+      {
+        version: 1,
+        kind: "event",
+        event: "ready",
+        upload_capability: capability,
+        agent_generation: 7,
+        upload_max_bytes: AGENT_CTL_MAX_UPLOAD_BYTES,
+        upload_chunk_bytes: AGENT_CTL_UPLOAD_CHUNK_BYTES,
+      },
+    );
     assert.deepEqual(
       parseAgentCtlText(
         '{"version":1,"kind":"event","event":"display_state","owner":true,"cols":120,"rows":32,"viewers":2}',
@@ -65,6 +91,105 @@ describe("spawn.ctl browser protocol", () => {
       },
     );
     assert.equal(parseAgentCtlText('{"version":2,"kind":"response","ok":true}'), null);
+  });
+
+  test("frames bounded uploads and validates resumable direct responses", async () => {
+    const capability = requestId(1);
+    const uploadId = requestId(2);
+    const bytes = new TextEncoder().encode("hello upload");
+    const sha256 = await sha256Blob(new Blob([bytes]));
+    assert.equal(sha256, "2d119f1cd272958a492a144af600b9dc36531f73027b34073967345b027021b1");
+    const start = {
+      capability,
+      agentGeneration: 9,
+      uploadId,
+      name: "note.txt",
+      mimeType: "text/plain",
+      destination: "cwd" as const,
+      totalBytes: bytes.length,
+      chunks: 1,
+      sha256: sha256 ?? "",
+    };
+    assert.deepEqual(JSON.parse(makeAgentCtlUploadStart(start) ?? "null"), {
+      version: 1,
+      kind: "request",
+      request_id: uploadId,
+      operation: "upload_start",
+      capability,
+      agent_generation: 9,
+      name: "note.txt",
+      mime_type: "text/plain",
+      destination: "cwd",
+      total_bytes: bytes.length,
+      chunks: 1,
+      sha256,
+    });
+    assert.equal(makeAgentCtlUploadStart({ ...start, name: "../escape" }), null);
+    assert.equal(
+      makeAgentCtlUploadStart({ ...start, totalBytes: AGENT_CTL_MAX_UPLOAD_BYTES + 1 }),
+      null,
+    );
+    assert.equal(makeAgentCtlUploadCancel(requestId(3), uploadId, capability, 0), null);
+
+    const frame = encodeAgentCtlUploadChunk(uploadId, 0, true, bytes);
+    assert.ok(frame);
+    assert.deepEqual(Array.from(frame.subarray(0, 8)), [0x53, 0x50, 0x43, 0x54, 1, 2, 1, 0]);
+    assert.equal(new DataView(frame.buffer).getUint32(24, true), 0);
+    assert.deepEqual(frame.subarray(28), bytes);
+
+    assert.deepEqual(
+      parseAgentCtlUploadResponse(
+        {
+          version: 1,
+          kind: "response",
+          request_id: uploadId,
+          operation: "upload_start",
+          ok: true,
+          state: "ready",
+          next_sequence: 1,
+          received_bytes: bytes.length,
+        },
+        start,
+      ),
+      { kind: "ready", nextSequence: 1, receivedBytes: bytes.length },
+    );
+    assert.equal(
+      parseAgentCtlUploadResponse(
+        {
+          version: 1,
+          kind: "response",
+          request_id: uploadId,
+          operation: "upload_complete",
+          ok: true,
+          state: "complete",
+          path: "/repo/note.txt",
+          total_bytes: bytes.length + 1,
+          sha256: sha256 ?? "",
+        },
+        start,
+      ),
+      null,
+    );
+    assert.deepEqual(
+      parseAgentCtlUploadResponse(
+        {
+          version: 1,
+          kind: "response",
+          request_id: uploadId,
+          ok: false,
+          error: {
+            code: "outcome_unknown",
+            detail: "reconcile before retrying",
+          },
+        },
+        start,
+      ),
+      {
+        kind: "error",
+        code: "outcome_unknown",
+        message: "reconcile before retrying",
+      },
+    );
   });
 
   test("decodes request-bound chunks and verifies complete response length", () => {

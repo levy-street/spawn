@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -16,13 +15,13 @@ use uuid::Uuid;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
+use crate::host_direct::{decode_write_chunk, HostDirectChannel};
 use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
 };
+use crate::host_signal::HostConnectedSignal;
 use crate::host_tools::{HostToolOperations, HostToolService};
-use crate::pty::WsOutbound;
-use crate::rtc::{try_send_host_status, HostRtcBinding};
 
 const PROTOCOL: &str = "spawn.host.ctl";
 const VERSION: u16 = 1;
@@ -248,7 +247,7 @@ impl Drop for PublicationPermit {
 
 #[derive(Clone)]
 struct Context {
-    dc: Arc<RTCDataChannel>,
+    direct: HostDirectChannel,
     files: Arc<HostFileService>,
     tools: Arc<HostToolService>,
     tool_operations: Arc<HostToolOperations>,
@@ -351,16 +350,7 @@ impl Context {
                 .notify_publication_send_finished();
             return false;
         }
-        let encoded = value.to_string();
-        let sent = if encoded.len() > MAX_FRAME_BYTES {
-            false
-        } else {
-            tokio::select! {
-                biased;
-                _ = publication.cancelled.cancelled() => false,
-                result = self.dc.send_text(encoded) => result.is_ok(),
-            }
-        };
+        let sent = self.direct.publish(value, &publication.cancelled).await;
         #[cfg(test)]
         if is_hello {
             self.files
@@ -368,6 +358,15 @@ impl Context {
                 .notify_publication_send_finished();
         }
         sent
+    }
+
+    async fn send_read_chunk(&self, stream_id: &str, sequence: u64, bytes: &[u8]) -> bool {
+        let Some(publication) = Arc::clone(&self.publications).claim() else {
+            return false;
+        };
+        self.direct
+            .publish_read_chunk(stream_id, sequence, bytes, &publication.cancelled)
+            .await
     }
 
     async fn response(&self, request_id: &str, result: Value) -> bool {
@@ -661,7 +660,7 @@ impl Context {
                 Err(error) => context.error(&request_id, error.code, &error.detail).await,
             };
             if !sent && !context.closed.load(Ordering::Acquire) {
-                close_with_deadline_later(Arc::clone(&context.dc));
+                close_with_deadline_later(context.direct.transport());
             }
         };
         if self.spawn_session_task(task).await {
@@ -739,7 +738,7 @@ impl Context {
                 Err(error) => context.error(&request_id, error.code, &error.detail).await,
             };
             if !sent && !context.closed.load(Ordering::Acquire) {
-                close_with_deadline_later(Arc::clone(&context.dc));
+                close_with_deadline_later(context.direct.transport());
             }
         };
         if self.spawn_session_task(task).await {
@@ -791,7 +790,7 @@ impl Context {
             let sent = context.send_read(&request_id, &path, cancelled).await;
             context.state.lock().await.read_requests.remove(&request_id);
             if !sent && !context.closed.load(Ordering::Acquire) {
-                close_with_deadline_later(Arc::clone(&context.dc));
+                close_with_deadline_later(context.direct.transport());
             }
         };
         if self.spawn_session_task(task).await {
@@ -1006,7 +1005,7 @@ impl Context {
                 cleanup = cleanup_rx.recv() => {
                     let Some(cleanup) = cleanup else { break; };
                     if !self.process_write_cleanup(cleanup).await {
-                        close_with_deadline_later(Arc::clone(&self.dc));
+                        close_with_deadline_later(self.direct.transport());
                         break;
                     }
                 }
@@ -1018,7 +1017,7 @@ impl Context {
                 }
                 _ = tokio::time::sleep(write_reaper_interval()) => {
                     if !self.reap_stale_writes().await {
-                        close_with_deadline_later(Arc::clone(&self.dc));
+                        close_with_deadline_later(self.direct.transport());
                         break;
                     }
                 }
@@ -1109,13 +1108,7 @@ impl Context {
             length = length.saturating_add(read as u64);
             actual.update(&buffer[..read]);
             if !self
-                .send(json!({
-                    "version": VERSION,
-                    "type": "stream.chunk",
-                    "stream_id": stream_id,
-                    "sequence": sequence,
-                    "bytes_b64": STANDARD.encode(&buffer[..read]),
-                }))
+                .send_read_chunk(&stream_id, sequence, &buffer[..read])
                 .await
             {
                 return false;
@@ -1265,17 +1258,12 @@ impl Context {
     }
 
     async fn handle_stream_chunk(&self, object: &Map<String, Value>, arrival_order: u64) -> bool {
-        let (Some(stream_id), Some(sequence), Some(encoded)) = (
-            valid_id(object.get("stream_id")),
-            object.get("sequence").and_then(Value::as_u64),
-            object.get("bytes_b64").and_then(Value::as_str),
-        ) else {
+        let Some(chunk) = decode_write_chunk(object, MAX_ID_BYTES, STREAM_CHUNK_BYTES) else {
             return false;
         };
-        let bytes = match STANDARD.decode(encoded) {
-            Ok(bytes) if !bytes.is_empty() && bytes.len() <= STREAM_CHUNK_BYTES => bytes,
-            _ => return false,
-        };
+        let stream_id = chunk.stream_id.as_str();
+        let sequence = chunk.sequence;
+        let bytes = chunk.bytes;
         if self.arrived_after_cancel(stream_id, arrival_order) {
             return false;
         }
@@ -1685,9 +1673,7 @@ fn payload_bool(payload: Option<&Map<String, Value>>, key: &str) -> Option<bool>
 
 pub(crate) fn install(
     dc: Arc<RTCDataChannel>,
-    session_id: String,
-    binding: HostRtcBinding,
-    out_tx: mpsc::Sender<WsOutbound>,
+    connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
 ) {
     let message_dc = Arc::clone(&dc);
@@ -1767,9 +1753,7 @@ pub(crate) fn install(
         let context_slot = Arc::clone(&open_context);
         let publications = Arc::clone(&open_publications);
         let status_publication_fence = Arc::clone(&open_status_publication_fence);
-        let out_tx = out_tx.clone();
-        let session_id = session_id.clone();
-        let binding = binding.clone();
+        let connected_signal = connected_signal.clone();
         let files = files_override.clone();
         let shutdown = open_shutdown.clone();
         let arrivals = Arc::clone(&open_arrivals);
@@ -1795,7 +1779,7 @@ pub(crate) fn install(
             #[cfg(test)]
             file_operations.set_effect_test_hooks(files.write_lifecycle_test_hooks());
             let context = Context {
-                dc: Arc::clone(&dc),
+                direct: HostDirectChannel::new(Arc::clone(&dc)),
                 files,
                 tools: HostToolService::shared(),
                 tool_operations: HostToolOperations::new(),
@@ -1843,7 +1827,7 @@ pub(crate) fn install(
                         };
                         let Some(value) = value else { break; };
                         if !normal_context.handle_normal(value).await {
-                            close_with_deadline_later(Arc::clone(&normal_context.dc));
+                            close_with_deadline_later(normal_context.direct.transport());
                             break;
                         }
                     }
@@ -1869,7 +1853,7 @@ pub(crate) fn install(
                             }
                         }
                         if !fast_context.handle_fast(value).await {
-                            close_with_deadline_later(Arc::clone(&fast_context.dc));
+                            close_with_deadline_later(fast_context.direct.transport());
                             break;
                         }
                     }
@@ -1927,7 +1911,7 @@ pub(crate) fn install(
                 Ok(_publication) => {
                     !publication_context.closed.load(Ordering::Acquire)
                         && !publication_context.shutdown.is_cancelled()
-                        && try_send_host_status(&out_tx, session_id, &binding, "connected")
+                        && connected_signal.publish()
                 }
                 Err(_) => false,
             };

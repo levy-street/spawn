@@ -28,6 +28,7 @@ pub const MAX_SCROLL_LINES: i16 = 200;
 
 const CHUNK_MAGIC: &[u8; 4] = b"SPCT";
 const CHUNK_KIND_REPLAY: u8 = 1;
+const CHUNK_KIND_UPLOAD: u8 = 2;
 const CHUNK_HEADER_LEN: usize = 4 + 1 + 1 + 2 + 16 + 4;
 const CHUNK_FLAG_LAST: u16 = 1;
 
@@ -120,6 +121,39 @@ pub enum ControlOperation {
         cols: u16,
         rows: u16,
     },
+    UploadStart {
+        capability: Uuid,
+        agent_generation: u64,
+        name: String,
+        mime_type: String,
+        #[serde(default)]
+        destination: UploadDestinationRequest,
+        total_bytes: usize,
+        chunks: u32,
+        sha256: String,
+    },
+    UploadCancel {
+        capability: Uuid,
+        agent_generation: u64,
+        upload_id: Uuid,
+    },
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadDestinationRequest {
+    #[default]
+    Attachments,
+    Cwd,
+}
+
+impl From<UploadDestinationRequest> for crate::upload::UploadDestination {
+    fn from(value: UploadDestinationRequest) -> Self {
+        match value {
+            UploadDestinationRequest::Attachments => Self::Attachments,
+            UploadDestinationRequest::Cwd => Self::Cwd,
+        }
+    }
 }
 
 fn default_history_lines() -> u16 {
@@ -161,24 +195,49 @@ impl ControlRequest {
         let invalid_size = |cols: u16, rows: u16| {
             !(MIN_COLS..=MAX_COLS).contains(&cols) || !(MIN_ROWS..=MAX_ROWS).contains(&rows)
         };
-        let invalid = match self.operation {
+        let invalid = match &self.operation {
             ControlOperation::History {
                 lines, cols, rows, ..
             } => {
-                lines == 0
-                    || lines > MAX_HISTORY_LINES
+                *lines == 0
+                    || *lines > MAX_HISTORY_LINES
                     || cols
-                        .zip(rows)
-                        .is_some_and(|(cols, rows)| invalid_size(cols, rows))
+                        .as_ref()
+                        .zip(rows.as_ref())
+                        .is_some_and(|(cols, rows)| invalid_size(*cols, *rows))
                     || cols.is_some() != rows.is_some()
             }
-            ControlOperation::Snapshot { lines, .. } => lines == 0 || lines > MAX_HISTORY_LINES,
+            ControlOperation::Snapshot { lines, .. } => *lines == 0 || *lines > MAX_HISTORY_LINES,
             ControlOperation::Resize { cols, rows }
-            | ControlOperation::TakeControl { cols, rows } => invalid_size(cols, rows),
+            | ControlOperation::TakeControl { cols, rows } => invalid_size(*cols, *rows),
             ControlOperation::Scroll { lines } => {
-                lines == 0 || !(-MAX_SCROLL_LINES..=MAX_SCROLL_LINES).contains(&lines)
+                *lines == 0 || !(-MAX_SCROLL_LINES..=MAX_SCROLL_LINES).contains(lines)
             }
             ControlOperation::Redraw => false,
+            ControlOperation::UploadStart {
+                ref name,
+                ref mime_type,
+                ref sha256,
+                destination,
+                total_bytes,
+                chunks,
+                ..
+            } => crate::upload::UploadManifest {
+                name: name.clone(),
+                mime_type: mime_type.clone(),
+                destination: match destination {
+                    UploadDestinationRequest::Attachments => {
+                        crate::upload::UploadDestination::Attachments
+                    }
+                    UploadDestinationRequest::Cwd => crate::upload::UploadDestination::Cwd,
+                },
+                total_bytes: *total_bytes,
+                chunks: *chunks,
+                sha256: sha256.clone(),
+            }
+            .validate()
+            .is_err(),
+            ControlOperation::UploadCancel { .. } => false,
         };
         if invalid {
             return Err(ProtocolError::new(
@@ -191,12 +250,14 @@ impl ControlRequest {
     }
 
     pub fn operation_name(&self) -> &'static str {
-        match self.operation {
+        match &self.operation {
             ControlOperation::History { .. } => "history",
             ControlOperation::Snapshot { .. } => "snapshot",
             ControlOperation::Resize { .. } => "resize",
             ControlOperation::Scroll { .. } => "scroll",
             ControlOperation::Redraw => "redraw",
+            ControlOperation::UploadStart { .. } => "upload_start",
+            ControlOperation::UploadCancel { .. } => "upload_cancel",
             ControlOperation::TakeControl { .. } => "take_control",
         }
     }
@@ -261,6 +322,35 @@ struct ReadyEvent {
     version: u8,
     kind: &'static str,
     event: &'static str,
+    upload_capability: Uuid,
+    agent_generation: u64,
+    upload_max_bytes: usize,
+    upload_chunk_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct UploadReadyResponse {
+    version: u8,
+    kind: &'static str,
+    request_id: Uuid,
+    operation: &'static str,
+    ok: bool,
+    state: &'static str,
+    next_sequence: u32,
+    received_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct UploadCompleteResponse<'a> {
+    version: u8,
+    kind: &'static str,
+    request_id: Uuid,
+    operation: &'static str,
+    ok: bool,
+    state: &'static str,
+    path: &'a str,
+    total_bytes: usize,
+    sha256: &'a str,
 }
 
 async fn enqueue(
@@ -328,11 +418,19 @@ pub async fn send_ack(
     enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await
 }
 
-pub async fn send_ready(sender: &ControlSender) -> Result<(), ProtocolError> {
+pub async fn send_ready(
+    sender: &ControlSender,
+    upload_capability: Uuid,
+    agent_generation: u64,
+) -> Result<(), ProtocolError> {
     let event = ReadyEvent {
         version: PROTOCOL_VERSION,
         kind: "event",
         event: "ready",
+        upload_capability,
+        agent_generation,
+        upload_max_bytes: crate::upload::MAX_UPLOAD_BYTES,
+        upload_chunk_bytes: crate::upload::UPLOAD_CHUNK_BYTES,
     };
     let text = serde_json::to_string(&event).map_err(|error| {
         ProtocolError::new(
@@ -342,6 +440,58 @@ pub async fn send_ready(sender: &ControlSender) -> Result<(), ProtocolError> {
         )
     })?;
     enqueue(sender, ControlOutbound::Text(text), None).await
+}
+
+pub async fn send_upload_ready(
+    sender: &ControlSender,
+    request_id: Uuid,
+    next_sequence: u32,
+    received_bytes: usize,
+) -> Result<(), ProtocolError> {
+    let response = UploadReadyResponse {
+        version: PROTOCOL_VERSION,
+        kind: "response",
+        request_id,
+        operation: "upload_start",
+        ok: true,
+        state: "ready",
+        next_sequence,
+        received_bytes,
+    };
+    let text = serde_json::to_string(&response).map_err(|error| {
+        ProtocolError::new(
+            Some(request_id),
+            "encode_failed",
+            &format!("encoding upload readiness failed: {error}"),
+        )
+    })?;
+    enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await
+}
+
+pub async fn send_upload_complete(
+    sender: &ControlSender,
+    request_id: Uuid,
+    result: &crate::upload::UploadResult,
+) -> Result<(), ProtocolError> {
+    let response = UploadCompleteResponse {
+        version: PROTOCOL_VERSION,
+        kind: "response",
+        request_id,
+        operation: "upload_complete",
+        ok: true,
+        state: "complete",
+        path: &result.path,
+        total_bytes: result.total_bytes,
+        sha256: &result.sha256,
+    };
+    let text = serde_json::to_string(&response).map_err(|error| {
+        ProtocolError::new(
+            Some(request_id),
+            "encode_failed",
+            &format!("encoding upload completion failed: {error}"),
+        )
+    })?;
+    enqueue(sender, ControlOutbound::Text(text), Some(request_id)).await
 }
 
 pub async fn send_replay(
@@ -403,6 +553,58 @@ fn encode_chunk(request_id: Uuid, sequence: u32, last: bool, payload: &[u8]) -> 
     frame.extend_from_slice(&sequence.to_le_bytes());
     frame.extend_from_slice(payload);
     frame
+}
+
+pub struct UploadChunk {
+    pub upload_id: Uuid,
+    pub sequence: u32,
+    pub last: bool,
+    pub payload: Vec<u8>,
+}
+
+impl Drop for UploadChunk {
+    fn drop(&mut self) {
+        self.payload.zeroize();
+    }
+}
+
+pub fn decode_upload_chunk(bytes: &[u8]) -> Result<UploadChunk, ProtocolError> {
+    let request_id = (bytes.len() >= 24)
+        .then(|| Uuid::from_slice(&bytes[8..24]).ok())
+        .flatten();
+    if bytes.len() <= CHUNK_HEADER_LEN
+        || bytes.len() > CHUNK_HEADER_LEN + crate::upload::UPLOAD_CHUNK_BYTES
+        || &bytes[..bytes.len().min(4)] != CHUNK_MAGIC
+        || bytes.get(4) != Some(&PROTOCOL_VERSION)
+        || bytes.get(5) != Some(&CHUNK_KIND_UPLOAD)
+    {
+        return Err(ProtocolError::new(
+            request_id,
+            "malformed_upload_chunk",
+            "upload chunk framing is invalid",
+        ));
+    }
+    let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+    if flags & !CHUNK_FLAG_LAST != 0 {
+        return Err(ProtocolError::new(
+            request_id,
+            "malformed_upload_chunk",
+            "upload chunk flags are invalid",
+        ));
+    }
+    let Some(upload_id) = request_id else {
+        return Err(ProtocolError::new(
+            None,
+            "malformed_upload_chunk",
+            "upload chunk id is invalid",
+        ));
+    };
+    Ok(UploadChunk {
+        upload_id,
+        sequence: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        last: flags & CHUNK_FLAG_LAST != 0,
+        payload: bytes[CHUNK_HEADER_LEN..].to_vec(),
+    })
 }
 
 #[derive(Clone, Default)]
@@ -686,6 +888,73 @@ mod tests {
         assert_eq!(
             ControlRequest::decode(&partial_geometry).unwrap_err().code,
             "invalid_parameters"
+        );
+
+        let capability = Uuid::new_v4();
+        let upload = format!(
+            r#"{{"version":1,"kind":"request","request_id":"{id}","operation":"upload_start","capability":"{capability}","agent_generation":3,"name":"note.txt","mime_type":"text/plain","destination":"cwd","total_bytes":1,"chunks":1,"sha256":"{}"}}"#,
+            "00".repeat(32),
+        );
+        let decoded = ControlRequest::decode(&upload).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            ControlOperation::UploadStart { .. }
+        ));
+        assert_eq!(
+            ControlRequest::decode(&upload.replace("note.txt", "../note.txt"))
+                .unwrap_err()
+                .code,
+            "invalid_parameters"
+        );
+    }
+
+    #[test]
+    fn upload_chunk_framing_is_strict_and_request_bound() {
+        let upload_id = Uuid::new_v4();
+        let payload = b"secret chunk";
+        let mut frame = encode_chunk(upload_id, 7, true, payload);
+        frame[5] = CHUNK_KIND_UPLOAD;
+        let chunk = decode_upload_chunk(&frame).unwrap();
+        assert_eq!(chunk.upload_id, upload_id);
+        assert_eq!(chunk.sequence, 7);
+        assert!(chunk.last);
+        assert_eq!(chunk.payload, payload);
+
+        let mut replay_kind = frame.clone();
+        replay_kind[5] = CHUNK_KIND_REPLAY;
+        let error = match decode_upload_chunk(&replay_kind) {
+            Err(error) => error,
+            Ok(_) => panic!("replay kind was accepted as an upload"),
+        };
+        assert_eq!(error.request_id, Some(upload_id));
+        assert_eq!(error.code, "malformed_upload_chunk");
+
+        let mut unknown_flags = frame.clone();
+        unknown_flags[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        let error = match decode_upload_chunk(&unknown_flags) {
+            Err(error) => error,
+            Ok(_) => panic!("unknown upload flags were accepted"),
+        };
+        assert_eq!(error.request_id, Some(upload_id));
+        assert!(decode_upload_chunk(&frame[..CHUNK_HEADER_LEN]).is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_event_binds_upload_limits_capability_and_generation() {
+        let capability = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        send_ready(&tx, capability, 42).await.unwrap();
+        let message = rx.recv().await.unwrap();
+        let ControlOutbound::Text(text) = &message else {
+            panic!("expected ready text")
+        };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["upload_capability"], capability.to_string());
+        assert_eq!(value["agent_generation"], 42);
+        assert_eq!(value["upload_max_bytes"], crate::upload::MAX_UPLOAD_BYTES);
+        assert_eq!(
+            value["upload_chunk_bytes"],
+            crate::upload::UPLOAD_CHUNK_BYTES
         );
     }
 

@@ -51,6 +51,7 @@ def test_test_all_runs_required_local_smoke_matrix():
         "smoke-service-manager.sh",
         "check-worker-only-daemon.sh --self-test",
         "check-no-server-terminal-content.sh",
+        "check-no-server-agent-upload.sh",
         "bun run test:e2e",
         "bun run build",
         "git diff --check",
@@ -83,7 +84,6 @@ def test_owner_recovery_smoke_uses_real_postgres_and_redis_crash_gates():
         "SPAWN_TEST_EXTERNAL_SERVICES=1",
         "test_registration_repairs_db_b_redis_a_with_successor_c",
         "test_delayed_c_recovery_cannot_overwrite_successor_d",
-        "test_upload_resolution_distinguishes_missing_waiter_from_stale_owner",
         "test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding",
     ]
     missing = [item for item in expected if item not in body]

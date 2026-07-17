@@ -6,14 +6,15 @@ be independently reviewed and shippable, but the Phase 2 claim is made only
 after the historical-data purge and final inventory pass. Grep is one check,
 not proof that old plaintext has left disks, databases, Redis, or backups.
 
-## Current source reality (P2-HOST-02 review candidate)
+## Current source reality (P2-TERM-01 review candidate)
 
 - `spawn-worker` is the only session backend. Its bounded encrypted-at-rest
   replay log is the live endpoint's only history source; tmux execution and
   fallback are retired and guarded against reintroduction.
 - Agent terminals require two ordered WebRTC DataChannels: `spawn.pty` carries
   PTY bytes and `spawn.ctl` carries request-bound history/snapshot plus
-  resize/display ownership. Missing, duplicate, closed, unknown, or unordered
+  resize/display ownership and bounded agent uploads. Missing, duplicate,
+  closed, unknown, or unordered
   channels fail closed, with no server-content fallback. Neither channel's
   message handler may affect the worker or viewer state until one shared gate
   has observed both required channels open successfully; pre-ready frames are
@@ -24,28 +25,31 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   generation-scoped queues until that event and tears down/retries the RTC
   attempt if readiness plus initial replay do not complete within 10 seconds.
 - The daemon control socket requires `spawn.control.v2`; the browser agent
-  socket requires `spawn.v2`. Both are text/JSON-only signaling, disclosed
-  lifecycle, and still-pending upload/launch control. Binary terminal frames,
+  socket requires `spawn.v2`. Both are text/JSON-only signaling and disclosed
+  lifecycle. Binary terminal frames,
   `spawn.v1`, the `0x01`/`0x02` relay, transcripts, agent-content Redis pubsub,
   and server history/snapshot/display relay are removed in the reviewed
   P2-AGENT-02 cut. Browser RTC offer/candidate/close frames bind
   the exact agent/scope/protocol/version/nonce tuple.
 - A reviewed host-scoped `spawn.host.ctl` transport root is integrated and
-  works independently of any agent. The current P2-HOST-02 candidate moves
+  works independently of any agent. The merged P2-HOST-02 implementation moves
   host list/stat/read/write/mkdir/rename/remove, browser download/upload, and
   browser-mediated cross-host transfer onto bounded capability-rooted streams
   on that channel.
 - Host directory/file REST routes, server broker waiters/result schemas,
   daemon `host.fs.*` frames, and registration `home_dir` are removed in the
-  current candidate. Host paths, entry metadata, file bytes, hashes, and
+  merged source. Host paths, entry metadata, file bytes, hashes, and
   detailed filesystem errors therefore remain endpoint-to-endpoint.
 - Tool checks and installs also use server↔daemon control frames. Installer
   `output` and `error` can contain arbitrary commands, paths, and secrets;
   `HostToolPolicy.last_auto_update_error` persists a detailed error derived
   from the result.
 - REST and WebSocket terminal input/snapshot/resize/scroll/redraw/display
-  surfaces are removed in the reviewed source. Agent uploads still
-  cross the server and remain assigned to P2-TERM-01.
+  surfaces are removed. The P2-TERM-01 candidate also removes both agent-upload
+  routes, browser/daemon upload WebSocket frames, broker waiters, schemas, and
+  base64 payloads; old upload frames close fail-closed without logging content.
+  Upload names, bytes, endpoint paths, hashes, cancellation, and detailed
+  results now remain on the direct per-agent `spawn.ctl` channel.
 - `Agent.cwd`/`argv`/`env`, `Skill.content`, and
   `Preset.default_argv`/`env_template`/`install` are plaintext database fields.
   Preset templates are merged into the launch environment in `routes/agents.py`;
@@ -54,8 +58,9 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   `cwd` basename into the retained `Agent.name` column. Existing rows do not
   record whether a name was explicit or derived.
 - Daemon `Outbound::Error.message` frames contain full `anyhow` chains (often
-  including cwd/file paths). `ws/daemon.py` forwards upload messages and logs
-  every free-form message; other detailed status/exit strings can do the same.
+  including cwd/file paths). Upload-specific frames are removed in the
+  P2-TERM-01 candidate, but other detailed status/exit strings can still be
+  forwarded or logged.
 - Removing current and future writes is insufficient: existing transcript files, database
   values, derived names, server/observability logs, legacy
   `spawn:agent:*:ring` Redis keys, and infrastructure backups/snapshots remain
@@ -195,10 +200,9 @@ is restricted to stable content-free values.
 
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
 
-The filesystem portion is **IMPLEMENTED, REVIEW PENDING** in P2-HOST-02. The
-interactive tool portion is also **IMPLEMENTED, REVIEW PENDING** separately as
-P2-HOST-03A. Neither candidate is integrated or complete until independent
-review passes and it merges.
+The filesystem portion is **REVIEWED AND MERGED** in P2-HOST-02 at `4e7c89b`.
+The interactive tool portion is **IMPLEMENTED, REVIEW PENDING** separately as
+P2-HOST-03A and is not complete until independent review passes and it merges.
 
 - Move list/read/write/mkdir/rename/remove request/response frames off the
   server WebSocket. Paths, entry names, sizes/times, file bytes, and detailed
@@ -242,12 +246,27 @@ review passes and it merges.
   after the web client and daemon path is live. Tool route deletion remains
   deferred to Increment 7.
 
-### 6 — agent uploads and terminal control-plane retirement (terminal cut reviewed)
+### 6 — agent uploads and terminal control-plane retirement (review candidate)
 
-P2-TERM-01 still must replace agent `bytes_b64` upload legs (`ws/browser.py`, REST `routes/agents.py`,
-and `agent_control.decode_upload`) with a chunked per-agent `spawn.ctl` stream.
-Keep only a content-free saved/failed acknowledgement; paths remain on the
-encrypted channel.
+P2-TERM-01 replaces the agent `bytes_b64` REST/WS/broker legs with a bounded
+per-agent `spawn.ctl` stream. The `ready` event carries a fresh per-channel
+capability, the exact agent-backend generation, and the 20 MiB/48 KiB endpoint
+limits. A stable upload UUID binds an immutable manifest and enables bounded
+resume/idempotency. Kind-2 binary chunks carry exact sequence/final framing;
+the daemon validates length and SHA-256, caps four uploads per viewer and 64
+globally, and expires a bounded completion cache.
+
+The worker private protocol is bumped to version 5 so a launched or adopted
+worker retains its canonical local cwd as the upload capability root. The
+daemon opens that root and attachment directories component-by-component with
+no-follow directory descriptors, accepts one relative leaf only, writes a
+same-directory mode-0600 temporary file, and atomically hard-links a free final
+name without clobbering regular files or symlinks. Cancellation, malformed
+chunks, channel teardown, and backend replacement remove temporary state.
+Endpoint paths and detailed responses travel only on `spawn.ctl`; there is no
+content-free server acknowledgement because the server has no upload leg at
+all. Old workers without the cwd capability and old REST/WS upload clients fail
+closed instead of activating a compatibility relay.
 
 The reviewed P2-TERM-02/P2-AGENT-02 cut removes REST
 input/snapshot/resize/scroll/redraw, the equivalent `/ws/browser`

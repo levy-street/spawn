@@ -32,10 +32,9 @@ also accepts `Bearer` for API testing).
 |--------|-----------------------|------------------------------------------|
 | GET    | `/api/hosts`          | list current user's hosts                |
 | GET    | `/api/hosts/{id}`     | one host                                 |
-| GET    | `/api/hosts/{id}/tool-targets` | disclosed preset/policy metadata used to select E2E interactive tool targets; never returns command, install argv, path, version, output, or error detail |
-| GET    | `/api/hosts/{id}/tools` | **legacy, temporarily retained:** check preset executable targets through the server/daemon control leg |
+| GET    | `/api/hosts/{id}/tools` | check preset executable targets on the connected host daemon |
 | POST   | `/api/hosts/{id}/control/ping` | owner-authorized, content-free current daemon-generation readiness check (204) |
-| POST   | `/api/hosts/{id}/tools/{preset_id}/install` | **legacy, temporarily retained:** run that preset's server-stored install command through the server/daemon control leg |
+| POST   | `/api/hosts/{id}/tools/{preset_id}/install` | run that preset's install command on the connected host daemon |
 | PATCH  | `/api/hosts/{id}/tools/{preset_id}/policy` | update per-target policy: `{auto_update?}` |
 | PATCH  | `/api/hosts/{id}`     | rename: `{name}`                         |
 | DELETE | `/api/hosts/{id}`     | revoke daemon token + drop the host      |
@@ -190,17 +189,10 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 {"type": "agent.activity", "agent_id": "uuid"}
 
 {"type": "agent.input_activity", "agent_id": "uuid"}
-```
 
 Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `agent.activity` records meaningful PTY output timing, while
 `agent.input_activity` records input timing for the direct WebRTC DataChannel.
-
-```json
-{"type": "agent.uploaded",
- "agent_id": "uuid",
- "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png",
- "client_id": "browser-upload-id"}
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
@@ -226,7 +218,6 @@ terminal bytes: `agent.activity` records meaningful PTY output timing, while
  "protocol": "spawn.pty", "protocol_version": 2,
  "status": "connected|failed",
  "message": "optional detail"}
-```
 
 Host-scoped signaling uses the same `rtc.*` types but replaces `agent_id` with
 an explicit, mandatory binding tuple on every frame:
@@ -246,13 +237,6 @@ Host `rtc.candidate` and `rtc.status` frames carry the identical tuple and
 binding nonce. Host status values are content-free codes; endpoint error
 detail is not placed on the signaling websocket.
 
-The following `host.tools.*` daemon-WebSocket frames are the temporarily
-retained legacy and unattended path. The interactive hosts-page path does not
-use them; its protected details use `spawn.host.ctl` below. They remain until
-P2-HOST-03B moves durable targets/unattended execution to the endpoint and
-removes this compatibility path.
-
-```json
 {"type": "host.tools.check_result",
  "request_id": "uuid",
  "tools": [{
@@ -339,17 +323,6 @@ removes this compatibility path.
 `agent.kill.signal` is optional and accepts only `TERM` or `KILL`; omitted
 means `TERM`. Other values are rejected before lifecycle dispatch.
 
-{"type": "agent.upload",
- "agent_id": "uuid",
- "cwd": "/home/me/projects/foo",
- "name": "screenshot.png",
- "mime_type": "image/png",
- "bytes_b64": "...",
- "paste_prefix": "@",
- "paste": false,
- "destination": "cwd",
- "client_id": "browser-upload-id"}
-
 {"type": "rtc.offer",
  "session_id": "browser-generated-id",
  "binding_nonce": "browser-or-server-generated-hex",
@@ -391,14 +364,7 @@ legacy `generation` spelling is rejected.
 
 The daemon launches the agent argv at `cwd` with the host user's process
 environment, overlaid with the `env` from this frame. spawn does not inject
-provider credentials — each agent CLI authenticates itself on the host.
-Image uploads are saved by the daemon under `<cwd>/.spawn/attachments/` by
-default. When `destination` is `"cwd"`, the upload may be any file type and is
-saved directly under `<cwd>` using a sanitized, non-overwriting filename.
-When `paste` is true or omitted, the saved path is inserted into the agent PTY
-using `paste_prefix`; when `paste` is false, the daemon only reports the saved
-path back to the browser. `client_id` is an optional browser correlation id.
-The server sends
+provider credentials — each agent CLI authenticates itself on the host. The server sends
 `host.heartbeat` acknowledgements for daemon heartbeats so the daemon can
 distinguish healthy idle connections from dead sockets.
 
@@ -408,18 +374,14 @@ distinguish healthy idle connections from dead sockets.
 - Required subprotocol: `spawn.v2`. An old/missing subprotocol receives only
   `{"type":"protocol.required","protocol":"spawn.v2","version":2}` and
   closes with `4003`.
-- This WebSocket is content-free signaling, disclosed lifecycle/status, and
-  the still-pending upload migration. It never sends binary frames and closes
-  with `4002` for a binary frame or terminal viewport/history/snapshot JSON.
+- This WebSocket is content-free signaling plus disclosed lifecycle/status. It
+  never sends binary frames and closes with `4002` for a binary frame or any
+  retired terminal, viewport, history, snapshot, or upload JSON frame.
 - History, snapshots, geometry, scrolling, redraw and display ownership use
-  `spawn.ctl`; terminal bytes use `spawn.pty`. Neither reaches the server.
+  `spawn.ctl`; terminal bytes use `spawn.pty`; agent uploads use the upload
+  stream on `spawn.ctl`. None reaches the server.
 
 ### Browser → server
-
-```json
-{"type": "upload", "name": "screenshot.png", "mime_type": "image/png", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
-{"type": "upload", "destination": "cwd", "name": "notes.txt", "mime_type": "text/plain", "bytes_b64": "...", "paste": false, "client_id": "browser-upload-id"}
-```
 
 The browser additionally sends
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
@@ -436,9 +398,6 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
  "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 {"type": "agent.exit", "exit_code": 0, "signal": null}
 {"type": "agent.status", "status": "running"}
-{"type": "upload.saved", "path": "/home/me/projects/foo/.spawn/attachments/screenshot.png", "client_id": "browser-upload-id"}
-{"type": "upload.saved", "path": "/home/me/projects/foo/notes.txt", "client_id": "browser-upload-id"}
-{"type": "upload.error", "message": "..."}
 {"type": "rtc.answer", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "sdp": "v=0..."}
 {"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "candidate": {"candidate": "..."}}
 {"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "agent_id": "uuid", "scope_type":"agent", "scope_id":"uuid", "protocol":"spawn.pty", "protocol_version":2, "status": "connected|failed"}
@@ -449,7 +408,9 @@ signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
 The terminal data plane is two mandatory WebRTC DataChannels negotiated over
 the content-free WebSocket signaling plane.
 
-- The browser creates ordered DataChannels named `spawn.pty` and `spawn.ctl`.
+- The browser creates fully reliable ordered DataChannels named `spawn.pty`
+  and `spawn.ctl` (no packet-lifetime or retransmit limit). The daemon verifies
+  all three properties for both labels before admitting either channel.
 - Signaling goes through `rtc.*` JSON frames on `/ws/browser` and `/ws/daemon`.
 - DataChannel messages are raw binary PTY bytes:
   - browser → daemon: stdin bytes for the authorized agent
@@ -480,6 +441,8 @@ UUID and binds every response/chunk to its caller:
 {"version":1,"kind":"request","request_id":"uuid","operation":"take_control","cols":120,"rows":32}
 {"version":1,"kind":"request","request_id":"uuid","operation":"scroll","lines":-8}
 {"version":1,"kind":"request","request_id":"uuid","operation":"redraw"}
+{"version":1,"kind":"request","request_id":"upload-uuid","operation":"upload_start","capability":"ready-capability-uuid","agent_generation":7,"name":"notes.txt","mime_type":"text/plain","destination":"cwd","total_bytes":90000,"chunks":2,"sha256":"64-lowercase-hex-digest"}
+{"version":1,"kind":"request","request_id":"cancel-uuid","operation":"upload_cancel","capability":"ready-capability-uuid","agent_generation":7,"upload_id":"upload-uuid"}
 ```
 
 History and snapshot currently support styled terminal replay only
@@ -517,6 +480,113 @@ Each binary chunk is at most 48 KiB of payload:
 +----------+---------+------+-------+----------------+----------+---------+
 ```
 
+Upload chunks use the same 28-byte header with `kind=2`; the request UUID is
+the stable upload UUID and flag bit 0 is set only on the final chunk. Before
+accepting upload metadata, the daemon's `ready` event gives this control
+channel a fresh unguessable capability, the exact bound agent-backend
+generation, and the fixed endpoint limits:
+
+```json
+{"version":1,"kind":"event","event":"ready","upload_capability":"uuid","agent_generation":7,"upload_max_bytes":20971520,"upload_chunk_bytes":49152}
+{"version":1,"kind":"response","request_id":"upload-uuid","operation":"upload_start","ok":true,"state":"ready","next_sequence":1,"received_bytes":49152}
+{"version":1,"kind":"response","request_id":"upload-uuid","operation":"upload_complete","ok":true,"state":"complete","path":"/endpoint/path/notes.txt","total_bytes":90000,"sha256":"64-lowercase-hex-digest"}
+```
+
+The browser first reserves one of eight agent-scoped reconciliation slots in
+`sessionStorage`, before sending `upload_start`. The ledger never evicts an
+unresolved record. Full capacity or unavailable durability fails closed before
+any endpoint frame. A same-tab memory/history fallback preserves the identity
+and visible lock across component/navigation remounts when the storage write
+itself fails; no later upload is admitted until storage recovers and an
+explicit checked dismissal is successfully persisted. A durability fault
+poisons every already-reserved overlapping upload; restoration or an unrelated
+successful write cannot clear the fault or make those uploads dispatch. The
+in-memory fault and best-effort reconciliation event are still latched when
+both `sessionStorage` and history fallback writes fail, and native storage/
+history exceptions never replace the typed upload-blocked result. The browser
+then hashes before sending, applies SCTP buffered-amount backpressure, and
+retries only the pre-effect `upload_start` exchange with a stable upload UUID a
+bounded number of times. After every asynchronous hash, digest, backpressure,
+chunk-read, and response boundary it rechecks cancellation, the immutable RTC
+generation, and the exact open control-channel identity. It repeats those
+checks before and after durable reconciliation promotion and synchronously
+before sending the final frame; queued completion cannot outrun cancellation or
+generation replacement. Immediately before the final chunk it durably promotes
+the reserved
+record to `outcome_unknown`; a failed promotion prevents final dispatch and
+cancels the unpublished upload. It never retries after dispatching the final
+chunk. A timeout, abort, or disconnect after that dispatch is stable
+`outcome_unknown`; best-effort cancellation cannot downgrade it, and the user
+must reconcile the destination before retrying. The daemon admits
+at most 20 MiB per upload, 48 KiB per chunk, four active uploads per viewer,
+and 64 active uploads globally. Hub lookup and admission are one atomic state
+operation returning `Inserted`, `Existing`, or `Complete`; only `Inserted`
+prepares a descriptor and private temporary file. `Existing` performs exact
+owner, manifest, lifecycle, and resume/conflict checks without replacing the
+resident slot. A retry with the identical manifest resumes at
+the acknowledged sequence or returns the cached completion; reuse with a
+different manifest fails. Chunks must be ordered with exact lengths and final
+flag. Length, SHA-256, capability, backend generation, framing, and destination
+checks all fail closed. Cancellation, channel loss, backend replacement, and
+malformed chunks remove private temporary files. Preparation, writes, sync,
+commit, unlink, and directory sync run in owned blocking operations. A single
+absolute teardown deadline bounds waiting, while operation permits and the
+per-viewer/global admission charge remain held until descriptor/temp cleanup
+actually completes; timed-out cleanup stays tracked. A pre-publication
+cancellation cannot later publish, while an already-linearized final commit may
+finish only under the `outcome_unknown`/completed-cache rule below.
+
+This reconciliation ledger is deliberately tab-local. A new tab or browser
+restart is not protected by the Phase 2 browser ledger; the future durable
+endpoint-owned journal/recovery boundary belongs to P2-DATA-01/P2-DATA-02. The
+eight-record limit is also an intentional availability tradeoff: eight
+unresolved or durability-blocked records deny further uploads until the user
+checks endpoint state and successfully persists explicit dismissals. Records
+are never silently evicted to recover capacity.
+The deadline is created once by the peer's immutable coordinator at the first
+initiating channel/peer close, not separately for each cleanup stage. Delayed
+sender-close, connection-state, duplicate-close, invalid-channel, and backend
+replacement paths reuse it even if they wait for serialized agent cleanup.
+Cancellation and viewer removal are published first. The peer's global
+admission token transfers from the active map entry into a bounded closing-peer
+registry/task; transport close, the effect fence, registry cleanup, and upload
+drain retain that charge after the peer-map deadline until they actually
+settle. A retained published entry whose private-name unlink or directory fsync
+failed is rescheduled by every later matching session/generation teardown;
+failure remains charged, while eventual success removes the temp, descriptors,
+operation permit, and admission entry without a second publication.
+
+The retained worker cwd is a canonical absolute capability root. The endpoint
+opens it and its attachment directories component-by-component without
+following symlinks, accepts a single relative leaf name only, writes a same-dir
+mode-0600 temporary file, and commits with an atomic no-clobber link. Existing
+regular files and symlinks are never overwritten. The final endpoint path and
+detailed error exist only on `spawn.ctl`; the REST API and both server
+WebSockets have no agent-upload content or acknowledgement leg. Workers older
+than private worker protocol version 5 lack the retained cwd capability and are
+rejected for adoption rather than enabling a server or path fallback.
+
+Successful no-clobber link creation is the upload publication point. The
+daemon records the completed stable ID immediately, before temporary unlink and
+directory fsync, so a lost acknowledgement reconciles to the same result and
+cannot duplicate the file. Any later unlink/fsync failure is
+`error.code="outcome_unknown"`; callers must not infer rollback or retry the
+effect. Definite pre-publication validation, hash, write, or sync failures keep
+their request-bound stable error code.
+
+Removing an in-progress browser attachment aborts its upload generation. If no
+final chunk was dispatched this is a definite silent cancellation and a
+successful ledger write clears its reservation. If the final chunk was
+dispatched, removal still removes the local preview and ignores late success,
+but it must preserve the visible `outcome_unknown` reconciliation warning;
+endpoint publication may already have occurred. Acknowledged completion clears
+the record only after that removal is persisted; a failed write retains the
+record and locks new effects. Otherwise the warning survives the transient
+status timeout, Remove, unmount/navigation/remount, overlapping terminal
+instances, and unrelated later statuses. Its only actions are to focus the
+terminal for an endpoint check and to dismiss after that check; there is
+deliberately no retry action.
+
 Flag bit 0 marks the last chunk. Errors are request-bound JSON responses with
 `ok:false` plus stable `error.code` and bounded endpoint-only `error.detail`.
 The worker uses an 8 MiB conservative total resource charge by default. It
@@ -527,7 +597,7 @@ response budget. An append/checkpoint admission failure disables replay for
 that live worker rather than returning partial history; live PTY forwarding
 continues. The control envelope retains a separate 12 MiB hard rejection ceiling.
 
-`spawn.pty` and `spawn.ctl` are each ordered, but there is no total order
+`spawn.pty` and `spawn.ctl` are each fully reliable and ordered, but there is no total order
 between them. Replay metadata therefore carries `pty_offset`, the exact
 per-viewer `spawn.pty` byte boundary represented by the replay. Worker output
 and replay share the worker's durable watermark, translated through the
@@ -572,7 +642,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove","tool.check","tool.install"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1,"tool_targets":8,"tool_processes":4,"tool_output_bytes":4096}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -696,60 +766,6 @@ streams and awaits cleanup before returning. The former REST
 `/dirs` and `/files/*` routes and server/daemon `host.fs.*` frames are retired.
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
-
-### Interactive host tools
-
-The hosts page obtains only disclosed target metadata from
-`GET /api/hosts/{id}/tool-targets`: preset ID/name, `agent_kind`, auto-update
-policy, and check/update timestamps. It then sends the selected preset ID and
-stable tool kind directly to the endpoint. Commands, installer argv,
-executable paths, installed/latest versions, stdout/stderr, truncation state,
-and detailed errors exist only in this encrypted DataChannel.
-
-```json
-{"version":1,"type":"request","request_id":"r","operation":"tool.check","payload":{"targets":[{"target_id":"preset-uuid","tool":"codex"}]}}
-{"version":1,"type":"response","request_id":"r","ok":true,"result":{"tools":[{"target_id":"preset-uuid","tool":"codex","command":["codex"],"installed":true,"path":"/home/me/.local/bin/codex","version":"codex 1.2.3","latest_version":"1.2.4","update_available":true}]}}
-
-{"version":1,"type":"request","request_id":"i","operation":"tool.install","payload":{"target":{"target_id":"preset-uuid","tool":"codex"}}}
-{"version":1,"type":"response","request_id":"i","ok":true,"result":{"target_id":"preset-uuid","tool":"codex","command":["codex"],"install_argv":["npm","install","--global","@openai/codex"],"outcome":"succeeded","success":true,"exit_code":0,"stdout":"...","stderr":"","output_truncated":false,"status":{"target_id":"preset-uuid","tool":"codex","command":["codex"],"installed":true,"path":"/home/me/.local/bin/codex","version":"codex 1.2.4","latest_version":"1.2.4","update_available":false}}}
-```
-
-Both payloads reject unknown fields. Target IDs are bounded opaque identifiers;
-the browser cannot supply an executable, path, shell text, version argument, or
-installer argument. The endpoint owns this fixed v1 policy:
-
-| Tool kind | Check argv | Install argv |
-| --- | --- | --- |
-| `claude-code` | `claude --version` | `npm install --global @anthropic-ai/claude-code` |
-| `codex` | `codex --version` | `npm install --global @openai/codex` |
-| `opencode` | `opencode --version` | `npm install --global opencode-ai` |
-| `aider-sonnet` | `aider --version` | `python3 -m pip install --user --upgrade aider-chat` |
-| `shell` | `bash --version` | unavailable |
-
-Every executable is resolved against the endpoint environment and executed as
-an exact argument vector. There is no shell interpolation or free-form install
-command on this path. Resolution rejects path separators and non-allowlisted
-tool kinds. At most eight targets are accepted per check, four child processes
-run concurrently, and a second install of the same tool fails with `tool_busy`.
-Checks use a five-second endpoint deadline; installs use 180 seconds. Stdout
-and stderr each retain only their final 4096 bytes and report
-`output_truncated` when earlier bytes were discarded.
-
-Cancellation, request timeout, channel close, and host-session replacement
-kill the child process group and drain it under the host session's single
-absolute teardown deadline. A cancellation that wins before process creation
-is a definitive no-effect error. Once the installer starts, nonzero exit,
-timeout, cancellation, shutdown, failed reconciliation, and any other partial
-effect return `outcome:"unknown"`; the browser never retries automatically.
-Loss of the install acknowledgement is also `outcome_unknown`. Reconcile with
-`tool.check` before a user retries. Successful installation is acknowledged
-only after an endpoint check resolves the expected executable. Reconnecting
-creates a fresh host session but never replays a mutation.
-
-The legacy REST `/tools` and `/install` routes, server `host.tools.*` frames,
-and server-stored unattended update target remain temporarily available for
-compatibility. Their presence means Phase 2 is incomplete. P2-HOST-03B removes
-them only after the durable target and unattended policy are endpoint-owned.
 
 ## Versioning
 

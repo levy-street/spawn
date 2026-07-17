@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import agent_control, auth, schemas
+from .. import auth, schemas
 from ..db import get_session
 from ..models import Agent, Host, Preset, User
 from ..ws.broker import get_broker
@@ -307,54 +306,6 @@ async def restart_agent(
         skills=skills,
     )
     return _to_out(agent, host.name)
-
-
-@router.post("/{agent_id}/upload", response_model=schemas.AgentUploadOut)
-async def upload_agent(
-    agent_id: str,
-    body: schemas.AgentUploadRequest,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentUploadOut:
-    result = await agent_control.upload_agent_file(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        name=body.name,
-        mime_type=body.mime_type,
-        bytes_b64=body.bytes_b64,
-        paste=body.paste,
-        destination=body.destination,
-        client_id=body.client_id,
-    )
-    return schemas.AgentUploadOut.model_validate(result)
-
-
-@router.post("/{agent_id}/upload-file", response_model=schemas.AgentUploadOut)
-async def upload_agent_multipart(
-    agent_id: str,
-    file: UploadFile = File(...),
-    paste: bool = Form(default=True),
-    destination: str | None = Form(default=None),
-    client_id: str | None = Form(default=None),
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
-) -> schemas.AgentUploadOut:
-    data = await file.read(agent_control.MAX_UPLOAD_BYTES + 1)
-    if len(data) > agent_control.MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="Upload is too large; the limit is 20 MB.")
-    result = await agent_control.upload_agent_file(
-        session=session,
-        user=user,
-        agent_id=agent_id,
-        name=file.filename,
-        mime_type=file.content_type,
-        bytes_b64=base64.b64encode(data).decode("ascii"),
-        paste=paste,
-        destination=destination,
-        client_id=client_id,
-    )
-    return schemas.AgentUploadOut.model_validate(result)
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)

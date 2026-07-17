@@ -144,13 +144,13 @@ scrollback key is process-ephemeral anyway (§7).
 
 `len` counts the payload only; `MAX_FRAME_LEN` = 32 MiB (replay dominates and
 is capped far below this by the scrollback budget). Structured payloads are
-JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 4`, checked at
+JSON; hot-path payloads are raw bytes. `PROTO_VERSION = 5`, checked at
 adoption time from `Hello.version` — a version-skewed worker is refused, not
 guessed at.
 
 | Type | Dir | Payload | Purpose |
 |---|---|---|---|
-| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows}` | first frame on **every** accepted connection; enables stateless adoption and binds lifecycle to this exact worker instance |
+| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows, cwd?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct agent uploads |
 | `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the agent. Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
@@ -474,7 +474,7 @@ described in §6.2, including checkpoint and framing charges.
 | **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
 | **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
 | **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, verifies `Hello.agent_id`, and adopts from the `Hello` (instance identity, state, pid, geometry), then derives the independent lifecycle socket — no persistent supervisor state. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
-| **spawnd upgrade + protocol change** | `Hello.version` gates adoption; a mismatched worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak. Old workers drain away as their agents exit. |
+| **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct agent uploads. A mismatched or cwd-less worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak or falling back to a server upload path. Old workers drain away as their agents exit. |
 | **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
 | **Host reboot** | workers and agents die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
 

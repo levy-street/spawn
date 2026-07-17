@@ -21,11 +21,12 @@ A security audit found that the server **saw protected content**: even for v2
 (DataChannel) clients the daemon mirrored PTY output to the server as plaintext
 (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
 transited the server. The reviewed P2-AGENT-02/P2-TERM-02 cut now removes that
-agent-terminal path. The current P2-HOST-02 review candidate also removes host
-paths/files/transfers from the server, while installer output, agent uploads,
-launch values, preset environment templates, and skill bodies still have
-server-readable paths or stores. Signaling is unsigned (server can MITM the
-DataChannel). Goal of this work ("Tier 2"):
+agent-terminal path. The reviewed P2-HOST-02 cut removes host paths/files/
+transfers from the server. The current P2-TERM-01 review candidate also removes
+agent uploads, while installer output, launch values, preset environment
+templates, and skill bodies still have server-readable paths or stores.
+Signaling is unsigned (server can MITM the DataChannel). Goal of this work
+("Tier 2"):
 
 - **Phase 2** — server has no plaintext protected-content path or recoverable
   plaintext store. Acceptance includes runtime path tests plus primary and
@@ -52,6 +53,8 @@ DataChannel). Goal of this work ("Tier 2"):
 | `640a2e0` | QUAL-01–04 | Merge commit integrating the parallel format/Clippy cleanups; current reviewed Wave 0 checkpoint. |
 | `1f66d2d` | P2-AGENT-01, P2-TMUX-01, P2-HOST-01 | Integrated the independently reviewed per-agent control root, worker-only/tmux-removal cutover, and host-scoped control root plus their hardening series on `master`. |
 | `5722288` | P2-AGENT-02, P2-TERM-02 | Integrated the independently reviewed server-terminal relay removal, mandatory two-channel agent RTC gate, strict v2 signaling, and bounded lifecycle teardown series on `master`. |
+| `22c1f0c` | QUAL-FLAKE-01 | Integrated the independently reviewed task-lifecycle and smoke stability corrections. |
+| `4e7c89b` | P2-HOST-02 | Integrated the independently reviewed capability-rooted host filesystem channel, bounded streaming/cancellation, conservative `outcome_unknown`, shutdown/publication, and temp-cleanup hardening series on `master`. |
 
 ### Increment 1 detail (the keystone)
 
@@ -117,13 +120,12 @@ local-daemon cleanup is bounded and tied to stable process identities, and the
 persistent-agent smoke waits on an owner-authorized, content-free
 current-generation `host.ping`/`host.pong` exchange.
 
-P2-HOST-02 now has an integrated implementation candidate on its isolated
-review branch: host home/list/stat/read/write/mkdir/rename/remove, browser
+P2-HOST-02 passed independent review and is integrated on `master` at
+`4e7c89b`: host home/list/stat/read/write/mkdir/rename/remove, browser
 download/upload, and browser-mediated cross-host transfer use bounded,
 hash-and-length-checked DataChannel streams. Registration `home_dir`, filesystem
 REST routes, server broker waiters/result schemas, and daemon `host.fs.*` frames
-are removed in that branch. This is **IMPLEMENTED, REVIEW PENDING**, not an
-integrated or `DONE` claim.
+are removed.
 
 The first P2-HOST-02 review rejected the candidate for path-resolution races,
 serial DataChannel read deadlock, check-then-rename clobbering, incomplete
@@ -155,7 +157,7 @@ pointless flush. Browser read declarations reject active and tombstoned IDs.
 Forced fast-delay cancel-then-chunk/end, stalled-write ACK/cancel survival,
 prompt cleanup, browser declaration replay, paired-channel backlog/reuse,
 rapid write-churn shutdown, and distinct-host isolation regressions cover these
-findings. Independent review is still required before merge.
+findings.
 
 The latest review made the close/effect boundary explicit. A mutation that
 passes the session effect fence may finish after peer close, so lost
@@ -177,7 +179,7 @@ commits retain the conservative `outcome_unknown` rule. Cleanup syscalls run in
 accounted blocking closures and cannot extend the single close deadline, even
 when an unlink itself stalls.
 
-**Current integrated P2-HOST-02 candidate validation:** daemon format and
+**Accepted P2-HOST-02 review validation:** daemon format and
 strict all-target Clippy pass; all 169 daemon tests pass; server Ruff and all
 149 server tests pass; web lint, typecheck, all 54 unit tests, 68 Playwright
 tests with retries disabled (3 opt-in audits skipped), and the production build
@@ -186,8 +188,8 @@ matrix, including prebuilt install, HTTP, Redis, PostgreSQL owner recovery,
 login, daemon lifecycle, live-browser, and service-manager smokes. No
 P2-HOST-02 worker process remains afterward.
 
-The P2-HOST-02 candidate includes the reviewed worker-only and agent relay
-checkpoints and must retain both source guards through review.
+The merged P2-HOST-02 implementation includes the reviewed worker-only and
+agent-relay checkpoints and retains both source guards.
 
 P2-HOST-03A now has an implementation candidate on its isolated review branch.
 The hosts page fetches only disclosed preset ID/name, agent kind, policy, and
@@ -338,17 +340,134 @@ and the production build pass. `SPAWN_E2E_PORT=3791 scripts/test-all.sh` passes
 all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
 daemon, live-browser, and service-manager smokes.
 
-This merged source checkpoint is not deployed, does not purge historical
-copies, and does not complete Phase 2. Offline history is now an explicit
-non-feature: replay is available only from a live endpoint worker; when the
-host is offline or the worker exits, the server has no transcript to show.
-Historical transcript files, Redis/AOF/WAL, logs, memory, swap, cores, backups,
-replicas and snapshots remain in P2-PURGE-01 scope.
+**P2-TERM-01 checkpoint (implemented, review pending):** agent upload names,
+bytes, hashes, endpoint paths, cancellation, and detailed results move off both
+REST/WS legs onto bounded kind-2 chunks on the direct `spawn.ctl` DataChannel.
+The stream is bound to a fresh per-channel capability and exact worker-backend
+generation; stable upload UUIDs support bounded resume/idempotency. The daemon
+validates exact chunk order/length/final flag and SHA-256, applies per-viewer and
+global admission limits plus a bounded completion cache, and cleans private
+temporary files on error, cancellation, disconnect, or replacement. The
+worker protocol is version 5 so launched/adopted workers retain a canonical
+local cwd. Upload commits use retained no-follow directory descriptors, mode
+0600 same-directory temporary files, and atomic no-clobber final links; invalid
+or old peers fail closed. Server routes, schemas, broker waiters, browser and
+daemon upload frames, and web API helpers are removed. Legacy frames close
+without logging names, paths, errors, or payloads.
+
+The current correction series requires both agent DataChannels to be ordered
+and fully reliable. Upload preparation, write/sync, link, unlink, and directory
+sync are owned blocking operations with tracked permits; session/generation
+teardown uses one absolute deadline and keeps per-viewer/global capacity charged
+until real descriptor/temp cleanup finishes. Successful final linking records
+the completion cache before fallible unlink/fsync cleanup. Post-link cleanup
+failure, or browser timeout/abort/disconnect after final chunk dispatch, is the
+stable `outcome_unknown` result and is never retried automatically. Remove,
+unmount, and RTC-generation replacement abort browser uploads, send best-effort
+`upload_cancel`, and cannot resurrect UI state from late completion. A Remove
+before final dispatch stays a silent definite cancellation; after final
+dispatch the thumbnail still disappears but the reconciliation warning remains
+visible. Hashing, backpressure, chunk reads, and acknowledgement waits recheck
+the abort signal, immutable RTC generation, and exact open control-channel
+identity after every await. The same checks run immediately before and after
+the reconciliation promotion and synchronously before final send, so a queued
+late completion cannot overtake cancellation or replacement. Upload admission
+atomically returns `Inserted`, `Existing`, or `Complete` under the hub lock;
+only `Inserted` prepares a descriptor/temp, while `Existing` performs exact
+owner, manifest, lifecycle, and resume checks. Before `upload_start`, the
+browser durably reserves one of eight
+agent-scoped reconciliation slots without eviction. Full capacity or a storage
+fault refuses the upload with zero endpoint effect. Immediately before the
+final frame it durably promotes that reservation to `outcome_unknown`; a failed
+promotion cancels before publication. Same-tab memory and history-state
+fallbacks preserve a failed-write identity, warning, and global upload lock
+across component/navigation remounts. The fault poisons every overlapping
+reservation; restored storage or another successful write cannot clear it or
+let a stalled upload dispatch. Even simultaneous `sessionStorage` and history
+fallback failures retain the in-memory lock, notify mounted consumers
+best-effort, and surface only the typed blocked result. A successful
+acknowledged completion or
+explicit checked dismissal frees a slot only after the removal persists. The
+record is independent of the transient three-second status and attachment
+lifetime, and no warning offers retry. Control-channel teardown publishes
+cancellation and viewer removal immediately. Every callback for that peer
+shares an immutable
+first-close deadline, including delayed sender, state, duplicate, invalid, and
+replacement paths. The tracked cleanup owns the RTC admission token until
+transport, fence, registries, and uploads actually settle, so map removal does
+not free capacity and stalled churn remains inside the global peer cap.
+Teardown also reschedules retained post-publication unlink/fsync cleanup; a
+failure stays charged and a later session/generation teardown retries it.
+
+**Current P2-TERM-01 correction validation (review still pending):** focused
+daemon upload tests pass, including partial resume/conflict, global-64 and
+completed-cache-128/TTL pressure, prepare/sync/commit/cleanup stalls, retained
+capacity, cancellation races, and repeated post-link unlink/fsync failure with
+session/generation retry, zero temp/FD/operation residue, idempotent
+publication, and barrier-controlled same/different-owner concurrent starts
+with exactly one preparation/temp and no slot replacement. Deterministic paused-time RTC tests prove delayed duplicate,
+sender, and state closes cannot gain a new deadline, and a stalled cleanup
+retains its admission slot across peer-map removal and replacement churn until
+zero residue. A real paired-WebRTC regression drives the actual PTY and control
+sender loops to failure, stalls their DataChannel-close path, then proves a
+delayed duplicate and peer-state close reuse the sender's original deadline;
+both labels settle with no peer, closing-registry, sink, task, or admission
+residue. The real-peer gate rejects unordered,
+packet-lifetime-limited, and retransmit-limited `spawn.pty` and `spawn.ctl`
+channels without resident state. TypeScript and the browser protocol unit suite
+pass; focused browser tests cover declared reliability, large multi-chunk
+transfer, non-immediate `bufferedAmount` drain, Remove-driven cancellation, and
+lost final acknowledgement without retry. Gated final-Blob-read races prove
+Remove and RTC-generation replacement dispatch no final frame, publish nothing,
+and ignore a queued late completion without losing definite/ambiguous state.
+Browser coverage also advances more
+than three seconds under a fake clock, applies later ordinary status, removes
+the attachment, and unmounts/navigates/remounts the terminal while the durable
+reconciliation record remains until explicit post-check dismissal. Browser
+storage-fault coverage proves reservation failure has zero endpoint effect,
+pre-final promotion failure cancels without publication, post-final failure
+retains exactly one ambiguity without retry, eight unresolved records refuse a
+ninth before `upload_start`, a concurrent fault permanently blocks older
+stalled reservations, dual storage/history failure remains typed and visible to
+overlapping consumers, and checked dismissal after recovery frees capacity.
+Paired real WebRTC tests cover
+verified multi-chunk publication, a stalled-cleanup control close within one
+deadline with replacement isolation and eventual zero residue, and a lost
+final acknowledgement that reconciles the same stable ID on a replacement
+channel without a duplicate destination. The production-source upload guard
+has only exact audited direct host-channel allowances; its adversarial self-test
+rejects privileged-file relays before and after test modules and in moved
+helpers. Strict daemon format and all-target
+Clippy pass; all 60 library, 124 daemon, and 8 worker-E2E tests pass; server Ruff
+and all 134 server tests pass; web lint, all 55 unit tests, 83 Playwright tests
+(3 opt-in audits skipped), and the production build pass.
+`SPAWN_E2E_PORT=45342 scripts/test-all.sh` passes the full repeatable matrix,
+including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
+daemon lifecycle, live-browser, and service-manager smokes. Current-master
+mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base
+and the simulated merge tree equals the candidate tree. Independent re-review
+is still required before acceptance or merge.
+
+The reconciliation ledger is intentionally tab-local: a new tab or browser
+restart is not covered by this Phase 2 safety state. P2-DATA-01/P2-DATA-02 must
+define the future durable endpoint-owned journal and cross-restart recovery
+boundary. Its hard eight-record cap is an explicit availability/DoS tradeoff:
+eight unresolved or durability-blocked records stop all new uploads until the
+user checks endpoint state and successfully persists explicit dismissals. No
+record is silently evicted to regain service.
+
+This is still a source checkpoint: it is not merged or deployed, does not purge
+historical copies, and does not complete Phase 2. Offline history is now an
+explicit non-feature: replay is available only from a live endpoint worker;
+when the host is offline or the worker exits, the server has no transcript to
+show. Historical transcript files, Redis/AOF/WAL, logs, memory, swap, cores,
+backups, replicas and snapshots remain in P2-PURGE-01 scope.
 
 ## Remaining sequence
 
-1. Independently review and merge the P2-HOST-02 filesystem migration, then
-   migrate agent uploads, which still use a server-visible route.
+1. Independently review and merge the P2-TERM-01 direct agent-upload candidate,
+   including current-master integrated-host coexistence; do not restore a
+   REST/WS compatibility upload path for old peers.
 2. Independently review and merge the implemented parallel E2E path for
    interactive installer detail. Keep the legacy tool route until its
    endpoint-owned durable targets exist; this wave is not the final tool cut.
