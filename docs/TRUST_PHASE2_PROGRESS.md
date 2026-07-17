@@ -11,11 +11,11 @@ A security audit found that the server **saw protected content**: even for v2
 (`0x01` leg) → transcripts + Redis pubsub, and history/snapshot frames still
 transited the server. The reviewed P2-AGENT-02/P2-TERM-02 cut now removes that
 agent-terminal path. The reviewed P2-HOST-02 cut removes host paths/files/
-transfers from the server. The current P2-TERM-01 review candidate also removes
-agent uploads, while installer output, launch values, preset environment
-templates, and skill bodies still have server-readable paths or stores.
-Signaling is unsigned (server can MITM the DataChannel). Goal of this work
-("Tier 2"):
+transfers from the server, and the independently reviewed P2-TERM-01 cut merged
+at `5d99ebb4` removes agent uploads. Installer output, launch values, preset
+environment templates, and skill bodies still have server-readable paths or
+stores. Signaling is unsigned (server can MITM the DataChannel). Goal of this
+work ("Tier 2"):
 
 - **Phase 2** — server has no plaintext protected-content path or recoverable
   plaintext store. Acceptance includes runtime path tests plus primary and
@@ -44,6 +44,7 @@ Signaling is unsigned (server can MITM the DataChannel). Goal of this work
 | `5722288` | P2-AGENT-02, P2-TERM-02 | Integrated the independently reviewed server-terminal relay removal, mandatory two-channel agent RTC gate, strict v2 signaling, and bounded lifecycle teardown series on `master`. |
 | `22c1f0c` | QUAL-FLAKE-01 | Integrated the independently reviewed task-lifecycle and smoke stability corrections. |
 | `4e7c89b` | P2-HOST-02 | Integrated the independently reviewed capability-rooted host filesystem channel, bounded streaming/cancellation, conservative `outcome_unknown`, shutdown/publication, and temp-cleanup hardening series on `master`. |
+| `5d99ebb4` | P2-TERM-01 | Integrated the independently reviewed direct agent-upload migration, durable browser reconciliation boundary, bounded endpoint cleanup, server upload-path removal, and final fixed-signal capability correction on `master`. |
 
 ### Increment 1 detail (the keystone)
 
@@ -178,7 +179,10 @@ login, daemon lifecycle, live-browser, and service-manager smokes. No
 P2-HOST-02 worker process remains afterward.
 
 The merged P2-HOST-02 implementation includes the reviewed worker-only and
-agent-relay checkpoints and retains both source guards.
+agent-relay checkpoints and retains both source guards. Its conservative
+`outcome_unknown` effect boundary and no-automatic-retry rule are inputs to
+P2-DATA-01; the durable cross-restart reconciliation journal remains DATA-02
+work and is not claimed by HOST-02.
 
 **P2-TMUX-01 cutover checkpoint (reviewed and merged):** production daemon
 creation/adoption/replay/input/resize/shutdown paths use `spawn-worker`; the
@@ -217,7 +221,7 @@ and the production build pass. `SPAWN_E2E_PORT=3791 scripts/test-all.sh` passes
 all repeatable checks plus local installer, HTTP, Redis, owner-recovery, login,
 daemon, live-browser, and service-manager smokes.
 
-**P2-TERM-01 checkpoint (implemented, review pending):** agent upload names,
+**P2-TERM-01 checkpoint (reviewed and merged at `5d99ebb4`):** agent upload names,
 bytes, hashes, endpoint paths, cancellation, and detailed results move off both
 REST/WS legs onto bounded kind-2 chunks on the direct `spawn.ctl` DataChannel.
 The stream is bound to a fresh per-channel capability and exact worker-backend
@@ -232,7 +236,7 @@ or old peers fail closed. Server routes, schemas, broker waiters, browser and
 daemon upload frames, and web API helpers are removed. Legacy frames close
 without logging names, paths, errors, or payloads.
 
-The current correction series requires both agent DataChannels to be ordered
+The accepted correction series requires both agent DataChannels to be ordered
 and fully reliable. Upload preparation, write/sync, link, unlink, and directory
 sync are owned blocking operations with tracked permits; session/generation
 teardown uses one absolute deadline and keeps per-viewer/global capacity charged
@@ -276,7 +280,7 @@ not free capacity and stalled churn remains inside the global peer cap.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 
-**Current P2-TERM-01 correction validation (review still pending):** focused
+**Accepted P2-TERM-01 review and merge validation:** focused
 daemon upload tests pass, including partial resume/conflict, global-64 and
 completed-cache-128/TTL pressure, prepare/sync/commit/cleanup stalls, retained
 capacity, cancellation races, and repeated post-link unlink/fsync failure with
@@ -321,9 +325,10 @@ and all 134 server tests pass; web lint, all 55 unit tests, 83 Playwright tests
 `SPAWN_E2E_PORT=45342 scripts/test-all.sh` passes the full repeatable matrix,
 including prebuilt install, HTTP, Redis, PostgreSQL owner recovery, login,
 daemon lifecycle, live-browser, and service-manager smokes. Current-master
-mergeability passes: `master` at `4e7c89b` is the candidate's exact merge base
-and the simulated merge tree equals the candidate tree. Independent re-review
-is still required before acceptance or merge.
+mergeability passed at final review. Independent re-review found no remaining
+issues after the fixed-signal capability was moved and pinned in
+`daemon/src/host_signal.rs`; the reviewed series was integrated on `master` at
+`5d99ebb4`.
 
 The reconciliation ledger is intentionally tab-local: a new tab or browser
 restart is not covered by this Phase 2 safety state. P2-DATA-01/P2-DATA-02 must
@@ -333,23 +338,73 @@ eight unresolved or durability-blocked records stop all new uploads until the
 user checks endpoint state and successfully persists explicit dismissals. No
 record is silently evicted to regain service.
 
-This is still a source checkpoint: it is not merged or deployed, does not purge
-historical copies, and does not complete Phase 2. Offline history is now an
-explicit non-feature: replay is available only from a live endpoint worker;
-when the host is offline or the worker exits, the server has no transcript to
-show. Historical transcript files, Redis/AOF/WAL, logs, memory, swap, cores,
-backups, replicas and snapshots remain in P2-PURGE-01 scope.
+This reviewed source is merged but not deployed, does not purge historical
+copies, and does not complete Phase 2. Offline history is now an explicit
+non-feature: replay is available only from a live endpoint worker; when the
+host is offline or the worker exits, the server has no transcript to show.
+Historical transcript files, Redis/AOF/WAL, logs, memory, swap, cores, backups,
+replicas and snapshots remain in P2-PURGE-01 scope.
+
+**P2-DATA-01 bounded design candidate (independent review pending):**
+`docs/DURABLE_SENSITIVE_DATA.md` selects a per-host endpoint-local canonical
+store. It explicitly rejects an opaque client-encrypted server store as the
+Phase 2 canonical source and forbids server key escrow, plaintext fallback,
+dual-write, browser-only canonical storage, and last-write-wins. The design
+covers the AEAD/key hierarchy, browser and endpoint trust, multi-device/host
+regressions, offline daemon restart, account recovery and encrypted
+export/import, CAS/replay/rollback semantics and limitations, migration,
+rotation/revocation/deletion, quotas, authenticated metadata, observability,
+compatibility failures, endpoint-durable `outcome_unknown` reconciliation,
+exact retained server metadata, and hand-offs to
+P2-DATA-02/P2-HOST-03B/P2-PURGE-01. Ten falsifiable acceptance gates are
+defined.
+
+Earlier DATA/HOST guard experiments tried to interpret Markdown and English
+security claims. That scope is intentionally stopped. Audit backups remain on
+`backup/p2-data-guard-interrupted-20260716` and
+`backup/p2-host-guard-interrupted-20260716`; neither those branches nor the
+complex guard commits on `review/p2-data-design` are merge candidates. The
+salvaged design prose is reviewed normally.
+
+[`GUARD_POLICY.md`](GUARD_POLICY.md) is now permanent: source guards enforce
+machine-readable rows, schemas, routes, APIs, required files, and small literal
+forbidden sets. They never parse English semantics, render Markdown/HTML, or
+maintain a generated prose inventory. The bounded shell guard can detect a
+missing canonical marker; it cannot approve this ADR or prove a runtime claim.
+
+**Parallel Phase 3 foundations (active):** P3-IDENTITY-01A owns the canonical
+Ed25519/envelope/fingerprint primitives and test vectors. P3-IDENTITY-01B owns
+host identity-key persistence and explicit pairing/re-pairing against that
+contract. Their branches start from reviewed master and may proceed in parallel
+with remaining Phase 2 cleanup. Neither foundation means signaling is signed,
+and each task plus later integration still requires its own tests, independent
+review, mergeability proof, and accepted gate.
+
+This checkpoint is documentation only. No endpoint store, protected-data
+DataChannel operation, migration, server-column clearing, deployment, or purge
+has occurred, and P2-DATA-02 remains blocked until the decision passes review
+and is merged.
 
 ## Remaining sequence
 
-1. Independently review and merge the P2-TERM-01 direct agent-upload candidate,
-   including current-master integrated-host coexistence; do not restore a
-   REST/WS compatibility upload path for old peers.
-2. Ship the parallel E2E path for interactive installer detail. Keep the
-   legacy tool route until its endpoint-owned durable targets exist; this wave
-   is not the final tool cut.
-3. Move full launch manifests, `Agent.env`, preset environment/install/tool
-   targets, and skill bodies to the approved endpoint-owned/encrypted store.
+1. Preserve the reviewed P2-TERM-01 server-upload-path removal merged at
+   `5d99ebb4` and the P2-HOST-02 filesystem cut merged at `4e7c89b`; do not
+   restore REST/WS compatibility content paths while integrating later work.
+2. Finish independent review of the bounded P2-DATA-01 design and the parallel
+   P2-HOST-03A interactive installer candidate. In parallel, continue the
+   independently gated P3-IDENTITY-01A crypto and P3-IDENTITY-01B host-pairing
+   foundations without claiming signed signaling. Keep the legacy tool route
+   until its endpoint-owned durable targets exist; this wave is not the final
+   tool cut.
+3. Only after P2-DATA-01 and P2-HOST-03A have passed independent review and
+   merged (with P2-HOST-02 and P2-TERM-01 already merged), implement the
+   then-reviewed per-host endpoint-local store in P2-DATA-02. Its evidence must
+   name exact reviewed protocol/effect-boundary commits, including TERM-01 at
+   `5d99ebb4` and the future accepted HOST-03A commit. Move full launch
+   manifests, `Agent.env`, preset environment/install/tool targets, and skill
+   bodies into it over `spawn.host.ctl`. Preserve the explicit offline-host and
+   cross-host-sync regressions in `DURABLE_SENSITIVE_DATA.md`; do not introduce
+   a protected server queue as a convenience fallback.
    Stop cwd-derived default names, then make the interactive E2E tool path
    mandatory, remove its legacy server route, finish unattended tool migration,
    and replace free-form server-visible daemon errors with E2E details.
@@ -357,10 +412,11 @@ backups, replicas and snapshots remain in P2-PURGE-01 scope.
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-5. Phase 3 adds Ed25519 host keys, browser device keys, and signed signaling
-   bound to SDP, session, agent-or-host scope, protocol version, sender role, and
-   intended peer key. Trusted/verifiable endpoints test fingerprint substitution
-   and cross-session/cross-scope replay for both agent- and host-scoped peer
+5. After the active Phase 3 foundations pass their own reviews, separately
+   integrate browser device keys and signed signaling bound to SDP, session,
+   agent-or-host scope, protocol version, sender role, and intended peer key.
+   Trusted/verifiable endpoints must reject fingerprint substitution and
+   cross-session/cross-scope replay for both agent- and host-scoped peer
    connections; unverified operator-hosted JavaScript remains outside that
    guarantee.
 
