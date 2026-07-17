@@ -47,7 +47,10 @@ test("persists a non-extractable identity across real browser page sessions", as
   const first = await page.evaluate(async () => {
     const api = globalThis.SpawnBrowserIdentity;
     const identity = await api.loadOrCreateBrowserDeviceIdentity("browser-persistence");
-    return { keys: Object.keys(identity).sort(), publicKeyWire: identity.publicKeyWire };
+    return {
+      keys: Object.keys(identity).sort(),
+      publicKeyWire: identity.publicKeyWire,
+    };
   });
 
   await page.reload();
@@ -112,7 +115,12 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
         request.onerror = () => reject(request.error);
         request.onblocked = () => reject(new Error("database deletion blocked"));
       });
-    const createInvalidDatabase = (keyPath: string, autoIncrement: boolean, marker: string) =>
+    const createInvalidDatabase = (schema: {
+      autoIncrement: boolean;
+      keyPath: string | string[] | null;
+      seedKey?: IDBValidKey;
+      seedRecord: Record<string, unknown>;
+    }) =>
       new Promise<void>((resolve, reject) => {
         const request = indexedDB.open(
           api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
@@ -120,10 +128,14 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
         );
         request.onupgradeneeded = () => {
           const store = request.result.createObjectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME, {
-            autoIncrement,
-            keyPath,
+            autoIncrement: schema.autoIncrement,
+            keyPath: schema.keyPath,
           });
-          store.add({ [keyPath]: "seed", marker });
+          if (schema.seedKey === undefined) {
+            store.add(schema.seedRecord);
+          } else {
+            store.add(schema.seedRecord, schema.seedKey);
+          }
         };
         request.onsuccess = () => {
           request.result.close();
@@ -135,41 +147,87 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
       new Promise<{
         autoIncrement: boolean;
         keyPath: IDBObjectStore["keyPath"];
+        keys: IDBValidKey[];
         records: unknown[];
       }>((resolve, reject) => {
         const request = indexedDB.open(api.BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
         request.onsuccess = () => {
           const database = request.result;
-          const transaction = database.transaction(
-            api.BROWSER_DEVICE_IDENTITY_STORE_NAME,
-            "readonly",
-          );
-          const store = transaction.objectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME);
-          const records = store.getAll();
-          records.onsuccess = () => {
-            resolve({
+          let settled = false;
+          const fail = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            database.close();
+            reject(error);
+          };
+          try {
+            const transaction = database.transaction(
+              api.BROWSER_DEVICE_IDENTITY_STORE_NAME,
+              "readonly",
+            );
+            const store = transaction.objectStore(api.BROWSER_DEVICE_IDENTITY_STORE_NAME);
+            const keys = store.getAllKeys();
+            const records = store.getAll();
+            const snapshot = {
               autoIncrement: store.autoIncrement,
               keyPath: store.keyPath,
-              records: records.result,
-            });
-            database.close();
-          };
-          records.onerror = () => {
-            database.close();
-            reject(records.error);
-          };
+              keys: [] as IDBValidKey[],
+              records: [] as unknown[],
+            };
+            keys.onsuccess = () => {
+              snapshot.keys = keys.result;
+            };
+            records.onsuccess = () => {
+              snapshot.records = records.result;
+            };
+            transaction.oncomplete = () => {
+              if (settled) return;
+              settled = true;
+              database.close();
+              resolve(snapshot);
+            };
+            transaction.onabort = () =>
+              fail(transaction.error ?? new Error("database inspection transaction aborted"));
+            transaction.onerror = () =>
+              fail(transaction.error ?? new Error("database inspection transaction failed"));
+          } catch (error) {
+            fail(error);
+          }
         };
         request.onerror = () => reject(request.error);
       });
 
     const cases = [
-      { autoIncrement: false, keyPath: "wrongAccountId", marker: "wrong-key-path" },
-      { autoIncrement: true, keyPath: "accountId", marker: "auto-increment" },
+      {
+        autoIncrement: false,
+        keyPath: "wrongAccountId",
+        seedRecord: { marker: "wrong-key-path", wrongAccountId: "seed" },
+      },
+      {
+        autoIncrement: false,
+        keyPath: ["tenant", "account"],
+        seedRecord: {
+          account: "seed",
+          marker: "compound-key-path",
+          tenant: "test",
+        },
+      },
+      {
+        autoIncrement: false,
+        keyPath: null,
+        seedKey: "seed",
+        seedRecord: { marker: "out-of-line-key" },
+      },
+      {
+        autoIncrement: true,
+        keyPath: "accountId",
+        seedRecord: { accountId: "seed", marker: "auto-increment" },
+      },
     ];
     const observed = [];
     for (const invalid of cases) {
       await deleteDatabase();
-      await createInvalidDatabase(invalid.keyPath, invalid.autoIncrement, invalid.marker);
+      await createInvalidDatabase(invalid);
       const before = await inspectDatabase();
       const errors = [];
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -190,12 +248,44 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
       after: {
         autoIncrement: false,
         keyPath: "wrongAccountId",
+        keys: ["seed"],
         records: [{ marker: "wrong-key-path", wrongAccountId: "seed" }],
       },
       before: {
         autoIncrement: false,
         keyPath: "wrongAccountId",
+        keys: ["seed"],
         records: [{ marker: "wrong-key-path", wrongAccountId: "seed" }],
+      },
+      errors: ["corrupt_record", "corrupt_record"],
+    },
+    {
+      after: {
+        autoIncrement: false,
+        keyPath: ["tenant", "account"],
+        keys: [["test", "seed"]],
+        records: [{ account: "seed", marker: "compound-key-path", tenant: "test" }],
+      },
+      before: {
+        autoIncrement: false,
+        keyPath: ["tenant", "account"],
+        keys: [["test", "seed"]],
+        records: [{ account: "seed", marker: "compound-key-path", tenant: "test" }],
+      },
+      errors: ["corrupt_record", "corrupt_record"],
+    },
+    {
+      after: {
+        autoIncrement: false,
+        keyPath: null,
+        keys: ["seed"],
+        records: [{ marker: "out-of-line-key" }],
+      },
+      before: {
+        autoIncrement: false,
+        keyPath: null,
+        keys: ["seed"],
+        records: [{ marker: "out-of-line-key" }],
       },
       errors: ["corrupt_record", "corrupt_record"],
     },
@@ -203,11 +293,13 @@ test("rejects corrupt version-1 store schemas repeatedly without rotating", asyn
       after: {
         autoIncrement: true,
         keyPath: "accountId",
+        keys: ["seed"],
         records: [{ accountId: "seed", marker: "auto-increment" }],
       },
       before: {
         autoIncrement: true,
         keyPath: "accountId",
+        keys: ["seed"],
         records: [{ accountId: "seed", marker: "auto-increment" }],
       },
       errors: ["corrupt_record", "corrupt_record"],
