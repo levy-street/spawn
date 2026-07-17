@@ -1,0 +1,57 @@
+{
+  "format": "spawn-signed-signal-v1",
+  "key_material_source": "RFC 8032 section 7.1 test vectors 1 and 2; test use only",
+  "signing_key": {
+    "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "public_key_wire": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+  },
+  "intended_peer_key": {
+    "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+    "public_key_wire": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"
+  },
+  "mutation_fields": [
+    "signal_kind",
+    "protocol_version",
+    "session_id",
+    "scope_type",
+    "scope_id",
+    "sender_role",
+    "intended_peer_public_key",
+    "sdp"
+  ],
+  "vectors": [
+    {
+      "id": "agent-offer",
+      "signal_kind": "offer",
+      "protocol_version": 2,
+      "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+      "scope_type": "agent",
+      "scope_id": "11111111-2222-4333-8444-555555555555",
+      "sender_role": "browser",
+      "intended_peer_public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "sdp": "v=0\r\no=- 461173305954868531 2 IN IP4 127.0.0.1\r\ns=spawn-agent\r\nt=0 0\r\na=setup:actpass\r\n",
+      "transcript_hex": "535041574e2d5254432d5349474e414c2d5349472d5631010100000002002430313866306637372d383664322d376138652d396231632d31663362383437636132613101002431313131313131312d323232322d343333332d383434342d353535353535353535353535013d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00000057763d300d0a6f3d2d20343631313733333035393534383638353331203220494e20495034203132372e302e302e310d0a733d737061776e2d6167656e740d0a743d3020300d0a613d73657475703a616374706173730d0a",
+      "sha256_hex": "efdb1ed0f7016e325e1dad0d173fded429d16e7e830ec6f4d18bf6011e407a06",
+      "signature_hex": "49681f65c87d88e5aac3d8694a770a53f15dbba751c1bcdeac7529628814553ebc3186b33f0dd7861cf5aca3882a8609884fe55b30b7fafa65383a06b36fc602",
+      "signature_wire": "SWgfZch9iOWqw9hpSncKU_Fdu6dRwbzerHUpYogUVT68MYazPw3Xhhz1rKOIKoYJiE_lWzC3-vplODoGs2_GAg",
+      "replay_signature_from": "host-answer"
+    },
+    {
+      "id": "host-answer",
+      "signal_kind": "answer",
+      "protocol_version": 1,
+      "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+      "scope_type": "host",
+      "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "sender_role": "daemon",
+      "intended_peer_public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+      "transcript_hex": "535041574e2d5254432d5349474e414c2d5349472d5631010200000001002430313866306637372d383664322d376138652d396231632d31663362383437636132623202002461616161616161612d626262622d346363632d386464642d656565656565656565656565023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00000055763d300d0a6f3d2d20343631313733333035393534383638353332203220494e20495034203132372e302e302e310d0a733d737061776e2d686f73740d0a743d3020300d0a613d73657475703a6163746976650d0a",
+      "sha256_hex": "1ce91c0d3aef35f22a4bb48e5d2eebb029205a07c4766739923ea490d683cbb4",
+      "signature_hex": "3615830ce7f53550076020da954ce82aea27833336b2a66c1eed8f08959122b47319b2d5faaf895e8a1eaf3004c01e2bf3fae34ed8f01a1b151fa20d7f9b030b",
+      "signature_wire": "NhWDDOf1NVAHYCDalUzoKuongzM2sqZsHu2PCJWRIrRzGbLV-q-JXooerzAEwB4r8_rjTtjwGhsVH6INf5sDCw",
+      "replay_signature_from": "agent-offer"
+    }
+  ]
+}
