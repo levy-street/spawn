@@ -38,7 +38,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
-import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
+import {
+  unsignedHostControlDestination,
+  useHostControlClientFactory,
+} from "@/lib/host-control-trust";
+import type { HostDirEntry, HostDirList } from "@/lib/hostControl";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
@@ -138,7 +142,9 @@ export function FileExplorer({
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [pageCursors, setPageCursors] = useState<Record<string, number[]>>({});
   const uploadDirRef = useRef<string | null>(null);
+  const transferControllersRef = useRef(new Set<AbortController>());
   const initialAppliedRef = useRef(false);
+  const hostControlFactory = useHostControlClientFactory();
   const { client: hostControl, state: hostControlState } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
 
@@ -455,16 +461,28 @@ export function FileExplorer({
     }) => {
       if (!hostControl) throw new Error("Source host is not connected");
       return (async () => {
-        const destination = new HostControlClient(destHostId);
+        const destination = hostControlFactory.createClient(
+          unsignedHostControlDestination(destHostId),
+        );
+        const operation = new AbortController();
+        transferControllersRef.current.add(operation);
+        const signal = AbortSignal.any([
+          operation.signal,
+          hostControl.getTrustSignal(),
+          destination.getTrustSignal(),
+        ]);
         try {
-          await destination.waitUntilReady();
-          const home = await destination.home();
+          await destination.waitUntilReady(undefined, signal);
+          const home = await destination.home({ signal });
           return await hostControl.transferFileTo(
             destination,
             entry.path,
             destDir === "~" ? home.home_dir : destDir,
+            false,
+            signal,
           );
         } finally {
+          transferControllersRef.current.delete(operation);
           destination.close();
         }
       })();
@@ -472,6 +490,15 @@ export function FileExplorer({
     onSuccess: (result) => setStatus(`Sent to ${result.path ?? "destination host"}`),
     onError: (err) => setStatus(errorMessage(err)),
   });
+
+  useEffect(() => {
+    return () => {
+      for (const controller of transferControllersRef.current) {
+        controller.abort(new DOMException("File explorer unmounted", "AbortError"));
+      }
+      transferControllersRef.current.clear();
+    };
+  }, []);
 
   const download = useCallback(
     async (entry: HostDirEntry) => {

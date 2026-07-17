@@ -2,9 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
 import { commitAuthenticatedUser } from "./auth";
 import type { BrowserDeviceRegistrationState } from "./browser-device-registration";
-import { type BrowserTrustInputs, deriveBrowserTrust } from "./browser-trust";
 import {
+  type BrowserTrustInputs,
+  deriveBrowserTrust,
+  refreshBrowserTrustAfterPeerInvalidation,
+} from "./browser-trust";
+import {
+  BrowserTrustInvalidationProtocol,
   establishBrowserTrustSession,
+  fanoutBrowserTrustInvalidation,
   getBrowserTrustSessionSnapshot,
   invalidateBrowserTrust,
   SERVER_BROWSER_TRUST_SESSION_SNAPSHOT,
@@ -70,6 +76,7 @@ describe("browser trust status", () => {
       status: "invalidated" as const,
       ownerUserId: null,
       reason: "unauthorized" as const,
+      source: "local" as const,
     };
     expect(deriveBrowserTrust(inputs({ session: invalidated }))).toMatchObject({
       status: "blocked",
@@ -83,6 +90,7 @@ describe("browser trust status", () => {
             status: "established",
             ownerUserId: USER_B,
             reason: null,
+            source: null,
           },
         }),
       ),
@@ -147,5 +155,125 @@ describe("browser trust status", () => {
       status: "established",
       ownerUserId: USER_B,
     });
+  });
+
+  test("propagates logout, expiry, and auth errors to a second tab without replay", () => {
+    const received: string[] = [];
+    const tabA = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000101",
+      () => {},
+      () => 1_000,
+    );
+    const tabB = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000102",
+      (reason) => {
+        received.push(reason);
+        invalidateBrowserTrust(reason, { broadcast: false, source: "peer" });
+      },
+      () => 1_000,
+    );
+
+    for (const reason of ["logout", "session_expired", "auth_error"] as const) {
+      const message = tabA.create(reason);
+      expect(tabB.receive(message)).toBe(true);
+      expect(tabB.receive(message)).toBe(false);
+      expect(getBrowserTrustSessionSnapshot()).toMatchObject({
+        status: "invalidated",
+        reason,
+        source: "peer",
+      });
+    }
+    expect(received).toEqual(["logout", "session_expired", "auth_error"]);
+  });
+
+  test("requires fresh /me and registration reads before a peer account switch re-establishes", async () => {
+    const queryClient = new QueryClient();
+    const order: string[] = [];
+    invalidateBrowserTrust("account_change", { broadcast: false, source: "peer" });
+
+    const restored = await refreshBrowserTrustAfterPeerInvalidation(
+      queryClient,
+      new AbortController().signal,
+      {
+        fetchMe: async () => {
+          order.push(`me:${getBrowserTrustSessionSnapshot().status}`);
+          return {
+            user: {
+              id: USER_B,
+              email: "b@example.com",
+              created_at: "2026-07-17T00:00:00Z",
+            },
+          };
+        },
+        fetchRegistration: async (_client, userId) => {
+          order.push(`registration:${userId}:${getBrowserTrustSessionSnapshot().status}`);
+          return {
+            ...readyRegistration,
+            device: { ...readyRegistration.device, id: "00000000-0000-4000-8000-000000000004" },
+          };
+        },
+      },
+    );
+
+    expect(restored).toBe(true);
+    expect(order).toEqual(["me:invalidated", `registration:${USER_B}:invalidated`]);
+    expect(getBrowserTrustSessionSnapshot()).toMatchObject({
+      status: "established",
+      ownerUserId: USER_B,
+    });
+
+    invalidateBrowserTrust("logout", { broadcast: false, source: "peer" });
+    let registrationCalled = false;
+    expect(
+      await refreshBrowserTrustAfterPeerInvalidation(queryClient, new AbortController().signal, {
+        fetchMe: async () => null,
+        fetchRegistration: async () => {
+          registrationCalled = true;
+          return readyRegistration;
+        },
+      }),
+    ).toBe(false);
+    expect(registrationCalled).toBe(false);
+    expect(getBrowserTrustSessionSnapshot().status).toBe("invalidated");
+  });
+
+  test("broadcast revocation still reaches a peer when the durable marker write fails", () => {
+    const received: string[] = [];
+    const tabA = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000103",
+      () => {},
+      () => 1_000,
+    );
+    const tabB = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000104",
+      (reason) => received.push(reason),
+      () => 1_000,
+    );
+    fanoutBrowserTrustInvalidation(tabA.create("registration_revoked"), {
+      broadcast: (encoded) => void tabB.receive(encoded),
+      store: () => {
+        throw new Error("localStorage quota failure");
+      },
+    });
+    expect(received).toEqual(["registration_revoked"]);
+  });
+
+  test("bounds peer replay memory and rejects oversized protocol input", () => {
+    const tabA = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000105",
+      () => {},
+      () => 1_000,
+    );
+    const tabB = new BrowserTrustInvalidationProtocol(
+      "00000000-0000-4000-8000-000000000106",
+      () => {},
+      () => 1_000,
+    );
+    for (let index = 0; index < 80; index += 1) {
+      expect(tabB.receive(tabA.create("unauthorized"))).toBe(true);
+    }
+    expect(tabA.seenEventCount()).toBe(64);
+    expect(tabB.seenEventCount()).toBe(64);
+    expect(tabB.receive("x".repeat(513))).toBe(false);
   });
 });

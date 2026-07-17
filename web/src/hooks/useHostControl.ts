@@ -1,25 +1,39 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-import { HostControlClient, type HostControlState } from "@/lib/hostControl";
+import {
+  unsignedHostControlDestination,
+  useHostControlClientFactory,
+} from "@/lib/host-control-trust";
+import type { HostControlClient, HostControlState } from "@/lib/hostControl";
 
 export function useHostControl(hostId: string | null, enabled = true) {
-  const client = useMemo(() => (hostId ? new HostControlClient(hostId) : null), [hostId]);
+  const factory = useHostControlClientFactory();
+  const [client, setClient] = useState<HostControlClient | null>(null);
   const [state, setState] = useState<HostControlState>("idle");
 
   useEffect(() => {
-    if (!client || !enabled) {
+    setClient(null);
+    if (!hostId || !enabled) {
       setState("idle");
       return;
     }
+    let client: HostControlClient;
+    try {
+      client = factory.createClient(unsignedHostControlDestination(hostId));
+    } catch {
+      setState("error");
+      return;
+    }
+    setClient(client);
     const unsubscribe = client.subscribe(setState);
     client.connect();
     return () => {
       unsubscribe();
       client.close();
     };
-  }, [client, enabled]);
+  }, [enabled, factory, hostId]);
 
   return { client, state };
 }

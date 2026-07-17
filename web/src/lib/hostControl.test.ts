@@ -113,9 +113,27 @@ const metadata = {
   protocol_version: 1,
 };
 
-async function readyClient(options = {}, clientHostId = hostId) {
+function testTrust(clientHostId = hostId, controller = new AbortController()) {
+  return {
+    accountOwnerUserId: "00000000-0000-4000-8000-000000000010",
+    trustEpochKey: "test-epoch",
+    browserRegistration: {
+      deviceId: "00000000-0000-4000-8000-000000000011",
+      publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    },
+    destination: {
+      hostId: clientHostId,
+      peerIdentity: { status: "unsigned_not_implemented" },
+    },
+    lifecycleSignal: controller.signal,
+    acquire: () => true,
+    release: () => {},
+  };
+}
+
+async function readyClient(options = {}, clientHostId = hostId, trust = testTrust(clientHostId)) {
   const clientMetadata = { ...metadata, scope_id: clientHostId };
-  const client = new HostControlClient(clientHostId, options);
+  const client = new HostControlClient(clientHostId, trust, options);
   client.connect();
   const ws = FakeWebSocket.instances.at(-1);
   ws.onopen?.();
@@ -322,8 +340,34 @@ describe("HostControlClient", () => {
     second.client.close();
   });
 
+  test("trust revocation aborts requests, mutations, and both sides of a pending transfer", async () => {
+    const requestEpoch = new AbortController();
+    const endpoint = await readyClient({}, hostId, testTrust(hostId, requestEpoch));
+    const ping = endpoint.client.ping().catch((error) => error);
+    const mutation = endpoint.client.mkdir("/possibly-created").catch((error) => error);
+    requestEpoch.abort();
+    expect((await ping).name).toBe("AbortError");
+    expect(await mutation).toMatchObject({ code: "outcome_unknown" });
+    expect(endpoint.pc.channel.closed).toBe(true);
+
+    const transferEpoch = new AbortController();
+    const source = await readyClient({}, hostId, testTrust(hostId, transferEpoch));
+    const destination = await readyClient(
+      {},
+      destinationHostId,
+      testTrust(destinationHostId, transferEpoch),
+    );
+    const transfer = source.client
+      .transferFileTo(destination.client, "/source/pending.txt", "/destination")
+      .catch((error) => error);
+    transferEpoch.abort();
+    expect((await transfer).name).toBe("AbortError");
+    expect(source.pc.channel.closed).toBe(true);
+    expect(destination.pc.channel.closed).toBe(true);
+  });
+
   test("ignores signaling metadata for another host", async () => {
-    const client = new HostControlClient(hostId);
+    const client = new HostControlClient(hostId, testTrust());
     client.connect();
     const ws = FakeWebSocket.instances.at(-1);
     ws.onopen?.();
@@ -341,7 +385,7 @@ describe("HostControlClient", () => {
   });
 
   test("times out before an answer or hello and reconnects exactly once", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -364,7 +408,7 @@ describe("HostControlClient", () => {
 
     FakeWebSocket.instances = [];
     FakePeerConnection.instances = [];
-    const noHelloClient = new HostControlClient(hostId, {
+    const noHelloClient = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -396,7 +440,7 @@ describe("HostControlClient", () => {
   });
 
   test("attempt deadline covers a websocket that never opens or never receives config", async () => {
-    const neverOpen = new HostControlClient(hostId, {
+    const neverOpen = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -407,7 +451,7 @@ describe("HostControlClient", () => {
 
     FakeWebSocket.instances = [];
     FakePeerConnection.instances = [];
-    const noConfig = new HostControlClient(hostId, {
+    const noConfig = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 5,
       reconnectBaseDelayMs: 1,
     });
@@ -443,7 +487,7 @@ describe("HostControlClient", () => {
   });
 
   test("repeated unavailable attempts increase backoff until a valid hello", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 1000,
       reconnectBaseDelayMs: 20,
     });
@@ -534,7 +578,7 @@ describe("HostControlClient", () => {
   });
 
   test("queued callbacks from a replaced websocket cannot affect the current attempt", async () => {
-    const client = new HostControlClient(hostId, {
+    const client = new HostControlClient(hostId, testTrust(), {
       connectTimeoutMs: 1000,
       reconnectBaseDelayMs: 1,
     });
@@ -1148,6 +1192,20 @@ describe("HostControlClient", () => {
       }),
     );
     await expect(transferring).resolves.toEqual({ path: "/destination/notes.txt" });
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("refuses a cross-host transfer whose destination belongs to another trust epoch", async () => {
+    const source = await readyClient();
+    const otherEpoch = testTrust(destinationHostId);
+    otherEpoch.trustEpochKey = "other-epoch";
+    const destination = await readyClient({}, destinationHostId, otherEpoch);
+    const sentBefore = source.pc.channel.sent.length;
+    await expect(
+      source.client.transferFileTo(destination.client, "/source/secret.txt", "/destination"),
+    ).rejects.toMatchObject({ name: "SecurityError" });
+    expect(source.pc.channel.sent).toHaveLength(sentBefore);
     source.client.close();
     destination.client.close();
   });

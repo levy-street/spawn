@@ -137,6 +137,27 @@ export interface HostControlClientOptions {
   streamTimeoutMs?: number;
 }
 
+export type HostControlDestinationTrustMaterial = {
+  hostId: string;
+  /** Reserved for the signed-signal cutover; unsigned operation is explicit. */
+  peerIdentity: { status: "unsigned_not_implemented" };
+};
+
+export interface HostControlTrustMaterial {
+  accountOwnerUserId: string;
+  trustEpochKey: string;
+  browserRegistration: {
+    deviceId: string;
+    publicKey: string;
+  };
+  destination: HostControlDestinationTrustMaterial;
+  lifecycleSignal: AbortSignal;
+  /** The epoch registry owns every live transport and may refuse stale reacquisition. */
+  acquire: (client: HostControlClient) => boolean;
+  /** Releases both the registry slot and the registry's strong reference. */
+  release: (client: HostControlClient) => void;
+}
+
 export class HostControlClient {
   private state: HostControlState = "idle";
   private ws: WebSocket | null = null;
@@ -154,11 +175,22 @@ export class HostControlClient {
   private cancelledIncomingStreams = new Map<string, CancelledIncomingStream>();
   private outgoingStreams = new Map<string, OutgoingStream>();
   private listeners = new Set<(state: HostControlState) => void>();
+  private trustRevoked = false;
+  private trustLeaseAttached = false;
+  private readonly onTrustAbort = () => this.revokeTrust();
 
   constructor(
     readonly hostId: string,
+    readonly trustMaterial: HostControlTrustMaterial,
     private readonly options: HostControlClientOptions = {},
-  ) {}
+  ) {
+    if (trustMaterial.destination.hostId !== hostId) {
+      throw new Error("Host control destination trust does not match the requested host");
+    }
+    if (!this.attachTrustLease()) {
+      this.trustRevoked = true;
+    }
+  }
 
   getState(): HostControlState {
     return this.state;
@@ -171,20 +203,48 @@ export class HostControlClient {
   }
 
   connect(): void {
+    if (this.trustRevoked) return;
     if (!this.stopped) return;
+    if (!this.attachTrustLease()) {
+      this.revokeTrust();
+      return;
+    }
     this.stopped = false;
     this.openWebSocket();
   }
 
-  waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<void> {
+  waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, signal?: AbortSignal): Promise<void> {
+    const lifecycleSignal = signal
+      ? AbortSignal.any([this.trustMaterial.lifecycleSignal, signal])
+      : this.trustMaterial.lifecycleSignal;
+    if (this.trustRevoked || lifecycleSignal.aborted) {
+      return Promise.reject(new DOMException("Browser trust epoch ended", "AbortError"));
+    }
     if (this.state === "ready") return Promise.resolve();
     this.connect();
+    if (this.trustRevoked || lifecycleSignal.aborted) {
+      return Promise.reject(new DOMException("Browser trust epoch ended", "AbortError"));
+    }
     return new Promise((resolve, reject) => {
       let unsubscribe = () => {};
       let settled = false;
-      const timer = setTimeout(
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        lifecycleSignal.removeEventListener("abort", onAbort);
+        unsubscribe();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new DOMException("Browser trust epoch ended", "AbortError"));
+      };
+      timer = setTimeout(
         () => {
-          unsubscribe();
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(new HostControlError("connect_timeout", "Host control connection timed out"));
         },
         Math.max(1, timeoutMs),
@@ -192,29 +252,70 @@ export class HostControlClient {
       unsubscribe = this.subscribe((state) => {
         if (state !== "ready") return;
         settled = true;
-        clearTimeout(timer);
-        unsubscribe();
+        cleanup();
         resolve();
       });
       if (settled) unsubscribe();
+      else if (lifecycleSignal.aborted) onAbort();
+      else lifecycleSignal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
+  getTrustSignal(): AbortSignal {
+    return this.trustMaterial.lifecycleSignal;
+  }
+
+  revokeTrust(): void {
+    if (this.trustRevoked) return;
+    this.trustRevoked = true;
+    this.closeWithError(new DOMException("Browser trust epoch ended", "AbortError"));
+  }
+
   close(): void {
+    this.closeWithError(new Error("Host control connection closed"));
+  }
+
+  private closeWithError(error: Error): void {
     this.stopped = true;
     this.connectionAttempt += 1;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.clearConnectDeadline();
-    this.cleanupRtc(true);
+    this.cleanupRtc(true, error);
     const ws = this.ws;
     this.ws = null;
     if (ws) {
       this.detachWebSocket(ws);
-      ws.close(1000, "host control closed");
+      try {
+        ws.close(1000, "host control closed");
+      } catch {
+        // Local teardown and pending-operation rejection remain mandatory.
+      }
     }
-    this.rejectPending(new Error("Host control connection closed"));
+    this.rejectPending(error);
     this.setState("closed");
+    this.detachTrustLease();
+  }
+
+  private attachTrustLease(): boolean {
+    if (this.trustLeaseAttached) return !this.trustMaterial.lifecycleSignal.aborted;
+    if (this.trustMaterial.lifecycleSignal.aborted || !this.trustMaterial.acquire(this)) {
+      return false;
+    }
+    this.trustLeaseAttached = true;
+    this.trustMaterial.lifecycleSignal.addEventListener("abort", this.onTrustAbort, { once: true });
+    if (this.trustMaterial.lifecycleSignal.aborted) {
+      this.detachTrustLease();
+      return false;
+    }
+    return true;
+  }
+
+  private detachTrustLease(): void {
+    if (!this.trustLeaseAttached) return;
+    this.trustLeaseAttached = false;
+    this.trustMaterial.lifecycleSignal.removeEventListener("abort", this.onTrustAbort);
+    this.trustMaterial.release(this);
   }
 
   request<T = unknown>(
@@ -222,6 +323,9 @@ export class HostControlClient {
     payload?: unknown,
     options: HostControlRequestOptions = {},
   ): Promise<T> {
+    if (this.trustRevoked || this.trustMaterial.lifecycleSignal.aborted) {
+      return Promise.reject(new DOMException("Browser trust epoch ended", "AbortError"));
+    }
     const channel = this.channel;
     if (this.state !== "ready" || channel?.readyState !== "open") {
       return Promise.reject(new Error("Host control channel is not ready"));
@@ -607,7 +711,24 @@ export class HostControlClient {
     overwrite = false,
     signal?: AbortSignal,
   ): Promise<HostFileOp> {
-    const source = await this.readFile(path, { signal, timeoutMs: this.streamTimeoutMs() });
+    if (
+      this.trustMaterial.accountOwnerUserId !== destination.trustMaterial.accountOwnerUserId ||
+      this.trustMaterial.trustEpochKey !== destination.trustMaterial.trustEpochKey
+    ) {
+      throw new DOMException("Cross-epoch host transfer refused", "SecurityError");
+    }
+    const transferSignal = AbortSignal.any([
+      this.trustMaterial.lifecycleSignal,
+      destination.trustMaterial.lifecycleSignal,
+      ...(signal ? [signal] : []),
+    ]);
+    if (transferSignal.aborted) {
+      throw new DOMException("Browser trust epoch ended", "AbortError");
+    }
+    const source = await this.readFile(path, {
+      signal: transferSignal,
+      timeoutMs: this.streamTimeoutMs(),
+    });
     try {
       const destinationPath = await destination.writeStream(
         source.stream,
@@ -618,7 +739,7 @@ export class HostControlClient {
           sha256: source.sha256,
           overwrite,
         },
-        signal,
+        transferSignal,
       );
       return { path: destinationPath };
     } catch (error) {
@@ -628,7 +749,7 @@ export class HostControlClient {
   }
 
   private openWebSocket(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.trustRevoked) return;
     const attempt = ++this.connectionAttempt;
     const previous = this.ws;
     this.ws = null;
@@ -1195,10 +1316,19 @@ export class HostControlClient {
     }
   }
 
-  private cleanupRtc(notifyServer: boolean): void {
+  private cleanupRtc(
+    notifyServer: boolean,
+    terminalError: Error = new HostControlError("connection_closed", "Host control session ended"),
+  ): void {
     const sessionId = this.sessionId;
     this.sessionId = null;
-    if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
+    if (notifyServer && sessionId) {
+      try {
+        this.sendSignal({ type: "rtc.close", session_id: sessionId });
+      } catch {
+        // Local channel closure does not depend on signaling availability.
+      }
+    }
     const channel = this.channel;
     const pc = this.pc;
     this.channel = null;
@@ -1209,31 +1339,38 @@ export class HostControlClient {
       channel.onmessage = null;
       channel.onclose = null;
       channel.onerror = null;
-      channel.close();
+      try {
+        channel.close();
+      } catch {
+        // Continue closing the peer and rejecting every pending capability.
+      }
     }
     if (pc) {
       pc.onicecandidate = null;
       pc.onconnectionstatechange = null;
-      pc.close();
+      try {
+        pc.close();
+      } catch {
+        // Pending operations are still rejected below.
+      }
     }
-    this.rejectPending(new Error("Host control session ended"));
-    const streamError = new HostControlError("connection_closed", "Host control session ended");
+    this.rejectPending(terminalError);
     for (const [streamId, incoming] of this.incomingStreams) {
       this.incomingStreams.delete(streamId);
       clearTimeout(incoming.timer);
-      incoming.controller.error(streamError);
+      incoming.controller.error(terminalError);
     }
     this.cancelledIncomingStreams.clear();
     for (const [streamId, outgoing] of this.outgoingStreams) {
       this.outgoingStreams.delete(streamId);
       clearTimeout(outgoing.timer);
-      outgoing.reject(this.writeAcknowledgementLost(outgoing, streamError));
+      outgoing.reject(this.writeAcknowledgementLost(outgoing, terminalError));
     }
     if (!this.stopped && this.state === "ready") this.setState("open");
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer) return;
+    if (this.stopped || this.trustRevoked || this.reconnectTimer) return;
     this.clearConnectDeadline();
     this.reconnectAttempt += 1;
     const attempt = this.connectionAttempt;
@@ -1271,7 +1408,9 @@ export class HostControlClient {
   }
 
   private isCurrentWebSocket(ws: WebSocket, attempt: number): boolean {
-    return !this.stopped && this.ws === ws && this.connectionAttempt === attempt;
+    return (
+      !this.stopped && !this.trustRevoked && this.ws === ws && this.connectionAttempt === attempt
+    );
   }
 
   private detachWebSocket(ws: WebSocket): void {

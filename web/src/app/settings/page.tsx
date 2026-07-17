@@ -28,6 +28,7 @@ import {
   finishBrowserDeviceLocalCleanup,
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
+import { establishBrowserTrustSession, invalidateBrowserTrust } from "@/lib/browser-trust-events";
 
 export default function SettingsPage() {
   return (
@@ -122,6 +123,7 @@ function BrowserDevicesSettings() {
       // Disable identity-dependent actions in this tab immediately after the
       // server confirms revocation, even if durable local cleanup state cannot
       // be written or IndexedDB deletion fails below.
+      invalidateBrowserTrust("registration_revoked");
       setRegistrationState({ status: "cleanup_pending", publicKey: device.public_key });
       try {
         const localStatus = await beginBrowserDeviceLocalCleanup(user.id, device.public_key);
@@ -166,12 +168,16 @@ function BrowserDevicesSettings() {
     }
   };
 
-  const createReplacement = () => {
+  const createReplacement = async () => {
     if (!user || registration.data?.status !== "revoked") return;
     setError(null);
     try {
       allowExplicitBrowserIdentityReplacement(user.id, registration.data.publicKey);
-      void qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
+      await qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
+      const replacement = qc.getQueryData<BrowserDeviceRegistrationState>(
+        browserDeviceRegistrationQueryKey(user.id),
+      );
+      if (replacement?.status === "ready") establishBrowserTrustSession(user.id);
       void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -222,7 +228,7 @@ function BrowserDevicesSettings() {
                 The server key is revoked and the local key is removed. Creating a replacement is an
                 explicit new registration.
               </p>
-              <Button size="sm" onClick={createReplacement}>
+              <Button size="sm" onClick={() => void createReplacement()}>
                 Create replacement identity
               </Button>
             </div>

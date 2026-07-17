@@ -573,6 +573,28 @@ becomes null, changes UUID, or browser registration is revoked/errors,
 and pins even though it is mounted above `AuthGate`. Account-switch and expired-
 session tests plus distinct H1→H2 cross-host pins are mandatory.
 
+**P3-BROWSER-TRUST-SCOPE (implementation complete; independent re-review
+pending):** the browser now derives a single account/registration epoch above
+both terminal and HostControl providers. Local logout, 401/expiry, auth or
+registration error, account replacement, and confirmed current-device
+revocation synchronously close warm terminals, peer connections, DataChannels,
+pending requests, and streams. A bounded invalidation-only cross-tab protocol
+uses BroadcastChannel with an independent storage fallback; a receiving tab
+cannot trust the message as identity evidence and must perform fresh `/me` and
+browser-registration reads before establishing a replacement epoch. Replay
+memory, message size, and per-epoch HostControl clients are bounded.
+
+All production HostControl construction now crosses one registry that requires
+the account owner, exact epoch, active browser registration, and an explicit
+per-destination trust-material object. Normal close releases the registry lease
+and lifecycle listener; stale reconnect is refused, and H1→H2 transfers combine
+both lifecycle signals and reject owner/epoch mismatch. A source inventory
+guards against reintroducing raw destination construction. The destination
+identity field remains explicitly `unsigned_not_implemented`, because live
+peer pins/signers do not exist until F4/F5. This checkpoint therefore makes no
+signed-signaling, TOFU, or L1 claim and is not merge-ready until independent
+re-review and current-master mergeability pass.
+
 Daemon trust state cannot remain the one-time `run()` credential snapshot.
 Pin add/revoke and token/host-key rotation require a revisioned coherent
 whole-record reload/notification, or a loud enforced restart boundary. The

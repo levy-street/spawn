@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { type BrowserDevice, browserDevices } from "./api";
 import {
@@ -116,6 +116,21 @@ async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegis
     throw new Error("browser registration response did not match the submitted active key");
   }
   return { status: "ready", device, publicKey: identity.publicKeyWire };
+}
+
+/** Peer invalidations may re-open trust only after bypassing every cached registration result. */
+export async function fetchFreshBrowserDeviceRegistration(
+  queryClient: QueryClient,
+  userId: string,
+): Promise<BrowserDeviceRegistrationState> {
+  const queryKey = browserDeviceRegistrationQueryKey(userId);
+  await queryClient.cancelQueries({ queryKey });
+  queryClient.removeQueries({ queryKey });
+  return await queryClient.fetchQuery({
+    queryKey,
+    queryFn: () => registerBrowserDevice(userId),
+    staleTime: 0,
+  });
 }
 
 export function browserIdentityConnectionsAllowed(

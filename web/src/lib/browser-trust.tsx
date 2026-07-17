@@ -5,19 +5,25 @@ import {
   createContext,
   type ReactNode,
   useContext,
+  useEffect,
   useLayoutEffect,
   useRef,
   useSyncExternalStore,
 } from "react";
+import { ApiError, auth, type User } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   type BrowserDeviceRegistrationState,
+  fetchFreshBrowserDeviceRegistration,
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
 import {
   type BrowserTrustSessionSnapshot,
+  establishBrowserTrustSession,
   getBrowserTrustSessionSnapshot,
+  invalidateBrowserTrust,
   SERVER_BROWSER_TRUST_SESSION_SNAPSHOT,
+  startBrowserTrustInvalidationBridge,
   subscribeBrowserTrustSession,
 } from "@/lib/browser-trust-events";
 
@@ -204,6 +210,42 @@ export function discardBrowserOwnedQueryCache(
   queryClient.removeQueries({ predicate });
 }
 
+export interface PeerBrowserTrustRefreshDependencies {
+  fetchMe: (signal: AbortSignal) => Promise<{ user: User } | null>;
+  fetchRegistration: (
+    queryClient: QueryClient,
+    userId: string,
+  ) => Promise<BrowserDeviceRegistrationState>;
+}
+
+const peerRefreshDependencies: PeerBrowserTrustRefreshDependencies = {
+  fetchMe: async (signal) => {
+    try {
+      return await auth.me(signal, true);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) return null;
+      throw error;
+    }
+  },
+  fetchRegistration: fetchFreshBrowserDeviceRegistration,
+};
+
+/** A peer event closes now and can only be replaced by fresh auth and registration reads. */
+export async function refreshBrowserTrustAfterPeerInvalidation(
+  queryClient: QueryClient,
+  signal: AbortSignal,
+  dependencies: PeerBrowserTrustRefreshDependencies = peerRefreshDependencies,
+): Promise<boolean> {
+  const me = await dependencies.fetchMe(signal);
+  if (signal.aborted || me === null) return false;
+  queryClient.setQueryData(["me"], me);
+  discardBrowserOwnedQueryCache(queryClient, me.user.id);
+  const registration = await dependencies.fetchRegistration(queryClient, me.user.id);
+  if (signal.aborted || registration.status !== "ready") return false;
+  establishBrowserTrustSession(me.user.id);
+  return true;
+}
+
 const BrowserTrustCtx = createContext<BrowserTrustStatus | null>(null);
 
 export function BrowserTrustProvider({ children }: { children: ReactNode }) {
@@ -250,8 +292,15 @@ export function BrowserTrustProvider({ children }: { children: ReactNode }) {
       if (handledInvalidationSerialRef.current === session.serial) return;
       handledInvalidationSerialRef.current = session.serial;
       void queryClient.cancelQueries();
-      queryClient.setQueryData(["me"], null);
-      discardBrowserOwnedQueryCache(queryClient, null);
+      const preserveAuthenticatedIdentity =
+        session.reason === "registration_revoked" ||
+        session.reason === "registration_error" ||
+        session.reason === "auth_error";
+      if (!preserveAuthenticatedIdentity) queryClient.setQueryData(["me"], null);
+      discardBrowserOwnedQueryCache(
+        queryClient,
+        preserveAuthenticatedIdentity ? trust.observedUserId : null,
+      );
       return;
     }
 
@@ -261,7 +310,24 @@ export function BrowserTrustProvider({ children }: { children: ReactNode }) {
     ) {
       discardBrowserOwnedQueryCache(queryClient, trust.observedUserId);
     }
-  }, [queryClient, session.serial, session.status, trust]);
+  }, [queryClient, session.reason, session.serial, session.status, trust]);
+
+  useEffect(startBrowserTrustInvalidationBridge, []);
+
+  useEffect(() => {
+    if (registration.error !== null && session.status !== "invalidated") {
+      invalidateBrowserTrust("registration_error");
+    }
+  }, [registration.error, session.status]);
+
+  useEffect(() => {
+    if (session.status !== "invalidated" || session.source !== "peer") return;
+    const controller = new AbortController();
+    void refreshBrowserTrustAfterPeerInvalidation(queryClient, controller.signal).catch(() => {
+      // The invalidated state is the fail-closed result for every refresh error.
+    });
+    return () => controller.abort();
+  }, [queryClient, session]);
 
   return <BrowserTrustCtx.Provider value={trust}>{children}</BrowserTrustCtx.Provider>;
 }

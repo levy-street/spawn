@@ -2,7 +2,11 @@
 
 import { type QueryClient, useQuery } from "@tanstack/react-query";
 import { ApiError, auth, type User } from "@/lib/api";
-import { establishBrowserTrustSession, invalidateBrowserTrust } from "@/lib/browser-trust-events";
+import {
+  broadcastBrowserTrustInvalidation,
+  establishBrowserTrustSession,
+  invalidateBrowserTrust,
+} from "@/lib/browser-trust-events";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses
@@ -17,11 +21,15 @@ export function useAuth() {
         return await auth.me(signal);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) return null;
+        invalidateBrowserTrust("auth_error");
         throw err;
       }
     },
     retry: false,
     staleTime: 30_000,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: "always",
+    refetchOnReconnect: "always",
   });
 
   return {
@@ -45,7 +53,8 @@ export function commitAuthenticatedUser(queryClient: QueryClient, user: User): v
 }
 
 export async function logout() {
-  invalidateBrowserTrust("logout");
+  invalidateBrowserTrust("logout", { broadcast: false });
   await auth.logout();
+  broadcastBrowserTrustInvalidation("logout");
   if (typeof window !== "undefined") window.location.assign("/login");
 }

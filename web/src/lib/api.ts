@@ -28,9 +28,9 @@ export class ApiError extends Error {
 
 export async function api<T>(
   path: string,
-  init: RequestInit & { schema?: z.ZodType<T> } = {},
+  init: RequestInit & { schema?: z.ZodType<T>; suppressTrustInvalidation?: boolean } = {},
 ): Promise<T> {
-  const { schema, headers, ...rest } = init;
+  const { schema, headers, suppressTrustInvalidation, ...rest } = init;
   const res = await fetch(`${API_URL}${path}`, {
     credentials: "include",
     headers: {
@@ -42,7 +42,9 @@ export async function api<T>(
   });
 
   if (!res.ok) {
-    if (res.status === 401) invalidateBrowserTrust("unauthorized");
+    if (res.status === 401 && !suppressTrustInvalidation) {
+      invalidateBrowserTrust("unauthorized");
+    }
     let body: { code?: string; message?: string; detail?: unknown } | undefined;
     try {
       body = await res.json();
@@ -305,10 +307,11 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
-  me: (signal?: AbortSignal) =>
+  me: (signal?: AbortSignal, suppressTrustInvalidation = false) =>
     api("/api/me", {
       method: "GET",
       signal,
+      suppressTrustInvalidation,
       schema: z.object({ user: UserSchema }),
     }),
   providers: () =>
