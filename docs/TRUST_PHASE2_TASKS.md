@@ -149,13 +149,14 @@ their progress neither satisfies nor weakens any Phase 2 gate.
 |----|--------|-------|------------|------------------------|
 | P3-IDENTITY-01A | ACTIVE — PARALLEL FOUNDATION | Build the canonical cryptographic foundation: typed Ed25519 keys/signatures, deterministic signed-envelope encoding, domain separation, fingerprint representation, and cross-language test vectors. This does not enable signed signaling | P2-AGENT-01, P2-HOST-01 | Independent review proves deterministic canonical bytes, strict decode/re-encode rejection, key/signature test vectors, domain separation, malformed-input bounds, secret zeroization/permissions where applicable, and no runtime security claim before integration |
 | P3-IDENTITY-01B | ACTIVE — PARALLEL FOUNDATION | Build host identity-key generation, protected persistence, fingerprint display, and explicit host-key pairing/re-pairing flows against the 01A contract while 01A proceeds in parallel | P2-HOST-01; integration requires reviewed P3-IDENTITY-01A | Independent review proves stable host identity, owner-authorized pairing, loud key-change/re-pair UX, cancellation/replay/cross-host isolation, protected key storage, recovery/rotation behavior, and no claim that agent/host signaling is signed yet |
-| P3-IDENTITY-02 | PLANNED | Integrate signed agent/host signaling over the canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; add browser device identity, TOFU pinning, and fingerprint UX | P3-IDENTITY-01A, P3-IDENTITY-01B | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
+| P3-IDENTITY-02A | ACTIVE — IMPLEMENTED, REVIEW PENDING | Persist one account-scoped, non-extractable browser device identity in versioned, bounded IndexedDB storage; expose only its public key and signing operation; fail closed on unavailable/corrupt storage; provide expected-public-key-bound local deletion | P3-IDENTITY-01A | Independent unit and native-browser review proves reload stability, first-creation tab convergence, nonextractability, account isolation, strict stored-key correspondence, corruption/unavailable-storage failure, bounded records, expected-key deletion, and mergeability; no registration, login, TOFU, or signed-signaling claim is made |
+| P3-IDENTITY-02 | PLANNED | Integrate signed agent/host signaling over the canonical tuple containing SDP, session ID, scope type/ID, protocol version, sender role, and intended peer key; consume the browser device identity and add TOFU pinning plus fingerprint UX | P3-IDENTITY-01A, P3-IDENTITY-01B, P3-IDENTITY-02A | With independently trusted/verifiable endpoint builds, fingerprint substitution plus cross-session, cross-agent, cross-host, cross-scope, protocol-version, role, and peer-key replay all make both endpoints abort loudly for agent and host sessions; unverified hosted JavaScript is explicitly not covered |
 
-The 01A and 01B foundations may proceed in parallel with remaining Phase 2
-cleanup because they do not reopen a protected server content path. That
-overlap does not complete Phase 2 or establish a Phase 3 guarantee. Each task,
-and the later signed-signaling integration claim, still requires its own tests,
-independent review, mergeability proof, and accepted gate.
+The 01A, 01B, and bounded 02A foundations may proceed in parallel with
+remaining Phase 2 cleanup because they do not reopen a protected server content
+path. That overlap does not complete Phase 2 or establish a Phase 3 guarantee.
+Each task, and the later signed-signaling integration claim, still requires its
+own tests, independent review, mergeability proof, and accepted gate.
 
 ## Review-finding coverage
 
