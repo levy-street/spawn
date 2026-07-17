@@ -98,10 +98,13 @@ Explicit fence closure is derived from the parser's container-normalized token
 span and content-line count, so valid blockquote/list fences remain inactive
 while unclosed container fences fail closed.
 While `p2_data_01_status` remains `proposed_independent_review_pending`, a
-separate semantic pass rejects nearby `approved`, `accepted`, `authoritative`,
-or `selected` status claims about P2-DATA or its durable store/contract. Only
-explicit negation, historical context, or review-and-merge conditions are
-allowed; regenerating the exact prose inventory cannot bless a premature claim.
+separate semantic pass groups status claims by their explicit subject and
+rejects `approved`, `accepted`, `authoritative`, or `selected` claims about
+P2-DATA or its durable store/contract. Subjectless continuations retain their
+governing DATA subject, while a new explicit non-DATA subject starts a separate
+claim. Only claim-local negation, historical context, or review-and-merge
+conditions are allowed; regenerating the exact prose inventory cannot bless a
+premature claim.
 Every visible sentence in the guarded Markdown corpus must exactly match the
 reviewed path, structural location, sentence index, duplicate occurrence,
 category, and normalized text in

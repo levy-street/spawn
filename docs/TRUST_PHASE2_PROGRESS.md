@@ -389,6 +389,15 @@ The full-corpus location/occurrence ledger and all prior hostile fixtures remain
 mandatory. These corrections still await independent rereview and are not an
 accepted design yet.
 
+Two later status-prose rereviews rejected distance-bounded subject matching and
+sentence/clause-wide negation, historical, and review-gate exemptions. The
+current guard uses bounded claim groups, carries a DATA subject across an
+elided-subject continuation, resets that scope for an explicit non-DATA
+subject, and binds compound negation, historical status lists, and either-order
+review-plus-merge gates to the affected claim. Table-driven reinventory cases
+cover the reported false accepts and false rejects. This correction also still
+awaits independent rereview.
+
 This checkpoint is documentation only. No endpoint store, protected-data
 DataChannel operation, migration, server-column clearing, deployment, or purge
 has occurred, and P2-DATA-02 remains blocked until the decision passes review

@@ -537,36 +537,50 @@ def all_corpus_sentences(root: Path) -> tuple[CorpusSentence, ...]:
 PREMATURE_DATA_STATUS_WORD = re.compile(
     r"\b(?:approved|accepted|authoritative|selected)\b"
 )
-DATA_STATUS_SUBJECT = re.compile(
+DATA_STATUS_SUBJECT_PATTERN = (
     r"\b(?:"
     r"p2-data-(?:01|02)|"
     r"data-(?:01|02)(?: decision| design| target| contract| store)?|"
     r"durable protected(?:-data)? (?:state|target|store)|"
+    r"durable-data store|"
     r"protected-data store|"
+    r"private store|"
+    r"endpoint-owned store|"
     r"endpoint(?:-local)? store|"
     r"(?:endpoint-local|per-host(?: endpoint-local)?) "
     r"(?:canonical |durable )?store|"
-    r"(?:p2-data-02 )?store contract"
+    r"(?:p2-data-02 )?store contract|"
+    r"canonical store"
     r")\b"
 )
+DATA_STATUS_SUBJECT = re.compile(DATA_STATUS_SUBJECT_PATTERN)
 DATA_STATUS_CLAUSE_BOUNDARY = re.compile(
     r"\s*;\s*|\s*,\s*(?=(?:but|however|yet|whereas)\b)|"
     r"\s+\b(?:but|however|yet|whereas)\b\s+"
 )
-DATA_STATUS_CLAIM_CONJUNCTION = re.compile(
-    r"\s+\band\b\s+(?=(?:the\s+)?(?:"
-    r"p2-data-(?:01|02)|data-(?:01|02)|durable protected|protected-data store|"
-    r"endpoint(?:-local)? store|per-host(?: endpoint-local)? store|store contract"
-    r")\b)"
+EXPLICIT_STATUS_SUBJECT_START = (
+    r"(?:the\s+)?(?:"
+    r"p2-[a-z0-9-]+|"
+    r"data-(?:01|02)(?: decision| design| target| contract| store)?|"
+    r"durable protected(?:-data)? (?:state|target|store)|"
+    r"durable-data store|protected-data store|private store|"
+    r"endpoint-owned store|endpoint(?:-local)? store|"
+    r"(?:endpoint-local|per-host(?: endpoint-local)?) "
+    r"(?:canonical |durable )?store|"
+    r"(?:p2-data-02 )?store contract|canonical store|"
+    r"host protocol|(?:one |a )?prototype"
+    r")\b"
 )
+EXPLICIT_STATUS_SUBJECT = re.compile(EXPLICIT_STATUS_SUBJECT_START)
 HISTORICAL_DATA_CONTEXT = re.compile(
     r"\b(?:historical|historically|superseded|former|previous|previously)\b"
 )
-REVIEW_AND_MERGE = re.compile(r"\b(?:review|reviewed)\b.{0,120}\b(?:merge|merged)\b")
+REVIEW_WORD = re.compile(r"\b(?:review|reviewed)\b")
+MERGE_WORD = re.compile(r"\b(?:merge|merged)\b")
 
 
-def status_is_locally_negated(clause: str, status_word: re.Match[str]) -> bool:
-    prefix = clause[: status_word.start()]
+def status_is_locally_negated(group: str, status_word: re.Match[str]) -> bool:
+    prefix = group[: status_word.start()]
     return bool(
         re.search(
             r"\b(?:not|never|no longer)(?:\s+[a-z0-9_-]+){0,2}\s*$",
@@ -575,76 +589,124 @@ def status_is_locally_negated(clause: str, status_word: re.Match[str]) -> bool:
     )
 
 
-def status_has_historical_context(
-    clause: str, status_word: re.Match[str], subject: re.Match[str]
+def status_group_is_negated(
+    group: str, status_words: tuple[re.Match[str], ...]
 ) -> bool:
-    historical = tuple(HISTORICAL_DATA_CONTEXT.finditer(clause[: status_word.start()]))
-    if not historical:
-        return False
-    last_historical = historical[-1]
-    if PREMATURE_DATA_STATUS_WORD.search(
-        clause[last_historical.end() : status_word.start()]
-    ):
-        return False
-    claim_start = min(status_word.start(), subject.start())
-    claim_end = max(status_word.end(), subject.end())
-    current_context = clause[claim_start : min(len(clause), claim_end + 48)]
-    return not re.search(r"\b(?:now|currently)\b", current_context)
-
-
-def status_has_future_review_gate(
-    clause: str, status_word: re.Match[str], subject: re.Match[str]
-) -> bool:
-    claim_start = min(status_word.start(), subject.start())
-    claim_end = max(status_word.end(), subject.end())
-    before = clause[:claim_start]
-    after = clause[claim_end:]
-    after_gate = re.search(r"\bonly (?:when|after)\b", after)
-    if after_gate is not None and REVIEW_AND_MERGE.search(after[after_gate.start() :]):
+    if all(status_is_locally_negated(group, status) for status in status_words):
         return True
+
+    first = status_words[0]
+    last = status_words[-1]
+    prefix = group[: first.start()]
+    shared_negative = re.search(r"\b(?:not|never|no longer)\s*$", prefix)
+    shared_neither = re.search(r"\bneither\s*$", prefix)
+    if shared_negative is None and shared_neither is None:
+        return False
+
+    connectors = PREMATURE_DATA_STATUS_WORD.sub("", group[first.start() : last.end()])
+    if re.fullmatch(r"(?:\s|,|\band\b|\bor\b|\bnor\b)*", connectors) is None:
+        return False
+    return shared_neither is None or bool(re.search(r"\bnor\b", connectors))
+
+
+def status_group_has_historical_context(
+    group: str,
+    status_words: tuple[re.Match[str], ...],
+    subjects: tuple[re.Match[str], ...],
+) -> bool:
+    claim_start = min(
+        status_words[0].start(),
+        subjects[0].start() if subjects else status_words[0].start(),
+    )
+    if HISTORICAL_DATA_CONTEXT.search(group[:claim_start]) is None:
+        return False
+    return re.search(r"\b(?:now|currently)\b", group[claim_start:]) is None
+
+
+def contains_review_and_merge(text: str) -> bool:
+    return REVIEW_WORD.search(text) is not None and MERGE_WORD.search(text) is not None
+
+
+def status_group_has_future_review_gate(
+    group: str,
+    status_words: tuple[re.Match[str], ...],
+    subjects: tuple[re.Match[str], ...],
+) -> bool:
+    claim_start = min(
+        status_words[0].start(),
+        subjects[0].start() if subjects else status_words[0].start(),
+    )
+    claim_end = max(
+        status_words[-1].end(),
+        subjects[-1].end() if subjects else status_words[-1].end(),
+    )
+    before = group[:claim_start]
+    after = group[claim_end:]
+
     before_gate = re.search(r"\bonly (?:when|after)\b", before)
-    if before_gate is None:
-        return False
-    gated_prefix = before[before_gate.start() :]
-    if not REVIEW_AND_MERGE.search(gated_prefix):
-        return False
-    if PREMATURE_DATA_STATUS_WORD.search(
-        clause[before_gate.end() : status_word.start()]
+    if before_gate is not None and contains_review_and_merge(
+        before[before_gate.start() :]
     ):
+        return True
+    after_gate = re.search(r"\bonly (?:when|after)\b", after)
+    if after_gate is None:
         return False
-    current_context = clause[claim_start : min(len(clause), claim_end + 48)]
-    return not re.search(r"\b(?:now|currently)\b", current_context)
+    return contains_review_and_merge(after[after_gate.start() :])
+
+
+def data_status_claim_groups(sentence: str) -> tuple[tuple[str, bool], ...]:
+    """Return bounded claims and whether each is governed by a DATA subject."""
+
+    groups: list[tuple[str, bool]] = []
+    data_subject_in_scope = False
+    for clause in DATA_STATUS_CLAUSE_BOUNDARY.split(sentence):
+        explicit_subjects = tuple(EXPLICIT_STATUS_SUBJECT.finditer(clause))
+        if explicit_subjects:
+            subject_groups: list[tuple[str, bool]] = []
+            for index, subject in enumerate(explicit_subjects):
+                start = 0 if index == 0 else subject.start()
+                end = (
+                    explicit_subjects[index + 1].start()
+                    if index + 1 < len(explicit_subjects)
+                    else len(clause)
+                )
+                subject_groups.append(
+                    (
+                        clause[start:end],
+                        DATA_STATUS_SUBJECT.search(subject.group()) is not None,
+                    )
+                )
+        else:
+            subject_groups = ((clause, data_subject_in_scope),)
+
+        for group, subject_is_data in subject_groups:
+            if not group.strip():
+                continue
+            data_subject_in_scope = subject_is_data
+            groups.append((group, data_subject_in_scope))
+    return tuple(groups)
 
 
 def enforce_pending_data_review_status(root: Path, status: str) -> None:
     if status != "proposed_independent_review_pending":
         return
     for record in all_corpus_sentences(root):
-        primary_clauses = DATA_STATUS_CLAUSE_BOUNDARY.split(record.sentence)
-        clauses = (
-            clause
-            for primary_clause in primary_clauses
-            for clause in DATA_STATUS_CLAIM_CONJUNCTION.split(primary_clause)
-        )
-        for clause in clauses:
-            status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(clause))
-            subjects = tuple(DATA_STATUS_SUBJECT.finditer(clause))
-            if not status_words or not subjects:
+        for group, has_data_subject_scope in data_status_claim_groups(record.sentence):
+            status_words = tuple(PREMATURE_DATA_STATUS_WORD.finditer(group))
+            subjects = tuple(DATA_STATUS_SUBJECT.finditer(group))
+            if not status_words or not has_data_subject_scope:
                 continue
-            for status_word in status_words:
-                if status_is_locally_negated(clause, status_word):
-                    continue
-                for subject in subjects:
-                    if status_has_historical_context(clause, status_word, subject):
-                        continue
-                    if status_has_future_review_gate(clause, status_word, subject):
-                        continue
-                    raise ContradictionError(
-                        "data-review-status-prose",
-                        root / record.path,
-                        f"{record.location} sentence {record.sentence_index}: "
-                        f"{clause.strip()}",
-                    )
+            if status_group_is_negated(group, status_words):
+                continue
+            if status_group_has_historical_context(group, status_words, subjects):
+                continue
+            if status_group_has_future_review_gate(group, status_words, subjects):
+                continue
+            raise ContradictionError(
+                "data-review-status-prose",
+                root / record.path,
+                f"{record.location} sentence {record.sentence_index}: {group.strip()}",
+            )
 
 
 class DuplicateJsonKey(ValueError):
@@ -1818,6 +1880,38 @@ def self_test(source: Path) -> None:
         )
     )
 
+    status_reinventory_rejects = (
+        ("private store selected", "The private store is selected."),
+        ("durable-data store selected", "The durable-data store is selected."),
+        ("endpoint-owned store selected", "The endpoint-owned store is selected."),
+        ("generic canonical store selected", "The canonical store is selected."),
+        (
+            "elided DATA subject after negated adversative",
+            "P2-DATA-01 is not approved, but selected now.",
+        ),
+        (
+            "elided DATA subject after historical adversative",
+            "Historically, P2-DATA-01 was approved, but selected now.",
+        ),
+        (
+            "prototype review gate cannot govern later DATA subject",
+            "Only after review and merge may a prototype be accepted before "
+            "P2-DATA-01 is selected now.",
+        ),
+        (
+            "prototype history cannot govern later DATA subject",
+            "Historically a prototype was accepted before P2-DATA-01 is selected now.",
+        ),
+    )
+    mutations.extend(
+        (
+            f"status claim-group reject: {name}",
+            status_claim_fixture("docs/DESIGN.md", sentence),
+            "data-review-status-prose",
+        )
+        for name, sentence in status_reinventory_rejects
+    )
+
     normalization_cases = (
         (
             "endpoint-local protected store production claim",
@@ -2101,6 +2195,40 @@ def self_test(source: Path) -> None:
             "equivalent visible Markdown and Unicode formatting remains accepted",
             equivalent_visible_formatting,
         )
+    )
+    status_reinventory_accepts = (
+        (
+            "shared compound negation",
+            "P2-DATA-01 is not approved, accepted, or selected.",
+        ),
+        (
+            "neither nor negation",
+            "P2-DATA-01 is neither approved nor accepted.",
+        ),
+        (
+            "historical status list",
+            "Historically, P2-DATA-01 was approved and accepted.",
+        ),
+        (
+            "review gate with reversed merge ordering",
+            "Only after it is merged following independent review does "
+            "P2-DATA-01 become accepted.",
+        ),
+        (
+            "unrelated P2-HOST status",
+            "P2-DATA-01 remains review pending and P2-HOST-02 is accepted.",
+        ),
+        (
+            "unrelated host protocol status",
+            "P2-DATA-01 remains review pending and the host protocol is accepted.",
+        ),
+    )
+    positive_mutations.extend(
+        (
+            f"status claim-group accept: {name}",
+            status_claim_fixture("docs/DESIGN.md", sentence),
+        )
+        for name, sentence in status_reinventory_accepts
     )
 
     with tempfile.TemporaryDirectory(prefix="spawn-data-guard-") as temp:
