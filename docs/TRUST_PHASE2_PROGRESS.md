@@ -380,10 +380,29 @@ with remaining Phase 2 cleanup. Neither foundation means signaling is signed,
 and each task plus later integration still requires its own tests, independent
 review, mergeability proof, and accepted gate.
 
-This checkpoint is documentation only. No endpoint store, protected-data
-DataChannel operation, migration, server-column clearing, deployment, or purge
-has occurred, and P2-DATA-02 remains blocked until the decision passes review
-and is merged.
+**P3-IDENTITY-02A browser identity (implemented, review pending):** the bounded
+browser library now persists one versioned, account-scoped, non-extractable
+Ed25519 private key in IndexedDB and exposes only the public key plus an opaque
+signing operation. Serialized first-writer creation makes concurrent tabs load
+one winner; every reload validates record shape, algorithm/usages, canonical
+public bytes, and private/public correspondence before use. Corrupt or
+unavailable storage fails without rotation, storage is capped at 32 accounts,
+and local deletion is bound to the expected public key. Focused fake-IndexedDB
+unit tests and native Chromium tests cover persistence, nonextractability,
+convergence, account separation, corruption/mismatch, unavailable storage, and
+deletion.
+
+This is a local storage/library foundation only. It is not wired to server
+registration, login, pairing, TOFU, signaling, or any API payload, and it does
+not make agent or host signaling signed. The private key remains an opaque
+non-extractable `CryptoKey`; no private bytes or JWK are exported, logged, put in
+Web Storage, or sent to the server. Independent review and mergeability proof
+are still required before 02A is accepted.
+
+The P2-DATA-01 checkpoint described above remains documentation only. No
+endpoint protected-data store, DataChannel operation, migration, server-column
+clearing, deployment, or purge has occurred, and P2-DATA-02 remains blocked
+until the decision passes review and is merged.
 
 ## Remaining sequence
 
@@ -412,8 +431,9 @@ and is merged.
    server paths and run the historical plaintext purge across process memory,
    disk/DB/Redis, swap/core dumps, logs/observability, and every backup/snapshot.
    Verify the oldest retained restore before making the Phase 2 claim.
-5. After the active Phase 3 foundations pass their own reviews, separately
-   integrate browser device keys and signed signaling bound to SDP, session,
+5. After the active Phase 3 foundations, including bounded browser identity
+   P3-IDENTITY-02A, pass their own reviews, separately integrate registration,
+   TOFU/fingerprint UX, and signed signaling bound to SDP, session,
    agent-or-host scope, protocol version, sender role, and intended peer key.
    Trusted/verifiable endpoints must reject fingerprint substitution and
    cross-session/cross-scope replay for both agent- and host-scoped peer
