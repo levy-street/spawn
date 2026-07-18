@@ -775,3 +775,30 @@ export async function loadBrowserHostPin(
     database.close();
   }
 }
+
+/**
+ * Look up any local pin bound to `hostId`, independent of any key the server
+ * claims. The signed-RTC trust gate uses this to detect a downgrade: if a
+ * hostId is already locally pinned but the server presents a null or foreign
+ * key, the connection must be refused rather than silently reduced to a raw,
+ * unauthenticated path. Returns a bound record whether active or revoked; the
+ * caller treats any binding as "this hostId is known" and fails closed.
+ */
+export async function loadBrowserHostPinByHostId(
+  input: { readonly accountId: string; readonly origin: string; readonly hostId: string },
+  options: BrowserHostPinStorageOptions = {},
+): Promise<BrowserHostPin | null> {
+  assertScope(input.accountId, input.origin);
+  assertCanonicalUuid(input.hostId, "hostId");
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory);
+  try {
+    const records = await readValidatedRecords(database);
+    const bound = recordsInScope(records, input.accountId, input.origin).find((record) =>
+      record.hostIds.includes(input.hostId),
+    );
+    return bound === undefined ? null : publicPin(bound);
+  } finally {
+    database.close();
+  }
+}
