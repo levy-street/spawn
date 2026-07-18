@@ -25,7 +25,8 @@ import {
   sha256Blob,
   slicePtyChunkAfterAnchor,
 } from "@/lib/agent-ctl";
-import { SignedRtcLiveSession, type SignedRtcTrustCapability } from "@/lib/signed-rtc-live";
+import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
+import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import {
   agentRtcTuple,
   buildAgentWsUrl,
@@ -46,9 +47,10 @@ import {
 export interface UseAgentSocketOptions {
   agentId: string;
   enabled?: boolean;
-  /** Exact epoch-scoped browser signer plus exact active local Host pin.
-   * Presence selects signed mode for every RTC generation in this hook. */
-  signedRtcTrust?: SignedRtcTrustCapability;
+  /** Resolve, once per RTC generation, whether this host requires signed
+   * signaling, may use raw (unpinned TOFU first-contact), or must be refused.
+   * Absence keeps every generation unsigned. */
+  resolveSignedRtcTrust?: () => Promise<SignedRtcTrustDecision>;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
@@ -150,7 +152,7 @@ export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): st
 export function useAgentSocket({
   agentId,
   enabled = true,
-  signedRtcTrust,
+  resolveSignedRtcTrust,
   initialSize = null,
   onData,
   onHistory,
@@ -166,6 +168,9 @@ export function useAgentSocket({
   // shared readiness gate, and the initial replay has completed.
   const [dcOpen, setDcOpen] = useState(false);
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
+  // Non-null when the last attempt was refused because the host identity could
+  // not be verified against a local pin. A refusal is terminal (no auto-retry).
+  const [signedRtcRefusal, setSignedRtcRefusal] = useState<SignedRtcRefusalReason | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
   const agentGenerationRef = useRef(0);
@@ -1044,18 +1049,40 @@ export function useAgentSocket({
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         if (!isCurrentRtcGeneration()) return;
-        const nextSignedRtcSession = signedRtcTrust
-          ? new SignedRtcLiveSession(
-              {
-                scopeType: "agent",
-                scopeId: agentId,
-                protocol: "spawn.pty",
-                protocolVersion: 2,
-              },
-              sessionId,
-              signedRtcTrust,
-            )
-          : null;
+        let signedRtcDecision: SignedRtcTrustDecision = { mode: "unpinned" };
+        if (resolveSignedRtcTrust) {
+          try {
+            signedRtcDecision = await resolveSignedRtcTrust();
+          } catch {
+            // A resolver failure must fail closed for a possibly-pinned host.
+            signedRtcDecision = { mode: "refuse", reason: "pin_storage_error" };
+          }
+          if (!isCurrentRtcGeneration()) return;
+        }
+        if (signedRtcDecision.mode === "refuse") {
+          // The host identity could not be verified against a local pin. Refuse
+          // outright: never fall back to a raw, unauthenticated path, and do not
+          // auto-retry until the local trust state changes.
+          setSignedRtcRefusal(signedRtcDecision.reason);
+          setState("error");
+          lastRtcIceServers = null;
+          cleanupRtc(true, false, rtcGeneration);
+          return;
+        }
+        setSignedRtcRefusal(null);
+        const nextSignedRtcSession =
+          signedRtcDecision.mode === "signed"
+            ? new SignedRtcLiveSession(
+                {
+                  scopeType: "agent",
+                  scopeId: agentId,
+                  protocol: "spawn.pty",
+                  protocolVersion: 2,
+                },
+                sessionId,
+                signedRtcDecision.capability,
+              )
+            : null;
         const carrier = nextSignedRtcSession
           ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
           : { sdp: offer.sdp };
@@ -1348,7 +1375,7 @@ export function useAgentSocket({
       pendingInputRef.current.clear();
       if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
     };
-  }, [agentId, enabled, signedRtcTrust]);
+  }, [agentId, enabled, resolveSignedRtcTrust]);
 
   // Poll WebRTC stats while the channel is up: the selected candidate pair
   // tells us whether bytes flow direct, via STUN-discovered addresses, or
@@ -1472,5 +1499,5 @@ export function useAgentSocket({
     return uploadRef.current(blob, options);
   };
 
-  return { state, v2, dcOpen, connInfo, sendBinary, sendJson, uploadFile };
+  return { state, v2, dcOpen, connInfo, signedRtcRefusal, sendBinary, sendJson, uploadFile };
 }
