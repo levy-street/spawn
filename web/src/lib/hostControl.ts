@@ -1,5 +1,6 @@
 import { hashStream, Sha256 } from "@/lib/sha256";
-import { SignedRtcLiveSession, type SignedRtcTrustCapability } from "@/lib/signed-rtc-live";
+import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
+import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { buildHostWsUrl } from "@/lib/ws";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
@@ -141,9 +142,9 @@ export interface HostControlClientOptions {
   reconnectBaseDelayMs?: number;
   /** Primarily useful for bounded clients and deterministic timeout tests. */
   streamTimeoutMs?: number;
-  /** Exact epoch-scoped browser signer plus the exact active local pin for
-   * this Host. Presence freezes every RTC generation into signed mode. */
-  signedRtcTrust?: SignedRtcTrustCapability;
+  /** Resolve, per RTC generation, whether this host requires signed signaling,
+   * may use raw (unpinned TOFU first-contact), or must be refused. */
+  resolveSignedRtcTrust?: () => Promise<SignedRtcTrustDecision>;
 }
 
 export class HostControlClient {
@@ -158,6 +159,9 @@ export class HostControlClient {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private signedRtcSession: SignedRtcLiveSession | null = null;
+  // Non-null when the last attempt was refused because the host identity could
+  // not be verified against a local pin. Terminal: blocks auto-reconnect.
+  private signedRtcRefusal: SignedRtcRefusalReason | null = null;
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
@@ -183,7 +187,14 @@ export class HostControlClient {
   connect(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.signedRtcRefusal = null;
     this.openWebSocket();
+  }
+
+  /** The reason the last attempt was refused (unverifiable host identity), or
+   * null. A refusal is terminal until an explicit reconnect. */
+  getSignedRtcRefusal(): SignedRtcRefusalReason | null {
+    return this.signedRtcRefusal;
   }
 
   waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<void> {
@@ -817,18 +828,35 @@ export class HostControlClient {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
-      const nextSignedRtcSession = this.options.signedRtcTrust
-        ? new SignedRtcLiveSession(
-            {
-              scopeType: "host",
-              scopeId: this.hostId,
-              protocol: HOST_CONTROL_PROTOCOL,
-              protocolVersion: HOST_CONTROL_VERSION,
-            },
-            sessionId,
-            this.options.signedRtcTrust,
-          )
-        : null;
+      let decision: SignedRtcTrustDecision = { mode: "unpinned" };
+      if (this.options.resolveSignedRtcTrust) {
+        decision = await this.options
+          .resolveSignedRtcTrust()
+          .catch(() => ({ mode: "refuse", reason: "pin_storage_error" }) as const);
+        if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
+      }
+      if (decision.mode === "refuse") {
+        // Host identity could not be verified against a local pin. Refuse the
+        // control channel outright — no raw fallback, no auto-reconnect.
+        this.signedRtcRefusal = decision.reason;
+        this.setState("error");
+        this.failRtc(sessionId);
+        return;
+      }
+      this.signedRtcRefusal = null;
+      const nextSignedRtcSession =
+        decision.mode === "signed"
+          ? new SignedRtcLiveSession(
+              {
+                scopeType: "host",
+                scopeId: this.hostId,
+                protocol: HOST_CONTROL_PROTOCOL,
+                protocolVersion: HOST_CONTROL_VERSION,
+              },
+              sessionId,
+              decision.capability,
+            )
+          : null;
       const carrier = nextSignedRtcSession
         ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
         : { sdp: offer.sdp ?? "" };
@@ -1287,7 +1315,7 @@ export class HostControlClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer) return;
+    if (this.stopped || this.signedRtcRefusal !== null || this.reconnectTimer) return;
     this.clearConnectDeadline();
     this.reconnectAttempt += 1;
     const attempt = this.connectionAttempt;

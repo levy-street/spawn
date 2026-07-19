@@ -272,7 +272,9 @@ afterEach(() => {
 describe("HostControlClient", () => {
   test("signed HostControl applies only the host-signed transcript SDP", async () => {
     const signed = await signedRtcTrust();
-    const client = new HostControlClient(hostId, { signedRtcTrust: signed.trust });
+    const client = new HostControlClient(hostId, {
+      resolveSignedRtcTrust: async () => ({ mode: "signed", capability: signed.trust }),
+    });
     client.connect();
     const ws = FakeWebSocket.instances.at(-1);
     ws.onopen?.();
@@ -325,7 +327,9 @@ describe("HostControlClient", () => {
 
   test("signed HostControl tears down stripped answers without legacy fallback", async () => {
     const signed = await signedRtcTrust();
-    const client = new HostControlClient(hostId, { signedRtcTrust: signed.trust });
+    const client = new HostControlClient(hostId, {
+      resolveSignedRtcTrust: async () => ({ mode: "signed", capability: signed.trust }),
+    });
     client.connect();
     const ws = FakeWebSocket.instances.at(-1);
     ws.onopen?.();
