@@ -143,18 +143,25 @@ pub enum WsInbound {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundFrameError {
+    MalformedJson,
+    BinaryForbidden,
+}
+
 /// Convert a tungstenite Message into our normalized WsInbound, or return
 /// None for frames we ignore (Ping/Pong/Frame).
-pub fn classify(msg: Message) -> Result<Option<WsInbound>> {
+fn classify(msg: Message) -> std::result::Result<Option<WsInbound>, InboundFrameError> {
     match msg {
         Message::Text(t) => {
-            let frame: Inbound = serde_json::from_str(&t)
-                .with_context(|| format!("decoding inbound JSON frame: {t}"))?;
+            // Never retain serde's error chain here: unknown enum values and
+            // malformed tokens can be copied into its Display text. The
+            // hostile server frame must not reach daemon logs.
+            let frame: Inbound =
+                serde_json::from_str(&t).map_err(|_| InboundFrameError::MalformedJson)?;
             Ok(Some(WsInbound::Json(Box::new(frame))))
         }
-        Message::Binary(_) => {
-            anyhow::bail!("binary frames are forbidden on the daemon control socket")
-        }
+        Message::Binary(_) => Err(InboundFrameError::BinaryForbidden),
         Message::Close(_) => Ok(Some(WsInbound::Closed)),
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
     }
@@ -168,8 +175,10 @@ pub async fn run_sender_loop(
 ) {
     while let Some(out) = rx.recv().await {
         let res = stream_tx.send(Message::Text(out.into_text())).await;
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "ws send error; sender loop exiting");
+        if res.is_err() {
+            // A peer-initiated protocol failure can influence tungstenite's
+            // error text. Do not copy it into daemon logs.
+            tracing::warn!("daemon control websocket send failed; sender loop exiting");
             break;
         }
     }
@@ -220,8 +229,10 @@ pub async fn run_reader_loop(
         let Some(msg) = msg_opt else { break };
         let msg = match msg {
             Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "ws read error");
+            Err(_) => {
+                // Tungstenite protocol errors can include peer-controlled
+                // close reasons. Keep the ingress diagnostic content-free.
+                tracing::warn!("daemon control websocket read failed");
                 break;
             }
         };
@@ -241,8 +252,11 @@ pub async fn run_reader_loop(
                 // idleness deadline — heartbeats from the server are real
                 // signal but those are JSON Text and hit the branch above.
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "discarding malformed inbound frame");
+            Err(InboundFrameError::MalformedJson) => {
+                tracing::warn!("discarding malformed JSON daemon control frame");
+            }
+            Err(InboundFrameError::BinaryForbidden) => {
+                tracing::warn!("discarding binary daemon control frame");
             }
         }
     }
@@ -258,6 +272,22 @@ pub fn backoff_for_attempt(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn daemon_control_handshake_requires_exact_selected_subprotocol() {
@@ -287,7 +317,18 @@ mod tests {
     fn binary_frames_fail_closed() {
         let error = classify(Message::Binary(b"terminal secret".to_vec()))
             .expect_err("binary daemon control frame must be rejected");
-        assert!(error.to_string().contains("binary frames are forbidden"));
+        assert_eq!(error, InboundFrameError::BinaryForbidden);
+    }
+
+    #[test]
+    fn malformed_text_errors_retain_no_payload_or_parser_details() {
+        let canary = "SIGNED_LOG_CANARY_do_not_emit";
+        let error = classify(Message::Text(format!(
+            r#"{{"type":"{canary}","signed_envelope":null}}"#
+        )))
+        .expect_err("unknown frame type must be rejected");
+        assert_eq!(error, InboundFrameError::MalformedJson);
+        assert!(!format!("{error:?}").contains(canary));
     }
 
     #[test]
@@ -309,5 +350,152 @@ mod tests {
             WsInbound::Json(inner)
                 if matches!(*inner, Inbound::HostPing { ref request_id } if request_id == "request-1")
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn reader_logs_one_bounded_content_free_diagnostic_per_rejected_frame() {
+        const CANARY: &str = "SIGNED_LOG_CANARY_do_not_emit";
+        const NEAR_ROUTING_LIMIT: usize = 1100 * 1024 - 1;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket log test");
+        let address = listener.local_addr().unwrap();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+
+        let overbound_wire = format!(
+            "{CANARY}{}",
+            "x".repeat(crate::proto::MAX_SIGNED_RTC_RELAY_BYTES + 1 - CANARY.len())
+        );
+        let mut near_limit = serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+            "signed_envelope": overbound_wire,
+            "padding": ""
+        });
+        let empty_len = near_limit.to_string().len();
+        near_limit["padding"] = serde_json::json!("p".repeat(NEAR_ROUTING_LIMIT - empty_len));
+        let near_limit = near_limit.to_string();
+        assert_eq!(near_limit.len(), NEAR_ROUTING_LIMIT);
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept websocket log test");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        HeaderValue::from_static(SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("websocket log test handshake");
+
+            let agent_id = "11111111-2222-4333-8444-555555555555";
+            let rejected = [
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+                    "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "binding_generation": 7,
+                    "agent_id": agent_id,
+                    "scope_type": "agent",
+                    "scope_id": agent_id,
+                    "protocol": "spawn.pty",
+                    "protocol_version": 2,
+                    "signed_envelope": null,
+                    "sdp": format!("v=0\r\na={CANARY}\r\n")
+                })
+                .to_string(),
+                format!(r#"{{"type":"rtc.offer","sdp":"{CANARY}","#),
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+                    "signed_envelope": {"unknown": CANARY}
+                })
+                .to_string(),
+                near_limit,
+            ];
+            for frame in rejected {
+                socket
+                    .send(Message::Text(frame))
+                    .await
+                    .expect("send rejected text frame");
+            }
+            socket
+                .send(Message::Binary(CANARY.as_bytes().to_vec()))
+                .await
+                .expect("send rejected binary frame");
+            socket
+                .send(Message::Text(r#"{"type":"host.heartbeat"}"#.into()))
+                .await
+                .expect("send valid frame after rejections");
+            close_rx.await.expect("reader-alive observation");
+            socket.close(None).await.expect("close websocket log test");
+        });
+
+        let url = Url::parse(&format!("ws://{address}/api/daemon/ws")).unwrap();
+        let stream = connect(&url, "log-test-token")
+            .await
+            .expect("connect websocket log test");
+        let (write_half, read_half) = stream.split();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedLogWriter(Arc::clone(&captured_writer)))
+            .finish();
+        let reader = run_reader_loop(read_half, inbound_tx).with_subscriber(subscriber);
+        let reader_task = tokio::spawn(reader);
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("reader did not survive rejected frames")
+            .expect("reader channel closed after rejected frames");
+        assert!(
+            matches!(inbound, WsInbound::Json(frame) if matches!(*frame, Inbound::HostHeartbeat))
+        );
+        close_tx.send(()).expect("release websocket log test");
+        tokio::time::timeout(Duration::from_secs(1), reader_task)
+            .await
+            .expect("reader close timeout")
+            .expect("reader task");
+        drop(write_half);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("websocket log server timeout")
+            .expect("websocket log server task");
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("discarding malformed JSON daemon control frame")
+                .count(),
+            4
+        );
+        assert_eq!(
+            log.matches("discarding binary daemon control frame")
+                .count(),
+            1
+        );
+        assert!(log.len() < 512, "diagnostics must stay bounded");
+        for forbidden in [
+            CANARY,
+            "signed_envelope",
+            "raw downgrade",
+            "spawn.pty",
+            "018f0f77",
+            "expected value",
+            "unknown variant",
+        ] {
+            assert!(!log.contains(forbidden), "log leaked {forbidden}: {log}");
+        }
     }
 }

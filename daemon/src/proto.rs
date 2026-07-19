@@ -12,20 +12,22 @@ use uuid::Uuid;
 /// accepts at most 512 KiB until the signed cutover is complete.
 pub const MAX_SIGNED_RTC_RELAY_BYTES: usize = 512 * 1024;
 
-fn deserialize_bounded_signed_envelope<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_present_bounded_signed_envelope<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    if value
-        .as_ref()
-        .is_some_and(|wire| wire.len() > MAX_SIGNED_RTC_RELAY_BYTES)
-    {
+    // `#[serde(default)]` handles an absent field without invoking this
+    // function. Once the field is present, require a non-null JSON string so
+    // `signed_envelope: null` cannot collapse to `None` and select legacy SDP.
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_SIGNED_RTC_RELAY_BYTES {
         return Err(serde::de::Error::custom(
             "signed RTC envelope exceeds its live relay bound",
         ));
     }
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn serialize_bounded_signed_envelope<S>(
@@ -116,7 +118,7 @@ pub enum Outbound {
             default,
             skip_serializing_if = "Option::is_none",
             serialize_with = "serialize_bounded_signed_envelope",
-            deserialize_with = "deserialize_bounded_signed_envelope"
+            deserialize_with = "deserialize_present_bounded_signed_envelope"
         )]
         signed_envelope: Option<String>,
     },
@@ -225,7 +227,10 @@ pub enum Inbound {
         sdp: Option<String>,
         /// Preserved exactly for the Phase-3 verifier cutover. F1 accepts the
         /// relay shape; F2 will verify it before starting WebRTC negotiation.
-        #[serde(default, deserialize_with = "deserialize_bounded_signed_envelope")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_bounded_signed_envelope"
+        )]
         signed_envelope: Option<String>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
@@ -455,6 +460,78 @@ mod signed_rtc_relay_tests {
     }
 
     #[test]
+    fn signed_offer_presence_is_distinct_from_absent_legacy_sdp() {
+        let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+        let legacy: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": session_id,
+            "sdp": "v=0\r\n"
+        }))
+        .expect("absent signed field remains valid legacy shape");
+        assert!(matches!(
+            legacy,
+            Inbound::RtcOffer {
+                sdp: Some(ref sdp),
+                signed_envelope: None,
+                ..
+            } if sdp == "v=0\r\n"
+        ));
+
+        let signed: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": session_id,
+            "signed_envelope": "{\"opaque\":true}"
+        }))
+        .expect("present bounded string remains valid signed shape");
+        assert!(matches!(
+            signed,
+            Inbound::RtcOffer {
+                sdp: None,
+                signed_envelope: Some(ref wire),
+                ..
+            } if wire == "{\"opaque\":true}"
+        ));
+    }
+
+    #[test]
+    fn signed_offer_rejects_present_null_and_every_non_string_shape() {
+        let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+        for (case, value, raw_sdp) in [
+            ("null-only", serde_json::Value::Null, false),
+            ("null-plus-raw", serde_json::Value::Null, true),
+            (
+                "unknown-object",
+                serde_json::json!({"unknown": true}),
+                false,
+            ),
+            ("array", serde_json::json!(["wire"]), false),
+            ("boolean", serde_json::json!(true), false),
+            ("number", serde_json::json!(7), false),
+        ] {
+            let mut frame = serde_json::json!({
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": value
+            });
+            if raw_sdp {
+                frame["sdp"] = serde_json::json!("v=0\r\nraw downgrade");
+            }
+            assert!(
+                serde_json::from_value::<Inbound>(frame).is_err(),
+                "present signed field must reject {case}"
+            );
+        }
+
+        let duplicate = format!(
+            r#"{{"type":"rtc.offer","session_id":"{session_id}","signed_envelope":"first","signed_envelope":"second"}}"#
+        );
+        assert!(
+            serde_json::from_str::<Inbound>(&duplicate).is_err(),
+            "duplicate signed fields must not create an ambiguous mode"
+        );
+    }
+
+    #[test]
     fn signed_offer_rejects_live_bound_plus_one() {
         let exact = serde_json::json!({
             "type": "rtc.offer",
@@ -503,6 +580,59 @@ mod signed_rtc_relay_tests {
             signed_envelope: Some("x".repeat(MAX_SIGNED_RTC_RELAY_BYTES + 1)),
         };
         assert!(serde_json::to_value(oversized).is_err());
+    }
+
+    #[test]
+    fn answer_deserialization_has_the_same_present_non_null_rule() {
+        let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+        let absent: Outbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.answer",
+            "session_id": session_id,
+            "sdp": "v=0\r\n"
+        }))
+        .expect("absent signed answer remains legacy");
+        assert!(matches!(
+            absent,
+            Outbound::RtcAnswer {
+                sdp: Some(ref sdp),
+                signed_envelope: None,
+                ..
+            } if sdp == "v=0\r\n"
+        ));
+
+        let signed: Outbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.answer",
+            "session_id": session_id,
+            "signed_envelope": "{\"opaque\":true}"
+        }))
+        .expect("present signed answer string");
+        assert!(matches!(
+            signed,
+            Outbound::RtcAnswer {
+                sdp: None,
+                signed_envelope: Some(ref wire),
+                ..
+            } if wire == "{\"opaque\":true}"
+        ));
+
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({"unknown": true}),
+            serde_json::json!(["wire"]),
+            serde_json::json!(false),
+            serde_json::json!(9),
+        ] {
+            assert!(
+                serde_json::from_value::<Outbound>(serde_json::json!({
+                    "type": "rtc.answer",
+                    "session_id": session_id,
+                    "signed_envelope": value,
+                    "sdp": "v=0\r\nraw downgrade"
+                }))
+                .is_err(),
+                "present answer field must require a non-null string"
+            );
+        }
     }
 }
 

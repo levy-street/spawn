@@ -1624,7 +1624,7 @@ impl RtcSessions {
     }
 
     #[cfg(test)]
-    async fn resident_session_count(&self) -> usize {
+    pub(crate) async fn resident_session_count(&self) -> usize {
         self.peers.lock().await.len() + self.host_peers.lock().await.len()
     }
 

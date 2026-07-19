@@ -523,8 +523,11 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 tracing::info!("ws closed cleanly; reconnecting");
                 attempt = 0;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "ws session ended with error");
+            Err(_) => {
+                // Connection/handshake error text can include data supplied
+                // by the remote endpoint. Keep the reconnect diagnostic
+                // class-only at this final WebSocket logging boundary.
+                tracing::warn!("daemon control websocket session ended with error");
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -2245,6 +2248,7 @@ mod tests {
     use crate::proto::AgentSkillConfig;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
 
@@ -3331,6 +3335,185 @@ mod tests {
             "Bearer new-local-token"
         );
         tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("local websocket server timeout")
+            .expect("local websocket server task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn local_daemon_rejects_ambiguous_signed_offer_values_before_rtc_dispatch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket");
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let (close_tx, close_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept daemon socket");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("spawn.control.v2"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("daemon websocket handshake");
+            let register = socket
+                .next()
+                .await
+                .expect("daemon register frame")
+                .expect("valid daemon register frame")
+                .into_text()
+                .expect("text daemon register frame");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&register).unwrap()["type"],
+                "register"
+            );
+
+            let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+            let agent_id = "11111111-2222-4333-8444-555555555555";
+            let frames = [
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "binding_generation": 7,
+                    "agent_id": agent_id,
+                    "scope_type": "agent",
+                    "scope_id": agent_id,
+                    "protocol": "spawn.pty",
+                    "protocol_version": 2,
+                    "signed_envelope": null,
+                    "sdp": "v=0\r\nraw downgrade"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": null
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": {"unknown": true}
+                })
+                .to_string(),
+                format!(r#"{{"type":"rtc.offer","session_id":"{session_id}","signed_envelope":}}"#),
+                // A valid string selects signed mode. F1 deliberately refuses
+                // it before RTC until F2 verifies and extracts transcript SDP.
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": "{\"opaque\":true}"
+                })
+                .to_string(),
+                // Even a valid signed string cannot fall through to its raw
+                // sibling, and an absent signed field still parses as legacy.
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": "{\"opaque\":true}",
+                    "sdp": "v=0\r\nraw sibling"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "sdp": "v=0\r\n",
+                })
+                .to_string(),
+            ];
+            for frame in frames {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(frame))
+                    .await
+                    .expect("send adversarial RTC frame");
+            }
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    r#"{"type":"host.ping","request_id":"after-rejected-rtc"}"#.into(),
+                ))
+                .await
+                .expect("send post-rejection ping");
+
+            let mut unexpected = Vec::new();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .expect("post-rejection pong timeout")
+                    .expect("post-rejection websocket close")
+                    .expect("post-rejection websocket read")
+                    .into_text()
+                    .expect("post-rejection text frame");
+                let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if value["type"] == "host.pong" && value["request_id"] == "after-rejected-rtc" {
+                    break;
+                }
+                unexpected.push(value);
+            }
+            assert_eq!(unexpected, Vec::<serde_json::Value>::new());
+            observed_tx.send(()).expect("rejection observation");
+            close_rx.await.expect("close request");
+            socket.close(None).await.expect("close daemon socket");
+        });
+
+        let host_id = Uuid::from_u128(10);
+        let record = credential_record(
+            1,
+            1,
+            "signed-presence-test-token",
+            host_id,
+            server_url.as_str(),
+            7,
+            &[],
+        );
+        let active = LiveCredentialSnapshot::initial(record.clone(), &server_url).unwrap();
+        let stable_record = record.clone();
+        let mut loader =
+            CredentialLoader::start(Duration::from_secs(1), move || Ok(stable_record.clone()))
+                .expect("credential loader");
+        let registry = AgentRegistry::new();
+        assert!(registry.claim_discovery());
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+
+        let connection = serve_one_connection_with_loader(
+            &active,
+            &ws_url,
+            &registry,
+            &rtc_sessions,
+            Duration::from_secs(5),
+            &mut loader,
+        );
+        tokio::pin!(connection);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                observed = observed_rx => observed.expect("server rejection observation"),
+                result = &mut connection => {
+                    panic!("daemon connection ended before rejection proof: {}", result.is_ok());
+                }
+            }
+        })
+        .await
+        .expect("live signed-presence rejection timeout");
+        assert_eq!(rtc_sessions.resident_session_count().await, 0);
+        close_tx.send(()).expect("close test websocket");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), &mut connection)
+            .await
+            .expect("daemon connection close timeout")
+            .expect("daemon connection result");
+        assert!(matches!(outcome, ServeOutcome::SessionEnded(_)));
+        assert_eq!(rtc_sessions.resident_session_count().await, 0);
+        tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("local websocket server timeout")
             .expect("local websocket server task");
