@@ -29,7 +29,8 @@ use crate::config;
 use spawnd::host_pair_possession::{
     sign_transcript, signature_to_wire, HostPairPossessionTranscript,
 };
-use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire};
+use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire, SignedSignalTranscript};
+use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
 
 const KEYRING_SERVICE: &str = "spawn";
 /// Pre-scoping releases used this global account. Only the canonical default
@@ -1170,6 +1171,36 @@ pub fn sign_host_pair_possession(
         &signing_key,
         &transcript,
     )))
+}
+
+/// An owned, `'static` capability to sign RTC answer transcripts with the host
+/// identity key. It exposes only a signing method (never the seed) so it can be
+/// moved into the async negotiation task that produces the answer SDP.
+#[derive(Clone)]
+pub struct HostRtcAnswerSigner {
+    signing_key: SigningKey,
+}
+
+impl HostRtcAnswerSigner {
+    /// Sign a negotiated answer transcript, returning the opaque wire envelope.
+    pub fn sign(
+        &self,
+        protocol: RtcProtocol,
+        transcript: &SignedSignalTranscript,
+    ) -> Result<String> {
+        sign_rtc_signal_wire(&self.signing_key, protocol, transcript)
+            .context("signing RTC answer transcript")
+    }
+}
+
+/// Derive an owned host RTC answer signer from the loaded record, or `None` when
+/// no host identity has been generated yet. Seed decoding stays in `creds`;
+/// callers receive only the sign capability.
+pub fn host_rtc_answer_signer(creds: &StoredCreds) -> Result<Option<HostRtcAnswerSigner>> {
+    let Some(signing_key) = host_signing_key(creds)? else {
+        return Ok(None);
+    };
+    Ok(Some(HostRtcAnswerSigner { signing_key }))
 }
 
 fn host_signing_key(creds: &StoredCreds) -> Result<Option<SigningKey>> {

@@ -7,6 +7,7 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::sync::Once;
 use std::thread;
 use std::time::Duration;
@@ -25,7 +26,11 @@ use crate::proto::{
     AgentCreate, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound, Outbound,
 };
 use crate::pty::{self, WsOutbound};
-use crate::rtc::{HostRtcSignal, RtcSessions};
+use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
+use spawnd::signed_signal::{
+    public_key_from_wire, ScopeType, SenderRole, SignalKind, SignedSignalTranscript,
+};
+use spawnd::signed_signal_wire::{verify_rtc_signal_wire, VerifiedRtcSignal};
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 
@@ -813,6 +818,59 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
     }
 }
 
+/// Verify an opaque signed RTC offer against this host's identity and each
+/// locally-approved browser pin. Returns the verified signal on the first pin
+/// that matches (the browser that signed it is `sender_public_key`); `None`
+/// when no local pin verifies it, so an unverifiable offer is never downgraded.
+fn verify_signed_rtc_offer(envelope: &str, record: &StoredCreds) -> Option<VerifiedRtcSignal> {
+    let host_identity = creds::host_identity(record).ok().flatten()?;
+    let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
+    for pin in record.browser_pins() {
+        let Ok(browser_key) = public_key_from_wire(pin.public_key()) else {
+            continue;
+        };
+        if let Ok(verified) = verify_rtc_signal_wire(envelope, &browser_key, &host_key) {
+            return Some(verified);
+        }
+    }
+    None
+}
+
+/// Build the owned answer signer for a verified signed offer. The answer
+/// transcript reuses the verified offer's exact session, scope, and protocol,
+/// and binds the browser (offer sender) as the intended peer. `None` only when
+/// the host identity has gone away.
+fn build_rtc_answer_signer(
+    record: &StoredCreds,
+    verified: &VerifiedRtcSignal,
+) -> Result<Option<RtcAnswerSigner>> {
+    let Some(host_signer) = creds::host_rtc_answer_signer(record)? else {
+        return Ok(None);
+    };
+    let protocol = verified.protocol();
+    let transcript = verified.transcript();
+    let protocol_version = transcript.protocol_version();
+    let scope_type = transcript.scope_type();
+    let scope_id = transcript.scope_id().to_string();
+    let session_id = transcript.session_id().to_string();
+    let peer_bytes = verified.sender_public_key().to_bytes();
+    let signer: RtcAnswerSigner = Arc::new(move |local_sdp: &str| -> Result<String> {
+        let answer = SignedSignalTranscript::new(
+            SignalKind::Answer,
+            protocol_version,
+            session_id.clone(),
+            scope_type,
+            scope_id.clone(),
+            SenderRole::Daemon,
+            peer_bytes,
+            local_sdp,
+        )
+        .context("building signed RTC answer transcript")?;
+        host_signer.sign(protocol, &answer)
+    });
+    Ok(Some(signer))
+}
+
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
     registry: &AgentRegistry,
@@ -873,23 +931,54 @@ async fn dispatch_loop(
                     ice_servers,
                     ice_transport_policy,
                 } => {
-                    if signed_envelope.is_some() {
-                        // F1 makes the complete opaque offer reachable here.
-                        // F2 must install pin verification and extract the
-                        // verified transcript SDP. Never fall back to a raw
-                        // sibling SDP when signed mode was selected.
-                        if sdp.is_some() {
-                            tracing::warn!("rejecting mixed signed/raw RTC offer");
-                        } else {
-                            tracing::warn!(
-                                "signed RTC offer relay reached daemon before verifier cutover"
-                            );
-                        }
+                    if signed_envelope.is_some() && sdp.is_some() {
+                        tracing::warn!("rejecting mixed signed/raw RTC offer");
                         continue;
                     }
-                    let Some(sdp) = sdp else {
-                        tracing::warn!("rejecting RTC offer without SDP envelope");
-                        continue;
+                    // A signed offer must verify against a locally-approved
+                    // browser pin and this host identity, and describe exactly
+                    // this session; it is never downgraded to a raw SDP.
+                    let verified_offer = match &signed_envelope {
+                        Some(envelope) => {
+                            match verify_signed_rtc_offer(envelope, &live_credentials.record) {
+                                Some(verified)
+                                    if verified.transcript().session_id() == session_id.as_str() =>
+                                {
+                                    Some(verified)
+                                }
+                                Some(_) => {
+                                    tracing::warn!("rejecting signed RTC offer with mismatched session");
+                                    continue;
+                                }
+                                None => {
+                                    tracing::warn!("rejecting signed RTC offer that no local pin verified");
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let answer_signer = match &verified_offer {
+                        Some(verified) => {
+                            match build_rtc_answer_signer(&live_credentials.record, verified) {
+                                Ok(Some(signer)) => Some(signer),
+                                _ => {
+                                    tracing::warn!("cannot sign RTC answer for verified signed offer");
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let offer_sdp = match &verified_offer {
+                        Some(verified) => verified.transcript().sdp().to_string(),
+                        None => {
+                            let Some(sdp) = sdp else {
+                                tracing::warn!("rejecting RTC offer without SDP envelope");
+                                continue;
+                            };
+                            sdp
+                        }
                     };
                     match (
                         binding_nonce,
@@ -913,6 +1002,18 @@ async fn dispatch_loop(
                             && protocol == "spawn.pty"
                             && protocol_version == 2 =>
                         {
+                            // A signed offer's verified scope must match this
+                            // agent routing, so a relay cannot redirect a signed
+                            // offer to a different agent.
+                            if let Some(verified) = &verified_offer {
+                                let t = verified.transcript();
+                                if t.scope_type() != ScopeType::Agent
+                                    || t.scope_id() != agent_id.to_string().as_str()
+                                {
+                                    tracing::warn!("signed RTC offer scope does not match agent routing");
+                                    continue;
+                                }
+                            }
                             if ice_transport_policy.is_none() {
                                 if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
                                     session_id,
@@ -923,10 +1024,11 @@ async fn dispatch_loop(
                                     rtc_sessions
                                         .handle_offer(
                                             binding,
-                                            sdp,
+                                            offer_sdp,
                                             ice_servers,
                                             registry.clone(),
                                             out_tx.clone(),
+                                            answer_signer,
                                         )
                                         .await;
                                 }
@@ -941,6 +1043,19 @@ async fn dispatch_loop(
                             protocol,
                             protocol_version,
                         ) => {
+                            // A signed host offer's verified scope must match the
+                            // host routing for the same reason.
+                            if let Some(verified) = &verified_offer {
+                                let t = verified.transcript();
+                                let scope_ok = t.scope_type() == ScopeType::Host
+                                    && scope_id
+                                        .as_ref()
+                                        .map_or(false, |id| t.scope_id() == id.to_string().as_str());
+                                if !scope_ok {
+                                    tracing::warn!("signed RTC offer scope does not match host routing");
+                                    continue;
+                                }
+                            }
                             rtc_sessions
                                 .handle_host_offer(
                                     HostRtcSignal {
@@ -951,10 +1066,11 @@ async fn dispatch_loop(
                                         protocol,
                                         protocol_version,
                                     },
-                                    sdp,
+                                    offer_sdp,
                                     ice_servers,
                                     ice_transport_policy,
                                     out_tx.clone(),
+                                    answer_signer,
                                 )
                                 .await;
                         }
@@ -2336,6 +2452,89 @@ mod tests {
             &url::Url::parse("https://spawn.example/control").unwrap(),
         )
         .expect("live credential snapshot")
+    }
+
+    #[test]
+    fn signed_rtc_offer_verifies_and_answer_round_trips() {
+        use ed25519_dalek::SigningKey;
+        use spawnd::signed_signal::{
+            public_key_from_wire, public_key_to_wire, ScopeType, SenderRole, SignalKind,
+            SignedSignalTranscript,
+        };
+        use spawnd::signed_signal_wire::{sign_rtc_signal_wire, verify_rtc_signal_wire, RtcProtocol};
+
+        // Deterministic browser + host identities.
+        let browser_key = SigningKey::from_bytes(&[7u8; 32]);
+        let browser_pub_wire = public_key_to_wire(&browser_key.verifying_key());
+        let host_seed = [9u8; 32];
+        let host_key = SigningKey::from_bytes(&host_seed);
+        let host_pub_wire = public_key_to_wire(&host_key.verifying_key());
+        let host_peer = public_key_from_wire(&host_pub_wire).unwrap();
+
+        // A record holding this host identity and an approved pin for the browser.
+        let mut record = StoredCreds::default();
+        record.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode(host_seed));
+        let fingerprint = creds::browser_key_fingerprint(&browser_pub_wire).unwrap();
+        let pin = creds::browser_pin_from_approval(
+            &Uuid::from_u128(1).to_string(),
+            "ed25519",
+            &browser_pub_wire,
+            &fingerprint,
+        )
+        .unwrap();
+        creds::merge_browser_pin(&mut record, pin).unwrap();
+
+        let session_id = Uuid::from_u128(2).to_string();
+        let scope_id = Uuid::from_u128(3).to_string();
+
+        // The browser signs an agent offer intended for this host.
+        let offer = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            session_id.clone(),
+            ScopeType::Agent,
+            scope_id.clone(),
+            SenderRole::Browser,
+            host_peer.to_bytes(),
+            "v=0\r\no=browser\r\n",
+        )
+        .unwrap();
+        let offer_wire = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &offer).unwrap();
+
+        // The daemon verifies the offer against its host identity + pins.
+        let verified = verify_signed_rtc_offer(&offer_wire, &record).expect("offer verifies");
+        assert_eq!(verified.transcript().session_id(), session_id);
+        assert_eq!(verified.transcript().sdp(), "v=0\r\no=browser\r\n");
+        assert_eq!(verified.sender_public_key(), &browser_key.verifying_key());
+
+        // The daemon signs an answer that the browser can verify against its pins.
+        let signer = build_rtc_answer_signer(&record, &verified)
+            .unwrap()
+            .expect("answer signer");
+        let answer_wire = (&signer)("v=0\r\no=daemon\r\n").expect("sign answer");
+        let browser_peer = public_key_from_wire(&browser_pub_wire).unwrap();
+        let answer = verify_rtc_signal_wire(&answer_wire, &host_peer, &browser_peer)
+            .expect("browser verifies the daemon answer");
+        assert_eq!(answer.transcript().sdp(), "v=0\r\no=daemon\r\n");
+        assert_eq!(answer.transcript().session_id(), session_id);
+        assert_eq!(answer.transcript().scope_id(), scope_id);
+
+        // An offer from an unknown (unpinned) browser must never verify.
+        let stranger = SigningKey::from_bytes(&[11u8; 32]);
+        let stranger_offer = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            session_id,
+            ScopeType::Agent,
+            scope_id,
+            SenderRole::Browser,
+            host_peer.to_bytes(),
+            "v=0\r\no=stranger\r\n",
+        )
+        .unwrap();
+        let stranger_wire =
+            sign_rtc_signal_wire(&stranger, RtcProtocol::Agent, &stranger_offer).unwrap();
+        assert!(verify_signed_rtc_offer(&stranger_wire, &record).is_none());
     }
 
     #[test]

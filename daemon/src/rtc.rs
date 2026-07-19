@@ -43,6 +43,11 @@ use crate::upload::{
     UPLOAD_CLOSE_TIMEOUT,
 };
 
+/// Signs a negotiated answer SDP, returning the opaque signed-signal wire
+/// envelope. Present only for a verified signed offer; absent leaves the answer
+/// as raw SDP. Owned and `Send + Sync` so it can move into the negotiation task.
+pub type RtcAnswerSigner = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
 const AGENT_RTC_PROTOCOL_VERSION: u16 = 2;
@@ -571,6 +576,7 @@ impl RtcSessions {
         ice_servers: Vec<RtcIceServerConfig>,
         registry: AgentRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
+        answer_signer: Option<RtcAnswerSigner>,
     ) {
         let trust_epoch = self.capture_trust_epoch();
         let Some(agent) = registry.binding_for(binding.agent_id) else {
@@ -605,7 +611,7 @@ impl RtcSessions {
         };
 
         if let Err(e) = self
-            .create_answer(bound.clone(), sdp, ice_servers, registry, out_tx.clone())
+            .create_answer(bound.clone(), sdp, ice_servers, registry, out_tx.clone(), answer_signer)
             .await
         {
             tracing::warn!(
@@ -633,6 +639,7 @@ impl RtcSessions {
         ice_servers: Vec<RtcIceServerConfig>,
         registry: AgentRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
+        answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
         let admission_permit = self
             .peer_admission
@@ -793,6 +800,25 @@ impl RtcSessions {
             }
         };
 
+        // Sign the negotiated answer when the offer was verified-signed, and
+        // never emit a raw sibling SDP alongside it. A signing failure seals
+        // the peer rather than downgrading to an unauthenticated answer.
+        let (answer_sdp, answer_signed_envelope) = match &answer_signer {
+            Some(sign) => match sign(&local_sdp) {
+                Ok(wire) => (None, Some(wire)),
+                Err(e) => {
+                    self.close_if_same(
+                        &binding.signaling.session_id,
+                        &binding.signaling.generation,
+                        &pc,
+                    )
+                    .await;
+                    return Err(e.context("signing agent RTC answer"));
+                }
+            },
+            None => (Some(local_sdp), None),
+        };
+
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
@@ -803,8 +829,8 @@ impl RtcSessions {
                 scope_id: Some(binding.signaling.agent_id),
                 protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
                 protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
-                sdp: Some(local_sdp),
-                signed_envelope: None,
+                sdp: answer_sdp,
+                signed_envelope: answer_signed_envelope,
             },
         )
         .await;
@@ -818,6 +844,7 @@ impl RtcSessions {
         ice_servers: Vec<RtcIceServerConfig>,
         ice_transport_policy: Option<String>,
         out_tx: mpsc::Sender<WsOutbound>,
+        answer_signer: Option<RtcAnswerSigner>,
     ) {
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
@@ -839,6 +866,7 @@ impl RtcSessions {
                     trust_epoch,
                     out_tx: out_tx.clone(),
                 },
+                answer_signer,
             )
             .await
         {
@@ -855,6 +883,7 @@ impl RtcSessions {
         ice_servers: Vec<RtcIceServerConfig>,
         ice_transport_policy: Option<String>,
         admission: HostRtcAdmissionContext,
+        answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
         let admission_permit = self
             .peer_admission
@@ -938,6 +967,18 @@ impl RtcSessions {
                 return Err(error);
             }
         };
+        // Sign the negotiated host answer when the offer was verified-signed;
+        // never emit a raw sibling SDP. A signing failure seals the peer.
+        let (answer_sdp, answer_signed_envelope) = match &answer_signer {
+            Some(sign) => match sign(&local_sdp) {
+                Ok(wire) => (None, Some(wire)),
+                Err(e) => {
+                    self.close_host_if_same(&session_id, &pc).await;
+                    return Err(e.context("signing host RTC answer"));
+                }
+            },
+            None => (Some(local_sdp), None),
+        };
         send_json(
             &admission.out_tx,
             Outbound::RtcAnswer {
@@ -948,8 +989,8 @@ impl RtcSessions {
                 scope_id: Some(binding.host_id),
                 protocol: Some(binding.protocol),
                 protocol_version: Some(binding.protocol_version),
-                sdp: Some(local_sdp),
-                signed_envelope: None,
+                sdp: answer_sdp,
+                signed_envelope: answer_signed_envelope,
             },
         )
         .await;
@@ -3701,6 +3742,7 @@ mod tests {
                 Vec::new(),
                 registry.clone(),
                 out_tx,
+                None,
             )
             .await;
 
@@ -3950,6 +3992,7 @@ mod tests {
                 Vec::new(),
                 registry,
                 out_tx,
+                None,
             )
             .await;
         assert_eq!(sessions.resident_session_count().await, 1, "{case}");
@@ -6003,6 +6046,7 @@ mod tests {
                 Vec::new(),
                 registry.clone(),
                 status_tx,
+                None,
             )
             .await;
         let status_message = status_rx.recv().await.expect("post-exit status");
@@ -6156,6 +6200,7 @@ mod tests {
                     Vec::new(),
                     offer_registry,
                     out_tx,
+                    None,
                 )
                 .await;
         });
@@ -6232,6 +6277,7 @@ mod tests {
                 Vec::new(),
                 registry.clone(),
                 out_tx,
+                None,
             )
             .await;
         assert_eq!(sessions.resident_session_count().await, 1);
