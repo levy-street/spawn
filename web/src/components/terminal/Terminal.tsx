@@ -6,6 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { useQuery } from "@tanstack/react-query";
 import Image from "next/image";
 import {
   type ChangeEvent,
@@ -36,6 +37,9 @@ import {
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
 import { DirectAgentUploadError } from "@/lib/agent-ctl";
+import { agents, hosts } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -1156,9 +1160,46 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     );
   };
 
+  // Signed-signaling trust inputs. Terminal only receives agentId, so it
+  // derives the account, the agent's host, and that host's server-claimed key
+  // and fingerprint (all react-query cached and shared with the pages). The
+  // claimed values are untrusted; the local pin gate decides how to use them.
+  const { user: authUser } = useAuth();
+  const agentIdentityQuery = useQuery({
+    queryKey: ["agent", agentId],
+    queryFn: () => agents.get(agentId),
+    staleTime: 30_000,
+  });
+  const signalingHostId = agentIdentityQuery.data?.host_id ?? null;
+  const hostIdentityQuery = useQuery({
+    queryKey: ["host", signalingHostId],
+    queryFn: () => hosts.get(signalingHostId as string),
+    enabled: signalingHostId !== null,
+    staleTime: 30_000,
+  });
+  const signalingAccountId = authUser?.id ?? null;
+  const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
+  const claimedHostFingerprint = hostIdentityQuery.data?.host_key_fingerprint ?? null;
+  // Trust can only be evaluated once the account and hostId are known. Until
+  // then the socket stays disabled so a pinned host is never reached over a raw
+  // path before its pin is checked.
+  const signalingIdentityKnown = signalingAccountId !== null && signalingHostId !== null;
+  const resolveTrust = useCallback(
+    (): Promise<SignedRtcTrustDecision> =>
+      resolveSignedRtcTrust({
+        accountId: signalingAccountId as string,
+        hostId: signalingHostId as string,
+        claimedHostPublicKey,
+        claimedHostFingerprint,
+        isActive: () => true,
+      }),
+    [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
+  );
+
   const socket = useAgentSocket({
     agentId,
-    enabled: socketInitialSize !== null,
+    enabled: socketInitialSize !== null && signalingIdentityKnown,
+    resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -1353,9 +1394,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       socketState: socket.state,
       v2: socket.v2,
       dcOpen: socket.dcOpen,
+      signedRtcRefusal: socket.signedRtcRefusal,
       ...socket.connInfo,
     });
-  }, [socket.state, socket.v2, socket.dcOpen, socket.connInfo]);
+  }, [socket.state, socket.v2, socket.dcOpen, socket.signedRtcRefusal, socket.connInfo]);
 
   // Only surface "waiting for the direct channel" after a grace period —
   // the DC normally opens within a second or two of attach.
