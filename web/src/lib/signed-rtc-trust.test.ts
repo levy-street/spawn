@@ -149,6 +149,24 @@ describe("resolveSignedRtcTrust gate", () => {
     expect(decision.reason).toBe("browser_identity_unavailable");
   });
 
+  test("non-secure context (no WebCrypto) => unpinned, never refuse", async () => {
+    // A pin can never have been approved in an origin without WebCrypto, so
+    // there is nothing to downgrade from; refusing would break all traffic.
+    await seedPin();
+    await bindHostId();
+    const realCrypto = globalThis.crypto;
+    Object.defineProperty(globalThis, "crypto", {
+      value: { getRandomValues: realCrypto.getRandomValues?.bind(realCrypto) },
+      configurable: true,
+    });
+    try {
+      const decision = await resolve();
+      expect(decision.mode).toBe("unpinned");
+    } finally {
+      Object.defineProperty(globalThis, "crypto", { value: realCrypto, configurable: true });
+    }
+  });
+
   test("signed capability.assertActive throws once the trust epoch ends", async () => {
     await seedPin();
     await seedDeviceIdentity();

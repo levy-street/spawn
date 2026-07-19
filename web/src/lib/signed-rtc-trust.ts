@@ -76,6 +76,16 @@ export interface ResolveSignedRtcTrustInput {
 export async function resolveSignedRtcTrust(
   input: ResolveSignedRtcTrustInput,
 ): Promise<SignedRtcTrustDecision> {
+  // Without WebCrypto (i.e. a non-secure context) no pin can ever have been
+  // approved in THIS origin: the pin store is origin-scoped and approving one
+  // requires signing. There is therefore nothing to downgrade from, and a
+  // signed session is impossible. Treat it as unpinned rather than refusing
+  // every connection — refusing here would break all traffic on such an origin
+  // without protecting anything.
+  if (typeof globalThis.crypto?.subtle === "undefined") {
+    return { mode: "unpinned" };
+  }
+
   const origin = input.origin ?? browserHostPinServerOrigin();
 
   let resolvedHostPublicKeyWire: string;
