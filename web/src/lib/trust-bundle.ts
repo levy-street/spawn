@@ -130,14 +130,12 @@ function requireAccountId(accountId: string): string {
  * string keeps this key disjoint from any other use of the same PRF secret.
  */
 export async function deriveTrustBundleKey(
-  prfOutput: BufferSource,
+  prfOutput: Uint8Array | ArrayBuffer,
   accountId: string,
 ): Promise<CryptoKey> {
   const subtle = requireSubtle();
   requireAccountId(accountId);
-  const secret = new Uint8Array(
-    prfOutput instanceof ArrayBuffer ? prfOutput : (prfOutput as ArrayBufferView).buffer,
-  );
+  const secret = prfOutput instanceof ArrayBuffer ? new Uint8Array(prfOutput) : prfOutput;
   if (secret.byteLength < PRF_OUTPUT_BYTES) {
     throw new TrustBundleError(
       "invalid_prf_secret",
