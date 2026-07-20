@@ -17,8 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
+from ..browser_endorsement import verify_browser_endorsement_proof
 from ..db import get_session
-from ..models import PasskeyCredential, TrustBundle, User
+from ..host_identity import ed25519_key_fingerprint
+from ..models import BrowserDevice, Host, HostBrowserPin, PasskeyCredential, TrustBundle, User
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
 
@@ -203,3 +205,125 @@ async def delete_passkey(
     if result.rowcount != 1:
         raise HTTPException(status_code=404, detail="passkey not found")
     await session.commit()
+
+
+MAX_BROWSER_PINS_PER_HOST = 32
+
+
+@router.post("/endorsements", response_model=schemas.BrowserEndorsementOut)
+async def create_browser_endorsement(
+    body: schemas.BrowserEndorsementCreate,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.BrowserEndorsementOut:
+    """Admit a browser device to a host on an already-trusted device's authority.
+
+    The signature is verified here only to keep malformed rows out of the store.
+    The daemon re-verifies it against the browser keys it already pins, so a
+    server that skipped or forged this check would gain nothing: it cannot
+    produce an endorsement signed by a key the daemon trusts.
+    """
+
+    user_id = user.id
+    host = await session.get(Host, body.host_id)
+    if host is None or host.owner_user_id != user_id:
+        raise HTTPException(status_code=404, detail="host not found")
+    if host.host_public_key is None:
+        raise HTTPException(status_code=409, detail="host has no identity key to bind to")
+
+    devices = {
+        row.id: row
+        for row in (
+            await session.execute(
+                select(BrowserDevice).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.id.in_([body.endorser_device_id, body.endorsed_device_id]),
+                )
+            )
+        ).scalars()
+    }
+    endorser = devices.get(body.endorser_device_id)
+    endorsed = devices.get(body.endorsed_device_id)
+    if endorser is None or endorsed is None:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    for device in (endorser, endorsed):
+        if device.revoked_at is not None:
+            raise HTTPException(
+                status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
+            )
+
+    # The endorser must already be pinned to this host. An endorsement from a
+    # device the host does not trust carries no authority, and accepting it here
+    # would invite the daemon to reject rows this table had blessed.
+    endorser_pinned = (
+        await session.execute(
+            select(HostBrowserPin.browser_device_id).where(
+                HostBrowserPin.host_id == host.id,
+                HostBrowserPin.browser_device_id == endorser.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if endorser_pinned is None:
+        raise HTTPException(
+            status_code=409, detail="the endorsing device is not trusted by this host"
+        )
+
+    verify_browser_endorsement_proof(
+        user_id=user_id,
+        host_public_key_wire=host.host_public_key,
+        endorser_public_key_wire=endorser.public_key,
+        endorsed_public_key_wire=endorsed.public_key,
+        endorsed_device_id=endorsed.id,
+        signature_wire=body.signature,
+    )
+
+    fingerprint = ed25519_key_fingerprint(endorsed.public_key)
+    created_at = datetime.now(UTC)
+    existing = await session.get(HostBrowserPin, (host.id, endorsed.id))
+    if existing is not None:
+        # Idempotent: re-endorsing an already-admitted device is a retry.
+        return schemas.BrowserEndorsementOut(
+            host_id=host.id,
+            endorsed_device_id=endorsed.id,
+            endorsed_key_fingerprint=existing.browser_key_fingerprint,
+            endorser_device_id=body.endorser_device_id,
+            created_at=existing.created_at,
+        )
+
+    count = len(
+        (
+            await session.execute(
+                select(HostBrowserPin.browser_device_id).where(HostBrowserPin.host_id == host.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if count >= MAX_BROWSER_PINS_PER_HOST:
+        raise HTTPException(status_code=409, detail="host browser pin capacity is exhausted")
+
+    session.add(
+        HostBrowserPin(
+            host_id=host.id,
+            browser_device_id=endorsed.id,
+            browser_key_algorithm="ed25519",
+            browser_public_key=endorsed.public_key,
+            browser_key_fingerprint=fingerprint,
+            endorser_device_id=endorser.id,
+            endorsement_signature=body.signature,
+            created_at=created_at,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="endorsement could not be stored") from None
+
+    return schemas.BrowserEndorsementOut(
+        host_id=host.id,
+        endorsed_device_id=body.endorsed_device_id,
+        endorsed_key_fingerprint=fingerprint,
+        endorser_device_id=body.endorser_device_id,
+        created_at=created_at,
+    )

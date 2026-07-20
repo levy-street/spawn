@@ -562,3 +562,25 @@ class PasskeyCredentialOut(BaseModel):
 class PasskeyCredentialCreate(BaseModel):
     credential_id: str = Field(min_length=1, max_length=512)
     label: str | None = Field(default=None, max_length=128)
+
+
+class BrowserEndorsementCreate(BaseModel):
+    """One trusted browser admitting another to a host."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str = Field(min_length=36, max_length=36)
+    endorser_device_id: str = Field(min_length=36, max_length=36)
+    endorsed_device_id: str = Field(min_length=36, max_length=36)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
+
+
+class BrowserEndorsementOut(BaseModel):
+    host_id: str
+    endorsed_device_id: str
+    endorsed_key_fingerprint: str
+    endorser_device_id: str
+    created_at: datetime

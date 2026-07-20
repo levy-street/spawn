@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from spawn_server.db import get_sessionmaker
+
 pytestmark = pytest.mark.anyio
 
 
@@ -163,3 +165,195 @@ async def test_the_same_credential_id_may_belong_to_two_accounts(client):
     assert (
         await client.post("/api/trust/passkeys", json={"credential_id": "AQIDBA"}, headers=second)
     ).status_code == 200
+
+
+# ---------- browser endorsement ----------
+
+
+def _endorsement_signature(
+    *, user_id: str, host_public_key: str, endorser_private, endorsed_public_key: str,
+    endorsed_device_id: str,
+) -> str:
+    import base64
+
+    from spawn_server.browser_endorsement import encode_browser_endorsement_transcript
+    from spawn_server.host_identity import decode_ed25519_public_key
+
+    transcript = encode_browser_endorsement_transcript(
+        user_id,
+        decode_ed25519_public_key(host_public_key),
+        endorser_private.public_key().public_bytes_raw(),
+        decode_ed25519_public_key(endorsed_public_key),
+        endorsed_device_id,
+    )
+    return base64.urlsafe_b64encode(endorser_private.sign(transcript)).rstrip(b"=").decode()
+
+
+async def _endorsement_fixture(client, email: str):
+    """A host with one pinned browser, plus a second unpinned browser."""
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from spawn_server.host_identity import ed25519_key_fingerprint
+    from spawn_server.models import BrowserDevice, Host, HostBrowserPin
+
+    user_id, auth = await _signup(client, email)
+    endorser_key = Ed25519PrivateKey.generate()
+    endorsed_key = Ed25519PrivateKey.generate()
+    host_key = Ed25519PrivateKey.generate()
+
+    def wire(key) -> str:
+        import base64
+
+        return (
+            base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
+        )
+
+    async with get_sessionmaker()() as session:
+        host = Host(
+            name="endorse-box",
+            owner_user_id=user_id,
+            host_key_algorithm="ed25519",
+            host_public_key=wire(host_key),
+        )
+        session.add(host)
+        endorser = BrowserDevice(
+            owner_user_id=user_id, key_algorithm="ed25519", public_key=wire(endorser_key)
+        )
+        endorsed = BrowserDevice(
+            owner_user_id=user_id, key_algorithm="ed25519", public_key=wire(endorsed_key)
+        )
+        session.add_all([endorser, endorsed])
+        await session.flush()
+        session.add(
+            HostBrowserPin(
+                host_id=host.id,
+                browser_device_id=endorser.id,
+                browser_key_algorithm="ed25519",
+                browser_public_key=endorser.public_key,
+                browser_key_fingerprint=ed25519_key_fingerprint(endorser.public_key),
+            )
+        )
+        await session.commit()
+        ids = (host.id, wire(host_key), endorser.id, endorsed.id, wire(endorsed_key))
+    return user_id, auth, endorser_key, endorsed_key, ids
+
+
+async def test_a_pinned_browser_can_endorse_another(client):
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(client, "endorse@example.com")
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    signature = _endorsement_signature(
+        user_id=user_id,
+        host_public_key=host_pub,
+        endorser_private=endorser_key,
+        endorsed_public_key=endorsed_pub,
+        endorsed_device_id=endorsed_id,
+    )
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["endorsed_device_id"] == endorsed_id
+
+    # Retrying is idempotent, since a dropped response is normal.
+    again = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert again.status_code == 200
+
+
+async def test_an_unpinned_browser_cannot_endorse(client):
+    """Authority must come from a device the host already trusts."""
+
+    user_id, auth, _, endorsed_key, ids = await _endorsement_fixture(
+        client, "unpinned-endorser@example.com"
+    )
+    host_id, host_pub, _, endorsed_id, endorsed_pub = ids
+
+    # The endorsed (unpinned) device tries to admit itself via a third device.
+    signature = _endorsement_signature(
+        user_id=user_id,
+        host_public_key=host_pub,
+        endorser_private=endorsed_key,
+        endorsed_public_key=endorsed_pub,
+        endorsed_device_id=endorsed_id,
+    )
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorsed_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert response.status_code in (409, 422)
+
+
+async def test_a_forged_endorsement_is_refused(client):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    user_id, auth, _, _, ids = await _endorsement_fixture(client, "forged@example.com")
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    signature = _endorsement_signature(
+        user_id=user_id,
+        host_public_key=host_pub,
+        endorser_private=Ed25519PrivateKey.generate(),
+        endorsed_public_key=endorsed_pub,
+        endorsed_device_id=endorsed_id,
+    )
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert response.status_code == 422
+
+
+async def test_endorsing_for_another_account_host_is_refused(client):
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(
+        client, "cross-account@example.com"
+    )
+    _, other_auth = await _signup(client, "outsider@example.com")
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    signature = _endorsement_signature(
+        user_id=user_id,
+        host_public_key=host_pub,
+        endorser_private=endorser_key,
+        endorsed_public_key=endorsed_pub,
+        endorsed_device_id=endorsed_id,
+    )
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=other_auth,
+    )
+    assert response.status_code == 404

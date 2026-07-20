@@ -307,6 +307,11 @@ class HostBrowserPin(Base):
     browser_key_algorithm: Mapped[str] = mapped_column(String(16), nullable=False)
     browser_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
     browser_key_fingerprint: Mapped[str] = mapped_column(String(23), nullable=False)
+    # Present when this pin was created by endorsement rather than by the device
+    # ceremony. Retained so the daemon can re-verify the signature against the
+    # browser keys it already trusts instead of believing this row.
+    endorser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    endorsement_signature: Mapped[str | None] = mapped_column(String(86), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
