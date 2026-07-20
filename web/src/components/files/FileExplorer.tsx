@@ -38,7 +38,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
+import { resolveSignedRtcTrust } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
@@ -139,6 +141,7 @@ export function FileExplorer({
   const [pageCursors, setPageCursors] = useState<Record<string, number[]>>({});
   const uploadDirRef = useRef<string | null>(null);
   const initialAppliedRef = useRef(false);
+  const { user } = useAuth();
   const { client: hostControl, state: hostControlState } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
 
@@ -454,8 +457,24 @@ export function FileExplorer({
       destDir: string;
     }) => {
       if (!hostControl) throw new Error("Source host is not connected");
+      // The destination channel must honour the same pin gate as the source:
+      // a pinned host is never reached over a raw path, file transfer included.
+      // Without an account we cannot consult the pin store, so fail closed
+      // rather than silently transferring over an unverified connection.
+      const accountId = user?.id;
+      if (!accountId) throw new Error("Not signed in; cannot verify the destination host");
       return (async () => {
-        const destination = new HostControlClient(destHostId);
+        const destHost = await hosts.get(destHostId);
+        const destination = new HostControlClient(destHostId, {
+          resolveSignedRtcTrust: () =>
+            resolveSignedRtcTrust({
+              accountId,
+              hostId: destHostId,
+              claimedHostPublicKey: destHost.host_public_key ?? null,
+              claimedHostFingerprint: destHost.host_key_fingerprint ?? null,
+              isActive: () => true,
+            }),
+        });
         try {
           await destination.waitUntilReady();
           const home = await destination.home();

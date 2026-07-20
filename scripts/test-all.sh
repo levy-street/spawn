@@ -40,6 +40,9 @@ printf '%s\n' "== signed RTC verified-SDP guard =="
 scripts/check-signed-rtc-live.sh --self-test
 scripts/check-signed-rtc-live.sh
 
+printf '%s\n' "== host-control pin-gate guard =="
+scripts/check-host-control-gated.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 
