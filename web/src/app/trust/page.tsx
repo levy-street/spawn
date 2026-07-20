@@ -476,8 +476,8 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
               : (thisDevice.data?.fingerprint ?? "no identity on this device")}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Open this page on the device you want to add and compare its fingerprint with the one
-            listed below before confirming.
+            Compare this against the fingerprint shown for this device on your other screen. Names
+            are conveniences; only the fingerprint is trustworthy.
           </p>
         </div>
 
@@ -490,12 +490,17 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
           <ul className="flex flex-col gap-3">
             {candidates.map((device) => (
               <li key={device.id} className="rounded border p-3 text-sm">
-                <p className="break-all font-mono font-semibold">{device.fingerprint}</p>
-                <p className="text-xs text-muted-foreground">added {device.created_at}</p>
+                <p className="font-semibold">{device.label ?? "Unnamed device"}</p>
+                <p className="break-all font-mono text-xs">{device.fingerprint}</p>
+                <p className="text-xs text-muted-foreground">
+                  added {new Date(device.created_at).toLocaleString()}
+                </p>
                 {confirmed === device.id ? (
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <span className="text-xs">
-                      Confirm this exact fingerprint is shown on that device:
+                      Open this page on that device and check it shows this exact fingerprint. The
+                      name above is only a label — the server can set it to anything, so it is the
+                      fingerprint that must match.
                     </span>
                     <Button
                       type="button"

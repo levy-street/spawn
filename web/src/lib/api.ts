@@ -283,6 +283,8 @@ export const BrowserDeviceSchema = z.object({
   key_algorithm: z.literal("ed25519"),
   public_key: z.string().length(43),
   fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
+  /** Recognition only; never a trust input. See the server model. */
+  label: z.string().nullable().default(null),
   created_at: z.string(),
   revoked_at: z.string().nullable(),
 });
@@ -392,7 +394,12 @@ export const hosts = {
 };
 
 export const browserDevices = {
-  register: (body: { key_algorithm: "ed25519"; public_key: string; signature: string }) =>
+  register: (body: {
+    key_algorithm: "ed25519";
+    public_key: string;
+    signature: string;
+    label?: string | null;
+  }) =>
     api("/api/browser-devices/register", {
       method: "POST",
       body: JSON.stringify(body),
@@ -402,6 +409,12 @@ export const browserDevices = {
     api("/api/browser-devices", {
       method: "GET",
       schema: z.array(BrowserDeviceSchema),
+    }),
+  rename: (deviceId: string, label: string | null) =>
+    api(`/api/browser-devices/${deviceId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ label }),
+      schema: BrowserDeviceSchema,
     }),
   revoke: (deviceId: string, expectedPublicKey: string) =>
     api(`/api/browser-devices/${deviceId}/revoke`, {

@@ -25,6 +25,7 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
         key_algorithm="ed25519",
         public_key=device.public_key,
         fingerprint=ed25519_key_fingerprint(device.public_key),
+        label=device.label,
         created_at=device.created_at,
         revoked_at=device.revoked_at,
     )
@@ -72,6 +73,9 @@ async def register_browser_device(
         owner_user_id=user_id,
         key_algorithm=body.key_algorithm,
         public_key=body.public_key,
+        # Only on first registration. Re-registration returns the existing row,
+        # so a name the operator chose is never overwritten by a later default.
+        label=body.label,
     )
     session.add(device)
     try:
@@ -155,3 +159,32 @@ async def revoke_browser_device(
         # this immutable-key contract. Fail closed rather than claiming revoke.
         raise HTTPException(status_code=409, detail="browser device revocation did not commit")
     return _to_out(device)
+
+
+@router.patch("/{device_id}", response_model=schemas.BrowserDeviceOut)
+async def rename_browser_device(
+    device_id: str,
+    body: schemas.BrowserDeviceRenameRequest,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.BrowserDeviceOut:
+    """Rename a device for recognition. Changes no trust: the key is unchanged."""
+
+    device = await session.get(BrowserDevice, device_id)
+    if device is None or device.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    device.label = body.label
+    label = body.label
+    public_key = device.public_key
+    created_at = device.created_at
+    revoked_at = device.revoked_at
+    await session.commit()
+    return schemas.BrowserDeviceOut(
+        id=device_id,
+        key_algorithm="ed25519",
+        public_key=public_key,
+        fingerprint=ed25519_key_fingerprint(public_key),
+        label=label,
+        created_at=created_at,
+        revoked_at=revoked_at,
+    )

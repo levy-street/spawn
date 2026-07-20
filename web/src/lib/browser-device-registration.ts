@@ -95,6 +95,48 @@ export function allowExplicitBrowserIdentityReplacement(
   window.localStorage.removeItem(markerKey(userId));
 }
 
+/**
+ * A first guess at what to call this device, so the list is navigable before
+ * anyone renames anything.
+ *
+ * Recognition only. This is sent to the server, stored there, and editable
+ * there, so it must never be what an operator verifies -- a hostile server can
+ * set any label it likes. The fingerprint remains the comparison value.
+ */
+export function defaultDeviceLabel(): string | null {
+  const agent = globalThis.navigator?.userAgent ?? "";
+  if (agent === "") return null;
+  const platform = /iPhone/u.test(agent)
+    ? "iPhone"
+    : /iPad/u.test(agent)
+      ? "iPad"
+      : /Android/u.test(agent)
+        ? "Android"
+        : /Macintosh|Mac OS/u.test(agent)
+          ? "Mac"
+          : /Windows/u.test(agent)
+            ? "Windows"
+            : /Linux/u.test(agent)
+              ? "Linux"
+              : null;
+  const browser = /EdgA?\//u.test(agent)
+    ? "Edge"
+    : /OPR\//u.test(agent)
+      ? "Opera"
+      : /Firefox\//u.test(agent)
+        ? "Firefox"
+        : /CriOS|Chrome\//u.test(agent)
+          ? "Chrome"
+          : /Safari\//u.test(agent)
+            ? "Safari"
+            : null;
+  if (platform === null && browser === null) return null;
+  return [browser, platform]
+    .filter((part) => part !== null)
+    .join(" on ")
+    .slice(0, 64);
+}
+
 async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegistrationState> {
   const marker = readBrowserDeviceRevocationMarker(userId);
   if (marker !== null) return { status: marker.status, publicKey: marker.publicKey };
@@ -105,6 +147,7 @@ async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegis
     key_algorithm: "ed25519",
     public_key: identity.publicKeyWire,
     signature,
+    label: defaultDeviceLabel(),
   });
   const expectedFingerprint = await ed25519PublicKeyFingerprint(identity.publicKeyWire);
   if (

@@ -53,6 +53,8 @@ class MeResponse(BaseModel):
 class BrowserDeviceRegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Recognition only. Never used in a trust decision -- see BrowserDevice.
+    label: str | None = Field(default=None, max_length=64)
     key_algorithm: Literal["ed25519"]
     public_key: str = Field(min_length=43, max_length=43)
     signature: str = Field(
@@ -84,8 +86,15 @@ class BrowserDeviceOut(BaseModel):
     key_algorithm: Literal["ed25519"]
     public_key: str
     fingerprint: str
+    label: str | None = None
     created_at: datetime
     revoked_at: datetime | None = None
+
+
+class BrowserDeviceRenameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = Field(default=None, max_length=64)
 
 
 class AuthProviderOut(BaseModel):

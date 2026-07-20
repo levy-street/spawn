@@ -63,6 +63,10 @@ class BrowserDevice(Base):
     )
     key_algorithm: Mapped[str] = mapped_column(String(16), nullable=False)
     public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    # Recognition only, never verification: server-stored and server-mutable, so
+    # a hostile server could label its own device convincingly. The fingerprint
+    # remains the value an operator compares.
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
