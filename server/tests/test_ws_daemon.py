@@ -223,11 +223,12 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
     sent = _sent_json(ws)
     # The registration frame carries the authoritative live browser-pin set so
     # a daemon reconciles revocations on every connect; this host has none.
-    assert {
-        "type": "registered",
-        "host_id": host_id,
-        "browser_device_ids": [],
-    } in sent
+    registered = next(frame for frame in sent if frame.get("type") == "registered")
+    assert registered["host_id"] == host_id
+    # Carries the authoritative live pin set so the daemon reconciles
+    # revocations, and full records so it can adopt endorsed devices.
+    assert registered["browser_device_ids"] == []
+    assert registered["browser_pins"] == []
     assert {"type": "host.heartbeat"} in sent
     assert get_broker().get_daemon_for_host(host_id) is None
 

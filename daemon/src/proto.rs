@@ -173,11 +173,34 @@ pub enum Outbound {
 // Server → daemon
 // ---------------------------------------------------------------------------
 
+/// One browser pin as the server reports it. Nothing here is trusted: a record
+/// is adopted only if its endorsement verifies against a key already pinned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundBrowserPin {
+    pub browser_device_id: String,
+    pub browser_key_algorithm: String,
+    pub browser_public_key: String,
+    pub browser_key_fingerprint: String,
+    #[serde(default)]
+    pub endorser_public_key: Option<String>,
+    #[serde(default)]
+    pub endorsement_signature: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
         host_id: Uuid,
+        /// Account the host belongs to. Server-supplied, and safe to be: it is
+        /// only an input to endorsement verification, so a wrong value makes
+        /// the signature fail rather than admitting anything.
+        #[serde(default)]
+        account_id: Option<String>,
+        /// Full pin records, so an endorsed device can be adopted. None from a
+        /// server that predates them; adoption simply does not happen.
+        #[serde(default)]
+        browser_pins: Option<Vec<InboundBrowserPin>>,
         // None means the server never sent the field, which is not the same as
         // an empty set: a server that cannot report its pins must not cause
         // every local pin to be dropped.

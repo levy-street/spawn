@@ -901,6 +901,8 @@ async fn dispatch_loop(
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
                     host_id,
+                    account_id,
+                    browser_pins,
                     browser_device_ids,
                 } => {
                     if host_id != live_credentials.host_id {
@@ -910,6 +912,35 @@ async fn dispatch_loop(
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
                     tracing::info!(%host_id, "registered with server");
+                    // Adopt any device a trusted browser has endorsed. The
+                    // server proposes; only an endorsement verifiable against a
+                    // key already pinned here authorizes. Done before pruning so
+                    // a device admitted in this frame is not immediately dropped
+                    // for being absent from the older id list.
+                    if let (Some(account), Some(proposed)) = (&account_id, &browser_pins) {
+                        let candidates: Vec<creds::ProposedBrowserPin> = proposed
+                            .iter()
+                            .map(|pin| creds::ProposedBrowserPin {
+                                device_id: pin.browser_device_id.clone(),
+                                key_algorithm: pin.browser_key_algorithm.clone(),
+                                public_key: pin.browser_public_key.clone(),
+                                fingerprint: pin.browser_key_fingerprint.clone(),
+                                endorser_public_key: pin.endorser_public_key.clone(),
+                                endorsement_signature: pin.endorsement_signature.clone(),
+                            })
+                            .collect();
+                        match creds::adopt_endorsed_browser_pins(account, &candidates) {
+                            Ok(0) => {}
+                            Ok(adopted) => tracing::info!(
+                                adopted,
+                                "adopted browser pins endorsed by an already-trusted device"
+                            ),
+                            Err(error) => tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not adopt endorsed browser pins"
+                            ),
+                        }
+                    }
                     // Converge on the server's live pin set. Absent the field
                     // nothing is dropped, so an older server cannot empty the
                     // local pins by staying silent.

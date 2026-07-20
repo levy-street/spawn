@@ -26,6 +26,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
+use spawnd::browser_endorsement::{self, BrowserEndorsementTranscript};
 use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
 use spawnd::host_pair_possession::{
     sign_transcript, signature_to_wire, HostPairPossessionTranscript,
@@ -362,6 +363,97 @@ fn retain_live_browser_pins(creds: &mut StoredCreds, live_device_ids: &[String])
         .browser_pins
         .retain(|pin| live.contains(pin.browser_device_id.as_str()));
     before - creds.browser_pins.len()
+}
+
+/// Adopt browser pins the server reports, but only on an endorsement this
+/// daemon can verify against a key it already trusts.
+///
+/// This is the one path by which the pin set grows without a terminal ceremony.
+/// The server may propose; it may not authorize. A record without an
+/// endorsement, or with one signed by a key outside the current pin set, is
+/// ignored rather than adopted -- so a hostile server cannot admit its own
+/// browser to this host no matter what it puts in the frame.
+///
+/// Returns how many pins were adopted.
+pub fn adopt_endorsed_browser_pins(
+    account_id: &str,
+    proposed: &[ProposedBrowserPin],
+) -> Result<usize> {
+    let mut stored = load().context("loading credentials to adopt endorsed browser pins")?;
+    let expected = credential_revision(&stored)?;
+    let Some(identity) = host_identity(&stored)? else {
+        return Ok(0);
+    };
+    let host_key = public_key_from_wire(&identity.public_key)
+        .context("decoding the stored host public key")?;
+
+    // Snapshot the trusted set before adopting anything: a pin admitted in this
+    // pass must not become an endorser within it, or one forged record could
+    // bootstrap a chain of them.
+    let trusted: Vec<_> = stored
+        .browser_pins
+        .iter()
+        .filter_map(|pin| public_key_from_wire(&pin.browser_public_key).ok())
+        .collect();
+
+    let mut adopted = 0;
+    for candidate in proposed {
+        if stored
+            .browser_pins
+            .iter()
+            .any(|pin| pin.browser_device_id == candidate.device_id)
+        {
+            continue;
+        }
+        let (Some(endorser), Some(signature_wire)) = (
+            &candidate.endorser_public_key,
+            &candidate.endorsement_signature,
+        ) else {
+            continue;
+        };
+        let Ok(transcript) = BrowserEndorsementTranscript::from_wire(
+            account_id,
+            &identity.public_key,
+            endorser,
+            &candidate.public_key,
+            &candidate.device_id,
+        ) else {
+            continue;
+        };
+        let Ok(signature) = browser_endorsement::signature_from_wire(signature_wire) else {
+            continue;
+        };
+        if browser_endorsement::verify_endorsement(&transcript, &signature, &host_key, &trusted)
+            .is_err()
+        {
+            continue;
+        }
+        let pin = browser_pin_from_approval(
+            &candidate.device_id,
+            &candidate.key_algorithm,
+            &candidate.public_key,
+            &candidate.fingerprint,
+        )
+        .context("validating an endorsed browser pin")?;
+        if merge_browser_pin(&mut stored, pin)? {
+            adopted += 1;
+        }
+    }
+    if adopted == 0 {
+        return Ok(0);
+    }
+    save(&mut stored, &expected).context("persisting adopted browser pins")?;
+    Ok(adopted)
+}
+
+/// A pin the server proposes, before any verification.
+pub struct ProposedBrowserPin {
+    pub device_id: String,
+    pub key_algorithm: String,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub endorser_public_key: Option<String>,
+    pub endorsement_signature: Option<String>,
 }
 
 pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<bool> {
@@ -2418,6 +2510,98 @@ mod tests {
         assert_eq!(retain_live_browser_pins(&mut creds, &live), 0);
         // The server naming an unknown device must not create trust for it.
         assert_eq!(creds.browser_pins.len(), 1);
+    }
+
+    /// Build a proposal endorsed by `endorser` for a brand-new device key.
+    fn proposed_endorsement(
+        host: &SigningKey,
+        endorser: &SigningKey,
+        endorsed: &SigningKey,
+        account: &str,
+        device_id: &str,
+    ) -> ProposedBrowserPin {
+        let endorsed_wire = public_key_to_wire(&endorsed.verifying_key());
+        let transcript = BrowserEndorsementTranscript::from_wire(
+            account,
+            &public_key_to_wire(&host.verifying_key()),
+            &public_key_to_wire(&endorser.verifying_key()),
+            &endorsed_wire,
+            device_id,
+        )
+        .expect("valid endorsement transcript");
+        let signature = browser_endorsement::signature_to_wire(
+            &browser_endorsement::sign_transcript(endorser, &transcript),
+        );
+        ProposedBrowserPin {
+            device_id: device_id.to_owned(),
+            key_algorithm: BROWSER_KEY_ALGORITHM.to_owned(),
+            public_key: endorsed_wire.clone(),
+            fingerprint: browser_key_fingerprint(&endorsed_wire).unwrap(),
+            endorser_public_key: Some(public_key_to_wire(&endorser.verifying_key())),
+            endorsement_signature: Some(signature),
+        }
+    }
+
+    #[test]
+    fn an_endorsement_from_a_pinned_browser_is_adoptable() {
+        let account = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        let device = "11111111-2222-4333-8444-555555555555";
+        let (host, endorser, endorsed) = (
+            SigningKey::from_bytes(&[21; 32]),
+            SigningKey::from_bytes(&[22; 32]),
+            SigningKey::from_bytes(&[23; 32]),
+        );
+        let proposal = proposed_endorsement(&host, &endorser, &endorsed, account, device);
+
+        let transcript = BrowserEndorsementTranscript::from_wire(
+            account,
+            &public_key_to_wire(&host.verifying_key()),
+            proposal.endorser_public_key.as_deref().unwrap(),
+            &proposal.public_key,
+            device,
+        )
+        .unwrap();
+        let signature = browser_endorsement::signature_from_wire(
+            proposal.endorsement_signature.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        // Trusted endorser: verifies.
+        browser_endorsement::verify_endorsement(
+            &transcript,
+            &signature,
+            &host.verifying_key(),
+            &[endorser.verifying_key()],
+        )
+        .expect("a pinned endorser admits the device");
+
+        // Same proposal, empty trust set: refused. This is what makes the
+        // server unable to admit its own browser -- it has no pinned key.
+        assert!(browser_endorsement::verify_endorsement(
+            &transcript,
+            &signature,
+            &host.verifying_key(),
+            &[],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_proposal_without_an_endorsement_is_never_adopted() {
+        // The plain shape a hostile server would send: a well-formed pin record
+        // with no signature behind it.
+        let endorsed = SigningKey::from_bytes(&[24; 32]);
+        let wire = public_key_to_wire(&endorsed.verifying_key());
+        let proposal = ProposedBrowserPin {
+            device_id: "11111111-2222-4333-8444-555555555556".to_owned(),
+            key_algorithm: BROWSER_KEY_ALGORITHM.to_owned(),
+            public_key: wire.clone(),
+            fingerprint: browser_key_fingerprint(&wire).unwrap(),
+            endorser_public_key: None,
+            endorsement_signature: None,
+        };
+        assert!(proposal.endorser_public_key.is_none());
+        assert!(proposal.endorsement_signature.is_none());
     }
 
     fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {

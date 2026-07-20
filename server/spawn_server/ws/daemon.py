@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from .. import auth as auth_mod
 from ..db import get_sessionmaker
@@ -692,6 +693,47 @@ async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     )
 
 
+async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
+    """Full pin records, so a daemon can adopt endorsed devices it has not met.
+
+    Carries the endorsement signature and the endorser's public key. The daemon
+    re-verifies that signature against the browser keys it already pins, so
+    nothing here is taken on trust -- a record without a verifiable endorsement
+    is ignored rather than adopted.
+    """
+
+    async with _bounded_host_ownership_session() as session:
+        endorser = aliased(BrowserDevice)
+        rows = await session.execute(
+            select(
+                HostBrowserPin.browser_device_id,
+                HostBrowserPin.browser_key_algorithm,
+                HostBrowserPin.browser_public_key,
+                HostBrowserPin.browser_key_fingerprint,
+                HostBrowserPin.endorsement_signature,
+                endorser.public_key.label("endorser_public_key"),
+            )
+            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
+            .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
+            .where(
+                HostBrowserPin.host_id == host_id,
+                BrowserDevice.revoked_at.is_(None),
+            )
+            .order_by(HostBrowserPin.browser_device_id)
+        )
+        return [
+            {
+                "browser_device_id": row.browser_device_id,
+                "browser_key_algorithm": row.browser_key_algorithm,
+                "browser_public_key": row.browser_public_key,
+                "browser_key_fingerprint": row.browser_key_fingerprint,
+                "endorsement_signature": row.endorsement_signature,
+                "endorser_public_key": row.endorser_public_key,
+            }
+            for row in rows
+        ]
+
+
 async def _live_browser_device_ids(host_id: str) -> list[str]:
     """Browser devices currently pinned to this host and not revoked.
 
@@ -1234,7 +1276,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             {
                                 "type": "registered",
                                 "host_id": host.id,
+                                "account_id": host.owner_user_id,
                                 "browser_device_ids": await _live_browser_device_ids(host.id),
+                                "browser_pins": await _live_browser_pins(host.id),
                             },
                         )
                         registered = True
