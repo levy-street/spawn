@@ -15,6 +15,7 @@ import {
   type BrowserHostPinStorageOptions,
   browserHostPinServerOrigin,
   listActiveBrowserHostPins,
+  revokeBrowserHostPin,
 } from "./browser-host-pins";
 import { openTrustBundle, sealTrustBundle, type TrustBundleHost } from "./trust-bundle";
 
@@ -110,4 +111,43 @@ export async function importTrustBundle(
     added.push(host.hostPublicKey);
   }
   return { added, alreadyTrusted };
+}
+
+/**
+ * Drop every host pin this device holds, returning it to the unpinned path.
+ *
+ * The recovery when a device holds pins the daemon will not accept: it signs
+ * offers that are refused, which presents as a connection that simply never
+ * establishes. Unpinned it connects again -- unprotected, but working -- and
+ * can be re-endorsed afterwards. Without this the only remedy is clearing site
+ * data through browser settings, which also destroys the device identity and so
+ * invalidates any endorsement already granted to it.
+ */
+export async function forgetTrustOnThisDevice(
+  scope: TrustBootstrapScope,
+): Promise<{ readonly forgotten: number }> {
+  const origin = scope.origin ?? browserHostPinServerOrigin();
+  const pins = await listActiveBrowserHostPins(
+    { accountId: scope.accountId, origin },
+    scope.pinStorage ?? {},
+  );
+  let forgotten = 0;
+  for (const pin of pins) {
+    for (const hostId of pin.hostIds) {
+      await revokeBrowserHostPin(
+        {
+          accountId: scope.accountId,
+          origin,
+          targetHostId: hostId,
+          claimedHostId: hostId,
+          claimedHostPublicKey: pin.hostPublicKey,
+          claimedHostFingerprint: pin.hostFingerprint,
+        },
+        scope.pinStorage ?? {},
+      );
+      forgotten += 1;
+      break;
+    }
+  }
+  return { forgotten };
 }

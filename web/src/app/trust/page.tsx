@@ -21,7 +21,11 @@ import {
 } from "@/lib/passkey-prf";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { probeStoragePersistence } from "@/lib/storage-diagnostics";
-import { importTrustBundle, sealCurrentTrust } from "@/lib/trust-bootstrap";
+import {
+  forgetTrustOnThisDevice,
+  importTrustBundle,
+  sealCurrentTrust,
+} from "@/lib/trust-bootstrap";
 import { deriveTrustBundleKey } from "@/lib/trust-bundle";
 
 function describe(error: unknown): string {
@@ -178,8 +182,27 @@ function TrustSettings() {
     onError: (err) => setError(describe(err)),
   });
 
+  /**
+   * Recovery for a device holding pins the daemon will not accept: it signs
+   * offers that are refused, which looks like a terminal that never connects.
+   * Unpinned it works again, unprotected, and can be re-endorsed after.
+   */
+  const forget = useMutation({
+    mutationFn: () => forgetTrustOnThisDevice({ accountId: accountId as string }),
+    onMutate: begin,
+    onSuccess: (result) => {
+      setStatus(
+        result.forgotten === 0
+          ? "This device held no host trust to forget."
+          : `Forgot ${result.forgotten} host${result.forgotten === 1 ? "" : "s"}. This device now connects unprotected until it is trusted again.`,
+      );
+      queryClient.invalidateQueries({ queryKey: ["trust"] });
+    },
+    onError: (err) => setError(describe(err)),
+  });
+
   const supported = isPasskeySupported();
-  const busy = setUp.isPending || unlock.isPending;
+  const busy = setUp.isPending || unlock.isPending || forget.isPending;
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
@@ -264,6 +287,15 @@ function TrustSettings() {
               data-testid="unlock-trust"
             >
               {unlock.isPending ? "Unlocking…" : "Unlock trust on this device"}
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={busy || accountId === null || (localPins.data?.length ?? 0) === 0}
+              onClick={() => forget.mutate()}
+              data-testid="forget-trust"
+            >
+              {forget.isPending ? "Forgetting…" : "Forget trust on this device"}
             </Button>
           </div>
 
