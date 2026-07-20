@@ -757,6 +757,29 @@ export async function revokeBrowserHostPin(
 }
 
 /** Read one exact scoped pin for recovery UI without creating or changing trust. */
+/**
+ * Every active pin in scope, for sealing into the operator's trust bundle.
+ *
+ * Active only: revocation tombstones must not be carried to a new device, or
+ * importing the bundle there would resurrect trust the operator withdrew.
+ */
+export async function listActiveBrowserHostPins(
+  input: { readonly accountId: string; readonly origin: string },
+  options: BrowserHostPinStorageOptions = {},
+): Promise<BrowserHostPin[]> {
+  assertScope(input.accountId, input.origin);
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory);
+  try {
+    const records = await readValidatedRecords(database);
+    return recordsInScope(records, input.accountId, input.origin)
+      .filter((record) => record.state === "active")
+      .map(publicPin);
+  } finally {
+    database.close();
+  }
+}
+
 export async function loadBrowserHostPin(
   input: ApproveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
