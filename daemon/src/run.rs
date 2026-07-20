@@ -822,6 +822,23 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
 /// locally-approved browser pin. Returns the verified signal on the first pin
 /// that matches (the browser that signed it is `sender_public_key`); `None`
 /// when no local pin verifies it, so an unverifiable offer is never downgraded.
+/// Whether this daemon refuses RTC offers that carry no verified signed
+/// envelope.
+///
+/// Off by default, and deliberately so: turning it on locks out any browser
+/// that cannot do signed signaling at all, which today includes every origin
+/// that is not a secure context (plain-HTTP access by IP has no WebCrypto, so
+/// it can neither hold a pin nor sign an offer). Enable it only once every
+/// browser that must reach this host is served over HTTPS.
+///
+/// While it is off, the browser-side pin gate protects the operator's own
+/// browser from being downgraded, but does not stop a server from opening its
+/// own unsigned session to this daemon.
+fn require_signed_rtc_offers() -> bool {
+    std::env::var_os("SPAWND_REQUIRE_SIGNED_RTC")
+        .is_some_and(|value| value == "1" || value == "true")
+}
+
 fn verify_signed_rtc_offer(envelope: &str, record: &StoredCreds) -> Option<VerifiedRtcSignal> {
     let host_identity = creds::host_identity(record).ok().flatten()?;
     let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
@@ -1004,6 +1021,16 @@ async fn dispatch_loop(
                     let offer_sdp = match &verified_offer {
                         Some(verified) => verified.transcript().sdp().to_string(),
                         None => {
+                            if require_signed_rtc_offers() {
+                                // Without this, the browser-side pin gate can be
+                                // bypassed entirely: a server that simply omits
+                                // the signed envelope gets a raw peer connection
+                                // to the PTY without going near the browser.
+                                tracing::warn!(
+                                    "rejecting unsigned RTC offer: signed signaling is required"
+                                );
+                                continue;
+                            }
                             let Some(sdp) = sdp else {
                                 tracing::warn!("rejecting RTC offer without SDP envelope");
                                 continue;
