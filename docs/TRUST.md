@@ -210,6 +210,109 @@ cannot become an implicit cross-account key transfer; only the original account
 may intentionally re-pair that key. Browsers refuse sessions with unpinned keys
 at L1+.
 
+## ADR: how a new device bootstraps trust
+
+**Status:** accepted 2026-07-20. Supersedes the implicit decision that the
+`spawnd login` terminal ceremony is the only root of trust — which was never
+argued for, it was simply the first thing built.
+
+### The constraint
+
+Exactly one combination is impossible, and it is impossible for an
+information-theoretic reason rather than an engineering one:
+
+> a brand-new device holding nothing but an account session, with no other
+> paired device present and no secret the operator carries, **and** a server
+> that cannot machine-in-the-middle it.
+
+If everything a device holds came from the server, the only party it can
+authenticate is the server. Every workable design therefore has to introduce
+exactly one piece of truth the server did not supply.
+
+The mistake to avoid is conflating two different jobs. OAuth authenticates the
+*operator to the server*. Something else must authenticate the *server's claims
+to the operator*. Once those are separate, "any device" and "untrusted server"
+stop being in tension.
+
+### Options considered
+
+1. **Terminal ceremony** (what existed). The operator reads the host
+   fingerprint off the host's own terminal. Unforgeable, and unusable as the
+   only path: onboarding a phone requires a shell on the host.
+2. **Device endorsement.** An already-trusted browser signs a statement
+   vouching for a new browser's key, which the daemon verifies against a key it
+   already trusts. No terminal — but useless on a fresh device when no paired
+   device is to hand.
+3. **Operator-held secret unlocking a trust bundle.** Host public keys and an
+   account-level signing key are encrypted client-side and stored as ciphertext
+   the server cannot read. Any device, no terminal, no second device.
+4. **Trust on first use.** Accept first contact, refuse loudly on any later
+   substitution. Cheap, and what the gate already does for unpinned hosts.
+
+### Decision
+
+**Passkey PRF as the primary path, endorsement as the fallback, TOFU as the
+default underneath.**
+
+The WebAuthn `prf` extension derives a stable symmetric secret from a passkey,
+which unlocks the trust bundle of option 3. Passkeys already sync across an
+operator's devices, so this yields "sign in on a new phone and it just works"
+without the server ever being able to forge a host key. It trusts the platform
+passkey sync provider, but explicitly *not* the spawn server, which is the
+threat this document exists to address.
+
+Endorsement covers devices where PRF is unavailable and the loss-of-passkey
+recovery path. Both paths write the same origin-scoped pin store the signed-RTC
+gate already reads, so the gate itself does not change.
+
+TOFU remains the behaviour for an unpinned host, because refusing every
+un-bootstrapped device would make the product unusable long before the above
+exists.
+
+### Consequence for enforcement
+
+`SPAWND_REQUIRE_SIGNED_RTC` must stay **off** until this ADR is implemented.
+Enforcement removes the unpinned fallback, at which point "cryptographically
+protected" and "able to connect at all" collapse into the same condition — and
+with only the terminal ceremony available, every new device would need a shell
+on the host first. Enforcement is gated on device bootstrapping, not merely on
+HTTPS.
+
+### What this does not fix
+
+The server ships the client. Perfect key distribution to a browser whose code
+the server controls is partly ceremonial: a hostile server can serve a client
+that skips the checks entirely. This work is still the prerequisite for a
+verifiable client and already defeats network attackers and any server
+unwilling to tamper with code delivery — but browser-in-a-tab cannot reach the
+full claim on its own. See the client verifiability note below.
+
+## ADR: client verifiability
+
+**Status:** accepted 2026-07-20.
+
+A reproducible build plus an in-repo verifier (`scripts/verify-served-client.sh`)
+lets anyone rebuild the client from a commit and compare it against what a
+target server actually serves.
+
+Stated honestly: **this detects broad tampering and cannot prevent targeted
+tampering.** A hostile server can serve a clean bundle to a verifier and a
+backdoored one to a single session keyed on cookie, IP, or user-agent. The
+value is that it forces attacks to be targeted to stay hidden, which makes mass
+compromise impossible to conceal — not that the tab becomes trustworthy.
+
+Closing the remainder needs an append-only transparency log of signed build
+manifests, so that serving a malicious build requires either publishing it
+permanently in public or serving something no verifier can find. An extension
+that verifies before execution is the endgame; the log is the high-value step
+before it.
+
+Prerequisites, none of which hold yet: `generateBuildId` is unset so every Next
+build differs; the toolchain is unpinned (no `engines`, no `.nvmrc`); and build
+inputs bake into the bundle (`SPAWN_API_PROXY_TARGET`,
+`NEXT_PUBLIC_SPAWN_WS_URL`), so they must be declared publicly or honest builds
+will not match.
+
 ## Feature relocation map
 
 What moves where, and the regressions we accept:
