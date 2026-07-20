@@ -1,4 +1,5 @@
 import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
+import { encodeBrowserEndorsementTranscript } from "./browser-endorsement-transcript";
 import { encodeHostPairApprovalTranscript } from "./host-pair-approval-transcript";
 import {
   ED25519_PUBLIC_KEY_WIRE_CHARS,
@@ -451,6 +452,51 @@ export async function createHostPairApprovalProof(
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
       "host-pair approval signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign an endorsement admitting another browser device to a host.
+ *
+ * Only a device the daemon already pins can produce one it will accept, so this
+ * is the operator's own trusted browser exercising authority the server does
+ * not have. The endorsed key is supplied by the caller and must be the one the
+ * operator confirmed out of band -- signing does not establish where it came
+ * from, only that this device vouched for it.
+ */
+export async function createBrowserEndorsementProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  hostPublicKey: string,
+  endorsedPublicKey: string,
+  endorsedDeviceId: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeBrowserEndorsementTranscript(
+    accountId,
+    hostPublicKey,
+    record.publicKeyWire,
+    endorsedPublicKey,
+    endorsedDeviceId,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "browser endorsement signer returned an invalid signature length",
     );
   }
   return encodeBase64Url(signature);

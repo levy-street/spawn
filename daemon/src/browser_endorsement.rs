@@ -352,3 +352,38 @@ mod tests {
         assert!(signature_from_wire(&signature).is_ok());
     }
 }
+
+#[cfg(test)]
+mod cross_runtime_vector {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Fixed vector shared with the browser and server encoders. All three sign
+    /// the same bytes or endorsement silently fails to verify across runtimes.
+    pub const VECTOR_USER: &str = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+    pub const VECTOR_DEVICE: &str = "11111111-2222-4333-8444-555555555555";
+
+    #[test]
+    fn transcript_matches_the_shared_vector() {
+        let host = SigningKey::from_bytes(&[11; 32]);
+        let endorser = SigningKey::from_bytes(&[12; 32]);
+        let endorsed = SigningKey::from_bytes(&[13; 32]);
+        let wire = |k: &SigningKey| URL_SAFE_NO_PAD.encode(k.verifying_key().to_bytes());
+
+        let transcript = BrowserEndorsementTranscript::from_wire(
+            VECTOR_USER,
+            &wire(&host),
+            &wire(&endorser),
+            &wire(&endorsed),
+            VECTOR_DEVICE,
+        )
+        .expect("valid transcript");
+
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(transcript.encode()));
+        assert_eq!(transcript.encode().len(), 24 + 1 + 16 + 32 * 3 + 16);
+        // The browser encoder asserts this same digest. If either side changes
+        // the layout, endorsements stop verifying across runtimes -- silently,
+        // since each side would still agree with itself.
+        assert_eq!(digest, "zWI0kvAu5asJ4YKWiXSmlbSZM2u8_z7DOiVQ6vE220Y");
+    }
+}

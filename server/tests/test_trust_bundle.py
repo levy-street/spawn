@@ -357,3 +357,28 @@ async def test_endorsing_for_another_account_host_is_refused(client):
         headers=other_auth,
     )
     assert response.status_code == 404
+
+
+def test_endorsement_transcript_matches_the_daemon_and_browser_bytes():
+    """All three encoders must agree, or endorsements fail across runtimes.
+
+    Vector produced by daemon/src/browser_endorsement.rs and asserted again in
+    web/src/lib/browser-endorsement-transcript.test.ts. A divergence would be
+    silent: each runtime would still agree with itself.
+    """
+
+    import base64
+    import hashlib
+
+    from spawn_server.browser_endorsement import encode_browser_endorsement_transcript
+    from spawn_server.host_identity import decode_ed25519_public_key
+
+    transcript = encode_browser_endorsement_transcript(
+        "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+        decode_ed25519_public_key("Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo"),
+        decode_ed25519_public_key("C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0"),
+        decode_ed25519_public_key("kaKKC3Q4FZOk2UaVeSCJJq_IrYLIg5t2RDWbnrqaSzo"),
+        "11111111-2222-4333-8444-555555555555",
+    )
+    digest = base64.urlsafe_b64encode(hashlib.sha256(transcript).digest()).rstrip(b"=").decode()
+    assert digest == "zWI0kvAu5asJ4YKWiXSmlbSZM2u8_z7DOiVQ6vE220Y"
