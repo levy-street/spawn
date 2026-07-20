@@ -142,6 +142,11 @@ export function FileExplorer({
   const uploadDirRef = useRef<string | null>(null);
   const initialAppliedRef = useRef(false);
   const { user } = useAuth();
+  // Liveness for the destination-channel trust capability: a transfer that
+  // spans a logout or account switch must abort rather than complete under the
+  // previous account's pin and signing identity.
+  const liveAccountIdRef = useRef<string | null>(user?.id ?? null);
+  liveAccountIdRef.current = user?.id ?? null;
   const { client: hostControl, state: hostControlState } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
 
@@ -472,7 +477,7 @@ export function FileExplorer({
               hostId: destHostId,
               claimedHostPublicKey: destHost.host_public_key ?? null,
               claimedHostFingerprint: destHost.host_key_fingerprint ?? null,
-              isActive: () => true,
+              isActive: () => liveAccountIdRef.current === accountId,
             }),
         });
         try {

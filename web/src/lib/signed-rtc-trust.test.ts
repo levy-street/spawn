@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
+import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
 import {
   approveBrowserHostPin,
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "./browser-host-pins";
-import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
-import { ed25519PublicKeyFingerprint } from "./signed-signal";
 import { resolveSignedRtcTrust } from "./signed-rtc-trust";
+import { ed25519PublicKeyFingerprint } from "./signed-signal";
 
 const ACCOUNT = "00000000-0000-4000-8000-000000000001";
 const HOST_ID = "00000000-0000-4000-8000-000000000003";
@@ -48,9 +48,7 @@ async function seedDeviceIdentity(): Promise<void> {
   await loadOrCreateBrowserDeviceIdentity(ACCOUNT, deviceIdentityStorage());
 }
 
-function resolve(
-  overrides: Partial<Parameters<typeof resolveSignedRtcTrust>[0]> = {},
-) {
+function resolve(overrides: Partial<Parameters<typeof resolveSignedRtcTrust>[0]> = {}) {
   return resolveSignedRtcTrust({
     accountId: ACCOUNT,
     hostId: HOST_ID,

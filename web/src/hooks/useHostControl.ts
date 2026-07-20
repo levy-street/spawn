@@ -39,12 +39,17 @@ export function useHostControl(hostId: string | null, enabled = true) {
         ? new HostControlClient(hostId, {
             resolveSignedRtcTrust: (): Promise<SignedRtcTrustDecision> => {
               const t = trustRef.current;
+              const epochAccountId = t.accountId;
               return resolveSignedRtcTrust({
-                accountId: t.accountId as string,
+                accountId: epochAccountId as string,
                 hostId: t.hostId as string,
                 claimedHostPublicKey: t.claimedHostPublicKey,
                 claimedHostFingerprint: t.claimedHostFingerprint,
-                isActive: () => true,
+                // The trust epoch ends the moment the signed-in account changes:
+                // a negotiation spanning a logout or account switch must abort
+                // rather than complete under the previous account's pin and
+                // signing identity.
+                isActive: () => trustRef.current.accountId === epochAccountId,
               });
             },
           })

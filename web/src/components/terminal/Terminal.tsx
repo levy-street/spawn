@@ -1178,6 +1178,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     staleTime: 30_000,
   });
   const signalingAccountId = authUser?.id ?? null;
+  // Liveness for the trust capability. The epoch ends the moment the signed-in
+  // account changes, so a negotiation that spans a logout or account switch
+  // must abort instead of completing under the previous account's pin and
+  // signing identity.
+  const liveAccountIdRef = useRef<string | null>(signalingAccountId);
+  liveAccountIdRef.current = signalingAccountId;
   const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
   const claimedHostFingerprint = hostIdentityQuery.data?.host_key_fingerprint ?? null;
   // Trust can only be evaluated once the account and hostId are known. Until
@@ -1191,7 +1197,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         hostId: signalingHostId as string,
         claimedHostPublicKey,
         claimedHostFingerprint,
-        isActive: () => true,
+        isActive: () => liveAccountIdRef.current === signalingAccountId,
       }),
     [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
   );
