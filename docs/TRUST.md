@@ -447,11 +447,28 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 - Successful device login locally retains the approving browser's strict
   device/key/fingerprint tuple in the protected daemon credential record (32
   pins maximum). Status shows device IDs and fingerprints, never browser keys
-  or credential secrets. This is not live signaling trust yet; server
-  revocation cannot silently remove a local pin, and explicit re-pair/local
-  management remains required. The initial tuple is server-mediated and is not
-  an independently sourced expected-peer pin until a later explicit OOB
-  fingerprint comparison/activation gate passes.
+  or credential secrets.
+- Pin trust is asymmetric by design, and this reverses an earlier decision that
+  local pins are immutable against the server. Additions still require the
+  browser's `SPAWN-HOST-PAIR-APPROVE-V1` proof plus the operator's out-of-band
+  fingerprint comparison; the server cannot create trust. Removals are taken
+  from the server: registration carries the authoritative live pin set and the
+  daemon retains only what is still listed. The earlier rule — that server
+  revocation could not silently remove a local pin — meant a revoked browser
+  device kept working against the daemon indefinitely, because the daemon
+  learned its pins once at pairing and there is no credential-reload endpoint.
+  Accepting server-driven removal grants the server no power it lacked, since
+  it can already deny service by refusing to relay, and it closes a stale-trust
+  hole that had no other mitigation. A server naming an unknown device creates
+  no trust for it, and an absent field drops nothing.
+- The browser's approval proof is retained in the credential record as evidence
+  rather than reduced to a stored verdict, and is re-verified against the host
+  key on every load. Verification defeats replay and cross-host, cross-account
+  and cross-ceremony reuse. It cannot by itself defeat a hostile server, since
+  the transcript commits to the signer's own key and a substituted keypair
+  yields a self-consistent proof — which is why `spawnd login` prints the
+  browser fingerprint for the operator to compare against the one the `/device`
+  page shows. That comparison is the only check a hostile server cannot pass.
 - Keyring and fallback copies use a shared whole-record commit identity. Loads
   select one complete `(generation, record ID)` and never combine its token,
   host identity/server metadata, or browser pins with another generation.
@@ -476,6 +493,14 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 - Signed `rtc.offer`/`rtc.answer` over the canonical SDP, session, agent-or-host
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.
+- Enforcement is a separate switch from verification, and the claim depends on
+  it. The daemon still accepts unsigned offers unless
+  `SPAWND_REQUIRE_SIGNED_RTC=1`, so until that is on, the browser-side gate
+  protects the operator's browser from being downgraded but does not stop a
+  server from omitting the envelope and opening its own unsigned session
+  straight to the daemon. Enabling it locks out any origin that is not a secure
+  context — plain HTTP by IP has no WebCrypto and can neither hold a pin nor
+  sign an offer — so HTTPS everywhere is a prerequisite, not a nicety.
 - Fingerprints surfaced in `spawnd status` and the web UI host page.
 - Acceptance, using independently trusted/verifiable browser and daemon builds:
   a test-harness server that substitutes an SDP fingerprint or replays a valid
