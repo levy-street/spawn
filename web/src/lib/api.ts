@@ -442,6 +442,26 @@ export const trust = {
     }),
   removePasskey: (id: string) =>
     api(`/api/trust/passkeys/${id}`, { method: "DELETE", schema: z.unknown() }),
+  /** Browser device IDs a host already trusts. */
+  hostPins: (hostId: string) =>
+    api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  endorse: (body: {
+    host_id: string;
+    endorser_device_id: string;
+    endorsed_device_id: string;
+    signature: string;
+  }) =>
+    api("/api/trust/endorsements", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({
+        host_id: z.string(),
+        endorsed_device_id: z.string(),
+        endorsed_key_fingerprint: z.string(),
+        endorser_device_id: z.string(),
+        created_at: z.string(),
+      }),
+    }),
 };
 
 export const agents = {

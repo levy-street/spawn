@@ -327,3 +327,24 @@ async def create_browser_endorsement(
         endorser_device_id=body.endorser_device_id,
         created_at=created_at,
     )
+
+
+@router.get("/hosts/{host_id}/pins", response_model=list[str])
+async def list_host_browser_pins(
+    host_id: str,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[str]:
+    """Browser device IDs this host trusts, so the UI can offer to endorse the rest."""
+
+    host = await session.get(Host, host_id)
+    if host is None or host.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="host not found")
+    rows = (
+        await session.execute(
+            select(HostBrowserPin.browser_device_id)
+            .where(HostBrowserPin.host_id == host_id)
+            .order_by(HostBrowserPin.browser_device_id)
+        )
+    ).scalars()
+    return list(rows)

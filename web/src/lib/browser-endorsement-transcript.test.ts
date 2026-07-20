@@ -27,7 +27,9 @@ describe("browser endorsement transcript", () => {
       VECTOR.deviceId,
     );
     expect(transcript.byteLength).toBe(BROWSER_ENDORSEMENT_TRANSCRIPT_BYTES);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", transcript));
+    const owned = new ArrayBuffer(transcript.byteLength);
+    new Uint8Array(owned).set(transcript);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", owned));
     expect(encodeBase64Url(digest)).toBe(VECTOR.sha256);
   });
 

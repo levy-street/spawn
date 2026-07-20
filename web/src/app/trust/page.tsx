@@ -6,9 +6,12 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { trust } from "@/lib/api";
+import { type BrowserDevice, browserDevices, hosts, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
+import {
+  createBrowserEndorsementProof,
+  loadBrowserDeviceIdentity,
+} from "@/lib/browser-device-identity";
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
 import {
   createTrustPasskey,
@@ -16,6 +19,7 @@ import {
   isPasskeySupported,
   PasskeyPrfError,
 } from "@/lib/passkey-prf";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { probeStoragePersistence } from "@/lib/storage-diagnostics";
 import { importTrustBundle, sealCurrentTrust } from "@/lib/trust-bootstrap";
 import { deriveTrustBundleKey } from "@/lib/trust-bundle";
@@ -281,6 +285,179 @@ function TrustSettings() {
           </p>
         </CardContent>
       </Card>
+      <EndorseDevices accountId={accountId} />
     </div>
+  );
+}
+
+/**
+ * Admit another browser to a host on this device's authority.
+ *
+ * The fingerprint comparison is the entire security value. Signing proves this
+ * device vouched for a key; it says nothing about where that key came from, so
+ * a server could offer its own and the signature would still be valid. Only the
+ * operator seeing the same fingerprint on both screens rules that out, which is
+ * why the confirmation is a deliberate step rather than a one-click action.
+ */
+function EndorseDevices({ accountId }: { accountId: string | null }) {
+  const queryClient = useQueryClient();
+  const [confirmed, setConfirmed] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const hostList = useQuery({
+    queryKey: ["trust", "hosts"],
+    queryFn: () => hosts.list(),
+    enabled: accountId !== null,
+  });
+  const host = hostList.data?.[0] ?? null;
+
+  const devices = useQuery({
+    queryKey: ["trust", "browser-devices"],
+    queryFn: () => browserDevices.list(),
+    enabled: accountId !== null,
+  });
+  const pinned = useQuery({
+    queryKey: ["trust", "host-pins", host?.id],
+    queryFn: () => trust.hostPins(host?.id as string),
+    enabled: host?.id !== undefined,
+  });
+  const thisDevice = useQuery({
+    queryKey: ["trust", "this-device", accountId],
+    queryFn: async () => {
+      const identity = await loadBrowserDeviceIdentity(accountId as string);
+      if (identity === null) return null;
+      return {
+        publicKeyWire: identity.publicKeyWire,
+        // Derived locally rather than read from the server: this is the value
+        // the operator compares, so it must not come from the party being
+        // guarded against.
+        fingerprint: await ed25519PublicKeyFingerprint(identity.publicKeyWire),
+      };
+    },
+    enabled: accountId !== null,
+  });
+
+  const endorse = useMutation({
+    mutationFn: async (target: BrowserDevice) => {
+      const id = accountId as string;
+      const hostKey = host?.host_public_key ?? null;
+      if (host === null || hostKey === null) {
+        throw new Error("this host has no identity key to endorse against");
+      }
+      const identity = await loadBrowserDeviceIdentity(id);
+      if (identity === null) {
+        throw new Error("this device has no identity to endorse with");
+      }
+      const signature = await createBrowserEndorsementProof(
+        identity,
+        id,
+        hostKey,
+        target.public_key,
+        target.id,
+      );
+      const mine = (await browserDevices.list()).find(
+        (device) => device.public_key === identity.publicKeyWire,
+      );
+      if (mine === undefined) {
+        throw new Error("this device is not registered with the server");
+      }
+      return trust.endorse({
+        host_id: host.id,
+        endorser_device_id: mine.id,
+        endorsed_device_id: target.id,
+        signature,
+      });
+    },
+    onMutate: () => {
+      setNote(null);
+      setFailure(null);
+    },
+    onSuccess: (result) => {
+      setNote(
+        `Endorsed ${result.endorsed_key_fingerprint}. The host adopts it on the daemon's next connect.`,
+      );
+      setConfirmed(null);
+      queryClient.invalidateQueries({ queryKey: ["trust"] });
+    },
+    onError: (error) => setFailure(error instanceof Error ? error.message : String(error)),
+  });
+
+  const mineWire = thisDevice.data?.publicKeyWire ?? null;
+  const unpinned = (devices.data ?? []).filter(
+    (device) =>
+      device.revoked_at === null &&
+      device.public_key !== mineWire &&
+      !(pinned.data ?? []).includes(device.id),
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Trust another device</CardTitle>
+        <CardDescription>
+          Admit a browser to {host?.name ?? "your host"} on this device&apos;s authority. The server
+          can relay an endorsement but cannot create one.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <div className="rounded border p-3 text-sm">
+          <p className="font-semibold">This device&apos;s fingerprint</p>
+          <p className="break-all font-mono" data-testid="this-device-fingerprint">
+            {thisDevice.data === undefined
+              ? "…"
+              : (thisDevice.data?.fingerprint ?? "no identity on this device")}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Open this page on the device you want to add and compare its fingerprint with the one
+            listed below before confirming.
+          </p>
+        </div>
+
+        {unpinned.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No other devices are waiting. Sign in on the new device first, then reload here.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-3">
+            {unpinned.map((device) => (
+              <li key={device.id} className="rounded border p-3 text-sm">
+                <p className="break-all font-mono font-semibold">{device.fingerprint}</p>
+                <p className="text-xs text-muted-foreground">added {device.created_at}</p>
+                {confirmed === device.id ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className="text-xs">
+                      Confirm this exact fingerprint is shown on that device:
+                    </span>
+                    <Button
+                      type="button"
+                      disabled={endorse.isPending}
+                      onClick={() => endorse.mutate(device)}
+                    >
+                      It matches — trust it
+                    </Button>
+                    <Button type="button" variant="secondary" onClick={() => setConfirmed(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                ) : (
+                  <Button
+                    type="button"
+                    className="mt-2"
+                    variant="secondary"
+                    onClick={() => setConfirmed(device.id)}
+                  >
+                    Trust this device…
+                  </Button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {note !== null && <p className="text-sm font-medium">{note}</p>}
+        {failure !== null && <p className="text-sm font-medium text-destructive">{failure}</p>}
+      </CardContent>
+    </Card>
   );
 }
