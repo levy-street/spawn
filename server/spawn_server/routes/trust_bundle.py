@@ -21,6 +21,7 @@ from ..browser_endorsement import verify_browser_endorsement_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
 from ..models import BrowserDevice, Host, HostBrowserPin, PasskeyCredential, TrustBundle, User
+from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
 
@@ -319,6 +320,10 @@ async def create_browser_endorsement(
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="endorsement could not be stored") from None
+
+    # Nudge the daemon so the endorsement applies now rather than whenever it
+    # next reconnects. Failure is fine: registration reconciles regardless.
+    await push_browser_pins(host.id)
 
     return schemas.BrowserEndorsementOut(
         host_id=host.id,

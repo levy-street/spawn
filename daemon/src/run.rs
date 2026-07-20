@@ -834,6 +834,58 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
 /// While it is off, the browser-side pin gate protects the operator's own
 /// browser from being downgraded, but does not stop a server from opening its
 /// own unsigned session to this daemon.
+
+/// Bring local browser pins in line with what the server reports.
+///
+/// Adoption first, then pruning: a device admitted by this very frame would
+/// otherwise be dropped immediately for being absent from the id list. Only an
+/// endorsement verifiable against a key already pinned here can add anything;
+/// removals are taken from the server, which can only reduce access.
+fn reconcile_browser_pins(
+    account_id: Option<&str>,
+    proposed: Option<&[crate::proto::InboundBrowserPin]>,
+    live_device_ids: Option<&[String]>,
+) {
+    if let (Some(account), Some(proposed)) = (account_id, proposed) {
+        let candidates: Vec<creds::ProposedBrowserPin> = proposed
+            .iter()
+            .map(|pin| creds::ProposedBrowserPin {
+                device_id: pin.browser_device_id.clone(),
+                key_algorithm: pin.browser_key_algorithm.clone(),
+                public_key: pin.browser_public_key.clone(),
+                fingerprint: pin.browser_key_fingerprint.clone(),
+                endorser_public_key: pin.endorser_public_key.clone(),
+                endorsement_signature: pin.endorsement_signature.clone(),
+            })
+            .collect();
+        match creds::adopt_endorsed_browser_pins(account, &candidates) {
+            Ok(0) => {}
+            Ok(adopted) => tracing::info!(
+                adopted,
+                "adopted browser pins endorsed by an already-trusted device"
+            ),
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                "could not adopt endorsed browser pins"
+            ),
+        }
+    }
+    // Absent the field nothing is dropped, so an older server cannot empty the
+    // local pins by staying silent.
+    if let Some(live) = live_device_ids {
+        match creds::prune_browser_pins_to_live_set(live) {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::warn!(removed, "dropped browser pins the server no longer lists")
+            }
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                "could not reconcile browser pins against the server"
+            ),
+        }
+    }
+}
+
 fn require_signed_rtc_offers() -> bool {
     std::env::var_os("SPAWND_REQUIRE_SIGNED_RTC")
         .is_some_and(|value| value == "1" || value == "true")
@@ -912,51 +964,25 @@ async fn dispatch_loop(
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
                     tracing::info!(%host_id, "registered with server");
-                    // Adopt any device a trusted browser has endorsed. The
-                    // server proposes; only an endorsement verifiable against a
-                    // key already pinned here authorizes. Done before pruning so
-                    // a device admitted in this frame is not immediately dropped
-                    // for being absent from the older id list.
-                    if let (Some(account), Some(proposed)) = (&account_id, &browser_pins) {
-                        let candidates: Vec<creds::ProposedBrowserPin> = proposed
-                            .iter()
-                            .map(|pin| creds::ProposedBrowserPin {
-                                device_id: pin.browser_device_id.clone(),
-                                key_algorithm: pin.browser_key_algorithm.clone(),
-                                public_key: pin.browser_public_key.clone(),
-                                fingerprint: pin.browser_key_fingerprint.clone(),
-                                endorser_public_key: pin.endorser_public_key.clone(),
-                                endorsement_signature: pin.endorsement_signature.clone(),
-                            })
-                            .collect();
-                        match creds::adopt_endorsed_browser_pins(account, &candidates) {
-                            Ok(0) => {}
-                            Ok(adopted) => tracing::info!(
-                                adopted,
-                                "adopted browser pins endorsed by an already-trusted device"
-                            ),
-                            Err(error) => tracing::warn!(
-                                error = format!("{error:#}"),
-                                "could not adopt endorsed browser pins"
-                            ),
-                        }
-                    }
-                    // Converge on the server's live pin set. Absent the field
-                    // nothing is dropped, so an older server cannot empty the
-                    // local pins by staying silent.
-                    if let Some(live) = browser_device_ids {
-                        match creds::prune_browser_pins_to_live_set(&live) {
-                            Ok(0) => {}
-                            Ok(removed) => tracing::warn!(
-                                removed,
-                                "dropped browser pins the server no longer lists"
-                            ),
-                            Err(error) => tracing::warn!(
-                                error = format!("{error:#}"),
-                                "could not reconcile browser pins against the server"
-                            ),
-                        }
-                    }
+                    reconcile_browser_pins(
+                        account_id.as_deref(),
+                        browser_pins.as_deref(),
+                        browser_device_ids.as_deref(),
+                    );
+                }
+                Inbound::HostBrowserPins {
+                    account_id,
+                    browser_pins,
+                    browser_device_ids,
+                } => {
+                    // Pushed when the set changes, so endorsing a device takes
+                    // effect immediately instead of waiting for the daemon to
+                    // happen to reconnect -- which could be hours.
+                    reconcile_browser_pins(
+                        account_id.as_deref(),
+                        browser_pins.as_deref(),
+                        browser_device_ids.as_deref(),
+                    );
                 }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");

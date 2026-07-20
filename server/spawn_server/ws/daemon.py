@@ -1721,3 +1721,35 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             async with _bounded_host_ownership_session() as session:
                 await _mark_host_offline_if_owner(session, host.id, conn.id, conn.host_generation)
         log.info("daemon disconnected host=%s", host.id)
+
+
+async def push_browser_pins(host_id: str) -> bool:
+    """Tell a connected daemon its browser pin set changed.
+
+    Best effort by design. Reconciliation at registration is the guarantee; this
+    only removes the wait, so a daemon that is offline or attached to another
+    worker still converges on its next connect rather than missing the change.
+    """
+
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if daemon is None:
+        return False
+    async with _bounded_host_ownership_session() as session:
+        host = await session.get(Host, host_id)
+        if host is None:
+            return False
+        owner_user_id = host.owner_user_id
+    try:
+        await _bounded_send_text(
+            daemon,
+            {
+                "type": "host.browser_pins",
+                "account_id": owner_user_id,
+                "browser_device_ids": await _live_browser_device_ids(host_id),
+                "browser_pins": await _live_browser_pins(host_id),
+            },
+        )
+    except Exception:
+        log.warning("could not push browser pins to daemon host=%s", host_id)
+        return False
+    return True

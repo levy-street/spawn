@@ -207,6 +207,17 @@ pub enum Inbound {
         #[serde(default)]
         browser_device_ids: Option<Vec<String>>,
     },
+    /// Pushed when a host's browser pin set changes, so an endorsement takes
+    /// effect without waiting for the daemon to reconnect.
+    #[serde(rename = "host.browser_pins")]
+    HostBrowserPins {
+        #[serde(default)]
+        account_id: Option<String>,
+        #[serde(default)]
+        browser_pins: Option<Vec<InboundBrowserPin>>,
+        #[serde(default)]
+        browser_device_ids: Option<Vec<String>>,
+    },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
     #[serde(rename = "host.ping")]
