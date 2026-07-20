@@ -86,6 +86,28 @@ function TrustSettings() {
   const setUp = useMutation({
     mutationFn: async () => {
       const id = accountId as string;
+      // Refuse before creating anything if setting up here would destroy trust
+      // that already exists. A bundle is sealed under one passkey's secret, so
+      // a second, unrelated passkey cannot open it -- sealing this device's
+      // (likely empty) pins over the top would lose the operator's host keys
+      // AND lock every enrolled device out of the old bundle at once.
+      // Enrolling an additional device needs the key-wrapping ceremony, not
+      // this path.
+      const existing = await trust.getBundle();
+      if (existing !== null) {
+        const local = await listActiveBrowserHostPins({
+          accountId: id,
+          origin: browserHostPinServerOrigin(),
+        });
+        if (local.length === 0) {
+          throw new Error(
+            "A trust bundle already exists and this device has no verified hosts to seal. " +
+              "Setting up here would overwrite it with an empty one and lock out your other " +
+              "devices. Use “Unlock trust on this device” instead.",
+          );
+        }
+      }
+
       const passkey = await createTrustPasskey(id, user?.email ?? "spawn operator");
       if (!passkey.prfEnabled) {
         throw new PasskeyPrfError(
@@ -98,7 +120,6 @@ function TrustSettings() {
       const secret = await evaluateTrustPrf(id, [passkey.credentialId]);
       const key = await deriveTrustBundleKey(secret, id);
       const { sealed, hostCount } = await sealCurrentTrust(key, { accountId: id });
-      const existing = await trust.getBundle();
       await trust.putBundle(sealed, existing?.revision);
       return hostCount;
     },
