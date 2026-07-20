@@ -20,8 +20,19 @@ function defaultPublicWsUrl(): string {
   return "";
 }
 
+// Next mints a random buildId per build, which bakes a different string into
+// every prerendered .html/.rsc and renames static/<buildId>/. That alone makes
+// the client unverifiable: nobody can rebuild a commit and check it matches
+// what a server serves. Pinning it takes the served surface from 28
+// nondeterministic files to zero. Callers wanting cache-busting across commits
+// set SPAWN_BUILD_ID to the commit sha, and the verifier passes the same sha.
+function buildId(): string {
+  return process.env.SPAWN_BUILD_ID || "spawn";
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  generateBuildId: buildId,
   experimental: {
     // Next buffers proxied request bodies (rewrites share the middleware
     // pipeline) with a 10MB default, silently truncating larger uploads. The
