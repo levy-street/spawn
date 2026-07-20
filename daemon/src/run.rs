@@ -944,6 +944,11 @@ async fn dispatch_loop(
                                 Some(verified)
                                     if verified.transcript().session_id() == session_id.as_str() =>
                                 {
+                                    tracing::info!(
+                                        scope_type = ?verified.transcript().scope_type(),
+                                        scope_id = %verified.transcript().scope_id(),
+                                        "verified signed RTC offer against a local browser pin"
+                                    );
                                     Some(verified)
                                 }
                                 Some(_) => {

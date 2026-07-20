@@ -1046,9 +1046,11 @@ export function useAgentSocket({
       }
 
       try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        if (!isCurrentRtcGeneration()) return;
+        // Resolve trust BEFORE creating the offer. The decision reads IndexedDB,
+        // and doing it after setLocalDescription delays the offer — which delays
+        // the daemon's own ICE gathering, so its host/srflx candidates arrive
+        // late and ICE can nominate a relay pair first. Deciding first keeps the
+        // signalling path latency-free.
         let signedRtcDecision: SignedRtcTrustDecision = { mode: "unpinned" };
         if (resolveSignedRtcTrust) {
           try {
@@ -1070,6 +1072,10 @@ export function useAgentSocket({
           return;
         }
         setSignedRtcRefusal(null);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        if (!isCurrentRtcGeneration()) return;
         const nextSignedRtcSession =
           signedRtcDecision.mode === "signed"
             ? new SignedRtcLiveSession(

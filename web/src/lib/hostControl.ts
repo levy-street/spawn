@@ -825,9 +825,9 @@ export class HostControlClient {
     };
 
     try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
+      // Resolve trust BEFORE creating the offer: the decision reads IndexedDB,
+      // and deciding afterwards delays the offer past ICE gathering, which both
+      // emits candidates ahead of the offer and biases ICE toward a relay pair.
       let decision: SignedRtcTrustDecision = { mode: "unpinned" };
       if (this.options.resolveSignedRtcTrust) {
         decision = await this.options
@@ -844,6 +844,10 @@ export class HostControlClient {
         return;
       }
       this.signedRtcRefusal = null;
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       const nextSignedRtcSession =
         decision.mode === "signed"
           ? new SignedRtcLiveSession(
