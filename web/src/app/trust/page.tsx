@@ -342,17 +342,17 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
     queryFn: () => hosts.list(),
     enabled: accountId !== null,
   });
-  const host = hostList.data?.[0] ?? null;
+  // Only hosts with an identity key can be endorsed against, and there may be
+  // several -- including stale records for a host that was re-paired. Picking
+  // one arbitrarily silently signed against the wrong key and posted nothing.
+  const keyedHosts = (hostList.data ?? []).filter(
+    (candidate) => (candidate.host_public_key ?? null) !== null,
+  );
 
   const devices = useQuery({
     queryKey: ["trust", "browser-devices"],
     queryFn: () => browserDevices.list(),
     enabled: accountId !== null,
-  });
-  const pinned = useQuery({
-    queryKey: ["trust", "host-pins", host?.id],
-    queryFn: () => trust.hostPins(host?.id as string),
-    enabled: host?.id !== undefined,
   });
   const thisDevice = useQuery({
     queryKey: ["trust", "this-device", accountId],
@@ -370,36 +370,70 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
     enabled: accountId !== null,
   });
 
+  /** Every host this browser is already trusted by; those are what it can vouch for. */
+  const myHosts = useQuery({
+    queryKey: [
+      "trust",
+      "my-hosts",
+      keyedHosts.map((h) => h.id).join(","),
+      thisDevice.data?.publicKeyWire,
+    ],
+    queryFn: async () => {
+      const mine = (await browserDevices.list()).find(
+        (device) => device.public_key === thisDevice.data?.publicKeyWire,
+      );
+      if (mine === undefined) return [];
+      const pinned = await Promise.all(
+        keyedHosts.map(async (candidate) => ({
+          host: candidate,
+          trusted: (await trust.hostPins(candidate.id)).includes(mine.id),
+        })),
+      );
+      return pinned.filter((entry) => entry.trusted).map((entry) => entry.host);
+    },
+    enabled: keyedHosts.length > 0 && thisDevice.data != null,
+  });
+
   const endorse = useMutation({
     mutationFn: async (target: BrowserDevice) => {
       const id = accountId as string;
-      const hostKey = host?.host_public_key ?? null;
-      if (host === null || hostKey === null) {
-        throw new Error("this host has no identity key to endorse against");
+      const targets = myHosts.data ?? [];
+      if (targets.length === 0) {
+        throw new Error(
+          "This device is not trusted by any host yet, so it cannot vouch for another. Endorse from a device that is already connected.",
+        );
       }
       const identity = await loadBrowserDeviceIdentity(id);
       if (identity === null) {
-        throw new Error("this device has no identity to endorse with");
+        throw new Error("This device has no identity to endorse with.");
       }
-      const signature = await createBrowserEndorsementProof(
-        identity,
-        id,
-        hostKey,
-        target.public_key,
-        target.id,
-      );
       const mine = (await browserDevices.list()).find(
         (device) => device.public_key === identity.publicKeyWire,
       );
       if (mine === undefined) {
-        throw new Error("this device is not registered with the server");
+        throw new Error("This device is not registered with the server.");
       }
-      return trust.endorse({
-        host_id: host.id,
-        endorser_device_id: mine.id,
-        endorsed_device_id: target.id,
-        signature,
-      });
+      // Endorse for every host this device is trusted by, rather than making
+      // the operator reason about which host a device "belongs" to.
+      const results = [];
+      for (const target_host of targets) {
+        const signature = await createBrowserEndorsementProof(
+          identity,
+          id,
+          target_host.host_public_key as string,
+          target.public_key,
+          target.id,
+        );
+        results.push(
+          await trust.endorse({
+            host_id: target_host.id,
+            endorser_device_id: mine.id,
+            endorsed_device_id: target.id,
+            signature,
+          }),
+        );
+      }
+      return { count: results.length, fingerprint: results[0].endorsed_key_fingerprint };
     },
     onMutate: () => {
       setNote(null);
@@ -407,7 +441,7 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
     },
     onSuccess: (result) => {
       setNote(
-        `Endorsed ${result.endorsed_key_fingerprint}. The host adopts it on the daemon's next connect.`,
+        `Endorsed ${result.fingerprint} for ${result.count} host${result.count === 1 ? "" : "s"}. It is adopted on the daemon's next connect.`,
       );
       setConfirmed(null);
       queryClient.invalidateQueries({ queryKey: ["trust"] });
@@ -416,11 +450,11 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
   });
 
   const mineWire = thisDevice.data?.publicKeyWire ?? null;
-  const unpinned = (devices.data ?? []).filter(
-    (device) =>
-      device.revoked_at === null &&
-      device.public_key !== mineWire &&
-      !(pinned.data ?? []).includes(device.id),
+  // Candidates are live devices other than this one. A device already trusted
+  // by every host here would be endorsed redundantly, which the server treats
+  // as idempotent, so it is not worth hiding at the cost of another round trip.
+  const candidates = (devices.data ?? []).filter(
+    (device) => device.revoked_at === null && device.public_key !== mineWire,
   );
 
   return (
@@ -428,8 +462,9 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
       <CardHeader>
         <CardTitle>Trust another device</CardTitle>
         <CardDescription>
-          Admit a browser to {host?.name ?? "your host"} on this device&apos;s authority. The server
-          can relay an endorsement but cannot create one.
+          Admit a browser to the {myHosts.data?.length ?? 0} host
+          {(myHosts.data?.length ?? 0) === 1 ? "" : "s"} this device is trusted by. The server can
+          relay an endorsement but cannot create one.
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -446,13 +481,14 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
           </p>
         </div>
 
-        {unpinned.length === 0 ? (
+        {candidates.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            No other devices are waiting. Sign in on the new device first, then reload here.
+            No other devices are waiting. Sign in on the new device first, then reload here. Revoked
+            devices are never listed.
           </p>
         ) : (
           <ul className="flex flex-col gap-3">
-            {unpinned.map((device) => (
+            {candidates.map((device) => (
               <li key={device.id} className="rounded border p-3 text-sm">
                 <p className="break-all font-mono font-semibold">{device.fingerprint}</p>
                 <p className="text-xs text-muted-foreground">added {device.created_at}</p>
