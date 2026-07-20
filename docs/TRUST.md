@@ -251,8 +251,24 @@ stop being in tension.
 
 ### Decision
 
-**Passkey PRF as the primary path, endorsement as the fallback, TOFU as the
-default underneath.**
+**Passkey PRF and endorsement, both required. TOFU as the default underneath.**
+
+Corrected 2026-07-20 after testing on real devices. This ADR originally called
+endorsement a *fallback* for platforms lacking PRF. That was wrong, and the
+error was structural rather than a detail: trust runs in two directions and only
+one of them is a passkey problem.
+
+- **Browser learns the host's key.** The sealed bundle carries it. Passkeys
+  solve this, and a second device inherits it with no terminal ceremony.
+- **Daemon learns the browser's key.** Nothing in the passkey path carries it,
+  and the daemon refuses pin additions on the server's say-so, so the only
+  authority it accepts is a signature from a browser key it already pins.
+
+A device that unlocks the bundle but is not endorsed is *worse off than before*:
+it now holds a host pin, so it signs its offers, and the daemon rejects every
+one. That was observed on a phone — importing the bundle broke a device that had
+been working on the unpinned path. Both halves are needed on every platform,
+whatever its PRF support.
 
 The WebAuthn `prf` extension derives a stable symmetric secret from a passkey,
 which unlocks the trust bundle of option 3. Passkeys already sync across an
@@ -261,9 +277,15 @@ without the server ever being able to forge a host key. It trusts the platform
 passkey sync provider, but explicitly *not* the spawn server, which is the
 threat this document exists to address.
 
-Endorsement covers devices where PRF is unavailable and the loss-of-passkey
-recovery path. Both paths write the same origin-scoped pin store the signed-RTC
-gate already reads, so the gate itself does not change.
+Endorsement additionally covers devices where PRF is unavailable and the
+loss-of-passkey recovery path. The bundle path writes the origin-scoped pin
+store the signed-RTC gate already reads, so the gate itself does not change.
+
+Endorsed pins must also be recorded server-side. The daemon's pin set can never
+exceed what the server lists, because reconciliation prunes anything absent from
+it -- so a pin admitted by endorsement alone is erased on the next connect. The
+server row is the mirror; the endorsement signature is the authority. Discovered
+by hand-placing a pin and watching reconciliation delete it.
 
 TOFU remains the behaviour for an unpinned host, because refusing every
 un-bootstrapped device would make the product unusable long before the above
