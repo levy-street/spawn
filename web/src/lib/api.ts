@@ -288,6 +288,22 @@ export const BrowserDeviceSchema = z.object({
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
+/** Opaque ciphertext: the server stores it and cannot read it. */
+export const TrustBundleSchema = z.object({
+  sealed: z.string().min(1),
+  revision: z.number().int().min(1),
+  updated_at: z.string(),
+});
+export type TrustBundle = z.infer<typeof TrustBundleSchema>;
+
+export const PasskeyCredentialSchema = z.object({
+  id: z.string().uuid(),
+  credential_id: z.string().min(1),
+  label: z.string().nullable(),
+  created_at: z.string(),
+});
+export type PasskeyCredential = z.infer<typeof PasskeyCredentialSchema>;
+
 // ---------- Endpoints ----------
 
 export const auth = {
@@ -393,6 +409,39 @@ export const browserDevices = {
       body: JSON.stringify({ expected_public_key: expectedPublicKey }),
       schema: BrowserDeviceSchema,
     }),
+};
+
+export const trust = {
+  /** null when this account has never sealed a bundle. */
+  getBundle: () =>
+    api("/api/trust/bundle", {
+      method: "GET",
+      schema: TrustBundleSchema.nullable(),
+    }),
+  /**
+   * `expectedRevision` must be the revision the bundle was read at, or omitted
+   * when creating the first one. The server refuses a blind overwrite so a
+   * stale device cannot drop host keys another device added.
+   */
+  putBundle: (sealed: string, expectedRevision?: number) =>
+    api("/api/trust/bundle", {
+      method: "PUT",
+      body: JSON.stringify({ sealed, expected_revision: expectedRevision ?? null }),
+      schema: TrustBundleSchema,
+    }),
+  listPasskeys: () =>
+    api("/api/trust/passkeys", {
+      method: "GET",
+      schema: z.array(PasskeyCredentialSchema),
+    }),
+  addPasskey: (credentialId: string, label?: string) =>
+    api("/api/trust/passkeys", {
+      method: "POST",
+      body: JSON.stringify({ credential_id: credentialId, label: label ?? null }),
+      schema: PasskeyCredentialSchema,
+    }),
+  removePasskey: (id: string) =>
+    api(`/api/trust/passkeys/${id}`, { method: "DELETE", schema: z.unknown() }),
 };
 
 export const agents = {
