@@ -296,11 +296,25 @@ where
         // invalid proof never reaches the credential file.
         let approval_verified =
             verify_browser_approval(&body, identity, approval_nonce, browser_public_key)?;
-        if approval_verified {
+        // Retain the proof itself, not a verdict about it, so every later load
+        // re-derives the verdict rather than trusting this one.
+        let browser_pin = if approval_verified {
             println!("spawn: browser approval proof verified");
+            creds::attach_browser_approval_proof(
+                browser_pin,
+                body.account_id
+                    .as_deref()
+                    .expect("a verified proof carries an account ID"),
+                approval_nonce,
+                body.browser_approval_signature
+                    .as_deref()
+                    .expect("a verified proof carries a signature"),
+            )
+            .context("retaining the verified browser approval proof")?
         } else {
             println!("spawn: warning: this server supplied no browser approval proof");
-        }
+            browser_pin
+        };
         // The proof cannot tell a substituted browser key from the real one, so
         // the operator confirms this fingerprint matches the one their browser
         // shows. This is the only check a hostile server cannot pass.

@@ -127,6 +127,18 @@ pub fn signature_from_wire(value: &str) -> Result<Signature, HostPairApprovalErr
     Ok(Signature::from_bytes(&decoded))
 }
 
+/// Canonical-form check for an account ID retained alongside a browser pin.
+pub fn account_id_bytes(value: &str) -> Result<[u8; USER_ID_BYTES], HostPairApprovalError> {
+    canonical_uuid_bytes(value)
+}
+
+/// Canonical-form check for a ceremony nonce retained alongside a browser pin.
+pub fn approval_nonce_bytes(
+    value: &str,
+) -> Result<[u8; APPROVAL_NONCE_BYTES], HostPairApprovalError> {
+    decode_wire_exact(value, "approval_nonce")
+}
+
 fn canonical_uuid_bytes(value: &str) -> Result<[u8; USER_ID_BYTES], HostPairApprovalError> {
     let parsed = Uuid::parse_str(value).map_err(|_| HostPairApprovalError::InvalidUserId)?;
     if parsed.to_string() != value {

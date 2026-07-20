@@ -26,6 +26,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
+use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
 use spawnd::host_pair_possession::{
     sign_transcript, signature_to_wire, HostPairPossessionTranscript,
 };
@@ -87,6 +88,18 @@ pub struct HostIdentity {
     pub fingerprint: String,
 }
 
+/// The browser's pairing approval, retained as evidence rather than reduced to
+/// a stored "verified" flag. Keeping the signature means the daemon re-derives
+/// the verdict from the proof on every load, so a tampered credential file or a
+/// host key that no longer matches is caught instead of trusted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserApprovalProof {
+    account_id: String,
+    approval_nonce: String,
+    signature: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserPin {
@@ -94,12 +107,54 @@ pub struct BrowserPin {
     browser_key_algorithm: String,
     browser_public_key: String,
     browser_key_fingerprint: String,
+    // Absent for pins created before this field existed, or by a server that
+    // supplies no proof. Omitted from the file entirely when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_proof: Option<BrowserApprovalProof>,
 }
 
 impl BrowserPin {
     pub fn device_id(&self) -> Uuid {
         // Construction and credential loading validate this exact field.
         Uuid::parse_str(&self.browser_device_id).expect("validated browser device UUID")
+    }
+
+    #[allow(dead_code)] // Consumed by the signed-offer enforcement policy.
+    pub fn has_approval_proof(&self) -> bool {
+        self.approval_proof.is_some()
+    }
+
+    /// Whether two pins name the same device and key, ignoring retained proof.
+    fn identity_matches(&self, other: &BrowserPin) -> bool {
+        self.browser_device_id == other.browser_device_id
+            && self.browser_key_algorithm == other.browser_key_algorithm
+            && self.browser_public_key == other.browser_public_key
+            && self.browser_key_fingerprint == other.browser_key_fingerprint
+    }
+
+    /// Re-verify the retained approval proof against this host's public key.
+    ///
+    /// Returns whether a proof was actually checked; `Ok(false)` means none is
+    /// retained. An error means one is retained and does not verify, which no
+    /// benign condition produces.
+    pub fn verify_approval(&self, host_public_key: &str) -> Result<bool> {
+        let Some(proof) = &self.approval_proof else {
+            return Ok(false);
+        };
+        let transcript = HostPairApprovalTranscript::from_wire(
+            &proof.account_id,
+            &proof.approval_nonce,
+            host_public_key,
+            &self.browser_public_key,
+        )
+        .context("decoding the retained browser approval transcript")?;
+        let signature = host_pair_approval::signature_from_wire(&proof.signature)
+            .context("decoding the retained browser approval signature")?;
+        let browser_key = public_key_from_wire(&self.browser_public_key)
+            .context("decoding the pinned browser public key")?;
+        host_pair_approval::verify_transcript(&browser_key, &transcript, &signature)
+            .context("verifying the retained browser approval proof")?;
+        Ok(true)
     }
 
     pub fn key_algorithm(&self) -> &str {
@@ -222,6 +277,36 @@ pub fn browser_pin_from_approval(
         browser_key_algorithm: BROWSER_KEY_ALGORITHM.to_owned(),
         browser_public_key: browser_public_key.to_owned(),
         browser_key_fingerprint: expected_fingerprint,
+        approval_proof: None,
+    })
+}
+
+/// Attach the browser's approval proof to a validated pin.
+///
+/// Only canonical wire forms are retained, so a malformed proof is rejected
+/// here rather than at some later verification that might be skipped.
+pub fn attach_browser_approval_proof(
+    pin: BrowserPin,
+    account_id: &str,
+    approval_nonce: &str,
+    signature: &str,
+) -> Result<BrowserPin> {
+    if host_pair_approval::account_id_bytes(account_id).is_err() {
+        bail!("approval proof account ID is not a canonical UUID")
+    }
+    if host_pair_approval::approval_nonce_bytes(approval_nonce).is_err() {
+        bail!("approval proof nonce is not a canonical 32-byte value")
+    }
+    if host_pair_approval::signature_from_wire(signature).is_err() {
+        bail!("approval proof signature is not a canonical Ed25519 signature")
+    }
+    Ok(BrowserPin {
+        approval_proof: Some(BrowserApprovalProof {
+            account_id: account_id.to_owned(),
+            approval_nonce: approval_nonce.to_owned(),
+            signature: signature.to_owned(),
+        }),
+        ..pin
     })
 }
 
@@ -252,10 +337,22 @@ pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
 pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<bool> {
     validate_browser_pins(&creds.browser_pins)?;
     validate_browser_pin(&pin)?;
-    for existing in &creds.browser_pins {
+    for index in 0..creds.browser_pins.len() {
+        let existing = &creds.browser_pins[index];
         if existing.browser_device_id == pin.browser_device_id {
             if existing == &pin {
                 return Ok(false);
+            }
+            // Same device and same key, differing only in retained evidence.
+            // Re-pairing an already-pinned browser against a server that can
+            // now supply the proof is an upgrade, not a key conflict — and a
+            // proof already held is never dropped for one that is absent.
+            if existing.identity_matches(&pin) {
+                if pin.approval_proof.is_none() {
+                    return Ok(false);
+                }
+                creds.browser_pins[index] = pin;
+                return Ok(true);
             }
             bail!("browser device ID is already pinned to a different key")
         }
@@ -1637,8 +1734,21 @@ fn validate_loaded_creds(creds: &StoredCreds) -> Result<()> {
     {
         bail!("stored server URL is too large")
     }
-    host_identity(creds)?;
+    let identity = host_identity(creds)?;
     validate_browser_pins(&creds.browser_pins)?;
+    // Re-derive every retained verdict from its proof. A credential file whose
+    // approval evidence no longer matches its host key fails to load rather
+    // than serving a pin whose provenance silently stopped being true.
+    if let Some(identity) = &identity {
+        for pin in &creds.browser_pins {
+            pin.verify_approval(&identity.public_key).with_context(|| {
+                format!(
+                    "re-verifying the retained approval proof for browser device {}",
+                    pin.browser_device_id
+                )
+            })?;
+        }
+    }
     if !creds.browser_pins.is_empty() {
         creds
             .host_id
@@ -1686,12 +1796,21 @@ fn validate_persistable_creds(creds: &StoredCreds) -> Result<()> {
 }
 
 fn validate_browser_pin(pin: &BrowserPin) -> Result<()> {
-    let validated = browser_pin_from_approval(
+    let mut validated = browser_pin_from_approval(
         &pin.browser_device_id,
         &pin.browser_key_algorithm,
         &pin.browser_public_key,
         &pin.browser_key_fingerprint,
     )?;
+    if let Some(proof) = &pin.approval_proof {
+        validated = attach_browser_approval_proof(
+            validated,
+            &proof.account_id,
+            &proof.approval_nonce,
+            &proof.signature,
+        )
+        .context("validating the retained browser approval proof")?;
+    }
     if &validated != pin {
         bail!("stored browser pin is not canonical")
     }
@@ -2107,6 +2226,121 @@ mod tests {
                 |record| backends.write_file(record),
             )
         })
+    }
+
+    /// Build a browser pin carrying a genuinely signed approval proof, plus the
+    /// host key that proof is bound to.
+    fn proven_browser_pin(index: u8) -> (BrowserPin, String, String) {
+        let host_key = SigningKey::from_bytes(&[index.wrapping_add(41); 32]);
+        let browser_key = SigningKey::from_bytes(&[index.wrapping_add(97); 32]);
+        let host_wire = public_key_to_wire(&host_key.verifying_key());
+        let browser_wire = public_key_to_wire(&browser_key.verifying_key());
+        let account = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        let nonce = URL_SAFE_NO_PAD.encode([index; 32]);
+
+        let transcript =
+            HostPairApprovalTranscript::from_wire(account, &nonce, &host_wire, &browser_wire)
+                .expect("valid approval transcript");
+        let signature = host_pair_approval::signature_to_wire(
+            &host_pair_approval::sign_transcript(&browser_key, &transcript),
+        );
+
+        let pin = browser_pin(Uuid::from_u128(u128::from(index) + 1), &browser_wire);
+        let proven = attach_browser_approval_proof(pin, account, &nonce, &signature)
+            .expect("attaching a valid proof");
+        (proven, host_wire, signature)
+    }
+
+    #[test]
+    fn a_retained_proof_reverifies_against_its_host_key() {
+        let (pin, host_wire, _) = proven_browser_pin(3);
+        assert!(pin.has_approval_proof());
+        assert!(pin.verify_approval(&host_wire).expect("verifies"));
+    }
+
+    #[test]
+    fn a_retained_proof_does_not_verify_against_another_host_key() {
+        let (pin, _, _) = proven_browser_pin(4);
+        let (_, other_host, _) = proven_browser_pin(5);
+        let error = pin.verify_approval(&other_host).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("approval proof"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_pin_without_a_proof_reports_no_verdict_rather_than_failing() {
+        let (_, host_wire, _) = proven_browser_pin(6);
+        let plain = generated_browser_pin(2);
+        assert!(!plain.has_approval_proof());
+        assert!(!plain
+            .verify_approval(&host_wire)
+            .expect("no proof retained"));
+    }
+
+    #[test]
+    fn a_tampered_retained_proof_fails_validation() {
+        let (pin, _, signature) = proven_browser_pin(7);
+        let flipped = if signature.starts_with('A') { 'B' } else { 'A' };
+        let tampered = BrowserPin {
+            approval_proof: Some(BrowserApprovalProof {
+                account_id: "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_owned(),
+                approval_nonce: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+                signature: format!("{flipped}{}", &signature[1..]),
+            }),
+            ..pin.clone()
+        };
+        // The shape is still canonical, so this must be caught by verification
+        // against the host key, not merely by format validation.
+        assert!(validate_browser_pin(&tampered).is_ok());
+        let (_, host_wire, _) = proven_browser_pin(7);
+        assert!(tampered.verify_approval(&host_wire).is_err());
+    }
+
+    #[test]
+    fn a_malformed_retained_proof_is_rejected_on_sight() {
+        let (pin, _, signature) = proven_browser_pin(8);
+        for (account, nonce, sig) in [
+            (
+                "not-a-uuid",
+                URL_SAFE_NO_PAD.encode([8_u8; 32]),
+                signature.clone(),
+            ),
+            (
+                "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+                "short".to_owned(),
+                signature.clone(),
+            ),
+            (
+                "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+                URL_SAFE_NO_PAD.encode([8_u8; 32]),
+                "truncated".to_owned(),
+            ),
+        ] {
+            assert!(
+                attach_browser_approval_proof(pin.clone(), account, &nonce, &sig).is_err(),
+                "accepted a malformed proof: {account} {nonce} {sig}"
+            );
+        }
+    }
+
+    #[test]
+    fn repairing_upgrades_an_unproven_pin_and_never_downgrades_a_proven_one() {
+        let (proven, _, _) = proven_browser_pin(9);
+        let mut unproven = proven.clone();
+        unproven.approval_proof = None;
+
+        // Upgrade: the same device and key, now with evidence behind it.
+        let mut creds = StoredCreds::default();
+        creds.browser_pins = vec![unproven.clone()];
+        assert!(merge_browser_pin(&mut creds, proven.clone()).unwrap());
+        assert!(creds.browser_pins[0].has_approval_proof());
+
+        // Downgrade must not happen: a proof already held survives a re-pair
+        // against a server that supplies none.
+        assert!(!merge_browser_pin(&mut creds, unproven).unwrap());
+        assert!(creds.browser_pins[0].has_approval_proof());
     }
 
     fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {
