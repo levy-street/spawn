@@ -21,6 +21,15 @@
 # random). None of them are served, so comparing them would produce permanent
 # false positives.
 #
+# CROSS-MACHINE REPRODUCIBILITY IS NOT YET ACHIEVED. Measured against dev: 25
+# of 44 served assets matched byte-for-byte, and the other 19 differed only in
+# webpack module ORDER inside the chunk (identical byte length, same modules,
+# emitted in a different sequence) -- which changes the content hash and so the
+# filename. The two machines differed in bun (1.3.13 vs 1.3.14), node (v20.20.2
+# vs v22.19.0), and CPU count (16 vs 12), any of which can reorder emission.
+# A same-machine rebuild is reproducible; a different-machine rebuild is not.
+# Closing this needs a pinned build environment (container), not a better script.
+#
 # Both sides must use the same SPAWN_BUILD_ID (default "spawn").
 set -euo pipefail
 
@@ -66,7 +75,8 @@ while IFS= read -r local_file; do
   url="$target/_next/static/$rel"
 
   served="$build_dir/served.bin"
-  code="$(curl -sS -o "$served" -w '%{http_code}' --max-time 30 "$url" || echo 000)"
+  # --globoff: route paths contain [id], which curl otherwise reads as a range.
+  code="$(curl -sS --globoff -o "$served" -w '%{http_code}' --max-time 30 "$url" || echo 000)"
   if [[ "$code" != "200" ]]; then
     printf 'MISSING  %s (HTTP %s)\n' "$rel" "$code"
     missing=$((missing + 1))

@@ -307,11 +307,26 @@ permanently in public or serving something no verifier can find. An extension
 that verifies before execution is the endgame; the log is the high-value step
 before it.
 
-Prerequisites, none of which hold yet: `generateBuildId` is unset so every Next
-build differs; the toolchain is unpinned (no `engines`, no `.nvmrc`); and build
-inputs bake into the bundle (`SPAWN_API_PROXY_TARGET`,
-`NEXT_PUBLIC_SPAWN_WS_URL`), so they must be declared publicly or honest builds
-will not match.
+Status. `generateBuildId` is now pinned, which took the served surface from 28
+nondeterministic files to zero **on one machine**, measured across nine builds.
+`scripts/verify-served-client.sh` rebuilds and compares that surface.
+
+Cross-machine reproducibility is not yet achieved, and that is the case the
+verifier actually needs — a third party rebuilding on their own hardware.
+Measured against dev, 25 of 44 served assets matched byte-for-byte; the other 19
+differed only in webpack module *order* inside the chunk (same modules, same
+byte length, different emission sequence), which changes the content hash and
+therefore the filename. The build machines differed in bun (1.3.13 vs 1.3.14),
+node (v20.20.2 vs v22.19.0) and CPU count (16 vs 12); any of those can reorder
+emission. The toolchain is now declared in `web/package.json`, but declaring is
+not enforcing: closing this needs a pinned build environment, i.e. a container,
+which is the next step rather than a script change.
+
+Note also that same-machine testing cannot detect this class of problem, and
+that the manifest key-order race is flaky — one A/B build pair showed a single
+difference where later pairs showed seventeen. Any future claim of
+reproducibility needs several builds, on more than one machine, before it means
+anything.
 
 ## Feature relocation map
 
