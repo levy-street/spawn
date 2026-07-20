@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
 import {
   createTrustPasskey,
@@ -15,6 +16,7 @@ import {
   isPasskeySupported,
   PasskeyPrfError,
 } from "@/lib/passkey-prf";
+import { probeStoragePersistence } from "@/lib/storage-diagnostics";
 import { importTrustBundle, sealCurrentTrust } from "@/lib/trust-bootstrap";
 import { deriveTrustBundleKey } from "@/lib/trust-bundle";
 
@@ -63,6 +65,18 @@ function TrustSettings() {
     queryFn: () => trust.getBundle(),
     enabled: accountId !== null,
   });
+  // Does this browser persist what the trust model needs? A device that mints a
+  // fresh identity every load can never be pinned, and nothing else here works.
+  const storage = useQuery({
+    queryKey: ["trust", "storage-probe", accountId],
+    queryFn: async () => {
+      const existing = accountId === null ? null : await loadBrowserDeviceIdentity(accountId);
+      return { identityPersisted: existing !== null, probe: await probeStoragePersistence() };
+    },
+    enabled: accountId !== null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+
   const localPins = useQuery({
     queryKey: ["trust", "local-pins", accountId],
     queryFn: () =>
@@ -204,6 +218,29 @@ function TrustSettings() {
                 {passkeys.data?.length ?? "…"}
               </span>
             </p>
+          </div>
+
+          <div className="rounded border p-3 text-sm" data-testid="storage-report">
+            <p className="font-semibold">Browser storage</p>
+            {storage.isLoading || storage.data === undefined ? (
+              <p className="text-muted-foreground">checking…</p>
+            ) : (
+              <ul className="mt-1 font-mono text-xs">
+                <li>device identity persisted: {String(storage.data.identityPersisted)}</li>
+                <li>plain value persists: {String(storage.data.probe.plainValuePersists)}</li>
+                <li>Ed25519 key persists: {String(storage.data.probe.ed25519KeyPersists)}</li>
+                <li>ECDSA key persists: {String(storage.data.probe.ecdsaKeyPersists)}</li>
+                {storage.data.probe.failure !== null && (
+                  <li className="text-destructive">failure: {storage.data.probe.failure}</li>
+                )}
+              </ul>
+            )}
+            {storage.data !== undefined && !storage.data.identityPersisted && (
+              <p className="mt-2 text-destructive">
+                This browser did not keep its device identity. It will mint a new one on every load
+                and can never be pinned, so signed connections cannot work here.
+              </p>
+            )}
           </div>
 
           <div className="flex flex-wrap gap-2">
