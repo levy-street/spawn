@@ -27,12 +27,12 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
+use crate::worker_backend;
+use crate::ws::{self, WsInbound};
 use spawnd::signed_signal::{
     public_key_from_wire, ScopeType, SenderRole, SignalKind, SignedSignalTranscript,
 };
 use spawnd::signed_signal_wire::{verify_rtc_signal_wire, VerifiedRtcSignal};
-use crate::worker_backend;
-use crate::ws::{self, WsInbound};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
@@ -942,7 +942,8 @@ async fn dispatch_loop(
                         Some(envelope) => {
                             match verify_signed_rtc_offer(envelope, &live_credentials.record) {
                                 Some(verified)
-                                    if verified.transcript().session_id() == session_id.as_str() =>
+                                    if verified.transcript().session_id()
+                                        == session_id.as_str() =>
                                 {
                                     tracing::info!(
                                         scope_type = ?verified.transcript().scope_type(),
@@ -952,11 +953,15 @@ async fn dispatch_loop(
                                     Some(verified)
                                 }
                                 Some(_) => {
-                                    tracing::warn!("rejecting signed RTC offer with mismatched session");
+                                    tracing::warn!(
+                                        "rejecting signed RTC offer with mismatched session"
+                                    );
                                     continue;
                                 }
                                 None => {
-                                    tracing::warn!("rejecting signed RTC offer that no local pin verified");
+                                    tracing::warn!(
+                                        "rejecting signed RTC offer that no local pin verified"
+                                    );
                                     continue;
                                 }
                             }
@@ -968,7 +973,9 @@ async fn dispatch_loop(
                             match build_rtc_answer_signer(&live_credentials.record, verified) {
                                 Ok(Some(signer)) => Some(signer),
                                 _ => {
-                                    tracing::warn!("cannot sign RTC answer for verified signed offer");
+                                    tracing::warn!(
+                                        "cannot sign RTC answer for verified signed offer"
+                                    );
                                     continue;
                                 }
                             }
@@ -1015,7 +1022,9 @@ async fn dispatch_loop(
                                 if t.scope_type() != ScopeType::Agent
                                     || t.scope_id() != agent_id.to_string().as_str()
                                 {
-                                    tracing::warn!("signed RTC offer scope does not match agent routing");
+                                    tracing::warn!(
+                                        "signed RTC offer scope does not match agent routing"
+                                    );
                                     continue;
                                 }
                             }
@@ -1053,11 +1062,13 @@ async fn dispatch_loop(
                             if let Some(verified) = &verified_offer {
                                 let t = verified.transcript();
                                 let scope_ok = t.scope_type() == ScopeType::Host
-                                    && scope_id
-                                        .as_ref()
-                                        .map_or(false, |id| t.scope_id() == id.to_string().as_str());
+                                    && scope_id.as_ref().map_or(false, |id| {
+                                        t.scope_id() == id.to_string().as_str()
+                                    });
                                 if !scope_ok {
-                                    tracing::warn!("signed RTC offer scope does not match host routing");
+                                    tracing::warn!(
+                                        "signed RTC offer scope does not match host routing"
+                                    );
                                     continue;
                                 }
                             }
@@ -2466,7 +2477,9 @@ mod tests {
             public_key_from_wire, public_key_to_wire, ScopeType, SenderRole, SignalKind,
             SignedSignalTranscript,
         };
-        use spawnd::signed_signal_wire::{sign_rtc_signal_wire, verify_rtc_signal_wire, RtcProtocol};
+        use spawnd::signed_signal_wire::{
+            sign_rtc_signal_wire, verify_rtc_signal_wire, RtcProtocol,
+        };
 
         // Deterministic browser + host identities.
         let browser_key = SigningKey::from_bytes(&[7u8; 32]);

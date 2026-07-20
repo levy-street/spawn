@@ -13,6 +13,9 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::StatusCode;
 use zeroize::{Zeroize, Zeroizing};
 
+use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
+use spawnd::signed_signal::public_key_from_wire;
+
 use crate::cli::LoginArgs;
 use crate::config;
 use crate::creds;
@@ -127,7 +130,14 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
-            let host_id = commit_poll_success(&mut stored, body, &identity, &server, creds::save)?;
+            let host_id = commit_poll_success(
+                &mut stored,
+                body,
+                &identity,
+                &server,
+                &start.approval_nonce,
+                creds::save,
+            )?;
             println!("spawn: logged in. host_id = {host_id}");
             return Ok(());
         }
@@ -165,17 +175,68 @@ fn poll_has_success_fields(body: &DevicePollResponse) -> bool {
         || body.browser_key_fingerprint.is_some()
 }
 
+/// Verify the browser's approval proof against values this daemon already holds.
+///
+/// The nonce and host key come from this daemon's own device/start exchange, so
+/// a proof minted for another ceremony, another host, or another account cannot
+/// be replayed here. Returns whether a proof was actually verified.
+///
+/// A missing proof is tolerated and reported as unverified, because a pre-0022
+/// server cannot supply one. A present-but-invalid proof aborts the login: no
+/// benign condition produces one.
+///
+/// This does not by itself defeat a hostile server. The transcript commits to
+/// the signer's own key, so a server substituting its own keypair can mint a
+/// self-consistent proof. Distinguishing that case is what the operator's
+/// out-of-band fingerprint comparison below is for.
+fn verify_browser_approval(
+    body: &DevicePollResponse,
+    identity: &HostIdentity,
+    approval_nonce: &str,
+    browser_public_key: &str,
+) -> Result<bool> {
+    let (Some(account_id), Some(signature_wire)) = (
+        body.account_id.as_deref(),
+        body.browser_approval_signature.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    let transcript = HostPairApprovalTranscript::from_wire(
+        account_id,
+        approval_nonce,
+        &identity.public_key,
+        browser_public_key,
+    )
+    .context("decoding the browser approval transcript")?;
+    let signature = host_pair_approval::signature_from_wire(signature_wire)
+        .context("decoding the browser approval signature")?;
+    let browser_key = public_key_from_wire(browser_public_key)
+        .context("decoding the approved browser public key")?;
+    host_pair_approval::verify_transcript(&browser_key, &transcript, &signature)
+        .context("verifying the browser approval proof")?;
+    Ok(true)
+}
+
 fn commit_poll_success<F>(
     stored: &mut creds::StoredCreds,
     body: DevicePollResponse,
     identity: &HostIdentity,
     server: &url::Url,
+    approval_nonce: &str,
     persist: F,
 ) -> Result<uuid::Uuid>
 where
     F: FnOnce(&mut creds::StoredCreds, &creds::CredentialRevision) -> Result<()>,
 {
-    commit_poll_success_observed(stored, body, identity, server, persist, |_| {})
+    commit_poll_success_observed(
+        stored,
+        body,
+        identity,
+        server,
+        approval_nonce,
+        persist,
+        |_| {},
+    )
 }
 
 fn commit_poll_success_observed<F, O>(
@@ -183,6 +244,7 @@ fn commit_poll_success_observed<F, O>(
     mut body: DevicePollResponse,
     identity: &HostIdentity,
     server: &url::Url,
+    approval_nonce: &str,
     persist: F,
     observe_wiped_token: O,
 ) -> Result<uuid::Uuid>
@@ -230,6 +292,19 @@ where
             browser_key_fingerprint,
         )
         .context("validating approved browser identity from device/poll")?;
+        // Check the browser's own signature before storing the pin, so an
+        // invalid proof never reaches the credential file.
+        let approval_verified =
+            verify_browser_approval(&body, identity, approval_nonce, browser_public_key)?;
+        if approval_verified {
+            println!("spawn: browser approval proof verified");
+        } else {
+            println!("spawn: warning: this server supplied no browser approval proof");
+        }
+        // The proof cannot tell a substituted browser key from the real one, so
+        // the operator confirms this fingerprint matches the one their browser
+        // shows. This is the only check a hostile server cannot pass.
+        println!("spawn: verify browser fingerprint: {browser_key_fingerprint}");
         let owned_token = std::mem::take(
             &mut **token
                 .as_mut()
@@ -277,6 +352,10 @@ fn detect_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 32 zero bytes: a canonical 43-char base64url ceremony nonce.
+    const TEST_ACCOUNT: &str = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+    const TEST_APPROVAL_NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
     use super::*;
 
     const BROWSER_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
@@ -300,6 +379,8 @@ mod tests {
             browser_key_algorithm: None,
             browser_public_key: None,
             browser_key_fingerprint: None,
+            account_id: None,
+            browser_approval_signature: None,
             error: None,
         }
     }
@@ -334,6 +415,7 @@ mod tests {
             complete_response(),
             &identity(),
             &server,
+            TEST_APPROVAL_NONCE,
             |candidate, _| {
                 persisted.set(true);
                 assert_eq!(candidate.browser_pins().len(), 1);
@@ -360,6 +442,7 @@ mod tests {
             wrong_host,
             &identity(),
             &server,
+            TEST_APPROVAL_NONCE,
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -373,6 +456,7 @@ mod tests {
             missing_token,
             &identity(),
             &server,
+            TEST_APPROVAL_NONCE,
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -386,6 +470,7 @@ mod tests {
             missing_host_id,
             &identity(),
             &server,
+            TEST_APPROVAL_NONCE,
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -400,6 +485,7 @@ mod tests {
                 invalid,
                 &identity(),
                 &server,
+                TEST_APPROVAL_NONCE,
                 |_, _| Ok(()),
             )
             .unwrap_err();
@@ -444,6 +530,7 @@ mod tests {
                 body,
                 &identity(),
                 &server,
+                TEST_APPROVAL_NONCE,
                 |_, _| {
                     persisted.set(true);
                     Ok(())
@@ -498,6 +585,7 @@ mod tests {
                 body,
                 &identity(),
                 &server,
+                TEST_APPROVAL_NONCE,
                 |_, _| {
                     persisted.set(true);
                     Ok(())
@@ -520,8 +608,149 @@ mod tests {
             browser_key_algorithm: None,
             browser_public_key: None,
             browser_key_fingerprint: None,
+            account_id: None,
+            browser_approval_signature: None,
             error: None,
         };
         assert!(poll_has_success_fields(&body));
+    }
+
+    /// Build a ceremony whose browser approval proof is genuinely signed.
+    fn signed_ceremony(
+        nonce: &str,
+    ) -> (HostIdentity, DevicePollResponse, ed25519_dalek::SigningKey) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let host_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let browser_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let host_wire = URL_SAFE_NO_PAD.encode(host_key.verifying_key().to_bytes());
+        let browser_wire = URL_SAFE_NO_PAD.encode(browser_key.verifying_key().to_bytes());
+
+        let identity = HostIdentity {
+            algorithm: "ed25519",
+            public_key: host_wire.clone(),
+            fingerprint: "SHA256:fingerprint".into(),
+        };
+
+        let transcript =
+            HostPairApprovalTranscript::from_wire(TEST_ACCOUNT, nonce, &host_wire, &browser_wire)
+                .expect("valid approval transcript");
+        let signature = host_pair_approval::signature_to_wire(
+            &host_pair_approval::sign_transcript(&browser_key, &transcript),
+        );
+
+        let mut body = response();
+        body.host_public_key = Some(host_wire);
+        body.browser_device_id = Some("11111111-2222-4333-8444-555555555555".into());
+        body.browser_key_algorithm = Some("ed25519".into());
+        body.browser_key_fingerprint = Some(creds::browser_key_fingerprint(&browser_wire).unwrap());
+        body.browser_public_key = Some(browser_wire);
+        body.account_id = Some(TEST_ACCOUNT.into());
+        body.browser_approval_signature = Some(signature);
+        (identity, body, browser_key)
+    }
+
+    #[test]
+    fn login_accepts_a_genuinely_signed_browser_approval() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let (identity, body, _) = signed_ceremony(TEST_APPROVAL_NONCE);
+        let mut stored = creds::StoredCreds::default();
+        let persisted = std::cell::Cell::new(false);
+        commit_poll_success(
+            &mut stored,
+            body,
+            &identity,
+            &server,
+            TEST_APPROVAL_NONCE,
+            |candidate, _| {
+                persisted.set(true);
+                assert_eq!(candidate.browser_pins().len(), 1);
+                Ok(())
+            },
+        )
+        .expect("a verified approval completes the login");
+        assert!(persisted.get());
+    }
+
+    #[test]
+    fn login_aborts_when_the_approval_proof_does_not_verify() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let (identity, mut body, _) = signed_ceremony(TEST_APPROVAL_NONCE);
+        // Flip one signature character: a forged or tampered proof.
+        let signature = body.browser_approval_signature.take().unwrap();
+        let flipped = if signature.starts_with('A') { 'B' } else { 'A' };
+        body.browser_approval_signature = Some(format!("{flipped}{}", &signature[1..]));
+
+        let persisted = std::cell::Cell::new(false);
+        let error = commit_poll_success(
+            &mut creds::StoredCreds::default(),
+            body,
+            &identity,
+            &server,
+            TEST_APPROVAL_NONCE,
+            |_, _| {
+                persisted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("browser approval proof"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!persisted.get(), "an unverified pin must never be stored");
+    }
+
+    #[test]
+    fn login_rejects_an_approval_proof_from_another_ceremony() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        // Signed against a different nonce than the one this daemon started.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let other_nonce = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let (identity, body, _) = signed_ceremony(&other_nonce);
+
+        let persisted = std::cell::Cell::new(false);
+        let error = commit_poll_success(
+            &mut creds::StoredCreds::default(),
+            body,
+            &identity,
+            &server,
+            TEST_APPROVAL_NONCE,
+            |_, _| {
+                persisted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("browser approval proof"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!persisted.get());
+    }
+
+    #[test]
+    fn login_still_completes_against_a_server_that_supplies_no_proof() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let (identity, mut body, _) = signed_ceremony(TEST_APPROVAL_NONCE);
+        body.account_id = None;
+        body.browser_approval_signature = None;
+
+        let persisted = std::cell::Cell::new(false);
+        commit_poll_success(
+            &mut creds::StoredCreds::default(),
+            body,
+            &identity,
+            &server,
+            TEST_APPROVAL_NONCE,
+            |_, _| {
+                persisted.set(true);
+                Ok(())
+            },
+        )
+        .expect("a pre-0022 server must still be able to pair");
+        assert!(persisted.get());
     }
 }

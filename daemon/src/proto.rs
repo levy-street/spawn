@@ -425,6 +425,10 @@ pub struct DevicePollResponse {
     pub browser_key_algorithm: Option<String>,
     pub browser_public_key: Option<String>,
     pub browser_key_fingerprint: Option<String>,
+    // Absent from a pre-0022 server, which cannot supply the proof. The daemon
+    // treats that as unverified rather than as a failure.
+    pub account_id: Option<String>,
+    pub browser_approval_signature: Option<String>,
     pub error: Option<String>,
 }
 

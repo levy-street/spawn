@@ -611,7 +611,14 @@ impl RtcSessions {
         };
 
         if let Err(e) = self
-            .create_answer(bound.clone(), sdp, ice_servers, registry, out_tx.clone(), answer_signer)
+            .create_answer(
+                bound.clone(),
+                sdp,
+                ice_servers,
+                registry,
+                out_tx.clone(),
+                answer_signer,
+            )
             .await
         {
             tracing::warn!(

@@ -9,12 +9,12 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use spawnd::host_pair_approval::HostPairApprovalTranscript;
 use spawnd::signed_signal::{
     generate_signing_key, public_key_from_wire, public_key_to_wire, sign_transcript_wire,
     signature_from_wire, signature_to_wire, verify_transcript_wire, ScopeType, SenderRole,
     SignalKind, SignedSignalTranscript,
 };
-use spawnd::host_pair_approval::HostPairApprovalTranscript;
 use spawnd::signed_signal_wire::{sign_rtc_signal_wire, verify_rtc_signal_wire, RtcProtocol};
 use std::io::{self, Read};
 use uuid::Uuid;

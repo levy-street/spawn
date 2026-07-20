@@ -135,10 +135,7 @@ fn canonical_uuid_bytes(value: &str) -> Result<[u8; USER_ID_BYTES], HostPairAppr
     Ok(*parsed.as_bytes())
 }
 
-fn decode_wire_exact(
-    value: &str,
-    field: &'static str,
-) -> Result<[u8; 32], HostPairApprovalError> {
+fn decode_wire_exact(value: &str, field: &'static str) -> Result<[u8; 32], HostPairApprovalError> {
     if value.len() != FIXED_WIRE_LENGTH || value.contains('=') {
         return Err(HostPairApprovalError::InvalidBase64Url(field));
     }
@@ -301,9 +298,15 @@ mod tests {
     fn encodes_the_documented_layout() {
         let (host, browser) = (key(1), key(2));
         let encoded = transcript(&host, &browser).encode();
-        assert_eq!(encoded.len(), HOST_PAIR_APPROVAL_MAGIC.len() + 1 + 16 + 32 + 32 + 32);
+        assert_eq!(
+            encoded.len(),
+            HOST_PAIR_APPROVAL_MAGIC.len() + 1 + 16 + 32 + 32 + 32
+        );
         assert!(encoded.starts_with(HOST_PAIR_APPROVAL_MAGIC));
-        assert_eq!(encoded[HOST_PAIR_APPROVAL_MAGIC.len()], HOST_PAIR_APPROVAL_VERSION);
+        assert_eq!(
+            encoded[HOST_PAIR_APPROVAL_MAGIC.len()],
+            HOST_PAIR_APPROVAL_VERSION
+        );
         assert!(encoded.ends_with(&browser.verifying_key().to_bytes()));
     }
 }
