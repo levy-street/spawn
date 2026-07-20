@@ -334,6 +334,36 @@ pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
     ))
 }
 
+/// Drop local browser pins the server no longer lists for this host.
+///
+/// Removal is the one direction it is safe to take from the server: it can only
+/// reduce access, and a server that lies here causes a denial of service it
+/// could already cause by refusing to relay at all. Additions are never taken
+/// from this list — those require an approval proof and the operator's
+/// fingerprint comparison at pairing.
+///
+/// Returns how many pins were dropped.
+pub fn prune_browser_pins_to_live_set(live_device_ids: &[String]) -> Result<usize> {
+    let mut stored = load().context("loading credentials to reconcile browser pins")?;
+    let expected = credential_revision(&stored)?;
+    let removed = retain_live_browser_pins(&mut stored, live_device_ids);
+    if removed == 0 {
+        return Ok(0);
+    }
+    save(&mut stored, &expected).context("persisting reconciled browser pins")?;
+    Ok(removed)
+}
+
+/// Retain only the pins named by the live set, returning how many were dropped.
+fn retain_live_browser_pins(creds: &mut StoredCreds, live_device_ids: &[String]) -> usize {
+    let live: HashSet<&str> = live_device_ids.iter().map(String::as_str).collect();
+    let before = creds.browser_pins.len();
+    creds
+        .browser_pins
+        .retain(|pin| live.contains(pin.browser_device_id.as_str()));
+    before - creds.browser_pins.len()
+}
+
 pub fn merge_browser_pin(creds: &mut StoredCreds, pin: BrowserPin) -> Result<bool> {
     validate_browser_pins(&creds.browser_pins)?;
     validate_browser_pin(&pin)?;
@@ -2341,6 +2371,53 @@ mod tests {
         // against a server that supplies none.
         assert!(!merge_browser_pin(&mut creds, unproven).unwrap());
         assert!(creds.browser_pins[0].has_approval_proof());
+    }
+
+    #[test]
+    fn reconciling_drops_only_pins_absent_from_the_live_set() {
+        let mut creds = StoredCreds::default();
+        let first = generated_browser_pin(1);
+        let second = generated_browser_pin(2);
+        creds.browser_pins = vec![first.clone(), second.clone()];
+        creds
+            .browser_pins
+            .sort_by(|l, r| l.browser_device_id.cmp(&r.browser_device_id));
+
+        // A revoked device disappears from the server's list.
+        let live = vec![second.browser_device_id.clone()];
+        assert_eq!(retain_live_browser_pins(&mut creds, &live), 1);
+        assert_eq!(creds.browser_pins.len(), 1);
+        assert_eq!(
+            creds.browser_pins[0].browser_device_id,
+            second.browser_device_id
+        );
+
+        // Reconciling again is a no-op rather than repeatedly rewriting.
+        assert_eq!(retain_live_browser_pins(&mut creds, &live), 0);
+    }
+
+    #[test]
+    fn reconciling_against_an_empty_live_set_drops_every_pin() {
+        let mut creds = StoredCreds::default();
+        creds.browser_pins = vec![generated_browser_pin(3)];
+        // Only reachable when the server actually reported an empty set; the
+        // absent-field case never calls this (see the Registered handler).
+        assert_eq!(retain_live_browser_pins(&mut creds, &[]), 1);
+        assert!(creds.browser_pins.is_empty());
+    }
+
+    #[test]
+    fn reconciling_never_adds_a_pin_the_server_names() {
+        let mut creds = StoredCreds::default();
+        let known = generated_browser_pin(4);
+        creds.browser_pins = vec![known.clone()];
+        let live = vec![
+            known.browser_device_id.clone(),
+            Uuid::from_u128(999).to_string(),
+        ];
+        assert_eq!(retain_live_browser_pins(&mut creds, &live), 0);
+        // The server naming an unknown device must not create trust for it.
+        assert_eq!(creds.browser_pins.len(), 1);
     }
 
     fn browser_pin(device_id: Uuid, public_key: &str) -> BrowserPin {

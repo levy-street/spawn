@@ -178,13 +178,16 @@ pub enum Outbound {
 pub enum Inbound {
     Registered {
         host_id: Uuid,
+        // None means the server never sent the field, which is not the same as
+        // an empty set: a server that cannot report its pins must not cause
+        // every local pin to be dropped.
+        #[serde(default)]
+        browser_device_ids: Option<Vec<String>>,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
     #[serde(rename = "host.ping")]
-    HostPing {
-        request_id: String,
-    },
+    HostPing { request_id: String },
     #[serde(rename = "host.tools.check")]
     HostToolsCheck {
         request_id: String,

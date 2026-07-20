@@ -882,7 +882,10 @@ async fn dispatch_loop(
         match msg {
             WsInbound::Closed => return Ok(()),
             WsInbound::Json(frame) => match *frame {
-                Inbound::Registered { host_id } => {
+                Inbound::Registered {
+                    host_id,
+                    browser_device_ids,
+                } => {
                     if host_id != live_credentials.host_id {
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
@@ -890,6 +893,22 @@ async fn dispatch_loop(
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
                     tracing::info!(%host_id, "registered with server");
+                    // Converge on the server's live pin set. Absent the field
+                    // nothing is dropped, so an older server cannot empty the
+                    // local pins by staying silent.
+                    if let Some(live) = browser_device_ids {
+                        match creds::prune_browser_pins_to_live_set(&live) {
+                            Ok(0) => {}
+                            Ok(removed) => tracing::warn!(
+                                removed,
+                                "dropped browser pins the server no longer lists"
+                            ),
+                            Err(error) => tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not reconcile browser pins against the server"
+                            ),
+                        }
+                    }
                 }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");

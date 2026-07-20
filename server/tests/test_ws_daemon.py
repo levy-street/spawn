@@ -221,7 +221,13 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
     await daemon_ws(ws, token=token)  # type: ignore[arg-type]
 
     sent = _sent_json(ws)
-    assert {"type": "registered", "host_id": host_id} in sent
+    # The registration frame carries the authoritative live browser-pin set so
+    # a daemon reconciles revocations on every connect; this host has none.
+    assert {
+        "type": "registered",
+        "host_id": host_id,
+        "browser_device_ids": [],
+    } in sent
     assert {"type": "host.heartbeat"} in sent
     assert get_broker().get_daemon_for_host(host_id) is None
 
@@ -1560,3 +1566,52 @@ async def test_daemon_ws_activity_is_content_free_and_binary_fails_closed(client
         assert host.last_seen_at is not None
     assert ws.closed == (4002, "binary terminal frames are retired")
     assert "secret terminal bytes" not in caplog.text
+
+
+async def test_live_browser_device_ids_excludes_revoked_devices(client):
+    """Revocation must reach the daemon.
+
+    A daemon learns its browser pins once, at pairing. Registration reports the
+    live set so a revoked device stops being trusted on the next connect rather
+    than remaining valid indefinitely.
+    """
+
+    from datetime import UTC, datetime
+
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_device_ids
+
+    async with get_sessionmaker()() as session:
+        user = User(email="pinreconcile@example.com", password_hash="x")
+        session.add(user)
+        await session.flush()
+        host = Host(name="reconcile-box", owner_user_id=user.id)
+        session.add(host)
+        await session.flush()
+
+        live_device = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="L" * 43
+        )
+        revoked_device = BrowserDevice(
+            owner_user_id=user.id,
+            key_algorithm="ed25519",
+            public_key="R" * 43,
+            revoked_at=datetime.now(UTC),
+        )
+        session.add_all([live_device, revoked_device])
+        await session.flush()
+
+        for device in (live_device, revoked_device):
+            session.add(
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=device.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=device.public_key,
+                    browser_key_fingerprint="SHA256:" + "z" * 16,
+                )
+            )
+        await session.commit()
+        host_id, live_id = host.id, live_device.id
+
+    assert await _live_browser_device_ids(host_id) == [live_id]

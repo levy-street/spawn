@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth as auth_mod
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..models import Agent, Host
+from ..models import Agent, BrowserDevice, Host, HostBrowserPin
 from ..redis import agent_event_channel, get_backend
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (
@@ -692,6 +692,26 @@ async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     )
 
 
+async def _live_browser_device_ids(host_id: str) -> list[str]:
+    """Browser devices currently pinned to this host and not revoked.
+
+    Deliberately excludes revoked devices rather than reporting state per pin:
+    the daemon uses this only to drop pins, so a device missing for any reason
+    is the safe outcome.
+    """
+
+    async with _bounded_host_ownership_session() as session:
+        rows = await session.execute(
+            select(HostBrowserPin.browser_device_id)
+            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
+            .where(
+                HostBrowserPin.host_id == host_id,
+                BrowserDevice.revoked_at.is_(None),
+            )
+        )
+        return sorted(row[0] for row in rows)
+
+
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
     await asyncio.wait_for(target.send_text(payload), timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS)
 
@@ -1201,7 +1221,22 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # or broker lock.
                         registration_accepted = await _redis_owner_is_current(conn)
                     if registration_accepted:
-                        await _bounded_send_text(conn, {"type": "registered", "host_id": host.id})
+                        # Carry the authoritative live pin set on every
+                        # registration. A daemon otherwise learns its browser
+                        # pins exactly once, at pairing, and never hears about
+                        # a revocation — so a revoked browser would keep
+                        # working against it indefinitely. Reconciling here is
+                        # self-healing: a daemon that was offline or attached
+                        # to another worker when the revocation happened still
+                        # converges on its next connect.
+                        await _bounded_send_text(
+                            conn,
+                            {
+                                "type": "registered",
+                                "host_id": host.id,
+                                "browser_device_ids": await _live_browser_device_ids(host.id),
+                            },
+                        )
                         registered = True
                     if not registration_accepted:
                         async with _bounded_host_ownership_session() as session:
