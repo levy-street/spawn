@@ -14,12 +14,14 @@ use spawnd::signed_signal::{
     signature_from_wire, signature_to_wire, verify_transcript_wire, ScopeType, SenderRole,
     SignalKind, SignedSignalTranscript,
 };
+use spawnd::host_pair_approval::HostPairApprovalTranscript;
 use spawnd::signed_signal_wire::{sign_rtc_signal_wire, verify_rtc_signal_wire, RtcProtocol};
 use std::io::{self, Read};
 use uuid::Uuid;
 
 const BROWSER_REGISTRATION_MAGIC: &[u8] = b"SPAWN-BROWSER-REGISTER-V1";
-const HOST_PAIR_APPROVAL_MAGIC: &[u8] = b"SPAWN-HOST-PAIR-APPROVE-V1";
+// The host-pair approval magic and layout now live in spawnd::host_pair_approval,
+// so this check exercises the production encoder instead of a private copy.
 const CONTRACT_VERSION: u8 = 1;
 const APPROVAL_NONCE_BYTES: usize = 32;
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -476,26 +478,23 @@ fn encode_browser_registration(user_id: &str, browser_public_key: &str) -> Resul
     Ok(output)
 }
 
+/// Delegates to the daemon's own verifier module so this interop check proves
+/// agreement against the encoder that actually runs in production, not a
+/// private copy that could silently drift from it.
 fn encode_host_pair_approval(
     user_id: &str,
     approval_nonce: &str,
     host_public_key: &str,
     browser_public_key: &str,
 ) -> Result<Vec<u8>> {
-    let user_id = canonical_uuid_bytes(user_id)?;
-    let nonce = decode_canonical_exact::<APPROVAL_NONCE_BYTES>(approval_nonce, "approval nonce")?;
-    let host_key =
-        public_key_from_wire(host_public_key).context("validating host-pair host public key")?;
-    let browser_key = public_key_from_wire(browser_public_key)
-        .context("validating host-pair browser public key")?;
-    let mut output = Vec::with_capacity(HOST_PAIR_APPROVAL_MAGIC.len() + 1 + 16 + 32 + 32 + 32);
-    output.extend_from_slice(HOST_PAIR_APPROVAL_MAGIC);
-    output.push(CONTRACT_VERSION);
-    output.extend_from_slice(&user_id);
-    output.extend_from_slice(&nonce);
-    output.extend_from_slice(host_key.as_bytes());
-    output.extend_from_slice(browser_key.as_bytes());
-    Ok(output)
+    Ok(HostPairApprovalTranscript::from_wire(
+        user_id,
+        approval_nonce,
+        host_public_key,
+        browser_public_key,
+    )
+    .context("encoding host-pair approval transcript")?
+    .encode())
 }
 
 fn canonical_uuid_bytes(value: &str) -> Result<[u8; 16]> {
