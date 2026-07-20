@@ -6,7 +6,7 @@ import {
   type PasskeyCredentialsApi,
   PasskeyPrfError,
 } from "./passkey-prf";
-import { deriveTrustBundleKey, openTrustBundle, sealTrustBundle } from "./trust-bundle";
+import { openTrustEnvelope, sealTrustEnvelope } from "./trust-envelope";
 
 const ACCOUNT = "00000000-0000-4000-8000-000000000001";
 
@@ -86,8 +86,9 @@ describe("passkey PRF", () => {
 
   test("evaluation yields a 32-byte secret at a domain-separated salt", async () => {
     const credentials = authenticator();
-    const secret = await evaluateTrustPrf(ACCOUNT, [], { credentials });
+    const { secret, credentialId } = await evaluateTrustPrf(ACCOUNT, [], { credentials });
     expect(secret.byteLength).toBe(32);
+    expect(credentialId).toBe("AQIDBA");
     // The salt is the SHA-256 of the domain string, not the raw string.
     const expected = new Uint8Array(
       await crypto.subtle.digest("SHA-256", new TextEncoder().encode("SPAWN-TRUST-BUNDLE-PRF-V1")),
@@ -98,13 +99,13 @@ describe("passkey PRF", () => {
   test("the same authenticator reproduces the same secret", async () => {
     const first = await evaluateTrustPrf(ACCOUNT, [], { credentials: authenticator({ key: 9 }) });
     const second = await evaluateTrustPrf(ACCOUNT, [], { credentials: authenticator({ key: 9 }) });
-    expect(first).toEqual(second);
+    expect(first.secret).toEqual(second.secret);
   });
 
   test("a different authenticator yields a different secret", async () => {
     const mine = await evaluateTrustPrf(ACCOUNT, [], { credentials: authenticator({ key: 1 }) });
     const theirs = await evaluateTrustPrf(ACCOUNT, [], { credentials: authenticator({ key: 2 }) });
-    expect(mine).not.toEqual(theirs);
+    expect(mine.secret).not.toEqual(theirs.secret);
   });
 
   test("an authenticator that will not evaluate PRF is distinguishable from cancellation", async () => {
@@ -171,17 +172,15 @@ describe("passkey PRF", () => {
     // The property the whole path exists for: a device holding only this
     // passkey recovers the trust bundle, with the server never seeing the key.
     const credentials = authenticator({ key: 42 });
-    const secret = await evaluateTrustPrf(ACCOUNT, [], { credentials });
-    const key = await deriveTrustBundleKey(secret, ACCOUNT);
-    const sealed = await sealTrustBundle(key, ACCOUNT, []);
+    const { secret, credentialId } = await evaluateTrustPrf(ACCOUNT, [], { credentials });
+    const sealed = await sealTrustEnvelope(ACCOUNT, [], [{ credentialId, prfSecret: secret }]);
 
     const freshDevice = authenticator({ key: 42 });
     const recovered = await evaluateTrustPrf(ACCOUNT, [], { credentials: freshDevice });
-    const opened = await openTrustBundle(
-      await deriveTrustBundleKey(recovered, ACCOUNT),
-      ACCOUNT,
-      sealed,
-    );
+    const opened = await openTrustEnvelope(ACCOUNT, sealed, {
+      credentialId: recovered.credentialId,
+      prfSecret: recovered.secret,
+    });
     expect(opened.accountId).toBe(ACCOUNT);
 
     // A different authenticator must not open it.
@@ -189,7 +188,10 @@ describe("passkey PRF", () => {
       credentials: authenticator({ key: 43 }),
     });
     await expect(
-      openTrustBundle(await deriveTrustBundleKey(attacker, ACCOUNT), ACCOUNT, sealed),
+      openTrustEnvelope(ACCOUNT, sealed, {
+        credentialId: attacker.credentialId,
+        prfSecret: attacker.secret,
+      }),
     ).rejects.toThrow();
   });
 });

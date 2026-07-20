@@ -9,7 +9,7 @@ import {
 } from "./browser-host-pins";
 import { ed25519PublicKeyFingerprint } from "./signed-signal";
 import { importTrustBundle, sealCurrentTrust } from "./trust-bootstrap";
-import { deriveTrustBundleKey } from "./trust-bundle";
+import type { PasskeyWrapInput } from "./trust-envelope";
 
 const ACCOUNT = "00000000-0000-4000-8000-000000000001";
 const HOST_ID = "00000000-0000-4000-8000-000000000003";
@@ -22,8 +22,8 @@ function device() {
   return { indexedDBFactory: new IDBFactory() };
 }
 
-async function key(seed: number): Promise<CryptoKey> {
-  return deriveTrustBundleKey(new Uint8Array(32).fill(seed), ACCOUNT);
+function key(seed: number): PasskeyWrapInput {
+  return { credentialId: `passkey-${seed}`, prfSecret: new Uint8Array(32).fill(seed) };
 }
 
 async function pin(storage: { indexedDBFactory: IDBFactory }, hostKey: string) {
@@ -45,7 +45,7 @@ describe("trust bootstrap", () => {
     await pin(first, HOST_KEY);
     await pin(first, OTHER_HOST_KEY);
 
-    const bundleKey = await key(1);
+    const bundleKey = key(1);
     const { sealed, hostCount } = await sealCurrentTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
@@ -99,7 +99,7 @@ describe("trust bootstrap", () => {
     const active = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, first);
     expect(active.map((p) => p.hostPublicKey)).toEqual([OTHER_HOST_KEY]);
 
-    const { sealed, hostCount } = await sealCurrentTrust(await key(2), {
+    const { sealed, hostCount } = await sealCurrentTrust(key(2), {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -107,7 +107,7 @@ describe("trust bootstrap", () => {
     expect(hostCount).toBe(1);
 
     const second = device();
-    const imported = await importTrustBundle(await key(2), sealed, {
+    const imported = await importTrustBundle(key(2), sealed, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: second,
@@ -133,7 +133,7 @@ describe("trust bootstrap", () => {
   test("importing twice is idempotent", async () => {
     const first = device();
     await pin(first, HOST_KEY);
-    const bundleKey = await key(3);
+    const bundleKey = key(3);
     const { sealed } = await sealCurrentTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
@@ -156,7 +156,7 @@ describe("trust bootstrap", () => {
   test("a bundle sealed under another secret cannot import anything", async () => {
     const first = device();
     await pin(first, HOST_KEY);
-    const { sealed } = await sealCurrentTrust(await key(4), {
+    const { sealed } = await sealCurrentTrust(key(4), {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -164,7 +164,7 @@ describe("trust bootstrap", () => {
 
     const second = device();
     const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: second };
-    await expect(importTrustBundle(await key(5), sealed, scope)).rejects.toThrow();
+    await expect(importTrustBundle(key(5), sealed, scope)).rejects.toThrow();
     // Nothing was pinned by the failed import.
     expect(
       await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, second),
@@ -174,7 +174,7 @@ describe("trust bootstrap", () => {
   test("imported pins are usable by the gate, with locally re-derived fingerprints", async () => {
     const first = device();
     await pin(first, HOST_KEY);
-    const bundleKey = await key(6);
+    const bundleKey = key(6);
     const { sealed } = await sealCurrentTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
@@ -205,7 +205,7 @@ describe("trust bootstrap", () => {
   test("sealing an empty device produces an openable empty bundle", async () => {
     // A device with nothing verified must still be able to publish, or the
     // first seal would need special-casing at every call site.
-    const bundleKey = await key(7);
+    const bundleKey = key(7);
     const { sealed, hostCount } = await sealCurrentTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,

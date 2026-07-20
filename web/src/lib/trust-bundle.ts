@@ -23,7 +23,8 @@ const TRUST_BUNDLE_AAD_MAGIC = "SPAWN-TRUST-BUNDLE-AAD-V1";
 const TRUST_BUNDLE_VERSION = 1;
 
 const PRF_OUTPUT_BYTES = 32;
-const IV_BYTES = 12;
+export const TRUST_IV_BYTES = 12;
+const IV_BYTES = TRUST_IV_BYTES;
 const PUBLIC_KEY_WIRE_LENGTH = 43;
 const MAX_HOSTS = 256;
 
@@ -85,7 +86,7 @@ function requireSubtle(): SubtleCrypto {
  * is still enforced by re-encoding, so a padded or otherwise non-canonical
  * spelling of the same bytes is rejected rather than silently accepted.
  */
-function decodeVariableBase64Url(value: string): Uint8Array {
+export function decodeVariableBase64Url(value: string): Uint8Array {
   if (typeof value !== "string" || value.length === 0 || value.length % 4 === 1) {
     throw new TrustBundleError("invalid_bundle", "invalid canonical base64url");
   }
@@ -109,7 +110,7 @@ function decodeVariableBase64Url(value: string): Uint8Array {
 }
 
 /** WebCrypto wants a plain ArrayBuffer; typed-array generics do not satisfy it. */
-function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+export function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   const buffer = new ArrayBuffer(view.byteLength);
   new Uint8Array(buffer).set(view);
   return buffer;
@@ -212,7 +213,7 @@ async function canonicalHost(host: TrustBundleHost): Promise<TrustBundleHost> {
 }
 
 /** Deterministic plaintext, so an unchanged bundle re-seals identically. */
-async function canonicalBundle(
+export async function canonicalBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
 ): Promise<TrustBundle> {

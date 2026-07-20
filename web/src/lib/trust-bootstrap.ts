@@ -17,7 +17,8 @@ import {
   listActiveBrowserHostPins,
   revokeBrowserHostPin,
 } from "./browser-host-pins";
-import { openTrustBundle, sealTrustBundle, type TrustBundleHost } from "./trust-bundle";
+import type { TrustBundleHost } from "./trust-bundle";
+import { openTrustEnvelope, type PasskeyWrapInput, sealTrustEnvelope } from "./trust-envelope";
 
 export interface TrustBootstrapScope {
   readonly accountId: string;
@@ -49,7 +50,7 @@ function pinToBundleHost(pin: BrowserHostPin): TrustBundleHost {
  * captured here.
  */
 export async function sealCurrentTrust(
-  key: CryptoKey,
+  passkey: PasskeyWrapInput,
   scope: TrustBootstrapScope,
 ): Promise<{ readonly sealed: string; readonly hostCount: number }> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
@@ -59,7 +60,7 @@ export async function sealCurrentTrust(
   );
   const hosts = pins.map(pinToBundleHost);
   return {
-    sealed: await sealTrustBundle(key, scope.accountId, hosts),
+    sealed: await sealTrustEnvelope(scope.accountId, hosts, [passkey]),
     hostCount: hosts.length,
   };
 }
@@ -76,12 +77,12 @@ export async function sealCurrentTrust(
  * so re-importing neither duplicates nor resurrects anything.
  */
 export async function importTrustBundle(
-  key: CryptoKey,
+  passkey: PasskeyWrapInput,
   sealed: string,
   scope: TrustBootstrapScope,
 ): Promise<ImportedTrust> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
-  const bundle = await openTrustBundle(key, scope.accountId, sealed);
+  const bundle = await openTrustEnvelope(scope.accountId, sealed, passkey);
 
   const before = new Set(
     (

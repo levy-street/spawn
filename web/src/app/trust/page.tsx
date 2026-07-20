@@ -26,7 +26,7 @@ import {
   importTrustBundle,
   sealCurrentTrust,
 } from "@/lib/trust-bootstrap";
-import { deriveTrustBundleKey } from "@/lib/trust-bundle";
+import { enrollPasskeyInEnvelope } from "@/lib/trust-envelope";
 
 function describe(error: unknown): string {
   if (error instanceof PasskeyPrfError) {
@@ -139,9 +139,11 @@ function TrustSettings() {
       }
       await trust.addPasskey(passkey.credentialId, "this device");
 
-      const secret = await evaluateTrustPrf(id, [passkey.credentialId]);
-      const key = await deriveTrustBundleKey(secret, id);
-      const { sealed, hostCount } = await sealCurrentTrust(key, { accountId: id });
+      const { secret } = await evaluateTrustPrf(id, [passkey.credentialId]);
+      const { sealed, hostCount } = await sealCurrentTrust(
+        { credentialId: passkey.credentialId, prfSecret: secret },
+        { accountId: id },
+      );
       await trust.putBundle(sealed, existing?.revision);
       return hostCount;
     },
@@ -166,9 +168,10 @@ function TrustSettings() {
         );
       }
       const known = (await trust.listPasskeys()).map((row) => row.credential_id);
-      const secret = await evaluateTrustPrf(id, known);
-      const key = await deriveTrustBundleKey(secret, id);
-      return importTrustBundle(key, stored.sealed, { accountId: id });
+      const { credentialId, secret } = await evaluateTrustPrf(id, known);
+      return importTrustBundle({ credentialId, prfSecret: secret }, stored.sealed, {
+        accountId: id,
+      });
     },
     onMutate: begin,
     onSuccess: (result) => {
@@ -201,8 +204,47 @@ function TrustSettings() {
     onError: (err) => setError(describe(err)),
   });
 
+  /**
+   * Enroll a second passkey as a backup. Requires an existing one that already
+   * unlocks, because a wrap can only be added by someone who can recover the
+   * data key -- which is exactly the property that keeps the server out.
+   */
+  const addBackup = useMutation({
+    mutationFn: async () => {
+      const id = accountId as string;
+      const stored = await trust.getBundle();
+      if (stored === null) {
+        throw new Error("Set up a passkey on this device first; there is nothing to back up yet.");
+      }
+      const known = (await trust.listPasskeys()).map((row) => row.credential_id);
+      const existing = await evaluateTrustPrf(id, known);
+      const backup = await createTrustPasskey(id, user?.email ?? "spawn operator");
+      if (!backup.prfEnabled) {
+        throw new PasskeyPrfError(
+          "prf_unavailable",
+          "this authenticator reported no PRF support, so it cannot be a backup",
+        );
+      }
+      const backupSecret = await evaluateTrustPrf(id, [backup.credentialId]);
+      const next = await enrollPasskeyInEnvelope(
+        id,
+        stored.sealed,
+        { credentialId: existing.credentialId, prfSecret: existing.secret },
+        { credentialId: backup.credentialId, prfSecret: backupSecret.secret },
+      );
+      await trust.addPasskey(backup.credentialId, "backup passkey");
+      await trust.putBundle(next, stored.revision);
+    },
+    onMutate: begin,
+    onSuccess: () => {
+      setStatus("Backup passkey enrolled. Either passkey now opens your trust bundle.");
+      queryClient.invalidateQueries({ queryKey: ["trust"] });
+    },
+    onError: (err) => setError(describe(err)),
+  });
+
   const supported = isPasskeySupported();
-  const busy = setUp.isPending || unlock.isPending || forget.isPending;
+  const busy = setUp.isPending || unlock.isPending || forget.isPending || addBackup.isPending;
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
@@ -287,6 +329,15 @@ function TrustSettings() {
               data-testid="unlock-trust"
             >
               {unlock.isPending ? "Unlocking…" : "Unlock trust on this device"}
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={!supported || busy || accountId === null || bundle.data == null}
+              onClick={() => addBackup.mutate()}
+              data-testid="add-backup-passkey"
+            >
+              {addBackup.isPending ? "Enrolling…" : "Add a backup passkey"}
             </Button>
             <Button
               type="button"

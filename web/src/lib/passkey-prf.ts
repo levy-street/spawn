@@ -212,11 +212,17 @@ export async function createTrustPasskey(
  * platform offer any discoverable credential, which is what a brand-new device
  * needs since it knows nothing yet.
  */
+export interface TrustPrfResult {
+  /** Which enrolled credential the authenticator actually used. */
+  readonly credentialId: string;
+  readonly secret: Uint8Array;
+}
+
 export async function evaluateTrustPrf(
   accountId: string,
   credentialIds: readonly string[] = [],
   options: PasskeyPrfOptions = {},
-): Promise<Uint8Array> {
+): Promise<TrustPrfResult> {
   requireAccountId(accountId);
   const credentials = resolveCredentials(options);
   const salt = await trustPrfSalt();
@@ -258,5 +264,6 @@ export async function evaluateTrustPrf(
   if (secret.byteLength < PRF_SECRET_BYTES) {
     throw new PasskeyPrfError("invalid_secret", "PRF secret is shorter than required");
   }
-  return secret;
+  // Which credential was used matters to the envelope: its wrap is keyed by ID.
+  return { credentialId: encodeCredentialId((assertion as PublicKeyCredential).rawId), secret };
 }
