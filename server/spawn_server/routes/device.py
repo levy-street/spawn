@@ -281,6 +281,7 @@ async def device_poll(
             DeviceCode.browser_key_algorithm,
             DeviceCode.browser_public_key,
             DeviceCode.browser_key_fingerprint,
+            DeviceCode.browser_approval_signature,
         )
         .execution_options(synchronize_session=False)
     )
@@ -434,6 +435,11 @@ async def device_poll(
                 browser_key_algorithm=None,
                 browser_public_key=None,
                 browser_key_fingerprint=None,
+                # The proof is bound to the browser key being cleared here, so
+                # it must go with it: a stale signature would otherwise outlive
+                # the binding it attests to and be handed to the daemon on a
+                # later approval by a different browser.
+                browser_approval_signature=None,
             )
             .execution_options(synchronize_session=False)
         )
@@ -607,6 +613,11 @@ async def device_poll(
         "browser_key_algorithm": claimed["browser_key_algorithm"],
         "browser_public_key": claimed["browser_public_key"],
         "browser_key_fingerprint": claimed["browser_key_fingerprint"],
+        # The account ID and the browser's approval signature let the daemon
+        # verify the SPAWN-HOST-PAIR-APPROVE-V1 transcript against the approval
+        # nonce and host key it already holds from its own device/start call.
+        "account_id": claimed["user_id"],
+        "browser_approval_signature": claimed["browser_approval_signature"],
     }
 
 
@@ -749,6 +760,10 @@ async def device_approve(
             browser_key_algorithm=body.browser_key_algorithm,
             browser_public_key=body.browser_public_key,
             browser_key_fingerprint=body.browser_key_fingerprint,
+            # Retained (not just verified and dropped) so the daemon can check
+            # for itself that this browser consented to this host in this
+            # ceremony, instead of trusting the server's assertion.
+            browser_approval_signature=body.signature,
         )
         .execution_options(synchronize_session=False)
     )

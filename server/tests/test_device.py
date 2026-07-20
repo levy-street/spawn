@@ -28,6 +28,7 @@ from spawn_server.host_identity import (
 from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
+    verify_host_pair_approval_proof,
 )
 from spawn_server.host_pair_possession import (
     decode_device_code,
@@ -2007,3 +2008,85 @@ async def test_postgresql_delete_start_race_linearizes_both_commit_orders(
         public_key=_public_key(36),
         start_commits_first=False,
     )
+
+
+async def test_poll_hands_the_daemon_a_verifiable_browser_approval_proof(client):
+    """The daemon must be able to check browser consent for itself.
+
+    Until 0022 the approval signature was verified by the server and then
+    discarded, so a daemon's browser pin rested entirely on the server's
+    assertion. Poll now carries the proof, and it must verify against the
+    approval nonce and host key the daemon already holds from device/start.
+    """
+
+    user_id, auth = await _signup(client, "proof@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    device, private_key = browser
+    public_key = _public_key()
+
+    start = await _start(client, public_key)
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+
+    poll = await _poll(client, start, public_key)
+    assert poll.status_code == 200, poll.text
+    body = poll.json()
+
+    assert body["account_id"] == user_id
+    signature = body["browser_approval_signature"]
+    assert signature is not None and len(signature) == 86
+
+    # The proof verifies against the daemon's own copies of the nonce and host
+    # key, not against anything else the poll response claims.
+    verify_host_pair_approval_proof(
+        user_id=user_id,
+        approval_nonce_wire=review["approval_nonce"],
+        host_public_key_wire=public_key,
+        browser_public_key_wire=device["public_key"],
+        signature_wire=signature,
+    )
+
+    # A proof lifted onto a different host key must not verify.
+    with pytest.raises(HTTPException):
+        verify_host_pair_approval_proof(
+            user_id=user_id,
+            approval_nonce_wire=review["approval_nonce"],
+            host_public_key_wire=_public_key(9),
+            browser_public_key_wire=device["public_key"],
+            signature_wire=signature,
+        )
+
+
+async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
+    """A cleared browser binding must not leave its proof behind.
+
+    The proof attests to a specific browser key. If it outlived the binding it
+    would be handed to the daemon alongside a later approval by a different
+    browser.
+    """
+
+    user_id, auth = await _signup(client, "proof-revoke@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    device, _ = browser
+    public_key = _public_key()
+
+    start = await _start(client, public_key)
+    review = await _review(client, start, auth)
+    assert (await _approve(client, start, user_id, auth, review, browser)).status_code == 200
+
+    revoked = await client.post(
+        f"/api/browser-devices/{device['id']}/revoke",
+        json={"expected_public_key": device["public_key"]},
+        headers=auth,
+    )
+    assert revoked.status_code == 200, revoked.text
+
+    poll = await _poll(client, start, public_key)
+    assert poll.json() == {"error": "authorization_pending"}
+
+    async with get_sessionmaker()() as session:
+        row = await session.get(DeviceCode, start["device_code"])
+        assert row is not None
+        assert row.browser_device_id is None
+        assert row.browser_approval_signature is None

@@ -192,6 +192,10 @@ class DevicePollSuccess(BaseModel):
     browser_key_algorithm: Literal["ed25519"]
     browser_public_key: str
     browser_key_fingerprint: str
+    # Absent for ceremonies approved by a pre-0022 server, which is why the
+    # daemon treats a missing proof as unverified rather than as a failure.
+    account_id: str | None = None
+    browser_approval_signature: str | None = None
 
 
 class DevicePollPending(BaseModel):

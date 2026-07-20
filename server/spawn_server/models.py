@@ -409,6 +409,10 @@ class DeviceCode(Base):
     browser_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
     browser_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
     browser_key_fingerprint: Mapped[str | None] = mapped_column(String(23), nullable=True)
+    # The browser's SPAWN-HOST-PAIR-APPROVE-V1 signature, retained so the poll
+    # response can hand it to the daemon. Nullable for ceremonies approved by a
+    # pre-0022 server; whether a daemon insists on it is the daemon's policy.
+    browser_approval_signature: Mapped[str | None] = mapped_column(String(86), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -444,6 +448,11 @@ class DeviceCode(Base):
             "browser_key_algorithm = 'ed25519' AND length(browser_public_key) = 43 AND "
             "length(browser_key_fingerprint) = 23)",
             name="ck_device_codes_browser_binding",
+        ),
+        CheckConstraint(
+            "browser_approval_signature IS NULL OR "
+            "(length(browser_approval_signature) = 86 AND browser_device_id IS NOT NULL)",
+            name="ck_device_codes_browser_approval_signature",
         ),
         Index(
             "ix_device_codes_host_key",
