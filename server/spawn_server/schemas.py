@@ -534,3 +534,31 @@ class ScreenOut(BaseModel):
     pinned_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class TrustBundleOut(BaseModel):
+    """Opaque to the server by design; only the operator's device can read it."""
+
+    sealed: str
+    revision: int
+    updated_at: datetime
+
+
+class TrustBundlePut(BaseModel):
+    sealed: str = Field(min_length=1)
+    # None means "creating the first bundle". Replacing an existing one requires
+    # the revision it was read at, so a stale device cannot silently drop host
+    # keys another device added.
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class PasskeyCredentialOut(BaseModel):
+    id: str
+    credential_id: str
+    label: str | None
+    created_at: datetime
+
+
+class PasskeyCredentialCreate(BaseModel):
+    credential_id: str = Field(min_length=1, max_length=512)
+    label: str | None = Field(default=None, max_length=128)

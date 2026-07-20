@@ -13,8 +13,10 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     SmallInteger,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -124,6 +126,64 @@ class AuthProviderState(Base):
     )
 
     user: Mapped[User | None] = relationship(back_populates="auth_provider_states")
+
+
+class TrustBundle(Base):
+    """The operator's sealed trust bundle: ciphertext the server cannot read.
+
+    Holds the host keys this account has verified out of band, encrypted under
+    a key derived from a WebAuthn PRF secret that never leaves the operator's
+    authenticator. The server stores and serves these bytes without being able
+    to read or forge them -- that is the entire point, and it is what lets a new
+    device learn real host keys without trusting this server.
+    """
+
+    __tablename__ = "trust_bundles"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Canonical base64url of iv || AES-GCM ciphertext. Opaque here by design.
+    sealed: Mapped[str] = mapped_column(Text, nullable=False)
+    # Monotonic, client-supplied. Lets a device notice it is about to overwrite
+    # a newer bundle sealed by another device rather than silently clobbering it.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("length(sealed) > 0", name="ck_trust_bundles_sealed_present"),
+        CheckConstraint("revision >= 1", name="ck_trust_bundles_revision_positive"),
+    )
+
+
+class PasskeyCredential(Base):
+    """A WebAuthn credential ID used to unlock the trust bundle.
+
+    Deliberately not secret and deliberately unverified: the PRF secret is
+    derived and consumed entirely in the browser, so the server never checks an
+    assertion. A server that tampers with this list can only cause an unlock to
+    fail -- it cannot learn or forge the secret, which lives in the
+    authenticator. Corrupting it is denial of service, not disclosure.
+    """
+
+    __tablename__ = "passkey_credentials"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    credential_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "credential_id", name="uq_passkey_owner_credential"),
+        CheckConstraint("length(credential_id) > 0", name="ck_passkey_credential_id_present"),
+    )
 
 
 class HostKeyClaim(Base):
