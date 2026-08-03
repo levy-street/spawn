@@ -59,9 +59,12 @@ copied raw-SDP calls and requires every one to fail.
   The reviewed browser trust-scope integration must bind it to the exact
   WeakMap-backed epoch identity capability when supplying `signOffer`; this
   branch neither loads a raw identity nor duplicates that capability logic.
-- The daemon's `run.rs` still rejects `signed_envelope` before RTC admission.
-  It does not yet verify the browser offer, feed verified offer SDP into
-  negotiation, or sign a live answer.
+- The daemon-side verifier has since landed (commit 2496912 and follow-ups):
+  `run.rs` verifies a signed browser offer against the browser pins it holds,
+  feeds only the verified transcript SDP into negotiation, signs the live
+  answer, and — when `SPAWND_REQUIRE_SIGNED_RTC` is set — rejects an unsigned
+  offer outright. This inventory predates that cutover; it described the browser
+  prerequisite before the daemon consumed it.
 
 Tests cover both agent and Host routes, raw-versus-verified fingerprint
 substitution, signature/pin/intended-peer/topology/session mutation, stripping,

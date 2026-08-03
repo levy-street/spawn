@@ -2,11 +2,12 @@
 
 This adapter carries the accepted signed-signal transcript on an endpoint
 boundary. The F1 relay prerequisite can carry its exact JSON text as one opaque
-`signed_envelope` string. A review-pending F2 browser candidate now signs offers
+`signed_envelope` string. The F2 browser candidate signs offers
 through an injected trust-epoch operation and makes both browser RTC consumers
 apply only a pin-verified answer transcript; daemon offer verification and live
-answer signing are still absent. The carrier and browser prerequisite do not by
-themselves establish pin provenance, the signed-only cutover, TOFU, or L1.
+answer signing have since landed (commit 2496912 and follow-ups). The carrier
+and browser prerequisite do not by themselves establish the signed-only cutover
+or L1, which remain gated on `SPAWND_REQUIRE_SIGNED_RTC` enforcement.
 
 An envelope is one JSON object containing exactly these fields:
 

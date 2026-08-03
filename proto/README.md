@@ -312,10 +312,12 @@ signing operation and an exact active local Host pin; its agent and HostControl
 consumers verify the answer and feed only the verified transcript SDP to WebRTC.
 Field presence selects signed mode: when `signed_envelope` is present it must be
 a bounded, non-null JSON string; `null`, objects, arrays, and other JSON types
-are rejected before dispatch and cannot fall through to raw SDP. The daemon
-still refuses an opaque signed offer before RTC negotiation until the verifier
-cutover is integrated. Thus these raw examples are staged compatibility, not a
-trusted or downgrade-resistant final mode.
+are rejected before dispatch and cannot fall through to raw SDP. The daemon now
+verifies an opaque signed offer against its browser pins and signs the live
+answer (commit 2496912 and follow-ups); it rejects an unsigned offer only when
+`SPAWND_REQUIRE_SIGNED_RTC` is set. Thus these raw examples are staged
+compatibility for the pre-enforcement window, not a downgrade-resistant final
+mode.
 
 {"type": "rtc.answer",
  "session_id": "browser-generated-id",
