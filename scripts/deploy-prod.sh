@@ -127,6 +127,16 @@ new_rev="$(git rev-parse --short HEAD)"
 printf 'remote deploy: updated %s from %s to %s\n' "$SPAWN_DEPLOY_BRANCH" "$old_rev" "$new_rev"
 
 if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
+  # Pin the Next buildId to the deployed commit. Without this the buildId
+  # defaults to the constant "spawn", so /_next/static/spawn/*.js is a stable URL
+  # with changing content across deploys — and because the service worker caches
+  # /_next/static/* cache-first with no revalidation, clients keep a stale build
+  # (and any one-time poisoned response there persists) indefinitely. A per-commit
+  # buildId gives every deploy fresh, content-addressed asset URLs. Verifiers must
+  # pass the same SPAWN_BUILD_ID (see scripts/verify-served-client.sh).
+  build_id="$(git rev-parse HEAD)"
+  printf 'remote deploy: pinning SPAWN_BUILD_ID=%s\n' "$build_id"
+
   if command -v uv >/dev/null 2>&1; then
     (cd server && uv sync --frozen && uv run alembic upgrade head)
   else
@@ -134,7 +144,7 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   fi
 
   if command -v bun >/dev/null 2>&1; then
-    (cd web && bun install --frozen-lockfile && bun run build)
+    (cd web && bun install --frozen-lockfile && SPAWN_BUILD_ID="$build_id" bun run build)
   else
     die "bun is required for web dependency sync and build"
   fi
