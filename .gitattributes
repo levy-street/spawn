@@ -1,0 +1,26 @@
+# Force source files to always be treated as text, so a stray control byte
+# (e.g. a raw NUL in a string literal) can never make a source file render as
+# "Binary files differ" and thus slip through code review unseen. See the
+# trust-envelope.ts incident fixed in the same series as this file's addition.
+#
+# `text` normalizes line endings to LF; `diff` overrides git's NUL-byte binary
+# heuristic so these paths always produce a textual diff.
+*.ts    text diff
+*.tsx   text diff
+*.js    text diff
+*.mjs   text diff
+*.cjs   text diff
+*.jsx   text diff
+*.rs    text diff
+*.py    text diff
+*.sh    text diff
+*.json  text diff
+*.jsonc text diff
+*.toml  text diff
+*.yaml  text diff
+*.yml   text diff
+*.css   text diff
+*.scss  text diff
+*.html  text diff
+*.md    text diff
+*.sql   text diff
