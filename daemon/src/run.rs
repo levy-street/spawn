@@ -835,54 +835,136 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
 /// browser from being downgraded, but does not stop a server from opening its
 /// own unsigned session to this daemon.
 
+/// Run one blocking credential mutation off the Tokio dispatch task with the
+/// exact isolation the single-flight loader uses for the same backend:
+///
+///  * the credential-loader thread-local marker, so a keyring/file backend
+///    panic is redacted by the installed hook to the fixed diagnostic instead
+///    of printing the raw payload (which can carry secret material); and
+///  * a `catch_unwind`, so such a panic can never unwind across the async
+///    boundary or abort the process.
+///
+/// `creds::load()`/`save()` reach a cross-process lock, the filesystem, and a
+/// native keyring; running them inline on a Tokio task both blocks the runtime
+/// and bypasses this redaction. The work is bounded by the same hard deadline
+/// as a loader load: on timeout the abandoned blocking job still runs to
+/// completion on its pool thread, but no longer stalls dispatch.
+async fn run_isolated_credential_blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    // Idempotent (`Once`): the daemon run path installs this when it builds the
+    // loader, but keep the invariant independent of call order.
+    install_credential_loader_panic_hook();
+    let handle = tokio::task::spawn_blocking(move || {
+        IS_CREDENTIAL_LOADER_THREAD.with(|marker| marker.set(true));
+        let outcome = catch_unwind(AssertUnwindSafe(work));
+        // Return the pooled blocking thread to a neutral identity so a later
+        // unrelated blocking task on it is not mistaken for the loader and its
+        // panic wrongly redacted. This always runs: `catch_unwind` returns.
+        IS_CREDENTIAL_LOADER_THREAD.with(|marker| marker.set(false));
+        outcome
+    });
+    match tokio::time::timeout(CREDENTIAL_LOAD_DEADLINE, handle).await {
+        // Never format the caught payload: like the loader's diagnostic, it can
+        // carry credential-backend secrets. Drop it and surface a fixed error.
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(_panic))) => Err(anyhow!("credential reconcile failed; trust unchanged")),
+        Ok(Err(_join)) => Err(anyhow!("credential reconcile task failed; trust unchanged")),
+        Err(_elapsed) => Err(anyhow!("credential reconcile exceeded its hard deadline")),
+    }
+}
+
 /// Bring local browser pins in line with what the server reports.
 ///
 /// Adoption first, then pruning: a device admitted by this very frame would
 /// otherwise be dropped immediately for being absent from the id list. Only an
 /// endorsement verifiable against a key already pinned here can add anything;
 /// removals are taken from the server, which can only reduce access.
-fn reconcile_browser_pins(
+///
+/// The backing `creds::load()`/`save()` calls run through
+/// [`run_isolated_credential_blocking`], never inline on this Tokio task, so a
+/// backend panic during reconcile is redacted exactly like the loader's and
+/// cannot leak secret material to stderr/logs.
+async fn reconcile_browser_pins(
     account_id: Option<&str>,
     proposed: Option<&[crate::proto::InboundBrowserPin]>,
     live_device_ids: Option<&[String]>,
 ) {
-    if let (Some(account), Some(proposed)) = (account_id, proposed) {
-        let candidates: Vec<creds::ProposedBrowserPin> = proposed
-            .iter()
-            .map(|pin| creds::ProposedBrowserPin {
-                device_id: pin.browser_device_id.clone(),
-                key_algorithm: pin.browser_key_algorithm.clone(),
-                public_key: pin.browser_public_key.clone(),
-                fingerprint: pin.browser_key_fingerprint.clone(),
-                endorser_public_key: pin.endorser_public_key.clone(),
-                endorsement_signature: pin.endorsement_signature.clone(),
-            })
-            .collect();
-        match creds::adopt_endorsed_browser_pins(account, &candidates) {
-            Ok(0) => {}
-            Ok(adopted) => tracing::info!(
-                adopted,
-                "adopted browser pins endorsed by an already-trusted device"
-            ),
-            Err(error) => tracing::warn!(
-                error = format!("{error:#}"),
-                "could not adopt endorsed browser pins"
-            ),
+    // Snapshot the frame into owned values on the async task; only the blocking
+    // keyring/file load+save is moved off Tokio below.
+    let adopt = match (account_id, proposed) {
+        (Some(account), Some(proposed)) => {
+            let account = account.to_owned();
+            let candidates: Vec<creds::ProposedBrowserPin> = proposed
+                .iter()
+                .map(|pin| creds::ProposedBrowserPin {
+                    device_id: pin.browser_device_id.clone(),
+                    key_algorithm: pin.browser_key_algorithm.clone(),
+                    public_key: pin.browser_public_key.clone(),
+                    fingerprint: pin.browser_key_fingerprint.clone(),
+                    endorser_public_key: pin.endorser_public_key.clone(),
+                    endorsement_signature: pin.endorsement_signature.clone(),
+                })
+                .collect();
+            Some((account, candidates))
         }
-    }
+        _ => None,
+    };
     // Absent the field nothing is dropped, so an older server cannot empty the
     // local pins by staying silent.
-    if let Some(live) = live_device_ids {
-        match creds::prune_browser_pins_to_live_set(live) {
-            Ok(0) => {}
-            Ok(removed) => {
-                tracing::warn!(removed, "dropped browser pins the server no longer lists")
-            }
-            Err(error) => tracing::warn!(
+    let prune = live_device_ids.map(<[String]>::to_vec);
+    if adopt.is_none() && prune.is_none() {
+        return;
+    }
+
+    type ReconcileOutcomes = (Option<Result<usize>>, Option<Result<usize>>);
+    let outcome = run_isolated_credential_blocking(move || -> ReconcileOutcomes {
+        // Ordinary (non-panic) backend errors on one side do not skip the
+        // other, matching the previous inline behavior; only a genuine panic
+        // short-circuits both, which the isolation redacts and fails closed.
+        let adopted = adopt
+            .as_ref()
+            .map(|(account, candidates)| creds::adopt_endorsed_browser_pins(account, candidates));
+        let removed = prune
+            .as_ref()
+            .map(|live| creds::prune_browser_pins_to_live_set(live));
+        (adopted, removed)
+    })
+    .await;
+
+    let (adopted, removed) = match outcome {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            tracing::warn!(
                 error = format!("{error:#}"),
-                "could not reconcile browser pins against the server"
-            ),
+                "could not reconcile browser pins off the dispatch task"
+            );
+            return;
         }
+    };
+
+    match adopted {
+        None | Some(Ok(0)) => {}
+        Some(Ok(adopted)) => tracing::info!(
+            adopted,
+            "adopted browser pins endorsed by an already-trusted device"
+        ),
+        Some(Err(error)) => tracing::warn!(
+            error = format!("{error:#}"),
+            "could not adopt endorsed browser pins"
+        ),
+    }
+    match removed {
+        None | Some(Ok(0)) => {}
+        Some(Ok(removed)) => {
+            tracing::warn!(removed, "dropped browser pins the server no longer lists")
+        }
+        Some(Err(error)) => tracing::warn!(
+            error = format!("{error:#}"),
+            "could not reconcile browser pins against the server"
+        ),
     }
 }
 
@@ -968,7 +1050,8 @@ async fn dispatch_loop(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
-                    );
+                    )
+                    .await;
                 }
                 Inbound::HostBrowserPins {
                     account_id,
@@ -982,7 +1065,8 @@ async fn dispatch_loop(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
-                    );
+                    )
+                    .await;
                 }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");
@@ -3373,6 +3457,110 @@ mod tests {
         let unrelated = std::thread::spawn(|| panic!("ordinary-thread-panic"));
         assert!(unrelated.join().is_err());
         Err(anyhow!("credential loader failed"))
+    }
+
+    #[tokio::test]
+    async fn reconcile_credential_blocking_runs_under_marker_and_fails_closed_on_panic() {
+        // The reconcile-path credential work must execute under the loader's
+        // redaction marker, so a keyring/file backend panic hits the redacting
+        // hook rather than the ordinary one.
+        let marker_seen = run_isolated_credential_blocking(|| {
+            IS_CREDENTIAL_LOADER_THREAD.with(Cell::get)
+        })
+        .await
+        .expect("isolated credential work returns its value");
+        assert!(
+            marker_seen,
+            "reconcile backend work must set the credential-loader redaction marker"
+        );
+
+        // A panic in that work is caught and surfaced as a fixed error rather
+        // than unwinding across the async boundary; the secret-bearing payload
+        // never reaches the returned message.
+        let panicked = run_isolated_credential_blocking(|| -> () {
+            panic!("{PANIC_CANARY_TOKEN} {PANIC_CANARY_PATH}");
+        })
+        .await;
+        let error = panicked.expect_err("a reconcile backend panic must fail closed");
+        let message = format!("{error:#}");
+        assert!(!message.contains(PANIC_CANARY_TOKEN));
+        assert!(!message.contains(PANIC_CANARY_PATH));
+    }
+
+    #[test]
+    fn reconcile_credential_panic_subprocess_redacts_stderr() {
+        let output = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg("run::tests::reconcile_credential_panic_subprocess_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PANIC_SUBPROCESS_ENV, "1")
+            .output()
+            .expect("run reconcile credential panic subprocess");
+        assert!(
+            !output.status.success(),
+            "helper must surface the redacted failure and exit nonzero"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        // A backend panic on the reconcile path is redacted to the fixed
+        // diagnostic; its secret-bearing payload/location never reaches stderr.
+        assert!(!combined.contains(PANIC_CANARY_TOKEN));
+        assert!(!combined.contains(PANIC_CANARY_PATH));
+        assert!(!combined.contains("panicked at"));
+        let fixed = std::str::from_utf8(CREDENTIAL_LOADER_PANIC_DIAGNOSTIC)
+            .expect("static diagnostic utf8")
+            .trim_end();
+        assert_eq!(combined.matches(fixed).count(), 1);
+        // An unrelated panic on an ordinary thread still reaches the preexisting
+        // application hook, proving the marker keys redaction to this path only.
+        assert!(combined.contains("preexisting-hook:ordinary-thread-panic"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn reconcile_credential_panic_subprocess_helper() -> Result<()> {
+        if std::env::var_os(PANIC_SUBPROCESS_ENV).is_none() {
+            return Ok(());
+        }
+
+        // The loader hook must compose with and preserve an already-installed
+        // application hook for every unrelated thread.
+        std::panic::set_hook(Box::new(|info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string-panic");
+            let mut stderr = std::io::stderr().lock();
+            let _ = std::io::Write::write_all(
+                &mut stderr,
+                format!("preexisting-hook:{payload}\n").as_bytes(),
+            );
+        }));
+
+        // Drive the exact reconcile isolation with a backend that panics
+        // carrying a secret token and path, as a hostile keyring/file panic
+        // could. The redacting hook must fire (marker set) and the payload must
+        // never reach stderr or the returned error.
+        let outcome: Result<()> = run_isolated_credential_blocking(|| {
+            assert!(
+                IS_CREDENTIAL_LOADER_THREAD.with(Cell::get),
+                "reconcile backend work must run under the loader redaction marker"
+            );
+            panic!("{PANIC_CANARY_TOKEN} {PANIC_CANARY_PATH}");
+        })
+        .await;
+        let error = outcome.expect_err("a reconcile backend panic must fail closed");
+        let message = format!("{error:#}");
+        assert!(!message.contains(PANIC_CANARY_TOKEN));
+        assert!(!message.contains(PANIC_CANARY_PATH));
+
+        let unrelated = std::thread::spawn(|| panic!("ordinary-thread-panic"));
+        assert!(unrelated.join().is_err());
+        Err(anyhow!("reconcile credential backend failed"))
     }
 
     #[tokio::test]
