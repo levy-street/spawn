@@ -28,6 +28,7 @@ import {
   finishBrowserDeviceLocalCleanup,
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 export default function SettingsPage() {
   return (
@@ -100,6 +101,29 @@ function BrowserDevicesSettings() {
   const currentDevice =
     (devices.data ?? []).find((device) => device.public_key === currentPublicKey) ??
     (registration.data?.status === "ready" ? registration.data.device : undefined);
+
+  // Derive each device's fingerprint locally from its key rather than trusting
+  // the server's `fingerprint` field: this is the value the operator reads to
+  // decide which device to revoke, so a hostile server must not be able to
+  // mislabel one device with another's fingerprint. Mirrors the endorse page.
+  const deviceFingerprints = useQuery({
+    queryKey: [
+      "browser-device-fingerprints",
+      (devices.data ?? []).map((device) => device.public_key).join(","),
+    ],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        (devices.data ?? []).map(
+          async (device) =>
+            [device.id, await ed25519PublicKeyFingerprint(device.public_key)] as const,
+        ),
+      );
+      return new Map(entries);
+    },
+    enabled: (devices.data?.length ?? 0) > 0,
+  });
+  const fingerprintFor = (device: BrowserDevice): string | null =>
+    deviceFingerprints.data?.get(device.id) ?? null;
 
   const setRegistrationState = (state: BrowserDeviceRegistrationState) => {
     if (!user) return;
@@ -183,8 +207,8 @@ function BrowserDevicesSettings() {
       <CardHeader>
         <CardTitle>Browser identities</CardTitle>
         <CardDescription>
-          Account-bound public keys for browsers you have used. Fingerprints are derived by the
-          server; registration does not yet authenticate live host signaling.
+          Account-bound public keys for browsers you have used. Fingerprints are derived locally
+          from each key; registration does not yet authenticate live host signaling.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -192,13 +216,13 @@ function BrowserDevicesSettings() {
           <p className="text-sm font-medium">This browser</p>
           {currentDevice ? (
             <p className="mt-1 break-all font-mono text-xs" data-testid="browser-fingerprint">
-              {currentDevice.fingerprint}
+              {fingerprintFor(currentDevice) ?? currentDevice.fingerprint}
             </p>
           ) : (
             <p className="mt-1 text-xs text-muted-foreground">
               {registration.isError
                 ? "Identity registration needs attention."
-                : "No server-derived fingerprint is available."}
+                : "No fingerprint is available."}
             </p>
           )}
           {registration.data?.status === "cleanup_pending" && (
@@ -245,11 +269,12 @@ function BrowserDevicesSettings() {
           )}
           {(devices.data ?? []).map((device) => {
             const isCurrent = device.public_key === currentPublicKey;
+            const derivedFingerprint = fingerprintFor(device);
             return (
               <div key={device.id} className="flex items-start justify-between gap-3 p-3">
                 <div className="min-w-0 space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-xs">{device.fingerprint}</span>
+                    <span className="font-mono text-xs">{derivedFingerprint ?? "…"}</span>
                     {isCurrent && (
                       <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
                         this browser
@@ -269,9 +294,9 @@ function BrowserDevicesSettings() {
                   <Button
                     size="sm"
                     variant="secondary"
-                    disabled={revoke.isPending}
+                    disabled={revoke.isPending || derivedFingerprint === null}
                     onClick={() => {
-                      if (confirm(`Revoke browser ${device.fingerprint}?`)) revoke.mutate(device);
+                      if (confirm(`Revoke browser ${derivedFingerprint}?`)) revoke.mutate(device);
                     }}
                   >
                     Revoke

@@ -143,6 +143,38 @@ describe("trust envelope", () => {
     );
   });
 
+  test("revocation refuses to silently drop a wrap that is neither kept nor revoked", async () => {
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const withTwo = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    const withThree = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      withTwo,
+      passkey("laptop", 1),
+      passkey("phone", 3),
+    );
+    // Keeping only laptop would drop the still-enrolled "phone" — refuse, even
+    // though a hostile server might have hidden "phone" from the passkey list.
+    await expect(
+      revokePasskeyFromEnvelope(ACCOUNT, withThree, [passkey("laptop", 1)], "yubikey", 2),
+    ).rejects.toThrow(TrustBundleError);
+    // Enumerating every survivor succeeds.
+    const revoked = await revokePasskeyFromEnvelope(
+      ACCOUNT,
+      withThree,
+      [passkey("laptop", 1), passkey("phone", 3)],
+      "yubikey",
+      2,
+    );
+    expect(new Set(envelopeWrapCredentialIds(ACCOUNT, revoked))).toEqual(
+      new Set(["laptop", "phone"]),
+    );
+  });
+
   test("revocation must advance the revision", async () => {
     const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     const withBackup = await enrollPasskeyInEnvelope(

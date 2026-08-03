@@ -367,6 +367,21 @@ export async function revokePasskeyFromEnvelope(
   if (!envelope.wraps.some((wrap) => wrap.credentialId === revokedCredentialId)) {
     throw new TrustBundleError("invalid_bundle", "no such passkey is enrolled");
   }
+  // Resealing keeps wraps only for `keep`, so any enrolled passkey that is
+  // neither kept nor the one being revoked would be silently and permanently
+  // dropped. Refuse here rather than trusting the caller (or a server-supplied
+  // passkey list) to have enumerated every survivor — a hostile server that
+  // hides a third passkey must not be able to induce its eviction.
+  const keptIds = new Set(keep.map((passkey) => passkey.credentialId));
+  const orphaned = envelope.wraps.find(
+    (wrap) => wrap.credentialId !== revokedCredentialId && !keptIds.has(wrap.credentialId),
+  );
+  if (orphaned !== undefined) {
+    throw new TrustBundleError(
+      "invalid_bundle",
+      "revocation would drop an enrolled passkey that is neither kept nor revoked",
+    );
+  }
   // Recover through a kept passkey (which proves it can currently open), then
   // reseal for the kept set under a fresh key and a bumped revision.
   const dataKey = await recoverDataKey(envelope, accountId, keep[0]);
