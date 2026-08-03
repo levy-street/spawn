@@ -38,7 +38,8 @@ between the host daemon, the browser, and a ciphertext-only TURN relay.
 ## Local dev (quickstart)
 
 System prerequisites: `docker`, Python 3.13 (`uv` installs interpreters on
-demand), Rust stable (via `rustup`), and Bun 1.x. Agent hosts install both
+demand), Rust stable (via `rustup`), Bun 1.x, and `ripgrep` (`rg`, required by
+the source guards that `scripts/test-all.sh` runs). Agent hosts install both
 `spawnd` and its paired `spawn-worker` binary.
 
 ## Daemon install
@@ -128,8 +129,11 @@ That runs server lint/tests, daemon Rust tests, hosted prebuilt-install smoke,
 local HTTP-surface smoke, real `spawnd login` smoke, local server+daemon
 recovery smoke, real Redis coordination/signaling smoke,
 live browser+daemon smoke, service-manager crash-restart smoke, web lint,
-Playwright browser tests, web production build, and diff hygiene. The Redis
-smoke starts an isolated Redis instance and proves owner fencing and
+Playwright browser tests, web production build, and diff hygiene. The source
+guards use `ripgrep` (`rg`); `check-signed-rtc-live.sh` and
+`check-no-server-agent-upload.sh` fail closed with a clear error if it is
+absent. The Redis smoke starts an isolated Redis instance and proves owner
+fencing and
 cross-process signaling using the production backend; Redis carries no PTY
 content.
 The local daemon smoke also launches multiple shell agents concurrently and verifies
