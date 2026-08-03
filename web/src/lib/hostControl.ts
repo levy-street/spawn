@@ -159,6 +159,11 @@ export class HostControlClient {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private signedRtcSession: SignedRtcLiveSession | null = null;
+  // True once the current generation has decided it will negotiate a signed
+  // session, set BEFORE ICE gathering/offer so the legacy raw-answer branch is
+  // unreachable during the window before signedRtcSession is armed. Reset on
+  // every teardown so a fresh generation starts unpinned until it decides.
+  private signedRtcRequired = false;
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
@@ -728,7 +733,15 @@ export class HostControlClient {
           .catch(() => {
             if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(expectedSessionId);
           });
-      } else if (message.type === "rtc.answer" && message.session_id === this.sessionId) {
+      } else if (
+        message.type === "rtc.answer" &&
+        !this.signedRtcRequired &&
+        message.session_id === this.sessionId
+      ) {
+        // Legacy unpinned (TOFU) path only. Once this generation has selected
+        // signed mode, signedRtcRequired stays true for its whole lifetime, so
+        // a raw answer can never reach the peer's remote-description setter here
+        // — even in the window before signedRtcSession is armed; it is dropped.
         const pc = this.pc;
         if (!pc) return;
         if (typeof message.sdp !== "string") {
@@ -790,18 +803,21 @@ export class HostControlClient {
     this.channel = channel;
     this.sessionId = sessionId;
     this.pendingRemoteCandidates = [];
+    // Locally-gathered ICE candidates carry the session_id. Emitting them
+    // before the (possibly signed) offer is armed and sent would disclose the
+    // session to the server ahead of the signed envelope, reopening the raw
+    // remote-answer race. Buffer them until the offer is on the wire.
+    let offerSent = false;
+    const pendingLocalCandidates: RTCIceCandidateInit[] = [];
     pc.onicecandidate = (event) => {
       if (!event.candidate || this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt))
         return;
-      this.sendSignal(
-        {
-          type: "rtc.candidate",
-          session_id: sessionId,
-          candidate: event.candidate.toJSON(),
-        },
-        ws,
-        attempt,
-      );
+      const candidate = event.candidate.toJSON();
+      if (!offerSent) {
+        pendingLocalCandidates.push(candidate);
+        return;
+      }
+      this.sendSignal({ type: "rtc.candidate", session_id: sessionId, candidate }, ws, attempt);
     };
     pc.onconnectionstatechange = () => {
       if (
@@ -844,6 +860,10 @@ export class HostControlClient {
         return;
       }
       this.signedRtcRefusal = null;
+      // Commit to signed mode for this generation BEFORE gathering starts, so
+      // the legacy raw-answer branch is gated off for the entire lifetime of a
+      // signed generation, not only once signedRtcSession is assigned below.
+      this.signedRtcRequired = decision.mode === "signed";
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -867,6 +887,13 @@ export class HostControlClient {
       if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       this.signedRtcSession = nextSignedRtcSession;
       this.sendSignal({ type: "rtc.offer", session_id: sessionId, ...carrier }, ws, attempt);
+      // The offer (signed envelope when signed) is now the first frame that can
+      // disclose this session to the server. Only now release the buffered
+      // local candidates, and let later ones flow directly.
+      offerSent = true;
+      for (const candidate of pendingLocalCandidates.splice(0)) {
+        this.sendSignal({ type: "rtc.candidate", session_id: sessionId, candidate }, ws, attempt);
+      }
     } catch {
       if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
     }
@@ -1284,6 +1311,7 @@ export class HostControlClient {
     this.sessionId = null;
     this.signedRtcSession?.abort();
     this.signedRtcSession = null;
+    this.signedRtcRequired = false;
     if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
     const channel = this.channel;
     const pc = this.pc;

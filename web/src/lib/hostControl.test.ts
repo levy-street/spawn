@@ -349,6 +349,85 @@ describe("HostControlClient", () => {
     client.close();
   });
 
+  test("signed HostControl buffers ICE and ignores a raw answer before the offer arms", async () => {
+    // Reproduce the pre-arm race: a signed generation is selected, but the
+    // signing round-trip has not finished, so signedRtcSession is not yet set.
+    // A server that learns the session id early and returns a raw answer here
+    // must NOT get its fingerprint applied via a legacy setRemoteDescription.
+    const signed = await signedRtcTrust();
+    let capturedSessionId: string | null = null;
+    let reachSigning: () => void;
+    const signingReached = new Promise<void>((resolve) => {
+      reachSigning = resolve;
+    });
+    let releaseSigning: () => void;
+    const signingGate = new Promise<void>((resolve) => {
+      releaseSigning = resolve;
+    });
+    const capability = {
+      ...signed.trust,
+      signOffer: async (input) => {
+        capturedSessionId = input.transcript.sessionId;
+        reachSigning();
+        await signingGate;
+        return signed.trust.signOffer(input);
+      },
+    };
+    const client = new HostControlClient(hostId, {
+      resolveSignedRtcTrust: async () => ({ mode: "signed", capability }),
+    });
+    client.connect();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [{ urls: ["turn:relay.example"] }],
+      ice_transport_policy: "relay",
+      ...metadata,
+    });
+
+    // Wait until we are inside the signing boundary: offer gathered, but the
+    // signed session is not yet armed. This is the exact vulnerable window.
+    await signingReached;
+    const pc = FakePeerConnection.instances.at(-1);
+    expect(capturedSessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+
+    // (b) Locally-gathered ICE must be buffered, not emitted, before the offer:
+    // emitting it would disclose the session id ahead of the signed envelope.
+    pc.onicecandidate?.({
+      candidate: { toJSON: () => ({ candidate: "candidate:host", sdpMid: "0", sdpMLineIndex: 0 }) },
+    });
+    expect(framesOf(ws, "rtc.candidate")).toHaveLength(0);
+    expect(framesOf(ws, "rtc.offer")).toHaveLength(0);
+
+    // (a) A raw answer arriving in the window is ignored — never applied and
+    // never allowed to tear the generation into an unpinned reconnect.
+    ws.receive({
+      type: "rtc.answer",
+      session_id: capturedSessionId,
+      sdp: "v=0\r\ns=hostile-race\r\na=fingerprint:sha-256 AA:BB\r\n",
+      ...metadata,
+    });
+    await Bun.sleep(2);
+    expect(pc.remoteDescription).toBeNull();
+    expect(pc.channel.closed).toBe(false);
+
+    // Arm the signed offer: now the offer and the buffered candidate flow, both
+    // bound to the same session id, and the raw answer still never took effect.
+    releaseSigning();
+    const offer = await waitForSentFrame(ws, "rtc.offer");
+    expect(offer).toHaveProperty("signed_envelope");
+    expect(offer).not.toHaveProperty("sdp");
+    expect(offer.session_id).toBe(capturedSessionId);
+    const candidateFrame = await waitForSentFrame(ws, "rtc.candidate");
+    expect(candidateFrame.session_id).toBe(capturedSessionId);
+    expect(pc.remoteDescription).toBeNull();
+    client.close();
+  });
+
   test("creates a host-bound TURN-only channel and completes a bound ping", async () => {
     const { client, pc, offer } = await readyClient();
     expect(pc.channel.label).toBe(HOST_CONTROL_PROTOCOL);
