@@ -4,6 +4,7 @@ import {
   approveBrowserHostPin,
   listActiveBrowserHostPins,
   loadBrowserHostPin,
+  loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "./browser-host-pins";
@@ -218,5 +219,49 @@ describe("trust bootstrap", () => {
       pinStorage: device(),
     });
     expect(imported.added).toHaveLength(0);
+  });
+
+  test("an imported pin carries its Host IDs, so the downgrade gate sees it immediately", async () => {
+    // Regression: pins used to import with empty hostIds, so the signed-RTC
+    // downgrade check (loadBrowserHostPinByHostId) could not recognise an
+    // imported host until a first successful signed resolve. A hostile server
+    // could exploit that window to hold the device on the raw, unsigned path by
+    // simply never presenting the key for that hostId.
+    const first = device();
+    await pin(first, HOST_KEY);
+    // Binding a hostId on the source device is what carries it into the bundle.
+    await resolveActiveBrowserHostPin(
+      {
+        accountId: ACCOUNT,
+        origin: ORIGIN,
+        hostId: HOST_ID,
+        claimedHostPublicKey: HOST_KEY,
+        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
+      },
+      first,
+    );
+
+    const bundleKey = key(8);
+    const { sealed } = await sealCurrentTrust(bundleKey, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: first,
+    });
+
+    const second = device();
+    await importTrustBundle(bundleKey, sealed, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: second,
+    });
+
+    // The new device recognises the host by ID with no prior signed resolve.
+    const bound = await loadBrowserHostPinByHostId(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: HOST_ID },
+      second,
+    );
+    expect(bound).not.toBeNull();
+    expect(bound?.hostPublicKey).toBe(HOST_KEY);
+    expect(bound?.hostIds).toContain(HOST_ID);
   });
 });

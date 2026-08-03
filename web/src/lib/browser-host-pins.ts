@@ -85,6 +85,14 @@ export interface ApproveBrowserHostPinInput {
   readonly origin: string;
   readonly hostPublicKey: string;
   readonly hostFingerprint: string;
+  /**
+   * Host IDs already known to map to this key (e.g. carried in a trust bundle).
+   * Seeding them means the signed-RTC downgrade check can recognise this host by
+   * ID immediately, instead of only after a first successful signed resolve —
+   * without which a server can hold a freshly imported host on the raw path by
+   * simply never presenting the key. Omit for a pure key approval.
+   */
+  readonly hostIds?: readonly string[];
 }
 
 export interface ResolveBrowserHostPinInput {
@@ -592,6 +600,30 @@ function assertScope(accountId: string, origin: string): void {
 }
 
 /**
+ * Validate and bound Host IDs seeded onto a pin at approval time. Malformed IDs
+ * are skipped rather than fatal, so one bad entry in an imported bundle cannot
+ * break an otherwise-valid import; the count is capped to the same limit the
+ * store enforces on read.
+ */
+function normalizeSeedHostIds(hostIds: readonly string[] | undefined): string[] {
+  if (hostIds === undefined || hostIds.length === 0) return [];
+  const valid = [...new Set(hostIds)]
+    .filter((id) => typeof id === "string" && CANONICAL_UUID_PATTERN.test(id))
+    .sort();
+  return valid.slice(0, BROWSER_HOST_PIN_MAX_HOST_IDS);
+}
+
+/** Union seed IDs into an existing set, never dropping an existing binding. */
+function mergeHostIds(existing: readonly string[], seed: readonly string[]): string[] {
+  const merged = [...existing];
+  for (const id of seed) {
+    if (merged.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) break;
+    if (!merged.includes(id)) merged.push(id);
+  }
+  return merged.sort();
+}
+
+/**
  * Persist the exact locally fingerprinted key before any server approval call.
  * This is the only operation allowed to reactivate an exact revoked key, and
  * callers must invoke it only from a fresh explicit user-confirmed ceremony.
@@ -602,6 +634,7 @@ export async function approveBrowserHostPin(
 ): Promise<BrowserHostPin> {
   assertScope(input.accountId, input.origin);
   const identity = await strictIdentity(input.hostPublicKey, input.hostFingerprint);
+  const seedHostIds = normalizeSeedHostIds(input.hostIds);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
@@ -609,13 +642,19 @@ export async function approveBrowserHostPin(
       const existing = recordsInScope(records, input.accountId, input.origin).find(
         (record) => record.hostPublicKey === identity.hostPublicKey,
       );
-      if (existing?.state === "active") return { result: publicPin(existing) };
+      if (existing?.state === "active") {
+        const merged = mergeHostIds(existing.hostIds, seedHostIds);
+        if (merged.length === existing.hostIds.length) return { result: publicPin(existing) };
+        const updated: StoredBrowserHostPinV1 = { ...existing, hostIds: merged };
+        return { nextRecord: updated, result: publicPin(updated) };
+      }
 
       const now = checkedNow(options);
       if (existing !== undefined) {
         const reactivated: StoredBrowserHostPinV1 = {
           ...existing,
           approvedAtMs: Math.max(now, existing.approvedAtMs, existing.revokedAtMs ?? 0),
+          hostIds: mergeHostIds(existing.hostIds, seedHostIds),
           revokedAtMs: null,
           state: "active",
         };
@@ -632,7 +671,7 @@ export async function approveBrowserHostPin(
         approvedAtMs: now,
         createdAtMs: now,
         hostFingerprint: identity.hostFingerprint,
-        hostIds: [],
+        hostIds: seedHostIds,
         hostPublicKey: identity.hostPublicKey,
         origin: input.origin,
         recordId: recordId(input.accountId, input.origin, identity.hostPublicKey),

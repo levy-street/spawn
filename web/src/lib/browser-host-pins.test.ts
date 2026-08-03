@@ -9,6 +9,7 @@ import {
   BROWSER_HOST_PIN_STORE_NAME,
   BrowserHostPinError,
   loadBrowserHostPin,
+  loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "./browser-host-pins";
@@ -590,5 +591,38 @@ describe("browser-local host pins", () => {
       loadBrowserHostPin(approvalInput(), options(factory)),
       "duplicate_conflict",
     );
+  });
+});
+
+describe("approveBrowserHostPin Host ID seeding", () => {
+  test("seeds Host IDs so the pin is recognised by hostId without a resolve", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    const bound = await loadBrowserHostPinByHostId(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: HOST_ID },
+      options(factory),
+    );
+    expect(bound?.hostPublicKey).toBe(HOST_KEY);
+    expect(bound?.hostIds).toEqual([HOST_ID]);
+  });
+
+  test("re-approving unions new Host IDs without dropping existing ones", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [OTHER_HOST_ID] }, options(factory));
+    const bound = await loadBrowserHostPinByHostId(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: OTHER_HOST_ID },
+      options(factory),
+    );
+    expect(bound?.hostIds).toEqual([HOST_ID, OTHER_HOST_ID]);
+  });
+
+  test("skips a malformed Host ID rather than failing the whole approval", async () => {
+    const factory = new IDBFactory();
+    const approved = await approveBrowserHostPin(
+      { ...approvalInput(), hostIds: ["not-a-uuid", HOST_ID] },
+      options(factory),
+    );
+    expect(approved.hostIds).toEqual([HOST_ID]);
   });
 });

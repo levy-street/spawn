@@ -106,6 +106,11 @@ export async function importTrustBundle(
         origin,
         hostPublicKey: host.hostPublicKey,
         hostFingerprint: host.hostFingerprint,
+        // Carry the bundle's Host IDs so the signed-RTC downgrade check can
+        // recognise this host by ID right away. Without them an imported pin is
+        // invisible to that check until a first successful signed resolve, and a
+        // server can hold the device on the raw path by never presenting the key.
+        hostIds: host.hostIds,
       },
       scope.pinStorage ?? {},
     );
