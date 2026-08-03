@@ -9,8 +9,13 @@ import {
   revokeBrowserHostPin,
 } from "./browser-host-pins";
 import { ed25519PublicKeyFingerprint } from "./signed-signal";
-import { importTrustBundle, sealCurrentTrust } from "./trust-bootstrap";
-import type { PasskeyWrapInput } from "./trust-envelope";
+import {
+  enrollBackupPasskey,
+  importTrustBundle,
+  revokeBackupPasskey,
+  sealCurrentTrust,
+} from "./trust-bootstrap";
+import { openTrustEnvelope, type PasskeyWrapInput } from "./trust-envelope";
 
 const ACCOUNT = "00000000-0000-4000-8000-000000000001";
 const HOST_ID = "00000000-0000-4000-8000-000000000003";
@@ -39,6 +44,11 @@ async function pin(storage: { indexedDBFactory: IDBFactory }, hostKey: string) {
   );
 }
 
+/** Seal at server revision 0 (fresh account); freshness is covered separately. */
+function sealTrust(passkey: PasskeyWrapInput, scope: Parameters<typeof sealCurrentTrust>[1]) {
+  return sealCurrentTrust(passkey, scope, 0);
+}
+
 describe("trust bootstrap", () => {
   test("a new device inherits the hosts the first device verified", async () => {
     // The property the whole passkey path exists for.
@@ -47,7 +57,7 @@ describe("trust bootstrap", () => {
     await pin(first, OTHER_HOST_KEY);
 
     const bundleKey = key(1);
-    const { sealed, hostCount } = await sealCurrentTrust(bundleKey, {
+    const { sealed, hostCount } = await sealTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -100,7 +110,7 @@ describe("trust bootstrap", () => {
     const active = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, first);
     expect(active.map((p) => p.hostPublicKey)).toEqual([OTHER_HOST_KEY]);
 
-    const { sealed, hostCount } = await sealCurrentTrust(key(2), {
+    const { sealed, hostCount } = await sealTrust(key(2), {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -135,7 +145,7 @@ describe("trust bootstrap", () => {
     const first = device();
     await pin(first, HOST_KEY);
     const bundleKey = key(3);
-    const { sealed } = await sealCurrentTrust(bundleKey, {
+    const { sealed } = await sealTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -157,7 +167,7 @@ describe("trust bootstrap", () => {
   test("a bundle sealed under another secret cannot import anything", async () => {
     const first = device();
     await pin(first, HOST_KEY);
-    const { sealed } = await sealCurrentTrust(key(4), {
+    const { sealed } = await sealTrust(key(4), {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -176,7 +186,7 @@ describe("trust bootstrap", () => {
     const first = device();
     await pin(first, HOST_KEY);
     const bundleKey = key(6);
-    const { sealed } = await sealCurrentTrust(bundleKey, {
+    const { sealed } = await sealTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -207,7 +217,7 @@ describe("trust bootstrap", () => {
     // A device with nothing verified must still be able to publish, or the
     // first seal would need special-casing at every call site.
     const bundleKey = key(7);
-    const { sealed, hostCount } = await sealCurrentTrust(bundleKey, {
+    const { sealed, hostCount } = await sealTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: device(),
@@ -242,7 +252,7 @@ describe("trust bootstrap", () => {
     );
 
     const bundleKey = key(8);
-    const { sealed } = await sealCurrentTrust(bundleKey, {
+    const { sealed } = await sealTrust(bundleKey, {
       accountId: ACCOUNT,
       origin: ORIGIN,
       pinStorage: first,
@@ -263,5 +273,53 @@ describe("trust bootstrap", () => {
     expect(bound).not.toBeNull();
     expect(bound?.hostPublicKey).toBe(HOST_KEY);
     expect(bound?.hostIds).toContain(HOST_ID);
+  });
+
+  test("a rolled-back bundle is refused on import once a newer one has been seen", async () => {
+    // The untrusted-server replay attack: serving an older authentic bundle to
+    // resurrect withdrawn hosts. A device that has seen a newer revision refuses.
+    const source = device();
+    await pin(source, HOST_KEY);
+    const bundleKey = key(9);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: source };
+    const old = await sealCurrentTrust(bundleKey, scope, 0);
+    expect(old.revision).toBe(1);
+    await pin(source, OTHER_HOST_KEY);
+    // The server now reports revision 1, so the next seal binds revision 2.
+    const fresh = await sealCurrentTrust(bundleKey, scope, 1);
+    expect(fresh.revision).toBe(2);
+
+    const target = device();
+    const targetScope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: target };
+    await importTrustBundle(bundleKey, fresh.sealed, targetScope);
+    // Replaying the older bundle is refused as a rollback.
+    await expect(importTrustBundle(bundleKey, old.sealed, targetScope)).rejects.toThrow();
+  });
+
+  test("revoking a passkey reseals and blocks the revoked key end to end", async () => {
+    const dev = device();
+    await pin(dev, HOST_KEY);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: dev };
+    const primary = key(10);
+    const backup = key(11);
+    const { sealed, revision } = await sealCurrentTrust(primary, scope, 0);
+    const withBackup = await enrollBackupPasskey(scope, sealed, primary, backup);
+    // Both passkeys open it before revocation.
+    expect((await openTrustEnvelope(ACCOUNT, withBackup, primary)).revision).toBe(revision);
+    expect((await openTrustEnvelope(ACCOUNT, withBackup, backup)).revision).toBe(revision);
+
+    const revoked = await revokeBackupPasskey(
+      scope,
+      withBackup,
+      revision,
+      primary,
+      backup.credentialId,
+    );
+    expect(revoked.revision).toBeGreaterThan(revision);
+    // The kept passkey still opens the resealed bundle; the revoked one cannot.
+    expect((await openTrustEnvelope(ACCOUNT, revoked.sealed, primary)).revision).toBe(
+      revoked.revision,
+    );
+    await expect(openTrustEnvelope(ACCOUNT, revoked.sealed, backup)).rejects.toThrow();
   });
 });

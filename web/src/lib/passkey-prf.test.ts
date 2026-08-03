@@ -173,7 +173,7 @@ describe("passkey PRF", () => {
     // passkey recovers the trust bundle, with the server never seeing the key.
     const credentials = authenticator({ key: 42 });
     const { secret, credentialId } = await evaluateTrustPrf(ACCOUNT, [], { credentials });
-    const sealed = await sealTrustEnvelope(ACCOUNT, [], [{ credentialId, prfSecret: secret }]);
+    const sealed = await sealTrustEnvelope(ACCOUNT, [], [{ credentialId, prfSecret: secret }], 1);
 
     const freshDevice = authenticator({ key: 42 });
     const recovered = await evaluateTrustPrf(ACCOUNT, [], { credentials: freshDevice });

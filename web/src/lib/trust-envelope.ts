@@ -21,6 +21,7 @@ import { encodeBase64Url } from "./signed-signal";
 import {
   canonicalBundle,
   decodeVariableBase64Url,
+  requireRevision,
   TRUST_IV_BYTES,
   type TrustBundle,
   TrustBundleError,
@@ -177,12 +178,13 @@ export async function sealTrustEnvelope(
   accountId: string,
   hosts: readonly TrustBundleHost[],
   passkeys: readonly PasskeyWrapInput[],
+  revision: number,
 ): Promise<string> {
   requireAccountId(accountId);
   if (passkeys.length === 0) {
     throw new TrustBundleError("invalid_bundle", "an envelope needs at least one passkey wrap");
   }
-  const bundle = await canonicalBundle(accountId, hosts);
+  const bundle = await canonicalBundle(accountId, hosts, revision);
   const dataKey = crypto.getRandomValues(new Uint8Array(DATA_KEY_BYTES));
   const sealed = await sealBytes(
     await importDataKey(dataKey),
@@ -250,22 +252,18 @@ async function recoverDataKey(
   return dataKey;
 }
 
-/** Open the envelope with one enrolled passkey and return the trust bundle. */
-export async function openTrustEnvelope(
+/** Decrypt a sealed bundle under a recovered data key and revalidate it. */
+async function openSealedBundle(
+  dataKey: Uint8Array,
   accountId: string,
-  wire: string,
-  passkey: PasskeyWrapInput,
+  sealed: string,
 ): Promise<TrustBundle> {
-  requireAccountId(accountId);
-  const envelope = parseEnvelope(accountId, wire);
-  const dataKey = await recoverDataKey(envelope, accountId, passkey);
-
   let plaintext: Uint8Array;
   try {
     plaintext = await openBytes(
       await importDataKey(dataKey),
       aad(BUNDLE_AAD_MAGIC, accountId),
-      envelope.sealed,
+      sealed,
     );
   } catch {
     throw new TrustBundleError("decrypt_failed", "trust bundle did not authenticate");
@@ -281,8 +279,23 @@ export async function openTrustEnvelope(
     throw new TrustBundleError("invalid_bundle", "trust bundle has no host list");
   }
   // Re-canonicalize: authenticated decryption proves who wrote the bytes, not
-  // that they are well-formed, and these become trust anchors.
-  return canonicalBundle(accountId, candidate.hosts);
+  // that they are well-formed, and these become trust anchors. The revision is
+  // authenticated with the rest of the plaintext; legacy bundles without one
+  // open as 0. The caller enforces monotonicity against a local floor.
+  const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
+  return canonicalBundle(accountId, candidate.hosts, revision);
+}
+
+/** Open the envelope with one enrolled passkey and return the trust bundle. */
+export async function openTrustEnvelope(
+  accountId: string,
+  wire: string,
+  passkey: PasskeyWrapInput,
+): Promise<TrustBundle> {
+  requireAccountId(accountId);
+  const envelope = parseEnvelope(accountId, wire);
+  const dataKey = await recoverDataKey(envelope, accountId, passkey);
+  return openSealedBundle(dataKey, accountId, envelope.sealed);
 }
 
 /**
@@ -301,36 +314,65 @@ export async function enrollPasskeyInEnvelope(
   newPasskey: PasskeyWrapInput,
 ): Promise<string> {
   requireAccountId(accountId);
+  if (newPasskey.credentialId === unlockWith.credentialId) {
+    // Without this, "enrolling" the unlocking credential with a different secret
+    // replaces its only wrap under a key nothing can reproduce, permanently
+    // bricking the bundle. Mirrors the self-revoke guard below.
+    throw new TrustBundleError("invalid_bundle", "a passkey cannot enroll over itself");
+  }
   const envelope = parseEnvelope(accountId, wire);
   if (envelope.wraps.length >= MAX_WRAPS) {
     throw new TrustBundleError("too_many_hosts", `an envelope holds at most ${MAX_WRAPS} passkeys`);
   }
   const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
+  // Prove the sealed bundle actually opens under the recovered key before
+  // republishing it, so a server-corrupted `sealed` is caught here rather than
+  // being re-committed with a cheerful "backup enrolled" message.
+  await openSealedBundle(dataKey, accountId, envelope.sealed);
   const wraps = envelope.wraps.filter((wrap) => wrap.credentialId !== newPasskey.credentialId);
   wraps.push(await wrapDataKey(dataKey, accountId, newPasskey));
   const next: EnvelopeWire = { ...envelope, wraps };
   return encodeBase64Url(new TextEncoder().encode(JSON.stringify(next)));
 }
 
-/** Remove a passkey's access. Requires another passkey that can still unlock. */
+/**
+ * Revoke a passkey by resealing the bundle under a fresh data key for exactly
+ * the kept passkeys, at a higher revision.
+ *
+ * Filtering the wrap out is not enough: the server keeps every prior envelope,
+ * so a dropped wrap can be spliced back from an old copy. Instead we mint a new
+ * data key (which the revoked wrap can no longer derive) and bump the revision
+ * (so any replay of the old envelope falls below the device's rollback floor).
+ *
+ * `keep` must carry the PRF secret of every passkey that should retain access —
+ * a passkey the caller cannot exercise here cannot be re-wrapped and would lose
+ * access, so the caller is responsible for supplying all survivors. `revision`
+ * must exceed the current bundle's.
+ */
 export async function revokePasskeyFromEnvelope(
   accountId: string,
   wire: string,
-  unlockWith: PasskeyWrapInput,
-  credentialId: string,
+  keep: readonly PasskeyWrapInput[],
+  revokedCredentialId: string,
+  revision: number,
 ): Promise<string> {
   requireAccountId(accountId);
-  const envelope = parseEnvelope(accountId, wire);
-  if (credentialId === unlockWith.credentialId) {
-    throw new TrustBundleError("invalid_bundle", "a passkey cannot revoke itself");
+  if (keep.length === 0) {
+    throw new TrustBundleError("invalid_bundle", "revocation must keep at least one passkey");
   }
-  // Prove the caller can still open the envelope before shrinking it, so the
-  // last usable wrap cannot be removed by someone who cannot open it.
-  await recoverDataKey(envelope, accountId, unlockWith);
-  const wraps = envelope.wraps.filter((wrap) => wrap.credentialId !== credentialId);
-  if (wraps.length === envelope.wraps.length) {
+  if (keep.some((passkey) => passkey.credentialId === revokedCredentialId)) {
+    throw new TrustBundleError("invalid_bundle", "a passkey cannot be both kept and revoked");
+  }
+  const envelope = parseEnvelope(accountId, wire);
+  if (!envelope.wraps.some((wrap) => wrap.credentialId === revokedCredentialId)) {
     throw new TrustBundleError("invalid_bundle", "no such passkey is enrolled");
   }
-  const next: EnvelopeWire = { ...envelope, wraps };
-  return encodeBase64Url(new TextEncoder().encode(JSON.stringify(next)));
+  // Recover through a kept passkey (which proves it can currently open), then
+  // reseal for the kept set under a fresh key and a bumped revision.
+  const dataKey = await recoverDataKey(envelope, accountId, keep[0]);
+  const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
+  if (revision <= bundle.revision) {
+    throw new TrustBundleError("invalid_bundle", "revocation must advance the bundle revision");
+  }
+  return sealTrustEnvelope(accountId, bundle.hosts, keep, revision);
 }

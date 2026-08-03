@@ -32,10 +32,19 @@ async function host(): Promise<TrustBundleHost> {
   };
 }
 
+/** Most tests do not care about the revision; seal at a fixed one. */
+function sealEnvelope(
+  account: string,
+  hosts: readonly TrustBundleHost[],
+  passkeys: readonly PasskeyWrapInput[],
+) {
+  return sealTrustEnvelope(account, hosts, passkeys, 1);
+}
+
 describe("trust envelope", () => {
   test("one passkey seals and opens the bundle", async () => {
     const hosts = [await host(), await host()];
-    const wire = await sealTrustEnvelope(ACCOUNT, hosts, [passkey("laptop", 1)]);
+    const wire = await sealEnvelope(ACCOUNT, hosts, [passkey("laptop", 1)]);
     const opened = await openTrustEnvelope(ACCOUNT, wire, passkey("laptop", 1));
     expect(new Set(opened.hosts.map((h) => h.hostPublicKey))).toEqual(
       new Set(hosts.map((h) => h.hostPublicKey)),
@@ -45,7 +54,7 @@ describe("trust envelope", () => {
   test("a second enrolled passkey opens the same bundle", async () => {
     // The property this whole layer exists for: a backup passkey.
     const hosts = [await host()];
-    const sealed = await sealTrustEnvelope(ACCOUNT, hosts, [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, hosts, [passkey("laptop", 1)]);
     const twoKeys = await enrollPasskeyInEnvelope(
       ACCOUNT,
       sealed,
@@ -63,7 +72,7 @@ describe("trust envelope", () => {
   });
 
   test("an unenrolled passkey cannot open the envelope", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     await expect(openTrustEnvelope(ACCOUNT, sealed, passkey("stranger", 9))).rejects.toThrow(
       TrustBundleError,
     );
@@ -71,7 +80,7 @@ describe("trust envelope", () => {
 
   test("the wrong secret for an enrolled credential cannot open it", async () => {
     // Same credential ID, different PRF secret: a server swapping a wrap fails.
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     await expect(
       openTrustEnvelope(ACCOUNT, sealed, {
         credentialId: "laptop",
@@ -81,14 +90,14 @@ describe("trust envelope", () => {
   });
 
   test("an envelope cannot be opened under another account", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     await expect(openTrustEnvelope(OTHER_ACCOUNT, sealed, passkey("laptop", 1))).rejects.toThrow(
       TrustBundleError,
     );
   });
 
   test("tampering with the sealed bundle is detected", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     // Flip a byte inside the base64url payload.
     const flipped = `${sealed.slice(0, -2)}${sealed.endsWith("AA") ? "AB" : "AA"}`;
     await expect(openTrustEnvelope(ACCOUNT, flipped, passkey("laptop", 1))).rejects.toThrow(
@@ -96,8 +105,8 @@ describe("trust envelope", () => {
     );
   });
 
-  test("revoking a passkey removes its access while others keep theirs", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+  test("revoking a passkey reseals for the survivors and locks the revoked one out", async () => {
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     const withBackup = await enrollPasskeyInEnvelope(
       ACCOUNT,
       sealed,
@@ -107,25 +116,56 @@ describe("trust envelope", () => {
     const revoked = await revokePasskeyFromEnvelope(
       ACCOUNT,
       withBackup,
-      passkey("laptop", 1),
+      [passkey("laptop", 1)],
       "yubikey",
+      2,
     );
 
-    expect(await openTrustEnvelope(ACCOUNT, revoked, passkey("laptop", 1))).toBeDefined();
+    // The surviving passkey still opens it, at the bumped revision...
+    const opened = await openTrustEnvelope(ACCOUNT, revoked, passkey("laptop", 1));
+    expect(opened.revision).toBe(2);
+    // ...and the revoked passkey cannot: its wrap is gone and, because the data
+    // key is fresh, splicing the old wrap back from the retained envelope is
+    // useless too.
     await expect(openTrustEnvelope(ACCOUNT, revoked, passkey("yubikey", 2))).rejects.toThrow(
+      TrustBundleError,
+    );
+    expect(envelopeWrapCredentialIds(ACCOUNT, revoked)).toEqual(["laptop"]);
+  });
+
+  test("revocation refuses to keep and revoke the same passkey, or to keep none", async () => {
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    await expect(
+      revokePasskeyFromEnvelope(ACCOUNT, sealed, [passkey("laptop", 1)], "laptop", 2),
+    ).rejects.toThrow(TrustBundleError);
+    await expect(revokePasskeyFromEnvelope(ACCOUNT, sealed, [], "laptop", 2)).rejects.toThrow(
       TrustBundleError,
     );
   });
 
-  test("a passkey cannot revoke itself, which would risk locking everyone out", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+  test("revocation must advance the revision", async () => {
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    // Revision 1 does not exceed the bundle's own revision (1).
     await expect(
-      revokePasskeyFromEnvelope(ACCOUNT, sealed, passkey("laptop", 1), "laptop"),
+      revokePasskeyFromEnvelope(ACCOUNT, withBackup, [passkey("laptop", 1)], "yubikey", 1),
+    ).rejects.toThrow(TrustBundleError);
+  });
+
+  test("a passkey cannot enroll over itself with a different secret", async () => {
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    await expect(
+      enrollPasskeyInEnvelope(ACCOUNT, sealed, passkey("laptop", 1), passkey("laptop", 5)),
     ).rejects.toThrow(TrustBundleError);
   });
 
   test("enrolling is idempotent on the credential id", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     const once = await enrollPasskeyInEnvelope(
       ACCOUNT,
       sealed,
@@ -142,13 +182,13 @@ describe("trust envelope", () => {
   });
 
   test("only enrolled credential ids are advertised, not the secrets", async () => {
-    const sealed = await sealTrustEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
     expect(envelopeWrapCredentialIds(ACCOUNT, sealed)).toEqual(["laptop"]);
     // The wire form must not contain the raw PRF secret anywhere.
     expect(sealed).not.toContain(Buffer.from(new Uint8Array(32).fill(1)).toString("base64url"));
   });
 
   test("sealing needs at least one passkey", async () => {
-    await expect(sealTrustEnvelope(ACCOUNT, [await host()], [])).rejects.toThrow(TrustBundleError);
+    await expect(sealEnvelope(ACCOUNT, [await host()], [])).rejects.toThrow(TrustBundleError);
   });
 });

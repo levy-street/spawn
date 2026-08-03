@@ -61,7 +61,25 @@ export interface TrustBundleHost {
 export interface TrustBundle {
   readonly version: typeof TRUST_BUNDLE_VERSION;
   readonly accountId: string;
+  /**
+   * Monotonic revision, authenticated inside the sealed plaintext. A device
+   * refuses a bundle whose revision is below the highest it has already opened,
+   * so an untrusted server cannot replay an older authentic bundle to resurrect
+   * host keys or passkeys the operator has since withdrawn. Legacy bundles with
+   * no revision open as 0.
+   */
+  readonly revision: number;
   readonly hosts: readonly TrustBundleHost[];
+}
+
+export function requireRevision(revision: number): number {
+  if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) {
+    throw new TrustBundleError(
+      "invalid_bundle",
+      "trust bundle revision must be a non-negative integer",
+    );
+  }
+  return revision;
 }
 
 const CANONICAL_UUID =
@@ -216,10 +234,12 @@ async function canonicalHost(host: TrustBundleHost): Promise<TrustBundleHost> {
 export async function canonicalBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
+  revision: number,
 ): Promise<TrustBundle> {
   if (hosts.length > MAX_HOSTS) {
     throw new TrustBundleError("too_many_hosts", `a trust bundle holds at most ${MAX_HOSTS} hosts`);
   }
+  requireRevision(revision);
   const canonical = await Promise.all(hosts.map(canonicalHost));
   const seen = new Set<string>();
   for (const host of canonical) {
@@ -229,7 +249,7 @@ export async function canonicalBundle(
     seen.add(host.hostPublicKey);
   }
   canonical.sort((left, right) => (left.hostPublicKey < right.hostPublicKey ? -1 : 1));
-  return { version: TRUST_BUNDLE_VERSION, accountId, hosts: canonical };
+  return { version: TRUST_BUNDLE_VERSION, accountId, revision, hosts: canonical };
 }
 
 /** Seal a bundle for storage on the server, which only ever sees ciphertext. */
@@ -237,10 +257,11 @@ export async function sealTrustBundle(
   key: CryptoKey,
   accountId: string,
   hosts: readonly TrustBundleHost[],
+  revision: number,
 ): Promise<string> {
   const subtle = requireSubtle();
   requireAccountId(accountId);
-  const bundle = await canonicalBundle(accountId, hosts);
+  const bundle = await canonicalBundle(accountId, hosts, revision);
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
   const ciphertext = new Uint8Array(
@@ -313,5 +334,8 @@ export async function openTrustBundle(
   if (!Array.isArray(candidate.hosts)) {
     throw new TrustBundleError("invalid_bundle", "trust bundle has no host list");
   }
-  return canonicalBundle(accountId, candidate.hosts);
+  // Legacy bundles predate the revision field; they open as revision 0, which is
+  // the floor, so they establish rather than trip the rollback check.
+  const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
+  return canonicalBundle(accountId, candidate.hosts, revision);
 }

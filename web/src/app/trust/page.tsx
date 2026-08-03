@@ -6,7 +6,13 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { type BrowserDevice, browserDevices, hosts, trust } from "@/lib/api";
+import {
+  type BrowserDevice,
+  browserDevices,
+  hosts,
+  type PasskeyCredential,
+  trust,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   createBrowserEndorsementProof,
@@ -22,11 +28,13 @@ import {
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { probeStoragePersistence } from "@/lib/storage-diagnostics";
 import {
+  enrollBackupPasskey,
   forgetTrustOnThisDevice,
   importTrustBundle,
+  recordBundleRevision,
+  revokeBackupPasskey,
   sealCurrentTrust,
 } from "@/lib/trust-bootstrap";
-import { enrollPasskeyInEnvelope } from "@/lib/trust-envelope";
 
 function describe(error: unknown): string {
   if (error instanceof PasskeyPrfError) {
@@ -108,26 +116,19 @@ function TrustSettings() {
   const setUp = useMutation({
     mutationFn: async () => {
       const id = accountId as string;
-      // Refuse before creating anything if setting up here would destroy trust
-      // that already exists. A bundle is sealed under one passkey's secret, so
-      // a second, unrelated passkey cannot open it -- sealing this device's
-      // (likely empty) pins over the top would lose the operator's host keys
-      // AND lock every enrolled device out of the old bundle at once.
-      // Enrolling an additional device needs the key-wrapping ceremony, not
-      // this path.
+      // A bundle is sealed under one passkey's secret, so a second, unrelated
+      // passkey cannot open it. Sealing this device's pins over an existing
+      // bundle would lose the operator's other host keys AND lock every enrolled
+      // passkey out of the old bundle at once. Enrolling another key or device
+      // uses the key-wrapping ceremony ("Add a backup passkey" / "Unlock"),
+      // never this path — so refuse outright when a bundle already exists.
       const existing = await trust.getBundle();
       if (existing !== null) {
-        const local = await listActiveBrowserHostPins({
-          accountId: id,
-          origin: browserHostPinServerOrigin(),
-        });
-        if (local.length === 0) {
-          throw new Error(
-            "A trust bundle already exists and this device has no verified hosts to seal. " +
-              "Setting up here would overwrite it with an empty one and lock out your other " +
-              "devices. Use “Unlock trust on this device” instead.",
-          );
-        }
+        throw new Error(
+          "A trust bundle already exists for this account. Use “Unlock trust on this device” to " +
+            "import it, or “Add a backup passkey” to enroll another key. Setting up here would " +
+            "overwrite it and lock out your other devices.",
+        );
       }
 
       const passkey = await createTrustPasskey(id, user?.email ?? "spawn operator");
@@ -140,11 +141,14 @@ function TrustSettings() {
       await trust.addPasskey(passkey.credentialId, "this device");
 
       const { secret } = await evaluateTrustPrf(id, [passkey.credentialId]);
-      const { sealed, hostCount } = await sealCurrentTrust(
+      const { sealed, hostCount, revision } = await sealCurrentTrust(
         { credentialId: passkey.credentialId, prfSecret: secret },
         { accountId: id },
+        0,
       );
-      await trust.putBundle(sealed, existing?.revision);
+      await trust.putBundle(sealed, undefined);
+      // Advance the rollback floor only after the bundle is durably stored.
+      await recordBundleRevision({ accountId: id }, revision);
       return hostCount;
     },
     onMutate: begin,
@@ -175,11 +179,15 @@ function TrustSettings() {
     },
     onMutate: begin,
     onSuccess: (result) => {
-      setStatus(
+      const base =
         result.added.length === 0
           ? `Already up to date — ${result.alreadyTrusted.length} host${result.alreadyTrusted.length === 1 ? "" : "s"} already trusted on this device.`
-          : `Imported ${result.added.length} host${result.added.length === 1 ? "" : "s"} onto this device.`,
-      );
+          : `Imported ${result.added.length} host${result.added.length === 1 ? "" : "s"} onto this device.`;
+      const skipped =
+        result.skippedRevoked.length === 0
+          ? ""
+          : ` ${result.skippedRevoked.length} host${result.skippedRevoked.length === 1 ? "" : "s"} you revoked here ${result.skippedRevoked.length === 1 ? "was" : "were"} left revoked.`;
+      setStatus(base + skipped);
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
     onError: (err) => setError(describe(err)),
@@ -226,8 +234,8 @@ function TrustSettings() {
         );
       }
       const backupSecret = await evaluateTrustPrf(id, [backup.credentialId]);
-      const next = await enrollPasskeyInEnvelope(
-        id,
+      const next = await enrollBackupPasskey(
+        { accountId: id },
         stored.sealed,
         { credentialId: existing.credentialId, prfSecret: existing.secret },
         { credentialId: backup.credentialId, prfSecret: backupSecret.secret },
@@ -243,8 +251,55 @@ function TrustSettings() {
     onError: (err) => setError(describe(err)),
   });
 
+  /**
+   * Revoke a passkey by resealing the bundle for the one surviving passkey.
+   * Restricted to the two-passkey case: with more, a single device cannot gather
+   * every survivor's secret to re-wrap, so revoking here would drop the others.
+   */
+  const revoke = useMutation({
+    mutationFn: async (target: PasskeyCredential) => {
+      const id = accountId as string;
+      const stored = await trust.getBundle();
+      if (stored === null) {
+        throw new Error("There is no sealed bundle to revoke a passkey from.");
+      }
+      const survivors = (await trust.listPasskeys()).filter((row) => row.id !== target.id);
+      if (survivors.length !== 1) {
+        throw new Error(
+          "Revoking needs exactly one surviving passkey so this device can reseal for it. " +
+            "With more than two enrolled, revoke from each surviving device instead.",
+        );
+      }
+      const survivor = survivors[0];
+      // Unlock with the survivor: it authorizes the revoke and is the key the
+      // bundle is resealed for.
+      const { secret } = await evaluateTrustPrf(id, [survivor.credential_id]);
+      const { sealed, revision } = await revokeBackupPasskey(
+        { accountId: id },
+        stored.sealed,
+        stored.revision,
+        { credentialId: survivor.credential_id, prfSecret: secret },
+        target.credential_id,
+      );
+      await trust.putBundle(sealed, stored.revision);
+      await recordBundleRevision({ accountId: id }, revision);
+      await trust.removePasskey(target.id);
+    },
+    onMutate: begin,
+    onSuccess: () => {
+      setStatus("Passkey revoked. It can no longer open your trust bundle.");
+      queryClient.invalidateQueries({ queryKey: ["trust"] });
+    },
+    onError: (err) => setError(describe(err)),
+  });
+
   const supported = isPasskeySupported();
-  const busy = setUp.isPending || unlock.isPending || forget.isPending || addBackup.isPending;
+  const busy =
+    setUp.isPending ||
+    unlock.isPending ||
+    forget.isPending ||
+    addBackup.isPending ||
+    revoke.isPending;
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
@@ -311,6 +366,41 @@ function TrustSettings() {
               </p>
             )}
           </div>
+
+          {(passkeys.data?.length ?? 0) > 0 && (
+            <div className="rounded border p-3 text-sm" data-testid="passkey-list">
+              <p className="font-semibold">Enrolled passkeys</p>
+              <ul className="mt-1 flex flex-col gap-2">
+                {passkeys.data?.map((passkey) => (
+                  <li key={passkey.id} className="flex items-center justify-between gap-2">
+                    <span className="truncate">{passkey.label ?? "passkey"}</span>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="shrink-0"
+                      disabled={busy || accountId === null || (passkeys.data?.length ?? 0) !== 2}
+                      onClick={() => revoke.mutate(passkey)}
+                      data-testid="revoke-passkey"
+                    >
+                      {revoke.isPending ? "Revoking…" : "Revoke"}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+              {(passkeys.data?.length ?? 0) === 1 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Add a backup passkey before revoking — revoking your only passkey would lock you
+                  out of your trust bundle.
+                </p>
+              )}
+              {(passkeys.data?.length ?? 0) > 2 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Revoking is available only with exactly two passkeys enrolled. With more, this
+                  device cannot reseal for every survivor — revoke from each surviving device.
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="flex flex-wrap gap-2">
             <Button
