@@ -278,3 +278,75 @@ async def test_concurrent_postgresql_registration_and_revocation_converge(client
     )
     assert {response.status_code for response in revocations} == {200}
     assert len({response.json()["revoked_at"] for response in revocations}) == 1
+
+
+async def test_revoking_a_pinned_device_pushes_to_affected_hosts(client, monkeypatch):
+    """Revocation must reach a live daemon, not wait for its next reconnect.
+
+    Admitting a device already pushes to the host; revoking one must too, or a
+    long-lived daemon keeps trusting the revoked device -- and everything it
+    endorsed -- for as long as it stays connected.
+    """
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import BrowserDevice, Host, HostBrowserPin
+
+    user_id, token = await _signup(client, "revoke-push@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    pushed: list[str] = []
+
+    async def fake_push(host_id: str) -> bool:
+        pushed.append(host_id)
+        return True
+
+    monkeypatch.setattr("spawn_server.routes.browser_devices.push_browser_pins", fake_push)
+
+    endorser_pub = "E" * 43
+    async with get_sessionmaker()() as session:
+        host_a = Host(name="push-host-a", owner_user_id=user_id)
+        host_b = Host(name="push-host-b", owner_user_id=user_id)
+        session.add_all([host_a, host_b])
+        endorser = BrowserDevice(
+            owner_user_id=user_id, key_algorithm="ed25519", public_key=endorser_pub
+        )
+        endorsed = BrowserDevice(
+            owner_user_id=user_id, key_algorithm="ed25519", public_key="D" * 43
+        )
+        session.add_all([endorser, endorsed])
+        await session.flush()
+        # host_a trusts the endorser directly; host_b trusts a device it
+        # vouched for. Revoking the endorser changes both hosts' live sets.
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host_a.id,
+                    browser_device_id=endorser.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorser.public_key,
+                    browser_key_fingerprint="SHA256:" + "e" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host_b.id,
+                    browser_device_id=endorsed.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorsed.public_key,
+                    browser_key_fingerprint="SHA256:" + "d" * 16,
+                    endorser_device_id=endorser.id,
+                    endorsement_signature="s" * 86,
+                ),
+            ]
+        )
+        await session.commit()
+        host_a_id, host_b_id, endorser_id = host_a.id, host_b.id, endorser.id
+
+    response = await client.post(
+        f"/api/browser-devices/{endorser_id}/revoke",
+        json={"expected_public_key": endorser_pub},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["revoked_at"] is not None
+    # Pushed to every host whose pin set the revocation changed: the one that
+    # trusted the endorser directly and the one that trusted its endorsee.
+    assert set(pushed) == {host_a_id, host_b_id}

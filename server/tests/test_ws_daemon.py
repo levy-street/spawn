@@ -1616,3 +1616,93 @@ async def test_live_browser_device_ids_excludes_revoked_devices(client):
         host_id, live_id = host.id, live_device.id
 
     assert await _live_browser_device_ids(host_id) == [live_id]
+
+
+async def test_revoking_endorser_drops_its_endorsed_pins_from_live_set(client):
+    """Revoking a device must revoke what it endorsed.
+
+    A pin that exists only on a now-revoked endorser's authority must leave the
+    live set the daemon reconciles against. Otherwise revoking a stolen device
+    would not remove the access it granted, only the device itself.
+    """
+
+    from datetime import UTC, datetime
+
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_device_ids, _live_browser_pins
+
+    async with get_sessionmaker()() as session:
+        user = User(email="endorser-revoke@example.com", password_hash="x")
+        session.add(user)
+        await session.flush()
+        host = Host(name="endorser-revoke-box", owner_user_id=user.id)
+        session.add(host)
+        await session.flush()
+
+        endorser = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="E" * 43
+        )
+        endorsed = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="D" * 43
+        )
+        direct = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="A" * 43
+        )
+        session.add_all([endorser, endorsed, direct])
+        await session.flush()
+
+        session.add_all(
+            [
+                # Directly approved: the endorser itself and a control device.
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorser.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorser.public_key,
+                    browser_key_fingerprint="SHA256:" + "e" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=direct.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=direct.public_key,
+                    browser_key_fingerprint="SHA256:" + "a" * 16,
+                ),
+                # Live only on the endorser's authority.
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorsed.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorsed.public_key,
+                    browser_key_fingerprint="SHA256:" + "d" * 16,
+                    endorser_device_id=endorser.id,
+                    endorsement_signature="s" * 86,
+                ),
+            ]
+        )
+        await session.commit()
+        host_id = host.id
+        endorser_id, endorsed_id, direct_id = endorser.id, endorsed.id, direct.id
+
+    # All three pins are live before revocation.
+    assert await _live_browser_device_ids(host_id) == sorted(
+        [endorser_id, endorsed_id, direct_id]
+    )
+    assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
+        endorser_id,
+        endorsed_id,
+        direct_id,
+    }
+
+    async with get_sessionmaker()() as session:
+        endorser_device = await session.get(BrowserDevice, endorser_id)
+        assert endorser_device is not None
+        endorser_device.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+    # The endorser's own pin is gone (it is revoked) and so is the pin it
+    # endorsed; the directly approved control device is untouched.
+    assert await _live_browser_device_ids(host_id) == [direct_id]
+    assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
+        direct_id
+    }

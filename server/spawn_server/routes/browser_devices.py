@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +14,8 @@ from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, User
+from ..models import BrowserDevice, HostBrowserPin, User
+from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/browser-devices", tags=["browser-devices"])
 
@@ -158,6 +159,33 @@ async def revoke_browser_device(
         # No matching update and no tombstone means the row changed outside
         # this immutable-key contract. Fail closed rather than claiming revoke.
         raise HTTPException(status_code=409, detail="browser device revocation did not commit")
+
+    # Revocation only stamps a DB tombstone; a live daemon keeps trusting this
+    # device -- directly, and via every pin it endorsed -- until it next
+    # reconnects and reconciles. That wait can be days for a long-lived spawnd
+    # WS, so mirror the endorsement route and push the recomputed live pin set
+    # now to every host whose set this revocation changed (the device as
+    # endorsed OR as endorser). Best effort by design: registration
+    # reconciliation is the hard guarantee, so an absent or failed push must
+    # never fail the revoke.
+    affected_host_ids = (
+        await session.execute(
+            select(HostBrowserPin.host_id)
+            .where(
+                or_(
+                    HostBrowserPin.browser_device_id == device_id,
+                    HostBrowserPin.endorser_device_id == device_id,
+                )
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    for host_id in affected_host_ids:
+        try:
+            await push_browser_pins(host_id)
+        except Exception:
+            pass
+
     return _to_out(device)
 
 

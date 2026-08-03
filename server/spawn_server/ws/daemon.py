@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -693,13 +693,39 @@ async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     )
 
 
+def _live_browser_pin_filters(host_id: str, endorser: Any) -> tuple[Any, ...]:
+    """Conditions selecting the pins a daemon should still trust.
+
+    A pin is live only when the endorsed device is not revoked and, if the pin
+    was created by endorsement, the endorser device still exists and is itself
+    not revoked. Revoking a device therefore also revokes everything it
+    endorsed -- otherwise a stolen device would keep granting access after it
+    was revoked. A directly approved pin carries no endorser and is unaffected.
+
+    `endorser` is an ``aliased(BrowserDevice)`` outer-joined on
+    ``endorser.id == HostBrowserPin.endorser_device_id``; requiring
+    ``endorser.id`` to be non-null is what distinguishes "endorser exists and is
+    live" from "endorser row is missing" (both leave ``revoked_at`` null).
+    """
+
+    return (
+        HostBrowserPin.host_id == host_id,
+        BrowserDevice.revoked_at.is_(None),
+        or_(
+            HostBrowserPin.endorser_device_id.is_(None),
+            and_(endorser.id.isnot(None), endorser.revoked_at.is_(None)),
+        ),
+    )
+
+
 async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
     """Full pin records, so a daemon can adopt endorsed devices it has not met.
 
     Carries the endorsement signature and the endorser's public key. The daemon
     re-verifies that signature against the browser keys it already pins, so
     nothing here is taken on trust -- a record without a verifiable endorsement
-    is ignored rather than adopted.
+    is ignored rather than adopted. A pin endorsed by a now-revoked device is
+    excluded entirely (see ``_live_browser_pin_filters``).
     """
 
     async with _bounded_host_ownership_session() as session:
@@ -715,10 +741,7 @@ async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
             )
             .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
             .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
-            .where(
-                HostBrowserPin.host_id == host_id,
-                BrowserDevice.revoked_at.is_(None),
-            )
+            .where(*_live_browser_pin_filters(host_id, endorser))
             .order_by(HostBrowserPin.browser_device_id)
         )
         return [
@@ -735,21 +758,22 @@ async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
 
 
 async def _live_browser_device_ids(host_id: str) -> list[str]:
-    """Browser devices currently pinned to this host and not revoked.
+    """Browser devices currently pinned to this host whose pins are still live.
 
     Deliberately excludes revoked devices rather than reporting state per pin:
     the daemon uses this only to drop pins, so a device missing for any reason
-    is the safe outcome.
+    is the safe outcome. Applies the same endorser-revocation filter as
+    ``_live_browser_pins`` so a pin endorsed by a now-revoked device is dropped
+    too.
     """
 
     async with _bounded_host_ownership_session() as session:
+        endorser = aliased(BrowserDevice)
         rows = await session.execute(
             select(HostBrowserPin.browser_device_id)
             .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
-            .where(
-                HostBrowserPin.host_id == host_id,
-                BrowserDevice.revoked_at.is_(None),
-            )
+            .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
+            .where(*_live_browser_pin_filters(host_id, endorser))
         )
         return sorted(row[0] for row in rows)
 
