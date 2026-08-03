@@ -1706,3 +1706,91 @@ async def test_revoking_endorser_drops_its_endorsed_pins_from_live_set(client):
     assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
         direct_id
     }
+
+
+async def test_revoking_root_drops_the_whole_endorsement_subtree(client):
+    """Revocation severs a multi-hop endorsement chain, not just the first hop.
+
+    root -> mid -> leaf, all pinned. Revoking root must drop mid AND leaf: leaf's
+    only authority traces through mid, whose only authority was root. Checking
+    just the immediate endorser's revoked flag would keep leaf (mid still reads
+    not-revoked) and leave a stolen device a surviving 2-hop foothold.
+    """
+
+    from datetime import UTC, datetime
+
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_device_ids, _live_browser_pins
+
+    async with get_sessionmaker()() as session:
+        user = User(email="chain-revoke@example.com", password_hash="x")
+        session.add(user)
+        await session.flush()
+        host = Host(name="chain-revoke-box", owner_user_id=user.id)
+        session.add(host)
+        await session.flush()
+
+        root = BrowserDevice(owner_user_id=user.id, key_algorithm="ed25519", public_key="R" * 43)
+        mid = BrowserDevice(owner_user_id=user.id, key_algorithm="ed25519", public_key="M" * 43)
+        leaf = BrowserDevice(owner_user_id=user.id, key_algorithm="ed25519", public_key="L" * 43)
+        direct = BrowserDevice(owner_user_id=user.id, key_algorithm="ed25519", public_key="A" * 43)
+        session.add_all([root, mid, leaf, direct])
+        await session.flush()
+
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=root.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=root.public_key,
+                    browser_key_fingerprint="SHA256:" + "r" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=direct.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=direct.public_key,
+                    browser_key_fingerprint="SHA256:" + "a" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=mid.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=mid.public_key,
+                    browser_key_fingerprint="SHA256:" + "m" * 16,
+                    endorser_device_id=root.id,
+                    endorsement_signature="s" * 86,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=leaf.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=leaf.public_key,
+                    browser_key_fingerprint="SHA256:" + "l" * 16,
+                    endorser_device_id=mid.id,
+                    endorsement_signature="t" * 86,
+                ),
+            ]
+        )
+        await session.commit()
+        host_id = host.id
+        root_id, mid_id, leaf_id, direct_id = root.id, mid.id, leaf.id, direct.id
+
+    # All four are live before revocation.
+    assert await _live_browser_device_ids(host_id) == sorted(
+        [root_id, mid_id, leaf_id, direct_id]
+    )
+
+    async with get_sessionmaker()() as session:
+        root_device = await session.get(BrowserDevice, root_id)
+        assert root_device is not None
+        root_device.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+    # Revoking root drops the entire subtree beneath it (mid and leaf); only the
+    # directly approved control device remains.
+    assert await _live_browser_device_ids(host_id) == [direct_id]
+    assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
+        direct_id
+    }

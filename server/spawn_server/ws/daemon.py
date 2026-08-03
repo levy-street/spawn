@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -693,29 +693,60 @@ async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     )
 
 
-def _live_browser_pin_filters(host_id: str, endorser: Any) -> tuple[Any, ...]:
-    """Conditions selecting the pins a daemon should still trust.
+async def _live_browser_device_id_set(session: AsyncSession, host_id: str) -> set[str]:
+    """Device IDs whose pin on this host is *transitively* live.
 
-    A pin is live only when the endorsed device is not revoked and, if the pin
-    was created by endorsement, the endorser device still exists and is itself
-    not revoked. Revoking a device therefore also revokes everything it
-    endorsed -- otherwise a stolen device would keep granting access after it
-    was revoked. A directly approved pin carries no endorser and is unaffected.
+    A pin is live iff its endorsed device is not revoked AND either the pin was
+    directly approved (no endorser) or its endorser device is not revoked and the
+    endorser's own pin on this host is itself live. Revoking a device therefore
+    drops the whole endorsement subtree beneath it, not just the pins it directly
+    endorsed: checking only the immediate endorser's revoked flag would let a
+    2+-hop chain of attacker devices (root->mid->leaf) survive revocation of the
+    compromised root, because leaf's endorser `mid` still reads as not-revoked
+    even though `mid`'s own pin was dropped.
 
-    `endorser` is an ``aliased(BrowserDevice)`` outer-joined on
-    ``endorser.id == HostBrowserPin.endorser_device_id``; requiring
-    ``endorser.id`` to be non-null is what distinguishes "endorser exists and is
-    live" from "endorser row is missing" (both leave ``revoked_at`` null).
+    Computed as a fixpoint over the host's pins (bounded by
+    MAX_BROWSER_PINS_PER_HOST) rather than a recursive SQL CTE, so the logic is
+    identical on SQLite and Postgres. A missing endorser row (no FK on
+    endorser_device_id, so a hard-deleted endorser leaves a dangling id) fails
+    closed: endorser_id is NULL, so the pin is never admitted.
     """
 
-    return (
-        HostBrowserPin.host_id == host_id,
-        BrowserDevice.revoked_at.is_(None),
-        or_(
-            HostBrowserPin.endorser_device_id.is_(None),
-            and_(endorser.id.isnot(None), endorser.revoked_at.is_(None)),
-        ),
-    )
+    endorser = aliased(BrowserDevice)
+    rows = (
+        await session.execute(
+            select(
+                HostBrowserPin.browser_device_id,
+                HostBrowserPin.endorser_device_id,
+                BrowserDevice.revoked_at.label("endorsed_revoked_at"),
+                endorser.id.label("endorser_id"),
+                endorser.revoked_at.label("endorser_revoked_at"),
+            )
+            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
+            .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
+            .where(HostBrowserPin.host_id == host_id)
+        )
+    ).all()
+
+    # Only pins whose own endorsed device is not revoked are ever eligible.
+    eligible = [row for row in rows if row.endorsed_revoked_at is None]
+    live: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for row in eligible:
+            if row.browser_device_id in live:
+                continue
+            rooted = row.endorser_device_id is None
+            endorsed_by_live = (
+                row.endorser_id is not None
+                and row.endorser_revoked_at is None
+                and row.endorser_device_id in live
+            )
+            if rooted or endorsed_by_live:
+                live.add(row.browser_device_id)
+                changed = True
+    return live
 
 
 async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
@@ -724,11 +755,12 @@ async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
     Carries the endorsement signature and the endorser's public key. The daemon
     re-verifies that signature against the browser keys it already pins, so
     nothing here is taken on trust -- a record without a verifiable endorsement
-    is ignored rather than adopted. A pin endorsed by a now-revoked device is
-    excluded entirely (see ``_live_browser_pin_filters``).
+    is ignored rather than adopted. Only transitively-live pins are returned (see
+    ``_live_browser_device_id_set``).
     """
 
     async with _bounded_host_ownership_session() as session:
+        live_ids = await _live_browser_device_id_set(session, host_id)
         endorser = aliased(BrowserDevice)
         rows = await session.execute(
             select(
@@ -739,9 +771,8 @@ async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
                 HostBrowserPin.endorsement_signature,
                 endorser.public_key.label("endorser_public_key"),
             )
-            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
             .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
-            .where(*_live_browser_pin_filters(host_id, endorser))
+            .where(HostBrowserPin.host_id == host_id)
             .order_by(HostBrowserPin.browser_device_id)
         )
         return [
@@ -754,28 +785,21 @@ async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
                 "endorser_public_key": row.endorser_public_key,
             }
             for row in rows
+            if row.browser_device_id in live_ids
         ]
 
 
 async def _live_browser_device_ids(host_id: str) -> list[str]:
-    """Browser devices currently pinned to this host whose pins are still live.
+    """Browser devices whose pin on this host is transitively live.
 
-    Deliberately excludes revoked devices rather than reporting state per pin:
-    the daemon uses this only to drop pins, so a device missing for any reason
-    is the safe outcome. Applies the same endorser-revocation filter as
-    ``_live_browser_pins`` so a pin endorsed by a now-revoked device is dropped
-    too.
+    Deliberately excludes revoked devices (and any device whose endorsement chain
+    is no longer rooted in a live, directly-approved pin) rather than reporting
+    state per pin: the daemon uses this only to drop pins, so a device missing for
+    any reason is the safe outcome.
     """
 
     async with _bounded_host_ownership_session() as session:
-        endorser = aliased(BrowserDevice)
-        rows = await session.execute(
-            select(HostBrowserPin.browser_device_id)
-            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
-            .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
-            .where(*_live_browser_pin_filters(host_id, endorser))
-        )
-        return sorted(row[0] for row in rows)
+        return sorted(await _live_browser_device_id_set(session, host_id))
 
 
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
