@@ -464,6 +464,19 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
       if (mine === undefined) {
         throw new Error("This device is not registered with the server.");
       }
+      // The fingerprint the operator compared out of band is only meaningful if
+      // it is the fingerprint of the key we are about to sign. The server hands
+      // us `public_key` and `fingerprint` as independent fields, so re-derive the
+      // fingerprint from the key itself and refuse to endorse if the server's
+      // claimed value disagrees. Without this the OOB comparison is cosmetic: a
+      // hostile server can show the victim's fingerprint beside its own key and
+      // harvest a signature over the attacker key.
+      const endorsedFingerprint = await ed25519PublicKeyFingerprint(target.public_key);
+      if (endorsedFingerprint !== target.fingerprint) {
+        throw new Error(
+          "This device's fingerprint does not match its key. Refusing to endorse — the server may be substituting a key.",
+        );
+      }
       // Endorse for every host this device is trusted by, rather than making
       // the operator reason about which host a device "belongs" to.
       const results = [];
@@ -484,7 +497,9 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
           }),
         );
       }
-      return { count: results.length, fingerprint: results[0].endorsed_key_fingerprint };
+      // Report the locally derived fingerprint, not the server's echo, so the
+      // confirmation names exactly the key that was signed.
+      return { count: results.length, fingerprint: endorsedFingerprint };
     },
     onMutate: () => {
       setNote(null);
@@ -507,6 +522,22 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
   const candidates = (devices.data ?? []).filter(
     (device) => device.revoked_at === null && device.public_key !== mineWire,
   );
+  // Derive each candidate's fingerprint locally from its key, so the operator
+  // compares a value the server cannot choose. A row whose server-claimed
+  // fingerprint disagrees with the derived one is flagged and cannot be endorsed.
+  const candidateFingerprints = useQuery({
+    queryKey: ["trust", "candidate-fingerprints", candidates.map((d) => d.public_key).join(",")],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        candidates.map(
+          async (device) =>
+            [device.id, await ed25519PublicKeyFingerprint(device.public_key)] as const,
+        ),
+      );
+      return new Map(entries);
+    },
+    enabled: candidates.length > 0,
+  });
 
   return (
     <Card>
@@ -539,43 +570,54 @@ function EndorseDevices({ accountId }: { accountId: string | null }) {
           </p>
         ) : (
           <ul className="flex flex-col gap-3">
-            {candidates.map((device) => (
-              <li key={device.id} className="rounded border p-3 text-sm">
-                <p className="font-semibold">{device.label ?? "Unnamed device"}</p>
-                <p className="break-all font-mono text-xs">{device.fingerprint}</p>
-                <p className="text-xs text-muted-foreground">
-                  added {new Date(device.created_at).toLocaleString()}
-                </p>
-                {confirmed === device.id ? (
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <span className="text-xs">
-                      Open this page on that device and check it shows this exact fingerprint. The
-                      name above is only a label — the server can set it to anything, so it is the
-                      fingerprint that must match.
-                    </span>
+            {candidates.map((device) => {
+              const derivedFingerprint = candidateFingerprints.data?.get(device.id) ?? null;
+              const fingerprintMismatch =
+                derivedFingerprint !== null && derivedFingerprint !== device.fingerprint;
+              return (
+                <li key={device.id} className="rounded border p-3 text-sm">
+                  <p className="font-semibold">{device.label ?? "Unnamed device"}</p>
+                  <p className="break-all font-mono text-xs">{derivedFingerprint ?? "…"}</p>
+                  <p className="text-xs text-muted-foreground">
+                    added {new Date(device.created_at).toLocaleString()}
+                  </p>
+                  {fingerprintMismatch ? (
+                    <p className="mt-1 text-xs font-medium text-destructive">
+                      The server&apos;s claimed fingerprint for this device does not match its key.
+                      Do not endorse it.
+                    </p>
+                  ) : confirmed === device.id ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span className="text-xs">
+                        Open this page on that device and check it shows this exact fingerprint. The
+                        name above is only a label — the server can set it to anything, so it is the
+                        fingerprint that must match.
+                      </span>
+                      <Button
+                        type="button"
+                        disabled={endorse.isPending || derivedFingerprint === null}
+                        onClick={() => endorse.mutate(device)}
+                      >
+                        It matches — trust it
+                      </Button>
+                      <Button type="button" variant="secondary" onClick={() => setConfirmed(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : (
                     <Button
                       type="button"
-                      disabled={endorse.isPending}
-                      onClick={() => endorse.mutate(device)}
+                      className="mt-2"
+                      variant="secondary"
+                      disabled={derivedFingerprint === null}
+                      onClick={() => setConfirmed(device.id)}
                     >
-                      It matches — trust it
+                      Trust this device…
                     </Button>
-                    <Button type="button" variant="secondary" onClick={() => setConfirmed(null)}>
-                      Cancel
-                    </Button>
-                  </div>
-                ) : (
-                  <Button
-                    type="button"
-                    className="mt-2"
-                    variant="secondary"
-                    onClick={() => setConfirmed(device.id)}
-                  >
-                    Trust this device…
-                  </Button>
-                )}
-              </li>
-            ))}
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
 
