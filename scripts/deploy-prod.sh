@@ -74,6 +74,11 @@ remote_path="${SPAWN_DEPLOY_PATH:-/opt/spawn}"
 services="${SPAWN_DEPLOY_SERVICES:-spawn-server spawn-web}"
 sudo_cmd="${SPAWN_DEPLOY_SUDO-sudo -n}"
 run_build="${SPAWN_DEPLOY_BUILD:-1}"
+# Baked into the web build: Next stores the API proxy target in the routes
+# manifest at build time. The wrapper (scripts/next-with-proxy-target.mjs)
+# refuses to bake a silent default, so it must be set explicitly. Prod's server
+# listens on 127.0.0.1:8001; override for a host whose API is elsewhere.
+api_proxy_target="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}"
 
 printf 'deploy-prod: deploying %s to %s:%s\n' "$remote_ref" "$host" "$remote_path"
 
@@ -84,6 +89,7 @@ env_prefix="$(
   quote_env SPAWN_DEPLOY_SERVICES "$services"
   quote_env SPAWN_DEPLOY_SUDO "$sudo_cmd"
   quote_env SPAWN_DEPLOY_BUILD "$run_build"
+  quote_env SPAWN_API_PROXY_TARGET "$api_proxy_target"
 )"
 
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
@@ -144,7 +150,7 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   fi
 
   if command -v bun >/dev/null 2>&1; then
-    (cd web && bun install --frozen-lockfile && SPAWN_BUILD_ID="$build_id" bun run build)
+    (cd web && bun install --frozen-lockfile && SPAWN_API_PROXY_TARGET="$SPAWN_API_PROXY_TARGET" SPAWN_BUILD_ID="$build_id" bun run build)
   else
     die "bun is required for web dependency sync and build"
   fi
