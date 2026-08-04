@@ -3652,6 +3652,43 @@ function wrapSnapshotForXterm(input: string): string {
 type ReplayChunk = { cols: number; rows: number; data: string };
 
 /**
+ * In-band sentinel (an APC string, invisible if written to a terminal) that
+ * opens a committed-line-history replay: the worker recorded history as lines
+ * committed the moment they scrolled off screen, so the history section
+ * renders as flowing styled text — never geometry-walked, never reflowed —
+ * and the final chunk is a self-contained repaint of the live screen.
+ */
+const REPLAY_HISTORY_SENTINEL = "\x1b_sp:h1\x1b\\";
+
+/** Split a committed-line worker replay into its history text and its live
+ *  screen chunk; null for legacy (raw-byte, geometry-walked) replays. */
+function parseHistoryReplay(
+  chunks: ReplayChunk[] | null,
+): { history: string; screen: ReplayChunk } | null {
+  if (!chunks || chunks.length !== 2 || !chunks[0].data.startsWith(REPLAY_HISTORY_SENTINEL)) {
+    return null;
+  }
+  return {
+    history: chunks[0].data.slice(REPLAY_HISTORY_SENTINEL.length),
+    screen: chunks[1],
+  };
+}
+
+/**
+ * Emitted between the history text and the screen repaint: scrolls every
+ * viewport row the history writes occupied up into the scrollback region, so
+ * the absolute-addressed screen repaint that follows paints a blank viewport
+ * instead of overwriting the newest history lines. Computed at write time —
+ * wrapping against the live overlay width decides how many rows are occupied.
+ */
+function flushViewportIntoScrollback(term: XTerm): string {
+  const buffer = term.buffer.active;
+  const occupied = buffer.cursorY + (buffer.cursorX > 0 ? 1 : 0);
+  if (occupied <= 0) return "";
+  return `\x1b[${term.rows};1H${"\n".repeat(occupied)}`;
+}
+
+/**
  * Worker-backed agents ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
@@ -3680,8 +3717,13 @@ function parseExactReplay(text: string): ReplayChunk[] | null {
   return chunks;
 }
 
-/** A queued terminal write, optionally preceded by a geometry change. */
-type SequencedWrite = { resize?: { cols: number; rows: number }; data: string | Uint8Array };
+/** A queued terminal write, optionally preceded by a geometry change. A
+ *  function `data` is resolved at write time against the terminal's current
+ *  buffer state (after all earlier queued writes have been consumed). */
+type SequencedWrite = {
+  resize?: { cols: number; rows: number };
+  data: string | Uint8Array | ((term: XTerm) => string);
+};
 
 /**
  * Write in order, applying each op's resize only after every earlier write
@@ -3705,14 +3747,17 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
         // Mid-dispose during route changes; the write below is a no-op too.
       }
     }
-    term.write(op.data, step);
+    term.write(typeof op.data === "function" ? op.data(term) : op.data, step);
   };
   step();
 }
 
 /** Sequenced ops for the scrollback overlay (a display-only terminal that is
- *  safe to resize): exact worker replays get per-chunk geometry, plain
- *  endpoint replays get a fallback reformat, and both end at `finalSize`. */
+ *  safe to resize). Committed-line replays render their history as flowing
+ *  text at `finalSize` — no geometry walk, so nothing already rendered ever
+ *  reflows — then flush the viewport and paint the live screen. Legacy exact
+ *  replays get per-chunk geometry; plain endpoint replays get a fallback
+ *  reformat. All shapes end at `finalSize`. */
 function overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
@@ -3720,6 +3765,21 @@ function overlayWriteOps(
   const exact = parseExactReplay(text);
   if (!exact) {
     return [{ resize: finalSize, data: formatSnapshotForXterm(text) }];
+  }
+  const storied = parseHistoryReplay(exact);
+  if (storied) {
+    const ops: SequencedWrite[] = [
+      { resize: finalSize, data: storied.history },
+      { data: flushViewportIntoScrollback },
+      {
+        resize: { cols: storied.screen.cols, rows: storied.screen.rows },
+        data: storied.screen.data,
+      },
+    ];
+    if (storied.screen.cols !== finalSize.cols || storied.screen.rows !== finalSize.rows) {
+      ops.push({ resize: finalSize, data: "" });
+    }
+    return ops;
   }
   const ops: SequencedWrite[] = exact.map((chunk) => ({
     resize: { cols: chunk.cols, rows: chunk.rows },
