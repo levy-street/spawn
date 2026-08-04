@@ -109,20 +109,31 @@ function HostDetail() {
       }
       let localTombstoneWritten = false;
       try {
-        // A host with no public key was never locally pinned (a pin requires a
-        // key), so there is no local trust to revoke — skip straight to the
-        // server delete. Legacy/orphaned hosts lack a key and would otherwise be
-        // undeletable ("the Host API did not provide a host public key").
+        // Revoking the local pin is best-effort cleanup and must never block the
+        // server delete. There is nothing active to revoke when the host has no
+        // key (never pinnable — legacy/orphaned), no local pin is bound in this
+        // browser (missing_pin), or the pin is already a tombstone. In all those
+        // cases proceed straight to the server delete instead of failing "before
+        // any server DELETE"; only a genuine local-storage fault still blocks.
         if (host.host_public_key && host.host_key_fingerprint) {
-          await revokeBrowserHostPin({
-            accountId: user.id,
-            origin: browserHostPinServerOrigin(),
-            targetHostId,
-            claimedHostId: host.id,
-            claimedHostPublicKey: host.host_public_key,
-            claimedHostFingerprint: host.host_key_fingerprint,
-          });
-          localTombstoneWritten = true;
+          try {
+            await revokeBrowserHostPin({
+              accountId: user.id,
+              origin: browserHostPinServerOrigin(),
+              targetHostId,
+              claimedHostId: host.id,
+              claimedHostPublicKey: host.host_public_key,
+              claimedHostFingerprint: host.host_key_fingerprint,
+            });
+            localTombstoneWritten = true;
+          } catch (revokeErr) {
+            const nothingToRevoke =
+              revokeErr instanceof BrowserHostPinError &&
+              ["revoked_pin", "missing_pin", "null_key", "null_fingerprint"].includes(
+                revokeErr.code,
+              );
+            if (!nothingToRevoke) throw revokeErr;
+          }
         }
         setLocalDeletionPending(true);
         await hosts.remove(targetHostId);
