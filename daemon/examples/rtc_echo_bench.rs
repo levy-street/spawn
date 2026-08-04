@@ -21,9 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
     let api = APIBuilder::new().with_media_engine(media_engine).build();
-    let pc = Arc::new(
-        api.new_peer_connection(RTCConfiguration::default()).await?,
-    );
+    let pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
 
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
 
