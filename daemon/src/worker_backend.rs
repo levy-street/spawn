@@ -44,6 +44,11 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
         wire::T_STARTED => Some(MAX_STARTED_FRAME_BYTES),
         wire::T_OUTPUT => Some(MAX_LIVE_OUTPUT_FRAME_BYTES),
         wire::T_REPLAY => Some(wire::MAX_FRAME_LEN),
+        wire::T_REPLAY2 => Some(wire::MAX_FRAME_LEN),
+        // One committed batch is bounded by the emulator's drain window, but
+        // an `ED 2` on a huge screen can commit a full viewport at once.
+        wire::T_HISTORY => Some(wire::MAX_FRAME_LEN),
+        wire::T_HISTORY_WIPE => Some(8),
         wire::T_EXIT => Some(MAX_EXIT_FRAME_BYTES),
         wire::T_ERROR => Some(MAX_WORKER_ERROR_FRAME_BYTES),
         _ => None,
@@ -154,6 +159,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     if hello.state != "awaiting_start" {
         bail!("worker is not available for a new agent");
     }
+    subscribe_history(&mut stream, &hello).await?;
 
     let start = wire::StartSpec {
         cwd: spec.cwd.to_string(),
@@ -197,6 +203,19 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     ))
 }
 
+/// Subscribe to committed-history deltas when the worker advertises support.
+/// Workers never emit the new frame types unsubscribed, so old workers (no
+/// advertisement) and old daemons (no subscription) both stay on the legacy
+/// replay-only flow.
+async fn subscribe_history(stream: &mut UnixStream, hello: &wire::Hello) -> Result<()> {
+    if hello.history {
+        wire::write_frame(stream, wire::T_HISTORY_SUB, &[])
+            .await
+            .context("subscribing to worker history deltas")?;
+    }
+    Ok(())
+}
+
 /// Adopt an already-running worker (spawnd restart / lazy attach). Returns
 /// `Ok(None)` when no live worker socket exists for this agent.
 pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
@@ -224,6 +243,7 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
         return Ok(None);
     }
     tracing::info!(%agent_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
+    subscribe_history(&mut stream, &hello).await?;
     Ok(Some(assemble(
         agent_id,
         hello.pid.unwrap_or(0),
@@ -455,6 +475,48 @@ async fn run_reader(
                     send_replay_result(waiter, result);
                 }
             }
+            Ok(Some((wire::T_REPLAY2, payload))) => {
+                let payload = Zeroizing::new(payload);
+                let waiter = pending.lock().expect("pending lock").pop_front();
+                if let Some(waiter) = waiter {
+                    let result = match wire::decode_replay2(&payload) {
+                        Ok((watermark, anchor, bytes)) => {
+                            let replay = bytes.to_vec();
+                            let barrier = pty::OutputChunk::source_barrier(watermark);
+                            let _ = outbox_tx.send(barrier).await;
+                            Ok(pty::WorkerReplay::new_with_history(
+                                watermark,
+                                replay,
+                                (anchor.epoch, anchor.offset),
+                            ))
+                        }
+                        Err(error) => Err(error),
+                    };
+                    send_replay_result(waiter, result);
+                }
+            }
+            Ok(Some((wire::T_HISTORY, payload))) => {
+                let payload = Zeroizing::new(payload);
+                match wire::decode_history(&payload) {
+                    Ok((anchor, bytes)) => {
+                        control
+                            .route_history(anchor.epoch, Some(anchor.offset), bytes)
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%agent_id, %error, "invalid worker history frame");
+                    }
+                }
+            }
+            Ok(Some((wire::T_HISTORY_WIPE, payload))) => {
+                let payload = Zeroizing::new(payload);
+                match wire::decode_history_wipe(&payload) {
+                    Ok(epoch) => control.route_history(epoch, None, &[]).await,
+                    Err(error) => {
+                        tracing::warn!(%agent_id, %error, "invalid worker history wipe frame");
+                    }
+                }
+            }
             Ok(Some((wire::T_EXIT, payload))) => {
                 let payload = Zeroizing::new(payload);
                 let info: wire::ExitInfo = wire::decode_json(&payload).unwrap_or(wire::ExitInfo {
@@ -588,6 +650,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     cwd: Some("/".into()),
+                    history: false,
                 },
             )
             .await

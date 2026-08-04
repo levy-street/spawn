@@ -250,7 +250,12 @@ impl Emulator {
         let mut hyperlink: Option<alacritty_terminal::term::cell::Hyperlink> = None;
         let grid = self.term.grid();
         for offset in (1..=count).rev() {
-            paint_history_row(&grid[Line(-(offset as i32))], &mut pen, &mut hyperlink, &mut out);
+            paint_history_row(
+                &grid[Line(-(offset as i32))],
+                &mut pen,
+                &mut hyperlink,
+                &mut out,
+            );
         }
         set_hyperlink(&mut out, &mut hyperlink, None);
         out.extend_from_slice(b"\x1b[0m");
@@ -1070,7 +1075,10 @@ mod tests {
         let bytes = committed(&events);
         // Rendered wider, the logical line must reassemble on one row.
         let text = render_lines(40, 6, &bytes);
-        assert_eq!(text[0], "abcdefghijklmnopqrst", "wrap not reassembled: {text:?}");
+        assert_eq!(
+            text[0], "abcdefghijklmnopqrst",
+            "wrap not reassembled: {text:?}"
+        );
     }
 
     #[test]
@@ -1080,7 +1088,10 @@ mod tests {
         // ED 2 alone (plain `clear`): the viewport scrolls into history.
         let events = e.feed_output(b"\x1b[2J\x1b[H");
         let text = render_lines(20, 6, &committed(&events)).join("\n");
-        assert!(text.contains("seen-4"), "ED 2 must commit the viewport: {text}");
+        assert!(
+            text.contains("seen-4"),
+            "ED 2 must commit the viewport: {text}"
+        );
 
         // A later ED 3 truncates previously committed history.
         let events = e.feed_output(b"\x1b[3J");
@@ -1118,13 +1129,17 @@ mod tests {
         assert!(committed(&e.feed_output(b"\x1b[")).is_empty());
         let events = e.feed_output(b"3J");
         assert!(
-            events.iter().any(|event| matches!(event, HistoryEvent::Truncate)),
+            events
+                .iter()
+                .any(|event| matches!(event, HistoryEvent::Truncate)),
             "split ESC[3J missed"
         );
         // DECSED form too.
         e.feed_output(b"a\r\nb\r\nc\r\nd");
         let events = e.feed_output(b"\x1b[?3J");
-        assert!(events.iter().any(|event| matches!(event, HistoryEvent::Truncate)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, HistoryEvent::Truncate)));
     }
 
     #[test]
@@ -1133,7 +1148,9 @@ mod tests {
         e.feed_output(b"p\r\nq\r\nr\r\ns");
         let events = e.feed_output(b"\x1b[38;5;196mred\x1b[0m\x1b[33myellow\x1b[m");
         assert!(
-            !events.iter().any(|event| matches!(event, HistoryEvent::Truncate)),
+            !events
+                .iter()
+                .any(|event| matches!(event, HistoryEvent::Truncate)),
             "SGR misread as a scrollback wipe"
         );
     }
@@ -1182,5 +1199,57 @@ mod tests {
         // Everything scrolled off except what the 4-row screen retains.
         assert_eq!(count, 500 - 3, "committed line count: {count}");
         assert!(text.find("line-0000").unwrap() < text.find("line-0001").unwrap());
+    }
+
+    /// Diagnostic (scratch): feed a recorded PTY byte stream through the
+    /// commit engine and dump the committed history + final screen as text.
+    /// SPAWN_RECORDING=path SPAWN_RECORDING_GEOM=colsxrows SPAWN_RECORDING_CHUNK=n
+    #[test]
+    #[ignore]
+    fn commit_recording_dump() {
+        let path = std::env::var("SPAWN_RECORDING").expect("SPAWN_RECORDING");
+        let geom = std::env::var("SPAWN_RECORDING_GEOM").unwrap_or_else(|_| "100x30".into());
+        let chunk: usize = std::env::var("SPAWN_RECORDING_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let (cols, rows) = geom.split_once('x').expect("geom colsxrows");
+        let (cols, rows): (u16, u16) = (cols.parse().unwrap(), rows.parse().unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+
+        let mut e = Emulator::new(cols, rows);
+        let mut history: Vec<u8> = Vec::new();
+        let mut truncates = 0;
+        for part in bytes.chunks(chunk) {
+            for event in e.feed_output(part) {
+                match event {
+                    HistoryEvent::Lines(lines) => history.extend_from_slice(&lines),
+                    HistoryEvent::Truncate => {
+                        truncates += 1;
+                        history.clear();
+                    }
+                }
+            }
+        }
+
+        let line_count = history.windows(2).filter(|w| w == b"\r\n").count();
+        let mut viewer = Emulator::new(cols, (line_count as u16).saturating_add(4).max(4));
+        viewer.feed(&history);
+        let text = viewer.screen_text();
+        let last = text
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map_or(0, |i| i + 1);
+        println!(
+            "== committed history ({} bytes, {line_count} hard lines, {truncates} truncates) ==",
+            history.len()
+        );
+        for (i, line) in text[..last].iter().enumerate() {
+            println!("{i:5} |{line}|");
+        }
+        println!("== final screen ==");
+        for (i, line) in e.screen_text().iter().enumerate() {
+            println!("{i:5} |{line}|");
+        }
     }
 }

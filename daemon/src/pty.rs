@@ -126,6 +126,25 @@ pub struct DirectSinkReceiver {
     pub disconnected: watch::Receiver<bool>,
 }
 
+/// One committed-history event fanned out to a viewer: either a batch of
+/// committed lines (with its epoch/offset anchor) or a scrollback wipe. The
+/// stream mirrors the worker's encrypted log exactly.
+pub enum HistoryUpdate {
+    Delta {
+        epoch: u64,
+        offset: u64,
+        payload: DirectPayload,
+    },
+    Wipe {
+        epoch: u64,
+    },
+}
+
+/// Committed-line batches are small (only lines that scrolled off commit),
+/// but a large paste or `seq`-style flood commits one batch per 2 KiB of
+/// input, so the queue is deeper than the raw-output sink's.
+pub const HISTORY_SINK_QUEUE_DEPTH: usize = 256;
+
 pub const DIRECT_SINK_QUEUE_DEPTH: usize = 128;
 pub const DIRECT_SINK_CHUNK_BYTES: usize = 16 * 1024;
 pub const WORKER_OUTPUT_QUEUE_DEPTH: usize = 32;
@@ -272,6 +291,10 @@ pub struct ForwarderControl {
     slot: Arc<AsyncMutex<Option<SessionSink>>>,
     direct_sinks: Arc<AsyncMutex<HashMap<String, DirectSinkEntry>>>,
     direct_sink_notify: Arc<Notify>,
+    /// Committed-history delta subscribers, keyed by viewer session. A sink
+    /// that falls behind is dropped; its receiver closing tells the pump to
+    /// report a gap so the client re-anchors from a fresh replay.
+    history_sinks: Arc<AsyncMutex<HashMap<String, mpsc::Sender<HistoryUpdate>>>>,
     source_offset: Arc<AtomicU64>,
     source_notify: Arc<Notify>,
     /// Monotonic activity state. Input/output pings have independent throttle
@@ -295,6 +318,7 @@ impl ForwarderControl {
             slot: Arc::new(AsyncMutex::new(None)),
             direct_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
             direct_sink_notify: Arc::new(Notify::new()),
+            history_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
             source_offset: Arc::new(AtomicU64::new(0)),
             source_notify: Arc::new(Notify::new()),
             activity: Arc::new(Mutex::new(ActivityState::default())),
@@ -457,6 +481,36 @@ impl ForwarderControl {
         }
     }
 
+    /// Subscribe a viewer to committed-history deltas. Replacing an existing
+    /// subscription closes the previous receiver.
+    pub async fn add_history_sink(&self, id: String) -> mpsc::Receiver<HistoryUpdate> {
+        let (sink, receiver) = mpsc::channel(HISTORY_SINK_QUEUE_DEPTH);
+        self.history_sinks.lock().await.insert(id, sink);
+        receiver
+    }
+
+    pub async fn remove_history_sink(&self, id: &str) {
+        self.history_sinks.lock().await.remove(id);
+    }
+
+    /// Fan one committed-history event out to every subscriber. A full queue
+    /// drops that subscriber (closing its receiver), which the consumer
+    /// surfaces to its client as a gap to heal via replay.
+    pub async fn route_history(&self, epoch: u64, offset: Option<u64>, bytes: &[u8]) {
+        let mut sinks = self.history_sinks.lock().await;
+        sinks.retain(|_, sink| {
+            let update = match offset {
+                Some(offset) => HistoryUpdate::Delta {
+                    epoch,
+                    offset,
+                    payload: DirectPayload::new(bytes.to_vec()),
+                },
+                None => HistoryUpdate::Wipe { epoch },
+            };
+            sink.try_send(update).is_ok()
+        });
+    }
+
     pub async fn wait_for_direct_sink(&self, id: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -554,6 +608,10 @@ type ReplayWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 pub struct WorkerReplay {
     watermark: u64,
     bytes: Vec<u8>,
+    /// `(epoch, offset)` of the committed-history stream at capture, when the
+    /// worker streams history deltas. The offset ends on a batch boundary, so
+    /// a delta with exactly this start offset appends seamlessly.
+    history_anchor: Option<(u64, u64)>,
     #[cfg(test)]
     wipe_probe: Option<ReplayWipeProbe>,
 }
@@ -563,6 +621,17 @@ impl WorkerReplay {
         Self {
             watermark,
             bytes,
+            history_anchor: None,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    pub(crate) fn new_with_history(watermark: u64, bytes: Vec<u8>, anchor: (u64, u64)) -> Self {
+        Self {
+            watermark,
+            bytes,
+            history_anchor: Some(anchor),
             #[cfg(test)]
             wipe_probe: None,
         }
@@ -570,6 +639,10 @@ impl WorkerReplay {
 
     pub fn watermark(&self) -> u64 {
         self.watermark
+    }
+
+    pub fn history_anchor(&self) -> Option<(u64, u64)> {
+        self.history_anchor
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -585,6 +658,7 @@ impl WorkerReplay {
         Self {
             watermark,
             bytes,
+            history_anchor: None,
             wipe_probe: Some(wipe_probe),
         }
     }

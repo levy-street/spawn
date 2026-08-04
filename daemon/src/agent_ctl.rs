@@ -137,6 +137,10 @@ pub enum ControlOperation {
         agent_generation: u64,
         upload_id: Uuid,
     },
+    /// Opt in to committed-history delta events (`history_delta` /
+    /// `history_wipe` / `history_gap`). Push events are only sent to sessions
+    /// that subscribed, so clients that predate them never see unknown kinds.
+    HistorySubscribe,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -238,6 +242,7 @@ impl ControlRequest {
             .validate()
             .is_err(),
             ControlOperation::UploadCancel { .. } => false,
+            ControlOperation::HistorySubscribe => false,
         };
         if invalid {
             return Err(ProtocolError::new(
@@ -259,6 +264,7 @@ impl ControlRequest {
             ControlOperation::UploadStart { .. } => "upload_start",
             ControlOperation::UploadCancel { .. } => "upload_cancel",
             ControlOperation::TakeControl { .. } => "take_control",
+            ControlOperation::HistorySubscribe => "history_subscribe",
         }
     }
 }
@@ -315,6 +321,86 @@ struct ReplayResponse<'a> {
     pty_offset: Option<u64>,
     total_bytes: usize,
     chunks: usize,
+    /// Committed-history anchor at capture. The epoch is a string because it
+    /// is a u64 nonce that exceeds JavaScript's safe-integer range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_offset: Option<u64>,
+}
+
+/// Committed-history push event. `data` carries one base64 batch of committed
+/// lines for `history_delta`; it is empty for `history_wipe` (scrollback was
+/// erased) and `history_gap` (deltas were lost; re-anchor from a snapshot).
+#[derive(Serialize)]
+struct HistoryEventMessage<'a> {
+    version: u8,
+    kind: &'static str,
+    event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a str>,
+}
+
+/// Queue one committed-history push event. Failures mean the control channel
+/// is going away; the caller stops its pump.
+pub async fn send_history_event(
+    sender: &ControlSender,
+    event: HistoryEvent<'_>,
+) -> Result<(), ProtocolError> {
+    let message = match event {
+        HistoryEvent::Delta {
+            epoch,
+            offset,
+            data,
+        } => HistoryEventMessage {
+            version: PROTOCOL_VERSION,
+            kind: "event",
+            event: "history_delta",
+            history_epoch: Some(epoch.to_string()),
+            history_offset: Some(offset),
+            data: Some(data),
+        },
+        HistoryEvent::Wipe { epoch } => HistoryEventMessage {
+            version: PROTOCOL_VERSION,
+            kind: "event",
+            event: "history_wipe",
+            history_epoch: Some(epoch.to_string()),
+            history_offset: None,
+            data: None,
+        },
+        HistoryEvent::Gap => HistoryEventMessage {
+            version: PROTOCOL_VERSION,
+            kind: "event",
+            event: "history_gap",
+            history_epoch: None,
+            history_offset: None,
+            data: None,
+        },
+    };
+    let text = serde_json::to_string(&message).map_err(|error| {
+        ProtocolError::new(
+            None,
+            "encode_failed",
+            &format!("encoding history event failed: {error}"),
+        )
+    })?;
+    enqueue(sender, ControlOutbound::Text(text), None).await
+}
+
+pub enum HistoryEvent<'a> {
+    Delta {
+        epoch: u64,
+        offset: u64,
+        data: &'a str,
+    },
+    Wipe {
+        epoch: u64,
+    },
+    Gap,
 }
 
 #[derive(Serialize)]
@@ -511,6 +597,7 @@ pub async fn send_replay(
         ));
     }
     let chunks = bytes.len().div_ceil(CHUNK_PAYLOAD_BYTES);
+    let history_anchor = replay.history_anchor();
     let response = ReplayResponse {
         version: PROTOCOL_VERSION,
         kind: "response",
@@ -521,6 +608,8 @@ pub async fn send_replay(
         pty_offset,
         total_bytes: bytes.len(),
         chunks,
+        history_epoch: history_anchor.map(|(epoch, _)| epoch.to_string()),
+        history_offset: history_anchor.map(|(_, offset)| offset),
     };
     let text = serde_json::to_string(&response).map_err(|error| {
         ProtocolError::new(

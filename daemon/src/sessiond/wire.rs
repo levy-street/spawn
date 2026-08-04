@@ -48,6 +48,20 @@ pub const T_RESIZE: u8 = 0x06;
 pub const T_REDRAW: u8 = 0x07;
 pub const T_REPLAY_REQ: u8 = 0x08;
 pub const T_SHUTDOWN: u8 = 0x0B;
+/// Worker → daemon: one committed-line history batch, streamed live as it is
+/// persisted. Unknown to old daemons, which ignore unrecognized frame types.
+pub const T_HISTORY: u8 = 0x0D;
+/// Worker → daemon: the app wiped its scrollback (`ED 3`); payload carries the
+/// new history epoch.
+pub const T_HISTORY_WIPE: u8 = 0x0E;
+/// Worker → daemon: replay response with history anchor metadata. Sent instead
+/// of `T_REPLAY` by workers that stream `T_HISTORY` deltas.
+pub const T_REPLAY2: u8 = 0x0F;
+/// Daemon → worker: subscribe to the committed-history delta stream. Sent only
+/// to workers whose Hello advertises `history: true`; a worker never emits
+/// `T_HISTORY`/`T_HISTORY_WIPE`/`T_REPLAY2` unsubscribed, because daemons
+/// reject frame types they do not know (the connection would drop).
+pub const T_HISTORY_SUB: u8 = 0x10;
 
 /// First frame on every accepted connection, worker → daemon. Lets a
 /// restarted `spawnd` adopt a running worker without any handshake state.
@@ -71,6 +85,11 @@ pub struct Hello {
     /// capability-rooted direct uploads after supervisor adoption.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// This worker can stream committed-history deltas (`T_HISTORY`) once the
+    /// supervisor subscribes with `T_HISTORY_SUB`. Old daemons ignore the
+    /// field; old workers omit it.
+    #[serde(default)]
+    pub history: bool,
 }
 
 /// daemon → worker: spawn the agent. Sent over the private socket rather than
@@ -264,6 +283,72 @@ pub fn decode_replay(payload: &[u8]) -> Result<(u64, &[u8])> {
     Ok((watermark, &payload[8..]))
 }
 
+/// Anchor for the committed-history delta stream: `epoch` distinguishes
+/// wipes/restarts, `offset` counts committed plaintext bytes within the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryAnchor {
+    pub epoch: u64,
+    pub offset: u64,
+}
+
+/// Payload of `T_HISTORY`: `u64 LE epoch` + `u64 LE start offset` + one
+/// committed-line batch (self-contained styled text).
+pub fn encode_history(anchor: HistoryAnchor, bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + bytes.len());
+    buf.extend_from_slice(&anchor.epoch.to_le_bytes());
+    buf.extend_from_slice(&anchor.offset.to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf
+}
+
+pub fn decode_history(payload: &[u8]) -> Result<(HistoryAnchor, &[u8])> {
+    if payload.len() < 16 {
+        bail!("history payload too short: {}", payload.len());
+    }
+    let epoch = u64::from_le_bytes(payload[..8].try_into().expect("checked length"));
+    let offset = u64::from_le_bytes(payload[8..16].try_into().expect("checked length"));
+    Ok((HistoryAnchor { epoch, offset }, &payload[16..]))
+}
+
+/// Payload of `T_HISTORY_WIPE`: `u64 LE` new epoch (offset restarts at 0).
+pub fn encode_history_wipe(epoch: u64) -> [u8; 8] {
+    epoch.to_le_bytes()
+}
+
+pub fn decode_history_wipe(payload: &[u8]) -> Result<u64> {
+    if payload.len() != 8 {
+        bail!(
+            "history_wipe payload must be 8 bytes, got {}",
+            payload.len()
+        );
+    }
+    Ok(u64::from_le_bytes(
+        payload.try_into().expect("checked length"),
+    ))
+}
+
+/// Payload of `T_REPLAY2`: `u64 LE watermark` + `u64 LE history epoch` +
+/// `u64 LE history end offset at capture` + the replay bytes. The end offset
+/// always lands on a batch boundary, so deltas append exactly after it.
+pub fn encode_replay2(watermark: u64, anchor: HistoryAnchor, bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(24 + bytes.len());
+    buf.extend_from_slice(&watermark.to_le_bytes());
+    buf.extend_from_slice(&anchor.epoch.to_le_bytes());
+    buf.extend_from_slice(&anchor.offset.to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf
+}
+
+pub fn decode_replay2(payload: &[u8]) -> Result<(u64, HistoryAnchor, &[u8])> {
+    if payload.len() < 24 {
+        bail!("replay2 payload too short: {}", payload.len());
+    }
+    let watermark = u64::from_le_bytes(payload[..8].try_into().expect("checked length"));
+    let epoch = u64::from_le_bytes(payload[8..16].try_into().expect("checked length"));
+    let offset = u64::from_le_bytes(payload[16..24].try_into().expect("checked length"));
+    Ok((watermark, HistoryAnchor { epoch, offset }, &payload[24..]))
+}
+
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     frame_type: u8,
@@ -422,6 +507,44 @@ mod tests {
             .to_string();
         assert!(error.starts_with("unsupported lifecycle signal at line 1 column "));
         assert!(!error.contains(&oversized));
+    }
+
+    #[test]
+    fn history_frames_round_trip() {
+        let anchor = HistoryAnchor {
+            epoch: u64::MAX - 3,
+            offset: 987_654_321,
+        };
+        let framed = encode_history(anchor, b"\x1b[0mline\r\n");
+        let (decoded, bytes) = decode_history(&framed).unwrap();
+        assert_eq!(decoded, anchor);
+        assert_eq!(bytes, b"\x1b[0mline\r\n");
+        assert!(decode_history(&framed[..15]).is_err());
+
+        let wipe = encode_history_wipe(anchor.epoch);
+        assert_eq!(decode_history_wipe(&wipe).unwrap(), anchor.epoch);
+        assert!(decode_history_wipe(&wipe[..7]).is_err());
+
+        let replay = encode_replay2(42, anchor, b"payload");
+        let (watermark, decoded, bytes) = decode_replay2(&replay).unwrap();
+        assert_eq!(watermark, 42);
+        assert_eq!(decoded, anchor);
+        assert_eq!(bytes, b"payload");
+        assert!(decode_replay2(&replay[..23]).is_err());
+    }
+
+    #[test]
+    fn hello_history_field_defaults_off_for_old_workers() {
+        // An old worker's Hello omits `history`; decoding must not fail and
+        // must not accidentally enable the delta stream.
+        let old = serde_json::json!({
+            "version": PROTO_VERSION,
+            "agent_id": Uuid::new_v4(),
+            "instance_id": Uuid::new_v4(),
+            "state": "running",
+        });
+        let hello: Hello = serde_json::from_value(old).unwrap();
+        assert!(!hello.history);
     }
 
     #[tokio::test]

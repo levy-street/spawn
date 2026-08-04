@@ -154,7 +154,7 @@ guessed at.
 
 | Type | Dir | Payload | Purpose |
 |---|---|---|---|
-| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows, cwd?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct agent uploads |
+| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows, cwd?, history?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct agent uploads. `history: true` advertises the committed-history delta stream (§8.4) |
 | `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the agent. Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
@@ -166,6 +166,10 @@ guessed at.
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?: TERM\|KILL}` | compatibility command; current spawnd lifecycle delivery uses the independent endpoint below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
+| `T_HISTORY` 0x0D | w→d | `epoch u64 LE ‖ start_offset u64 LE ‖ committed bytes` | one committed-line batch, streamed live as it is persisted (§8.4). Only sent after `T_HISTORY_SUB` |
+| `T_HISTORY_WIPE` 0x0E | w→d | `epoch u64 LE` | the app erased its scrollback (`ED 3`); carries the new epoch, offsets restart at 0. Only sent after `T_HISTORY_SUB` |
+| `T_REPLAY2` 0x0F | w→d | `watermark u64 LE ‖ epoch u64 LE ‖ history_end_offset u64 LE ‖ raw bytes` | replay response with the committed-history anchor at capture; replaces `T_REPLAY` for subscribed supervisors. The end offset always lands on a batch boundary, so a delta starting there appends seamlessly |
+| `T_HISTORY_SUB` 0x10 | d→w | empty | subscribe to the delta stream. Sent only to workers whose `Hello` advertises `history: true`; a worker never emits the three frames above unsubscribed, because supervisors reject unknown frame types by dropping the connection |
 
 Connection semantics: the worker serves **one live supervisor connection**.
 It validates the candidate peer's effective UID and sends that candidate its
@@ -456,6 +460,32 @@ output and mid-session stdin echo) is asserted end-to-end in
 `daemon/tests/worker_e2e.rs` against a real `/bin/sh` on a real PTY, and
 through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
 `worker_backend::tests::worker_launch_adopt_and_priority_shutdown_roundtrip`.
+
+### 8.4 Live committed-history deltas
+
+Replay seeds the scrollback view; **deltas keep it exact forever after**. The
+worker streams every persisted history effect to its supervisor as it happens
+— `T_HISTORY` per committed batch, `T_HISTORY_WIPE` per `ED 3` — and spawnd
+fans them out per viewer as `spawn.ctl` events (`history_delta` with a base64
+fragment, `history_wipe`, and `history_gap` when a viewer's bounded queue
+overflowed and it must re-anchor). The browser's scrollback overlay is
+therefore a **pure view of the worker's log**: seeded from a replay's history
+section, extended only by deltas, with raw live PTY bytes never entering its
+buffer. The live screen is painted below the history at reveal time from the
+local live terminal (client-side serialize), so the seam cannot interleave and
+nothing is fetched to open scrollback.
+
+Continuity is a two-part anchor: `epoch` (a per-worker-process nonce, bumped
+on every wipe, sent as a decimal string on `spawn.ctl` because u64 exceeds
+JavaScript safe integers) and `offset` (committed plaintext bytes within the
+epoch). Replay anchors always land on batch boundaries; ctl-level fragments
+split batches at byte granularity and re-chain by offset. Any hole, epoch
+change, or overflow makes the client drop its anchor and heal with exactly one
+fresh snapshot. Everything is capability-gated end to end: workers advertise
+`history: true` in `Hello`, daemons subscribe with `T_HISTORY_SUB`, clients
+opt in with a `history_subscribe` ctl request — so old daemons, old workers,
+and old (cached) clients all continue on the legacy replay-only flow with no
+frame-type surprises.
 
 ## 9. Resize, flow control, multi-viewer
 

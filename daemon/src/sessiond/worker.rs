@@ -129,6 +129,7 @@ fn inbound_frame_limit(frame_type: u8) -> Option<usize> {
         wire::T_RESIZE => Some(4),
         wire::T_REDRAW => Some(0),
         wire::T_REPLAY_REQ => Some(4),
+        wire::T_HISTORY_SUB => Some(0),
         wire::T_SHUTDOWN => Some(MAX_SHUTDOWN_FRAME_BYTES),
         _ => None,
     }
@@ -137,7 +138,7 @@ fn inbound_frame_limit(frame_type: u8) -> Option<usize> {
 fn inbound_frame_size_exact(frame_type: u8, len: usize) -> bool {
     match frame_type {
         wire::T_RESIZE | wire::T_REPLAY_REQ => len == 4,
-        wire::T_REDRAW => len == 0,
+        wire::T_REDRAW | wire::T_HISTORY_SUB => len == 0,
         _ => true,
     }
 }
@@ -148,22 +149,64 @@ fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
         && inbound_frame_size_exact(frame_type, len)
 }
 
-/// Persist the emulator's history effects, in order. Returns false when the
-/// log failed (the caller destroys it and replay is disabled); event
-/// plaintext is wiped on every path.
-fn persist_events(log: &mut ScrollbackLog, events: Vec<HistoryEvent>) -> bool {
+/// Persist the emulator's history effects, in order, and stream each one to
+/// the supervisor as a live delta (`T_HISTORY` / `T_HISTORY_WIPE`) so attached
+/// clients keep their scrollback identical to the log without replaying raw
+/// bytes. Returns false when the log failed (the caller destroys it and
+/// replay is disabled — the delta stream stops with it, so consumers never
+/// diverge from what a replay would return); event plaintext is wiped on
+/// every path.
+async fn persist_events(
+    log: &mut ScrollbackLog,
+    events: Vec<HistoryEvent>,
+    conn_write: &mut Option<OwnedWriteHalf>,
+    anchor: &mut wire::HistoryAnchor,
+    subscribed: bool,
+) -> bool {
     for event in events {
-        let result = match event {
+        match event {
             HistoryEvent::Lines(lines) => {
-                let appended = log.append_history(&lines);
+                if let Err(error) = log.append_history(&lines) {
+                    secret::wipe_vec(lines);
+                    tracing::warn!(%error, "scrollback append failed; disabling replay for this worker");
+                    return false;
+                }
+                if subscribed {
+                    if let Some(w) = conn_write.as_mut() {
+                        let framed = wire::encode_history(*anchor, &lines);
+                        if wire::write_frame(w, wire::T_HISTORY, &framed)
+                            .await
+                            .is_err()
+                        {
+                            *conn_write = None;
+                        }
+                        secret::wipe_vec(framed);
+                    }
+                }
+                // The anchor tracks the log itself, not the subscription: a
+                // replay captured later must report the true end offset.
+                anchor.offset = anchor.offset.saturating_add(lines.len() as u64);
                 secret::wipe_vec(lines);
-                appended
             }
-            HistoryEvent::Truncate => log.truncate_all(),
-        };
-        if let Err(error) = result {
-            tracing::warn!(%error, "scrollback append failed; disabling replay for this worker");
-            return false;
+            HistoryEvent::Truncate => {
+                if let Err(error) = log.truncate_all() {
+                    tracing::warn!(%error, "scrollback truncate failed; disabling replay for this worker");
+                    return false;
+                }
+                anchor.epoch = anchor.epoch.wrapping_add(1);
+                anchor.offset = 0;
+                if subscribed {
+                    if let Some(w) = conn_write.as_mut() {
+                        let framed = wire::encode_history_wipe(anchor.epoch);
+                        if wire::write_frame(w, wire::T_HISTORY_WIPE, &framed)
+                            .await
+                            .is_err()
+                        {
+                            *conn_write = None;
+                        }
+                    }
+                }
+            }
         }
     }
     true
@@ -356,6 +399,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut exit_reported = false;
     let mut pty_source_offset = 0u64;
     let mut agent_cwd: Option<String> = None;
+    // Committed-history delta anchor. The epoch is a per-process nonce so a
+    // reconnecting client can tell a worker restart (or `ED 3` wipe, which
+    // bumps it) from a continuation; the offset counts committed plaintext
+    // bytes within the epoch and always lands on batch boundaries.
+    let mut history_anchor = wire::HistoryAnchor {
+        epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1),
+        offset: 0,
+    };
+    // Whether the CURRENT supervisor connection subscribed to history deltas
+    // (`T_HISTORY_SUB`). Never emit new-protocol frames unsubscribed: an old
+    // daemon rejects unknown frame types and drops the whole connection.
+    let mut history_sub = false;
 
     let started_at = tokio::time::Instant::now();
     let mut exited_at: Option<tokio::time::Instant> = None;
@@ -395,6 +453,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     cols: pty.as_ref().map(|p| p.size.lock().unwrap().0).unwrap_or(0),
                     rows: pty.as_ref().map(|p| p.size.lock().unwrap().1).unwrap_or(0),
                     cwd: agent_cwd.clone(),
+                    history: true,
                 };
                 let hello_sent = tokio::time::timeout(
                     SUPERVISOR_HELLO_TIMEOUT,
@@ -418,6 +477,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 generation = generation.wrapping_add(1);
                 conn_write = Some(write_half);
                 conn_reader = Some(spawn_conn_reader(read_half, generation, frame_tx.clone()));
+                // Subscriptions are per-connection; the replacement daemon
+                // re-subscribes if it speaks the delta protocol.
+                history_sub = false;
                 tracing::debug!(generation, "connection accepted");
             }
 
@@ -444,6 +506,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &child_state,
                     &mut agent_cwd,
                     pty_source_offset,
+                    &mut history_anchor,
+                    &mut history_sub,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => pty_open = true,
@@ -473,7 +537,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             let events = emu.feed_output(&chunk);
                             match log.as_mut() {
                                 Some(active_log) => {
-                                    replay_failed = !persist_events(active_log, events);
+                                    replay_failed = !persist_events(
+                                        active_log,
+                                        events,
+                                        &mut conn_write,
+                                        &mut history_anchor,
+                                        history_sub,
+                                    )
+                                    .await;
                                 }
                                 None => discard_events(events),
                             }
@@ -564,6 +635,8 @@ async fn handle_frame(
     child_state: &SharedChild,
     agent_cwd: &mut Option<String>,
     pty_source_offset: u64,
+    history_anchor: &mut wire::HistoryAnchor,
+    history_sub: &mut bool,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
@@ -634,7 +707,16 @@ async fn handle_frame(
                 let events = emu.resize(cols, rows);
                 let mut replay_failed = false;
                 match log.as_mut() {
-                    Some(active_log) => replay_failed = !persist_events(active_log, events),
+                    Some(active_log) => {
+                        replay_failed = !persist_events(
+                            active_log,
+                            events,
+                            conn_write,
+                            history_anchor,
+                            *history_sub,
+                        )
+                        .await;
+                    }
                     None => discard_events(events),
                 }
                 if replay_failed {
@@ -649,6 +731,10 @@ async fn handle_frame(
             // Obsolete: repaints are synthesized from the emulator via replay
             // (`T_REPLAY_REQ`); the agent process is never disturbed.
             tracing::debug!("ignoring redraw request (emulator-backed worker)");
+            Ok(LoopAction::Continue)
+        }
+        wire::T_HISTORY_SUB => {
+            *history_sub = true;
             Ok(LoopAction::Continue)
         }
         wire::T_REPLAY_REQ => {
@@ -678,8 +764,22 @@ async fn handle_frame(
             secret::wipe_vec(history);
             secret::wipe_vec(screen);
             if let Some(w) = conn_write.as_mut() {
-                let framed = wire::encode_replay(pty_source_offset, &replay);
-                let _ = wire::write_frame(w, wire::T_REPLAY, &framed).await;
+                // Subscribed supervisors get T_REPLAY2, which carries the
+                // history anchor at capture so the client can append later
+                // deltas exactly after this replay's content. Unsubscribed
+                // (old) daemons would drop the connection on an unknown frame
+                // type, so they get the legacy shape.
+                let framed = if *history_sub {
+                    wire::encode_replay2(pty_source_offset, *history_anchor, &replay)
+                } else {
+                    wire::encode_replay(pty_source_offset, &replay)
+                };
+                let frame_type = if *history_sub {
+                    wire::T_REPLAY2
+                } else {
+                    wire::T_REPLAY
+                };
+                let _ = wire::write_frame(w, frame_type, &framed).await;
                 secret::wipe_vec(framed);
             }
             secret::wipe_vec(replay);

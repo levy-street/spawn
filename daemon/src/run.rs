@@ -3464,11 +3464,10 @@ mod tests {
         // The reconcile-path credential work must execute under the loader's
         // redaction marker, so a keyring/file backend panic hits the redacting
         // hook rather than the ordinary one.
-        let marker_seen = run_isolated_credential_blocking(|| {
-            IS_CREDENTIAL_LOADER_THREAD.with(Cell::get)
-        })
-        .await
-        .expect("isolated credential work returns its value");
+        let marker_seen =
+            run_isolated_credential_blocking(|| IS_CREDENTIAL_LOADER_THREAD.with(Cell::get))
+                .await
+                .expect("isolated credential work returns its value");
         assert!(
             marker_seen,
             "reconcile backend work must set the credential-loader redaction marker"

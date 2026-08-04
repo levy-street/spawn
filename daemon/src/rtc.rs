@@ -2717,6 +2717,20 @@ async fn execute_control_request(
             )
             .await
         }
+        ControlOperation::HistorySubscribe => {
+            let Some(control) = registry.control_for_binding(agent) else {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "agent_unavailable",
+                    "agent is not attached to this daemon",
+                ));
+            };
+            if !effect.valid() {
+                return Ok(());
+            }
+            spawn_history_pump(control, sender.clone(), session_id.to_string());
+            agent_ctl::send_ack(sender, request_id, operation_name).await
+        }
         ControlOperation::Resize { cols, rows } => {
             if !controls.is_owner(agent_id, session_id).await {
                 return Err(ProtocolError::new(
@@ -2887,6 +2901,86 @@ struct ReplaySpec<'a> {
     operation: &'a str,
     lines: u16,
     plain: bool,
+}
+
+/// Relay committed-history deltas from the agent's forwarder to one control
+/// channel as `history_delta`/`history_wipe` events. If the per-viewer queue
+/// overflows (the fan-out drops the sink), the pump re-subscribes and emits a
+/// `history_gap` so the client re-anchors from a fresh snapshot. Ends when the
+/// control channel closes.
+fn spawn_history_pump(
+    control: crate::pty::ForwarderControl,
+    sender: ControlSender,
+    session_id: String,
+) {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    let key = format!("{session_id}:{}", Uuid::new_v4());
+    tokio::spawn(async move {
+        let mut resubscribed = false;
+        'outer: loop {
+            let mut receiver = control.add_history_sink(key.clone()).await;
+            if resubscribed
+                && agent_ctl::send_history_event(&sender, agent_ctl::HistoryEvent::Gap)
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+            resubscribed = true;
+            loop {
+                let update = tokio::select! {
+                    update = receiver.recv() => update,
+                    _ = sender.closed() => break 'outer,
+                };
+                let Some(update) = update else {
+                    // Dropped by the fan-out for falling behind: resubscribe
+                    // and tell the client to heal the hole.
+                    continue 'outer;
+                };
+                let sent = match update {
+                    crate::pty::HistoryUpdate::Delta {
+                        epoch,
+                        offset,
+                        payload,
+                    } => {
+                        // Fragment so each JSON text message stays under the
+                        // 16 KiB spawn.ctl request/response cap. Offsets are
+                        // byte-positions, so fragments re-anchor naturally.
+                        const FRAGMENT_BYTES: usize = 8 * 1024;
+                        let mut result = Ok(());
+                        for (index, part) in payload.chunks(FRAGMENT_BYTES).enumerate() {
+                            let data = BASE64.encode(part);
+                            result = agent_ctl::send_history_event(
+                                &sender,
+                                agent_ctl::HistoryEvent::Delta {
+                                    epoch,
+                                    offset: offset + (index * FRAGMENT_BYTES) as u64,
+                                    data: &data,
+                                },
+                            )
+                            .await;
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    crate::pty::HistoryUpdate::Wipe { epoch } => {
+                        agent_ctl::send_history_event(
+                            &sender,
+                            agent_ctl::HistoryEvent::Wipe { epoch },
+                        )
+                        .await
+                    }
+                };
+                if sent.is_err() {
+                    break 'outer;
+                }
+            }
+        }
+        control.remove_history_sink(&key).await;
+    });
 }
 
 async fn send_agent_replay(

@@ -587,8 +587,14 @@ async fn replay_is_a_sentineled_history_plus_current_screen() {
     // screen), so they appear in the screen section; nothing was committed
     // to history yet.
     let screen = &text[screen_at..];
-    assert!(screen.contains("before-resize"), "screen repaint: {screen:?}");
-    assert!(screen.contains("after-resize"), "screen repaint: {screen:?}");
+    assert!(
+        screen.contains("before-resize"),
+        "screen repaint: {screen:?}"
+    );
+    assert!(
+        screen.contains("after-resize"),
+        "screen repaint: {screen:?}"
+    );
 }
 
 /// The reconnect-seed regression: the RTC attach path requests replay with a
@@ -810,4 +816,211 @@ async fn worker_rejects_bad_start_and_reports_error() {
     assert_eq!(frame_type, wire::T_ERROR);
     let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
     assert!(err.message.contains("argv"), "unexpected error: {err:?}");
+}
+
+/// Committed-history delta streaming: nothing is emitted before the
+/// supervisor subscribes (old daemons would drop the connection on unknown
+/// frame types); once subscribed, every committed batch arrives with a
+/// contiguous (epoch, offset) chain, the replay switches to T_REPLAY2 whose
+/// anchor equals the chain's end, and the replayed history ends with exactly
+/// the streamed bytes. An `ED 3` wipe bumps the epoch and restarts offsets.
+#[tokio::test]
+async fn history_deltas_chain_match_replay_and_wipe_bumps_epoch() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    let hello = expect_hello(&mut conn, "awaiting_start").await;
+    assert!(hello.history, "worker must advertise delta capability");
+
+    // Scroll plenty of lines BEFORE subscribing; no history frames may appear.
+    let spec = start_spec(&[
+        "/bin/sh",
+        "-c",
+        "for i in $(seq 1 60); do echo unsub-$i; done; echo UNSUB-END; cat",
+    ]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    {
+        let mut acc: Vec<u8> = Vec::new();
+        while !acc.windows(9).any(|w| w == b"UNSUB-END") {
+            let (frame_type, payload) = read_frame(&mut conn).await;
+            assert_ne!(
+                frame_type,
+                wire::T_HISTORY,
+                "no deltas may be emitted before subscription"
+            );
+            assert_ne!(frame_type, wire::T_HISTORY_WIPE);
+            if frame_type == wire::T_OUTPUT {
+                let (_, bytes) = wire::decode_output(&payload).unwrap();
+                acc.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    // Subscribe, then push lines through `cat` so they scroll off and commit.
+    wire::write_frame(&mut conn, wire::T_HISTORY_SUB, &[])
+        .await
+        .unwrap();
+    for i in 0..50 {
+        wire::write_frame(
+            &mut conn,
+            wire::T_INPUT,
+            format!("delta-line-{i:03}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    wire::write_frame(&mut conn, wire::T_INPUT, b"DELTA-DONE\n")
+        .await
+        .unwrap();
+
+    // Collect deltas until the last marker line has committed (it scrolls off
+    // once enough lines follow it — push a few more to flush it through).
+    for i in 0..30 {
+        wire::write_frame(
+            &mut conn,
+            wire::T_INPUT,
+            format!("flush-{i:02}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    let mut epoch: Option<u64> = None;
+    let mut next_offset: Option<u64> = None;
+    let mut delta_bytes: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    while !delta_bytes.windows(14).any(|w| w == b"delta-line-049") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for committed deltas; got {:?}",
+            String::from_utf8_lossy(&delta_bytes)
+        );
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type != wire::T_HISTORY {
+            continue;
+        }
+        let (anchor, bytes) = wire::decode_history(&payload).unwrap();
+        match epoch {
+            None => epoch = Some(anchor.epoch),
+            Some(existing) => assert_eq!(anchor.epoch, existing, "epoch drifted mid-stream"),
+        }
+        if let Some(expected) = next_offset {
+            assert_eq!(
+                anchor.offset, expected,
+                "delta offsets must chain gaplessly"
+            );
+        }
+        next_offset = Some(anchor.offset + bytes.len() as u64);
+        delta_bytes.extend_from_slice(bytes);
+    }
+
+    // Quiesce, then capture a replay: T_REPLAY2 whose anchor continues the
+    // chain and whose history section ends with exactly the streamed bytes.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut tail_deltas = true;
+    while tail_deltas {
+        tail_deltas = false;
+        wire::write_frame(
+            &mut conn,
+            wire::T_REPLAY_REQ,
+            &wire::encode_replay_req(4 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        let payload = loop {
+            let (frame_type, payload) = read_frame(&mut conn).await;
+            match frame_type {
+                wire::T_REPLAY2 => break payload,
+                wire::T_REPLAY => panic!("subscribed replay must use T_REPLAY2"),
+                wire::T_HISTORY => {
+                    let (anchor, bytes) = wire::decode_history(&payload).unwrap();
+                    assert_eq!(Some(anchor.offset), next_offset.map(|_| anchor.offset));
+                    next_offset = Some(anchor.offset + bytes.len() as u64);
+                    delta_bytes.extend_from_slice(bytes);
+                    tail_deltas = true;
+                }
+                _ => {}
+            }
+        };
+        if tail_deltas {
+            continue; // late commits interleaved; re-capture so anchors settle
+        }
+        let (_, anchor, bytes) = wire::decode_replay2(&payload).unwrap();
+        assert_eq!(Some(anchor.epoch), epoch, "replay anchor epoch");
+        assert_eq!(
+            Some(anchor.offset),
+            next_offset,
+            "replay anchor must equal the delta chain's end"
+        );
+        let text = bytes.to_vec();
+        let sentinel = spawnd::sessiond::scrollback::REPLAY_HISTORY_SENTINEL;
+        let start = text
+            .windows(sentinel.len())
+            .position(|w| w == sentinel)
+            .expect("history sentinel")
+            + sentinel.len();
+        let marker = b"\x1b[8;";
+        let end = text[start..]
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .map(|p| start + p)
+            .expect("second geometry marker");
+        let history = &text[start..end];
+        assert!(
+            history.ends_with(&delta_bytes),
+            "replayed history must end with the streamed delta bytes (history {} bytes, deltas {} bytes)",
+            history.len(),
+            delta_bytes.len()
+        );
+    }
+
+    // ED 3 through the PTY (cat echoes the raw bytes): epoch bumps, offsets
+    // restart, and post-wipe commits chain from zero.
+    let old_epoch = epoch.unwrap();
+    wire::write_frame(&mut conn, wire::T_INPUT, b"\x1b[3J\n")
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    let new_epoch = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for history wipe"
+        );
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_HISTORY_WIPE {
+            break wire::decode_history_wipe(&payload).unwrap();
+        }
+    };
+    assert_eq!(
+        new_epoch,
+        old_epoch.wrapping_add(1),
+        "wipe must bump the epoch"
+    );
+    for i in 0..40 {
+        wire::write_frame(
+            &mut conn,
+            wire::T_INPUT,
+            format!("post-wipe-{i:02}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    let mut post_wipe_first: Option<wire::HistoryAnchor> = None;
+    while post_wipe_first.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for post-wipe deltas"
+        );
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_HISTORY {
+            let (anchor, _) = wire::decode_history(&payload).unwrap();
+            post_wipe_first = Some(anchor);
+        }
+    }
+    let anchor = post_wipe_first.unwrap();
+    assert_eq!(anchor.epoch, new_epoch);
+    assert_eq!(anchor.offset, 0, "offsets restart after a wipe");
 }
