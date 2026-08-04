@@ -1,18 +1,31 @@
-//! Headless screen emulator for checkpoint serialization.
+//! Headless screen emulator: screen serialization and history line commits.
 //!
 //! The worker feeds every PTY output byte through this emulator so that, at
 //! any moment, it can serialize the *current screen state* as an ANSI byte
-//! stream that reconstructs it in the browser's xterm.js. Checkpoints built
-//! this way replace the SIGWINCH-jiggle repaint hack: log rotation becomes
-//! invisible to the agent process, and a replay always opens with an exact,
-//! synthesized repaint instead of hoping the app redrew recently.
+//! stream that reconstructs it in the browser's xterm.js — replays open with
+//! an exact synthesized repaint, and the agent process is never signaled to
+//! provoke one.
+//!
+//! The emulator is also the single authority on *scrollback history*: raw TUI
+//! bytes are a rendering protocol, not a document, so history is recorded as
+//! **committed lines** — a line is committed exactly once, at the moment it
+//! scrolls off the top of the screen, serialized as styled text
+//! ([`HistoryEvent::Lines`]). Intermediate repaint frames never commit
+//! (rewrites happen in place), a resize cannot retroactively reflow what was
+//! already committed, and an app erasing its scrollback (`CSI 3 J`) surfaces
+//! as [`HistoryEvent::Truncate`] so the retained log is physically dropped.
+//! alacritty's grid provides the commit semantics: primary-screen scrolls
+//! rotate lines into grid history (`ED 2` scrolls the viewport into history,
+//! VTE/kitty-style; regions anchored at the top row commit too), which
+//! `feed_output` drains after every span and clears, keeping the grid's
+//! resident history transiently small.
 //!
 //! This means the worker deliberately retains plaintext semantic state for
 //! the current primary and alternate screen for its lifetime. The state is
-//! bounded by the active terminal geometry and has no scrolling history; it is
-//! not a second user-facing renderer and it never rewrites the live byte path.
-//! Serialized checkpoints are transient plaintext and are encrypted before
-//! being written to the scrollback segment files.
+//! bounded by the active terminal geometry plus the bounded drain window; it
+//! is not a second user-facing renderer and it never rewrites the live byte
+//! path. Serialized checkpoints and drained lines are transient plaintext and
+//! are encrypted before being written to the scrollback segment files.
 //!
 //! Fidelity contract (enforced by the unit tests and, eventually, the
 //! term-conformance corpus): `feed(bytes)` then `serialize()` then feeding the
@@ -44,6 +57,66 @@ struct Sink;
 
 impl EventListener for Sink {
     fn send_event(&self, _event: Event) {}
+}
+
+/// Upper bound on grid-resident history between drains. PTY reads are 8 KiB,
+/// so one drain window can commit at most ~8k lines (one LF per byte); the
+/// margin covers a same-window `ED 2` viewport push on a tall screen.
+const HISTORY_DRAIN_CAP: usize = 10_000;
+/// Drain stride within one `feed_output` call: bounds both the resident
+/// history ring and the size of any single committed-lines batch.
+const FEED_DRAIN_STRIDE: usize = 2 * 1024;
+
+/// History effects observed while feeding PTY output, in stream order.
+pub enum HistoryEvent {
+    /// Lines that scrolled off the screen, serialized as a self-contained
+    /// styled text stream: SGR runs + glyphs, `\r\n` after each hard line
+    /// end; soft-wrapped rows are painted edge-to-edge with no break so the
+    /// logical line re-wraps naturally at the consumer's width.
+    Lines(Vec<u8>),
+    /// The app erased its scrollback (`CSI 3 J` / `CSI ? 3 J`): previously
+    /// committed lines must be dropped.
+    Truncate,
+}
+
+/// Cross-chunk matcher for `ESC [ 3 J` and `ESC [ ? 3 J`. Byte-exact rather
+/// than a full CSI parser: these are the only forms terminals emit for a
+/// scrollback wipe, and a payload collision inside an opaque string would
+/// merely truncate history the app had asked to be unreadable anyway.
+#[derive(Default)]
+struct WipeScanner {
+    state: WipeState,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum WipeState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    CsiQuestion,
+    CsiThree,
+}
+
+impl WipeScanner {
+    /// Advance through `bytes`; true when a wipe sequence completed inside.
+    fn scan(&mut self, bytes: &[u8]) -> bool {
+        let mut matched = false;
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (_, 0x1b) => WipeState::Escape,
+                (WipeState::Escape, b'[') => WipeState::Csi,
+                (WipeState::Csi, b'?') => WipeState::CsiQuestion,
+                (WipeState::Csi | WipeState::CsiQuestion, b'3') => WipeState::CsiThree,
+                (WipeState::CsiThree, b'J') => {
+                    matched = true;
+                    WipeState::Ground
+                }
+                _ => WipeState::Ground,
+            };
+        }
+        matched
+    }
 }
 
 /// States alacritty tracks but does not expose; recorded from a second parse
@@ -107,6 +180,7 @@ pub struct Emulator {
     parser: Processor,
     shadow: Shadow,
     shadow_parser: Processor,
+    wipe_scanner: WipeScanner,
     cols: u16,
     rows: u16,
 }
@@ -116,9 +190,10 @@ impl Emulator {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let config = Config {
-            // Deep history lives in the encrypted byte log; the emulator only
-            // ever needs the screen.
-            scrolling_history: 0,
+            // Grid history is a transient drain window, not the deep store:
+            // `feed_output` commits and clears it every stride. Deep history
+            // lives in the encrypted line log.
+            scrolling_history: HISTORY_DRAIN_CAP,
             ..Config::default()
         };
         let size = TermSize::new(cols as usize, rows as usize);
@@ -127,17 +202,68 @@ impl Emulator {
             parser: Processor::new(),
             shadow: Shadow::new(rows),
             shadow_parser: Processor::new(),
+            wipe_scanner: WipeScanner::default(),
             cols,
             rows,
         }
     }
 
+    /// Raw feed: parses without draining history. Used by `serialize`'s
+    /// self-repair (whose streams never scroll) and by tests that only care
+    /// about screen state.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         self.shadow_parser.advance(&mut self.shadow, bytes);
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    /// Feed PTY output, returning the history effects it produced in stream
+    /// order. Strided so the grid-resident history stays bounded regardless
+    /// of chunk size; a scrollback wipe inside a stride orders its
+    /// `Truncate` before that stride's surviving commits (lines the wipe
+    /// already removed from the grid were doomed regardless).
+    pub fn feed_output(&mut self, bytes: &[u8]) -> Vec<HistoryEvent> {
+        let mut events = Vec::new();
+        for stride in bytes.chunks(FEED_DRAIN_STRIDE) {
+            let wiped = self.wipe_scanner.scan(stride);
+            self.feed(stride);
+            if wiped {
+                events.push(HistoryEvent::Truncate);
+            }
+            if let Some(lines) = self.drain_history() {
+                events.push(HistoryEvent::Lines(lines));
+            }
+        }
+        events
+    }
+
+    /// Serialize and clear every line the grid has rotated into history.
+    fn drain_history(&mut self) -> Option<Vec<u8>> {
+        let count = self.term.grid().history_size();
+        if count == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count * 48);
+        // Each batch is self-contained: an evicted or truncated predecessor
+        // batch must not leak pen or hyperlink state into this one.
+        out.extend_from_slice(b"\x1b[0m");
+        let mut pen = Pen::default();
+        let mut hyperlink: Option<alacritty_terminal::term::cell::Hyperlink> = None;
+        let grid = self.term.grid();
+        for offset in (1..=count).rev() {
+            paint_history_row(&grid[Line(-(offset as i32))], &mut pen, &mut hyperlink, &mut out);
+        }
+        set_hyperlink(&mut out, &mut hyperlink, None);
+        out.extend_from_slice(b"\x1b[0m");
+        self.term.grid_mut().clear_history();
+        Some(out)
+    }
+
+    /// Resize the screen. Narrowing reflows wrapped screen rows and can push
+    /// the excess into grid history — those rows genuinely left the screen,
+    /// so they are committed (kitty/VTE resize semantics). The grid history
+    /// is empty on entry (drained every feed), so widening has nothing to
+    /// pull back and can never un-commit a line.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Vec<HistoryEvent> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.cols = cols;
@@ -145,6 +271,10 @@ impl Emulator {
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
         self.shadow.resize(rows);
+        match self.drain_history() {
+            Some(lines) => vec![HistoryEvent::Lines(lines)],
+            None => Vec::new(),
+        }
     }
 
     pub fn geometry(&self) -> (u16, u16) {
@@ -563,6 +693,47 @@ fn paint_screen<T>(term: &Term<T>, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[0m");
 }
 
+/// Paint one committed history row as flowing styled text. Hard-ended rows
+/// are trimmed of trailing default cells and closed with `\r\n`; soft-wrapped
+/// rows paint edge-to-edge and emit no break, so the logical line reassembles
+/// and re-wraps naturally at whatever width the consumer renders at.
+fn paint_history_row(
+    line: &alacritty_terminal::grid::Row<Cell>,
+    pen: &mut Pen,
+    hyperlink: &mut Option<alacritty_terminal::term::cell::Hyperlink>,
+    out: &mut Vec<u8>,
+) {
+    let cols = line.len();
+    let wrapped = cols > 0 && line[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    let mut end = cols;
+    if !wrapped {
+        while end > 0 && is_default_cell(&line[Column(end - 1)]) {
+            end -= 1;
+        }
+    }
+    for col in 0..end {
+        let cell = &line[Column(col)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        set_hyperlink(out, hyperlink, cell.hyperlink());
+        pen.apply_cell(out, cell);
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        if let Some(zerowidth) = cell.zerowidth() {
+            for zw in zerowidth {
+                out.extend_from_slice(zw.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    if !wrapped {
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 fn is_default_cell(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.fg == Color::Named(NamedColor::Foreground)
@@ -843,5 +1014,173 @@ mod tests {
         let first = e.serialize();
         let second = e.serialize();
         assert_eq!(first, second);
+    }
+
+    /// Concatenate the Lines payloads of a feed's events (test convenience).
+    fn committed(events: &[HistoryEvent]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for event in events {
+            if let HistoryEvent::Lines(lines) = event {
+                out.extend_from_slice(lines);
+            }
+        }
+        out
+    }
+
+    /// Render committed-line bytes in a fresh terminal and return its rows.
+    fn render_lines(cols: u16, rows: u16, lines: &[u8]) -> Vec<String> {
+        let mut viewer = Emulator::new(cols, rows);
+        viewer.feed(lines);
+        viewer.screen_text()
+    }
+
+    #[test]
+    fn scrolled_lines_commit_and_repaints_do_not() {
+        let mut e = Emulator::new(20, 3);
+        let events = e.feed_output(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let text = render_lines(20, 5, &committed(&events));
+        assert_eq!(text[0], "one", "oldest committed line first: {text:?}");
+        assert_eq!(text[1], "two");
+        assert!(text[2].is_empty(), "screen rows must not commit: {text:?}");
+
+        // A bottom-anchored repaint (claude/codex style) rewrites in place:
+        // nothing scrolls, nothing commits.
+        let events = e.feed_output(b"\x1b[3;1H\x1b[Kstatus-9\x1b[2;1H\x1b[Kbox-9");
+        assert!(committed(&events).is_empty(), "in-place repaint committed");
+    }
+
+    #[test]
+    fn committed_lines_keep_styling() {
+        let mut e = Emulator::new(20, 2);
+        let events = e.feed_output(b"\x1b[1;31mred\x1b[0m ok\r\nnext\r\nlast");
+        let mut viewer = Emulator::new(20, 4);
+        viewer.feed(&committed(&events));
+        assert_eq!(viewer.screen_text()[0], "red ok");
+        let grid = viewer.term.grid();
+        let cell = &grid[Line(0)][Column(0)];
+        assert_eq!(cell.fg, Color::Named(NamedColor::Red), "fg lost in commit");
+        assert!(cell.flags.contains(Flags::BOLD), "bold lost in commit");
+    }
+
+    #[test]
+    fn wrapped_logical_lines_commit_without_breaks() {
+        let mut e = Emulator::new(8, 2);
+        // 20 chars wrap across 3 rows at cols=8; scroll them fully off.
+        let events = e.feed_output(b"abcdefghijklmnopqrst\r\n1\r\n2\r\n3\r\n4");
+        let bytes = committed(&events);
+        // Rendered wider, the logical line must reassemble on one row.
+        let text = render_lines(40, 6, &bytes);
+        assert_eq!(text[0], "abcdefghijklmnopqrst", "wrap not reassembled: {text:?}");
+    }
+
+    #[test]
+    fn clear_screen_commits_viewport_then_wipe_truncates() {
+        let mut e = Emulator::new(20, 3);
+        e.feed_output(b"seen-1\r\nseen-2\r\nseen-3\r\nseen-4");
+        // ED 2 alone (plain `clear`): the viewport scrolls into history.
+        let events = e.feed_output(b"\x1b[2J\x1b[H");
+        let text = render_lines(20, 6, &committed(&events)).join("\n");
+        assert!(text.contains("seen-4"), "ED 2 must commit the viewport: {text}");
+
+        // A later ED 3 truncates previously committed history.
+        let events = e.feed_output(b"\x1b[3J");
+        assert!(
+            matches!(events.as_slice(), [HistoryEvent::Truncate]),
+            "ED 3 must surface as a truncate"
+        );
+    }
+
+    #[test]
+    fn clear_terminal_triple_orders_truncate_after_doomed_commits() {
+        // The claude/codex `/clear`: ESC[2J ESC[3J ESC[H in one chunk. The
+        // 2J-pushed viewport is cleared by the 3J inside the grid itself, so
+        // the net event stream is a bare truncate — nothing pre-clear may
+        // survive it.
+        let mut e = Emulator::new(20, 3);
+        e.feed_output(b"old-1\r\nold-2\r\nold-3\r\nold-4");
+        let events = e.feed_output(b"\x1b[2J\x1b[3J\x1b[H");
+        let survivors = committed(&events);
+        let position = events
+            .iter()
+            .position(|event| matches!(event, HistoryEvent::Truncate))
+            .expect("truncate event");
+        assert!(
+            survivors.is_empty() || position == 0,
+            "content committed before the truncate would resurrect cleared history"
+        );
+        assert!(matches!(events[position], HistoryEvent::Truncate));
+    }
+
+    #[test]
+    fn wipe_sequence_split_across_feeds_still_truncates() {
+        let mut e = Emulator::new(20, 3);
+        e.feed_output(b"x\r\ny\r\nz\r\nw");
+        assert!(committed(&e.feed_output(b"\x1b[")).is_empty());
+        let events = e.feed_output(b"3J");
+        assert!(
+            events.iter().any(|event| matches!(event, HistoryEvent::Truncate)),
+            "split ESC[3J missed"
+        );
+        // DECSED form too.
+        e.feed_output(b"a\r\nb\r\nc\r\nd");
+        let events = e.feed_output(b"\x1b[?3J");
+        assert!(events.iter().any(|event| matches!(event, HistoryEvent::Truncate)));
+    }
+
+    #[test]
+    fn sgr_params_containing_three_do_not_truncate() {
+        let mut e = Emulator::new(20, 3);
+        e.feed_output(b"p\r\nq\r\nr\r\ns");
+        let events = e.feed_output(b"\x1b[38;5;196mred\x1b[0m\x1b[33myellow\x1b[m");
+        assert!(
+            !events.iter().any(|event| matches!(event, HistoryEvent::Truncate)),
+            "SGR misread as a scrollback wipe"
+        );
+    }
+
+    #[test]
+    fn shrinking_rows_commits_displaced_lines() {
+        let mut e = Emulator::new(20, 6);
+        e.feed_output(b"r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6");
+        let events = e.resize(20, 3);
+        let text = render_lines(20, 8, &committed(&events)).join("\n");
+        assert!(
+            text.contains("r1"),
+            "rows displaced by a shrink must commit: {text}"
+        );
+        // The screen still holds the tail.
+        assert!(e.screen_text().join("\n").contains("r6"));
+    }
+
+    #[test]
+    fn alt_screen_scrolling_never_commits() {
+        let mut e = Emulator::new(20, 3);
+        e.feed_output(b"shell-1\r\nshell-2");
+        let events = e.feed_output(b"\x1b[?1049h\x1b[Hv1\r\nv2\r\nv3\r\nv4\r\nv5");
+        assert!(
+            committed(&events).is_empty(),
+            "alt-screen scroll must not pollute history"
+        );
+        let events = e.feed_output(b"\x1b[?1049l");
+        assert!(committed(&events).is_empty());
+        assert_eq!(e.screen_text()[0], "shell-1", "primary restored");
+    }
+
+    #[test]
+    fn large_bursts_commit_every_line() {
+        // A burst far beyond one drain stride: every line must commit exactly
+        // once, in order.
+        let mut e = Emulator::new(20, 4);
+        let mut input = Vec::new();
+        for i in 0..500 {
+            input.extend_from_slice(format!("line-{i:04}\r\n").as_bytes());
+        }
+        let events = e.feed_output(&input);
+        let bytes = committed(&events);
+        let text = String::from_utf8_lossy(&bytes);
+        let count = text.matches("line-").count();
+        // Everything scrolled off except what the 4-row screen retains.
+        assert_eq!(count, 500 - 3, "committed line count: {count}");
+        assert!(text.find("line-0000").unwrap() < text.find("line-0001").unwrap());
     }
 }

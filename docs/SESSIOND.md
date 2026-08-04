@@ -43,28 +43,32 @@ everything else.
    signaling/lifecycle JSON over its server control socket.
 2. **User-facing terminal rendering lives in the browser.** xterm.js in
    `web/` owns the grid a human sees. The worker also holds a *headless
-   checkpoint emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus
-   an owned ANSI serializer) fed from the PTY read path. Its current primary
-   and alternate-screen grids are plaintext state resident for the worker's
-   lifetime, bounded by the active terminal geometry; it keeps no deep
-   scrollback. It is used to synthesize encrypted segment checkpoints and
-   never transforms the live forwarded bytes. This is a deliberate revision
-   of the original "workers are byte pipes" rule: the byte-pipe design needed
-   a SIGWINCH jiggle to provoke checkpoint repaints from the app, which
-   disturbed the agent, stacked duplicate frames into scrollback on every
-   rotation, and made checkpoint quality depend on each app's WINCH behavior.
-   The emulator's fidelity is a tested contract (`feed → serialize → re-feed
-   ⇒ identical state`), not an assumption.
-3. **Raw PTY bytes in the live path, end-to-end.** Live output is forwarded
-   byte-for-byte, unparsed. Scrollback is the raw output stream plus typed
-   CHECKPOINT records containing geometry and serialized screen state; replay
-   is "feed the same bytes to the same emulator, opening from a serialized
-   screen at a known geometry."
+   emulator* (`sessiond/emulator.rs`, alacritty's `Term` core plus an owned
+   ANSI serializer) fed from the PTY read path. Its current primary and
+   alternate-screen grids are plaintext state resident for the worker's
+   lifetime, bounded by the active terminal geometry plus a bounded history
+   drain window. It synthesizes the live-screen repaint served with every
+   replay and decides which lines commit to history; it never transforms the
+   live forwarded bytes. This is a deliberate revision of the original
+   "workers are byte pipes" rule: the byte-pipe design needed a SIGWINCH
+   jiggle to provoke checkpoint repaints from the app, which disturbed the
+   agent, stacked duplicate frames into scrollback on every rotation, and
+   made checkpoint quality depend on each app's WINCH behavior. The
+   emulator's fidelity is a tested contract (`feed → serialize → re-feed ⇒
+   identical state`), not an assumption.
+3. **Raw PTY bytes in the live path; committed lines in the history path.**
+   Live output is forwarded byte-for-byte, unparsed. History is NOT the byte
+   stream: raw TUI bytes are a rendering protocol, not a document, and
+   re-executing them can never yield faithful scrollback (intermediate
+   repaint frames, resize reflow). Instead the emulator commits each line
+   exactly once — at the moment it scrolls off the screen — serialized as
+   styled text, and only those committed lines are logged. Replay is
+   "committed history + a freshly synthesized screen repaint."
 4. **One process per agent.** Crash isolation, per-agent keys, per-agent
    lifecycle, no shared mux server.
 5. **Honest crypto claims.** Encrypted-at-rest scrollback protects the segment
-   files. It does not mean "encrypted before DRAM": the PTY path, checkpoint
-   grid, checkpoint serialization, replay, and forwarding all require
+   files. It does not mean "encrypted before DRAM": the PTY path, emulator
+   grid, committed-line serialization, replay, and forwarding all require
    plaintext in host memory (§6.3).
 
 ## 3. Process model
@@ -77,7 +81,7 @@ spawnd (host supervisor, one per host)
  ├── spawn-worker --agent-id A … (one process per agent, own process group)
  │    ├── owns the PTY master (portable-pty)
  │    ├── agent process (session leader on the PTY slave)
- │    ├── headless checkpoint emulator (grid state only, no scrollback)
+ │    ├── headless emulator (grid state + bounded history drain window)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
  │    ├── lifetime flock: $WORKER_DIR/<agent-id>.lock
  │    ├── supervisor listener: $WORKER_DIR/<agent-id>.sock
@@ -155,10 +159,10 @@ guessed at.
 | `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
-| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); forces a log checkpoint at the new geometry |
+| `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); lines displaced by a narrowing reflow commit to history |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
-| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing replay: geometry marker + checkpoint repaint + output with in-stream geometry markers (§8.1); watermark = cumulative lifetime output bytes logged at capture, including output no longer retained |
+| `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing v2 replay: geometry marker + history sentinel + committed lines, then geometry marker + live screen repaint (§8.1); watermark = cumulative lifetime PTY output bytes at capture, including output never committed to history |
 | `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?: TERM\|KILL}` | compatibility command; current spawnd lifecycle delivery uses the independent endpoint below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
@@ -251,22 +255,23 @@ u32 LE ciphertext_len | u8 kind | u64 LE seq | ciphertext (AEAD, 16-byte tag)
   spliced between kinds without detection. Any authentication or sequence
   failure **fails the whole replay closed** (and zeroizes the partial
   plaintext) rather than returning a best-effort screen.
-- **Kinds**: `OUTPUT` (raw PTY bytes) and `CHECKPOINT` (geometry plus an
-  emulator-serialized ANSI repaint opening every segment; §8.1). The
-  checkpoint payload is encrypted like output and its disk/replay footprint is
-  charged to the same total resource budget.
+- **Kinds**: `HISTORY` (a batch of committed scrollback lines, serialized as
+  self-contained styled text; §8.1). An app-driven scrollback wipe (`ED 3`)
+  is not a record at all — it physically unlinks every retained segment
+  (`truncate_all`), so cleared history stops existing on disk. The seq
+  counter never resets across truncation, so nonces cannot repeat.
 
 ### 6.2 Encrypt-on-read, bounded growth
 
-Each output chunk is fed into the checkpoint emulator and then encrypted before
-any scrollback write. The worker subsequently forwards the same plaintext
-chunk live and wipes its owned buffer. This is an encrypt-before-disk property,
-not encryption at the PTY/DRAM boundary. Plaintext is never written to segment
-files (unit-tested by grepping them for a marker;
-`plaintext_never_hits_disk`).
+Each output chunk is fed into the emulator; the lines it commits are
+encrypted before any scrollback write. The worker subsequently forwards the
+same plaintext chunk live and wipes its owned buffers. This is an
+encrypt-before-disk property, not encryption at the PTY/DRAM boundary.
+Plaintext is never written to segment files (unit-tested by grepping them for
+a marker; `plaintext_never_hits_disk`).
 
 Growth is controlled by two knobs. `--segment-bytes` defaults to 256 KiB of
-additional charged record bytes beyond the segment checkpoint before rotation
+additional charged record bytes per segment before rotation
 is due. `--max-log-bytes` defaults to an 8 MiB conservative total scrollback
 resource budget. Operators/tests may lower that value; values above the
 compiled 8 MiB upper bound are rejected. The charge includes exact retained
@@ -276,15 +281,15 @@ retained `Vec`/path bookkeeping, actual allocated file/directory blocks with
 safe floors, and conservative inode/directory-entry overhead. A hard 128-file
 cap plus ring-reused filenames bounds live inodes and directory growth under
 one-byte-output/resize adversaries. Before admitting a record the log removes
-whole oldest segments; it never returns a partial segment. A checkpoint that
+whole oldest segments; it never returns a partial segment. A record that
 fails conservative preflight is rejected before its file is created. If an
-append or checkpoint cannot preserve those invariants, the worker destroys and
+append or rotation cannot preserve those invariants, the worker destroys and
 disables its replay log but continues live output; subsequent replay is
 unavailable rather than partial or over-budget.
 
 The 8 MiB value is therefore neither "8 MiB of plaintext output" nor an exact
 measurement of process RSS. It is a hard ceiling on this deliberately
-conservative charge model, including checkpoint/grid serialization in replay
+conservative charge model, including grid/line serialization in replay
 form and bounded transient replay plaintext. The live emulator grid is a
 separate, geometry-bounded resident allocation (§6.3). The `spawn.ctl` layer
 also retains its independent 12 MiB response rejection ceiling.
@@ -301,7 +306,7 @@ also retains its independent 12 MiB response rejection ceiling.
   swap-residency guarantee weakens.
 - Owned plaintext is explicitly wiped on drop across the implemented handoff:
   worker PTY read chunks and reader/writer scratch, queued input and worker
-  frame payloads, serialized checkpoints, and worker replay buffers. spawnd's
+  frame payloads, serialized committed lines, and worker replay buffers. spawnd's
   replay result owns a self-wiping payload even while parked in a oneshot; its
   source bytes wipe on receiver cancellation and normal consumption.
   DataChannel input is copied into the self-wiping worker-input wrapper.
@@ -315,7 +320,7 @@ also retains its independent 12 MiB response rejection ceiling.
 - The headless emulator retains semantic plaintext for the current primary and
   alternate screen, cursor, modes, and auxiliary terminal state for the
   worker's lifetime. That state scales with terminal geometry and has no deep
-  history, but it is not transient. A serialized checkpoint and decrypted
+  history, but it is not transient. A serialized line batch and decrypted
   replay are additional transient plaintext buffers. The scrollback admission
   charge accounts conservatively for retained disk records, the returned
   replay, and decryption/framing scratch within its 8 MiB default; the
@@ -349,7 +354,7 @@ Why this is the right default — the alternatives and their tradeoffs:
 | **Per-worker ephemeral (chosen)** | no — but the PTY and agent died with the worker anyway, so the log has nothing meaningful left to replay | one agent's current session | none | zero key-management surface; nonce safety trivial; cleanup = forget |
 | Host key (spawnd keyring) | yes | every agent's scrollback on the host | none | requires spawnd→worker key delivery (over the socket, fine) and rotation story; buys persistence of logs whose PTY is gone — mostly useful for a future "transcript archive" feature, not live reattach |
 | Per-agent derived key (HKDF from host key + agent_id) | yes | one agent's full history | none | same delivery/rotation cost as host key with a smaller blast radius; the natural upgrade path if worker-restart-with-history ever becomes a feature |
-| Sealed to browser device keys (Phase-3 WebCrypto identities) | yes | nothing on the host can read it — including the worker | pub-key registry only | the strongest story ("host stores what only your devices can open") but the worker could no longer *serve* replay; replay/checkpoint logic would move client-side, multi-device needs key-wrapping fan-out. This is the TRUST.md "client-side-encrypted transcript backup" (Later) item, not the live-session log |
+| Sealed to browser device keys (Phase-3 WebCrypto identities) | yes | nothing on the host can read it — including the worker | pub-key registry only | the strongest story ("host stores what only your devices can open") but the worker could no longer *serve* replay; replay/serialization logic would move client-side, multi-device needs key-wrapping fan-out. This is the TRUST.md "client-side-encrypted transcript backup" (Later) item, not the live-session log |
 
 The live-session log exists to serve reattach while the agent is alive; the
 ephemeral key covers exactly that lifetime with the smallest possible surface.
@@ -358,56 +363,74 @@ When TRUST.md's optional encrypted transcript backup lands, it should be a
 
 ## 8. Reattach and replay
 
-### 8.1 Checkpoint segments
+### 8.1 Committed-line history
 
-Every segment opens with a `CHECKPOINT` record carrying `{cols, rows,
-emulator-serialized screen state}`. When `append_output` crosses the segment
-budget, the worker serializes its checkpoint emulator and rotates — **the
-agent process is never signaled, resized, or otherwise disturbed by storage
-rotation** (`scrollback_rotation_must_not_disturb_the_agent` in
-`worker_e2e.rs` asserts this). A PTY resize **forces a checkpoint at the new
-geometry** (replacing the active segment in place when it holds no output
-yet, so resize storms rewrite one small file instead of growing the log);
-every segment is therefore single-geometry and self-contained.
+History is owned by the emulator, not reconstructed from bytes. A line is
+**committed exactly once, at the moment it scrolls off the top of the
+screen** (alacritty's grid provides the semantics: full-screen scrolls and
+top-anchored regions rotate lines into grid history; `ED 2` scrolls the
+viewport into history, VTE/kitty-style). After every feed stride the worker
+drains those lines — serialized as self-contained styled text: SGR runs +
+glyphs, `\r\n` per hard line end, soft-wrapped rows painted edge-to-edge with
+no break so logical lines re-wrap at the consumer's width — and appends them
+encrypted (`HISTORY` records). In-place TUI repaints never scroll, so they
+never commit; a resize cannot retroactively reflow committed lines (narrowing
+commits the displaced rows once, widening finds an empty drain window and has
+nothing to un-commit); `ED 3` (`/clear` in claude/codex emits `2J 3J H`)
+physically truncates the log (`scrollback_wipe_erases_replayed_history`).
+Segment rotation is purely a storage/eviction concern — **the agent process
+is never signaled, resized, or otherwise disturbed by it**
+(`scrollback_rotation_must_not_disturb_the_agent`).
 
-Replay selects the newest run of whole segments whose complete replay
-representation fits the caller's `max_bytes`. If the newest complete segment
-does not fit, replay fails instead of returning a partial segment. The result
-is a **self-describing stream of geometry-tagged chunks**: each included
-segment contributes `CSI 8 ; rows ; cols t`, its checkpoint repaint, and its
-output. Checkpoint repaints are idempotent (leading `?1049l`, full-row
-painting, no ED), so mid-stream chunks converge rather than duplicate, and the
-final chunk alone reconstructs the current screen at the current geometry. The
-browser exploits both properties (`parseExactReplay` in `Terminal.tsx`): the
-**live terminal is seeded from the final chunk with zero resize calls** — it is
-fit-sized and must never be geometry-walked — while the display-only scrollback
-overlay renders every chunk at its own geometry via sequenced `term.resize()`
-(xterm.js parses but does not implement CSI 8 t itself).
+Replay concatenates the newest run of whole segments whose plaintext fits the
+caller's `max_bytes` (failing closed rather than splitting a segment), then
+the worker frames the response as a **self-describing v2 stream**:
 
-The original design used checkpoint *markers* plus a SIGWINCH jiggle to
-provoke repaints from the app. That was retired: it duplicated full frames in
-scrollback on every 256KB rotation (Ink-style TUIs fully re-render on WINCH),
-left replay quality dependent on app behavior, and could not describe
-geometry at all. The emulator-serialized checkpoint is the iTerm2 session
-restoration model adapted to encrypted-at-rest storage.
+```
+CSI 8 ; rows ; cols t   APC "sp:h1" ST   <committed lines…>
+CSI 8 ; rows ; cols t   <emulator-serialized live screen repaint>
+```
 
-### 8.2 The checkpoint emulator
+Both markers carry the *current* geometry; the history section is
+geometry-free flowing text. The screen repaint is synthesized from the live
+emulator at request time (idempotent: full-row painting, no ED), so the
+final chunk alone reconstructs the current screen — the browser's live
+terminal is still **seeded from the final chunk with zero resize calls**.
+The scrollback overlay, on recognizing the APC sentinel
+(`parseHistoryReplay` in `Terminal.tsx`), writes the history as flowing text
+at its own width (never geometry-walked, so nothing already rendered ever
+reflows), scrolls the occupied viewport rows into the scrollback region, and
+paints the screen chunk below. Clients without the sentinel fall back to the
+legacy chunk walk; replays from pre-v2 workers (which persist across
+upgrades) still parse via the same marker framing.
 
-`sessiond/emulator.rs` wraps alacritty_terminal's `Term` (no scrolling
-history — the grid only; deep history stays in the byte log) plus a shadow
-handler on a second vte parser for the states `Term` keeps private (margins,
-charsets). `serialize()` emits an ANSI stream reconstructing cells,
-attributes, hyperlinks, wide/combining chars, cursor (including pending
-wrap), margins, modes, charsets, cursor style, and palette overrides — for
-both screens when the alternate screen is active — including the DECSC
-saved-cursor register, which Ink renderers (claude, codex) rely on around
-every frame. Checkpoints only land on escape-sequence/UTF-8 boundaries
-(`sessiond/boundary.rs` tracks VT framing; the worker defers a due
-checkpoint until the stream is safe to cut, capped at 32 KB). The fidelity
-contract (`feed → serialize → re-feed ⇒ identical state`) is enforced
-cell-by-cell by the module's unit tests, and end-to-end by
-`replay_reconstructs_the_live_screen_across_rotations`, which renders the
-live byte stream and the replay through two emulators and requires identical
+Two prior designs were retired. Checkpoint markers + SIGWINCH jiggle
+duplicated full frames in scrollback on every rotation and left replay
+quality dependent on app WINCH behavior. Its replacement — raw-byte segments
+opened by emulator-serialized checkpoints — fixed the jiggle but kept
+re-executing the byte stream to rebuild history, which pushed intermediate
+repaint frames into the overlay's scrollback and reflowed (mangled) TUI rows
+at every geometry transition. Committed lines fix the class: history is a
+document written once, not a render re-run.
+
+### 8.2 The emulator
+
+`sessiond/emulator.rs` wraps alacritty_terminal's `Term` (grid history is
+enabled but used only as a bounded drain window — `feed_output` serializes
+and clears it every stride; deep history lives in the encrypted line log)
+plus a shadow handler on a second vte parser for the states `Term` keeps
+private (margins, charsets). `serialize()` emits an ANSI stream
+reconstructing cells, attributes, hyperlinks, wide/combining chars, cursor
+(including pending wrap), margins, modes, charsets, cursor style, and palette
+overrides — for both screens when the alternate screen is active — including
+the DECSC saved-cursor register, which Ink renderers (claude, codex) rely on
+around every frame. A byte-exact cross-chunk scanner detects `ED 3`
+(`CSI 3 J` / `CSI ? 3 J`) and surfaces it as a truncate event ordered into
+the commit stream. The fidelity contract (`feed → serialize → re-feed ⇒
+identical state`) is enforced cell-by-cell by the module's unit tests, and
+end-to-end by `replay_reconstructs_the_live_screen_across_rotations`, which
+renders the live byte stream and the replay through two emulators and
+requires identical
 screens. `T_REDRAW` is obsolete and ignored by workers: snapshots synthesized
 from the emulator already carry cursor and modes, so there is nothing left to
 provoke.
@@ -425,7 +448,7 @@ seen live bytes deterministically using `dc_offset`.
 
 `spawn.ctl` history/snapshot exposes this as styled terminal replay only:
 clients send `plain:false`. A `plain:true` request fails closed with
-`plain_replay_unsupported`; ANSI checkpoint/output bytes are never mislabeled
+`plain_replay_unsupported`; ANSI replay bytes are never mislabeled
 as plain text.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
@@ -437,8 +460,8 @@ through the full spawnd plumbing (forwarder, direct sinks, adopt path) in
 ## 9. Resize, flow control, multi-viewer
 
 **Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
-sends `T_RESIZE`; the worker applies it to the PTY master and the checkpoint
-emulator, and checkpoints the log at the new geometry. Resize *authority* is
+sends `T_RESIZE`; the worker applies it to the PTY master and the emulator,
+committing any lines a narrowing reflow displaces. Resize *authority* is
 negotiated endpoint-to-endpoint over `spawn.ctl`: the daemon's display-control
 hub designates one
 controlling viewer whose geometry drives the session while other viewers dim

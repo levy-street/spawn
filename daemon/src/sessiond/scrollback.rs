@@ -1,28 +1,27 @@
-//! Encrypted-at-rest, append-only scrollback log with stateful checkpoints.
+//! Encrypted-at-rest, append-only log of committed scrollback lines.
 //!
-//! PTY output is encrypted before it is written to this log and only ever
-//! hits disk as ChaCha20-Poly1305 ciphertext. The log is segmented: a new segment begins
-//! with a CHECKPOINT record carrying the geometry and an emulator-serialized
-//! screen state (see `sessiond::emulator`), so a replay starting at any
-//! segment boundary opens with an exact synthesized repaint — the agent
-//! process is never signaled or disturbed to produce one. A PTY resize
-//! forces a checkpoint (replacing the active segment when it holds no output
-//! yet, so resize storms cannot grow the log), which makes **every segment
-//! single-geometry and self-contained**.
+//! History is a document, not a byte stream: the emulator commits each line
+//! exactly once, at the moment it scrolls off the screen, serialized as
+//! styled text (see `sessiond::emulator::HistoryEvent`). Those batches are
+//! encrypted with ChaCha20-Poly1305 before they ever touch disk and appended
+//! here. Replay is a pure concatenation of the retained batches — no
+//! checkpoints, no raw repaint bytes, no geometry walking; the live screen is
+//! synthesized separately by the worker at request time.
 //!
-//! Replay output is a self-describing ANSI stream of geometry-tagged chunks:
-//! each included segment contributes `CSI 8 ; rows ; cols t` + its checkpoint
-//! repaint + its output. Checkpoint repaints are idempotent (full-row
-//! painting, no ED), so mid-stream chunks converge rather than duplicate, and
-//! a consumer may seed a live terminal from the final chunk alone.
+//! The log is segmented purely for eviction: whole oldest segments are
+//! deleted when the resource budget is exceeded, which drops the oldest
+//! committed lines in blocks. Because batches are self-contained (each opens
+//! with a full SGR reset), a replay starting at any segment renders cleanly.
+//! An app-driven scrollback wipe (`CSI 3 J`) maps to [`ScrollbackLog::truncate_all`],
+//! which physically unlinks every retained segment — cleared history stops
+//! existing on disk, it is not merely skipped on render.
 //!
 //! Growth is bounded by one conservative resource budget. It charges exact
 //! ciphertext/framing bytes, actual allocated file/directory blocks with safe
 //! floors and metadata overhead, twice the replay representation (returned
 //! bytes plus decryption/framing scratch), and retained segment/path
 //! bookkeeping. Segment filenames occupy a fixed ring and a hard count cap
-//! bounds inodes and directory growth even under tiny-output resize storms.
-//! Whole oldest segments are deleted; a checkpoint that fails conservative
+//! bounds inodes and directory growth. A record that fails conservative
 //! preflight is rejected before a file is created, and replay never returns a
 //! partial segment.
 //!
@@ -40,12 +39,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use super::secret;
 
-/// Additional charged resource bytes per segment before a checkpoint rotation
-/// is due. The segment's checkpoint is charged separately.
+/// Charged resource bytes per segment before rotation opens the next one.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 256 * 1024;
 /// Total scrollback resource budget across all segments.
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -57,23 +55,22 @@ const FILE_METADATA_CHARGE_BYTES: u64 = 1024;
 const DIRECTORY_METADATA_CHARGE_BYTES: u64 = 1024;
 const SEGMENT_PHYSICAL_FLOOR: u64 = ALLOCATION_FLOOR_BYTES + FILE_METADATA_CHARGE_BYTES;
 
-pub const KIND_OUTPUT: u8 = 1;
-pub const KIND_CHECKPOINT: u8 = 2;
+/// A batch of committed history lines (serialized styled text).
+pub const KIND_HISTORY: u8 = 3;
 
-/// Terminal geometry plus the emulator-serialized screen state that
-/// reconstructs it; written at the head of every segment.
-pub struct Checkpoint<'a> {
-    pub cols: u16,
-    pub rows: u16,
-    pub state: &'a [u8],
-}
-
-/// The geometry marker heading every replay chunk: `CSI 8 ; rows ; cols t`
-/// (xterm window ops syntax; xterm.js parses but does not apply it, so the
-/// web client splits on it and applies geometry via `term.resize()`).
+/// The geometry marker heading each section of a worker replay stream:
+/// `CSI 8 ; rows ; cols t` (xterm window ops syntax; xterm.js parses but does
+/// not apply it, so the web client splits on it).
 pub fn geometry_marker(cols: u16, rows: u16) -> Vec<u8> {
     format!("\x1b[8;{rows};{cols}t").into_bytes()
 }
+
+/// In-band sentinel that opens a committed-line-history replay stream
+/// (immediately after the head geometry marker). An APC string, so a
+/// terminal that has it written verbatim ignores it. Clients that recognize
+/// it render the history section as flowing lines instead of geometry-walking
+/// raw bytes; clients that don't fall back to the legacy chunk walk.
+pub const REPLAY_HISTORY_SENTINEL: &[u8] = b"\x1b_sp:h1\x1b\\";
 
 /// Per-record header: `u32 LE ciphertext_len | u8 kind | u64 LE seq`.
 const RECORD_HEADER_LEN: usize = 4 + 1 + 8;
@@ -85,7 +82,7 @@ struct Segment {
     path: PathBuf,
     /// Exact encrypted record bytes retained on disk.
     disk_bytes: u64,
-    /// Bytes this segment contributes to a styled replay.
+    /// Bytes this segment contributes to a replay.
     replay_bytes: u64,
     /// Disk + twice replay bytes. The second replay copy covers the largest
     /// transient during decrypt/framing without pretending plaintext is absent.
@@ -93,35 +90,26 @@ struct Segment {
     /// Allocated file blocks (not logical length), with an allocation floor and
     /// conservative inode/directory-entry overhead.
     physical_charge: u64,
-    /// Rotation threshold: checkpoint charge plus configured segment charge.
-    rotate_at: u64,
 }
 
 pub struct ScrollbackLog {
     dir: PathBuf,
     cipher: ChaCha20Poly1305,
     /// Strictly monotonic record counter; doubles as the AEAD nonce, which is
-    /// safe because the key is unique per worker process.
+    /// safe because the key is unique per worker process. Never reset — not
+    /// even by [`Self::truncate_all`] — so nonces cannot repeat.
     seq: u64,
     segments: Vec<Segment>,
     active: Option<File>,
     segment_bytes: u64,
     max_bytes: u64,
-    /// Cumulative OUTPUT plaintext bytes ever appended (the replay watermark).
+    /// Cumulative history plaintext bytes ever appended (observability).
     total_logged: u64,
-    /// Current geometry, tracked to drop no-op resize records.
-    geometry: (u16, u16),
 }
 
 impl ScrollbackLog {
-    pub fn new(dir: &Path, key: &secret::SecretBytes, initial: Checkpoint<'_>) -> Result<Self> {
-        Self::with_limits(
-            dir,
-            key,
-            DEFAULT_SEGMENT_BYTES,
-            DEFAULT_MAX_LOG_BYTES,
-            initial,
-        )
+    pub fn new(dir: &Path, key: &secret::SecretBytes) -> Result<Self> {
+        Self::with_limits(dir, key, DEFAULT_SEGMENT_BYTES, DEFAULT_MAX_LOG_BYTES)
     }
 
     pub fn with_limits(
@@ -129,7 +117,6 @@ impl ScrollbackLog {
         key: &secret::SecretBytes,
         segment_bytes: u64,
         max_bytes: u64,
-        initial: Checkpoint<'_>,
     ) -> Result<Self> {
         if key.as_slice().len() != 32 {
             bail!("scrollback key must be 32 bytes");
@@ -174,24 +161,22 @@ impl ScrollbackLog {
             segment_bytes,
             max_bytes,
             total_logged: 0,
-            geometry: (initial.cols, initial.rows),
         };
-        log.begin_segment(1, &initial)?;
+        log.begin_segment(1)?;
         Ok(log)
     }
 
-    /// Append PTY output. Returns true when a checkpoint rotation is due —
-    /// the caller should serialize its emulator state and call
-    /// [`rotate`](Self::rotate). The agent process is not involved.
-    pub fn append_output(&mut self, plaintext: &[u8]) -> Result<bool> {
+    /// Append one batch of committed history lines, rotating and evicting as
+    /// the budget requires.
+    pub fn append_history(&mut self, plaintext: &[u8]) -> Result<()> {
         if plaintext.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         let disk_bytes = record_disk_bytes(plaintext.len())?;
         let replay_bytes = plaintext.len() as u64;
         let record_charge = record_charge(disk_bytes, replay_bytes)?;
         self.trim_for_additional(record_charge, false)?;
-        self.append_record(KIND_OUTPUT, plaintext)?;
+        self.append_record(KIND_HISTORY, plaintext)?;
         let due = {
             let seg = self
                 .segments
@@ -201,63 +186,39 @@ impl ScrollbackLog {
             seg.replay_bytes += replay_bytes;
             seg.record_charge += record_charge;
             seg.physical_charge = segment_physical_charge(&seg.path)?;
-            seg.record_charge >= seg.rotate_at
+            seg.record_charge >= self.segment_bytes
         };
         self.total_logged += plaintext.len() as u64;
+        if due {
+            let next = self.segments.last().map(|s| s.index + 1).unwrap_or(1);
+            self.begin_segment(next)?;
+        }
         self.trim_to_budget()?;
-        Ok(due)
-    }
-
-    /// Record a PTY geometry change by checkpointing at the new geometry:
-    /// rotate when the active segment holds output, otherwise replace the
-    /// active segment's checkpoint in place — a resize storm therefore
-    /// rewrites one small file instead of growing the log. No-op when the
-    /// geometry is unchanged.
-    pub fn resize_checkpoint(&mut self, checkpoint: &Checkpoint<'_>) -> Result<()> {
-        if self.geometry == (checkpoint.cols, checkpoint.rows) {
-            return Ok(());
-        }
-        let active = self
-            .segments
-            .last()
-            .context("scrollback has no active segment")?;
-        if active.record_charge == active.rotate_at.saturating_sub(self.segment_bytes) {
-            self.validate_checkpoint(checkpoint, active.index)?;
-            let index = active.index;
-            let path = active.path.clone();
-            self.active.take();
-            unlink_segment(&path)?;
-            self.segments.pop();
-            self.segments.shrink_to_fit();
-            let result = self.begin_segment(index, checkpoint);
-            if result.is_ok() {
-                self.geometry = (checkpoint.cols, checkpoint.rows);
-            }
-            return result;
-        }
-        self.rotate(checkpoint)
-    }
-
-    /// Close the active segment and open the next one headed by `checkpoint`,
-    /// then drop oldest segments beyond the budget.
-    pub fn rotate(&mut self, checkpoint: &Checkpoint<'_>) -> Result<()> {
-        let next = self.segments.last().map(|s| s.index + 1).unwrap_or(1);
-        self.begin_segment(next, checkpoint)?;
-        self.geometry = (checkpoint.cols, checkpoint.rows);
         Ok(())
     }
 
-    /// Cumulative OUTPUT plaintext bytes ever appended.
+    /// Physically drop all retained history (the app erased its scrollback).
+    /// Every segment file is unlinked and a fresh empty segment begins; the
+    /// record sequence keeps counting so AEAD nonces never repeat.
+    pub fn truncate_all(&mut self) -> Result<()> {
+        let next = self.segments.last().map(|s| s.index + 1).unwrap_or(1);
+        self.active.take();
+        for seg in &self.segments {
+            unlink_segment(&seg.path)?;
+        }
+        self.segments.clear();
+        self.begin_segment(next)
+    }
+
+    /// Cumulative history plaintext bytes ever appended.
     pub fn total_logged(&self) -> u64 {
         self.total_logged
     }
 
-    /// Decrypt and stitch a self-describing replay stream from the newest run
-    /// of whole segments whose plaintext fits `max_bytes` (always at least
-    /// the newest segment). Every included segment contributes a geometry
-    /// marker + its checkpoint repaint + its output, so each chunk between
-    /// markers is self-contained and the final chunk alone reconstructs the
-    /// current screen at the current geometry.
+    /// Decrypt and concatenate committed-line batches from the newest run of
+    /// whole segments whose plaintext fits `max_bytes` (always at least the
+    /// newest segment). Batches are self-contained, so a replay starting at
+    /// any retained segment renders cleanly.
     pub fn replay(&mut self, max_bytes: u64) -> Result<Vec<u8>> {
         if max_bytes == 0 {
             bail!("replay budget must be non-zero");
@@ -287,8 +248,8 @@ impl ScrollbackLog {
         let capacity = usize::try_from(budget).context("replay budget does not fit usize")?;
         let mut out = Vec::with_capacity(capacity);
         // Seqs must be contiguous within a segment and strictly increasing
-        // across segment boundaries (in-place checkpoint replacement retires
-        // seq ranges, so cross-segment gaps are legitimate).
+        // across segment boundaries (truncation retires seq ranges, so
+        // cross-segment gaps are legitimate).
         let mut min_seq: u64 = 0;
         for seg in &self.segments[start..] {
             let data = match fs::read(&seg.path)
@@ -343,24 +304,8 @@ impl ScrollbackLog {
                         );
                     }
                 };
-                match kind {
-                    KIND_OUTPUT => out.extend_from_slice(&plaintext),
-                    KIND_CHECKPOINT => {
-                        let (cols, rows, state) = match decode_checkpoint(&plaintext) {
-                            Ok(parts) => parts,
-                            Err(e) => {
-                                plaintext.zeroize();
-                                secret::wipe(&mut out);
-                                return Err(e.context(format!(
-                                    "decoding checkpoint in {}",
-                                    seg.path.display()
-                                )));
-                            }
-                        };
-                        out.extend_from_slice(&geometry_marker(cols, rows));
-                        out.extend_from_slice(state);
-                    }
-                    _ => {}
+                if kind == KIND_HISTORY {
+                    out.extend_from_slice(&plaintext);
                 }
                 plaintext.zeroize();
             }
@@ -418,10 +363,9 @@ impl ScrollbackLog {
         let _ = fs::remove_dir(&self.dir);
     }
 
-    fn begin_segment(&mut self, index: u64, checkpoint: &Checkpoint<'_>) -> Result<()> {
+    fn begin_segment(&mut self, index: u64) -> Result<()> {
         let path = self.dir.join(segment_name(index));
-        let (disk_bytes, replay_bytes, checkpoint_charge) =
-            self.validate_checkpoint(checkpoint, index)?;
+        self.validate_new_segment(&path)?;
 
         // Reuse a fixed filename ring and unlink the oldest file before its
         // slot is reused. This bounds both live inodes and directory entries.
@@ -431,40 +375,16 @@ impl ScrollbackLog {
             self.segments.remove(0);
         }
 
-        let mut payload = Zeroizing::new(Vec::with_capacity(4 + checkpoint.state.len()));
-        payload.extend_from_slice(&checkpoint.cols.to_le_bytes());
-        payload.extend_from_slice(&checkpoint.rows.to_le_bytes());
-        payload.extend_from_slice(checkpoint.state);
-        let seq = self.seq;
-        let mut record = encrypt_record(&self.cipher, KIND_CHECKPOINT, seq, &payload)?;
-
-        let mut file = match OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(&path)
-            .with_context(|| format!("creating {}", path.display()))
-        {
-            Ok(file) => file,
-            Err(error) => {
-                record.zeroize();
-                return Err(error);
-            }
-        };
+            .with_context(|| format!("creating {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         }
-        if let Err(error) = file
-            .write_all(&record)
-            .with_context(|| format!("writing checkpoint to {}", path.display()))
-        {
-            record.zeroize();
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-        record.zeroize();
         let physical_charge = match segment_physical_charge(&path) {
             Ok(charge) => charge,
             Err(error) => {
@@ -480,16 +400,11 @@ impl ScrollbackLog {
         self.segments.push(Segment {
             index,
             path,
-            disk_bytes,
-            replay_bytes,
-            record_charge: checkpoint_charge,
+            disk_bytes: 0,
+            replay_bytes: 0,
+            record_charge: 0,
             physical_charge,
-            rotate_at: checkpoint_charge.saturating_add(self.segment_bytes),
         });
-        self.seq = self
-            .seq
-            .checked_add(1)
-            .context("scrollback sequence exhausted")?;
         self.trim_to_budget()?;
         Ok(())
     }
@@ -539,36 +454,21 @@ impl ScrollbackLog {
         Ok(())
     }
 
-    fn validate_checkpoint(
-        &self,
-        checkpoint: &Checkpoint<'_>,
-        index: u64,
-    ) -> Result<(u64, u64, u64)> {
-        let payload_len = checkpoint
-            .state
-            .len()
-            .checked_add(4)
-            .context("checkpoint length overflow")?;
-        let disk_bytes = record_disk_bytes(payload_len)?;
-        let replay_bytes = u64::try_from(checkpoint.state.len())?
-            .checked_add(geometry_marker(checkpoint.cols, checkpoint.rows).len() as u64)
-            .context("checkpoint replay length overflow")?;
-        let charge = record_charge(disk_bytes, replay_bytes)?;
-        let path = self.dir.join(segment_name(index));
+    /// Preflight for a fresh (empty) segment before its file is created.
+    fn validate_new_segment(&self, path: &Path) -> Result<()> {
         let minimum = self
             .fixed_memory_charge()
             .saturating_add(directory_physical_charge(&self.dir))
             .saturating_add(std::mem::size_of::<Segment>() as u64)
-            .saturating_add(path_heap_charge(&path))
-            .saturating_add(SEGMENT_PHYSICAL_FLOOR)
-            .saturating_add(charge);
+            .saturating_add(path_heap_charge(path))
+            .saturating_add(SEGMENT_PHYSICAL_FLOOR);
         if minimum > self.max_bytes {
             bail!(
-                "checkpoint requires at least {minimum} charged bytes, exceeding total budget {}",
+                "a scrollback segment requires at least {minimum} charged bytes, exceeding total budget {}",
                 self.max_bytes
             );
         }
-        Ok((disk_bytes, replay_bytes, charge))
+        Ok(())
     }
 
     fn fixed_memory_charge(&self) -> u64 {
@@ -714,15 +614,6 @@ fn aad_for(kind: u8, seq: u64) -> [u8; 9] {
     aad
 }
 
-fn decode_checkpoint(payload: &[u8]) -> Result<(u16, u16, &[u8])> {
-    if payload.len() < 4 {
-        bail!("checkpoint payload shorter than geometry header");
-    }
-    let cols = u16::from_le_bytes([payload[0], payload[1]]);
-    let rows = u16::from_le_bytes([payload[2], payload[3]]);
-    Ok((cols, rows, &payload[4..]))
-}
-
 fn parse_record<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u8, u64, &'a [u8])> {
     if data.len() - *offset < RECORD_HEADER_LEN {
         bail!("truncated record header");
@@ -748,168 +639,76 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
 
-    fn ckpt(state: &[u8]) -> Checkpoint<'_> {
-        Checkpoint {
-            cols: 80,
-            rows: 24,
-            state,
-        }
-    }
-
     fn new_log(dir: &Path, segment: u64, max: u64) -> ScrollbackLog {
         let key = secret::SecretBytes::random(32).unwrap();
-        ScrollbackLog::with_limits(dir, &key, segment, max, ckpt(b"")).unwrap()
-    }
-
-    fn marker() -> Vec<u8> {
-        geometry_marker(80, 24)
+        ScrollbackLog::with_limits(dir, &key, segment, max).unwrap()
     }
 
     #[test]
     fn append_and_replay_round_trip() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        log.append_output(b"hello ").unwrap();
-        log.append_output(b"world\r\n").unwrap();
-        assert_eq!(log.total_logged(), 13);
+        log.append_history(b"hello \r\n").unwrap();
+        log.append_history(b"world\r\n").unwrap();
+        assert_eq!(log.total_logged(), 15);
         let replay = log.replay(1024 * 1024).unwrap();
-        assert_eq!(replay, [marker().as_slice(), b"hello world\r\n"].concat());
+        assert_eq!(replay, b"hello \r\nworld\r\n");
     }
 
     #[test]
-    fn replay_opens_with_checkpoint_state() {
+    fn truncate_unlinks_every_segment_and_appends_continue() {
         let dir = tempdir().unwrap();
-        let key = secret::SecretBytes::random(32).unwrap();
-        let mut log = ScrollbackLog::with_limits(
-            dir.path(),
-            &key,
-            1024,
-            16 * 1024,
-            Checkpoint {
-                cols: 120,
-                rows: 40,
-                state: b"REPAINT",
-            },
-        )
-        .unwrap();
-        log.append_output(b"tail").unwrap();
-        let replay = log.replay(1024).unwrap();
-        assert_eq!(
-            replay,
-            [geometry_marker(120, 40).as_slice(), b"REPAINT", b"tail"].concat()
-        );
-    }
-
-    #[test]
-    fn resize_rotates_when_the_segment_has_output() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        log.append_output(b"before").unwrap();
-        let resized = Checkpoint {
-            cols: 120,
-            rows: 40,
-            state: b"STATE-AT-120",
-        };
-        log.resize_checkpoint(&resized).unwrap();
-        log.resize_checkpoint(&resized).unwrap(); // dedupe: unchanged geometry
-        log.append_output(b"after").unwrap();
-        assert_eq!(log.segment_count(), 2);
-        let replay = log.replay(1024).unwrap();
-        assert_eq!(
-            replay,
-            [
-                marker().as_slice(),
-                b"before",
-                geometry_marker(120, 40).as_slice(),
-                b"STATE-AT-120",
-                b"after"
-            ]
-            .concat()
-        );
-        // Watermark counts output only.
-        assert_eq!(log.total_logged(), 11);
-    }
-
-    #[test]
-    fn resize_storm_replaces_the_empty_segment_in_place() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        log.append_output(b"content").unwrap();
-        for i in 0..50u16 {
-            log.resize_checkpoint(&Checkpoint {
-                cols: 100 + i,
-                rows: 40,
-                state: b"S",
-            })
-            .unwrap();
+        let mut log = new_log(dir.path(), 64, 8 * 1024 * 1024);
+        for i in 0..8 {
+            log.append_history(format!("wiped-line-{i}\r\n").as_bytes())
+                .unwrap();
         }
-        // One rotation for the first change, in-place replacement after.
-        assert_eq!(log.segment_count(), 2);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-        let replay = log.replay(1024).unwrap();
-        assert_eq!(
-            replay,
-            [
-                marker().as_slice(),
-                b"content",
-                geometry_marker(149, 40).as_slice(),
-                b"S"
-            ]
-            .concat()
-        );
+        assert!(log.segment_count() > 1, "test needs multiple segments");
+        log.truncate_all().unwrap();
+        assert_eq!(log.segment_count(), 1);
+        assert_eq!(log.replay(1024).unwrap(), b"");
+        // Nothing pre-truncate survives on disk, even encrypted length-wise:
+        // exactly one empty segment file remains.
+        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(fs::metadata(entries[0].path()).unwrap().len(), 0);
+        // The log keeps working afterwards, and seq never regressed.
+        log.append_history(b"fresh\r\n").unwrap();
+        assert_eq!(log.replay(1024).unwrap(), b"fresh\r\n");
     }
 
     #[test]
     fn plaintext_never_hits_disk() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        let output_marker = b"SUPER-SECRET-MARKER-0451".as_slice();
-        let state_marker = b"CHECKPOINT-STATE-SECRET-9932".as_slice();
-        log.append_output(output_marker).unwrap();
-        log.rotate(&ckpt(state_marker)).unwrap();
+        let line_marker = b"SUPER-SECRET-MARKER-0451".as_slice();
+        log.append_history(line_marker).unwrap();
         for entry in fs::read_dir(dir.path()).unwrap().flatten() {
             let mut contents = Vec::new();
             File::open(entry.path())
                 .unwrap()
                 .read_to_end(&mut contents)
                 .unwrap();
-            for secret_bytes in [output_marker, state_marker] {
-                assert!(
-                    !contents
-                        .windows(secret_bytes.len())
-                        .any(|window| window == secret_bytes),
-                    "plaintext found in {}",
-                    entry.path().display()
-                );
-            }
+            assert!(
+                !contents
+                    .windows(line_marker.len())
+                    .any(|window| window == line_marker),
+                "plaintext found in {}",
+                entry.path().display()
+            );
         }
-        // ...but it decrypts fine (including the rotated-in checkpoint state).
-        let replay = log.replay(1024).unwrap();
-        assert_eq!(
-            replay,
-            [
-                marker().as_slice(),
-                output_marker,
-                marker().as_slice(),
-                state_marker
-            ]
-            .concat()
-        );
+        assert_eq!(log.replay(1024).unwrap(), line_marker);
     }
 
     #[test]
     fn rotation_bounds_growth_and_keeps_replay_coherent() {
         let dir = tempdir().unwrap();
-        // 1 KiB record target with enough total budget for several physically
-        // allocated segment files.
         let max = 32 * 1024;
         let mut log = new_log(dir.path(), 1024, max);
         let chunk = vec![b'x'; 512];
         let mut appended = 0u64;
         for _ in 0..32 {
-            if log.append_output(&chunk).unwrap() {
-                log.rotate(&ckpt(b"")).unwrap();
-            }
+            log.append_history(&chunk).unwrap();
             appended += chunk.len() as u64;
         }
         assert_eq!(log.total_logged(), appended);
@@ -920,50 +719,31 @@ mod tests {
         // Only segment files that are tracked exist on disk.
         let on_disk = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(on_disk, log.segment_count());
-        // Replay decrypts cleanly; each segment contributes one geometry
-        // marker (checkpoint states are empty in this test).
+        // Replay decrypts cleanly and is pure retained content.
         let replay = log.replay(u64::MAX).unwrap();
-        let retained_output = replay.iter().filter(|&&b| b == b'x').count() as u64;
-        let expected_len = marker().len() as u64 * log.segment_count() as u64 + retained_output;
-        assert_eq!(replay.len() as u64, expected_len);
+        assert!(replay.iter().all(|&b| b == b'x'));
         assert!(replay.len() as u64 <= max);
     }
 
     #[test]
     fn replay_budget_prefers_newest_segments() {
         let dir = tempdir().unwrap();
+        // Tiny segment budget: every batch rotates into its own segment.
         let mut log = new_log(dir.path(), 8, 1024 * 1024);
-        log.append_output(b"old-old-old!").unwrap();
-        log.rotate(&ckpt(b"NEW-CKPT-STATE")).unwrap();
-        log.append_output(b"new-new-new!").unwrap();
-        // Budget covers only one segment: the newest, opened by its own
-        // checkpoint state.
-        let newest_len = marker().len() + b"NEW-CKPT-STATE".len() + b"new-new-new!".len();
-        let replay = log.replay(newest_len as u64).unwrap();
-        assert_eq!(
-            replay,
-            [marker().as_slice(), b"NEW-CKPT-STATE", b"new-new-new!"].concat()
-        );
-        // Large budget: both segments, each opened by its own checkpoint.
+        log.append_history(b"old-old-old!").unwrap();
+        log.append_history(b"new-new-new!").unwrap();
+        assert!(log.segment_count() >= 2);
+        let replay = log.replay(b"new-new-new!".len() as u64).unwrap();
+        assert_eq!(replay, b"new-new-new!");
         let replay = log.replay(1024).unwrap();
-        assert_eq!(
-            replay,
-            [
-                marker().as_slice(),
-                b"old-old-old!",
-                marker().as_slice(),
-                b"NEW-CKPT-STATE",
-                b"new-new-new!"
-            ]
-            .concat()
-        );
+        assert_eq!(replay, b"old-old-old!new-new-new!");
     }
 
     #[test]
     fn tampered_record_fails_closed() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
-        log.append_output(b"authentic bytes").unwrap();
+        log.append_history(b"authentic bytes").unwrap();
         let seg_path = log.segments.last().unwrap().path.clone();
         if let Some(active) = log.active.as_mut() {
             drop(active.flush());
@@ -985,28 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn oversized_checkpoint_is_rejected_without_partial_replay() {
-        let dir = tempdir().unwrap();
-        let max = 16 * 1024;
-        let mut log = new_log(dir.path(), 256, max);
-        log.append_output(b"still-valid").unwrap();
-        let before = log.replay(1024).unwrap();
-        let files_before = fs::read_dir(dir.path()).unwrap().count();
-        let oversized = vec![b'X'; 4096];
-
-        assert!(log
-            .rotate(&Checkpoint {
-                cols: 400,
-                rows: 200,
-                state: &oversized,
-            })
-            .is_err());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), files_before);
-        assert_eq!(log.replay(1024).unwrap(), before);
-        assert!(log.budget_bytes() <= max);
-    }
-
-    #[test]
     fn configured_total_budget_cannot_exceed_protocol_limit() {
         let dir = tempdir().unwrap();
         let key = secret::SecretBytes::random(32).unwrap();
@@ -1015,7 +773,6 @@ mod tests {
             &key,
             DEFAULT_SEGMENT_BYTES,
             DEFAULT_MAX_LOG_BYTES + 1,
-            ckpt(b""),
         )
         .is_err());
     }
@@ -1024,7 +781,7 @@ mod tests {
     fn request_smaller_than_newest_whole_segment_fails_closed() {
         let dir = tempdir().unwrap();
         let mut log = new_log(dir.path(), 1024, 16 * 1024);
-        log.append_output(b"required-tail").unwrap();
+        log.append_history(b"required-tail").unwrap();
         let newest = log.segments.last().unwrap().replay_bytes;
         assert!(newest > 1);
         assert!(log.replay(newest - 1).is_err());
@@ -1032,70 +789,27 @@ mod tests {
     }
 
     #[test]
-    fn large_styled_grid_across_many_segments_obeys_every_bound() {
-        use super::super::emulator::Emulator;
-
+    fn oversized_batch_beyond_total_budget_fails_closed() {
         let dir = tempdir().unwrap();
-        let key = secret::SecretBytes::random(32).unwrap();
-        let mut emulator = Emulator::new(400, 200);
-        for row in 0..200 {
-            emulator.feed(format!("\x1b[{};{}m", 30 + row % 8, 40 + row % 8).as_bytes());
-            emulator.feed(&vec![b'A' + (row % 26) as u8; 400]);
-            emulator.feed(b"\r\n");
-        }
-        let mut state = emulator.serialize();
-        assert!(
-            state.len() > 80_000,
-            "styled grid was not adversarially large"
-        );
-
-        let max = 1024 * 1024;
-        let mut log = ScrollbackLog::with_limits(
-            dir.path(),
-            &key,
-            16 * 1024,
-            max,
-            Checkpoint {
-                cols: 400,
-                rows: 200,
-                state: &state,
-            },
-        )
-        .unwrap();
-        for index in 0..24u8 {
-            log.append_output(&vec![index; 8192]).unwrap();
-            log.rotate(&Checkpoint {
-                cols: 400,
-                rows: 200,
-                state: &state,
-            })
-            .unwrap();
-            assert!(log.budget_bytes() <= max);
-            assert!(log.disk_bytes() <= max);
-        }
-        let replay = log.replay(u64::MAX).unwrap();
-        assert!(replay.len() as u64 <= max);
-        assert!(replay.len() < 12 * 1024 * 1024);
-        assert!(replay.len() < super::super::wire::MAX_FRAME_LEN - 8);
-        assert!(log.disk_bytes().saturating_add(2 * replay.len() as u64) <= max);
-        state.zeroize();
+        let max = 16 * 1024;
+        let mut log = new_log(dir.path(), 256, max);
+        log.append_history(b"still-valid\r\n").unwrap();
+        let before = log.replay(1024).unwrap();
+        let oversized = vec![b'X'; 32 * 1024];
+        assert!(log.append_history(&oversized).is_err());
+        assert_eq!(log.replay(1024).unwrap(), before);
+        assert!(log.budget_bytes() <= max);
     }
 
     #[test]
-    fn tiny_output_resize_adversary_bounds_files_blocks_and_replay() {
+    fn tiny_batch_flood_bounds_files_blocks_and_replay() {
         let dir = tempdir().unwrap();
         let max = DEFAULT_MAX_LOG_BYTES;
         let mut log = new_log(dir.path(), 1, max);
 
         for index in 0..4096u16 {
             let byte = b'a' + (index % 26) as u8;
-            log.append_output(&[byte]).unwrap();
-            log.resize_checkpoint(&Checkpoint {
-                cols: 80 + index % 2,
-                rows: 24 + (index / 2) % 2,
-                state: b"S",
-            })
-            .unwrap();
+            log.append_history(&[byte]).unwrap();
             if index % 127 == 0 {
                 assert!(log.segment_count() <= MAX_SEGMENTS);
                 assert!(log.budget_bytes() <= max);
@@ -1113,9 +827,27 @@ mod tests {
 
         let replay = log.replay(u64::MAX).unwrap();
         assert!(!replay.is_empty());
-        assert!(replay
-            .windows(1)
-            .any(|window| window[0].is_ascii_lowercase()));
+        assert!(replay.iter().any(|b| b.is_ascii_lowercase()));
         assert!(replay.len() as u64 <= max);
+    }
+
+    #[test]
+    fn truncate_flood_bounds_inodes() {
+        // An adversary alternating tiny appends with ED 3 wipes must not grow
+        // files or leak inodes.
+        let dir = tempdir().unwrap();
+        let mut log = new_log(dir.path(), 64, 16 * 1024);
+        for i in 0..512u16 {
+            log.append_history(format!("l{i}\r\n").as_bytes()).unwrap();
+            if i % 3 == 0 {
+                log.truncate_all().unwrap();
+            }
+        }
+        assert!(log.segment_count() <= MAX_SEGMENTS);
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            log.segment_count()
+        );
+        assert!(log.budget_bytes() <= 16 * 1024);
     }
 }

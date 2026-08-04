@@ -8,11 +8,13 @@
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
 //! 3. `Start` spawns the agent argv on a PTY the worker owns. Raw output
-//!    feeds a headless screen emulator (`sessiond::emulator`), is encrypted
-//!    into the scrollback log before any disk write, then forwarded through a
-//!    bounded connection queue; plaintext chunks and PTY scratch are zeroized
-//!    after each hop/drop. Log rotations checkpoint the emulator's serialized
-//!    screen — the agent process is never signaled to provoke a repaint.
+//!    feeds a headless screen emulator (`sessiond::emulator`), which commits
+//!    lines to history exactly when they scroll off the screen; committed
+//!    lines are encrypted into the scrollback log before any disk write, and
+//!    the raw bytes are forwarded live through a bounded connection queue.
+//!    Plaintext chunks and PTY scratch are zeroized after each hop/drop.
+//!    Replays are committed history plus a screen repaint synthesized from
+//!    the emulator — the agent process is never signaled to provoke one.
 //! 4. On PTY EOF the worker reports `Exit`, deletes its scrollback (the key
 //!    dies with the process anyway), unlinks its socket, and exits.
 //!
@@ -37,24 +39,11 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use super::boundary::SeqScanner;
-use super::emulator::Emulator;
-use super::scrollback::{Checkpoint, ScrollbackLog};
+use super::emulator::{Emulator, HistoryEvent};
+use super::scrollback::{geometry_marker, ScrollbackLog, REPLAY_HISTORY_SENTINEL};
 use super::secret::{self, SecretBytes};
 use super::wire;
 
-/// A checkpoint waiting for an escape-sequence boundary in the output stream
-/// (splitting a sequence across segments would garble replays).
-#[derive(Clone, Copy, PartialEq)]
-enum PendingCheckpoint {
-    Rotate,
-    Resize,
-}
-
-/// If no boundary shows up within this many deferred bytes (pathological
-/// endless string), checkpoint anyway — a bounded rare glitch beats an
-/// unbounded segment.
-const CHECKPOINT_DEFER_CAP: usize = 32 * 1024;
 const PTY_READ_CHUNK_BYTES: usize = 8 * 1024;
 /// At most this many 8 KiB PTY reads may wait for the async worker loop. A
 /// stalled supervisor socket therefore backpressures the kernel PTY rather
@@ -159,65 +148,32 @@ fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
         && inbound_frame_size_exact(frame_type, len)
 }
 
-#[derive(Default)]
-struct CheckpointGate {
-    scanner: SeqScanner,
-    pending: Option<PendingCheckpoint>,
-    deferred_bytes: usize,
-}
-
-/// Serialize the emulator and cut the log: a rotation for size-triggered
-/// checkpoints, a geometry checkpoint for resize-triggered ones.
-fn checkpoint_now(
-    log: &mut ScrollbackLog,
-    emulator: &mut Emulator,
-    kind: PendingCheckpoint,
-) -> bool {
-    let (cols, rows) = emulator.geometry();
-    let state = emulator.serialize();
-    let checkpoint = Checkpoint {
-        cols,
-        rows,
-        state: &state,
-    };
-    let result = match kind {
-        PendingCheckpoint::Rotate => log.rotate(&checkpoint),
-        PendingCheckpoint::Resize => log.resize_checkpoint(&checkpoint),
-    };
-    let succeeded = match result {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, "checkpoint failed; disabling replay for this worker");
-            false
-        }
-    };
-    secret::wipe_vec(state);
-    succeeded
-}
-
-/// Feed bytes to the emulator and the log; a due rotation is queued on the
-/// gate (checkpoints land only on sequence boundaries).
-fn ingest(
-    emu: &mut Emulator,
-    log: &mut ScrollbackLog,
-    bytes: &[u8],
-    gate: &mut CheckpointGate,
-) -> bool {
-    if bytes.is_empty() {
-        return true;
-    }
-    emu.feed(bytes);
-    match log.append_output(bytes) {
-        Ok(true) => {
-            if gate.pending.is_none() {
-                gate.pending = Some(PendingCheckpoint::Rotate);
+/// Persist the emulator's history effects, in order. Returns false when the
+/// log failed (the caller destroys it and replay is disabled); event
+/// plaintext is wiped on every path.
+fn persist_events(log: &mut ScrollbackLog, events: Vec<HistoryEvent>) -> bool {
+    for event in events {
+        let result = match event {
+            HistoryEvent::Lines(lines) => {
+                let appended = log.append_history(&lines);
+                secret::wipe_vec(lines);
+                appended
             }
-            true
-        }
-        Ok(false) => true,
-        Err(error) => {
+            HistoryEvent::Truncate => log.truncate_all(),
+        };
+        if let Err(error) = result {
             tracing::warn!(%error, "scrollback append failed; disabling replay for this worker");
-            false
+            return false;
+        }
+    }
+    true
+}
+
+/// Drop history events without persisting them (log already disabled).
+fn discard_events(events: Vec<HistoryEvent>) {
+    for event in events {
+        if let HistoryEvent::Lines(lines) = event {
+            secret::wipe_vec(lines);
         }
     }
 }
@@ -349,7 +305,6 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     };
     let mut log: Option<ScrollbackLog> = None;
     let mut emulator: Option<Emulator> = None;
-    let mut gate = CheckpointGate::default();
 
     let parent = args
         .socket
@@ -483,12 +438,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &mut conn_write,
                     &mut log,
                     &mut emulator,
-                    &mut gate,
                     &setup,
                     &mut pty_tx,
                     &mut exit_tx,
                     &child_state,
                     &mut agent_cwd,
+                    pty_source_offset,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => pty_open = true,
@@ -509,69 +464,26 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             chunk = pty_rx.recv(), if pty_open => {
                 match chunk {
                     Some(chunk) => {
-                        // Feed the screen emulator, encrypt before any disk
-                        // write, then forward live. Checkpoints only land
-                        // on escape-sequence boundaries; the agent process is
+                        // Feed the screen emulator; lines it commits (or
+                        // truncates) are persisted encrypted before the raw
+                        // bytes are forwarded live. The agent process is
                         // never signaled or disturbed by any of it.
                         let mut replay_failed = false;
-                        if let (Some(emu), Some(active_log)) = (emulator.as_mut(), log.as_mut()) {
-                            let split = match gate.pending {
-                                Some(_) => gate.scanner.first_boundary(&chunk),
-                                None => {
-                                    gate.scanner.scan(&chunk);
-                                    None
+                        if let Some(emu) = emulator.as_mut() {
+                            let events = emu.feed_output(&chunk);
+                            match log.as_mut() {
+                                Some(active_log) => {
+                                    replay_failed = !persist_events(active_log, events);
                                 }
-                            };
-                            match (gate.pending, split) {
-                                (Some(kind), Some(i)) => {
-                                    replay_failed = !ingest(emu, active_log, &chunk[..i], &mut gate);
-                                    if !replay_failed {
-                                        replay_failed = !checkpoint_now(active_log, emu, kind);
-                                    }
-                                    if !replay_failed {
-                                        gate.pending = None;
-                                        gate.deferred_bytes = 0;
-                                        replay_failed =
-                                            !ingest(emu, active_log, &chunk[i..], &mut gate);
-                                    }
-                                }
-                                (Some(kind), None) => {
-                                    replay_failed = !ingest(emu, active_log, &chunk, &mut gate);
-                                    if !replay_failed {
-                                        gate.deferred_bytes += chunk.len();
-                                    }
-                                    if !replay_failed && gate.deferred_bytes > CHECKPOINT_DEFER_CAP {
-                                        replay_failed = !checkpoint_now(active_log, emu, kind);
-                                        gate.pending = None;
-                                        gate.deferred_bytes = 0;
-                                    }
-                                }
-                                (None, _) => {
-                                    replay_failed = !ingest(emu, active_log, &chunk, &mut gate);
-                                }
-                            }
-                            // A checkpoint that became due in this chunk can
-                            // land right away when the stream sits at a
-                            // sequence boundary.
-                            if !replay_failed && gate.scanner.at_boundary() {
-                                if let Some(kind) = gate.pending {
-                                    replay_failed = !checkpoint_now(active_log, emu, kind);
-                                    gate.pending = None;
-                                    gate.deferred_bytes = 0;
-                                }
+                                None => discard_events(events),
                             }
                         }
                         if replay_failed {
-                            gate.pending = None;
-                            gate.deferred_bytes = 0;
                             if let Some(failed_log) = log.take() {
                                 failed_log.destroy();
                             }
                         }
                         pty_source_offset = pty_source_offset.saturating_add(chunk.len() as u64);
-                        debug_assert!(log
-                            .as_ref()
-                            .is_none_or(|active_log| active_log.total_logged() == pty_source_offset));
                         if let Some(w) = conn_write.as_mut() {
                             let framed = wire::encode_output(pty_source_offset, &chunk);
                             if wire::write_frame(w, wire::T_OUTPUT, &framed).await.is_err() {
@@ -646,12 +558,12 @@ async fn handle_frame(
     conn_write: &mut Option<OwnedWriteHalf>,
     log: &mut Option<ScrollbackLog>,
     emulator: &mut Option<Emulator>,
-    gate: &mut CheckpointGate,
     setup: &LogSetup,
     pty_tx: &mut Option<mpsc::Sender<PlaintextChunk>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
     child_state: &SharedChild,
     agent_cwd: &mut Option<String>,
+    pty_source_offset: u64,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
@@ -669,23 +581,15 @@ async fn handle_frame(
                 .context("agent cwd capability root is not UTF-8")?
                 .to_string();
             let (cols, rows) = (spec.cols.max(1), spec.rows.max(1));
-            let mut emu = Emulator::new(cols, rows);
-            let initial = emu.serialize();
             let opened = ScrollbackLog::with_limits(
                 &setup.dir,
                 &setup.key,
                 setup.segment_bytes,
                 setup.max_log_bytes,
-                Checkpoint {
-                    cols,
-                    rows,
-                    state: &initial,
-                },
             )
             .context("opening scrollback log");
-            secret::wipe_vec(initial);
             *log = Some(opened?);
-            *emulator = Some(emu);
+            *emulator = Some(Emulator::new(cols, rows));
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
             let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
@@ -723,24 +627,17 @@ async fn handle_frame(
                 *p.size.lock().unwrap() = (cols, rows);
                 resize_master(&p.master, cols, rows);
             }
-            // A resize forces a checkpoint at the new geometry so every log
-            // segment stays single-geometry and the final replay chunk is
-            // always self-contained at the current size. Deferred to the
-            // next escape-sequence boundary when the stream is mid-sequence;
-            // a resize supersedes a pending size rotation (it rotates too).
+            // Narrowing can reflow wrapped screen rows off the top; the
+            // emulator commits those displaced lines and they are persisted
+            // like any scroll-off. Nothing already committed is touched.
             if let Some(emu) = emulator.as_mut() {
-                emu.resize(cols, rows);
+                let events = emu.resize(cols, rows);
                 let mut replay_failed = false;
-                if let Some(active_log) = log.as_mut() {
-                    if gate.pending.is_none() && gate.scanner.at_boundary() {
-                        replay_failed = !checkpoint_now(active_log, emu, PendingCheckpoint::Resize);
-                    } else {
-                        gate.pending = Some(PendingCheckpoint::Resize);
-                    }
+                match log.as_mut() {
+                    Some(active_log) => replay_failed = !persist_events(active_log, events),
+                    None => discard_events(events),
                 }
                 if replay_failed {
-                    gate.pending = None;
-                    gate.deferred_bytes = 0;
                     if let Some(failed_log) = log.take() {
                         failed_log.destroy();
                     }
@@ -759,10 +656,29 @@ async fn handle_frame(
             let active_log = log
                 .as_mut()
                 .context("worker replay is unavailable for this agent")?;
-            let replay = active_log.replay(max_bytes as u64)?;
-            let watermark = active_log.total_logged();
+            let emu = emulator
+                .as_mut()
+                .context("worker replay is unavailable before start")?;
+            // Self-describing v2 stream: geometry marker + history sentinel +
+            // committed lines, then geometry marker + synthesized live screen.
+            // The final chunk alone still seeds a live terminal, exactly like
+            // the checkpoint-based format it replaces.
+            let history = active_log.replay(max_bytes as u64)?;
+            let screen = emu.serialize();
+            let (cols, rows) = emu.geometry();
+            let marker = geometry_marker(cols, rows);
+            let mut replay = Vec::with_capacity(
+                2 * marker.len() + REPLAY_HISTORY_SENTINEL.len() + history.len() + screen.len(),
+            );
+            replay.extend_from_slice(&marker);
+            replay.extend_from_slice(REPLAY_HISTORY_SENTINEL);
+            replay.extend_from_slice(&history);
+            replay.extend_from_slice(&marker);
+            replay.extend_from_slice(&screen);
+            secret::wipe_vec(history);
+            secret::wipe_vec(screen);
             if let Some(w) = conn_write.as_mut() {
-                let framed = wire::encode_replay(watermark, &replay);
+                let framed = wire::encode_replay(pty_source_offset, &replay);
                 let _ = wire::write_frame(w, wire::T_REPLAY, &framed).await;
                 secret::wipe_vec(framed);
             }

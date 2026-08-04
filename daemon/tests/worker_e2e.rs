@@ -478,14 +478,13 @@ printf 'IDLE-DONE\n'
     );
 }
 
-/// Guards against the "garbled lines when scrolling" bug: replays used to be
-/// raw bytes with no geometry information, so a replay spanning a resize
-/// rendered old-geometry bytes at the current size. Replays are now
-/// self-describing: they open with a geometry marker (`CSI 8 ; rows ; cols t`)
-/// plus a checkpoint repaint and emit a marker at every recorded resize, so
-/// every byte renders at a known geometry.
+/// Guards against the "garbled lines when scrolling" bug: replays are
+/// self-describing committed-line streams. The head geometry marker + history
+/// sentinel open the flowing-text history section (renderable at any width),
+/// and a second marker opens a self-contained repaint of the current screen
+/// at the current geometry — the only section for which geometry matters.
 #[tokio::test]
-async fn replay_describes_geometry_across_resizes() {
+async fn replay_is_a_sentineled_history_plus_current_screen() {
     let fixture = WorkerFixture::launch().await;
     let mut conn = fixture.connect().await;
     expect_hello(&mut conn, "awaiting_start").await;
@@ -526,21 +525,103 @@ async fn replay_describes_geometry_across_resizes() {
     let (_, bytes) = wire::decode_replay(&replay).unwrap();
     let text = String::from_utf8_lossy(bytes);
 
-    // Opens with the starting geometry (80x24 from the StartSpec).
+    // Opens with the CURRENT geometry (after the resize) and the history
+    // sentinel that tells clients to render flowing lines, not raw bytes.
+    let sentinel = String::from_utf8_lossy(spawnd::sessiond::scrollback::REPLAY_HISTORY_SENTINEL);
+    let head = format!("\x1b[8;40;120t{sentinel}");
     assert!(
-        text.starts_with("\x1b[8;24;80t"),
-        "replay must open with a geometry marker: {:?}",
+        text.starts_with(&head),
+        "replay must open with geometry marker + history sentinel: {:?}",
         &text[..text.len().min(40)]
     );
-    let before = text.find("before-resize").expect("pre-resize output");
-    let resize_marker = text
-        .find("\x1b[8;40;120t")
-        .expect("resize must appear as a geometry marker");
-    let after = text.find("after-resize").expect("post-resize output");
+    // Exactly one more marker separates history from the screen repaint.
+    let markers: Vec<_> = text.match_indices("\x1b[8;40;120t").collect();
+    assert_eq!(markers.len(), 2, "history and screen sections: {text:?}");
+    let screen_at = markers[1].0;
+    // The live screen still shows both lines (nothing scrolled off a 40-row
+    // screen), so they appear in the screen section; nothing was committed
+    // to history yet.
+    let screen = &text[screen_at..];
+    assert!(screen.contains("before-resize"), "screen repaint: {screen:?}");
+    assert!(screen.contains("after-resize"), "screen repaint: {screen:?}");
+}
+
+/// A scrollback wipe (`ESC[2J ESC[3J`, the claude/codex `/clear`) must
+/// actually destroy retained history: the replay afterwards contains no
+/// pre-clear content anywhere — not even in the screen section.
+#[tokio::test]
+async fn scrollback_wipe_erases_replayed_history() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    let script = r#"
+i=0; while [ $i -lt 100 ]; do printf 'pre-clear-%04d\n' "$i"; i=$((i+1)); done
+printf 'PRE-DONE\n'
+read line
+printf '\033[2J\033[3J\033[H'
+printf 'POST-CLEAR-CONTENT\n'
+cat
+"#;
+    let spec = start_spec(&["/bin/sh", "-c", script]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    collect_output_until(&mut conn, b"PRE-DONE").await;
+
+    // Pre-clear content must be replayable first.
+    wire::write_frame(
+        &mut conn,
+        wire::T_REPLAY_REQ,
+        &wire::encode_replay_req(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let replay = loop {
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_REPLAY {
+            break payload;
+        }
+        assert!(frame_type == wire::T_OUTPUT);
+    };
+    let (_, bytes) = wire::decode_replay(&replay).unwrap();
+    let text = String::from_utf8_lossy(bytes);
     assert!(
-        before < resize_marker && resize_marker < after,
-        "geometry marker must sit between output produced at 80x24 and at \
-         120x40 (before={before}, marker={resize_marker}, after={after})"
+        text.contains("pre-clear-0000"),
+        "history must retain scrolled lines before the wipe"
+    );
+
+    // Trigger the clear and wait for post-clear output.
+    wire::write_frame(&mut conn, wire::T_INPUT, b"go\n")
+        .await
+        .unwrap();
+    collect_output_until(&mut conn, b"POST-CLEAR-CONTENT").await;
+
+    wire::write_frame(
+        &mut conn,
+        wire::T_REPLAY_REQ,
+        &wire::encode_replay_req(1024 * 1024),
+    )
+    .await
+    .unwrap();
+    let replay = loop {
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_REPLAY {
+            break payload;
+        }
+        assert!(frame_type == wire::T_OUTPUT);
+    };
+    let (_, bytes) = wire::decode_replay(&replay).unwrap();
+    let text = String::from_utf8_lossy(bytes);
+    assert!(
+        !text.contains("pre-clear-"),
+        "wiped history leaked into the replay"
+    );
+    assert!(
+        text.contains("POST-CLEAR-CONTENT"),
+        "post-clear screen missing from the replay"
     );
 }
 

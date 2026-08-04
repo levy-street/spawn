@@ -7,7 +7,6 @@
 //! self-contained (no dependency on the spawnd binary's private modules) so
 //! that the worker binary and the integration tests can share them.
 
-pub mod boundary;
 pub mod emulator;
 pub mod endpoint;
 pub mod scrollback;
