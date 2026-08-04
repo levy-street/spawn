@@ -3011,13 +3011,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
-      // Predict only pristine keystrokes (no rewrites, no attachment
-      // payloads) against a settled buffer — mid-seed the cursor is wherever
-      // the rewrite walk happens to be, so an anchor read then is garbage.
+      // Predictive echo is opt-in (localStorage.spawnPredictEcho = "on"):
+      // below ~30ms RTT the overlay flashes for a frame or two without
+      // buying perceptible snappiness. It earns its keep on high-RTT links
+      // (mobile, remote networks). Predict only pristine keystrokes against
+      // a settled buffer — mid-seed the cursor is wherever the rewrite walk
+      // happens to be, so an anchor read then is garbage.
       if (
         withAttachments === d &&
         !liveSeedWriteInFlightRef.current &&
-        localStorage.getItem("spawnPredictEcho") !== "off"
+        localStorage.getItem("spawnPredictEcho") === "on"
       ) {
         const buffer = term.buffer.active;
         const predicted = predictorRef.current.predict(

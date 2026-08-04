@@ -6,7 +6,13 @@ import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 // prediction overlay and are confirmed (removed) by the authoritative echo.
 // The mock never echoes on its own, so overlay states are deterministic.
 
-async function openTerminal(page: Page) {
+async function openTerminal(page: Page, { predict = true } = {}) {
+  // Prediction is opt-in; most specs exercise the enabled path.
+  if (predict) {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("spawnPredictEcho", "on");
+    });
+  }
   const messages: Array<string | Buffer> = [];
   await installAgentRtcMock(page, messages, {
     history: "ready\n$ ",
@@ -69,11 +75,8 @@ test("enter and control input never leave stale predictions behind", async ({ pa
   await expect(overlay(page)).toBeHidden();
 });
 
-test("localStorage escape hatch disables prediction", async ({ page }) => {
-  await page.addInitScript(() => {
-    window.localStorage.setItem("spawnPredictEcho", "off");
-  });
-  await openTerminal(page);
+test("prediction stays dormant without the opt-in flag", async ({ page }) => {
+  await openTerminal(page, { predict: false });
   await page.keyboard.type("quiet");
   await page.waitForTimeout(300);
   await expect(overlay(page)).toBeHidden();
