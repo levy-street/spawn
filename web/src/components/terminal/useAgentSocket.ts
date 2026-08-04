@@ -63,6 +63,9 @@ export interface UseAgentSocketOptions {
    *  the CURRENT rtc session, or null when the snapshot has no usable anchor
    *  (stale session). */
   onSnapshot?: (bytes: Uint8Array, plain: boolean, dcOffset?: number | null) => void;
+  /** The daemon refused or failed a snapshot request; there will be no
+   *  payload. Without this the requester only learns via its own timeout. */
+  onSnapshotError?: (message: string) => void;
 }
 
 export interface DirectAgentUploadOptions {
@@ -160,6 +163,7 @@ export function useAgentSocket({
   onExit,
   onStatus,
   onSnapshot,
+  onSnapshotError,
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
@@ -210,6 +214,7 @@ export function useAgentSocket({
     onExit,
     onStatus,
     onSnapshot,
+    onSnapshotError,
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
@@ -220,6 +225,7 @@ export function useAgentSocket({
     onExit,
     onStatus,
     onSnapshot,
+    onSnapshotError,
   };
 
   useEffect(() => {
@@ -804,6 +810,11 @@ export function useAgentSocket({
         if (result.kind === "response") {
           if (!result.response.ok && requestId === initialHistoryRequestId) {
             finishBootstrap(new Uint8Array(), 0);
+          } else if (!result.response.ok && result.response.operation === "snapshot") {
+            const error = result.response.error;
+            currentHandlers()?.onSnapshotError?.(
+              `${error?.code ?? "snapshot_failed"}: ${error?.detail ?? "no detail"}`,
+            );
           }
           return;
         }

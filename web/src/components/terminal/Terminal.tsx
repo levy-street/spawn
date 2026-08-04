@@ -1578,6 +1578,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
       }
     },
+    onSnapshotError: (message) => {
+      // Unlatch immediately instead of waiting out the request timeout, so
+      // the next refresh/overlay attempt isn't blocked behind a dead request.
+      console.warn(`scrollback snapshot refused: ${message}`);
+      if (scrollbackSnapshotTimeoutRef.current) {
+        clearTimeout(scrollbackSnapshotTimeoutRef.current);
+        scrollbackSnapshotTimeoutRef.current = null;
+      }
+      scrollbackSnapshotInFlightRef.current = false;
+      scrollbackSnapshotPurposeRef.current = null;
+    },
     onExit: (code, sig) => {
       const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
         sig ? ` signal=${sig}` : ""
@@ -1634,13 +1645,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       lines:
         purpose === "cache" && !dcActiveRef.current
           ? SCROLLBACK_UNANCHORED_CACHE_LINES
-          : purpose === "overlay" && exactStreamRef.current
-            ? // Worker replays: reach the full retained log. A TUI's redraw
-              // churn is hundreds of bytes per "line", so basic
-              // lines-to-bytes sizing leaves older replay out of reach and
-              // scrollback dead-ends ("can't scroll") on busy sessions.
-              TERMINAL_SNAPSHOT_LINES * 4
-            : TERMINAL_SNAPSHOT_LINES,
+          : // TERMINAL_SNAPSHOT_LINES equals the daemon's MAX_HISTORY_LINES,
+            // which it maps to its full replay budget (the whole retained
+            // log). Anything above it fails request validation outright, and
+            // the snapshot silently never arrives ("can't scroll").
+            TERMINAL_SNAPSHOT_LINES,
       plain: false,
     });
     if (!sent) {

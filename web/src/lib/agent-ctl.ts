@@ -159,7 +159,9 @@ export class AgentCtlRequestTracker {
 
     if (!response.ok) {
       this.#remove(requestId);
-      return { kind: "response", response };
+      // Error responses omit `operation`; graft the pending one on so the
+      // consumer can route the failure without its own request-id ledger.
+      return { kind: "response", response: { ...response, operation: pending.operation } };
     }
     if (response.operation !== pending.operation || pending.metadata) return null;
     if (pending.operation !== "history" && pending.operation !== "snapshot") {
