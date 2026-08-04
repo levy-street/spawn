@@ -4,6 +4,7 @@ import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useQuery } from "@tanstack/react-query";
@@ -230,17 +231,60 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const activeRef = useRef(active);
   const activePrevRef = useRef(active);
   const takeControlNowRef = useRef<() => boolean>(() => false);
+  // GPU renderer for the FOREGROUND terminal only. The DOM renderer rebuilds
+  // row elements and forces style/layout/paint after every echo — measurable
+  // extra frames of felt keystroke latency. Parked terminals release their
+  // addon so the warm pool can never exhaust the browser's WebGL context
+  // budget; a lost context falls back to the DOM renderer silently.
+  const webglAddonRef = useRef<WebglAddon | null>(null);
+  const syncWebglRenderer = useCallback((wantGpu: boolean) => {
+    if (!wantGpu || !wantsGpuRenderer()) {
+      webglAddonRef.current?.dispose();
+      webglAddonRef.current = null;
+      return;
+    }
+    const term = termRef.current;
+    if (!term || webglAddonRef.current) return;
+    try {
+      const webgl = new WebglAddon();
+      term.loadAddon(webgl);
+      // addon-webgl's dispose throws when the renderer never finished
+      // initializing (strict-mode dev double-mounts, lost contexts) and is
+      // reachable from term.dispose()'s addon sweep — make every dispose
+      // path exception-safe while preserving xterm's deregistration wrapper.
+      const wrappedDispose = webgl.dispose.bind(webgl);
+      webgl.dispose = () => {
+        try {
+          wrappedDispose();
+        } catch {
+          // Partially-initialized renderer; the terminal survives on DOM.
+        }
+      };
+      webgl.onContextLoss(() => {
+        webgl.dispose();
+        if (webglAddonRef.current === webgl) webglAddonRef.current = null;
+      });
+      webglAddonRef.current = webgl;
+    } catch {
+      // No WebGL available (headless GL blocklist, exhausted contexts):
+      // xterm keeps its DOM renderer.
+      webglAddonRef.current = null;
+    }
+  }, []);
+  const syncWebglRendererRef = useRef(syncWebglRenderer);
+  syncWebglRendererRef.current = syncWebglRenderer;
   useEffect(() => {
     const was = activePrevRef.current;
     activePrevRef.current = active;
     activeRef.current = active;
+    syncWebglRenderer(active);
     if (active && !was) {
       // Brought to the foreground from a parked state: reclaim control and fit
       // to the now-visible container. Two rAFs let the host's appendChild move
       // and the container's layout settle before we measure + resize.
       requestAnimationFrame(() => requestAnimationFrame(() => takeControlNowRef.current()));
     }
-  }, [active]);
+  }, [active, syncWebglRenderer]);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -1715,6 +1759,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    // The renderer addon needs the opened element; the active-state effect
+    // has already run by the time this bootstrap effect mounts.
+    syncWebglRendererRef.current(activeRef.current);
     const terminalViewport = terminalViewportRef.current;
     const terminalSurface = terminalSurfaceRef.current;
     const terminalElement = containerRef.current;
@@ -2571,6 +2618,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       liveSeedCoveredOffsetRef.current = null;
       liveSeedWriteInFlightRef.current = false;
       scrollbackPendingLiveWritesRef.current.clear();
+      webglAddonRef.current?.dispose();
+      webglAddonRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -3699,6 +3748,24 @@ function scrollElementPixels(element: HTMLElement, deltaY: number): boolean {
 
 function wrapSnapshotForXterm(input: string): string {
   return `\x1b[?7l${input}\x1b[?7h`;
+}
+
+/** Renderer preference for the live terminal. GPU (WebGL) by default for
+ *  real users; automation contexts (`navigator.webdriver` — Playwright, CI)
+ *  keep the DOM renderer, whose `.xterm-rows` text the e2e suites assert on.
+ *  `localStorage.spawnRenderer` overrides both ways: "gpu" forces the WebGL
+ *  addon under automation, "dom" is the escape hatch for machines where
+ *  WebGL glitches. */
+function wantsGpuRenderer(): boolean {
+  let preference: string | null = null;
+  try {
+    preference = window.localStorage.getItem("spawnRenderer");
+  } catch {
+    // Storage can be unavailable (privacy modes); fall through to default.
+  }
+  if (preference === "gpu") return true;
+  if (preference === "dom") return false;
+  return !navigator.webdriver;
 }
 
 /** One geometry-tagged span of a worker replay stream. */
