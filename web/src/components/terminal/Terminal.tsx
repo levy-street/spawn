@@ -283,6 +283,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // to the now-visible container. Two rAFs let the host's appendChild move
       // and the container's layout settle before we measure + resize.
       requestAnimationFrame(() => requestAnimationFrame(() => takeControlNowRef.current()));
+      // Catch up on the refreshes the parked quiescence skipped.
+      if (scrollbackCacheDirtyRef.current) {
+        scheduleScrollbackCacheRefreshRef.current(250);
+      }
     }
   }, [active, syncWebglRenderer]);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
@@ -855,6 +859,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     ) {
       return;
     }
+    // Parked instances never pre-render: the rebuild competes with the
+    // foreground terminal's input path, and foregrounding re-runs this.
+    if (!activeRef.current) return;
     // Converged committed-line terminal: live appends already produced what
     // this rebuild would; the fresh cache is stored for future rebuilds only.
     if (scrollbackTermConvergedRef.current && renderedHistoryReplayRef.current) return;
@@ -1578,6 +1585,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackCacheRefreshTimerRef.current = null;
         scrollbackCacheRefreshDeadlineRef.current = null;
         if (!scrollbackCacheDirtyRef.current) return;
+        // Parked warm-pool instances stay quiescent: a background snapshot
+        // fetch plus hidden-terminal rebuild steals main-thread time from
+        // whichever terminal the user is actually typing into. The cache
+        // stays dirty and one refresh runs on foregrounding instead.
+        if (!activeRef.current) return;
         // No refresh under an open overlay: the open render is made exact by
         // replaying DataChannel bytes past the capture offset, and direct
         // live appends keep it complete from then on — a mid-read rewrite
