@@ -215,10 +215,13 @@ impl ScrollbackLog {
         self.total_logged
     }
 
-    /// Decrypt and concatenate committed-line batches from the newest run of
-    /// whole segments whose plaintext fits `max_bytes` (always at least the
-    /// newest segment). Batches are self-contained, so a replay starting at
-    /// any retained segment renders cleanly.
+    /// Decrypt and concatenate the newest run of whole committed-line batches
+    /// whose plaintext fits `max_bytes`. Batches are self-contained (each
+    /// opens with a full SGR reset), so replay may begin at ANY record
+    /// boundary: a budget smaller than the newest segment — or even than a
+    /// single batch — degrades to less (or no) history instead of failing.
+    /// Reconnect seeds must never wedge on history volume; only integrity
+    /// failures (authentication, sequence) fail the replay closed.
     pub fn replay(&mut self, max_bytes: u64) -> Result<Vec<u8>> {
         if max_bytes == 0 {
             bail!("replay budget must be non-zero");
@@ -229,39 +232,33 @@ impl ScrollbackLog {
         if let Some(active) = self.active.as_mut() {
             active.flush().ok();
         }
-        let mut start = self.segments.len().saturating_sub(1);
-        let mut budget = 0u64;
-        for (i, seg) in self.segments.iter().enumerate().rev() {
-            if seg.replay_bytes > max_bytes && i == self.segments.len() - 1 {
-                bail!(
-                    "newest complete replay segment is {} bytes, exceeding request budget {max_bytes}",
-                    seg.replay_bytes
-                );
-            }
-            if budget.saturating_add(seg.replay_bytes) > max_bytes {
+
+        // Walk segments newest-first, decrypting each in full (contiguity is
+        // validated per segment) and keeping the newest batches that fit.
+        let mut kept: Vec<Vec<u8>> = Vec::new(); // newest-first
+        let mut kept_bytes: u64 = 0;
+        let mut budget_full = false;
+        // Seqs are strictly increasing across the whole log (truncation
+        // retires ranges but never resets the counter), so walking
+        // newest-first every segment must sit strictly below the floor set
+        // by the segments already consumed.
+        let mut floor_seq: Option<u64> = None;
+        for seg in self.segments.iter().rev() {
+            if budget_full {
                 break;
             }
-            budget += seg.replay_bytes;
-            start = i;
-        }
-
-        let capacity = usize::try_from(budget).context("replay budget does not fit usize")?;
-        let mut out = Vec::with_capacity(capacity);
-        // Seqs must be contiguous within a segment and strictly increasing
-        // across segment boundaries (truncation retires seq ranges, so
-        // cross-segment gaps are legitimate).
-        let mut min_seq: u64 = 0;
-        for seg in &self.segments[start..] {
             let data = match fs::read(&seg.path)
                 .with_context(|| format!("reading {}", seg.path.display()))
             {
                 Ok(data) => data,
                 Err(error) => {
-                    secret::wipe(&mut out);
+                    wipe_batches(kept);
                     return Err(error);
                 }
             };
+            let mut batches: Vec<Vec<u8>> = Vec::new();
             let mut offset = 0usize;
+            let mut first_seq: Option<u64> = None;
             let mut expect_seq: Option<u64> = None;
             while offset < data.len() {
                 let (kind, seq, ct) = match parse_record(&data, &mut offset)
@@ -269,24 +266,22 @@ impl ScrollbackLog {
                 {
                     Ok(record) => record,
                     Err(error) => {
-                        secret::wipe(&mut out);
+                        wipe_batches(kept);
+                        wipe_batches(batches);
                         return Err(error);
                     }
                 };
-                let valid = match expect_seq {
-                    Some(expected) => seq == expected,
-                    None => seq >= min_seq,
-                };
-                if !valid {
-                    secret::wipe(&mut out);
+                if expect_seq.is_some_and(|expected| seq != expected) {
+                    wipe_batches(kept);
+                    wipe_batches(batches);
                     bail!(
-                        "scrollback sequence gap in {} (expected {:?}/min {min_seq}, got {seq})",
+                        "scrollback sequence gap in {} (expected {:?}, got {seq})",
                         seg.path.display(),
                         expect_seq
                     );
                 }
+                first_seq.get_or_insert(seq);
                 expect_seq = Some(seq + 1);
-                min_seq = seq + 1;
                 let nonce_bytes = nonce_for(seq);
                 let mut plaintext = match self.cipher.decrypt(
                     Nonce::from_slice(&nonce_bytes),
@@ -297,7 +292,8 @@ impl ScrollbackLog {
                 ) {
                     Ok(p) => p,
                     Err(_) => {
-                        secret::wipe(&mut out);
+                        wipe_batches(kept);
+                        wipe_batches(batches);
                         bail!(
                             "scrollback record failed authentication in {}",
                             seg.path.display()
@@ -305,15 +301,43 @@ impl ScrollbackLog {
                     }
                 };
                 if kind == KIND_HISTORY {
-                    out.extend_from_slice(&plaintext);
+                    batches.push(plaintext);
+                } else {
+                    plaintext.zeroize();
                 }
-                plaintext.zeroize();
+            }
+            let last_seq = expect_seq.map(|next| next - 1);
+            if let (Some(last), Some(floor)) = (last_seq, floor_seq) {
+                if last >= floor {
+                    wipe_batches(kept);
+                    wipe_batches(batches);
+                    bail!(
+                        "scrollback sequence overlap in {} ({last} >= floor {floor})",
+                        seg.path.display()
+                    );
+                }
+            }
+            if let Some(first) = first_seq {
+                floor_seq = Some(first);
+            }
+            for mut batch in batches.into_iter().rev() {
+                if budget_full || kept_bytes.saturating_add(batch.len() as u64) > max_bytes {
+                    budget_full = true;
+                    batch.zeroize();
+                    continue;
+                }
+                kept_bytes += batch.len() as u64;
+                kept.push(batch);
             }
         }
-        if out.len() as u64 > max_bytes {
-            secret::wipe(&mut out);
-            bail!("replay exceeded its admitted response budget");
+
+        let capacity = usize::try_from(kept_bytes).context("replay size does not fit usize")?;
+        let mut out = Vec::with_capacity(capacity);
+        for batch in kept.iter().rev() {
+            out.extend_from_slice(batch);
         }
+        wipe_batches(kept);
+        debug_assert!(out.len() as u64 <= max_bytes);
         Ok(out)
     }
 
@@ -561,6 +585,12 @@ fn allocated_path_bytes(path: &Path) -> Result<u64> {
     Ok(len.div_ceil(ALLOCATION_FLOOR_BYTES) * ALLOCATION_FLOOR_BYTES)
 }
 
+fn wipe_batches(batches: Vec<Vec<u8>>) {
+    for mut batch in batches {
+        batch.zeroize();
+    }
+}
+
 fn unlink_segment(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -778,14 +808,41 @@ mod tests {
     }
 
     #[test]
-    fn request_smaller_than_newest_whole_segment_fails_closed() {
+    fn small_budget_degrades_to_newest_batches_never_fails() {
+        // The reconnect-seed regression: a 64 KiB replay request against a
+        // newest segment holding more than that wedged every attach. Budgets
+        // now select whole batches newest-first and simply return less.
         let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024, 16 * 1024);
-        log.append_history(b"required-tail").unwrap();
-        let newest = log.segments.last().unwrap().replay_bytes;
-        assert!(newest > 1);
-        assert!(log.replay(newest - 1).is_err());
-        assert_eq!(log.replay(newest).unwrap().len() as u64, newest);
+        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        log.append_history(b"batch-one\r\n").unwrap();
+        log.append_history(b"batch-two\r\n").unwrap();
+        log.append_history(b"batch-three\r\n").unwrap();
+        assert_eq!(log.segment_count(), 1, "one segment holds all batches");
+
+        // Budget for the newest batch only.
+        assert_eq!(log.replay(13).unwrap(), b"batch-three\r\n");
+        // Budget for the newest two.
+        assert_eq!(log.replay(24).unwrap(), b"batch-two\r\nbatch-three\r\n");
+        // Budget smaller than any single batch: empty history, not an error.
+        assert_eq!(log.replay(4).unwrap(), b"");
+        // Full budget: everything, oldest first.
+        assert_eq!(
+            log.replay(1024).unwrap(),
+            b"batch-one\r\nbatch-two\r\nbatch-three\r\n"
+        );
+    }
+
+    #[test]
+    fn small_budget_takes_newest_suffix_across_segments() {
+        let dir = tempdir().unwrap();
+        // Tiny segment budget: every batch rotates into its own segment.
+        let mut log = new_log(dir.path(), 8, 1024 * 1024);
+        log.append_history(b"seg-a\r\n").unwrap();
+        log.append_history(b"seg-b\r\n").unwrap();
+        log.append_history(b"seg-c\r\n").unwrap();
+        assert!(log.segment_count() >= 3);
+        assert_eq!(log.replay(7).unwrap(), b"seg-c\r\n");
+        assert_eq!(log.replay(14).unwrap(), b"seg-b\r\nseg-c\r\n");
     }
 
     #[test]

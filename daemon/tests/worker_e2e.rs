@@ -546,6 +546,62 @@ async fn replay_is_a_sentineled_history_plus_current_screen() {
     assert!(screen.contains("after-resize"), "screen repaint: {screen:?}");
 }
 
+/// The reconnect-seed regression: the RTC attach path requests replay with a
+/// fixed 64 KiB budget. When retained history outgrew the newest segment's
+/// share of that budget, replay used to fail closed — wedging every attach on
+/// "connecting" until the agent was restarted. A small budget must succeed
+/// with truncated history and a current screen.
+#[tokio::test]
+async fn small_budget_replay_succeeds_against_deep_history() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    // ~130 KB of committed lines — comfortably past a 64 KiB seed budget.
+    let script = r#"
+i=0; while [ $i -lt 1300 ]; do printf 'deep-%05d-%090d\n' "$i" 0; i=$((i+1)); done
+printf 'FLOOD-END\n'
+cat
+"#;
+    let spec = start_spec(&["/bin/sh", "-c", script]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+    collect_output_until(&mut conn, b"FLOOD-END").await;
+
+    wire::write_frame(
+        &mut conn,
+        wire::T_REPLAY_REQ,
+        &wire::encode_replay_req(64 * 1024),
+    )
+    .await
+    .unwrap();
+    let replay = loop {
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        if frame_type == wire::T_REPLAY {
+            break payload;
+        }
+        assert!(
+            frame_type == wire::T_OUTPUT,
+            "seed-sized replay must not error (frame {frame_type})"
+        );
+    };
+    let (_, bytes) = wire::decode_replay(&replay).unwrap();
+    let text = String::from_utf8_lossy(bytes);
+    // Newest history made it in; oldest was truncated to fit the budget.
+    assert!(text.contains("deep-01299"), "newest history missing");
+    assert!(!text.contains("deep-00000"), "budget was not applied");
+    // The screen section still reconstructs the live screen.
+    let mut replayed = spawnd::sessiond::emulator::Emulator::new(80, 24);
+    replayed.feed(bytes);
+    assert!(
+        replayed.screen_text().join("\n").contains("FLOOD-END"),
+        "screen repaint missing from small-budget replay"
+    );
+}
+
 /// A scrollback wipe (`ESC[2J ESC[3J`, the claude/codex `/clear`) must
 /// actually destroy retained history: the replay afterwards contains no
 /// pre-clear content anywhere — not even in the screen section.
