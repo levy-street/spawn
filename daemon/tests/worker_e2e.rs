@@ -63,6 +63,51 @@ impl WorkerFixture {
     }
 }
 
+/// Scratch diagnostic (ignored by default): input→echo latency through the
+/// worker + unix socket alone. Run with `--ignored --nocapture` to print the
+/// distribution when hunting interactive-latency regressions.
+#[tokio::test]
+#[ignore]
+async fn echo_latency_through_worker() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+    let spec = start_spec(&["/bin/cat"]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+
+    let mut samples = Vec::new();
+    for i in 0..50u8 {
+        let byte = [b'a' + (i % 26)];
+        let start = std::time::Instant::now();
+        wire::write_frame(&mut conn, wire::T_INPUT, &byte)
+            .await
+            .unwrap();
+        loop {
+            let (frame_type, payload) = read_frame(&mut conn).await;
+            if frame_type == wire::T_OUTPUT {
+                let (_, bytes) = wire::decode_output(&payload).unwrap();
+                if bytes.contains(&byte[0]) {
+                    break;
+                }
+            }
+        }
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "worker echo: min={:.2} p50={:.2} p90={:.2} max={:.2} ms",
+        samples[0],
+        samples[samples.len() / 2],
+        samples[samples.len() * 9 / 10],
+        samples[samples.len() - 1]
+    );
+}
+
 #[tokio::test]
 async fn duplicate_worker_is_rejected_and_crash_stale_endpoints_recover() {
     use std::os::unix::fs::PermissionsExt;
