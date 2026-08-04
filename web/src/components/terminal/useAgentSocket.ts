@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { decodeHistoryDelta } from "@/components/terminal/committed-history";
 import {
   AGENT_CTL_MAX_PENDING_PTY_BYTES,
   AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER,
@@ -8,6 +9,7 @@ import {
   AGENT_CTL_UPLOAD_CHUNK_BYTES,
   type AgentCtlOperation,
   AgentCtlRequestTracker,
+  type AgentCtlResponse,
   type AgentCtlTrackedResult,
   type AgentCtlUploadResult,
   type AgentCtlUploadStart,
@@ -55,17 +57,32 @@ export interface UseAgentSocketOptions {
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
   onData: (bytes: Uint8Array, dcOffsetAfter?: number) => void;
-  onHistory?: (bytes: Uint8Array, dcOffset?: number | null) => void;
+  onHistory?: (
+    bytes: Uint8Array,
+    dcOffset?: number | null,
+    historyAnchor?: { epoch: string; offset: number } | null,
+  ) => void;
   onDisplayControl?: (state: DisplayControlState) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
   onStatus?: (status: string) => void;
   /** dcOffset is the daemon-side DataChannel byte count at capture time for
    *  the CURRENT rtc session, or null when the snapshot has no usable anchor
-   *  (stale session). */
-  onSnapshot?: (bytes: Uint8Array, plain: boolean, dcOffset?: number | null) => void;
+   *  (stale session). historyAnchor is the committed-history stream position
+   *  at capture, present only for delta-streaming workers. */
+  onSnapshot?: (
+    bytes: Uint8Array,
+    plain: boolean,
+    dcOffset?: number | null,
+    historyAnchor?: { epoch: string; offset: number } | null,
+  ) => void;
   /** The daemon refused or failed a snapshot request; there will be no
    *  payload. Without this the requester only learns via its own timeout. */
   onSnapshotError?: (message: string) => void;
+  /** Committed-history delta stream (present after `history_subscribe` is
+   *  acknowledged by a delta-capable daemon+worker pair). */
+  onHistoryDelta?: (epoch: string, offset: number, bytes: Uint8Array) => void;
+  onHistoryWipe?: (epoch: string) => void;
+  onHistoryGap?: () => void;
 }
 
 export interface DirectAgentUploadOptions {
@@ -164,6 +181,9 @@ export function useAgentSocket({
   onStatus,
   onSnapshot,
   onSnapshotError,
+  onHistoryDelta,
+  onHistoryWipe,
+  onHistoryGap,
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
@@ -215,6 +235,9 @@ export function useAgentSocket({
     onStatus,
     onSnapshot,
     onSnapshotError,
+    onHistoryDelta,
+    onHistoryWipe,
+    onHistoryGap,
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
@@ -226,6 +249,9 @@ export function useAgentSocket({
     onStatus,
     onSnapshot,
     onSnapshotError,
+    onHistoryDelta,
+    onHistoryWipe,
+    onHistoryGap,
   };
 
   useEffect(() => {
@@ -411,6 +437,7 @@ export function useAgentSocket({
         bytes: Uint8Array;
         plain: boolean;
         ptyOffset: number;
+        historyAnchor: { epoch: string; offset: number } | null;
       }> = [];
       let pendingBootstrapPtyBytes = 0;
       let bootstrapDone = false;
@@ -777,22 +804,40 @@ export function useAgentSocket({
         if (sliced.bytes && handlers) handlers.onData(sliced.bytes, offsetAfter);
       };
 
+      const responseHistoryAnchor = (
+        response: AgentCtlResponse,
+      ): { epoch: string; offset: number } | null =>
+        typeof response.history_epoch === "string" &&
+        Number.isSafeInteger(response.history_offset) &&
+        (response.history_offset as number) >= 0
+          ? { epoch: response.history_epoch, offset: response.history_offset as number }
+          : null;
+
       const flushPendingSnapshots = () => {
         if (!isCurrentRtcGeneration()) return;
         const received = rtcRef.current.bytesReceived;
         while (pendingSnapshots.length > 0 && pendingSnapshots[0].ptyOffset <= received) {
           const snapshot = pendingSnapshots.shift();
           if (!snapshot) break;
-          currentHandlers()?.onSnapshot?.(snapshot.bytes, snapshot.plain, snapshot.ptyOffset);
+          currentHandlers()?.onSnapshot?.(
+            snapshot.bytes,
+            snapshot.plain,
+            snapshot.ptyOffset,
+            snapshot.historyAnchor,
+          );
         }
       };
 
-      const finishBootstrap = (bytes: Uint8Array, ptyOffset: number | null | undefined) => {
+      const finishBootstrap = (
+        bytes: Uint8Array,
+        ptyOffset: number | null | undefined,
+        historyAnchor: { epoch: string; offset: number } | null = null,
+      ) => {
         if (bootstrapDone || !isCurrentRtcGeneration()) return;
         const anchor = typeof ptyOffset === "number" && ptyOffset >= 0 ? ptyOffset : 0;
         const handlers = currentHandlers();
         if (!handlers) return;
-        if (handlers.onHistory) handlers.onHistory(bytes, ptyOffset);
+        if (handlers.onHistory) handlers.onHistory(bytes, ptyOffset, historyAnchor);
         else handlers.onData(bytes);
         bootstrapPtyAnchor = anchor;
         for (const chunk of pendingBootstrapPty.splice(0)) {
@@ -819,7 +864,11 @@ export function useAgentSocket({
           return;
         }
         if (requestId === initialHistoryRequestId || result.response.operation === "history") {
-          finishBootstrap(result.bytes, result.response.pty_offset);
+          finishBootstrap(
+            result.bytes,
+            result.response.pty_offset,
+            responseHistoryAnchor(result.response),
+          );
         } else if (result.response.operation === "snapshot") {
           const ptyOffset =
             typeof result.response.pty_offset === "number" ? result.response.pty_offset : null;
@@ -829,6 +878,7 @@ export function useAgentSocket({
                 bytes: result.bytes,
                 plain: Boolean(result.response.plain),
                 ptyOffset,
+                historyAnchor: responseHistoryAnchor(result.response),
               });
             }
           } else {
@@ -836,6 +886,7 @@ export function useAgentSocket({
               result.bytes,
               Boolean(result.response.plain),
               ptyOffset,
+              responseHistoryAnchor(result.response),
             );
           }
         }
@@ -877,6 +928,10 @@ export function useAgentSocket({
           cleanupRtc(true, true, rtcGeneration);
           return;
         }
+        // Opt in to committed-history deltas. Old daemons answer with a
+        // malformed_request error, which the tracker routes as a failed
+        // response we simply ignore — delta mode never engages.
+        sendControl("history_subscribe");
         markReady();
       };
 
@@ -1038,6 +1093,25 @@ export function useAgentSocket({
                   uploadAgentGeneration = message.agent_generation;
                   serverReady = true;
                   startBootstrap();
+                  return;
+                }
+                if (message.event === "history_delta") {
+                  const bytes = decodeHistoryDelta(message.data);
+                  if (bytes) {
+                    currentHandlers()?.onHistoryDelta?.(
+                      message.history_epoch,
+                      message.history_offset,
+                      bytes,
+                    );
+                  }
+                  return;
+                }
+                if (message.event === "history_wipe") {
+                  currentHandlers()?.onHistoryWipe?.(message.history_epoch);
+                  return;
+                }
+                if (message.event === "history_gap") {
+                  currentHandlers()?.onHistoryGap?.();
                   return;
                 }
                 currentHandlers()?.onDisplayControl?.({

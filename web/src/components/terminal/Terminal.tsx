@@ -2,6 +2,7 @@
 
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -24,6 +25,7 @@ import {
   useState,
 } from "react";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { CommittedHistoryOverlay } from "@/components/terminal/committed-history";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
 // Terminal configuration shared with the conformance harness
@@ -501,6 +503,19 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // interactive input path (measured >1s echo stalls under streaming).
   const scrollbackTermConvergedRef = useRef(false);
   const renderedHistoryReplayRef = useRef(false);
+  // Committed-history delta mode: the worker streams every committed line
+  // over spawn.ctl and the hidden overlay terminal becomes a pure view of the
+  // worker's log (raw PTY bytes never touch it). Engaged the moment any
+  // response or event carries a history anchor; the legacy snapshot/replay
+  // pipeline below stays for old workers that cannot stream deltas.
+  const committedHistoryRef = useRef<CommittedHistoryOverlay | null>(null);
+  const historyStreamActiveRef = useRef(false);
+  const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  // Set when a wheel-open is waiting for the controller's write queue to
+  // drain; consumed by finishDeltaReveal.
+  const scrollbackRevealPendingRef = useRef(false);
+  const finishDeltaRevealRef = useRef<() => void>(() => {});
+  const updateScrollbackRevealRef = useRef<(overlay: HTMLElement) => void>(() => {});
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
@@ -730,6 +745,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }
     syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     scrollbackVisibleRef.current = false;
+    scrollbackRevealPendingRef.current = false;
+    committedHistoryRef.current?.conceal();
     scrollbackRenderInFlightRef.current = false;
     scrollbackPendingLiveWritesRef.current.clear();
     scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
@@ -770,11 +787,49 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [healScrollbackScrollState, rememberScrolledView, setScrollbackReadyState],
   );
+  updateScrollbackRevealRef.current = updateScrollbackReveal;
+
+  // Delta-mode reveal completion: the controller's write queue drained after a
+  // wheel-open (history + live-screen tail are in the buffer), so position at
+  // the live edge, apply the wheel deltas banked while rendering, and reveal.
+  const finishDeltaReveal = useCallback(() => {
+    const overlay = getScrollbackViewport();
+    const historyTerm = scrollbackTermRef.current;
+    if (!overlay || !historyTerm || !scrollbackVisibleRef.current) return;
+    healScrollbackScrollState();
+    scrollbackOverlayHasSnapshotRef.current = true;
+    historyTerm.scrollToBottom();
+    const pendingDelta = scrollbackPendingDeltaPxRef.current;
+    const pendingLines = Math.trunc(pendingDelta / Math.max(1, terminalRowHeightRef.current));
+    if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+    scrollbackPendingDeltaPxRef.current = 0;
+    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+    scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
+    updateScrollbackReveal(overlay);
+  }, [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal]);
+  finishDeltaRevealRef.current = finishDeltaReveal;
+
+  // Rebuild the delta-mode overlay from a v2 replay's history text. The
+  // screen chunk is ignored: the reveal tail is painted from the local live
+  // terminal, which is always fresher than any capture.
+  const seedCommittedHistory = useCallback(
+    (bytes: Uint8Array, anchor: { epoch: string; offset: number }) => {
+      const controller = committedHistoryRef.current;
+      if (!controller) return;
+      const storied = parseHistoryReplay(parseExactReplay(decodeUtf8(bytes)));
+      const { cols, rows } = lastSizeRef.current;
+      controller.seed(storied ? storied.history : "", anchor, { cols, rows });
+    },
+    [],
+  );
 
   const renderScrollbackSnapshot = useCallback(
     (bytes: Uint8Array | null, reveal: boolean) => {
       const historyTerm = scrollbackTermRef.current;
       if (!bytes || !historyTerm) return;
+      // Delta mode owns the hidden terminal; a legacy rewrite would corrupt
+      // the controller's anchored buffer.
+      if (historyStreamActiveRef.current) return;
       const renderAlreadyInFlight = scrollbackRenderInFlightRef.current;
       const generation = scrollbackRenderGenerationRef.current + 1;
       scrollbackRenderGenerationRef.current = generation;
@@ -941,6 +996,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   revealRenderedScrollbackRef.current = revealRenderedScrollback;
 
   const prepareScrollbackSnapshot = useCallback(() => {
+    if (historyStreamActiveRef.current) return;
     const bytes = scrollbackCachedSnapshotBytesRef.current;
     if (
       !bytes ||
@@ -961,6 +1017,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const writeScrollbackLiveBytes = useCallback(
     (bytes: Uint8Array, dcOffsetAfter?: number) => {
+      // Delta mode: raw PTY bytes never enter the hidden terminal. The
+      // committed-history stream is its only content source; the live screen
+      // is painted at reveal time from the live terminal itself.
+      if (historyStreamActiveRef.current) {
+        committedHistoryRef.current?.liveScreenChanged();
+        return;
+      }
       const historyTerm = scrollbackTermRef.current;
       if (!historyTerm) return;
       const geometry = lastSizeRef.current;
@@ -1020,6 +1083,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // scrolling: the reset+rewrite collapses the scroll range mid-write, so
   // rendering underneath an active gesture yanks the view to stale content.
   const renderOverlaySnapshotWhenIdle = useCallback(() => {
+    if (historyStreamActiveRef.current) return;
     if (scrollbackRerenderTimerRef.current) {
       clearTimeout(scrollbackRerenderTimerRef.current);
       scrollbackRerenderTimerRef.current = null;
@@ -1416,7 +1480,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         cacheOffset !== undefined &&
         !scrollbackCachedSnapshotIsShallowRef.current &&
         dcOffsetAfter - cacheOffset < SCROLLBACK_DC_REPLAY_BUFFER_BYTES / 2;
-      if (!cacheCovered) {
+      // Delta mode: the committed-history stream keeps the overlay exact, so
+      // live output never invalidates it (no periodic multi-MB refetches).
+      if (!cacheCovered && !historyStreamActiveRef.current) {
         scrollbackCacheDirtyRef.current = true;
       }
       scrollbackLiveBytesAtRef.current = Date.now();
@@ -1444,7 +1510,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           }
         }, 250);
       }
-      if (!cacheCovered) scheduleScrollbackCacheRefreshRef.current();
+      if (!cacheCovered && !historyStreamActiveRef.current) {
+        scheduleScrollbackCacheRefreshRef.current();
+      }
       writeScrollbackLiveBytes(bytes, dcOffsetAfter);
       const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
       if (liveSeedWriteInFlightRef.current) {
@@ -1459,7 +1527,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         });
       }
     },
-    onHistory: (bytes, dcOffset) => {
+    onHistory: (bytes, dcOffset, historyAnchor) => {
       const term = termRef.current;
       if (!term) return;
       clearPrediction();
@@ -1468,6 +1536,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackTermConvergedRef.current = false;
       if (typeof dcOffset === "number") {
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
+      }
+      if (historyAnchor) {
+        // Delta-capable worker: the connect seed anchors the committed-line
+        // overlay; the scheduled deep refresh below re-seeds at full depth.
+        historyStreamActiveRef.current = true;
+        seedCommittedHistory(bytes, historyAnchor);
       }
       pendingLiveSeedWritesRef.current.clear();
       liveSeedCoveredOffsetRef.current = typeof dcOffset === "number" ? dcOffset : null;
@@ -1515,7 +1589,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
     },
     onDisplayControl: applyDisplayControl,
-    onSnapshot: (bytes, _plain, dcOffset) => {
+    onSnapshot: (bytes, _plain, dcOffset, historyAnchor) => {
       const snapshotIsExact = parseExactReplay(decodeUtf8(bytes)) !== null;
       if (snapshotIsExact) {
         exactStreamRef.current = true;
@@ -1571,6 +1645,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           liveSeedWasExactRef.current = snapshotIsExact;
         }
       }
+      if (historyAnchor) {
+        // Delta mode: this snapshot is a seed/heal for the committed-line
+        // overlay. The controller re-anchors from it; deltas keep it exact
+        // afterwards, so the cache is clean by construction.
+        historyStreamActiveRef.current = true;
+        scrollbackCacheDirtyRef.current = false;
+        seedCommittedHistory(bytes, historyAnchor);
+        return;
+      }
       if (scrollbackVisibleRef.current) {
         scrollbackSnapshotBytesRef.current = bytes;
         renderOverlaySnapshotWhenIdle();
@@ -1588,6 +1671,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
+    },
+    onHistoryDelta: (epoch, offset, bytes) => {
+      historyStreamActiveRef.current = true;
+      committedHistoryRef.current?.applyDelta(epoch, offset, bytes);
+    },
+    onHistoryWipe: (epoch) => {
+      historyStreamActiveRef.current = true;
+      committedHistoryRef.current?.applyWipe(epoch);
+    },
+    onHistoryGap: () => {
+      committedHistoryRef.current?.applyGap();
     },
     onExit: (code, sig) => {
       const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
@@ -1730,6 +1824,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         setScrollbackVisible(true);
       }
 
+      if (historyStreamActiveRef.current) {
+        // Delta mode: the hidden terminal already holds the exact committed
+        // history. Reveal paints the live-screen tail below it; when no seed
+        // has anchored yet, the controller requests one and the seed's render
+        // completes this reveal.
+        scrollbackRevealPendingRef.current = true;
+        committedHistoryRef.current?.reveal();
+        return true;
+      }
+
       if (scrollbackSnapshotBytesRef.current) {
         if (!revealRenderedScrollbackRef.current()) {
           requestAnimationFrame(() => {
@@ -1763,6 +1867,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // the old width. Drop the rendered copy and fetch a fresh checkpoint at the new
   // geometry instead of presenting stale-width history.
   const invalidateScrollbackForResize = useCallback(() => {
+    if (historyStreamActiveRef.current) {
+      // Delta mode: committed history is flowing text — xterm reflows it on
+      // resize with nothing refetched. Only the tail repaints.
+      const { cols, rows } = lastSizeRef.current;
+      committedHistoryRef.current?.resize(cols, rows);
+      return;
+    }
     scrollbackTermConvergedRef.current = false;
     scrollbackCacheDirtyRef.current = true;
     scrollbackRenderedSnapshotBytesRef.current = null;
@@ -1793,6 +1904,37 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     activateUnicodeVersion(historyTerm, Unicode11Addon);
     historyTerm.open(host);
     scrollbackTermRef.current = historyTerm;
+    committedHistoryRef.current = new CommittedHistoryOverlay({
+      term: () => scrollbackTermRef.current,
+      serializeLiveScreen: () => {
+        const addon = serializeAddonRef.current;
+        if (!addon || !termRef.current) return "";
+        try {
+          return addon.serialize({ scrollback: 0, excludeModes: true, excludeAltBuffer: true });
+        } catch {
+          return "";
+        }
+      },
+      requestSeed: () => {
+        scrollbackCacheDirtyRef.current = true;
+        if (scrollbackVisibleRef.current) {
+          requestSnapshotRef.current("overlay");
+        } else {
+          scheduleScrollbackCacheRefreshRef.current();
+        }
+      },
+      onRendered: () => {
+        if (scrollbackRevealPendingRef.current) {
+          scrollbackRevealPendingRef.current = false;
+          finishDeltaRevealRef.current();
+          return;
+        }
+        if (scrollbackVisibleRef.current) {
+          const overlay = getScrollbackViewport();
+          if (overlay) updateScrollbackRevealRef.current(overlay);
+        }
+      },
+    });
     // Route wheel through the shared scrollback logic (close-at-bottom,
     // snapshot refresh) instead of xterm's native buffer scrolling.
     historyTerm.attachCustomWheelEventHandler((event) => scrollbackWheelHandlerRef.current(event));
@@ -1812,6 +1954,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     return () => {
       host.removeEventListener("mouseup", copySelectionOnMouseUp);
+      committedHistoryRef.current?.dispose();
+      committedHistoryRef.current = null;
       historyTerm.dispose();
       if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
     };
@@ -1871,9 +2015,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const fit = new FitAddon();
     const links = new WebLinksAddon();
     const clipboard = new ClipboardAddon();
+    const serialize = new SerializeAddon();
     term.loadAddon(fit);
     term.loadAddon(links);
     term.loadAddon(clipboard);
+    term.loadAddon(serialize);
+    serializeAddonRef.current = serialize;
     activateUnicodeVersion(term, Unicode11Addon);
 
     term.open(containerRef.current);

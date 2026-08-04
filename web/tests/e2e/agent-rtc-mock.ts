@@ -14,6 +14,10 @@ export async function installAgentRtcMock(
     autoSnapshot?: boolean;
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
+    /** When set, replay responses carry this committed-history anchor
+     *  (epoch + historyOffset), putting the client in delta mode. */
+    historyEpoch?: string;
+    historyOffset?: number;
     onPtyInput?: (bytes: Buffer) => void | Promise<void>;
     onUpload?: (upload: {
       name: string;
@@ -51,6 +55,8 @@ export async function installAgentRtcMock(
       autoSnapshot,
       uploadFinalAction,
       stallUploadBackpressure,
+      historyEpoch,
+      historyOffset,
     }) => {
       const encoder = new TextEncoder();
       const state = {
@@ -62,6 +68,8 @@ export async function installAgentRtcMock(
         autoSnapshot,
         uploadFinalAction,
         stallUploadBackpressure,
+        historyEpoch,
+        historyOffset: historyOffset ?? 0,
         connections: 0,
         activePtyChannel: null as FakeDataChannel | null,
         channels: new Map<string, FakeDataChannel>(),
@@ -122,6 +130,9 @@ export async function installAgentRtcMock(
             pty_offset: state.ptyOffset,
             total_bytes: payload.length,
             chunks: payload.length === 0 ? 0 : 1,
+            ...(state.historyEpoch
+              ? { history_epoch: state.historyEpoch, history_offset: state.historyOffset }
+              : {}),
           }),
         );
         if (payload.length > 0) channel.receive(ctlChunk(requestId, payload));
@@ -455,6 +466,9 @@ export async function installAgentRtcMock(
             releaseHeldUploadCompletion: () => void;
             queueActiveUploadCompletion: () => boolean;
             replaceRtcGeneration: () => void;
+            sendHistoryDelta: (epoch: string, offset: number, text: string) => void;
+            sendHistoryWipe: (epoch: string) => void;
+            sendHistoryGap: () => void;
           };
         }
       ).__spawnRtcTest = {
@@ -527,6 +541,39 @@ export async function installAgentRtcMock(
         replaceRtcGeneration() {
           state.channels.get("spawn.ctl")?.close();
         },
+        sendHistoryDelta(epoch, offset, text) {
+          const bytes = encoder.encode(text);
+          let binary = "";
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          state.historyOffset = offset + bytes.length;
+          state.channels.get("spawn.ctl")?.receive(
+            JSON.stringify({
+              version: 1,
+              kind: "event",
+              event: "history_delta",
+              history_epoch: epoch,
+              history_offset: offset,
+              data: btoa(binary),
+            }),
+          );
+        },
+        sendHistoryWipe(epoch) {
+          state.historyEpoch = epoch;
+          state.historyOffset = 0;
+          state.channels.get("spawn.ctl")?.receive(
+            JSON.stringify({
+              version: 1,
+              kind: "event",
+              event: "history_wipe",
+              history_epoch: epoch,
+            }),
+          );
+        },
+        sendHistoryGap() {
+          state.channels
+            .get("spawn.ctl")
+            ?.receive(JSON.stringify({ version: 1, kind: "event", event: "history_gap" }));
+        },
       };
     },
     {
@@ -538,6 +585,8 @@ export async function installAgentRtcMock(
       autoSnapshot: options.autoSnapshot ?? false,
       uploadFinalAction: options.uploadFinalAction ?? "complete",
       stallUploadBackpressure: options.stallUploadBackpressure ?? false,
+      historyEpoch: options.historyEpoch,
+      historyOffset: options.historyOffset,
     },
   );
 }
@@ -604,6 +653,29 @@ export async function replyReplay(page: Page, text: string) {
       window as unknown as { __spawnRtcTest: { replyReplay: (text: string) => void } }
     ).__spawnRtcTest.replyReplay(value);
   }, text);
+}
+
+export async function sendHistoryDelta(page: Page, epoch: string, offset: number, text: string) {
+  await page.evaluate(
+    ({ epoch, offset, text }) => {
+      (
+        window as unknown as {
+          __spawnRtcTest: {
+            sendHistoryDelta: (epoch: string, offset: number, text: string) => void;
+          };
+        }
+      ).__spawnRtcTest.sendHistoryDelta(epoch, offset, text);
+    },
+    { epoch, offset, text },
+  );
+}
+
+export async function sendHistoryWipe(page: Page, epoch: string) {
+  await page.evaluate((value) => {
+    (
+      window as unknown as { __spawnRtcTest: { sendHistoryWipe: (epoch: string) => void } }
+    ).__spawnRtcTest.sendHistoryWipe(value);
+  }, epoch);
 }
 
 export async function setDisplayControl(

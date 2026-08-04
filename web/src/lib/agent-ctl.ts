@@ -24,7 +24,8 @@ export type AgentCtlOperation =
   | "take_control"
   | "upload_start"
   | "upload_cancel"
-  | "upload_complete";
+  | "upload_complete"
+  | "history_subscribe";
 
 export interface AgentCtlResponse {
   version: number;
@@ -42,6 +43,10 @@ export interface AgentCtlResponse {
   received_bytes?: number;
   path?: string;
   sha256?: string;
+  /** Committed-history anchor at capture (string: u64 epoch exceeds JS safe
+   *  integers). Present only on replays from delta-streaming workers. */
+  history_epoch?: string;
+  history_offset?: number;
 }
 
 export interface AgentCtlDisplayEvent {
@@ -64,7 +69,43 @@ export interface AgentCtlReadyEvent {
   upload_chunk_bytes: number;
 }
 
-export type AgentCtlTextMessage = AgentCtlResponse | AgentCtlDisplayEvent | AgentCtlReadyEvent;
+/** Committed-history stream events (only sent after `history_subscribe`).
+ *  `history_delta` carries one base64 fragment of committed lines starting at
+ *  `history_offset` within `history_epoch`; `history_wipe` announces an `ED 3`
+ *  scrollback erase (new epoch, offset restarts at 0); `history_gap` means
+ *  deltas were lost and the client must re-anchor from a fresh snapshot. */
+export interface AgentCtlHistoryDeltaEvent {
+  version: number;
+  kind: "event";
+  event: "history_delta";
+  history_epoch: string;
+  history_offset: number;
+  data: string;
+}
+
+export interface AgentCtlHistoryWipeEvent {
+  version: number;
+  kind: "event";
+  event: "history_wipe";
+  history_epoch: string;
+}
+
+export interface AgentCtlHistoryGapEvent {
+  version: number;
+  kind: "event";
+  event: "history_gap";
+}
+
+export type AgentCtlHistoryEvent =
+  | AgentCtlHistoryDeltaEvent
+  | AgentCtlHistoryWipeEvent
+  | AgentCtlHistoryGapEvent;
+
+export type AgentCtlTextMessage =
+  | AgentCtlResponse
+  | AgentCtlDisplayEvent
+  | AgentCtlReadyEvent
+  | AgentCtlHistoryEvent;
 
 export interface AgentCtlChunk {
   requestId: string;
@@ -527,6 +568,25 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
     ) {
       return value as unknown as AgentCtlReadyEvent;
     }
+    const validEpoch =
+      typeof value.history_epoch === "string" && /^\d{1,20}$/.test(value.history_epoch);
+    if (value.kind === "event" && value.event === "history_delta") {
+      if (
+        !validEpoch ||
+        !Number.isSafeInteger(value.history_offset) ||
+        (value.history_offset as number) < 0 ||
+        typeof value.data !== "string"
+      ) {
+        return null;
+      }
+      return value as unknown as AgentCtlHistoryDeltaEvent;
+    }
+    if (value.kind === "event" && value.event === "history_wipe") {
+      return validEpoch ? (value as unknown as AgentCtlHistoryWipeEvent) : null;
+    }
+    if (value.kind === "event" && value.event === "history_gap") {
+      return value as unknown as AgentCtlHistoryGapEvent;
+    }
     if (
       value.kind === "event" &&
       value.event === "display_state" &&
@@ -655,6 +715,7 @@ function isAgentCtlOperation(value: unknown): value is AgentCtlOperation {
     value === "take_control" ||
     value === "upload_start" ||
     value === "upload_cancel" ||
-    value === "upload_complete"
+    value === "upload_complete" ||
+    value === "history_subscribe"
   );
 }
