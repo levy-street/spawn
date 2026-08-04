@@ -6,6 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
+import { PredictiveEcho } from "./predictive-echo";
 import "@xterm/xterm/css/xterm.css";
 import { useQuery } from "@tanstack/react-query";
 import Image from "next/image";
@@ -289,6 +290,91 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
     }
   }, [active, syncWebglRenderer]);
+  // Mosh-style predictive local echo: printable keystrokes paint immediately
+  // in an overlay at the cursor and reconcile against the authoritative echo
+  // a round trip later. The buffer is never touched (see predictive-echo.ts).
+  const predictorRef = useRef(new PredictiveEcho());
+  const predictionOverlayRef = useRef<HTMLDivElement>(null);
+  const syncPredictionOverlay = useCallback(() => {
+    const overlay = predictionOverlayRef.current;
+    if (!overlay) return;
+    const term = termRef.current;
+    const pending = predictorRef.current.pendingText;
+    const buffer = term?.buffer.active;
+    const screen = containerRef.current?.querySelector(".xterm-screen");
+    const surface = terminalSurfaceRef.current;
+    if (
+      !term ||
+      !buffer ||
+      !screen ||
+      !surface ||
+      pending.length === 0 ||
+      !activeRef.current ||
+      scrollbackVisibleRef.current ||
+      buffer.type === "alternate" ||
+      buffer.viewportY < buffer.baseY
+    ) {
+      overlay.style.display = "none";
+      return;
+    }
+    const screenRect = screen.getBoundingClientRect();
+    const surfaceRect = surface.getBoundingClientRect();
+    if (screenRect.width <= 0 || term.cols <= 0 || term.rows <= 0) {
+      overlay.style.display = "none";
+      return;
+    }
+    const cellWidth = screenRect.width / term.cols;
+    const rowHeight =
+      terminalRowHeightRef.current > 0
+        ? terminalRowHeightRef.current
+        : screenRect.height / term.rows;
+    const x = screenRect.left - surfaceRect.left + buffer.cursorX * cellWidth;
+    const y = screenRect.top - surfaceRect.top + buffer.cursorY * rowHeight;
+    overlay.textContent = pending;
+    overlay.style.transform = `translate(${x}px, ${y}px)`;
+    overlay.style.lineHeight = `${rowHeight}px`;
+    overlay.style.display = "block";
+  }, []);
+  const syncPredictionOverlayRef = useRef(syncPredictionOverlay);
+  syncPredictionOverlayRef.current = syncPredictionOverlay;
+  const reconcilePrediction = useCallback(() => {
+    const predictor = predictorRef.current;
+    if (predictor.pendingText.length === 0) return;
+    const term = termRef.current;
+    const buffer = term?.buffer.active;
+    if (!term || !buffer) {
+      predictor.clear();
+      return;
+    }
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    const textBeforeCursor =
+      line?.translateToString(
+        false,
+        Math.max(0, buffer.cursorX - predictor.pendingText.length),
+        buffer.cursorX,
+      ) ?? "";
+    predictor.reconcile(
+      { row: buffer.baseY + buffer.cursorY, col: buffer.cursorX },
+      textBeforeCursor,
+      performance.now(),
+    );
+    syncPredictionOverlayRef.current();
+  }, []);
+  const reconcilePredictionRef = useRef(reconcilePrediction);
+  reconcilePredictionRef.current = reconcilePrediction;
+  const predictionSweepRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const schedulePredictionSweep = useCallback(() => {
+    if (predictionSweepRef.current) clearTimeout(predictionSweepRef.current);
+    predictionSweepRef.current = setTimeout(() => {
+      predictionSweepRef.current = null;
+      reconcilePredictionRef.current();
+      if (predictorRef.current.pendingText.length > 0) schedulePredictionSweep();
+    }, 2_500);
+  }, []);
+  const clearPrediction = useCallback(() => {
+    predictorRef.current.clear();
+    syncPredictionOverlayRef.current();
+  }, []);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -599,12 +685,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // input until the next full repaint. The 3J matters: without wiping
       // local scrollback, the seed's replayed output would duplicate lines
       // the buffer already scrolled in.
+      predictorRef.current.clear();
       const ops: SequencedWrite[] = [
         { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
         ...liveSeedWriteOps(text),
       ];
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
         term.scrollToBottom();
+        syncPredictionOverlayRef.current();
       });
       return true;
     },
@@ -1234,6 +1322,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (pending.chunks.length === 0) {
       liveSeedWriteInFlightRef.current = false;
       pinLiveViewportToBottomRef.current();
+      // Echo bytes that raced the seed flush bypassed the per-write
+      // reconcile; settle any outstanding predictions now.
+      reconcilePredictionRef.current();
       return;
     }
     writeSequenced(
@@ -1358,12 +1449,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       } else {
         termRef.current?.write(bytes, () => {
           pinLiveViewportToBottomRef.current();
+          reconcilePredictionRef.current();
         });
       }
     },
     onHistory: (bytes, dcOffset) => {
       const term = termRef.current;
       if (!term) return;
+      clearPrediction();
       // A (re)connect seed restarts append continuity for the hidden
       // terminal; the next full render re-establishes convergence.
       scrollbackTermConvergedRef.current = false;
@@ -2630,6 +2723,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       liveSeedCoveredOffsetRef.current = null;
       liveSeedWriteInFlightRef.current = false;
       scrollbackPendingLiveWritesRef.current.clear();
+      if (predictionSweepRef.current) {
+        clearTimeout(predictionSweepRef.current);
+        predictionSweepRef.current = null;
+      }
+      predictorRef.current.clear();
       webglAddonRef.current?.dispose();
       webglAddonRef.current = null;
       term.dispose();
@@ -2913,12 +3011,38 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
+      // Predict only pristine keystrokes (no rewrites, no attachment
+      // payloads) against a settled buffer — mid-seed the cursor is wherever
+      // the rewrite walk happens to be, so an anchor read then is garbage.
+      if (
+        withAttachments === d &&
+        !liveSeedWriteInFlightRef.current &&
+        localStorage.getItem("spawnPredictEcho") !== "off"
+      ) {
+        const buffer = term.buffer.active;
+        const predicted = predictorRef.current.predict(
+          d,
+          { row: buffer.baseY + buffer.cursorY, col: buffer.cursorX },
+          term.cols,
+          performance.now(),
+        );
+        if (predicted) schedulePredictionSweep();
+        if (predicted || predictorRef.current.pendingText.length === 0) {
+          syncPredictionOverlayRef.current();
+        }
+      }
     });
     return () => {
       onDataDisposableRef.current?.dispose();
       onDataDisposableRef.current = null;
     };
-  }, [appendAttachmentsForSubmit, hideScrollbackOverlay, rawInput, socket]);
+  }, [
+    appendAttachmentsForSubmit,
+    hideScrollbackOverlay,
+    rawInput,
+    socket,
+    schedulePredictionSweep,
+  ]);
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
@@ -3243,6 +3367,25 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             ref={containerRef}
             data-testid="terminal-live-host"
             className="size-full touch-none"
+          />
+          {/* Predictive local echo: unconfirmed keystrokes render here at the
+              cursor until the authoritative echo confirms them. Dotted
+              underline marks them as provisional, mosh-style. */}
+          <div
+            ref={predictionOverlayRef}
+            data-testid="terminal-prediction-overlay"
+            aria-hidden
+            className="pointer-events-none absolute left-0 top-0 z-[5]"
+            style={{
+              display: "none",
+              fontFamily: TERMINAL_FONT_FAMILY,
+              fontSize: `${TERMINAL_FONT_SIZE}px`,
+              whiteSpace: "pre",
+              color: "#e5e5e5",
+              opacity: 0.75,
+              textDecoration: "underline dotted",
+              textUnderlineOffset: "3px",
+            }}
           />
         </div>
       </div>
