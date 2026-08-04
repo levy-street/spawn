@@ -109,15 +109,21 @@ function HostDetail() {
       }
       let localTombstoneWritten = false;
       try {
-        await revokeBrowserHostPin({
-          accountId: user.id,
-          origin: browserHostPinServerOrigin(),
-          targetHostId,
-          claimedHostId: host.id,
-          claimedHostPublicKey: host.host_public_key ?? null,
-          claimedHostFingerprint: host.host_key_fingerprint ?? null,
-        });
-        localTombstoneWritten = true;
+        // A host with no public key was never locally pinned (a pin requires a
+        // key), so there is no local trust to revoke — skip straight to the
+        // server delete. Legacy/orphaned hosts lack a key and would otherwise be
+        // undeletable ("the Host API did not provide a host public key").
+        if (host.host_public_key && host.host_key_fingerprint) {
+          await revokeBrowserHostPin({
+            accountId: user.id,
+            origin: browserHostPinServerOrigin(),
+            targetHostId,
+            claimedHostId: host.id,
+            claimedHostPublicKey: host.host_public_key,
+            claimedHostFingerprint: host.host_key_fingerprint,
+          });
+          localTombstoneWritten = true;
+        }
         setLocalDeletionPending(true);
         await hosts.remove(targetHostId);
       } catch (err) {
