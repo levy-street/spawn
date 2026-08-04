@@ -6,6 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
+import { LatencyHud, latencyHudEnabled } from "./latency-hud";
 import { PredictiveEcho } from "./predictive-echo";
 import "@xterm/xterm/css/xterm.css";
 import { useQuery } from "@tanstack/react-query";
@@ -293,6 +294,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Mosh-style predictive local echo: printable keystrokes paint immediately
   // in an overlay at the cursor and reconcile against the authoritative echo
   // a round trip later. The buffer is never touched (see predictive-echo.ts).
+  const latencyHudRef = useRef<LatencyHud | null>(null);
   const predictorRef = useRef(new PredictiveEcho());
   const predictionOverlayRef = useRef<HTMLDivElement>(null);
   const syncPredictionOverlay = useCallback(() => {
@@ -1444,12 +1446,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       if (!cacheCovered) scheduleScrollbackCacheRefreshRef.current();
       writeScrollbackLiveBytes(bytes, dcOffsetAfter);
+      const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
       } else {
         termRef.current?.write(bytes, () => {
           pinLiveViewportToBottomRef.current();
           reconcilePredictionRef.current();
+          if (closeHudSample) {
+            requestAnimationFrame(() => closeHudSample(performance.now()));
+          }
         });
       }
     },
@@ -1867,6 +1873,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     // The renderer addon needs the opened element; the active-state effect
     // has already run by the time this bootstrap effect mounts.
     syncWebglRendererRef.current(activeRef.current);
+    if (latencyHudEnabled() && terminalSurfaceRef.current) {
+      latencyHudRef.current = new LatencyHud();
+      latencyHudRef.current.attach(terminalSurfaceRef.current);
+    }
     const terminalViewport = terminalViewportRef.current;
     const terminalSurface = terminalSurfaceRef.current;
     const terminalElement = containerRef.current;
@@ -2723,6 +2733,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       liveSeedCoveredOffsetRef.current = null;
       liveSeedWriteInFlightRef.current = false;
       scrollbackPendingLiveWritesRef.current.clear();
+      latencyHudRef.current?.detach();
+      latencyHudRef.current = null;
       if (predictionSweepRef.current) {
         clearTimeout(predictionSweepRef.current);
         predictionSweepRef.current = null;
@@ -3011,6 +3023,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
+      if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
+        latencyHudRef.current.noteKeystroke(performance.now());
+      }
       // Predictive echo is opt-in (localStorage.spawnPredictEcho = "on"):
       // below ~30ms RTT the overlay flashes for a frame or two without
       // buying perceptible snappiness. It earns its keep on high-RTT links
