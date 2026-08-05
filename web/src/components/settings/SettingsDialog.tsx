@@ -112,7 +112,7 @@ export function SettingsDialog() {
             <button
               type="button"
               aria-label="Close settings"
-              className="absolute right-3 top-3 mt-[env(safe-area-inset-top)] rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:mt-0"
+              className="absolute right-3 top-3 mt-[env(safe-area-inset-top)] rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground max-md:bg-card/90 max-md:shadow-sm max-md:backdrop-blur md:mt-0"
             >
               <X className="size-4" />
             </button>
