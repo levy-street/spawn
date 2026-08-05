@@ -463,7 +463,7 @@ describe("browser-local host pins", () => {
     );
   });
 
-  test("bounds observed routing Host IDs without replacing the active key", async () => {
+  test("bounds observed routing Host IDs by evicting, never refusing or replacing the key", async () => {
     const factory = new IDBFactory();
     await approveBrowserHostPin(approvalInput(), options(factory));
     for (let index = 0; index < 8; index += 1) {
@@ -472,15 +472,17 @@ describe("browser-local host pins", () => {
         HOST_KEY,
       );
     }
-    await expectPinError(
-      resolveActiveBrowserHostPin(
-        resolveInput({ hostId: "00000000-0000-4000-9000-000000000008" }),
-        options(factory),
-      ),
-      "capacity_exceeded",
-    );
-    expect((await rawRecords(factory))[0].hostIds).toHaveLength(8);
-    expect((await rawRecords(factory))[0].hostPublicKey).toBe(HOST_KEY);
+    // The 9th binding evicts one existing ID instead of refusing: a refusal
+    // surfaces as pin_storage_error, which under signed-RTC enforcement is a
+    // hard lockout, while a dropped binding re-binds on its next resolve.
+    const ninth = "00000000-0000-4000-9000-000000000008";
+    expect(
+      await resolveActiveBrowserHostPin(resolveInput({ hostId: ninth }), options(factory)),
+    ).toBe(HOST_KEY);
+    const record = (await rawRecords(factory))[0];
+    expect(record.hostIds).toHaveLength(8);
+    expect(record.hostIds).toContain(ninth);
+    expect(record.hostPublicKey).toBe(HOST_KEY);
   });
 
   test("deletion refuses split, substituted, and unbound identities without mutation or DELETE", async () => {

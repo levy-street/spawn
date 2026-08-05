@@ -30,6 +30,7 @@ MAX_HOST_RTC_SESSIONS_PER_DAEMON = 64
 MAX_HOST_SIGNAL_ENVELOPE_BYTES = 1200 * 1024
 HOST_RTC_STATUS_ALLOWLIST = frozenset({"connected", "failed", "unavailable"})
 HOST_OWNER_REVOKED_EVENT = "host.owner_revoked"
+BROWSER_PINS_CHANGED_EVENT = "host.browser_pins_changed"
 
 
 async def wait_for_signal_pump(pump: asyncio.Task[None], ready: asyncio.Event) -> None:
@@ -169,6 +170,27 @@ def encode_host_owner_revocation(event: HostOwnerRevocation) -> bytes:
         },
         separators=(",", ":"),
     ).encode()
+
+
+def encode_browser_pins_changed() -> bytes:
+    """Cross-worker nudge that a host's live browser-pin set changed.
+
+    Deliberately carries no pin data: the worker holding the daemon's socket
+    recomputes the authoritative set from the database, so a stale fanout can
+    never overwrite a newer state. Host identity is implicit in the channel.
+    """
+
+    return json.dumps({"type": BROWSER_PINS_CHANGED_EVENT}, separators=(",", ":")).encode()
+
+
+def decode_browser_pins_changed(payload: bytes) -> bool:
+    if not payload or len(payload) > 512:
+        return False
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("type") == BROWSER_PINS_CHANGED_EVENT
 
 
 def decode_host_owner_revocation(payload: bytes) -> HostOwnerRevocation | None:

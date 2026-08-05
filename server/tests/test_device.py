@@ -294,6 +294,8 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     assert approval.status_code == 200
     assert approval.json() == {
         **review,
+        # First pairing: the Host row does not exist yet, so no UUID to bind.
+        "host_id": None,
         "browser_device_id": browser[0]["id"],
         "browser_key_algorithm": "ed25519",
         "browser_public_key": browser[0]["public_key"],

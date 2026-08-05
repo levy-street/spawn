@@ -264,6 +264,10 @@ export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
   browser_key_algorithm: z.literal("ed25519"),
   browser_public_key: z.string().length(43),
   browser_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
+  // Present only when this key was already paired (re-pair): the Host row's
+  // UUID, used to bind the local pin immediately. First pairings get null and
+  // seed from /api/hosts once the daemon's poll creates the row.
+  host_id: z.string().uuid().nullish(),
 });
 export type DeviceApproval = z.infer<typeof DeviceApproveResponseSchema>;
 

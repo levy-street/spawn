@@ -780,4 +780,5 @@ async def device_approve(
         browser_key_algorithm=body.browser_key_algorithm,
         browser_public_key=body.browser_public_key,
         browser_key_fingerprint=body.browser_key_fingerprint,
+        host_id=pinned_host.id if pinned_host is not None else None,
     )

@@ -31,7 +31,9 @@ from .host_signal import (
     HostPresenceOwner,
     HostSignalEnvelope,
     RedisBrowserConn,
+    decode_browser_pins_changed,
     decode_host_owner_revocation,
+    encode_browser_pins_changed,
     decode_host_presence_owner,
     decode_host_signal,
     encode_host_owner_revocation,
@@ -1119,6 +1121,20 @@ async def _pump_host_rtc_signals(
     async with get_backend().subscribe_channel(host_signal_channel(conn.host_id)) as stream:
         ready.set()
         async for raw in stream:
+            if decode_browser_pins_changed(raw):
+                # Another worker recorded a pin change (typically a
+                # revocation) but does not hold this daemon's socket. Rebuild
+                # the authoritative set here and deliver it now instead of
+                # waiting for the daemon's next reconnect.
+                try:
+                    frame = await _browser_pins_frame(conn.host_id)
+                    if frame is not None:
+                        await _bounded_send_text(conn, frame)
+                except Exception:
+                    log.warning(
+                        "could not relay browser pin change to daemon host=%s", conn.host_id
+                    )
+                continue
             revocation = decode_host_owner_revocation(raw)
             if revocation is not None:
                 if (
@@ -1771,32 +1787,53 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
         log.info("daemon disconnected host=%s", host.id)
 
 
+async def _browser_pins_frame(host_id: str) -> dict[str, Any] | None:
+    """The authoritative full-set frame; removal is implicit in replacement.
+
+    `browser_device_ids` and `browser_pins` are always built together: the
+    daemon treats an absent id list as "server cannot report" and prunes
+    nothing, so a frame carrying pins without ids silently disables
+    revocation.
+    """
+
+    async with _bounded_host_ownership_session() as session:
+        host = await session.get(Host, host_id)
+        if host is None:
+            return None
+        owner_user_id = host.owner_user_id
+    return {
+        "type": "host.browser_pins",
+        "account_id": owner_user_id,
+        "browser_device_ids": await _live_browser_device_ids(host_id),
+        "browser_pins": await _live_browser_pins(host_id),
+    }
+
+
 async def push_browser_pins(host_id: str) -> bool:
     """Tell a connected daemon its browser pin set changed.
 
-    Best effort by design. Reconciliation at registration is the guarantee; this
-    only removes the wait, so a daemon that is offline or attached to another
-    worker still converges on its next connect rather than missing the change.
+    Best effort by design. Reconciliation at registration is the guarantee;
+    this only removes the wait. When another worker holds the daemon's socket,
+    the change is relayed over the host's cross-worker signal channel so a
+    revocation lands promptly regardless of which worker served the request —
+    a revocation that waited for the daemon's next reconnect could take days.
     """
 
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is None:
-        return False
-    async with _bounded_host_ownership_session() as session:
-        host = await session.get(Host, host_id)
-        if host is None:
+        try:
+            await get_backend().publish_channel(
+                host_signal_channel(host_id), encode_browser_pins_changed()
+            )
+        except Exception:
+            log.warning("could not relay browser pin change host=%s", host_id)
             return False
-        owner_user_id = host.owner_user_id
+        return True
+    frame = await _browser_pins_frame(host_id)
+    if frame is None:
+        return False
     try:
-        await _bounded_send_text(
-            daemon,
-            {
-                "type": "host.browser_pins",
-                "account_id": owner_user_id,
-                "browser_device_ids": await _live_browser_device_ids(host_id),
-                "browser_pins": await _live_browser_pins(host_id),
-            },
-        )
+        await _bounded_send_text(daemon, frame)
     except Exception:
         log.warning("could not push browser pins to daemon host=%s", host_id)
         return False

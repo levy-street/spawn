@@ -613,12 +613,17 @@ function normalizeSeedHostIds(hostIds: readonly string[] | undefined): string[] 
   return valid.slice(0, BROWSER_HOST_PIN_MAX_HOST_IDS);
 }
 
-/** Union seed IDs into an existing set, never dropping an existing binding. */
+/** Union seed IDs into an existing set. At capacity an existing binding is
+ *  evicted to admit the new one: hostIds are routing metadata that re-binds
+ *  on the next successful key-matching resolve, while refusing (or dropping
+ *  the newest) turns re-pair churn into a permanent stale set — and, under
+ *  signed-RTC enforcement, a hard lockout. */
 function mergeHostIds(existing: readonly string[], seed: readonly string[]): string[] {
   const merged = [...existing];
   for (const id of seed) {
-    if (merged.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) break;
-    if (!merged.includes(id)) merged.push(id);
+    if (merged.includes(id)) continue;
+    if (merged.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) merged.shift();
+    merged.push(id);
   }
   return merged.sort();
 }
@@ -724,15 +729,13 @@ export async function resolveActiveBrowserHostPin(
         );
       }
       if (bound !== undefined) return { result: exact.hostPublicKey };
-      if (exact.hostIds.length >= BROWSER_HOST_PIN_MAX_HOST_IDS) {
-        throw new BrowserHostPinError(
-          "capacity_exceeded",
-          `one local key may observe at most ${BROWSER_HOST_PIN_MAX_HOST_IDS} Host IDs`,
-        );
-      }
       const boundExact: StoredBrowserHostPinV1 = {
         ...exact,
-        hostIds: [...exact.hostIds, input.hostId].sort(),
+        // Same eviction-at-capacity policy as mergeHostIds: a binding is
+        // recoverable routing metadata, but refusing here would surface as
+        // pin_storage_error — a hard refusal with no raw fallback once
+        // signed-RTC enforcement is on.
+        hostIds: mergeHostIds(exact.hostIds, [input.hostId]),
       };
       return { nextRecord: boundExact, result: boundExact.hostPublicKey };
     });

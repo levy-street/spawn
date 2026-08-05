@@ -552,6 +552,19 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
     revocation = HostOwnerRevocation("a" * 32, "d" * 32)
     assert decode_host_owner_revocation(encode_host_owner_revocation(revocation)) == revocation
     assert decode_host_owner_revocation(b"null") is None
+
+    from spawn_server.ws.host_signal import (
+        decode_browser_pins_changed,
+        encode_browser_pins_changed,
+    )
+
+    # The pin-change nudge round-trips and never collides with the other
+    # channel event shapes (each decoder must reject the others' payloads).
+    assert decode_browser_pins_changed(encode_browser_pins_changed()) is True
+    assert decode_browser_pins_changed(encode_host_owner_revocation(revocation)) is False
+    assert decode_browser_pins_changed(b"null") is False
+    assert decode_host_owner_revocation(encode_browser_pins_changed()) is None
+    assert decode_host_signal(encode_browser_pins_changed()) is None
     with pytest.raises(ValueError, match="too large"):
         encode_host_signal(
             HostSignalEnvelope(

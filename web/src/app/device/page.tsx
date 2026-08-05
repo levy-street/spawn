@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ApiError, auth, type DevicePendingApproval } from "@/lib/api";
+import { ApiError, auth, type DevicePendingApproval, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   createHostPairApprovalProof,
@@ -23,6 +23,52 @@ import {
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
+
+/**
+ * Bind the just-approved local pin to its Host UUID so the signed-RTC
+ * downgrade gate can recognize the host by ID from the very first connection
+ * — an unbound pin (`hostIds: []`) is invisible to the known-host check, and
+ * a hostile server could hold that host on the raw path indefinitely.
+ *
+ * On a re-pair the approve response already carries the UUID. On a first
+ * pairing the Host row only exists after the daemon's poll completes, so
+ * this retries briefly against /api/hosts, matching strictly on the exact
+ * ceremony-reviewed public key (the server-supplied fingerprint is never
+ * consulted). Best-effort: the key pin is already durable, and the first
+ * successful key-matching resolve self-heals the binding later.
+ */
+async function seedApprovedHostBinding(input: {
+  accountId: string;
+  hostPublicKey: string;
+  hostFingerprint: string;
+  knownHostId: string | null | undefined;
+}): Promise<void> {
+  const bind = (hostId: string) =>
+    approveBrowserHostPin({
+      accountId: input.accountId,
+      origin: browserHostPinServerOrigin(),
+      hostPublicKey: input.hostPublicKey,
+      hostFingerprint: input.hostFingerprint,
+      hostIds: [hostId],
+    });
+  try {
+    if (input.knownHostId) {
+      await bind(input.knownHostId);
+      return;
+    }
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const listed = await hosts.list().catch(() => null);
+      const match = listed?.find((host) => host.host_public_key === input.hostPublicKey);
+      if (match) {
+        await bind(match.id);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+  } catch {
+    // Non-fatal by design; resolveActiveBrowserHostPin binds on first use.
+  }
+}
 
 export default function DevicePage() {
   return (
@@ -146,6 +192,12 @@ function DeviceInner() {
         );
       }
       setHostName(r.host_name);
+      void seedApprovedHostBinding({
+        accountId: user.id,
+        hostPublicKey: pending.host_public_key,
+        hostFingerprint: expectedFingerprint,
+        knownHostId: r.host_id,
+      });
       setPending(null);
       setLocalPinState(null);
       setLocalPinCommitted(false);

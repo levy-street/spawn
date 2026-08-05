@@ -428,7 +428,13 @@ async fn wait_for_credential_change_with(
     let mut ticker = tokio::time::interval_at(start, poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        // The ticker is the guarantee; the notify is a latency optimization
+        // that observes this daemon's own pin writes without waiting out the
+        // interval.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = credentials_touched_notify().notified() => {}
+        }
         let record = loader
             .load()
             .await
@@ -945,12 +951,16 @@ async fn reconcile_browser_pins(
         }
     };
 
+    let mut changed = false;
     match adopted {
         None | Some(Ok(0)) => {}
-        Some(Ok(adopted)) => tracing::info!(
-            adopted,
-            "adopted browser pins endorsed by an already-trusted device"
-        ),
+        Some(Ok(adopted)) => {
+            changed = true;
+            tracing::info!(
+                adopted,
+                "adopted browser pins endorsed by an already-trusted device"
+            );
+        }
         Some(Err(error)) => tracing::warn!(
             error = format!("{error:#}"),
             "could not adopt endorsed browser pins"
@@ -959,13 +969,31 @@ async fn reconcile_browser_pins(
     match removed {
         None | Some(Ok(0)) => {}
         Some(Ok(removed)) => {
-            tracing::warn!(removed, "dropped browser pins the server no longer lists")
+            changed = true;
+            tracing::warn!(removed, "dropped browser pins the server no longer lists");
         }
         Some(Err(error)) => tracing::warn!(
             error = format!("{error:#}"),
             "could not reconcile browser pins against the server"
         ),
     }
+    if changed {
+        // A revocation (or adoption) this daemon just wrote must reach the
+        // in-memory verifier snapshot now, not on the next poll tick: nudge
+        // the credential-change waiter so the ~500 ms stale-pin window (during
+        // which a revoked browser's signed offers still verify) collapses to
+        // the reload itself.
+        credentials_touched_notify().notify_one();
+    }
+}
+
+/// Wakes the credential-change poller immediately after a local write that
+/// must be observed promptly (browser-pin adoption/revocation). At most one
+/// session loop waits at a time; a missed wake degrades to the poll interval.
+fn credentials_touched_notify() -> &'static tokio::sync::Notify {
+    static CREDENTIALS_TOUCHED: std::sync::OnceLock<tokio::sync::Notify> =
+        std::sync::OnceLock::new();
+    CREDENTIALS_TOUCHED.get_or_init(tokio::sync::Notify::new)
 }
 
 fn require_signed_rtc_offers() -> bool {

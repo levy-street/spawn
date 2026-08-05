@@ -293,6 +293,11 @@ class DeviceApproveResponse(BaseModel):
     browser_key_algorithm: Literal["ed25519"]
     browser_public_key: str
     browser_key_fingerprint: str
+    # Existing Host row for this key (re-pair only): lets the approving
+    # browser bind its local pin to the host UUID immediately. Null on a
+    # first pairing — the Host row is created later by the daemon's poll, and
+    # the browser seeds the binding from /api/hosts instead.
+    host_id: str | None = None
 
 
 class DevicePendingResponse(BaseModel):
