@@ -80,10 +80,35 @@ describe("resolveSignedRtcTrust gate", () => {
     expect(typeof decision.capability.signOffer).toBe("function");
   });
 
-  test("never-approved keyed host => unpinned (raw TOFU first-contact)", async () => {
+  test("never-approved keyed host with an identity => signed TOFU on the claimed key", async () => {
+    // The daemon can authenticate this browser (mandatory under enforcement)
+    // even though the host is first-contact; the claimed key anchors answer
+    // verification, which the raw path never had. No pin is created.
     await seedDeviceIdentity();
     const decision = await resolve();
+    expect(decision.mode).toBe("signed");
+    if (decision.mode !== "signed") throw new Error("unreachable");
+    expect(decision.capability.hostPublicKeyWire).toBe(HOST_KEY);
+    expect(typeof decision.capability.signOffer).toBe("function");
+  });
+
+  test("never-approved keyed host without an identity => unpinned (raw TOFU)", async () => {
+    const decision = await resolve();
     expect(decision.mode).toBe("unpinned");
+  });
+
+  test("signed TOFU never creates or binds a local pin", async () => {
+    await seedDeviceIdentity();
+    const first = await resolve();
+    expect(first.mode).toBe("signed");
+    // A later withheld key must still be treated as a never-pinned host (raw
+    // or refused elsewhere), not as a downgrade from a pin this path must not
+    // have created.
+    const withheld = await resolve({
+      claimedHostPublicKey: null,
+      claimedHostFingerprint: null,
+    });
+    expect(withheld.mode).toBe("unpinned");
   });
 
   test("null claimed key on a never-pinned host => unpinned (legacy preserved)", async () => {

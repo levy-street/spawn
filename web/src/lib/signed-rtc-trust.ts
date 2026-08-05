@@ -11,6 +11,7 @@ import {
   resolveActiveBrowserHostPin,
 } from "./browser-host-pins";
 import type { SignedRtcTrustCapability } from "./signed-rtc-live";
+import { decodeEd25519PublicKeyWire } from "./signed-signal";
 import { signRtcSignalWire } from "./signed-signal-wire";
 
 /**
@@ -33,9 +34,15 @@ export type SignedRtcRefusalReason =
 
 /**
  * The trust decision for one live RTC connection generation.
- * - `signed`   — a local pin matched; signed signaling is mandatory.
- * - `unpinned` — this host has never been approved; raw TOFU first-contact is
- *   acceptable (unchanged legacy behavior).
+ * - `signed`   — offers are signed with this browser's identity. Either a
+ *   local pin matched (host fully verified), or the host is unpinned and the
+ *   capability anchors on the server's claimed key ("signed TOFU": the daemon
+ *   can authenticate this browser — mandatory under enforcement — while our
+ *   verification of the host is first-contact material, exactly as trusting
+ *   a raw TOFU connection was, except the answer must now verify at all).
+ * - `unpinned` — this host has never been approved AND no signed session is
+ *   possible (no claimed key, or no local identity); raw TOFU first-contact
+ *   is acceptable (unchanged legacy behavior).
  * - `refuse`   — the host is (or may be) pinned but cannot be verified; the
  *   caller must NOT connect, signed or raw.
  */
@@ -162,13 +169,56 @@ async function decideAfterResolveFailure(
           reason: withheld ? "host_key_withheld" : "host_key_substituted",
         };
       }
-      return { mode: "unpinned" };
+      return await signedTofuOrUnpinned(input);
     }
     default:
       // invalid_account, invalid_host_id, storage_failure, corrupt_record, etc.
       // None can authorize a raw connection to a keyed host: fail closed.
       return { mode: "refuse", reason: "pin_storage_error" };
   }
+}
+
+/**
+ * A never-pinned host used to mean raw TOFU — which enforcement-enabled
+ * daemons refuse, stranding devices that ARE trusted daemon-side (endorsed)
+ * but hold no local pin yet. When this browser has a signing identity and the
+ * server claims a parseable host key, sign anyway: the daemon authenticates
+ * this browser, and the answer must verify against the claimed key (raw
+ * checked nothing). The claimed key remains untrusted first-contact material
+ * — this path never creates, binds, or reactivates any local pin, and every
+ * pinned-host refusal above is unaffected. If the server lied about the key,
+ * the real daemon's envelope check fails and no connection forms.
+ */
+async function signedTofuOrUnpinned(
+  input: ResolveSignedRtcTrustInput,
+): Promise<SignedRtcTrustDecision> {
+  const claimed = input.claimedHostPublicKey;
+  if (claimed === null) return { mode: "unpinned" };
+  try {
+    decodeEd25519PublicKeyWire(claimed);
+  } catch {
+    return { mode: "unpinned" };
+  }
+  let identity: BrowserDeviceIdentity | null;
+  try {
+    identity = await loadBrowserDeviceIdentity(input.accountId, input.deviceIdentityStorage ?? {});
+  } catch {
+    return { mode: "unpinned" };
+  }
+  if (identity === null) return { mode: "unpinned" };
+
+  const signer = identity;
+  const capability: SignedRtcTrustCapability = {
+    browserPublicKeyWire: signer.publicKeyWire,
+    hostPublicKeyWire: claimed,
+    signOffer: (signalInput) => signRtcSignalWire(signer, signalInput),
+    assertActive: () => {
+      if (!input.isActive()) {
+        throw new Error("signed RTC trust epoch is no longer active");
+      }
+    },
+  };
+  return { mode: "signed", capability };
 }
 
 async function hostIdIsLocallyPinned(

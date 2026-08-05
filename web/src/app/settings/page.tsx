@@ -495,12 +495,12 @@ function BrowserDevicesSettings() {
               </p>
               {bundle.data != null && (
                 <p className="text-xs text-muted-foreground">
-                  Also unlock your saved host trust here with your passkey on the{" "}
+                  Approval is enough to connect. For full protection, also unlock your saved host
+                  trust with your passkey on the{" "}
                   <Link className="underline" href="/trust">
                     trust &amp; recovery
                   </Link>{" "}
-                  page — approval makes hosts accept this browser; unlocking makes this browser
-                  recognize your hosts. Both are needed.
+                  page so this browser verifies your hosts end to end, too.
                 </p>
               )}
               <p className="text-xs text-muted-foreground">
