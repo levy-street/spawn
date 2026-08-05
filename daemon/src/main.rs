@@ -15,6 +15,7 @@ mod agent_ctl;
 mod agents;
 mod cli;
 mod config;
+mod cpu_scopes;
 mod creds;
 mod host_control;
 mod host_direct;

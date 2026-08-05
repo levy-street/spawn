@@ -151,6 +151,9 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     let child = child_result?;
     drop(reservation);
     tracing::info!(agent_id = %spec.agent_id, worker_pid = child.id(), "spawned session worker");
+    // Move the worker into its per-agent CPU scope before the agent spawns
+    // (T_START below) so the whole agent tree inherits the cgroup.
+    crate::cpu_scopes::enroll_worker(spec.agent_id, child.id()).await;
 
     let mut stream = connect_with_retry(&socket, CONNECT_TIMEOUT)
         .await
