@@ -128,12 +128,14 @@ async function corruptExistingPin(page: Page): Promise<void> {
 
 async function approveExactHost(page: Page): Promise<void> {
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
   await page
-    .getByRole("button", { name: /Confirm (?:approval|reapproval)|Retry server approval/u })
+    .getByRole("button", {
+      name: /Fingerprint matches — approve|Approve this host again|Retry server approval/u,
+    })
     .click();
-  await expect(page.getByRole("status")).toContainText("Approved daemon");
+  await expect(page.getByRole("status")).toContainText("is connected");
 }
 
 async function requestHostDeletion(page: Page): Promise<void> {
@@ -305,7 +307,12 @@ test("key and fingerprint substitution cannot retarget an established Host-ID bi
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
 
-test("deletion cannot select among multiple active unbound host pins", async ({ page }) => {
+test("deletion never revokes among multiple active unbound host pins", async ({ page }) => {
+  // Since e6763f4 an unbound host may be deleted server-side (orphaned and
+  // legacy hosts must be removable), but the ambiguity protection holds in a
+  // stronger form: with no exact Host-ID-to-key binding there is nothing to
+  // select, so NO local pin is revoked — deletion can never guess and
+  // tombstone the wrong key. Both pins must survive untouched and active.
   const state = {
     deleteCalls: 0,
     hostVisible: true,
@@ -319,11 +326,8 @@ test("deletion cannot select among multiple active unbound host pins", async ({ 
 
   await requestHostDeletion(page);
 
-  await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
-  await expect(page.locator("p[role=alert]")).toContainText(
-    "existing exact local Host-ID-to-key binding",
-  );
-  expect(state.deleteCalls).toBe(0);
+  await page.waitForURL("**/hosts");
+  expect(state.deleteCalls).toBe(1);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
 
@@ -408,11 +412,11 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   expect(await readHostPins(page)).toMatchObject([{ state: "revoked" }]);
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
   await expect(page.getByTestId("local-pin-state")).toContainText("deletion tombstone");
-  await page.getByRole("button", { name: "Confirm reapproval" }).click();
-  await expect(page.getByRole("status")).toContainText("Approved daemon");
+  await page.getByRole("button", { name: "Approve this host again" }).click();
+  await expect(page.getByRole("status")).toContainText("is connected");
   expect(await readHostPins(page)).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
   ]);
