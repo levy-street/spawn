@@ -62,9 +62,6 @@ const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
 const SCROLLBACK_UNANCHORED_REFRESH_DEBOUNCE_MS = 5_000;
 const SCROLLBACK_UNANCHORED_REFRESH_MAX_WAIT_MS = 20_000;
 const SCROLLBACK_UNANCHORED_CACHE_LINES = 2_000;
-// Never re-render the overlay underneath an actively-scrolling user: the
-// reset+rewrite collapses the scroll range mid-gesture and yanks the view.
-const SCROLLBACK_RERENDER_IDLE_MS = 350;
 // Recent live DataChannel chunks kept for replay on top of offset-anchored
 // snapshots. Replay responses and live bytes use separate mandatory endpoint
 // DataChannels, so a fresh capture can lag chunks already rendered locally;
@@ -473,9 +470,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
-  // Connect-time history is intentionally shallow even when offset-anchored;
-  // opening deep scrollback must still request the endpoint's full capture.
-  const scrollbackCachedSnapshotIsShallowRef = useRef(false);
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderGenerationRef = useRef(0);
   const scrollbackCacheDirtyRef = useRef(true);
@@ -518,17 +512,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const markResizeSentRef = useRef((cols: number, rows: number) => {
     resizeMarkRef.current = { sentAt: Date.now(), cols, rows, firstByteAt: null, lastByteAt: null };
   });
-  const scrollbackRerenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Committed-line (v2) replays make the hidden scrollback terminal converge
-  // from direct live appends alone: once a v2 render completed and nothing
-  // broke append continuity (reconnect, geometry change, buffer overflow),
-  // a rebuild would reproduce exactly what the terminal already shows. While
-  // converged, periodic cache refreshes wait for the DC replay ring to near
-  // its coverage limit and pre-renders are skipped entirely — full
-  // reset+rewrites of megabytes of history on the main thread starve the
-  // interactive input path (measured >1s echo stalls under streaming).
-  const scrollbackTermConvergedRef = useRef(false);
-  const renderedHistoryReplayRef = useRef(false);
   // Committed-history delta mode: the worker streams every committed line
   // over spawn.ctl and the hidden overlay terminal becomes a pure view of the
   // worker's log (raw PTY bytes never touch it). Engaged the moment any
@@ -545,9 +528,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
   const scrollbackRenderInFlightRef = useRef(false);
-  const scrollbackPendingLiveWritesRef = useRef(
-    new PostRenderLiveWriteBuffer(SCROLLBACK_DC_REPLAY_BUFFER_BYTES),
-  );
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
@@ -578,8 +558,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
     () => {},
   );
-  const prepareScrollbackSnapshotRef = useRef<() => void>(() => {});
-  const revealRenderedScrollbackRef = useRef<() => boolean>(() => false);
   const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
   const requestSnapshotRef = useRef<(purpose: ScrollbackSnapshotPurpose) => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
@@ -765,17 +743,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const hideScrollbackOverlay = useCallback(() => {
     if (!scrollbackVisibleRef.current) return;
-    if (scrollbackRerenderTimerRef.current) {
-      clearTimeout(scrollbackRerenderTimerRef.current);
-      scrollbackRerenderTimerRef.current = null;
-    }
     syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
     scrollbackVisibleRef.current = false;
     scrollbackRevealPendingRef.current = false;
     committedHistoryRef.current?.conceal();
     syncScrollbackWebglRenderer(false);
     scrollbackRenderInFlightRef.current = false;
-    scrollbackPendingLiveWritesRef.current.clear();
     scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
     scrollbackStableLineRef.current = null;
     scrollbackSnapshotBytesRef.current = null;
@@ -882,27 +855,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       const { cols, rows } = lastSizeRef.current;
       const text = decodeUtf8(bytes);
-      const isHistoryReplay = parseHistoryReplay(parseExactReplay(text)) !== null;
-      scrollbackTermConvergedRef.current = false;
       historyTerm.reset();
-      // Queue the snapshot and any newer live chunks back-to-back so nothing
-      // that arrives mid-render can interleave; the callback rides the last
-      // queued write. A coverage gap (null) renders the snapshot alone —
-      // best effort for the overlay; the scheduled refresh converges it.
-      // Worker replays are geometry-tagged: each chunk renders at the size
-      // its bytes were produced for, and xterm reflows on each transition.
-      const replaySlices = takeDcReplaySlices(bytes);
-      const snapshotOffset = scrollbackSnapshotOffsetsRef.current.get(bytes);
-      const latestOffset = recentDcChunksRef.current.at(-1)?.offsetAfter;
-      let coveredOffset =
-        replaySlices !== null && snapshotOffset !== undefined
-          ? Math.max(snapshotOffset, latestOffset ?? snapshotOffset)
-          : null;
-      const ops: SequencedWrite[] = [
-        ...overlayWriteOps(text, { cols, rows }),
-        ...(replaySlices ?? []).map((slice) => ({ data: slice })),
-      ];
-      writeSequenced(historyTerm, ops, () => {
+      // Legacy (pre-delta) workers get a static render of the capture: the
+      // overlay is correct at open time and refreshed on the next open. No
+      // live bytes, ring slices, or convergence tracking ever touch this
+      // terminal — that machinery was the source of the mangled-history
+      // class the committed-history stream eliminated.
+      writeSequenced(historyTerm, overlayWriteOps(text, { cols, rows }), () => {
         // Two frames let xterm's renderer settle the viewport height, but
         // ALL scroll mutations happen atomically in the final frame: a
         // half-applied scrollToBottom from a render superseded mid-sequence
@@ -913,233 +872,41 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           if (scrollbackRenderGenerationRef.current !== generation) return;
           requestAnimationFrame(() => {
             if (scrollbackRenderGenerationRef.current !== generation) return;
-            const requestConvergedSnapshot = () => {
-              scrollbackRenderInFlightRef.current = false;
-              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
-              scrollbackCacheDirtyRef.current = true;
-              if (scrollbackVisibleRef.current) {
-                requestSnapshotRef.current("overlay");
-              } else {
-                scheduleScrollbackCacheRefreshRef.current(100);
-              }
-            };
-            const finishRender = () => {
-              scrollbackRenderInFlightRef.current = false;
-              scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
-              scrollbackRenderedSnapshotBytesRef.current = bytes;
-              renderedHistoryReplayRef.current = isHistoryReplay;
-              scrollbackTermConvergedRef.current = isHistoryReplay;
-              const overlay = getScrollbackViewport();
-              if (!overlay) return;
-              if (!reveal && !scrollbackVisibleRef.current) {
-                historyTerm.scrollToBottom();
-                overlay.scrollTop = maxElementScrollTop(overlay);
-                return;
-              }
-              scrollbackOverlayHasSnapshotRef.current = true;
-              healScrollbackScrollState();
-              const restoreLine = scrollbackRestoreLineRef.current;
-              scrollbackRestoreLineRef.current = null;
-              if (restoreLine !== null) {
-                historyTerm.scrollToLine(restoreLine);
-              } else {
-                historyTerm.scrollToBottom();
-              }
-              const pendingDelta = scrollbackPendingDeltaPxRef.current;
-              const pendingLines = Math.trunc(
-                pendingDelta / Math.max(1, terminalRowHeightRef.current),
-              );
-              if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-              scrollbackPendingDeltaPxRef.current = 0;
-              scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-              scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
-              updateScrollbackReveal(overlay);
-            };
-            const drainPendingLiveWrites = () => {
-              if (scrollbackRenderGenerationRef.current !== generation) return;
-              const geometry = lastSizeRef.current;
-              if (
-                replaySlices === null ||
-                historyTerm.cols !== geometry.cols ||
-                historyTerm.rows !== geometry.rows
-              ) {
-                requestConvergedSnapshot();
-                return;
-              }
-              const pending = scrollbackPendingLiveWritesRef.current.drain(coveredOffset, geometry);
-              if (pending.kind === "refresh") {
-                requestConvergedSnapshot();
-                return;
-              }
-              coveredOffset = pending.coveredOffset;
-              if (pending.chunks.length === 0) {
-                finishRender();
-                return;
-              }
-              writeSequenced(
-                historyTerm,
-                pending.chunks.map((data) => ({ data })),
-                drainPendingLiveWrites,
-              );
-            };
-            drainPendingLiveWrites();
+            scrollbackRenderInFlightRef.current = false;
+            scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
+            scrollbackRenderedSnapshotBytesRef.current = bytes;
+            const overlay = getScrollbackViewport();
+            if (!overlay) return;
+            if (!reveal && !scrollbackVisibleRef.current) {
+              historyTerm.scrollToBottom();
+              overlay.scrollTop = maxElementScrollTop(overlay);
+              return;
+            }
+            scrollbackOverlayHasSnapshotRef.current = true;
+            healScrollbackScrollState();
+            const restoreLine = scrollbackRestoreLineRef.current;
+            scrollbackRestoreLineRef.current = null;
+            if (restoreLine !== null) {
+              historyTerm.scrollToLine(restoreLine);
+            } else {
+              historyTerm.scrollToBottom();
+            }
+            const pendingDelta = scrollbackPendingDeltaPxRef.current;
+            const pendingLines = Math.trunc(
+              pendingDelta / Math.max(1, terminalRowHeightRef.current),
+            );
+            if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
+            scrollbackPendingDeltaPxRef.current = 0;
+            scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
+            scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
+            updateScrollbackReveal(overlay);
           });
         });
       });
     },
-    [getScrollbackViewport, healScrollbackScrollState, takeDcReplaySlices, updateScrollbackReveal],
+    [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal],
   );
   renderScrollbackSnapshotRef.current = renderScrollbackSnapshot;
-
-  const revealRenderedScrollback = useCallback(() => {
-    const overlay = getScrollbackViewport();
-    const bytes = scrollbackSnapshotBytesRef.current ?? scrollbackCachedSnapshotBytesRef.current;
-    // A rewrite in flight owns the scroll position and the banked wheel
-    // deltas; consuming them against the collapsing buffer loses them.
-    if (scrollbackRenderInFlightRef.current) return false;
-    if (!overlay) return false;
-    // A converged committed-line terminal holds everything any cached
-    // snapshot plus ring replay would rebuild — reveal it directly even when
-    // the cache object has rotated since the last full render.
-    const converged =
-      scrollbackTermConvergedRef.current &&
-      renderedHistoryReplayRef.current &&
-      scrollbackRenderedSnapshotBytesRef.current !== null;
-    if (!converged && (!bytes || scrollbackRenderedSnapshotBytesRef.current !== bytes)) {
-      return false;
-    }
-    scrollbackOverlayHasSnapshotRef.current = true;
-    healScrollbackScrollState();
-    const historyTerm = scrollbackTermRef.current;
-    const pendingDelta = scrollbackPendingDeltaPxRef.current;
-    const pendingLines = Math.trunc(pendingDelta / Math.max(1, terminalRowHeightRef.current));
-    if (historyTerm && pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-    scrollbackPendingDeltaPxRef.current = 0;
-    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-    scrollbackStableLineRef.current = historyTerm?.buffer.active.viewportY ?? null;
-    updateScrollbackReveal(overlay);
-    return true;
-  }, [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal]);
-  revealRenderedScrollbackRef.current = revealRenderedScrollback;
-
-  const prepareScrollbackSnapshot = useCallback(() => {
-    if (historyStreamActiveRef.current) return;
-    const bytes = scrollbackCachedSnapshotBytesRef.current;
-    if (
-      !bytes ||
-      scrollbackVisibleRef.current ||
-      scrollbackRenderedSnapshotBytesRef.current === bytes
-    ) {
-      return;
-    }
-    // Parked instances never pre-render: the rebuild competes with the
-    // foreground terminal's input path, and foregrounding re-runs this.
-    if (!activeRef.current) return;
-    // Converged committed-line terminal: live appends already produced what
-    // this rebuild would; the fresh cache is stored for future rebuilds only.
-    if (scrollbackTermConvergedRef.current && renderedHistoryReplayRef.current) return;
-    renderScrollbackSnapshotRef.current(bytes, false);
-  }, []);
-  prepareScrollbackSnapshotRef.current = prepareScrollbackSnapshot;
-
-  const writeScrollbackLiveBytes = useCallback(
-    (bytes: Uint8Array, dcOffsetAfter?: number) => {
-      // Delta mode: raw PTY bytes never enter the hidden terminal. The
-      // committed-history stream is its only content source; the live screen
-      // is painted at reveal time from the live terminal itself.
-      if (historyStreamActiveRef.current) {
-        committedHistoryRef.current?.liveScreenChanged();
-        return;
-      }
-      const historyTerm = scrollbackTermRef.current;
-      if (!historyTerm) return;
-      const geometry = lastSizeRef.current;
-      const queueForPostRender = () => {
-        scrollbackPendingLiveWritesRef.current.enqueue(bytes, dcOffsetAfter, geometry);
-      };
-      // The first visible render has no completed snapshot yet. Hold bytes
-      // arriving after that render captured its replay slices, then append
-      // them exactly once when the reset/geometry walk reaches its barrier.
-      // A visible overlay waiting for its first snapshot uses the same queue.
-      if (scrollbackRenderedSnapshotBytesRef.current === null) {
-        if (scrollbackRenderInFlightRef.current || scrollbackVisibleRef.current) {
-          queueForPostRender();
-        }
-        return;
-      }
-      if (scrollbackVisibleRef.current && !scrollbackOverlayHasSnapshotRef.current) {
-        queueForPostRender();
-        return;
-      }
-      // Warm-cache appends are an optimization and must never write at the
-      // wrong geometry. Mid-render, xterm's shared write queue would slot
-      // these bytes between the sequenced chunk walk's writes — at whatever
-      // historical geometry the walk is passing through. And after an
-      // external PTY resize (another window taking control), bytes at the
-      // new width can arrive before this client learns the geometry. Hold a
-      // bounded tail in both cases; drain it at the final geometry or request
-      // a fresh endpoint checkpoint when exact append is impossible.
-      if (scrollbackRenderInFlightRef.current) {
-        queueForPostRender();
-        return;
-      }
-      if (historyTerm.cols !== geometry.cols || historyTerm.rows !== geometry.rows) {
-        queueForPostRender();
-        scrollbackTermConvergedRef.current = false;
-        scrollbackCacheDirtyRef.current = true;
-        if (scrollbackVisibleRef.current) requestSnapshotRef.current("overlay");
-        else scheduleScrollbackCacheRefreshRef.current();
-        return;
-      }
-
-      // xterm's own viewport semantics do the right thing here: writes
-      // follow the bottom when the viewport is at the live edge and hold the
-      // reader's lines steady when scrolled up. Reaching around them with
-      // DOM scrollTop writes races the viewport sync and teleports the view.
-      const wasVisible = scrollbackVisibleRef.current;
-      historyTerm.write(bytes, () => {
-        if (!wasVisible || !scrollbackVisibleRef.current) return;
-        const overlay = getScrollbackViewport();
-        if (overlay) updateScrollbackReveal(overlay);
-      });
-    },
-    [getScrollbackViewport, updateScrollbackReveal],
-  );
-
-  // Re-render the overlay from a fresh snapshot only once the user pauses
-  // scrolling: the reset+rewrite collapses the scroll range mid-write, so
-  // rendering underneath an active gesture yanks the view to stale content.
-  const renderOverlaySnapshotWhenIdle = useCallback(() => {
-    if (historyStreamActiveRef.current) return;
-    if (scrollbackRerenderTimerRef.current) {
-      clearTimeout(scrollbackRerenderTimerRef.current);
-      scrollbackRerenderTimerRef.current = null;
-    }
-    const attempt = () => {
-      scrollbackRerenderTimerRef.current = null;
-      if (!scrollbackVisibleRef.current) return;
-      const bytes = scrollbackSnapshotBytesRef.current;
-      if (!bytes || scrollbackRenderedSnapshotBytesRef.current === bytes) return;
-      // No rewrite under the reader when the terminal is already converged;
-      // gap-heal paths clear the flag before requesting their snapshot.
-      if (scrollbackTermConvergedRef.current && renderedHistoryReplayRef.current) return;
-      const sinceScroll = Date.now() - scrollbackLastUserScrollAtRef.current;
-      if (sinceScroll < SCROLLBACK_RERENDER_IDLE_MS) {
-        scrollbackRerenderTimerRef.current = setTimeout(
-          attempt,
-          SCROLLBACK_RERENDER_IDLE_MS - sinceScroll,
-        );
-        return;
-      }
-      if (scrollbackOverlayHasSnapshotRef.current) {
-        scrollbackRestoreLineRef.current = scrollbackRenderInFlightRef.current
-          ? scrollbackStableLineRef.current
-          : (scrollbackTermRef.current?.buffer.active.viewportY ?? null);
-      }
-      renderScrollbackSnapshotRef.current(bytes, true);
-    };
-    attempt();
-  }, []);
 
   const showUploadStatus = useCallback((message: string) => {
     setUploadStatus(message);
@@ -1491,7 +1258,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         dcActiveRef.current = false;
         recentDcChunksRef.current = [];
         recentDcChunksSizeRef.current = 0;
-        scrollbackTermConvergedRef.current = false;
       }
       // An anchored cache stays exact as long as the DC replay ring can still
       // bridge from its capture offset (renders replay ring bytes on top).
@@ -1499,19 +1265,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // — refreshing on a wall-clock cadence instead re-downloaded and
       // re-rendered megabytes of history every few seconds of streaming,
       // starving interactive echo.
-      const cacheBytes = scrollbackCachedSnapshotBytesRef.current;
-      const cacheOffset =
-        cacheBytes !== null ? scrollbackSnapshotOffsetsRef.current.get(cacheBytes) : undefined;
-      const cacheCovered =
-        typeof dcOffsetAfter === "number" &&
-        cacheOffset !== undefined &&
-        !scrollbackCachedSnapshotIsShallowRef.current &&
-        dcOffsetAfter - cacheOffset < SCROLLBACK_DC_REPLAY_BUFFER_BYTES / 2;
-      // Delta mode: the committed-history stream keeps the overlay exact, so
-      // live output never invalidates it (no periodic multi-MB refetches).
-      if (!cacheCovered && !historyStreamActiveRef.current) {
-        scrollbackCacheDirtyRef.current = true;
-      }
       scrollbackLiveBytesAtRef.current = Date.now();
       // Resize->repaint timing: attribute the output burst that follows a
       // resize to that resize; finalize once it settles (250ms quiet).
@@ -1537,10 +1290,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           }
         }, 250);
       }
-      if (!cacheCovered && !historyStreamActiveRef.current) {
-        scheduleScrollbackCacheRefreshRef.current();
-      }
-      writeScrollbackLiveBytes(bytes, dcOffsetAfter);
+      // Delta mode keeps the overlay exact from the committed-history stream;
+      // legacy (pre-delta) workers render a fresh capture per overlay open,
+      // so raw live bytes never touch the hidden terminal on either path.
+      committedHistoryRef.current?.liveScreenChanged();
       const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
@@ -1558,9 +1311,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const term = termRef.current;
       if (!term) return;
       clearPrediction();
-      // A (re)connect seed restarts append continuity for the hidden
-      // terminal; the next full render re-establishes convergence.
-      scrollbackTermConvergedRef.current = false;
       if (typeof dcOffset === "number") {
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
       }
@@ -1594,21 +1344,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const altActive = lastChunk
         ? lastChunk.data.lastIndexOf("\x1b[?1049h") > lastChunk.data.lastIndexOf("\x1b[?1049l")
         : containsAlternateBufferSwitch(bytes);
-      if (altActive) {
-        scrollbackCachedSnapshotBytesRef.current = null;
-        scrollbackCachedSnapshotIsShallowRef.current = false;
-        scrollbackCacheDirtyRef.current = true;
-        scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
-      } else {
-        // The connect-time history is a shallow capture: seed the overlay so
-        // scrollback opens instantly, but leave the cache dirty so the full
-        // depth is fetched once the terminal is interactive.
-        scrollbackCachedSnapshotBytesRef.current = bytes;
-        scrollbackCachedSnapshotIsShallowRef.current = true;
-        scrollbackCacheDirtyRef.current = true;
-        scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
-        requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
-      }
+      // Cache the seed for the live-terminal heal machinery and schedule one
+      // deep refresh: in delta mode its response re-seeds the overlay at full
+      // depth; in legacy mode the overlay renders fresh per open instead.
+      scrollbackCachedSnapshotBytesRef.current = altActive ? null : bytes;
+      scrollbackCacheDirtyRef.current = true;
+      scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       term.reset();
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
@@ -1633,7 +1374,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
       scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
-      scrollbackCachedSnapshotIsShallowRef.current = false;
       if (typeof dcOffset === "number") {
         // Offset-anchored snapshot: renders are made exact by replaying live
         // DataChannel bytes past the capture offset, so the cache converges
@@ -1681,11 +1421,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         seedCommittedHistory(bytes, historyAnchor);
         return;
       }
-      if (scrollbackVisibleRef.current) {
+      // Legacy (pre-delta) worker: the overlay renders only while open, from
+      // the capture its open requested. Nothing pre-renders in the
+      // background, and nothing rewrites under the reader afterwards.
+      if (scrollbackVisibleRef.current && bytes !== scrollbackRenderedSnapshotBytesRef.current) {
         scrollbackSnapshotBytesRef.current = bytes;
-        renderOverlaySnapshotWhenIdle();
-      } else {
-        requestAnimationFrame(() => prepareScrollbackSnapshotRef.current());
+        renderScrollbackSnapshotRef.current(bytes, true);
       }
     },
     onSnapshotError: (message) => {
@@ -1843,7 +1584,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!scrollbackVisibleRef.current) {
         scrollbackVisibleRef.current = true;
         scrollbackOverlayHasSnapshotRef.current = false;
-        scrollbackSnapshotBytesRef.current = scrollbackCachedSnapshotBytesRef.current;
+        scrollbackSnapshotBytesRef.current = null;
+        scrollbackRenderedSnapshotBytesRef.current = null;
         // Null = start at the live edge; renders that overlap the open
         // scroll to bottom plus whatever wheel deltas banked.
         scrollbackStableLineRef.current = null;
@@ -1864,29 +1606,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return true;
       }
 
-      if (scrollbackSnapshotBytesRef.current) {
-        if (!revealRenderedScrollbackRef.current()) {
-          requestAnimationFrame(() => {
-            if (!revealRenderedScrollbackRef.current()) {
-              renderScrollbackSnapshotRef.current(scrollbackSnapshotBytesRef.current, true);
-            }
-          });
-        }
-      }
-
-      // An offset-anchored cached snapshot renders exactly (live bytes past
-      // the capture offset are replayed on top), so no fresh capture is
-      // needed even when live output has arrived since.
-      const cachedAnchored =
-        scrollbackSnapshotBytesRef.current !== null &&
-        scrollbackSnapshotOffsetsRef.current.get(scrollbackSnapshotBytesRef.current) !== undefined;
-      if (
-        !scrollbackSnapshotBytesRef.current ||
-        (scrollbackCacheDirtyRef.current &&
-          (!cachedAnchored || scrollbackCachedSnapshotIsShallowRef.current))
-      ) {
-        requestSnapshot("overlay");
-      }
+      // Legacy (pre-delta) worker: every open fetches and renders a fresh
+      // capture; onSnapshot completes the reveal when it lands.
+      requestSnapshot("overlay");
       return true;
     },
     [requestSnapshot, setScrollbackReadyState, syncScrollbackWebglRenderer],
@@ -1904,7 +1626,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       committedHistoryRef.current?.resize(cols, rows);
       return;
     }
-    scrollbackTermConvergedRef.current = false;
     scrollbackCacheDirtyRef.current = true;
     scrollbackRenderedSnapshotBytesRef.current = null;
     if (scrollbackVisibleRef.current) {
@@ -1980,8 +1701,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       viewport.style.touchAction = "none";
       viewport.style.overscrollBehavior = "contain";
     }
-    prepareScrollbackSnapshotRef.current();
-
     return () => {
       host.removeEventListener("mouseup", copySelectionOnMouseUp);
       committedHistoryRef.current?.dispose();
@@ -2920,7 +2639,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pendingLiveSeedWritesRef.current.clear();
       liveSeedCoveredOffsetRef.current = null;
       liveSeedWriteInFlightRef.current = false;
-      scrollbackPendingLiveWritesRef.current.clear();
       latencyHudRef.current?.detach();
       latencyHudRef.current = null;
       if (predictionSweepRef.current) {
