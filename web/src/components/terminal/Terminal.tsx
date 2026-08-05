@@ -241,14 +241,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // addon so the warm pool can never exhaust the browser's WebGL context
   // budget; a lost context falls back to the DOM renderer silently.
   const webglAddonRef = useRef<WebglAddon | null>(null);
-  const syncWebglRenderer = useCallback((wantGpu: boolean) => {
-    if (!wantGpu || !wantsGpuRenderer()) {
-      webglAddonRef.current?.dispose();
-      webglAddonRef.current = null;
-      return;
-    }
-    const term = termRef.current;
-    if (!term || webglAddonRef.current) return;
+  const scrollbackWebglAddonRef = useRef<WebglAddon | null>(null);
+  const attachGpuRenderer = useCallback((term: XTerm, ref: { current: WebglAddon | null }) => {
+    if (ref.current) return;
     try {
       const webgl = new WebglAddon();
       term.loadAddon(webgl);
@@ -266,15 +261,46 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       };
       webgl.onContextLoss(() => {
         webgl.dispose();
-        if (webglAddonRef.current === webgl) webglAddonRef.current = null;
+        if (ref.current === webgl) ref.current = null;
       });
-      webglAddonRef.current = webgl;
+      ref.current = webgl;
     } catch {
       // No WebGL available (headless GL blocklist, exhausted contexts):
       // xterm keeps its DOM renderer.
-      webglAddonRef.current = null;
+      ref.current = null;
     }
   }, []);
+  const syncWebglRenderer = useCallback(
+    (wantGpu: boolean) => {
+      if (!wantGpu || !wantsGpuRenderer()) {
+        webglAddonRef.current?.dispose();
+        webglAddonRef.current = null;
+        return;
+      }
+      const term = termRef.current;
+      if (!term) return;
+      attachGpuRenderer(term, webglAddonRef);
+    },
+    [attachGpuRenderer],
+  );
+  // The scrollback overlay must render with the SAME renderer as the live
+  // terminal: WebGL rounds glyph cells to whole device pixels while the DOM
+  // renderer lays out fractional CSS pixels, so mixing them makes scrolled
+  // content sit at visibly different font metrics than the live screen. The
+  // addon lives only while the overlay is actually revealed — one extra
+  // context at most, so the warm pool and multi-pane screens pay nothing.
+  const syncScrollbackWebglRenderer = useCallback(
+    (visible: boolean) => {
+      if (!visible || !wantsGpuRenderer()) {
+        scrollbackWebglAddonRef.current?.dispose();
+        scrollbackWebglAddonRef.current = null;
+        return;
+      }
+      const term = scrollbackTermRef.current;
+      if (term) attachGpuRenderer(term, scrollbackWebglAddonRef);
+    },
+    [attachGpuRenderer],
+  );
   const syncWebglRendererRef = useRef(syncWebglRenderer);
   syncWebglRendererRef.current = syncWebglRenderer;
   useEffect(() => {
@@ -747,6 +773,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scrollbackVisibleRef.current = false;
     scrollbackRevealPendingRef.current = false;
     committedHistoryRef.current?.conceal();
+    syncScrollbackWebglRenderer(false);
     scrollbackRenderInFlightRef.current = false;
     scrollbackPendingLiveWritesRef.current.clear();
     scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
@@ -770,7 +797,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       termRef.current?.focus();
     }
     if (scrollbackCacheDirtyRef.current) scheduleScrollbackCacheRefreshRef.current(100);
-  }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot]);
+  }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot, syncScrollbackWebglRenderer]);
 
   const updateScrollbackReveal = useCallback(
     (_overlay: HTMLElement) => {
@@ -1820,6 +1847,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // Null = start at the live edge; renders that overlap the open
         // scroll to bottom plus whatever wheel deltas banked.
         scrollbackStableLineRef.current = null;
+        // Renderer parity with the live terminal from the first painted
+        // frame; released again when the overlay closes.
+        syncScrollbackWebglRenderer(true);
         setScrollbackReadyState(false);
         setScrollbackVisible(true);
       }
@@ -1859,7 +1889,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       return true;
     },
-    [requestSnapshot, setScrollbackReadyState],
+    [requestSnapshot, setScrollbackReadyState, syncScrollbackWebglRenderer],
   );
   requestScrollbackSnapshotRef.current = requestScrollbackSnapshot;
 
@@ -1956,6 +1986,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       host.removeEventListener("mouseup", copySelectionOnMouseUp);
       committedHistoryRef.current?.dispose();
       committedHistoryRef.current = null;
+      scrollbackWebglAddonRef.current?.dispose();
+      scrollbackWebglAddonRef.current = null;
       historyTerm.dispose();
       if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
     };
