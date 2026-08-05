@@ -73,6 +73,10 @@ test("agent create permission errors are rendered as controlled form errors", as
   });
 
   await page.goto("/agents/new");
+  // Submit gates client-side until the host's home dir resolves over host
+  // control ("Connect to the host before choosing a directory"); the
+  // directory autofill is the observable signal that the gate is open.
+  await expect(page.locator("#agent-cwd")).toHaveValue("/Users/tester/");
   await page.getByRole("button", { name: "Spawn agent" }).click();
 
   await expect(page.getByText("CSRF token missing or invalid")).toBeVisible();
