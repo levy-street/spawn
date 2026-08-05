@@ -309,11 +309,10 @@ function TrustSettings() {
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
       <Card>
         <CardHeader>
-          <CardTitle>Trust sync &amp; recovery</CardTitle>
+          <CardTitle>Device trust</CardTitle>
           <CardDescription>
-            Carry the hosts this browser has verified to your other devices, protected by a passkey.
-            The server only ever stores ciphertext — it cannot read your host keys or forge new
-            ones.
+            Carry the hosts this browser has verified to your other devices, protected by a
+            passkey.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -333,9 +332,7 @@ function TrustSettings() {
               <span data-testid="bundle-state">…</span>
             ) : hasBundle ? (
               <>
-                Your saved trust (
-                <span data-testid="bundle-state">revision {bundle.data?.revision}</span>) opens with
-                any of{" "}
+                <span data-testid="bundle-state">Your saved trust</span> opens with any of{" "}
                 <span className="font-semibold" data-testid="passkey-count">
                   {passkeyCount ?? "…"}
                 </span>{" "}
@@ -355,8 +352,7 @@ function TrustSettings() {
             {!hasBundle &&
               actionRow({
                 title: "Set up a passkey",
-                description:
-                  "Creates a passkey and saves this browser's verified hosts under it, so your next device can inherit them instead of pairing from a terminal.",
+                description: "Saves this browser's verified hosts under a new passkey.",
                 button: (
                   <Button
                     type="button"
@@ -370,8 +366,7 @@ function TrustSettings() {
               })}
             {actionRow({
               title: "Unlock saved trust here",
-              description:
-                "Use your passkey to make this browser recognize the hosts you verified elsewhere. New devices also need approval from a trusted browser (Settings → Browser devices).",
+              description: "Recognize the hosts you verified elsewhere, using your passkey.",
               button: (
                 <Button
                   type="button"
@@ -387,8 +382,7 @@ function TrustSettings() {
             {hasBundle &&
               actionRow({
                 title: "Add a backup passkey",
-                description:
-                  "Enroll a second passkey that can also open your saved trust, so losing one authenticator never locks you out.",
+                description: "A second passkey that opens the same saved trust.",
                 button: (
                   <Button
                     type="button"
@@ -457,7 +451,7 @@ function TrustSettings() {
               {actionRow({
                 title: "Forget trust on this browser",
                 description:
-                  "Removes every host this browser recognizes. Use when its trust state is wrong and connections refuse; it connects unprotected afterwards until trusted again.",
+                  "Removes every host this browser recognizes; connections are unprotected until trusted again.",
                 button: (
                   <Button
                     type="button"
@@ -500,12 +494,11 @@ function TrustSettings() {
         <CardHeader>
           <CardTitle>Approving new devices</CardTitle>
           <CardDescription>
-            Device approval lives with your device list now: open{" "}
+            Happens in{" "}
             <Link className="underline" href="/settings">
               Settings → Browser devices
-            </Link>{" "}
-            on a browser that already works, press Approve next to the waiting device, and compare
-            fingerprints.
+            </Link>
+            : press Approve next to the waiting device and compare fingerprints.
           </CardDescription>
         </CardHeader>
       </Card>

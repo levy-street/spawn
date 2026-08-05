@@ -13,6 +13,7 @@ import {
   PinOff,
   RotateCcw,
   Settings,
+  ShieldCheck,
   SquarePen,
   SquareTerminal,
   Trash2,
@@ -229,6 +230,10 @@ export function Sidebar({
           <DropdownMenuItem href="/settings">
             <Settings className="size-4" aria-hidden />
             Settings
+          </DropdownMenuItem>
+          <DropdownMenuItem href="/trust">
+            <ShieldCheck className="size-4" aria-hidden />
+            Device trust
           </DropdownMenuItem>
           <DropdownMenuItem
             destructive

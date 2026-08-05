@@ -355,12 +355,17 @@ function BrowserDevicesSettings() {
                 )}
               </div>
             )}
-            <p
-              className="break-all font-mono text-xs text-muted-foreground"
-              data-testid={isCurrent ? "browser-fingerprint" : undefined}
-            >
-              {derivedFingerprint ?? "…"}
-            </p>
+            {/* Fingerprints matter at approval time — the ceremony re-derives
+                and shows them. Only this browser's own stays visible, since
+                it's what gets read out to an approving device. */}
+            {isCurrent && (
+              <p
+                className="break-all font-mono text-xs text-muted-foreground"
+                data-testid="browser-fingerprint"
+              >
+                {derivedFingerprint ?? "…"}
+              </p>
+            )}
             <p className="text-xs text-muted-foreground">
               Added {new Date(device.created_at).toLocaleDateString()}
               {device.revoked_at &&
@@ -427,9 +432,8 @@ function BrowserDevicesSettings() {
       <CardHeader>
         <CardTitle>Browser devices</CardTitle>
         <CardDescription>
-          Every browser you sign in from gets its own cryptographic key. Names are just labels to
-          tell them apart — hosts trust the key fingerprint, which is always computed locally in
-          this browser, never taken from the server.
+          Browsers signed in to your account. A new browser needs approval from one that already
+          works before hosts will accept it.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -486,29 +490,27 @@ function BrowserDevicesSettings() {
             >
               <p className="text-sm font-medium">This browser can&apos;t open terminals yet</p>
               <p className="text-sm text-muted-foreground">
-                No host trusts its key so far. To fix that, on a browser that already works, open
-                Settings → Browser devices, find this device, press <b>Approve</b>, and check it
-                shows this fingerprint:
+                On a browser that already works, open this page, press <b>Approve</b> next to this
+                device, and check it shows:
               </p>
               <p className="break-all rounded bg-muted px-2 py-1.5 font-mono text-sm font-semibold">
                 {fingerprintFor(currentDevice) ?? "…"}
               </p>
-              {bundle.data != null && (
-                <p className="text-xs text-muted-foreground">
-                  Approval is enough to connect. For full protection, also unlock your saved host
-                  trust with your passkey on the{" "}
-                  <Link className="underline" href="/trust">
-                    trust &amp; recovery
-                  </Link>{" "}
-                  page so this browser verifies your hosts end to end, too.
-                </p>
-              )}
               <p className="text-xs text-muted-foreground">
-                No other working browser? Pair directly with a host instead:{" "}
+                {bundle.data != null && (
+                  <>
+                    Have your passkey?{" "}
+                    <Link className="underline" href="/trust">
+                      Unlock saved trust
+                    </Link>{" "}
+                    instead. {" "}
+                  </>
+                )}
+                No other working browser?{" "}
                 <Link className="underline" href="/device">
-                  connect a host
-                </Link>
-                .
+                  Connect a host
+                </Link>{" "}
+                directly.
               </p>
             </div>
           )}
@@ -541,10 +543,9 @@ function BrowserDevicesSettings() {
         )}
 
         <p className="text-xs text-muted-foreground">
-          To carry your verified hosts to new devices with a passkey, or to manage backup passkeys,
-          see{" "}
+          Passkeys and carrying trust between devices live on{" "}
           <Link className="underline" href="/trust">
-            trust sync &amp; recovery
+            Device trust
           </Link>
           .
         </p>
