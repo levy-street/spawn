@@ -137,16 +137,16 @@ test("device approval shows the locally derived fingerprint before confirmation"
   });
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
 
   await expect(page.getByTestId("host-key-fingerprint")).toHaveText(hostFingerprint);
   await expect(page.getByTestId("browser-key-fingerprint")).toHaveText(browserFingerprint);
   await expect(page.getByText("build-host", { exact: false })).toBeVisible();
   expect(approved).toBe(false);
 
-  await page.getByRole("button", { name: "Confirm approval" }).click();
-  await expect(page.getByRole("status")).toContainText("Approved daemon for host build-host");
+  await page.getByRole("button", { name: "Fingerprint matches — approve" }).click();
+  await expect(page.getByRole("status")).toContainText("build-host is connected");
   expect(approved).toBe(true);
   expect(localPinAtServerApproval).toMatchObject([
     {
@@ -237,8 +237,8 @@ test("blocks first contact when the server fingerprint disagrees with the host k
   });
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText(
     "fingerprint did not match its public key",
@@ -310,22 +310,22 @@ test("server approval failure retains a reload-safe local pin and offers explici
   });
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
-  await page.getByRole("button", { name: "Confirm approval" }).click();
+  await page.getByRole("button", { name: "Fingerprint matches — approve" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("review the device code again");
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
-  await expect(page.getByRole("status")).toContainText("saved locally");
+  await expect(page.getByRole("status")).toContainText("saved in this browser");
   expect(await readHostPins(page)).toMatchObject([
     { state: "active", hostPublicKey: HOST_PUBLIC_KEY },
   ]);
 
   await page.reload();
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
   await expect(page.getByTestId("local-pin-state")).toContainText("already active");
   await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
 });
@@ -406,9 +406,9 @@ test("substituted approval response fails loudly while preserving retryable loca
   });
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
-  await page.getByRole("button", { name: "Confirm approval" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByRole("button", { name: "Fingerprint matches — approve" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText(
     "Approval response changed the reviewed host or browser identity",
@@ -466,11 +466,11 @@ test("local pin write corruption blocks approval before any server call", async 
   });
 
   await page.goto("/device");
-  await page.getByLabel("Device code").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Review daemon" }).click();
+  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Look up host" }).click();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
   await corruptHostPinStore(page);
-  await page.getByRole("button", { name: "Confirm approval" }).click();
+  await page.getByRole("button", { name: "Fingerprint matches — approve" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("stored host pin");
   expect(approveCalls).toBe(0);
@@ -547,19 +547,19 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
   await installRoutes(secondPage);
   await Promise.all([page.goto("/device"), secondPage.goto("/device")]);
   await Promise.all([
-    page.getByLabel("Device code").fill("QZ4K-7HMT"),
-    secondPage.getByLabel("Device code").fill("QZ4K-7HMT"),
+    page.getByLabel("Code from the terminal").fill("QZ4K-7HMT"),
+    secondPage.getByLabel("Code from the terminal").fill("QZ4K-7HMT"),
   ]);
   await Promise.all([
-    page.getByRole("button", { name: "Review daemon" }).click(),
-    secondPage.getByRole("button", { name: "Review daemon" }).click(),
+    page.getByRole("button", { name: "Look up host" }).click(),
+    secondPage.getByRole("button", { name: "Look up host" }).click(),
   ]);
   await Promise.all([
-    page.getByRole("button", { name: "Confirm approval" }).click(),
-    secondPage.getByRole("button", { name: "Confirm approval" }).click(),
+    page.getByRole("button", { name: "Fingerprint matches — approve" }).click(),
+    secondPage.getByRole("button", { name: "Fingerprint matches — approve" }).click(),
   ]);
-  await expect(page.getByRole("status")).toContainText("Approved daemon");
-  await expect(secondPage.getByRole("status")).toContainText("Approved daemon");
+  await expect(page.getByRole("status")).toContainText("is connected");
+  await expect(secondPage.getByRole("status")).toContainText("is connected");
   expect(await readHostPins(page)).toMatchObject([
     { hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
   ]);

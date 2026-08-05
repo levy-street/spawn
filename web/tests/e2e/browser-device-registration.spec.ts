@@ -108,7 +108,7 @@ test("registration failure stays loud while settings and logout remain accessibl
   await expect(page.getByRole("alert").first()).toContainText("registration failed");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
-  await expect(page.getByText("Browser identities", { exact: true })).toBeVisible();
+  await expect(page.getByText("Browser devices", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry registration" })).toBeVisible();
 });
 
@@ -202,4 +202,24 @@ test("rejects a substituted revocation response without deleting the local key",
     return result !== undefined;
   }, USER_ID);
   expect(localKeyStillExists).toBe(true);
+});
+
+test("devices can be renamed for recognition without touching the key", async ({ page }) => {
+  await mockAuthenticatedApi(page);
+  await page.goto("/settings");
+
+  const fingerprint = page.getByTestId("browser-fingerprint");
+  await expect(fingerprint).toHaveText(/^SHA256:/);
+  const before = await fingerprint.textContent();
+
+  await page.getByRole("button", { name: /^Rename/ }).click();
+  const nameInput = page.getByPlaceholder("e.g. Work laptop, Pixel phone");
+  await nameInput.fill("Test rig");
+  await page.getByRole("button", { name: "Save name" }).click();
+
+  await expect(page.getByText("Test rig", { exact: true })).toBeVisible();
+  // Renaming is recognition metadata only: same key, same locally derived
+  // fingerprint, same "this browser" binding.
+  await expect(fingerprint).toHaveText(before ?? /^SHA256:/);
+  await expect(page.getByText("this browser", { exact: true })).toBeVisible();
 });

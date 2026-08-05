@@ -547,6 +547,7 @@ export async function mockAuthenticatedApi(
           key_algorithm: "ed25519",
           public_key: body.public_key,
           fingerprint: `SHA256:${digest}`,
+          label: body.label ?? null,
           created_at: CREATED_AT,
           revoked_at: null,
         };
@@ -576,6 +577,18 @@ export async function mockAuthenticatedApi(
         return;
       }
       device.revoked_at ??= CREATED_AT;
+      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      return;
+    }
+    const browserRenameMatch = path.match(/^\/api\/browser-devices\/([^/]+)$/);
+    if (browserRenameMatch && method === "PATCH") {
+      const body = (await request.postDataJSON()) as { label?: string | null };
+      const device = browserDeviceList.find((item) => item.id === browserRenameMatch[1]);
+      if (!device) {
+        await route.fulfill({ status: 404, json: { detail: "browser device not found" } });
+        return;
+      }
+      device.label = body.label ?? null;
       await route.fulfill({ status: 200, contentType: "application/json", json: device });
       return;
     }

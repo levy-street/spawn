@@ -219,19 +219,24 @@ function DeviceInner() {
     }
   };
 
+  const deviceLabel =
+    registration.data?.status === "ready" ? (registration.data.device.label ?? null) : null;
+
   return (
     <div className="mx-auto max-w-md p-4">
       <Card>
         <CardHeader>
-          <CardTitle>Approve a daemon</CardTitle>
+          <CardTitle>Connect a host</CardTitle>
           <CardDescription>
-            Enter the code shown by <code>spawnd login</code> on the host you want to register.
+            Run <code>spawnd login</code> on the machine you want to reach. It prints a short code
+            and a key fingerprint — you&apos;ll enter the code here, then check the fingerprint
+            matches.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form className="space-y-3" onSubmit={onReview}>
             <div className="space-y-1">
-              <Label htmlFor="user_code">Device code</Label>
+              <Label htmlFor="user_code">Code from the terminal</Label>
               <Input
                 id="user_code"
                 placeholder="QZ4K-7HMT"
@@ -257,67 +262,75 @@ function DeviceInner() {
             )}
             {registration.isError && (
               <p className="text-sm text-destructive" role="alert">
-                Browser identity registration failed; approval is unavailable.
+                This browser&apos;s identity registration failed, so it cannot approve hosts. Reload
+                to retry.
               </p>
             )}
             {registration.data && registration.data.status !== "ready" && (
               <p className="text-sm text-destructive" role="alert">
-                This browser identity is {registration.data.status.replace("_", " ")}; approval is
-                unavailable.
+                This browser&apos;s identity is {registration.data.status.replace("_", " ")}, so it
+                cannot approve hosts.
               </p>
             )}
             {hostName && (
               <p className="text-sm text-foreground" role="status">
-                Approved daemon for host <code>{hostName}</code>. It should connect within a few
-                seconds.
+                <code>{hostName}</code> is connected. Its terminals are available from the Agents
+                page within a few seconds.
               </p>
             )}
             {pending ? (
               <div className="space-y-3 rounded-md border p-3">
-                <p className="text-sm">
-                  Confirm host <code>{pending.host_name}</code> with fingerprint:
-                </p>
-                <p
-                  className="break-all font-mono text-sm font-semibold"
-                  data-testid="host-key-fingerprint"
-                >
-                  {pending.host_key_fingerprint}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Compare this with the fingerprint printed by <code>spawnd login</code>.
-                </p>
+                <div className="space-y-1">
+                  <p className="text-sm font-medium">
+                    Check the fingerprint for <code>{pending.host_name}</code>
+                  </p>
+                  <p
+                    className="break-all rounded bg-muted px-2 py-1.5 font-mono text-sm font-semibold"
+                    data-testid="host-key-fingerprint"
+                  >
+                    {pending.host_key_fingerprint}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    The terminal running <code>spawnd login</code> printed the same value. If the
+                    two differ, stop — someone may be between you and the host.
+                  </p>
+                </div>
                 {localPinState === "active" && (
                   <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
-                    This exact fingerprint is already active in this browser. Confirm retries or
-                    completes the server approval without replacing local trust.
+                    This host key is already active in this browser, so approving again only
+                    completes the server side — local trust is unchanged.
                   </p>
                 )}
                 {localPinState === "revoked" && (
                   <p className="text-xs text-destructive" data-testid="local-pin-state">
-                    This exact fingerprint has a local deletion tombstone. Confirming this fresh
-                    ceremony explicitly reactivates only this same key.
+                    You previously removed this exact host key from this browser (a deletion
+                    tombstone remains). Approving now deliberately trusts this same key again.
                   </p>
                 )}
                 {localPinState === "new" && (
                   <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
-                    Confirmation first saves this exact fingerprint locally, then sends server
-                    approval.
+                    Approving saves this host key in this browser first, then registers the approval
+                    with the server.
                   </p>
                 )}
                 {localPinCommitted && (
                   <p className="text-xs font-medium text-foreground" role="status">
-                    Exact host fingerprint saved locally. Server approval can be retried safely.
+                    Host key saved in this browser. If the server step fails, retrying is safe.
                   </p>
                 )}
-                <p className="text-sm">Approving browser fingerprint:</p>
-                <p
-                  className="break-all font-mono text-sm font-semibold"
-                  data-testid="browser-key-fingerprint"
-                >
-                  {registration.data?.status === "ready"
-                    ? registration.data.device.fingerprint
-                    : "unavailable"}
-                </p>
+                <div className="space-y-1 border-t border-border pt-2">
+                  <p className="text-xs text-muted-foreground">
+                    Approving as{deviceLabel ? ` ${deviceLabel},` : ""} this browser&apos;s key:
+                  </p>
+                  <p
+                    className="break-all font-mono text-xs text-muted-foreground"
+                    data-testid="browser-key-fingerprint"
+                  >
+                    {registration.data?.status === "ready"
+                      ? registration.data.device.fingerprint
+                      : "unavailable"}
+                  </p>
+                </div>
                 <div className="flex gap-2">
                   <Button
                     type="button"
@@ -330,8 +343,8 @@ function DeviceInner() {
                       : localPinCommitted
                         ? "Retry server approval"
                         : localPinState === "revoked"
-                          ? "Confirm reapproval"
-                          : "Confirm approval"}
+                          ? "Approve this host again"
+                          : "Fingerprint matches — approve"}
                   </Button>
                   <Button
                     type="button"
@@ -349,7 +362,7 @@ function DeviceInner() {
               </div>
             ) : (
               <Button type="submit" className="w-full" disabled={submitting}>
-                {submitting ? "Checking..." : "Review daemon"}
+                {submitting ? "Checking..." : "Look up host"}
               </Button>
             )}
           </form>

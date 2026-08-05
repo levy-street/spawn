@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Trash2, X } from "lucide-react";
+import { Check, Pencil, Trash2, X } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
@@ -202,118 +202,240 @@ function BrowserDevicesSettings() {
     }
   };
 
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const rename = useMutation({
+    mutationFn: ({ id, label }: { id: string; label: string | null }) =>
+      browserDevices.rename(id, label),
+    onSuccess: () => {
+      setRenamingId(null);
+      setError(null);
+      void qc.invalidateQueries({ queryKey: ["browser-devices"] });
+    },
+    onError: (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+  });
+  const startRename = (device: BrowserDevice) => {
+    setRenamingId(device.id);
+    setRenameValue(device.label ?? "");
+  };
+  const submitRename = (device: BrowserDevice) => {
+    const trimmed = renameValue.trim();
+    rename.mutate({ id: device.id, label: trimmed === "" ? null : trimmed.slice(0, 64) });
+  };
+
+  // The list is the single source of rows; when the current device is known
+  // from registration but the fetch has not caught up yet, synthesize its row
+  // so "this browser" always has a home.
+  const listed = devices.data ?? [];
+  const rows: BrowserDevice[] =
+    currentDevice && !listed.some((device) => device.id === currentDevice.id)
+      ? [currentDevice as BrowserDevice, ...listed]
+      : listed;
+  const activeRows = rows
+    .filter((device) => !device.revoked_at)
+    .sort((a, b) => {
+      if ((a.public_key === currentPublicKey) !== (b.public_key === currentPublicKey)) {
+        return a.public_key === currentPublicKey ? -1 : 1;
+      }
+      return a.created_at < b.created_at ? 1 : -1;
+    });
+  const revokedRows = rows.filter((device) => device.revoked_at);
+
+  const deviceName = (device: BrowserDevice) => device.label?.trim() || null;
+
+  const renderRow = (device: BrowserDevice) => {
+    const isCurrent = device.public_key === currentPublicKey;
+    const derivedFingerprint = fingerprintFor(device);
+    const name = deviceName(device);
+    const isRenaming = renamingId === device.id;
+    return (
+      <div key={device.id} className="flex items-start justify-between gap-3 p-3">
+        <div className="min-w-0 flex-1 space-y-1">
+          {isRenaming ? (
+            <form
+              className="flex items-center gap-1.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitRename(device);
+              }}
+            >
+              <Input
+                autoFocus
+                value={renameValue}
+                maxLength={64}
+                placeholder="e.g. Work laptop, Pixel phone"
+                className="h-8 max-w-56 text-sm"
+                onChange={(event) => setRenameValue(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") setRenamingId(null);
+                }}
+                disabled={rename.isPending}
+              />
+              <Button
+                type="submit"
+                variant="ghost"
+                size="icon"
+                className="size-8"
+                aria-label="Save name"
+                disabled={rename.isPending}
+              >
+                <Check className="size-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-8"
+                aria-label="Cancel rename"
+                onClick={() => setRenamingId(null)}
+                disabled={rename.isPending}
+              >
+                <X className="size-4" />
+              </Button>
+            </form>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={name ? "text-sm font-medium" : "text-sm italic text-muted-foreground"}
+              >
+                {name ?? "Unnamed browser"}
+              </span>
+              {isCurrent && (
+                <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
+                  this browser
+                </span>
+              )}
+              {device.revoked_at && (
+                <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                  revoked
+                </span>
+              )}
+              {!device.revoked_at && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-6"
+                  aria-label={`Rename ${name ?? "unnamed browser"}`}
+                  title="Rename"
+                  onClick={() => startRename(device)}
+                >
+                  <Pencil className="size-3.5" />
+                </Button>
+              )}
+            </div>
+          )}
+          <p
+            className="break-all font-mono text-xs text-muted-foreground"
+            data-testid={isCurrent ? "browser-fingerprint" : undefined}
+          >
+            {derivedFingerprint ?? "…"}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Added {new Date(device.created_at).toLocaleDateString()}
+            {device.revoked_at && ` · revoked ${new Date(device.revoked_at).toLocaleDateString()}`}
+          </p>
+        </div>
+        {!device.revoked_at ? (
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={revoke.isPending || derivedFingerprint === null}
+            onClick={() => {
+              const who = name ?? "this unnamed browser";
+              if (
+                confirm(
+                  `Revoke ${who}?\n\nIt immediately loses terminal access on every host. ` +
+                    `Its key fingerprint is ${derivedFingerprint}.`,
+                )
+              ) {
+                revoke.mutate(device);
+              }
+            }}
+          >
+            Revoke
+          </Button>
+        ) : isCurrent && registration.data?.status !== "revoked" ? (
+          <Button size="sm" variant="secondary" onClick={() => void recoverRevokedLocalKey(device)}>
+            Remove local key
+          </Button>
+        ) : null}
+      </div>
+    );
+  };
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Browser identities</CardTitle>
+        <CardTitle>Browser devices</CardTitle>
         <CardDescription>
-          Account-bound public keys for browsers you have used. Fingerprints are derived locally
-          from each key; registration does not yet authenticate live host signaling.
+          Every browser you sign in from gets its own cryptographic key. Names are just labels to
+          tell them apart — hosts trust the key fingerprint, which is always computed locally in
+          this browser, never taken from the server.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="rounded-md border border-border p-3">
-          <p className="text-sm font-medium">This browser</p>
-          {currentDevice ? (
-            <p className="mt-1 break-all font-mono text-xs" data-testid="browser-fingerprint">
-              {fingerprintFor(currentDevice) ?? currentDevice.fingerprint}
+        {registration.isError && (
+          <div className="rounded-md border border-border p-3" role="alert">
+            <p className="text-sm text-destructive">
+              This browser&apos;s identity registration failed. Terminal access and approvals are
+              unavailable from here until it succeeds — try reloading.
             </p>
-          ) : (
-            <p className="mt-1 text-xs text-muted-foreground">
-              {registration.isError
-                ? "Identity registration needs attention."
-                : "No fingerprint is available."}
+          </div>
+        )}
+        {registration.data?.status === "cleanup_pending" && (
+          <div className="space-y-2 rounded-md border border-border p-3" role="alert">
+            <p className="text-sm text-amber-700 dark:text-amber-300">
+              This browser&apos;s key is revoked on the server, but deleting the local copy failed.
+              Nothing can use it anymore; retry to finish cleaning up.
             </p>
-          )}
-          {registration.data?.status === "cleanup_pending" && (
-            <div className="mt-3 space-y-2" role="alert">
-              <p className="text-sm text-amber-700 dark:text-amber-300">
-                Server revocation is complete. Local key deletion is still pending; a replacement
-                will not be generated automatically.
-              </p>
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => void retryCleanup(registration.data!.publicKey)}
-              >
-                Retry local key deletion
-              </Button>
-            </div>
-          )}
-          {registration.data?.status === "revoked" && (
-            <div className="mt-3 space-y-2" role="status">
-              <p className="text-sm">
-                The server key is revoked and the local key is removed. Creating a replacement is an
-                explicit new registration.
-              </p>
-              <Button size="sm" onClick={createReplacement}>
-                Create replacement identity
-              </Button>
-            </div>
-          )}
-        </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void retryCleanup(registration.data!.publicKey)}
+            >
+              Retry local key deletion
+            </Button>
+          </div>
+        )}
+        {registration.data?.status === "revoked" && (
+          <div className="space-y-2 rounded-md border border-border p-3" role="status">
+            <p className="text-sm">
+              This browser&apos;s previous key is fully revoked. To use spawn from here again,
+              create a fresh identity — it starts untrusted and needs approval like any new device.
+            </p>
+            <Button size="sm" onClick={createReplacement}>
+              Create replacement identity
+            </Button>
+          </div>
+        )}
 
         {(error || devices.error || localIdentity.error) && (
           <p className="text-sm text-destructive" role="alert">
             {error ??
-              `Failed to load browser identities: ${String(devices.error ?? localIdentity.error)}`}
+              `Failed to load browser devices: ${String(devices.error ?? localIdentity.error)}`}
           </p>
         )}
 
         <div className="divide-y divide-border rounded-md border border-border">
-          {devices.isLoading && (
-            <div className="p-3 text-sm text-muted-foreground">Loading browser identities...</div>
+          {devices.isLoading && rows.length === 0 && (
+            <div className="p-3 text-sm text-muted-foreground">Loading browser devices...</div>
           )}
-          {!devices.isLoading && !devices.error && (devices.data?.length ?? 0) === 0 && (
+          {!devices.isLoading && !devices.error && rows.length === 0 && (
             <div className="p-3 text-sm text-muted-foreground">No registered browsers.</div>
           )}
-          {(devices.data ?? []).map((device) => {
-            const isCurrent = device.public_key === currentPublicKey;
-            const derivedFingerprint = fingerprintFor(device);
-            return (
-              <div key={device.id} className="flex items-start justify-between gap-3 p-3">
-                <div className="min-w-0 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-xs">{derivedFingerprint ?? "…"}</span>
-                    {isCurrent && (
-                      <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
-                        this browser
-                      </span>
-                    )}
-                    {device.revoked_at && (
-                      <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
-                        revoked
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Registered {new Date(device.created_at).toLocaleDateString()}
-                  </p>
-                </div>
-                {!device.revoked_at ? (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    disabled={revoke.isPending || derivedFingerprint === null}
-                    onClick={() => {
-                      if (confirm(`Revoke browser ${derivedFingerprint}?`)) revoke.mutate(device);
-                    }}
-                  >
-                    Revoke
-                  </Button>
-                ) : isCurrent && registration.data?.status !== "revoked" ? (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => void recoverRevokedLocalKey(device)}
-                  >
-                    Remove local key
-                  </Button>
-                ) : null}
-              </div>
-            );
-          })}
+          {activeRows.map(renderRow)}
         </div>
+
+        {revokedRows.length > 0 && (
+          <details open={revokedRows.some((device) => device.public_key === currentPublicKey)}>
+            <summary className="cursor-pointer text-sm text-muted-foreground">
+              Revoked devices ({revokedRows.length})
+            </summary>
+            <div className="mt-2 divide-y divide-border rounded-md border border-border opacity-70">
+              {revokedRows.map(renderRow)}
+            </div>
+          </details>
+        )}
       </CardContent>
     </Card>
   );
