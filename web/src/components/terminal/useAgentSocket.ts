@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { decodeHistoryDelta } from "@/components/terminal/committed-history";
 import {
   AGENT_CTL_MAX_PENDING_PTY_BYTES,
@@ -132,6 +132,8 @@ type RtcState = {
 };
 
 const RTC_CONNECT_TIMEOUT_MS = 10_000;
+// Covers a full connect plus one retry cycle before an early upload gives up.
+const UPLOAD_READY_WAIT_MS = 20_000;
 const RTC_DISCONNECTED_GRACE_MS = 5_000;
 // Retry failed WebRTC attempts with backoff; there is no content fallback.
 const RTC_RETRY_BASE_DELAY_MS = 5_000;
@@ -224,7 +226,29 @@ export function useAgentSocket({
     throw new Error("Direct agent upload channel is not ready.");
   });
   const cancelUploadsRef = useRef<(reason: Error) => void>(() => {});
+  // Upload readiness latch. An upload requested before the ctl channel has
+  // delivered its ready capability waits here instead of failing outright:
+  // the window between the terminal becoming visible and readiness is real
+  // (account/host identity and trust resolution precede the socket), and a
+  // transient RTC teardown may still be followed by a retry that restores
+  // readiness. Waiters are therefore never rejected by lifecycle churn — only
+  // the caller's own abort signal or the bounded wait ends one early; a
+  // staleness re-check after the wait rejects callers whose agent moved on.
+  const uploadReadyRef = useRef(false);
+  const uploadReadyWaitersRef = useRef(new Set<() => void>());
+  const settleUploadReadiness = useCallback((ready: boolean) => {
+    uploadReadyRef.current = ready;
+    if (!ready) return;
+    const waiters = [...uploadReadyWaitersRef.current];
+    uploadReadyWaitersRef.current.clear();
+    for (const waiter of waiters) waiter();
+  }, []);
   const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  // Per-offer trust resolution reads the latest resolver through this ref: a
+  // change of resolver identity (e.g. the server's claimed host key arriving)
+  // must inform the NEXT offer, not tear down a live connection.
+  const resolveSignedRtcTrustRef = useRef(resolveSignedRtcTrust);
+  resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     agentId,
@@ -262,6 +286,7 @@ export function useAgentSocket({
     uploadRef.current = async () => {
       throw new Error("Direct agent upload channel is not ready.");
     };
+    settleUploadReadiness(false);
     cancelUploadsRef.current(new Error("Agent upload generation changed."));
     cancelUploadsRef.current = () => {};
     activeAgentIdRef.current = enabled && agentId ? agentId : null;
@@ -358,6 +383,7 @@ export function useAgentSocket({
       uploadRef.current = async () => {
         throw new Error("Direct agent upload channel is not ready.");
       };
+      settleUploadReadiness(false);
       cancelUploadsRef.current(new Error("Direct agent upload channel closed."));
       cancelUploadsRef.current = () => {};
       pendingRemoteRtcCandidatesRef.current = [];
@@ -792,6 +818,9 @@ export function useAgentSocket({
         rtcRef.current = { ...current, open: true };
         clearRtcConnectTimer();
         rtcRetryAttempts = 0;
+        // Only now is the upload context fully valid (channels open, server
+        // ready, bootstrap done): release uploads that were waiting for it.
+        settleUploadReadiness(true);
         if (isCurrentAgentGeneration()) setDcOpen(true);
         flushPendingInput();
       };
@@ -1137,9 +1166,12 @@ export function useAgentSocket({
         // late and ICE can nominate a relay pair first. Deciding first keeps the
         // signalling path latency-free.
         let signedRtcDecision: SignedRtcTrustDecision = { mode: "unpinned" };
-        if (resolveSignedRtcTrust) {
+        // Read through the ref so every offer resolves with the freshest trust
+        // inputs without the resolver's identity churning the connection.
+        const resolveTrust = resolveSignedRtcTrustRef.current;
+        if (resolveTrust) {
           try {
-            signedRtcDecision = await resolveSignedRtcTrust();
+            signedRtcDecision = await resolveTrust();
           } catch {
             // A resolver failure must fail closed for a possibly-pinned host.
             signedRtcDecision = { mode: "refuse", reason: "pin_storage_error" };
@@ -1466,7 +1498,7 @@ export function useAgentSocket({
       pendingInputRef.current.clear();
       if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
     };
-  }, [agentId, enabled, resolveSignedRtcTrust]);
+  }, [agentId, enabled, settleUploadReadiness]);
 
   // Poll WebRTC stats while the channel is up: the selected candidate pair
   // tells us whether bytes flow direct, via STUN-discovered addresses, or
@@ -1583,9 +1615,45 @@ export function useAgentSocket({
     return true;
   };
 
-  const uploadFile = (blob: Blob, options: DirectAgentUploadOptions) => {
+  const waitForUploadReadiness = (signal?: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      const abortError = () =>
+        signal?.reason instanceof Error
+          ? signal.reason
+          : new DOMException("Upload cancelled.", "AbortError");
+      if (signal?.aborted) {
+        reject(abortError());
+        return;
+      }
+      const waiter = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        uploadReadyWaitersRef.current.delete(waiter);
+        cleanup();
+        reject(abortError());
+      };
+      const timer = setTimeout(() => {
+        uploadReadyWaitersRef.current.delete(waiter);
+        cleanup();
+        reject(new Error("Direct agent upload channel is not ready."));
+      }, UPLOAD_READY_WAIT_MS);
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      uploadReadyWaitersRef.current.add(waiter);
+    });
+
+  const uploadFile = async (blob: Blob, options: DirectAgentUploadOptions) => {
+    if (!uploadReadyRef.current) await waitForUploadReadiness(options.signal);
+    // A caller holding this hook's return from an earlier agent must not
+    // dispatch into the current agent's channel — re-checked after the wait
+    // because readiness may have been restored by a successor generation.
     if (activeAgentIdRef.current !== agentId) {
-      return Promise.reject(new Error("Agent upload generation changed."));
+      throw new Error("Agent upload generation changed.");
     }
     return uploadRef.current(blob, options);
   };

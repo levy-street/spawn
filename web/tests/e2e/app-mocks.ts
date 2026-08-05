@@ -801,9 +801,24 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
-    if (path === `/api/agents/${AGENT_ID}`) {
-      await route.fulfill({ status: 200, contentType: "application/json", json: agent() });
-      return;
+    const agentGetMatch = path.match(/^\/api\/agents\/([^/]+)$/);
+    if (agentGetMatch) {
+      const agentGetId = agentGetMatch[1];
+      const listedAgent = agents.find(
+        (item) => (item as { id?: string }).id === agentGetId,
+      );
+      if (method === "GET" && listedAgent) {
+        await route.fulfill({ status: 200, contentType: "application/json", json: listedAgent });
+        return;
+      }
+      if (agentGetId === AGENT_ID) {
+        await route.fulfill({ status: 200, contentType: "application/json", json: agent() });
+        return;
+      }
+      if (method === "GET") {
+        await route.fulfill({ status: 404, json: { detail: "agent not found" } });
+        return;
+      }
     }
     if (path === `/api/agents/${AGENT_ID}/access`) {
       await route.fulfill({

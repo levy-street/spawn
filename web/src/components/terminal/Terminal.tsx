@@ -1220,10 +1220,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   liveAccountIdRef.current = signalingAccountId;
   const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
   const claimedHostFingerprint = hostIdentityQuery.data?.host_key_fingerprint ?? null;
-  // Trust can only be evaluated once the account and hostId are known. Until
-  // then the socket stays disabled so a pinned host is never reached over a raw
-  // path before its pin is checked.
-  const signalingIdentityKnown = signalingAccountId !== null && signalingHostId !== null;
+  // Trust can only be evaluated once the account and hostId are known, and the
+  // first connection must not race the host record: until the claimed key
+  // query settles (success or error — a keyless host legitimately resolves to
+  // null), the socket stays disabled. Connecting earlier would both reach a
+  // pinned host before its pin is checked and tear the connection down again
+  // the moment the claimed key lands, killing anything in flight on it.
+  const signalingIdentityKnown =
+    signalingAccountId !== null &&
+    signalingHostId !== null &&
+    (hostIdentityQuery.isSuccess || hostIdentityQuery.isError);
   const resolveTrust = useCallback(
     (): Promise<SignedRtcTrustDecision> =>
       resolveSignedRtcTrust({

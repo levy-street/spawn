@@ -3,6 +3,7 @@ import {
   handleAgentRtcSignal,
   installAgentRtcMock,
   replyReplay,
+  sendHistoryDelta,
   sendPty,
   setDisplayControl,
 } from "./agent-rtc-mock";
@@ -21,6 +22,8 @@ async function openTerminalWithMockSocket(
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
     fromAgents?: boolean;
+    historyEpoch?: string;
+    historyOffset?: number;
   } = {},
 ) {
   const messages: Array<string | Buffer> = [];
@@ -39,6 +42,8 @@ async function openTerminalWithMockSocket(
     autoSnapshot: options.autoSnapshot,
     uploadFinalAction: options.uploadFinalAction,
     stallUploadBackpressure: options.stallUploadBackpressure,
+    historyEpoch: options.historyEpoch,
+    historyOffset: options.historyOffset,
     onUpload: (upload) => {
       uploads.push(upload);
     },
@@ -1156,7 +1161,9 @@ test("worker replay streams render exactly with geometry markers", async ({ page
     "progress:AAAA\rprogress:BBBB\r\n" +
     "\x1b[8;30;100t" +
     "repainted-screen-line\r\nprogress:BBBB\r\ntail-at-current-size\r\n$ ";
-  await openTerminalWithMockSocket(page, { history });
+  // Legacy worker: the overlay fetches a capture per open; the mock answers
+  // with the same geometry-tagged stream.
+  await openTerminalWithMockSocket(page, { history, autoSnapshot: true });
 
   await expect(liveTerminalRows(page)).toContainText("tail-at-current-size");
   await expect(liveTerminalRows(page)).toContainText("progress:BBBB");
@@ -1173,14 +1180,27 @@ test("worker replay streams render exactly with geometry markers", async ({ page
   await expect(overlay.locator(".xterm-rows")).not.toContainText("AAAA");
 });
 
-test("terminal scrollback opens from cached snapshots without waiting for a round trip", async ({
+test("terminal scrollback opens from committed history without waiting for a round trip", async ({
   page,
 }) => {
+  // Delta-capable worker: the hidden overlay terminal is a standing view of
+  // the committed log, so opening scrollback is purely local — no snapshot
+  // reply is ever provided in this test — and committed deltas keep the view
+  // live while the reader is scrolled up.
+  const epoch = "1754300000000000042";
+  const v2Seed =
+    "\x1b[8;24;100t\x1b_sp:h1\x1b\\" +
+    longHistory(160).replaceAll("\n", "\r\n") +
+    "\x1b[8;24;100t\x1b[Hlive-screen-top\r\n$ ";
   const { messages } = await openTerminalWithMockSocket(page, {
-    history: longHistory(160),
+    history: v2Seed,
+    control: { owner: true, cols: 100, rows: 24, viewers: 1 },
+    historyEpoch: epoch,
+    historyOffset: 0,
   });
   const terminal = page.getByLabel("Agent terminal");
   await expect(terminal).toBeVisible();
+  await expect(liveTerminalRows(page)).toContainText("live-screen-top");
 
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -30);
@@ -1190,34 +1210,30 @@ test("terminal scrollback opens from cached snapshots without waiting for a roun
   await expect(overlay.locator(".xterm-rows")).toContainText("history-");
   expect(jsonMessages(messages).some((message) => message?.type === "scroll")).toBe(false);
 
-  await sendPty(page, "\x1b[2A\rLIVE-WHILE-SCROLLED");
+  // A committed line lands while the reader is scrolled up: the overlay
+  // appends it without yanking the read position.
+  await sendHistoryDelta(page, epoch, 0, "LIVE-WHILE-SCROLLED\r\n");
   await expect(overlay).toBeVisible();
   await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-WHILE-SCROLLED");
 
-  const beforeStreamingScroll = await scrollbackOverlayMetrics(page);
-  await sendPty(
-    page,
-    `${Array.from({ length: 80 }, (_, i) => `STREAMING-${String(i).padStart(2, "0")}`).join("\n")}\n`,
-  );
   await page.mouse.wheel(0, -600);
-  await expect
-    .poll(async () => {
-      const metrics = await scrollbackOverlayMetrics(page);
-      return metrics.scrollTop < beforeStreamingScroll.scrollTop - 100;
-    })
-    .toBe(true);
-  const afterStreamingScroll = await scrollbackOverlayMetrics(page);
+  const beforeStreamingScroll = await scrollbackOverlayMetrics(page);
+  let offset = 21;
+  for (let i = 0; i < 20; i += 1) {
+    const line = `STREAMING-${String(i).padStart(2, "0")}\r\n`;
+    await sendHistoryDelta(page, epoch, offset, line);
+    offset += line.length;
+  }
   await page.waitForTimeout(200);
   await expect
     .poll(async () => {
       const metrics = await scrollbackOverlayMetrics(page);
-      return metrics.scrollTop <= afterStreamingScroll.scrollTop + 20;
+      return metrics.scrollTop <= beforeStreamingScroll.scrollTop + 20;
     })
     .toBe(true);
 
-  await page.mouse.wheel(0, 5000);
+  await page.mouse.wheel(0, 8000);
   await expect(overlay).not.toBeVisible();
-  await expect(liveTerminalRows(page)).toContainText("STREAMING-79");
   await terminal.click();
   await page.keyboard.type("z");
   await expect.poll(() => binaryText(messages)).toContain("z");
@@ -1388,18 +1404,24 @@ test("resizing invalidates cached scrollback so history re-wraps at the new widt
   }, liveDuringInitialRender);
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -30);
-  const overlay = page.getByTestId("terminal-scrollback-overlay");
-  await expect(overlay).toBeVisible();
-  await expect(overlay).toHaveAttribute("data-live-injected-during-render", "true");
-  await expect(overlay).toHaveAttribute("aria-busy", "false");
-  await expect(overlay.locator(".xterm-rows")).toContainText("LIVE-DURING-INITIAL-OVERLAY-RENDER");
-  const initialRenderText = await overlay.locator(".xterm-rows").innerText();
-  expect(initialRenderText.match(/LIVE-DURING-INITIAL-OVERLAY-RENDER/g)?.length ?? 0).toBe(1);
-
+  // Legacy worker: the open waits on its capture fetch. Answer the queued
+  // request with the rewrapped capture — the overlay's first render reveals
+  // it at the new width.
   const rewrapped = `${Array.from({ length: 160 }, (_, i) => {
     return `REWRAPPED-${String(i).padStart(3, "0")}`;
   }).join("\n")}\n`;
   await replyReplay(page, rewrapped);
+
+  const overlay = page.getByTestId("terminal-scrollback-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay).toHaveAttribute("data-live-injected-during-render", "true");
+  await expect(overlay).toHaveAttribute("aria-busy", "false");
+  // The overlay is a static capture in legacy mode; live bytes that race its
+  // render belong to the live terminal and must cross the resize-reseed
+  // barrier exactly once instead of disappearing in that window.
+  await expect(liveTerminalRows(page)).toContainText("LIVE-DURING-INITIAL-OVERLAY-RENDER");
+  const liveText = await liveTerminalRows(page).innerText();
+  expect(liveText.match(/LIVE-DURING-INITIAL-OVERLAY-RENDER/g)?.length ?? 0).toBe(1);
 
   await expect(overlay.locator(".xterm-rows")).toContainText("REWRAPPED-");
   await expect(overlay.locator(".xterm-rows")).not.toContainText("history-");
@@ -1410,11 +1432,11 @@ test("scrollback overlay supports mouse text selection and still closes at botto
 }) => {
   await openTerminalWithMockSocket(page, {
     history: longHistory(160),
+    // Legacy worker: the open's capture fetch is answered by the mock.
+    autoSnapshot: true,
   });
   await expect(liveTerminalRows(page)).toContainText("history-159");
 
-  // The history snapshot is cached clean, so scrollback opens locally
-  // without a snapshot round trip.
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -300);
 
@@ -1488,8 +1510,14 @@ test.describe("mobile terminal touch", () => {
   test("touch scrollback opens, stays live, and returns to live input", async ({ page }) => {
     const { messages } = await openTerminalWithMockSocket(page, {
       history: longHistory(240),
+      // Legacy (pre-delta) workers answer the overlay's fetch-on-open
+      // snapshot request; the flick's reveal rides that response.
+      autoSnapshot: true,
     });
     await expect(page.getByLabel("Agent terminal")).toBeVisible();
+    // A flick can only reveal scrollback that exists: wait for the replayed
+    // history to land in the live terminal before gesturing.
+    await expect(liveTerminalRows(page)).toContainText("history-");
 
     await dragTouchInTerminal(page, 0.52, 0.6);
 
