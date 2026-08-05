@@ -229,3 +229,31 @@ test("devices can be renamed for recognition without touching the key", async ({
   await expect(fingerprint).toHaveText(before ?? /^SHA256:/);
   await expect(page.getByText("this browser", { exact: true })).toBeVisible();
 });
+
+test("clearing history prunes tombstones but never active devices", async ({ page }) => {
+  await mockAuthenticatedApi(page, {
+    extraBrowserDevices: [
+      {
+        id: "00000000-0000-4000-8000-000000000041",
+        key_algorithm: "ed25519",
+        public_key: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        fingerprint: "SHA256:AAAAAAAAAAAAAAAA",
+        label: "Old laptop",
+        created_at: "2026-07-01T00:00:00Z",
+        revoked_at: "2026-07-02T00:00:00Z",
+      },
+    ],
+  });
+  await page.goto("/settings");
+
+  await page.getByText("Revoked devices (1)").click();
+  await expect(page.getByText("Old laptop")).toBeVisible();
+
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "Clear history" }).click();
+
+  // The tombstone section disappears entirely; this browser's active row stays.
+  await expect(page.getByText(/Revoked devices/)).toHaveCount(0);
+  await expect(page.getByText("Old laptop")).toHaveCount(0);
+  await expect(page.getByText("this browser")).toBeVisible();
+});

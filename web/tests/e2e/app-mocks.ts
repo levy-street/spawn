@@ -801,6 +801,14 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    if (path === "/api/browser-devices/prune" && method === "POST") {
+      const pruned = browserDeviceList.filter((item) => item.revoked_at != null).length;
+      for (let i = browserDeviceList.length - 1; i >= 0; i -= 1) {
+        if (browserDeviceList[i].revoked_at != null) browserDeviceList.splice(i, 1);
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", json: { pruned } });
+      return;
+    }
     const agentGetMatch = path.match(/^\/api\/agents\/([^/]+)$/);
     if (agentGetMatch) {
       const agentGetId = agentGetMatch[1];

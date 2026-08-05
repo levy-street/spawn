@@ -181,6 +181,17 @@ export function DevicesPanel() {
     setRenamingId(device.id);
     setRenameValue(device.label ?? "");
   };
+
+  // Forgets tombstones only: revocation stays permanent (live pins were
+  // already severed, and a hard-deleted endorser fails closed daemon-side).
+  const prune = useMutation({
+    mutationFn: () => browserDevices.prune(),
+    onSuccess: () => {
+      setError(null);
+      void qc.invalidateQueries({ queryKey: ["browser-devices"] });
+    },
+    onError: (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+  });
   const submitRename = (device: BrowserDevice) => {
     const trimmed = renameValue.trim();
     rename.mutate({ id: device.id, label: trimmed === "" ? null : trimmed.slice(0, 64) });
@@ -485,6 +496,27 @@ export function DevicesPanel() {
           </summary>
           <div className="mt-2 divide-y divide-border rounded-md border border-border opacity-70">
             {revokedRows.map(renderRow)}
+          </div>
+          <div className="mt-2 flex items-center gap-3">
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={prune.isPending}
+              onClick={() => {
+                if (
+                  confirm(
+                    `Clear ${revokedRows.length} revoked device${
+                      revokedRows.length === 1 ? "" : "s"
+                    } from history?\n\nRevocation itself is permanent — these devices stay ` +
+                      "locked out — this only removes the list entries.",
+                  )
+                ) {
+                  prune.mutate();
+                }
+              }}
+            >
+              {prune.isPending ? "Clearing…" : "Clear history"}
+            </Button>
           </div>
         </details>
       )}

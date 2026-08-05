@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -119,6 +119,30 @@ async def list_browser_devices(
         .all()
     )
     return [_to_out(device) for device in devices]
+
+
+@router.post("/prune", response_model=schemas.BrowserDevicePruneResponse)
+async def prune_revoked_browser_devices(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.BrowserDevicePruneResponse:
+    """Hard-delete this account's revoked device tombstones.
+
+    Deletion is fail-closed by the same contract reconciliation relies on: a
+    revoked device's own pins are already non-live and cascade away with the
+    row, and pins whose endorsement chain ran through it stay severed because
+    a dangling endorser id is never admitted (see
+    ``_live_browser_device_id_set``). No host's live pin set changes, so no
+    push is needed — this only forgets history, never grants or restores.
+    """
+    result = await session.execute(
+        delete(BrowserDevice).where(
+            BrowserDevice.owner_user_id == user.id,
+            BrowserDevice.revoked_at.is_not(None),
+        )
+    )
+    await session.commit()
+    return schemas.BrowserDevicePruneResponse(pruned=result.rowcount or 0)
 
 
 @router.post("/{device_id}/revoke", response_model=schemas.BrowserDeviceOut)

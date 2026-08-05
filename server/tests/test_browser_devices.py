@@ -350,3 +350,53 @@ async def test_revoking_a_pinned_device_pushes_to_affected_hosts(client, monkeyp
     # Pushed to every host whose pin set the revocation changed: the one that
     # trusted the endorser directly and the one that trusted its endorsee.
     assert set(pushed) == {host_a_id, host_b_id}
+
+
+async def test_prune_deletes_only_this_accounts_tombstones(client):
+    user_id, token = await _signup(client, "prune@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    kept_proof = _proof(user_id, Ed25519PrivateKey.generate())
+    kept = (
+        await client.post("/api/browser-devices/register", json=kept_proof, headers=headers)
+    ).json()
+    dead_proof = _proof(user_id, Ed25519PrivateKey.generate())
+    dead = (
+        await client.post("/api/browser-devices/register", json=dead_proof, headers=headers)
+    ).json()
+    revoked = await client.post(
+        f"/api/browser-devices/{dead['id']}/revoke",
+        json={"expected_public_key": dead_proof["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200
+
+    # Another account's tombstone must survive this account's prune.
+    other_id, other_token = await _signup(client, "prune-other@example.com")
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+    other_proof = _proof(other_id, Ed25519PrivateKey.generate())
+    other = (
+        await client.post(
+            "/api/browser-devices/register", json=other_proof, headers=other_headers
+        )
+    ).json()
+    other_revoked = await client.post(
+        f"/api/browser-devices/{other['id']}/revoke",
+        json={"expected_public_key": other_proof["public_key"]},
+        headers=other_headers,
+    )
+    assert other_revoked.status_code == 200
+
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200
+    assert pruned.json() == {"pruned": 1}
+
+    listing = (await client.get("/api/browser-devices", headers=headers)).json()
+    assert [device["id"] for device in listing] == [kept["id"]]
+    other_listing = (await client.get("/api/browser-devices", headers=other_headers)).json()
+    assert [device["id"] for device in other_listing] == [other["id"]]
+    assert other_listing[0]["revoked_at"] is not None
+
+    # Idempotent: nothing left to prune.
+    again = await client.post("/api/browser-devices/prune", headers=headers)
+    assert again.status_code == 200
+    assert again.json() == {"pruned": 0}

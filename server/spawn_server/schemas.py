@@ -97,6 +97,10 @@ class BrowserDeviceRenameRequest(BaseModel):
     label: str | None = Field(default=None, max_length=64)
 
 
+class BrowserDevicePruneResponse(BaseModel):
+    pruned: int
+
+
 class AuthProviderOut(BaseModel):
     id: Literal["google", "microsoft", "github"]
     name: str

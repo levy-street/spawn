@@ -1794,3 +1794,97 @@ async def test_revoking_root_drops_the_whole_endorsement_subtree(client):
     assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
         direct_id
     }
+
+
+async def test_pruning_a_revoked_endorser_keeps_its_subtree_severed(client):
+    """Hard-deleting a revoked endorser must not resurrect what it endorsed.
+
+    Prune removes the tombstone row entirely, leaving the endorsed pin with a
+    dangling endorser_device_id. The live-set computation must treat that
+    exactly like a revoked endorser — never admitted — or clearing history
+    would silently restore access that revocation removed.
+    """
+
+    from datetime import UTC, datetime
+
+    from spawn_server import auth
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_device_ids, _live_browser_pins
+
+    async with get_sessionmaker()() as session:
+        user = User(email="endorser-prune@example.com", password_hash="x")
+        session.add(user)
+        await session.flush()
+        host = Host(name="endorser-prune-box", owner_user_id=user.id)
+        session.add(host)
+        await session.flush()
+
+        endorser = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="F" * 43
+        )
+        endorsed = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="G" * 43
+        )
+        direct = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="H" * 43
+        )
+        session.add_all([endorser, endorsed, direct])
+        await session.flush()
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorser.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorser.public_key,
+                    browser_key_fingerprint="SHA256:" + "f" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=direct.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=direct.public_key,
+                    browser_key_fingerprint="SHA256:" + "h" * 16,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorsed.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorsed.public_key,
+                    browser_key_fingerprint="SHA256:" + "g" * 16,
+                    endorser_device_id=endorser.id,
+                    endorsement_signature="s" * 86,
+                ),
+            ]
+        )
+        endorser.revoked_at = datetime.now(UTC)
+        await session.commit()
+        host_id = host.id
+        user_id = user.id
+        endorser_id, endorsed_id, direct_id = endorser.id, endorsed.id, direct.id
+
+    # Revocation already severed the endorser and its endorsee.
+    assert await _live_browser_device_ids(host_id) == [direct_id]
+
+    headers = {"Authorization": f"Bearer {auth.issue_access_token(user_id)}"}
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200
+    assert pruned.json() == {"pruned": 1}
+
+    # The endorser row (and, via cascade, its own pin) is gone; the endorsed
+    # pin's dangling endorser id keeps it out of the live set, and the
+    # directly approved device is untouched.
+    async with get_sessionmaker()() as session:
+        assert await session.get(BrowserDevice, endorser_id) is None
+        endorsed_pin = (
+            await session.execute(
+                select(HostBrowserPin).where(
+                    HostBrowserPin.browser_device_id == endorsed_id
+                )
+            )
+        ).scalar_one()
+        assert endorsed_pin.endorser_device_id == endorser_id
+    assert await _live_browser_device_ids(host_id) == [direct_id]
+    assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
+        direct_id
+    }

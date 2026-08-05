@@ -426,6 +426,12 @@ export const browserDevices = {
       body: JSON.stringify({ expected_public_key: expectedPublicKey }),
       schema: BrowserDeviceSchema,
     }),
+  /** Hard-deletes this account's revoked device tombstones. */
+  prune: () =>
+    api("/api/browser-devices/prune", {
+      method: "POST",
+      schema: z.object({ pruned: z.number().int() }),
+    }),
 };
 
 export const trust = {
