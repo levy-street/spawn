@@ -2,9 +2,11 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Trash2, X } from "lucide-react";
+import Link from "next/link";
 import { type FormEvent, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
+import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -17,6 +19,7 @@ import {
   type Skill,
   type SkillCreateInput,
   skills as skillApi,
+  trust,
 } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
@@ -178,29 +181,44 @@ function BrowserDevicesSettings() {
     }
   };
 
-  const recoverRevokedLocalKey = async (device: BrowserDevice) => {
+  /**
+   * One explicit action for "this browser was revoked, get me going again":
+   * clean up the dead local key (idempotent) and authorize minting a fresh
+   * identity. Still a single deliberate user click — a revoked browser never
+   * silently re-mints itself — but no longer two puzzle steps.
+   */
+  const startFresh = async (publicKey: string) => {
     if (!user) return;
     setError(null);
     try {
-      const status = await beginBrowserDeviceLocalCleanup(user.id, device.public_key);
-      setRegistrationState({ status, publicKey: device.public_key });
-      if (status === "cleanup_pending") await retryCleanup(device.public_key);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-
-  const createReplacement = () => {
-    if (!user || registration.data?.status !== "revoked") return;
-    setError(null);
-    try {
-      allowExplicitBrowserIdentityReplacement(user.id, registration.data.publicKey);
+      const status = await beginBrowserDeviceLocalCleanup(user.id, publicKey);
+      setRegistrationState({ status, publicKey });
+      if (status === "cleanup_pending") {
+        await finishBrowserDeviceLocalCleanup(user.id, publicKey);
+      }
+      setRegistrationState({ status: "revoked", publicKey });
+      qc.setQueryData(["browser-device-local-identity", user.id], null);
+      allowExplicitBrowserIdentityReplacement(user.id, publicKey);
       void qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
       void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
+
+  // Advisory trust coverage for badges and flow routing (verification stays
+  // fingerprint-only). Refreshes on its own, so "waiting for approval" flips
+  // to trusted once the other browser signs.
+  const trustMap = useDeviceTrustMap(user !== null);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [approvalNote, setApprovalNote] = useState<string | null>(null);
+  const currentTrustedHosts = currentDevice ? trustMap.trustedHostIdsFor(currentDevice.id) : [];
+  const canApproveOthers = currentTrustedHosts.length > 0;
+  const bundle = useQuery({
+    queryKey: ["trust", "bundle"],
+    queryFn: () => trust.getBundle(),
+    enabled: user !== null,
+  });
 
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -248,117 +266,158 @@ function BrowserDevicesSettings() {
     const derivedFingerprint = fingerprintFor(device);
     const name = deviceName(device);
     const isRenaming = renamingId === device.id;
+    const trustedCount = trustMap.trustedHostIdsFor(device.id).length;
+    const showTrustBadge = !device.revoked_at && trustMap.ready;
     return (
-      <div key={device.id} className="flex items-start justify-between gap-3 p-3">
-        <div className="min-w-0 flex-1 space-y-1">
-          {isRenaming ? (
-            <form
-              className="flex items-center gap-1.5"
-              onSubmit={(event) => {
-                event.preventDefault();
-                submitRename(device);
-              }}
-            >
-              <Input
-                autoFocus
-                value={renameValue}
-                maxLength={64}
-                placeholder="e.g. Work laptop, Pixel phone"
-                className="h-8 max-w-56 text-sm"
-                onChange={(event) => setRenameValue(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") setRenamingId(null);
+      <div key={device.id} className="p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1 space-y-1">
+            {isRenaming ? (
+              <form
+                className="flex items-center gap-1.5"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  submitRename(device);
                 }}
-                disabled={rename.isPending}
-              />
-              <Button
-                type="submit"
-                variant="ghost"
-                size="icon"
-                className="size-8"
-                aria-label="Save name"
-                disabled={rename.isPending}
               >
-                <Check className="size-4" />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-8"
-                aria-label="Cancel rename"
-                onClick={() => setRenamingId(null)}
-                disabled={rename.isPending}
-              >
-                <X className="size-4" />
-              </Button>
-            </form>
-          ) : (
-            <div className="flex flex-wrap items-center gap-2">
-              <span
-                className={name ? "text-sm font-medium" : "text-sm italic text-muted-foreground"}
-              >
-                {name ?? "Unnamed browser"}
-              </span>
-              {isCurrent && (
-                <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
-                  this browser
-                </span>
-              )}
-              {device.revoked_at && (
-                <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                  revoked
-                </span>
-              )}
-              {!device.revoked_at && (
+                <Input
+                  autoFocus
+                  value={renameValue}
+                  maxLength={64}
+                  placeholder="e.g. Work laptop, Pixel phone"
+                  className="h-8 max-w-56 text-sm"
+                  onChange={(event) => setRenameValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setRenamingId(null);
+                  }}
+                  disabled={rename.isPending}
+                />
                 <Button
+                  type="submit"
                   variant="ghost"
                   size="icon"
-                  className="size-6"
-                  aria-label={`Rename ${name ?? "unnamed browser"}`}
-                  title="Rename"
-                  onClick={() => startRename(device)}
+                  className="size-8"
+                  aria-label="Save name"
+                  disabled={rename.isPending}
                 >
-                  <Pencil className="size-3.5" />
+                  <Check className="size-4" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-8"
+                  aria-label="Cancel rename"
+                  onClick={() => setRenamingId(null)}
+                  disabled={rename.isPending}
+                >
+                  <X className="size-4" />
+                </Button>
+              </form>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span
+                  className={name ? "text-sm font-medium" : "text-sm italic text-muted-foreground"}
+                >
+                  {name ?? "Unnamed browser"}
+                </span>
+                {isCurrent && (
+                  <span className="rounded border border-border px-1.5 py-0.5 text-[11px]">
+                    this browser
+                  </span>
+                )}
+                {device.revoked_at && (
+                  <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                    revoked
+                  </span>
+                )}
+                {showTrustBadge &&
+                  (trustedCount > 0 ? (
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                      trusted · {trustedCount} host{trustedCount === 1 ? "" : "s"}
+                    </span>
+                  ) : (
+                    <span className="rounded border border-amber-600/50 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">
+                      not trusted yet
+                    </span>
+                  ))}
+                {!device.revoked_at && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-6"
+                    aria-label={`Rename ${name ?? "unnamed browser"}`}
+                    title="Rename"
+                    onClick={() => startRename(device)}
+                  >
+                    <Pencil className="size-3.5" />
+                  </Button>
+                )}
+              </div>
+            )}
+            <p
+              className="break-all font-mono text-xs text-muted-foreground"
+              data-testid={isCurrent ? "browser-fingerprint" : undefined}
+            >
+              {derivedFingerprint ?? "…"}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Added {new Date(device.created_at).toLocaleDateString()}
+              {device.revoked_at &&
+                ` · revoked ${new Date(device.revoked_at).toLocaleDateString()}`}
+            </p>
+          </div>
+          {!device.revoked_at ? (
+            <div className="flex shrink-0 gap-2">
+              {!isCurrent && trustMap.ready && trustedCount === 0 && canApproveOthers && (
+                <Button
+                  size="sm"
+                  disabled={derivedFingerprint === null}
+                  onClick={() => {
+                    setApprovalNote(null);
+                    setApprovingId(approvingId === device.id ? null : device.id);
+                  }}
+                >
+                  Approve…
                 </Button>
               )}
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={revoke.isPending || derivedFingerprint === null}
+                onClick={() => {
+                  const who = name ?? "this unnamed browser";
+                  if (
+                    confirm(
+                      `Revoke ${who}?\n\nIt immediately loses terminal access on every host. ` +
+                        `Its key fingerprint is ${derivedFingerprint}.`,
+                    )
+                  ) {
+                    revoke.mutate(device);
+                  }
+                }}
+              >
+                Revoke
+              </Button>
             </div>
-          )}
-          <p
-            className="break-all font-mono text-xs text-muted-foreground"
-            data-testid={isCurrent ? "browser-fingerprint" : undefined}
-          >
-            {derivedFingerprint ?? "…"}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Added {new Date(device.created_at).toLocaleDateString()}
-            {device.revoked_at && ` · revoked ${new Date(device.revoked_at).toLocaleDateString()}`}
-          </p>
+          ) : isCurrent && registration.data?.status !== "revoked" ? (
+            <Button size="sm" onClick={() => void startFresh(device.public_key)}>
+              Start fresh on this browser
+            </Button>
+          ) : null}
         </div>
-        {!device.revoked_at ? (
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={revoke.isPending || derivedFingerprint === null}
-            onClick={() => {
-              const who = name ?? "this unnamed browser";
-              if (
-                confirm(
-                  `Revoke ${who}?\n\nIt immediately loses terminal access on every host. ` +
-                    `Its key fingerprint is ${derivedFingerprint}.`,
-                )
-              ) {
-                revoke.mutate(device);
-              }
+        {approvingId === device.id && user && derivedFingerprint !== null && (
+          <EndorseDevicePanel
+            accountId={user.id}
+            target={device}
+            targetFingerprint={derivedFingerprint}
+            onDone={(summary) => {
+              setApprovingId(null);
+              setApprovalNote(summary);
             }}
-          >
-            Revoke
-          </Button>
-        ) : isCurrent && registration.data?.status !== "revoked" ? (
-          <Button size="sm" variant="secondary" onClick={() => void recoverRevokedLocalKey(device)}>
-            Remove local key
-          </Button>
-        ) : null}
+            onCancel={() => setApprovingId(null)}
+          />
+        )}
       </div>
     );
   };
@@ -400,11 +459,11 @@ function BrowserDevicesSettings() {
         {registration.data?.status === "revoked" && (
           <div className="space-y-2 rounded-md border border-border p-3" role="status">
             <p className="text-sm">
-              This browser&apos;s previous key is fully revoked. To use spawn from here again,
-              create a fresh identity — it starts untrusted and needs approval like any new device.
+              This browser&apos;s previous key is revoked. Start fresh to mint a new identity — it
+              begins untrusted and needs approval like any new device.
             </p>
-            <Button size="sm" onClick={createReplacement}>
-              Create replacement identity
+            <Button size="sm" onClick={() => void startFresh(registration.data!.publicKey)}>
+              Start fresh on this browser
             </Button>
           </div>
         )}
@@ -413,6 +472,50 @@ function BrowserDevicesSettings() {
           <p className="text-sm text-destructive" role="alert">
             {error ??
               `Failed to load browser devices: ${String(devices.error ?? localIdentity.error)}`}
+          </p>
+        )}
+
+        {currentDevice &&
+          trustMap.ready &&
+          trustMap.keyedHosts.length > 0 &&
+          currentTrustedHosts.length === 0 &&
+          registration.data?.status === "ready" && (
+            <div
+              className="space-y-2 rounded-md border border-amber-600/50 p-3"
+              data-testid="untrusted-callout"
+            >
+              <p className="text-sm font-medium">This browser can&apos;t open terminals yet</p>
+              <p className="text-sm text-muted-foreground">
+                No host trusts its key so far. To fix that, on a browser that already works, open
+                Settings → Browser devices, find this device, press <b>Approve</b>, and check it
+                shows this fingerprint:
+              </p>
+              <p className="break-all rounded bg-muted px-2 py-1.5 font-mono text-sm font-semibold">
+                {fingerprintFor(currentDevice) ?? "…"}
+              </p>
+              {bundle.data != null && (
+                <p className="text-xs text-muted-foreground">
+                  Also unlock your saved host trust here with your passkey on the{" "}
+                  <Link className="underline" href="/trust">
+                    trust &amp; recovery
+                  </Link>{" "}
+                  page — approval makes hosts accept this browser; unlocking makes this browser
+                  recognize your hosts. Both are needed.
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                No other working browser? Pair directly with a host instead:{" "}
+                <Link className="underline" href="/device">
+                  connect a host
+                </Link>
+                .
+              </p>
+            </div>
+          )}
+
+        {approvalNote !== null && (
+          <p className="text-sm font-medium" role="status">
+            {approvalNote}
           </p>
         )}
 
@@ -436,6 +539,15 @@ function BrowserDevicesSettings() {
             </div>
           </details>
         )}
+
+        <p className="text-xs text-muted-foreground">
+          To carry your verified hosts to new devices with a passkey, or to manage backup passkeys,
+          see{" "}
+          <Link className="underline" href="/trust">
+            trust sync &amp; recovery
+          </Link>
+          .
+        </p>
       </CardContent>
     </Card>
   );

@@ -1,23 +1,15 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  type BrowserDevice,
-  browserDevices,
-  hosts,
-  type PasskeyCredential,
-  trust,
-} from "@/lib/api";
+import { type PasskeyCredential, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import {
-  createBrowserEndorsementProof,
-  loadBrowserDeviceIdentity,
-} from "@/lib/browser-device-identity";
+import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
 import {
   createTrustPasskey,
@@ -25,7 +17,6 @@ import {
   isPasskeySupported,
   PasskeyPrfError,
 } from "@/lib/passkey-prf";
-import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { probeStoragePersistence } from "@/lib/storage-diagnostics";
 import {
   enrollBackupPasskey,
@@ -300,16 +291,29 @@ function TrustSettings() {
     forget.isPending ||
     addBackup.isPending ||
     revoke.isPending;
+  const hasBundle = bundle.data !== null && bundle.data !== undefined;
+  const pinCount = localPins.data?.length ?? null;
+  const passkeyCount = passkeys.data?.length ?? null;
+
+  const actionRow = (props: { title: string; description: string; button: React.ReactNode }) => (
+    <div className="flex items-start justify-between gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0">
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{props.title}</p>
+        <p className="text-xs text-muted-foreground">{props.description}</p>
+      </div>
+      <div className="shrink-0">{props.button}</div>
+    </div>
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
       <Card>
         <CardHeader>
-          <CardTitle>Device trust</CardTitle>
+          <CardTitle>Trust sync &amp; recovery</CardTitle>
           <CardDescription>
-            Your verified host keys, sealed under a passkey so a new device can inherit them without
-            pairing from a host terminal. The server stores only ciphertext and cannot read or forge
-            it.
+            Carry the hosts this browser has verified to your other devices, protected by a passkey.
+            The server only ever stores ciphertext — it cannot read your host keys or forge new
+            ones.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -319,57 +323,89 @@ function TrustSettings() {
             </p>
           )}
 
-          <div className="text-sm">
-            <p>
-              Hosts verified on this device:{" "}
-              <span className="font-mono font-semibold" data-testid="local-pin-count">
-                {localPins.data?.length ?? "…"}
-              </span>
-            </p>
-            <p>
-              Sealed bundle:{" "}
-              <span className="font-mono font-semibold" data-testid="bundle-state">
-                {bundle.isLoading
-                  ? "…"
-                  : bundle.data === null || bundle.data === undefined
-                    ? "none"
-                    : `revision ${bundle.data.revision}`}
-              </span>
-            </p>
-            <p>
-              Passkeys registered:{" "}
-              <span className="font-mono font-semibold" data-testid="passkey-count">
-                {passkeys.data?.length ?? "…"}
-              </span>
-            </p>
-          </div>
-
-          <div className="rounded border p-3 text-sm" data-testid="storage-report">
-            <p className="font-semibold">Browser storage</p>
-            {storage.isLoading || storage.data === undefined ? (
-              <p className="text-muted-foreground">checking…</p>
+          <p className="text-sm">
+            This browser recognizes{" "}
+            <span className="font-semibold" data-testid="local-pin-count">
+              {pinCount ?? "…"}
+            </span>{" "}
+            host{pinCount === 1 ? "" : "s"}.{" "}
+            {bundle.isLoading ? (
+              <span data-testid="bundle-state">…</span>
+            ) : hasBundle ? (
+              <>
+                Your saved trust (
+                <span data-testid="bundle-state">revision {bundle.data?.revision}</span>) opens with
+                any of{" "}
+                <span className="font-semibold" data-testid="passkey-count">
+                  {passkeyCount ?? "…"}
+                </span>{" "}
+                passkey{passkeyCount === 1 ? "" : "s"}.
+              </>
             ) : (
-              <ul className="mt-1 font-mono text-xs">
-                <li>device identity persisted: {String(storage.data.identityPersisted)}</li>
-                <li>plain value persists: {String(storage.data.probe.plainValuePersists)}</li>
-                <li>Ed25519 key persists: {String(storage.data.probe.ed25519KeyPersists)}</li>
-                <li>ECDSA key persists: {String(storage.data.probe.ecdsaKeyPersists)}</li>
-                {storage.data.probe.failure !== null && (
-                  <li className="text-destructive">failure: {storage.data.probe.failure}</li>
-                )}
-              </ul>
+              <>
+                <span data-testid="bundle-state">No saved trust yet</span> — set up a passkey below
+                so new devices can inherit your hosts (
+                <span data-testid="passkey-count">{passkeyCount ?? 0}</span> passkey
+                {passkeyCount === 1 ? "" : "s"} registered).
+              </>
             )}
-            {storage.data !== undefined && !storage.data.identityPersisted && (
-              <p className="mt-2 text-destructive">
-                This browser did not keep its device identity. It will mint a new one on every load
-                and can never be pinned, so signed connections cannot work here.
-              </p>
-            )}
+          </p>
+
+          <div>
+            {!hasBundle &&
+              actionRow({
+                title: "Set up a passkey",
+                description:
+                  "Creates a passkey and saves this browser's verified hosts under it, so your next device can inherit them instead of pairing from a terminal.",
+                button: (
+                  <Button
+                    type="button"
+                    disabled={!supported || busy || accountId === null}
+                    onClick={() => setUp.mutate()}
+                    data-testid="setup-passkey"
+                  >
+                    {setUp.isPending ? "Setting up…" : "Set up"}
+                  </Button>
+                ),
+              })}
+            {actionRow({
+              title: "Unlock saved trust here",
+              description:
+                "Use your passkey to make this browser recognize the hosts you verified elsewhere. New devices also need approval from a trusted browser (Settings → Browser devices).",
+              button: (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={!supported || busy || accountId === null}
+                  onClick={() => unlock.mutate()}
+                  data-testid="unlock-trust"
+                >
+                  {unlock.isPending ? "Unlocking…" : "Unlock"}
+                </Button>
+              ),
+            })}
+            {hasBundle &&
+              actionRow({
+                title: "Add a backup passkey",
+                description:
+                  "Enroll a second passkey that can also open your saved trust, so losing one authenticator never locks you out.",
+                button: (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={!supported || busy || accountId === null}
+                    onClick={() => addBackup.mutate()}
+                    data-testid="add-backup-passkey"
+                  >
+                    {addBackup.isPending ? "Enrolling…" : "Add backup"}
+                  </Button>
+                ),
+              })}
           </div>
 
           {(passkeys.data?.length ?? 0) > 0 && (
             <div className="rounded border p-3 text-sm" data-testid="passkey-list">
-              <p className="font-semibold">Enrolled passkeys</p>
+              <p className="font-semibold">Your passkeys</p>
               <ul className="mt-1 flex flex-col gap-2">
                 {passkeys.data?.map((passkey) => (
                   <li key={passkey.id} className="flex items-center justify-between gap-2">
@@ -390,55 +426,17 @@ function TrustSettings() {
               {(passkeys.data?.length ?? 0) === 1 && (
                 <p className="mt-2 text-xs text-muted-foreground">
                   Add a backup passkey before revoking — revoking your only passkey would lock you
-                  out of your trust bundle.
+                  out of your saved trust.
                 </p>
               )}
               {(passkeys.data?.length ?? 0) > 2 && (
                 <p className="mt-2 text-xs text-muted-foreground">
-                  Revoking is available only with exactly two passkeys enrolled. With more, this
-                  device cannot reseal for every survivor — revoke from each surviving device.
+                  Revoking needs exactly two passkeys enrolled. With more, this device cannot reseal
+                  for every survivor — revoke from each surviving device instead.
                 </p>
               )}
             </div>
           )}
-
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              disabled={!supported || busy || accountId === null}
-              onClick={() => setUp.mutate()}
-              data-testid="setup-passkey"
-            >
-              {setUp.isPending ? "Setting up…" : "Set up passkey and seal this device"}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={!supported || busy || accountId === null}
-              onClick={() => unlock.mutate()}
-              data-testid="unlock-trust"
-            >
-              {unlock.isPending ? "Unlocking…" : "Unlock trust on this device"}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={!supported || busy || accountId === null || bundle.data == null}
-              onClick={() => addBackup.mutate()}
-              data-testid="add-backup-passkey"
-            >
-              {addBackup.isPending ? "Enrolling…" : "Add a backup passkey"}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={busy || accountId === null || (localPins.data?.length ?? 0) === 0}
-              onClick={() => forget.mutate()}
-              data-testid="forget-trust"
-            >
-              {forget.isPending ? "Forgetting…" : "Forget trust on this device"}
-            </Button>
-          </div>
 
           {status !== null && (
             <p className="text-sm font-medium" data-testid="trust-status">
@@ -451,269 +449,66 @@ function TrustSettings() {
             </p>
           )}
 
-          <p className="text-xs text-muted-foreground">
-            Sealing publishes only hosts you have actively verified; revoked hosts are never carried
-            across. Importing pins those same keys here, which is safe because a bundle only opens
-            with a secret held by your authenticator.
-          </p>
+          <details>
+            <summary className="cursor-pointer text-sm text-muted-foreground">
+              Recovery &amp; diagnostics
+            </summary>
+            <div className="mt-2 flex flex-col gap-3">
+              {actionRow({
+                title: "Forget trust on this browser",
+                description:
+                  "Removes every host this browser recognizes. Use when its trust state is wrong and connections refuse; it connects unprotected afterwards until trusted again.",
+                button: (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={busy || accountId === null || (localPins.data?.length ?? 0) === 0}
+                    onClick={() => forget.mutate()}
+                    data-testid="forget-trust"
+                  >
+                    {forget.isPending ? "Forgetting…" : "Forget"}
+                  </Button>
+                ),
+              })}
+              <div className="rounded border p-3 text-sm" data-testid="storage-report">
+                <p className="font-semibold">Browser storage</p>
+                {storage.isLoading || storage.data === undefined ? (
+                  <p className="text-muted-foreground">checking…</p>
+                ) : (
+                  <ul className="mt-1 font-mono text-xs">
+                    <li>device identity persisted: {String(storage.data.identityPersisted)}</li>
+                    <li>plain value persists: {String(storage.data.probe.plainValuePersists)}</li>
+                    <li>Ed25519 key persists: {String(storage.data.probe.ed25519KeyPersists)}</li>
+                    <li>ECDSA key persists: {String(storage.data.probe.ecdsaKeyPersists)}</li>
+                    {storage.data.probe.failure !== null && (
+                      <li className="text-destructive">failure: {storage.data.probe.failure}</li>
+                    )}
+                  </ul>
+                )}
+                {storage.data !== undefined && !storage.data.identityPersisted && (
+                  <p className="mt-2 text-destructive">
+                    This browser did not keep its device identity. It will mint a new one on every
+                    load and can never be trusted, so signed connections cannot work here.
+                  </p>
+                )}
+              </div>
+            </div>
+          </details>
         </CardContent>
       </Card>
-      <EndorseDevices accountId={accountId} />
+      <Card>
+        <CardHeader>
+          <CardTitle>Approving new devices</CardTitle>
+          <CardDescription>
+            Device approval lives with your device list now: open{" "}
+            <Link className="underline" href="/settings">
+              Settings → Browser devices
+            </Link>{" "}
+            on a browser that already works, press Approve next to the waiting device, and compare
+            fingerprints.
+          </CardDescription>
+        </CardHeader>
+      </Card>
     </div>
-  );
-}
-
-/**
- * Admit another browser to a host on this device's authority.
- *
- * The fingerprint comparison is the entire security value. Signing proves this
- * device vouched for a key; it says nothing about where that key came from, so
- * a server could offer its own and the signature would still be valid. Only the
- * operator seeing the same fingerprint on both screens rules that out, which is
- * why the confirmation is a deliberate step rather than a one-click action.
- */
-function EndorseDevices({ accountId }: { accountId: string | null }) {
-  const queryClient = useQueryClient();
-  const [confirmed, setConfirmed] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-
-  const hostList = useQuery({
-    queryKey: ["trust", "hosts"],
-    queryFn: () => hosts.list(),
-    enabled: accountId !== null,
-  });
-  // Only hosts with an identity key can be endorsed against, and there may be
-  // several -- including stale records for a host that was re-paired. Picking
-  // one arbitrarily silently signed against the wrong key and posted nothing.
-  const keyedHosts = (hostList.data ?? []).filter(
-    (candidate) => (candidate.host_public_key ?? null) !== null,
-  );
-
-  const devices = useQuery({
-    queryKey: ["trust", "browser-devices"],
-    queryFn: () => browserDevices.list(),
-    enabled: accountId !== null,
-  });
-  const thisDevice = useQuery({
-    queryKey: ["trust", "this-device", accountId],
-    queryFn: async () => {
-      const identity = await loadBrowserDeviceIdentity(accountId as string);
-      if (identity === null) return null;
-      return {
-        publicKeyWire: identity.publicKeyWire,
-        // Derived locally rather than read from the server: this is the value
-        // the operator compares, so it must not come from the party being
-        // guarded against.
-        fingerprint: await ed25519PublicKeyFingerprint(identity.publicKeyWire),
-      };
-    },
-    enabled: accountId !== null,
-  });
-
-  /** Every host this browser is already trusted by; those are what it can vouch for. */
-  const myHosts = useQuery({
-    queryKey: [
-      "trust",
-      "my-hosts",
-      keyedHosts.map((h) => h.id).join(","),
-      thisDevice.data?.publicKeyWire,
-    ],
-    queryFn: async () => {
-      const mine = (await browserDevices.list()).find(
-        (device) => device.public_key === thisDevice.data?.publicKeyWire,
-      );
-      if (mine === undefined) return [];
-      const pinned = await Promise.all(
-        keyedHosts.map(async (candidate) => ({
-          host: candidate,
-          trusted: (await trust.hostPins(candidate.id)).includes(mine.id),
-        })),
-      );
-      return pinned.filter((entry) => entry.trusted).map((entry) => entry.host);
-    },
-    enabled: keyedHosts.length > 0 && thisDevice.data != null,
-  });
-
-  const endorse = useMutation({
-    mutationFn: async (target: BrowserDevice) => {
-      const id = accountId as string;
-      const targets = myHosts.data ?? [];
-      if (targets.length === 0) {
-        throw new Error(
-          "This device is not trusted by any host yet, so it cannot vouch for another. Endorse from a device that is already connected.",
-        );
-      }
-      const identity = await loadBrowserDeviceIdentity(id);
-      if (identity === null) {
-        throw new Error("This device has no identity to endorse with.");
-      }
-      const mine = (await browserDevices.list()).find(
-        (device) => device.public_key === identity.publicKeyWire,
-      );
-      if (mine === undefined) {
-        throw new Error("This device is not registered with the server.");
-      }
-      // The fingerprint the operator compared out of band is only meaningful if
-      // it is the fingerprint of the key we are about to sign. The server hands
-      // us `public_key` and `fingerprint` as independent fields, so re-derive the
-      // fingerprint from the key itself and refuse to endorse if the server's
-      // claimed value disagrees. Without this the OOB comparison is cosmetic: a
-      // hostile server can show the victim's fingerprint beside its own key and
-      // harvest a signature over the attacker key.
-      const endorsedFingerprint = await ed25519PublicKeyFingerprint(target.public_key);
-      if (endorsedFingerprint !== target.fingerprint) {
-        throw new Error(
-          "This device's fingerprint does not match its key. Refusing to endorse — the server may be substituting a key.",
-        );
-      }
-      // Endorse for every host this device is trusted by, rather than making
-      // the operator reason about which host a device "belongs" to.
-      const results = [];
-      for (const target_host of targets) {
-        const signature = await createBrowserEndorsementProof(
-          identity,
-          id,
-          target_host.host_public_key as string,
-          target.public_key,
-          target.id,
-        );
-        results.push(
-          await trust.endorse({
-            host_id: target_host.id,
-            endorser_device_id: mine.id,
-            endorsed_device_id: target.id,
-            signature,
-          }),
-        );
-      }
-      // Report the locally derived fingerprint, not the server's echo, so the
-      // confirmation names exactly the key that was signed.
-      return { count: results.length, fingerprint: endorsedFingerprint };
-    },
-    onMutate: () => {
-      setNote(null);
-      setFailure(null);
-    },
-    onSuccess: (result) => {
-      setNote(
-        `Endorsed ${result.fingerprint} for ${result.count} host${result.count === 1 ? "" : "s"}. It is adopted on the daemon's next connect.`,
-      );
-      setConfirmed(null);
-      queryClient.invalidateQueries({ queryKey: ["trust"] });
-    },
-    onError: (error) => setFailure(error instanceof Error ? error.message : String(error)),
-  });
-
-  const mineWire = thisDevice.data?.publicKeyWire ?? null;
-  // Candidates are live devices other than this one. A device already trusted
-  // by every host here would be endorsed redundantly, which the server treats
-  // as idempotent, so it is not worth hiding at the cost of another round trip.
-  const candidates = (devices.data ?? []).filter(
-    (device) => device.revoked_at === null && device.public_key !== mineWire,
-  );
-  // Derive each candidate's fingerprint locally from its key, so the operator
-  // compares a value the server cannot choose. A row whose server-claimed
-  // fingerprint disagrees with the derived one is flagged and cannot be endorsed.
-  const candidateFingerprints = useQuery({
-    queryKey: ["trust", "candidate-fingerprints", candidates.map((d) => d.public_key).join(",")],
-    queryFn: async () => {
-      const entries = await Promise.all(
-        candidates.map(
-          async (device) =>
-            [device.id, await ed25519PublicKeyFingerprint(device.public_key)] as const,
-        ),
-      );
-      return new Map(entries);
-    },
-    enabled: candidates.length > 0,
-  });
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Trust another device</CardTitle>
-        <CardDescription>
-          Admit a browser to the {myHosts.data?.length ?? 0} host
-          {(myHosts.data?.length ?? 0) === 1 ? "" : "s"} this device is trusted by. The server can
-          relay an endorsement but cannot create one.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <div className="rounded border p-3 text-sm">
-          <p className="font-semibold">This device&apos;s fingerprint</p>
-          <p className="break-all font-mono" data-testid="this-device-fingerprint">
-            {thisDevice.data === undefined
-              ? "…"
-              : (thisDevice.data?.fingerprint ?? "no identity on this device")}
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Compare this against the fingerprint shown for this device on your other screen. Names
-            are conveniences; only the fingerprint is trustworthy.
-          </p>
-        </div>
-
-        {candidates.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No other devices are waiting. Sign in on the new device first, then reload here. Revoked
-            devices are never listed.
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-3">
-            {candidates.map((device) => {
-              const derivedFingerprint = candidateFingerprints.data?.get(device.id) ?? null;
-              const fingerprintMismatch =
-                derivedFingerprint !== null && derivedFingerprint !== device.fingerprint;
-              return (
-                <li key={device.id} className="rounded border p-3 text-sm">
-                  <p className="font-semibold">{device.label ?? "Unnamed device"}</p>
-                  <p className="break-all font-mono text-xs">{derivedFingerprint ?? "…"}</p>
-                  <p className="text-xs text-muted-foreground">
-                    added {new Date(device.created_at).toLocaleString()}
-                  </p>
-                  {fingerprintMismatch ? (
-                    <p className="mt-1 text-xs font-medium text-destructive">
-                      The server&apos;s claimed fingerprint for this device does not match its key.
-                      Do not endorse it.
-                    </p>
-                  ) : confirmed === device.id ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <span className="text-xs">
-                        Open this page on that device and check it shows this exact fingerprint. The
-                        name above is only a label — the server can set it to anything, so it is the
-                        fingerprint that must match.
-                      </span>
-                      <Button
-                        type="button"
-                        disabled={endorse.isPending || derivedFingerprint === null}
-                        onClick={() => endorse.mutate(device)}
-                      >
-                        It matches — trust it
-                      </Button>
-                      <Button type="button" variant="secondary" onClick={() => setConfirmed(null)}>
-                        Cancel
-                      </Button>
-                    </div>
-                  ) : (
-                    <Button
-                      type="button"
-                      className="mt-2"
-                      variant="secondary"
-                      disabled={derivedFingerprint === null}
-                      onClick={() => setConfirmed(device.id)}
-                    >
-                      Trust this device…
-                    </Button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-
-        {note !== null && <p className="text-sm font-medium">{note}</p>}
-        {failure !== null && <p className="text-sm font-medium text-destructive">{failure}</p>}
-      </CardContent>
-    </Card>
   );
 }

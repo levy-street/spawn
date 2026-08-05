@@ -142,13 +142,20 @@ export async function mockAuthenticatedApi(
     fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
     fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+    /** Pre-registered devices beyond the one this browser registers itself. */
+    extraBrowserDevices?: Array<Record<string, unknown>>;
+    /** hostId → browser device ids the host trusts; endorsements append here. */
+    hostPins?: Record<string, string[]>;
   } = {},
 ) {
   const agents = options.agents ?? [];
   const hostList = options.hosts ?? [host];
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
-  const browserDeviceList: Array<Record<string, unknown>> = [];
+  const browserDeviceList: Array<Record<string, unknown>> = [
+    ...(options.extraBrowserDevices ?? []),
+  ];
+  const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -540,10 +547,11 @@ export async function mockAuthenticatedApi(
           .subarray(0, 12)
           .toString("base64url");
         device = {
-          id:
-            browserDeviceList.length === 0
-              ? BROWSER_DEVICE_ID
-              : `00000000-0000-4000-8000-${String(browserDeviceList.length + 9).padStart(12, "0")}`,
+          // The browser's own registration always gets the stable id, even
+          // when extra fixture devices are pre-seeded.
+          id: browserDeviceList.some((item) => item.id === BROWSER_DEVICE_ID)
+            ? `00000000-0000-4000-8000-${String(browserDeviceList.length + 9).padStart(12, "0")}`
+            : BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
           fingerprint: `SHA256:${digest}`,
@@ -578,6 +586,51 @@ export async function mockAuthenticatedApi(
       }
       device.revoked_at ??= CREATED_AT;
       await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      return;
+    }
+    if (path === "/api/trust/bundle" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", json: null });
+      return;
+    }
+    if (path === "/api/trust/passkeys" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", json: [] });
+      return;
+    }
+    const hostPinsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pins$/);
+    if (hostPinsMatch && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: hostPinMap[hostPinsMatch[1]] ?? [],
+      });
+      return;
+    }
+    if (path === "/api/trust/endorsements" && method === "POST") {
+      const body = (await request.postDataJSON()) as {
+        host_id: string;
+        endorser_device_id: string;
+        endorsed_device_id: string;
+        signature: string;
+      };
+      const endorsed = browserDeviceList.find((item) => item.id === body.endorsed_device_id);
+      if (!endorsed || typeof body.signature !== "string" || body.signature.length === 0) {
+        await route.fulfill({ status: 422, json: { detail: "invalid endorsement" } });
+        return;
+      }
+      hostPinMap[body.host_id] = [
+        ...new Set([...(hostPinMap[body.host_id] ?? []), body.endorsed_device_id]),
+      ];
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          host_id: body.host_id,
+          endorsed_device_id: body.endorsed_device_id,
+          endorsed_key_fingerprint: endorsed.fingerprint,
+          endorser_device_id: body.endorser_device_id,
+          created_at: CREATED_AT,
+        },
+      });
       return;
     }
     const browserRenameMatch = path.match(/^\/api\/browser-devices\/([^/]+)$/);

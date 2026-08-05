@@ -41,7 +41,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   page.once("dialog", (dialog) => void dialog.accept());
   await page.getByRole("button", { name: "Revoke" }).click();
   await expect(page.getByText("revoked", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Create replacement identity" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
 
   const afterRevoke = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -67,7 +67,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   expect(afterRevoke.marker).toBe(`revoked:${before.publicKey}`);
 
   await page.reload();
-  await expect(page.getByRole("button", { name: "Create replacement identity" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
   const stillAbsent = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("spawn-browser-device-identity");
@@ -87,7 +87,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   }, USER_ID);
   expect(stillAbsent).toBeUndefined();
 
-  await page.getByRole("button", { name: "Create replacement identity" }).click();
+  await page.getByRole("button", { name: "Start fresh on this browser" }).click();
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByText("revoked", { exact: true })).toHaveCount(1);
 });
