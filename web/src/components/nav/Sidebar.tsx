@@ -24,6 +24,7 @@ import { type ReactNode, useMemo, useRef, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
 import { ScreenIcon } from "@/components/screens/ScreenIcon";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
 import {
   DropdownMenu,
@@ -227,11 +228,11 @@ export function Sidebar({
         >
           <DropdownMenuLabel className="truncate">{user?.email ?? "—"}</DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem href="/settings">
+          <DropdownMenuItem onSelect={() => openSettings("account")}>
             <Settings className="size-4" aria-hidden />
             Settings
           </DropdownMenuItem>
-          <DropdownMenuItem href="/trust">
+          <DropdownMenuItem onSelect={() => openSettings("trust")}>
             <ShieldCheck className="size-4" aria-hidden />
             Device trust
           </DropdownMenuItem>

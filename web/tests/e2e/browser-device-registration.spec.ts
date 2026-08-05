@@ -67,6 +67,9 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   expect(afterRevoke.marker).toBe(`revoked:${before.publicKey}`);
 
   await page.reload();
+  // A reload closes the settings modal (it is an overlay, not a page); the
+  // revoked state must survive it and greet the user on reopen.
+  await page.goto("/settings");
   await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
   const stillAbsent = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -107,9 +110,12 @@ test("registration failure stays loud while settings and logout remain accessibl
 
   await expect(page.getByRole("alert").first()).toContainText("registration failed");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
-  await expect(page.getByText("Browser devices", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Browser devices" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry registration" })).toBeVisible();
+  // Logout stays reachable through the Account tab even when registration
+  // is broken.
+  await page.getByRole("button", { name: "Account" }).click();
+  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
 });
 
 test("rejects a substituted registration response", async ({ page }) => {

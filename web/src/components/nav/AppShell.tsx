@@ -13,6 +13,8 @@ import {
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
+import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -146,10 +148,13 @@ export function AppShell({
               <Link href="/" className="text-base font-semibold tracking-tight">
                 spawn
               </Link>
-              <Button asChild variant="ghost" size="icon" aria-label="Settings">
-                <Link href="/settings">
-                  <Settings className="size-4.5" />
-                </Link>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Settings"
+                onClick={() => openSettings("account")}
+              >
+                <Settings className="size-4.5" />
               </Button>
             </div>
           </header>
@@ -166,6 +171,7 @@ export function AppShell({
         </div>
       </div>
       {!hideMobileNav && <BottomTabs />}
+      <SettingsDialog />
     </div>
   );
 }

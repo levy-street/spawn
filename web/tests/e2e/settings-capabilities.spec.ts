@@ -16,7 +16,7 @@ test("settings can create skills", async ({ page }) => {
     },
   });
 
-  await page.goto("/settings");
+  await page.goto("/settings?tab=skills");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await expect(page.getByText("existing review")).toBeVisible();
 
@@ -39,7 +39,7 @@ test("settings can create skills", async ({ page }) => {
 test("settings has no MCP surface", async ({ page }) => {
   await mockAuthenticatedApi(page);
 
-  await page.goto("/settings");
+  await page.goto("/settings?tab=skills");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await expect(page.getByText("MCP", { exact: false })).toHaveCount(0);
 });
@@ -98,7 +98,7 @@ test("settings can edit and delete skills", async ({ page }) => {
     },
   });
 
-  await page.goto("/settings");
+  await page.goto("/settings?tab=skills");
   await page.getByRole("button", { name: "Edit skill existing review" }).click();
   await page.locator("#skill-description").fill("Updated review guidance");
   await page.locator("#skill-content").fill("Review the diff and identify regressions.");
