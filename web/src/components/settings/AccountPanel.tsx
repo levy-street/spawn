@@ -5,7 +5,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { account, ApiError } from "@/lib/api";
+import { ApiError, account } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 
 export function AccountPanel() {
@@ -26,8 +26,7 @@ export function AccountPanel() {
       // clears local auth state and lands on the login page.
       void logout();
     },
-    onError: (cause) =>
-      setError(cause instanceof ApiError ? cause.message : String(cause)),
+    onError: (cause) => setError(cause instanceof ApiError ? cause.message : String(cause)),
   });
 
   const emailMatches =

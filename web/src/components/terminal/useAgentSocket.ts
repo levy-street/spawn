@@ -104,6 +104,9 @@ export interface DirectAgentUploadOptions {
 
 export type SocketState = "idle" | "connecting" | "open" | "closed" | "error";
 
+/** How the live connection's signaling was authenticated. */
+export type SignalingTrustLevel = "verified" | "first_contact" | "raw";
+
 /** How the live terminal bytes are travelling right now. */
 export interface ConnInfo {
   /** ICE path classification of the selected candidate pair. */
@@ -197,6 +200,10 @@ export function useAgentSocket({
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. A refusal is terminal (no auto-retry).
   const [signedRtcRefusal, setSignedRtcRefusal] = useState<SignedRtcRefusalReason | null>(null);
+  // How the current connection's signaling was authenticated: "verified"
+  // (signed, host pin matched), "first_contact" (signed TOFU on the claimed
+  // key), or "raw" (unsigned legacy path). Null until a decision is made.
+  const [signalingTrust, setSignalingTrust] = useState<SignalingTrustLevel | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
   const agentGenerationRef = useRef(0);
@@ -292,6 +299,7 @@ export function useAgentSocket({
     activeAgentIdRef.current = enabled && agentId ? agentId : null;
     setV2(false);
     setDcOpen(false);
+    setSignalingTrust(null);
     if (!enabled || !agentId) return;
     let cancelled = false;
     let attempt = 0;
@@ -1189,6 +1197,13 @@ export function useAgentSocket({
           return;
         }
         setSignedRtcRefusal(null);
+        setSignalingTrust(
+          signedRtcDecision.mode === "signed"
+            ? signedRtcDecision.hostVerified
+              ? "verified"
+              : "first_contact"
+            : "raw",
+        );
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -1658,5 +1673,15 @@ export function useAgentSocket({
     return uploadRef.current(blob, options);
   };
 
-  return { state, v2, dcOpen, connInfo, signedRtcRefusal, sendBinary, sendJson, uploadFile };
+  return {
+    state,
+    v2,
+    dcOpen,
+    connInfo,
+    signedRtcRefusal,
+    signalingTrust,
+    sendBinary,
+    sendJson,
+    uploadFile,
+  };
 }

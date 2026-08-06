@@ -1482,9 +1482,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       v2: socket.v2,
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
+      signalingTrust: socket.signalingTrust,
       ...socket.connInfo,
     });
-  }, [socket.state, socket.v2, socket.dcOpen, socket.signedRtcRefusal, socket.connInfo]);
+  }, [
+    socket.state,
+    socket.v2,
+    socket.dcOpen,
+    socket.signedRtcRefusal,
+    socket.signalingTrust,
+    socket.connInfo,
+  ]);
 
   // Only surface "waiting for the direct channel" after a grace period —
   // the DC normally opens within a second or two of attach.

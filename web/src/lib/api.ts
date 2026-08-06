@@ -474,6 +474,25 @@ export const trust = {
   /** Browser device IDs a host already trusts. */
   hostPins: (hostId: string) =>
     api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  /**
+   * Endorsements naming this device, so it can verify them locally and learn
+   * its hosts' true keys. Every field is server-claimed; the caller verifies.
+   */
+  endorsementsFor: (endorsedDeviceId: string) =>
+    api(`/api/trust/endorsements?endorsed_device_id=${encodeURIComponent(endorsedDeviceId)}`, {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          host_id: z.string(),
+          host_name: z.string(),
+          host_public_key: z.string(),
+          endorser_device_id: z.string(),
+          endorser_public_key: z.string(),
+          endorser_label: z.string().nullable().optional(),
+          signature: z.string(),
+        }),
+      ),
+    }),
   endorse: (body: {
     host_id: string;
     endorser_device_id: string;

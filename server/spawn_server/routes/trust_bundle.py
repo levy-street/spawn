@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from .. import auth, schemas
 from ..browser_endorsement import verify_browser_endorsement_proof
@@ -209,6 +210,60 @@ async def delete_passkey(
 
 
 MAX_BROWSER_PINS_PER_HOST = 32
+
+
+@router.get("/endorsements", response_model=list[schemas.BrowserEndorsementRecord])
+async def list_endorsements_for_device(
+    endorsed_device_id: str,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.BrowserEndorsementRecord]:
+    """Endorsements naming a device, so IT can learn its hosts' true keys.
+
+    This is the delivery leg of the bidirectional approval ceremony: after a
+    trusted browser endorses a new device (verifying ITS fingerprint), the new
+    device fetches these records, has the operator confirm the ENDORSER's
+    fingerprint in the other direction, and verifies each endorsement
+    signature locally — the transcript covers the host key, so a server that
+    substitutes any field breaks a signature it cannot re-mint. Nothing here
+    is trusted as served; endorsements from revoked endorsers are omitted
+    only to avoid offering introductions the daemon already rejects.
+    """
+
+    endorser = aliased(BrowserDevice)
+    rows = await session.execute(
+        select(
+            HostBrowserPin.host_id,
+            Host.name.label("host_name"),
+            Host.host_public_key,
+            HostBrowserPin.endorser_device_id,
+            endorser.public_key.label("endorser_public_key"),
+            endorser.label.label("endorser_label"),
+            HostBrowserPin.endorsement_signature,
+        )
+        .join(Host, Host.id == HostBrowserPin.host_id)
+        .join(endorser, endorser.id == HostBrowserPin.endorser_device_id)
+        .where(
+            HostBrowserPin.browser_device_id == endorsed_device_id,
+            HostBrowserPin.endorsement_signature.is_not(None),
+            Host.owner_user_id == user.id,
+            Host.host_public_key.is_not(None),
+            endorser.revoked_at.is_(None),
+        )
+        .order_by(HostBrowserPin.host_id)
+    )
+    return [
+        schemas.BrowserEndorsementRecord(
+            host_id=row.host_id,
+            host_name=row.host_name,
+            host_public_key=row.host_public_key,
+            endorser_device_id=row.endorser_device_id,
+            endorser_public_key=row.endorser_public_key,
+            endorser_label=row.endorser_label,
+            signature=row.endorsement_signature,
+        )
+        for row in rows
+    ]
 
 
 @router.post("/endorsements", response_model=schemas.BrowserEndorsementOut)

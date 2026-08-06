@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { closeSettings, openSettings } from "@/components/settings/settings-dialog-store";
 import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
+import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type BrowserDevice, browserDevices, trust } from "@/lib/api";
@@ -435,6 +436,13 @@ export function DevicesPanel() {
           {error ??
             `Failed to load browser devices: ${String(devices.error ?? localIdentity.error)}`}
         </p>
+      )}
+
+      {/* Endorsed already? Then the endorsements carry host keys this browser
+          can verify for itself — offered before the untrusted callout, since
+          accepting them is strictly better than any first-contact path. */}
+      {user && currentDevice && (
+        <IntroductionPanel accountId={user.id} deviceId={currentDevice.id} />
       )}
 
       {currentDevice &&

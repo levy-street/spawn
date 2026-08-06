@@ -809,6 +809,13 @@ mod tests {
             .expect("worker bin path")
     }
 
+    /// Wait for `needle` on the direct sink.
+    ///
+    /// KNOWN FLAKE: in a full-suite run this wait is bimodal — the first bytes
+    /// either arrive in milliseconds or never (the accumulator is empty at the
+    /// deadline), so the failure is a race with another test, not slowness.
+    /// Raising the budget to 60s did not convert a single failure into a pass.
+    /// Reproduces without any signed-signaling change, and never in isolation.
     async fn collect_direct_until(
         rx: &mut mpsc::Receiver<pty::DirectPayload>,
         needle: &[u8],
@@ -816,20 +823,33 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
-                tokio::time::Instant::now() < deadline,
+                !remaining.is_zero(),
                 "timed out waiting for {:?}; got {:?}",
                 String::from_utf8_lossy(needle),
                 String::from_utf8_lossy(&acc)
             );
-            match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+            match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(chunk)) => {
                     acc.extend_from_slice(&chunk);
                     if acc.windows(needle.len()).any(|w| w == needle) {
                         return acc;
                     }
                 }
-                _ => panic!("direct sink closed while waiting"),
+                // Distinguish the two failures: a closed sink is a real defect,
+                // a timeout is the deadline above. Reporting both as "closed"
+                // sends the next reader hunting the wrong bug.
+                Ok(None) => panic!(
+                    "direct sink closed while waiting for {:?}; got {:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&acc)
+                ),
+                Err(_) => panic!(
+                    "timed out waiting for {:?}; got {:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&acc)
+                ),
             }
         }
     }

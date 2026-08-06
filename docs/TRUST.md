@@ -293,7 +293,15 @@ exists.
 
 ### Consequence for enforcement
 
-`SPAWND_REQUIRE_SIGNED_RTC` must stay **off** until this ADR is implemented.
+**RESOLVED (2026-08-06): enforcement is now the default.** Device bootstrapping
+shipped — endorsement admits a device without a shell on the host, and
+bidirectional approval additionally delivers the host's true key to the new
+device, so "cryptographically protected" and "able to connect" no longer
+conflict. `SPAWND_REQUIRE_SIGNED_RTC=0` is the explicit opt-out for recovery
+scenarios. The original reasoning is kept below for context.
+
+Historically, `SPAWND_REQUIRE_SIGNED_RTC` had to stay **off** until this ADR was
+implemented.
 Enforcement removes the unpinned fallback, at which point "cryptographically
 protected" and "able to connect at all" collapse into the same condition — and
 with only the terminal ceremony available, every new device would need a shell
@@ -634,8 +642,8 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   scope, protocol version, sender role, and intended peer key tuple; TOFU
   pinning; refuse unpinned keys.
 - Enforcement is a separate switch from verification, and the claim depends on
-  it. The daemon still accepts unsigned offers unless
-  `SPAWND_REQUIRE_SIGNED_RTC=1`, so until that is on, the browser-side gate
+  it. The daemon refuses unsigned offers by default since 2026-08-06; with the
+  explicit opt-out `SPAWND_REQUIRE_SIGNED_RTC=0` the browser-side gate
   protects the operator's browser from being downgraded but does not stop a
   server from omitting the envelope and opening its own unsigned session
   straight to the daemon. Enabling it locks out any origin that is not a secure
@@ -665,3 +673,38 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
 - E2E-encrypted WS relay as a last-resort rung for networks where even
   TURN/TCP fails (ciphertext-only through the server, DERP-style) — only
   if real-world failure rates justify it.
+
+## Bidirectional device approval (2026-08-06)
+
+Endorsement admits a new browser to a host: a trusted browser signs a
+transcript covering (account, host key, endorser key, endorsed key, endorsed
+device id), and the daemon verifies that signature against browser keys it
+already pins. That direction was always sound, but it was one-directional —
+the *daemon* learned to trust the new device, while the new device still had
+to take the host's key from the server on first contact (signed TOFU).
+
+The fix needed no new cryptography, only delivery: **the endorsement
+transcript already covers the host public key**, so a device holding a
+verified endorsement holds a host-key introduction signed by a device the
+operator trusts.
+
+- `GET /api/trust/endorsements?endorsed_device_id=…` returns the endorsements
+  naming a device, with the host key, the endorser key, and the signature.
+  Every field is server-claimed and untrusted as served.
+- The endorsed browser re-encodes the transcript from those claims plus its
+  **own** key and device id, and verifies the signature locally
+  (`web/src/lib/endorsement-introduction.ts`). Substituting the host key, the
+  endorser key, the account, or the endorsed device changes the transcript,
+  and the server cannot re-sign it — it holds no endorser private key.
+- The operator then confirms the **endorser's** fingerprint on the new
+  device's screen — the same comparison the endorsing browser made in the
+  other direction, which is what makes the ceremony bidirectional. This closes
+  the residual gap where a hostile server offers an endorsement from a key the
+  operator never approved.
+- Accepted introductions become ordinary local host pins, so the connection is
+  `verified` rather than `first contact`, and later key substitution is
+  refused exactly as for a hand-paired host.
+
+The connection chip now distinguishes the three states — verified (pin
+matched), first contact (signed TOFU), unverified (raw) — so this difference
+is visible rather than implied.

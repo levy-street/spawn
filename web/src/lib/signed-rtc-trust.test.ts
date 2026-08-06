@@ -76,6 +76,7 @@ describe("resolveSignedRtcTrust gate", () => {
     const decision = await resolve();
     expect(decision.mode).toBe("signed");
     if (decision.mode !== "signed") throw new Error("unreachable");
+    expect(decision.hostVerified).toBe(true);
     expect(decision.capability.hostPublicKeyWire).toBe(HOST_KEY);
     expect(typeof decision.capability.signOffer).toBe("function");
   });
@@ -88,6 +89,9 @@ describe("resolveSignedRtcTrust gate", () => {
     const decision = await resolve();
     expect(decision.mode).toBe("signed");
     if (decision.mode !== "signed") throw new Error("unreachable");
+    // First contact: signed, but the host is NOT verified — the UI must be
+    // able to tell this apart from a pin-anchored session.
+    expect(decision.hostVerified).toBe(false);
     expect(decision.capability.hostPublicKeyWire).toBe(HOST_KEY);
     expect(typeof decision.capability.signOffer).toBe("function");
   });

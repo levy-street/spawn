@@ -382,3 +382,111 @@ def test_endorsement_transcript_matches_the_daemon_and_browser_bytes():
     )
     digest = base64.urlsafe_b64encode(hashlib.sha256(transcript).digest()).rstrip(b"=").decode()
     assert digest == "zWI0kvAu5asJ4YKWiXSmlbSZM2u8_z7DOiVQ6vE220Y"
+
+
+async def test_endorsed_device_can_fetch_its_introductions(client):
+    """The delivery leg: the endorsed device gets what it needs to verify.
+
+    The record must carry the host key and endorser key, since the endorsed
+    browser re-encodes the transcript from them and checks the signature
+    locally. Endorsements naming other devices must never appear.
+    """
+
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(
+        client, "introductions@example.com"
+    )
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    signature = _endorsement_signature(
+        user_id=user_id,
+        host_public_key=host_pub,
+        endorser_private=endorser_key,
+        endorsed_public_key=endorsed_pub,
+        endorsed_device_id=endorsed_id,
+    )
+    created = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert created.status_code == 200, created.text
+
+    listed = await client.get(
+        f"/api/trust/endorsements?endorsed_device_id={endorsed_id}", headers=auth
+    )
+    assert listed.status_code == 200, listed.text
+    records = listed.json()
+    assert len(records) == 1
+    record = records[0]
+    assert record["host_id"] == host_id
+    assert record["host_public_key"] == host_pub
+    assert record["endorser_device_id"] == endorser_id
+    assert record["signature"] == signature
+
+    # The ENDORSER has no introduction of its own (it was pinned directly).
+    endorser_view = await client.get(
+        f"/api/trust/endorsements?endorsed_device_id={endorser_id}", headers=auth
+    )
+    assert endorser_view.status_code == 200
+    assert endorser_view.json() == []
+
+    # Another account cannot read this account's introductions.
+    other = await client.post(
+        "/api/auth/signup",
+        json={"email": "introductions-other@example.com", "password": "other-password"},
+    )
+    other_auth = {"Authorization": f"Bearer {other.json()['access_token']}"}
+    cross = await client.get(
+        f"/api/trust/endorsements?endorsed_device_id={endorsed_id}", headers=other_auth
+    )
+    assert cross.status_code == 200
+    assert cross.json() == []
+
+
+async def test_revoked_endorser_introductions_are_not_offered(client):
+    """A severed endorsement must not be offered as an introduction either."""
+
+    from datetime import UTC, datetime
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import BrowserDevice
+
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(
+        client, "revoked-introductions@example.com"
+    )
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    created = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": _endorsement_signature(
+                user_id=user_id,
+                host_public_key=host_pub,
+                endorser_private=endorser_key,
+                endorsed_public_key=endorsed_pub,
+                endorsed_device_id=endorsed_id,
+            ),
+        },
+        headers=auth,
+    )
+    assert created.status_code == 200
+
+    async with get_sessionmaker()() as session:
+        endorser = await session.get(BrowserDevice, endorser_id)
+        assert endorser is not None
+        endorser.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+    listed = await client.get(
+        f"/api/trust/endorsements?endorsed_device_id={endorsed_id}", headers=auth
+    )
+    assert listed.status_code == 200
+    assert listed.json() == []

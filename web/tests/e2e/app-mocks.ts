@@ -146,6 +146,8 @@ export async function mockAuthenticatedApi(
     extraBrowserDevices?: Array<Record<string, unknown>>;
     /** hostId → browser device ids the host trusts; endorsements append here. */
     hostPins?: Record<string, string[]>;
+    /** endorsed device id → endorsement records served to that device. */
+    endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
   } = {},
 ) {
   const agents = options.agents ?? [];
@@ -605,6 +607,15 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    if (path === "/api/trust/endorsements" && method === "GET") {
+      const endorsedId = url.searchParams.get("endorsed_device_id");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: options.endorsementsFor?.[endorsedId ?? ""] ?? [],
+      });
+      return;
+    }
     if (path === "/api/trust/endorsements" && method === "POST") {
       const body = (await request.postDataJSON()) as {
         host_id: string;
@@ -831,9 +842,7 @@ export async function mockAuthenticatedApi(
     const agentGetMatch = path.match(/^\/api\/agents\/([^/]+)$/);
     if (agentGetMatch) {
       const agentGetId = agentGetMatch[1];
-      const listedAgent = agents.find(
-        (item) => (item as { id?: string }).id === agentGetId,
-      );
+      const listedAgent = agents.find((item) => (item as { id?: string }).id === agentGetId);
       if (method === "GET" && listedAgent) {
         await route.fulfill({ status: 200, contentType: "application/json", json: listedAgent });
         return;

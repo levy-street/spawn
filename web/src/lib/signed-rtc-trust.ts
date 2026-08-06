@@ -47,7 +47,17 @@ export type SignedRtcRefusalReason =
  *   caller must NOT connect, signed or raw.
  */
 export type SignedRtcTrustDecision =
-  | { readonly mode: "signed"; readonly capability: SignedRtcTrustCapability }
+  | {
+      readonly mode: "signed";
+      readonly capability: SignedRtcTrustCapability;
+      /**
+       * True when the capability anchors on a locally approved pin — the host
+       * is fully verified. False for signed TOFU, where the daemon
+       * authenticates this browser but our knowledge of the host key is
+       * first-contact material. Surfaced so the UI can tell the two apart.
+       */
+      readonly hostVerified: boolean;
+    }
   | { readonly mode: "unpinned" }
   | { readonly mode: "refuse"; readonly reason: SignedRtcRefusalReason };
 
@@ -136,7 +146,7 @@ export async function resolveSignedRtcTrust(
       }
     },
   };
-  return { mode: "signed", capability };
+  return { mode: "signed", capability, hostVerified: true };
 }
 
 async function decideAfterResolveFailure(
@@ -218,7 +228,7 @@ async function signedTofuOrUnpinned(
       }
     },
   };
-  return { mode: "signed", capability };
+  return { mode: "signed", capability, hostVerified: false };
 }
 
 async function hostIdIsLocallyPinned(

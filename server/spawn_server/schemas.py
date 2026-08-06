@@ -609,3 +609,22 @@ class BrowserEndorsementOut(BaseModel):
     endorsed_key_fingerprint: str
     endorser_device_id: str
     created_at: datetime
+
+
+class BrowserEndorsementRecord(BaseModel):
+    """One endorsement as presented to the ENDORSED device.
+
+    Every field is server-claimed and untrusted on its own: the endorsed
+    browser re-encodes the endorsement transcript from these claims plus its
+    OWN key and device id, verifies the signature against the endorser key
+    whose fingerprint the operator confirmed on the endorsing browser's
+    screen, and only then treats `host_public_key` as introduced.
+    """
+
+    host_id: str
+    host_name: str
+    host_public_key: str
+    endorser_device_id: str
+    endorser_public_key: str
+    endorser_label: str | None = None
+    signature: str

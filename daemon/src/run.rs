@@ -997,8 +997,14 @@ fn credentials_touched_notify() -> &'static tokio::sync::Notify {
 }
 
 fn require_signed_rtc_offers() -> bool {
-    std::env::var_os("SPAWND_REQUIRE_SIGNED_RTC")
-        .is_some_and(|value| value == "1" || value == "true")
+    // Enforcement is the default: an unsigned offer to a daemon that has never
+    // pinned the offering browser is exactly the attack signed signaling
+    // exists to refuse. `SPAWND_REQUIRE_SIGNED_RTC=0` (or `false`) is the
+    // explicit escape hatch for operators who accept raw first-contact
+    // connections — e.g. while recovering a deployment whose every browser
+    // identity was lost.
+    !std::env::var_os("SPAWND_REQUIRE_SIGNED_RTC")
+        .is_some_and(|value| value == "0" || value == "false")
 }
 
 fn verify_signed_rtc_offer(envelope: &str, record: &StoredCreds) -> Option<VerifiedRtcSignal> {

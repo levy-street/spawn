@@ -1,6 +1,11 @@
 "use client";
 
-import type { ConnInfo, SocketState } from "@/components/terminal/useAgentSocket";
+import { ShieldAlert, ShieldCheck, ShieldOff } from "lucide-react";
+import type {
+  ConnInfo,
+  SignalingTrustLevel,
+  SocketState,
+} from "@/components/terminal/useAgentSocket";
 import { DropdownMenu, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
@@ -13,7 +18,36 @@ export interface AgentConnectionInfo extends ConnInfo {
   /** Set when the connection was refused because the host identity could not
    * be verified against a local pin. A refusal is terminal, not a retry. */
   signedRtcRefusal?: SignedRtcRefusalReason | null;
+  /** How this connection's signaling was authenticated, once decided. */
+  signalingTrust?: SignalingTrustLevel | null;
 }
+
+const TRUST_VIEW: Record<
+  SignalingTrustLevel,
+  { icon: typeof ShieldCheck; tint: string; label: string; detail: string }
+> = {
+  verified: {
+    icon: ShieldCheck,
+    tint: "text-emerald-500",
+    label: "verified",
+    detail:
+      "Verified: offers are signed by this browser and the host's identity matches your approved pin end to end.",
+  },
+  first_contact: {
+    icon: ShieldAlert,
+    tint: "text-amber-500",
+    label: "first contact",
+    detail:
+      "Signed, but this browser has not verified this host before — the host key came from the server on first contact. Approve the host or unlock your saved trust for full verification.",
+  },
+  raw: {
+    icon: ShieldOff,
+    tint: "text-muted-foreground",
+    label: "unverified",
+    detail:
+      "Unsigned connection: this host published no identity key, or this browser has no signing identity. Content is still end-to-end encrypted, but neither side's identity is verified.",
+  },
+};
 
 const REFUSAL_DETAIL: Record<SignedRtcRefusalReason, string> = {
   host_key_substituted:
@@ -82,11 +116,14 @@ export function ConnectionChip({
 }) {
   if (!info) return null;
   const view = viewFor(info);
+  const trust = info.signalingTrust ? TRUST_VIEW[info.signalingTrust] : null;
+  const TrustIcon = trust?.icon ?? null;
   const v2TrustDetail = info.dcOpen
     ? "spawn.v2 — terminal bytes and history are endpoint-to-endpoint; the server receives signaling and disclosed activity only"
     : "spawn.v2 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
   const title = [
     view.detail,
+    trust?.detail ?? null,
     info.rttMs != null ? `round trip ${info.rttMs} ms` : null,
     info.protocol ? `via ${info.protocol}` : null,
     info.dcOpen ? "DataChannel open" : null,
@@ -98,6 +135,7 @@ export function ConnectionChip({
   const details: Array<[string, string]> = info.signedRtcRefusal
     ? [["Security", REFUSAL_DETAIL[info.signedRtcRefusal]]]
     : [
+        ...(trust ? ([["Security", trust.detail]] as Array<[string, string]>) : []),
         ["Path", view.detail],
         ["Round trip", info.rttMs != null ? `${info.rttMs} ms` : "—"],
         ["Transport", info.protocol ?? "—"],
@@ -133,6 +171,9 @@ export function ConnectionChip({
               )}
               aria-hidden
             />
+            {TrustIcon && trust && (
+              <TrustIcon className={cn("size-3 shrink-0", trust.tint)} aria-hidden />
+            )}
             {info.dcOpen && info.rttMs != null && (
               <span className="tabular-nums">{info.rttMs}ms</span>
             )}
@@ -153,6 +194,12 @@ export function ConnectionChip({
               )}
               aria-hidden
             />
+            {TrustIcon && trust && (
+              <TrustIcon
+                className={cn("size-3 shrink-0", trust.tint)}
+                aria-label={`signaling: ${trust.label}`}
+              />
+            )}
             <span className="whitespace-nowrap tabular-nums">{view.label}</span>
           </button>
         )

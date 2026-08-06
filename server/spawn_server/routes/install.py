@@ -490,6 +490,11 @@ INSTALL_SCRIPT = dedent(
     # Headroom against fd exhaustion taking the host offline.
     LimitNOFILE=65536
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+    # Signed signaling is enforced by default: this daemon refuses RTC offers
+    # that are not signed by a browser identity it pins. Approve new devices
+    # from a browser that already works (Settings -> Browser devices) or pair
+    # them here. Recovery escape hatch, accepting unauthenticated offers:
+    # Environment="SPAWND_REQUIRE_SIGNED_RTC=0"
 
     [Install]
     WantedBy=default.target
