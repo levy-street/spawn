@@ -150,7 +150,11 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   fi
 
   if command -v bun >/dev/null 2>&1; then
-    (cd web && bun install --frozen-lockfile && SPAWN_API_PROXY_TARGET="$SPAWN_API_PROXY_TARGET" SPAWN_BUILD_ID="$build_id" bun run build)
+    # V8 caps its own heap well below this host's RAM+swap, so a growing app
+    # eventually dies with "Reached heap limit" on a machine that still has
+    # memory to give. Raise the cap explicitly rather than discovering it
+    # again as a failed deploy.
+    (cd web && bun install --frozen-lockfile && NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}" SPAWN_API_PROXY_TARGET="$SPAWN_API_PROXY_TARGET" SPAWN_BUILD_ID="$build_id" bun run build)
   else
     die "bun is required for web dependency sync and build"
   fi
