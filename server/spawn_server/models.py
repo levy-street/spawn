@@ -42,6 +42,13 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+    # Bumped whenever every existing session must stop working (password
+    # reset). Tokens carry the epoch they were minted under, so a stale one is
+    # refused even though JWTs are otherwise stateless and unrevocable.
+    session_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     hosts: Mapped[list[Host]] = relationship(back_populates="owner")
     agents: Mapped[list[Agent]] = relationship(back_populates="owner")
@@ -554,4 +561,27 @@ class Screen(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class EmailToken(Base):
+    """A single-use secret mailed to a user's address.
+
+    Only the SHA-256 of the emailed value is stored. The token IS the
+    credential — anyone holding it can reset a password — so the database
+    must not contain anything replayable if it leaks.
+    """
+
+    __tablename__ = "email_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
     )

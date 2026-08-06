@@ -81,6 +81,10 @@ export default function LoginPage() {
                 <Link href="/signup" className="text-foreground underline">
                   Create one
                 </Link>
+                {" · "}
+                <Link href="/forgot-password" className="text-foreground underline">
+                  Forgot password?
+                </Link>
               </p>
             </form>
           </div>

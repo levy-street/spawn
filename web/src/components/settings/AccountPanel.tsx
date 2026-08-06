@@ -5,7 +5,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ApiError, account } from "@/lib/api";
+import { ApiError, account, auth } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 
 export function AccountPanel() {
@@ -14,6 +14,14 @@ export function AccountPanel() {
   const [confirmEmail, setConfirmEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  const [resendNote, setResendNote] = useState<string | null>(null);
+  const resend = useMutation({
+    mutationFn: () => auth.requestEmailVerification(),
+    onSuccess: () => setResendNote("Sent — check your inbox."),
+    onError: (cause) =>
+      setResendNote(cause instanceof ApiError ? cause.message : "Could not send right now."),
+  });
 
   const remove = useMutation({
     mutationFn: () =>
@@ -38,6 +46,32 @@ export function AccountPanel() {
         <h2 className="text-lg font-semibold">Account</h2>
         <p className="text-sm text-muted-foreground">Signed in as {user?.email ?? "—"}</p>
       </div>
+
+      {user !== null && user.email_verified_at === null && (
+        <div
+          className="space-y-2 rounded-md border border-amber-600/50 p-3"
+          data-testid="verify-email-callout"
+        >
+          <p className="text-sm font-medium">Confirm your email address</p>
+          <p className="text-sm text-muted-foreground">
+            We sent a link to {user.email}. Verifying keeps account recovery working — a password
+            reset can only reach an address you control.
+          </p>
+          {resendNote !== null && (
+            <p className="text-sm" role="status">
+              {resendNote}
+            </p>
+          )}
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={resend.isPending}
+            onClick={() => resend.mutate()}
+          >
+            {resend.isPending ? "Sending…" : "Resend verification email"}
+          </Button>
+        </div>
+      )}
       <Button
         variant="secondary"
         onClick={() => {

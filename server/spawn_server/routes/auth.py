@@ -7,11 +7,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..models import AuthIdentity, Host, HostKeyClaim, User
 from ..ws.broker import get_broker
+from .account_recovery import send_verification_email
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -20,7 +21,11 @@ def _set_session_cookie(response: Response, token: str) -> None:
     auth.set_session_cookie(response, token)
 
 
-@router.post("/auth/signup", response_model=schemas.TokenResponse)
+@router.post(
+    "/auth/signup",
+    response_model=schemas.TokenResponse,
+    dependencies=[Depends(rate_limit.limiter(rate_limit.SIGNUP))],
+)
 async def signup(
     body: schemas.SignupRequest,
     response: Response,
@@ -42,14 +47,23 @@ async def signup(
             status_code=status.HTTP_409_CONFLICT, detail="email already in use"
         ) from e
     await session.refresh(user)
-    access_token = auth.issue_access_token(user.id)
-    _set_session_cookie(response, auth.issue_session_token(user.id))
+    # Best effort: a mail outage must not block account creation, and the user
+    # can request another from Settings.
+    await send_verification_email(session, user)
+    await session.commit()
+    await session.refresh(user)
+    access_token = auth.issue_access_token(user.id, user.session_epoch)
+    _set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=access_token, user=schemas.UserOut.model_validate(user)
     )
 
 
-@router.post("/auth/login", response_model=schemas.TokenResponse)
+@router.post(
+    "/auth/login",
+    response_model=schemas.TokenResponse,
+    dependencies=[Depends(rate_limit.limiter(rate_limit.LOGIN))],
+)
 async def login(
     body: schemas.LoginRequest,
     response: Response,
@@ -61,8 +75,8 @@ async def login(
     ).scalar_one_or_none()
     if row is None or not auth.verify_password(body.password, row.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
-    access_token = auth.issue_access_token(row.id)
-    _set_session_cookie(response, auth.issue_session_token(row.id))
+    access_token = auth.issue_access_token(row.id, row.session_epoch)
+    _set_session_cookie(response, auth.issue_session_token(row.id, row.session_epoch))
     return schemas.TokenResponse(
         access_token=access_token, user=schemas.UserOut.model_validate(row)
     )

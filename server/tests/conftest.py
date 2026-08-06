@@ -13,6 +13,10 @@ import pytest_asyncio
 
 # Configure environment BEFORE app modules are imported.
 os.environ.setdefault("SPAWN_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+# Rate limits are per-client and cumulative across a process, so leaving them
+# on would make unrelated tests fail based on how many ran before them. Tests
+# that exercise limiting turn it back on explicitly.
+os.environ.setdefault("SPAWN_RATE_LIMIT_ENABLED", "false")
 os.environ.setdefault("SPAWN_USE_INPROCESS_PUBSUB", "1")
 os.environ.setdefault("SPAWN_JWT_SECRET", "test-secret")
 # Tests use an HTTP client and assert development cookie/redirect behavior.

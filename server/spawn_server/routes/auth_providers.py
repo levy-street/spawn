@@ -440,7 +440,7 @@ async def provider_callback(
         profile=profile,
         linked_user_id=state_row.user_id,
     )
-    auth.set_session_cookie(response, auth.issue_session_token(user.id))
+    auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     redirect = RedirectResponse(state_row.return_to, status_code=status.HTTP_302_FOUND)
     if "set-cookie" in response.headers:
         redirect.headers.append("set-cookie", response.headers["set-cookie"])

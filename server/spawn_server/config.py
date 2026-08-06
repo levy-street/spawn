@@ -39,6 +39,30 @@ class Settings(BaseSettings):
 
     public_url: str = Field(default="http://localhost:8000")
 
+    # Where password-reset and verification links point. Falls back to
+    # public_url; set when the web app is served from a different origin than
+    # the API (it is, in this deployment).
+    web_url: str = Field(default="")
+
+    # "smtp" delivers; "console" logs the message and does NOT deliver (dev
+    # only — bodies contain live credentials); "disabled" refuses to send.
+    email_backend: str = Field(default="console")
+    email_from: str = Field(default="spawn <no-reply@localhost>")
+    smtp_host: str = Field(default="")
+    smtp_port: int = Field(default=587)
+    smtp_username: str = Field(default="")
+    smtp_password: str = Field(default="")
+    smtp_use_starttls: bool = Field(default=True)
+    smtp_use_ssl: bool = Field(default=False)
+
+    # Signup requires a verified address before terminals are reachable.
+    # Deployments that front signup with their own gate can turn this off.
+    require_email_verification: bool = Field(default=True)
+
+    # Fixed-window request caps, per client IP. Redis-backed when available so
+    # the limit is shared across workers; falls back to per-process counters.
+    rate_limit_enabled: bool = Field(default=True)
+
     # Comma-separated list of allowed browser origins. The web app at
     # localhost:3000 needs to be in here in dev so fetch() with
     # `credentials: include` and the cross-origin browser WS handshake

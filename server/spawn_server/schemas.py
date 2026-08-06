@@ -36,6 +36,7 @@ class UserOut(BaseModel):
     id: str
     email: EmailStr
     created_at: datetime
+    email_verified_at: datetime | None = None
 
 
 class TokenResponse(BaseModel):
@@ -99,6 +100,25 @@ class BrowserDeviceRenameRequest(BaseModel):
 
 class BrowserDevicePruneResponse(BaseModel):
     pruned: int
+
+
+class PasswordResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=16, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class EmailVerifyConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=16, max_length=256)
 
 
 class AccountDeleteRequest(BaseModel):

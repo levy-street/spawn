@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..host_identity import host_key_fingerprint
@@ -85,7 +85,11 @@ async def _expire_device_code(
     await session.commit()
 
 
-@router.post("/start", response_model=schemas.DeviceStartResponse)
+@router.post(
+    "/start",
+    response_model=schemas.DeviceStartResponse,
+    dependencies=[Depends(rate_limit.limiter(rate_limit.DEVICE_PAIRING))],
+)
 async def device_start(
     body: schemas.DeviceStartRequest,
     session: AsyncSession = Depends(get_session),
@@ -667,7 +671,7 @@ async def device_pending(
 async def device_approve(
     body: schemas.DeviceApproveRequest,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(auth.current_user),
+    user: User = Depends(auth.verified_user),
 ) -> schemas.DeviceApproveResponse:
     dc = await _pending_device_code(session, body.user_code)
     assert dc.host_key_algorithm is not None

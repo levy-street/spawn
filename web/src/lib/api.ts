@@ -69,6 +69,7 @@ export const UserSchema = z.object({
   id: z.string().uuid(),
   email: z.string().email(),
   created_at: z.string(),
+  email_verified_at: z.string().nullable().default(null),
 });
 export type User = z.infer<typeof UserSchema>;
 
@@ -326,6 +327,25 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
+  /** Always succeeds, whether or not the address has an account. */
+  requestPasswordReset: (email: string) =>
+    api<void>("/api/auth/password-reset/request", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    }),
+  confirmPasswordReset: (body: { token: string; new_password: string }) =>
+    api("/api/auth/password-reset/confirm", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AuthResponseSchema,
+    }),
+  requestEmailVerification: () => api<void>("/api/auth/verify-email/request", { method: "POST" }),
+  confirmEmailVerification: (token: string) =>
+    api("/api/auth/verify-email/confirm", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+      schema: z.object({ user: UserSchema }),
+    }),
   me: () =>
     api("/api/me", {
       method: "GET",
