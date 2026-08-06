@@ -101,6 +101,13 @@ class BrowserDevicePruneResponse(BaseModel):
     pruned: int
 
 
+class AccountDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_email: str
+    password: str | None = None
+
+
 class AuthProviderOut(BaseModel):
     id: Literal["google", "microsoft", "github"]
     name: str

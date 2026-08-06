@@ -1,12 +1,40 @@
 "use client";
 
+import { useMutation } from "@tanstack/react-query";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { account, ApiError } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 
 export function AccountPanel() {
   const { user } = useAuth();
+  const [confirming, setConfirming] = useState(false);
+  const [confirmEmail, setConfirmEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const remove = useMutation({
+    mutationFn: () =>
+      account.remove({
+        confirm_email: confirmEmail,
+        ...(password !== "" ? { password } : {}),
+      }),
+    onSuccess: () => {
+      // The server already deleted the session cookie with the account; this
+      // clears local auth state and lands on the login page.
+      void logout();
+    },
+    onError: (cause) =>
+      setError(cause instanceof ApiError ? cause.message : String(cause)),
+  });
+
+  const emailMatches =
+    user !== null && confirmEmail.trim().toLowerCase() === user.email.toLowerCase();
+
   return (
-    <section className="space-y-4">
+    <section className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold">Account</h2>
         <p className="text-sm text-muted-foreground">Signed in as {user?.email ?? "—"}</p>
@@ -19,7 +47,86 @@ export function AccountPanel() {
       >
         Log out
       </Button>
-      <p className="text-xs text-muted-foreground">Account deletion is not yet wired up.</p>
+
+      <div className="space-y-3 rounded-md border border-destructive/50 p-3">
+        <div>
+          <p className="text-sm font-medium">Delete account</p>
+          <p className="text-sm text-muted-foreground">
+            Permanently deletes this account: every host pairing, agent, screen, preset, skill,
+            device identity, and saved trust. Daemons on your machines keep running but lose this
+            server. This cannot be undone.
+          </p>
+        </div>
+        {!confirming ? (
+          <Button variant="secondary" onClick={() => setConfirming(true)}>
+            Delete account…
+          </Button>
+        ) : (
+          <form
+            className="space-y-3"
+            data-testid="delete-account-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setError(null);
+              remove.mutate();
+            }}
+          >
+            <div className="space-y-1">
+              <Label htmlFor="delete-confirm-email">Type your email to confirm</Label>
+              <Input
+                id="delete-confirm-email"
+                autoFocus
+                autoComplete="off"
+                placeholder={user?.email ?? ""}
+                value={confirmEmail}
+                onChange={(event) => setConfirmEmail(event.target.value)}
+                disabled={remove.isPending}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="delete-confirm-password">Password</Label>
+              <Input
+                id="delete-confirm-password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                disabled={remove.isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                Signed up through a provider without a password? Leave this empty.
+              </p>
+            </div>
+            {error !== null && (
+              <p className="text-sm text-destructive" role="alert">
+                {error}
+              </p>
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="submit"
+                variant="destructive"
+                disabled={!emailMatches || remove.isPending}
+              >
+                {remove.isPending ? "Deleting…" : "Permanently delete"}
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={remove.isPending}
+                onClick={() => {
+                  setConfirming(false);
+                  setConfirmEmail("");
+                  setPassword("");
+                  setError(null);
+                }}
+              >
+                Cancel
+              </Button>
+            </div>
+          </form>
+        )}
+      </div>
     </section>
   );
 }

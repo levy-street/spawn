@@ -801,6 +801,25 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    if (path === "/api/account/delete" && method === "POST") {
+      const body = (await request.postDataJSON()) as {
+        confirm_email?: string;
+        password?: string;
+      };
+      if ((body.confirm_email ?? "").trim().toLowerCase() !== "tester@example.com") {
+        await route.fulfill({
+          status: 403,
+          json: { detail: "confirmation email does not match this account" },
+        });
+        return;
+      }
+      if (body.password !== "correct horse battery") {
+        await route.fulfill({ status: 403, json: { detail: "password confirmation failed" } });
+        return;
+      }
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
     if (path === "/api/browser-devices/prune" && method === "POST") {
       const pruned = browserDeviceList.filter((item) => item.revoked_at != null).length;
       for (let i = browserDeviceList.length - 1; i >= 0; i -= 1) {

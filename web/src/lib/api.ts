@@ -434,6 +434,12 @@ export const browserDevices = {
     }),
 };
 
+export const account = {
+  /** Permanently deletes the signed-in account and everything it owns. */
+  remove: (body: { confirm_email: string; password?: string }) =>
+    api<void>("/api/account/delete", { method: "POST", body: JSON.stringify(body) }),
+};
+
 export const trust = {
   /** null when this account has never sealed a bundle. */
   getBundle: () =>

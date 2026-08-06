@@ -32,6 +32,12 @@ export function useAuth() {
 }
 
 export async function logout() {
-  await auth.logout();
+  try {
+    await auth.logout();
+  } catch {
+    // A failed logout call must never strand the user in the app — the
+    // session may already be dead server-side (expired, or the account was
+    // just deleted, which clears the cookie itself). Leaving is the point.
+  }
   if (typeof window !== "undefined") window.location.assign("/login");
 }

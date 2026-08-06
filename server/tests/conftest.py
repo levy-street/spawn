@@ -50,6 +50,8 @@ async def app():
             connect_args={"check_same_thread": False},
             future=True,
         )
+        # Match production referential behavior (Postgres always enforces).
+        db_mod.enable_sqlite_foreign_keys(engine)
     sm = async_sessionmaker(engine, expire_on_commit=False)
 
     # Override the module-level globals.
