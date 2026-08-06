@@ -42,6 +42,97 @@ Any SMTP provider works; there is no vendor lock-in here. Practical notes:
 Avoid personal Gmail/Fastmail accounts: they rate-limit hard, rewrite the From
 address, and mark mail from an unfamiliar server as spam.
 
+## Amazon SES, step by step
+
+SES is the cheapest option at volume ($0.10 per thousand) and needs no third
+party if you already host on AWS. It has one sharp edge: **new accounts are
+sandboxed and can only send to addresses you have verified**, which is
+useless for inviting people. Leaving the sandbox is a support request that
+usually clears within 24 hours, so start it first.
+
+Use the same region as the server; these commands assume `us-east-1`.
+
+### 1. Verify the sending domain (publishes DKIM)
+
+Console: **SES → Identities → Create identity → Domain**, enter your domain,
+keep **Easy DKIM** with 2048-bit keys, and — if the domain's hosted zone lives
+in the same AWS account — tick **Publish DNS records to Route 53**. That
+writes the three DKIM CNAMEs for you and is the whole reason this is easy.
+
+Equivalent CLI, from credentials that may touch SES and Route 53:
+
+```
+aws sesv2 create-email-identity   --email-identity example.com   --dkim-signing-attributes NextSigningKeyLength=RSA_2048_BIT   --region us-east-1
+```
+
+If you did not let SES publish them, fetch the records and add them yourself:
+
+```
+aws sesv2 get-email-identity --email-identity example.com   --region us-east-1 --query DkimAttributes.Tokens --output text
+```
+
+Each token `T` becomes `T._domainkey.example.com CNAME T.dkim.amazonses.com`.
+Verification flips to `Success` within minutes of the records resolving.
+
+### 2. Add SPF and DMARC
+
+Neither is created for you:
+
+```
+example.com            TXT  "v=spf1 include:amazonses.com ~all"
+_dmarc.example.com     TXT  "v=DMARC1; p=none; rua=mailto:you@example.com"
+```
+
+If a TXT record already exists on the apex, merge the SPF into it rather than
+adding a second one — two SPF records is a hard failure, not a warning.
+
+### 3. Leave the sandbox
+
+**SES → Account dashboard → Request production access.** Vague requests get
+rejected; say specifically what you send and how you handle bounces. For a
+deployment like this one, that is: transactional only (password resets,
+address verification, and invitations the recipient asked for), no marketing,
+no purchased lists, recipients are people who created an account or were
+invited by an admin, and every send is logged.
+
+Until this is approved you can only mail addresses verified as SES
+identities — verify your own address so you can test end to end meanwhile.
+
+### 4. Create SMTP credentials
+
+**SES → SMTP settings → Create SMTP credentials.** This makes an IAM user with
+`ses:SendRawEmail` and derives an SMTP username and password from it. They are
+**not** your AWS access keys, and the password is shown exactly once.
+
+### 5. Point spawn at it
+
+```
+SPAWN_EMAIL_BACKEND=smtp
+SPAWN_EMAIL_FROM=spawn <no-reply@example.com>
+SPAWN_SMTP_HOST=email-smtp.us-east-1.amazonaws.com
+SPAWN_SMTP_PORT=587
+SPAWN_SMTP_USERNAME=<SMTP username from step 4>
+SPAWN_SMTP_PASSWORD=<SMTP password from step 4>
+SPAWN_SMTP_USE_STARTTLS=true
+```
+
+Restart `spawn-server`, then **Admin → Email → Send test email**. The most
+common failures and what they mean:
+
+- `554 Message rejected: Email address is not verified` — still in the
+  sandbox, or the From address is not on the verified domain.
+- `535 Authentication Credentials Invalid` — using AWS access keys instead of
+  the SMTP credentials from step 4.
+- Connection timeout — port 587 blocked outbound; try 2587, which SES also
+  serves.
+
+### A note on credentials
+
+The server holds a static SMTP password under this setup. SES can also be
+driven by the instance's IAM role with no stored secret at all, which is
+strictly better — it needs an SES API backend rather than SMTP, which this
+project does not implement yet. Worth doing if you stay on SES.
+
 ## Make the mail arrive
 
 Deliverability is DNS, not code. Publish, on the sending domain:
