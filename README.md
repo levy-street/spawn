@@ -147,7 +147,7 @@ To include non-disruptive Linux host coverage over SSH, set a host alias from
 your local SSH config:
 
 ```bash
-SPAWN_REMOTE_LINUX_HOST=dream scripts/test-all.sh
+SPAWN_REMOTE_LINUX_HOST=<ssh-host> scripts/test-all.sh
 ```
 
 That additionally verifies Linux prebuilt install, user `systemd` restart
@@ -166,7 +166,7 @@ The real reboot persistence check is intentionally gated because it reboots the
 remote machine:
 
 ```bash
-SPAWN_ALLOW_REBOOT=1 SPAWN_REMOTE_REBOOT_HOST=dream scripts/test-all.sh
+SPAWN_ALLOW_REBOOT=1 SPAWN_REMOTE_REBOOT_HOST=<ssh-host> scripts/test-all.sh
 ```
 
 If the remote host needs sudo for reboot, provide `SPAWN_SUDO_PASSWORD` in the
@@ -174,11 +174,14 @@ environment for that command.
 
 ## Production deploy
 
-Production infrastructure is bootstrapped from the Levy Street Ansible repo:
-the `spawnd-prod` host is configured with nginx + certbot, TLS for
-`spawnd.dev`, and a reverse proxy to the Next.js web service on
-`127.0.0.1:3001`. Keep the FastAPI server private on `127.0.0.1:8001`; the web
-service proxies API and websocket traffic to it.
+Provision the host however you like (this deployment uses Ansible). The shape
+that matters: nginx + certbot terminating TLS for your domain and reverse
+proxying to the Next.js web service on `127.0.0.1:3001`. Keep the FastAPI
+server private on `127.0.0.1:8001`; the web service proxies API and websocket
+traffic to it, so nothing but the web port needs to face the internet.
+
+`scripts/deploy-prod.sh <ssh-host>` deploys to a host reachable through your
+SSH config.
 
 After the production host has a checkout, runtime dependencies, and systemd
 services such as `spawn-server` and `spawn-web`, deploy the current branch

@@ -847,40 +847,34 @@ until the decision passes review and is merged.
    connections; unverified operator-hosted JavaScript remains outside that
    guarantee.
 
-## Operational playbook (how to build/deploy/validate — no secrets here)
+## Operational playbook
 
-**Topology.** Two daemons share the oem dev box:
-- `spawnd.service` → **PROD** (`spawnd.dev`, AWS, an *earlier* commit). Binary
-  `~/.local/bin/spawnd`. **DO NOT TOUCH.**
-- `spawnd-dev.service` → **DEV** (dream → the minivac dev web instance).
-  Binary `~/.local/bin/spawnd-dev` (separate!), with workers under
-  `~/.local/state/spawn-dev/workers`. This is where THIS session's agent
-  (`9e4e2296`) runs.
-- Dev server + web on **minivac**: `systemctl --user` units
-  `spawn-dev-server.service` (127.0.0.1:18330) and `spawn-dev-web.service`
-  (0.0.0.0:8330). Repo at `~/projects/spawn`; web build needs
-  `SPAWN_API_PROXY_TARGET=http://127.0.0.1:18330`.
+This section previously described one specific deployment: its hostnames,
+systemd unit names, bound ports, and the procedure for minting a session token
+against its dev instance. None of that was secret, and all of it was a
+targeting map for the deployment it described — so it lives with the
+deployment now, not in a public repository.
 
-**Deploy the daemon (dev):** do not deploy this cutover as an ordinary hot or
-mixed-version restart. Follow `docs/TMUX_REMOVAL.md`: close ingress, inventory
-and drain old sessions without capture, build/install both `spawnd` and
-`spawn-worker`, deploy the matching server and web assets in the same change
-window, then restart and verify worker adoption/replay. `spawn.v1` components
-are intentionally incompatible and must fail closed. Compatible workers
-survive a supervisor restart; old sessions are unavailable. Remediation is a
-corrected content-free roll-forward, never re-enabling tmux or a WS relay.
+What is worth keeping is the shape, because the constraints are properties of
+the system rather than of any one host:
 
-**Deploy the server (dev):** `git push origin master` → `ssh minivac 'cd
-~/projects/spawn && git pull --ff-only && systemctl --user restart
-spawn-dev-server.service'`. For P2-AGENT-02 there is no backward-compatible
-rolling order: use the coordinated drain/restart above.
+**Two daemons must not share a binary or a state directory.** A dev daemon
+built from a working tree and a production daemon must install to different
+paths and keep their worker state separate, or a dev build silently adopts
+production sessions on restart.
 
-**Validate live:** mint a dev session token server-side
-(`auth.issue_session_token(user_id)` on the dev box — details + the user/host
-ids are in the private `reference_dev_playwright_token` memory, deliberately not
-committed), then `curl -H "Cookie: spawn_session=<tok>" <dev-web>/api/agents`
-and check `activity_state` / `last_output_at`, or drive Playwright from `web/`
-with the cookie.
+**The `spawn.v1` → `spawn.v2` cutover is not a rolling restart.** Follow
+`docs/TMUX_REMOVAL.md`: close ingress, drain old sessions without capture,
+build and install both `spawnd` and `spawn-worker`, deploy the matching server
+and web assets in the same change window, then restart and verify worker
+adoption and replay. The versions are deliberately incompatible and fail
+closed; remediation is a corrected content-free roll-forward, never
+re-enabling tmux or a WebSocket content relay.
+
+**Live validation needs a session, and a session is a credential.** Minting one
+server-side is the right way to drive a real browser against a real deployment
+without a password — which also means the procedure and the identifiers it
+needs belong in the operator's private notes.
 
 **Tasks:** `docs/TRUST_PHASE2_TASKS.md` is the repository task ledger and maps
 every review finding to an implementation, independent review, merge, and

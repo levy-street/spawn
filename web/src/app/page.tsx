@@ -179,7 +179,7 @@ function TerminalBackdrop() {
               dream
             </p>
             <p className="mt-3 text-zinc-500">routing terminal frames over WSS...</p>
-            <p className="mt-3 text-sky-300">agent ready - /Users/jeremy/projects/spawn</p>
+            <p className="mt-3 text-sky-300">agent ready - ~/projects/spawn</p>
           </div>
         </div>
       </div>
