@@ -32,6 +32,18 @@ def hash_random_password() -> str:
     return hash_password(secrets.token_urlsafe(32))
 
 
+def email_is_bootstrap_admin(email: str) -> bool:
+    """Whether SPAWN_ADMIN_EMAILS names this address.
+
+    Only ever grants; never revokes. The database flag stays the source of
+    truth so admin can also be handed out (and taken back) at runtime.
+    """
+
+    configured = get_settings().admin_emails
+    wanted = {item.strip().lower() for item in configured.split(",") if item.strip()}
+    return email.strip().lower() in wanted
+
+
 def normalize_email(email: str) -> str:
     return email.strip().lower()
 

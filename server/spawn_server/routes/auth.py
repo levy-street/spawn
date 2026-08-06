@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
+from ..invites import is_first_account, redeem_invite, signup_is_open
 from ..models import AuthIdentity, Host, HostKeyClaim, User
 from ..ws.broker import get_broker
 from .account_recovery import send_verification_email
@@ -37,7 +40,37 @@ async def signup(
     ).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already in use")
-    user = User(email=email, password_hash=auth.hash_password(body.password))
+
+    # A closed deployment needs an invite, except for the very first account:
+    # an empty install has nobody who could have issued one, and that account
+    # becomes the owner.
+    invite = None
+    # Two different questions: may this signup proceed without an invite, and
+    # is this the deployment's first account (which owns it). On an open
+    # deployment the first is always true and the second almost never is.
+    first_account = await is_first_account(session)
+    if not await signup_is_open(session):
+        if not body.invite:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="spawn is invite only right now",
+            )
+        try:
+            invite = await redeem_invite(session, body.invite)
+        except ValueError as cause:
+            # One message for every failure mode (unknown, used, expired,
+            # revoked): a stranger probing codes learns nothing from the
+            # difference.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="this invite is not valid",
+            ) from cause
+
+    user = User(
+        email=email,
+        password_hash=auth.hash_password(body.password),
+        is_admin=first_account or auth.email_is_bootstrap_admin(email),
+    )
     session.add(user)
     try:
         await session.commit()
@@ -47,6 +80,10 @@ async def signup(
             status_code=status.HTTP_409_CONFLICT, detail="email already in use"
         ) from e
     await session.refresh(user)
+    if invite is not None:
+        invite.used_at = datetime.now(UTC)
+        invite.used_by_user_id = user.id
+        await session.commit()
     # Best effort: a mail outage must not block account creation, and the user
     # can request another from Settings.
     await send_verification_email(session, user)
@@ -75,6 +112,12 @@ async def login(
     ).scalar_one_or_none()
     if row is None or not auth.verify_password(body.password, row.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
+    # Bootstrap admin from configuration so reaching the admin surface never
+    # requires hand-editing rows.
+    if not row.is_admin and auth.email_is_bootstrap_admin(row.email):
+        row.is_admin = True
+        await session.commit()
+        await session.refresh(row)
     access_token = auth.issue_access_token(row.id, row.session_epoch)
     _set_session_cookie(response, auth.issue_session_token(row.id, row.session_epoch))
     return schemas.TokenResponse(

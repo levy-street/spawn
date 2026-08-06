@@ -70,6 +70,7 @@ export const UserSchema = z.object({
   email: z.string().email(),
   created_at: z.string(),
   email_verified_at: z.string().nullable().default(null),
+  is_admin: z.boolean().default(false),
 });
 export type User = z.infer<typeof UserSchema>;
 
@@ -314,7 +315,7 @@ export type PasskeyCredential = z.infer<typeof PasskeyCredentialSchema>;
 // ---------- Endpoints ----------
 
 export const auth = {
-  signup: (body: { email: string; password: string }) =>
+  signup: (body: { email: string; password: string; invite?: string | null }) =>
     api("/api/auth/signup", {
       method: "POST",
       body: JSON.stringify(body),
@@ -452,6 +453,45 @@ export const browserDevices = {
       method: "POST",
       schema: z.object({ pruned: z.number().int() }),
     }),
+};
+
+export const AdminUserSchema = z.object({
+  id: z.string().uuid(),
+  email: z.string().email(),
+  created_at: z.string(),
+  email_verified_at: z.string().nullable().default(null),
+  is_admin: z.boolean().default(false),
+  host_count: z.number().int().default(0),
+  agent_count: z.number().int().default(0),
+  browser_device_count: z.number().int().default(0),
+});
+export type AdminUser = z.infer<typeof AdminUserSchema>;
+
+export const AdminInviteSchema = z.object({
+  id: z.string().uuid(),
+  email: z.string().nullable().default(null),
+  state: z.enum(["pending", "used", "expired", "revoked"]),
+  expires_at: z.string(),
+  created_at: z.string(),
+  used_at: z.string().nullable().default(null),
+  created_by_user_id: z.string().nullable().default(null),
+  used_by_user_id: z.string().nullable().default(null),
+  /** Present only in the response that created the invite — never on reload. */
+  url: z.string().nullable().default(null),
+});
+export type AdminInvite = z.infer<typeof AdminInviteSchema>;
+
+export const admin = {
+  users: () => api("/api/admin/users", { method: "GET", schema: z.array(AdminUserSchema) }),
+  invites: () => api("/api/admin/invites", { method: "GET", schema: z.array(AdminInviteSchema) }),
+  createInvite: (body: { email?: string | null; ttl_hours?: number | null }) =>
+    api("/api/admin/invites", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AdminInviteSchema,
+    }),
+  revokeInvite: (id: string) =>
+    api(`/api/admin/invites/${id}/revoke`, { method: "POST", schema: AdminInviteSchema }),
 };
 
 export const account = {

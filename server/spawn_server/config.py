@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     smtp_use_starttls: bool = Field(default=True)
     smtp_use_ssl: bool = Field(default=False)
 
+    # Comma-separated emails promoted to admin on sign-in. The database flag
+    # is the source of truth; this only bootstraps it, so an operator never
+    # has to edit rows by hand to reach the admin surface.
+    admin_emails: str = Field(default="")
+
+    # Closed deployment: signup needs an unused invite. The first account on
+    # an empty install is always allowed (nobody exists to invite it) and
+    # becomes the owner.
+    invite_only: bool = Field(default=True)
+    invite_default_ttl_hours: int = Field(default=72)
+
     # Signup requires a verified address before terminals are reachable.
     # Deployments that front signup with their own gate can turn this off.
     require_email_verification: bool = Field(default=True)

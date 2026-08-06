@@ -15,6 +15,7 @@ from .presets import seed_builtin_presets
 from .redis import lifespan_shutdown as redis_shutdown
 from .redis import lifespan_startup as redis_startup
 from .routes import account_recovery as account_recovery_routes
+from .routes import admin as admin_routes
 from .routes import agents as agents_routes
 from .routes import auth as auth_routes
 from .routes import auth_providers as auth_providers_routes
@@ -74,6 +75,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)
     app.include_router(account_recovery_routes.router)
+    app.include_router(admin_routes.router)
     app.include_router(auth_providers_routes.router)
     app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)

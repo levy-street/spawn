@@ -24,6 +24,8 @@ from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=256)
+    # Required on a closed deployment unless this is the very first account.
+    invite: str | None = Field(default=None, max_length=256)
 
 
 class LoginRequest(BaseModel):
@@ -37,6 +39,7 @@ class UserOut(BaseModel):
     email: EmailStr
     created_at: datetime
     email_verified_at: datetime | None = None
+    is_admin: bool = False
 
 
 class TokenResponse(BaseModel):
@@ -126,6 +129,37 @@ class AccountDeleteRequest(BaseModel):
 
     confirm_email: str
     password: str | None = None
+
+
+class AdminUserOut(BaseModel):
+    id: str
+    email: EmailStr
+    created_at: datetime
+    email_verified_at: datetime | None = None
+    is_admin: bool = False
+    host_count: int = 0
+    agent_count: int = 0
+    browser_device_count: int = 0
+
+
+class AdminInviteCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr | None = None
+    ttl_hours: int | None = Field(default=None, ge=1, le=24 * 30)
+
+
+class AdminInviteOut(BaseModel):
+    id: str
+    email: str | None = None
+    state: Literal["pending", "used", "expired", "revoked"]
+    expires_at: datetime
+    created_at: datetime
+    used_at: datetime | None = None
+    created_by_user_id: str | None = None
+    used_by_user_id: str | None = None
+    # Only ever populated in the response that created the invite.
+    url: str | None = None
 
 
 class AuthProviderOut(BaseModel):

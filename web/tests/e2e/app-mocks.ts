@@ -148,6 +148,8 @@ export async function mockAuthenticatedApi(
     hostPins?: Record<string, string[]>;
     /** endorsed device id → endorsement records served to that device. */
     endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
+    /** Override the signed-in account (e.g. to grant is_admin). */
+    me?: Record<string, unknown>;
   } = {},
 ) {
   const agents = options.agents ?? [];
@@ -536,7 +538,11 @@ export async function mockAuthenticatedApi(
     const method = request.method();
 
     if (path === "/api/me") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: { user } });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { user: options.me ?? user },
+      });
       return;
     }
     if (path === "/api/browser-devices/register" && method === "POST") {

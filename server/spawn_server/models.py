@@ -49,6 +49,9 @@ class User(Base):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Grants the admin surface. Bootstrapped from SPAWN_ADMIN_EMAILS (or the
+    # first account on a fresh install) rather than hardcoded anywhere.
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     hosts: Mapped[list[Host]] = relationship(back_populates="owner")
     agents: Mapped[list[Agent]] = relationship(back_populates="owner")
@@ -582,6 +585,35 @@ class EmailToken(Base):
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class Invite(Base):
+    """A single-use signup code for a closed deployment.
+
+    Only the hash is stored: the code travels in a shareable URL, so a leaked
+    database must not let anyone mint accounts. That also means the plaintext
+    exists exactly once, at creation, and cannot be shown again afterwards.
+    """
+
+    __tablename__ = "invites"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Advisory only -- the code admits whoever holds it. Records who it was
+    # meant for, and addresses the invitation email when present.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
