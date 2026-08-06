@@ -8,8 +8,11 @@
 # snapshots are pruned — a backup that has never been read is a rumour.
 set -euo pipefail
 
+# Deliberately OUTSIDE the deployment checkout: deploys refuse to run against
+# a dirty tree, and a checkout that is ever reset hard would take the
+# snapshots with it.
 DB_PATH="${SPAWN_DB_PATH:-/opt/spawn/server/spawn.db}"
-BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn/backups}"
+BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn-backups}"
 KEEP="${SPAWN_BACKUP_KEEP:-14}"
 
 usage() {
@@ -17,7 +20,7 @@ usage() {
 Usage: backup-db.sh [--db PATH] [--dir PATH] [--keep N]
 
   --db    SQLite database to snapshot   (default /opt/spawn/server/spawn.db)
-  --dir   Where snapshots are written   (default /opt/spawn/backups)
+  --dir   Where snapshots are written   (default /opt/spawn-backups)
   --keep  How many snapshots to retain  (default 14)
 
 Environment: SPAWN_DB_PATH, SPAWN_BACKUP_DIR, SPAWN_BACKUP_KEEP.

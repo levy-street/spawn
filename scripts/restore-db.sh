@@ -12,7 +12,7 @@ SNAPSHOT=""
 TARGET=""
 LIVE=0
 DB_PATH="${SPAWN_DB_PATH:-/opt/spawn/server/spawn.db}"
-BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn/backups}"
+BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn-backups}"
 
 usage() {
   cat <<'USAGE'

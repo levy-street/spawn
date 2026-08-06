@@ -8,7 +8,7 @@
 set -euo pipefail
 
 HOST="${SPAWN_BACKUP_HOST:-spawnd-prod}"
-REMOTE_DIR="${SPAWN_BACKUP_REMOTE_DIR:-/opt/spawn/backups}"
+REMOTE_DIR="${SPAWN_BACKUP_REMOTE_DIR:-/opt/spawn-backups}"
 LOCAL_DIR="${SPAWN_BACKUP_LOCAL_DIR:-$HOME/backups/spawn-prod}"
 KEEP="${SPAWN_BACKUP_KEEP_LOCAL:-30}"
 
