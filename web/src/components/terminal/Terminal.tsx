@@ -567,7 +567,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // to a byte budget, and TUI redraw churn dwarfs line-based sizing).
   const exactStreamRef = useRef(false);
   const invalidateScrollbackForResizeRef = useRef<() => void>(() => {});
+  const restoreScrollbackAfterResizeRef = useRef<() => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
+  // Lines between the reader's view and the bottom, captured before a
+  // reflow. A resize rewraps the overlay buffer, which moves every line
+  // number under the reader; without this the view collapses to the live
+  // edge and the overlay hides itself out from under them.
+  const scrollbackResizeAnchorRef = useRef<number | null>(null);
   const [scrollbackVisible, setScrollbackVisible] = useState(false);
   const [scrollbackReady, setScrollbackReady] = useState(false);
 
@@ -781,6 +787,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (scrollbackRenderInFlightRef.current) return;
       healScrollbackScrollState();
       const buffer = scrollbackTermRef.current?.buffer.active;
+      // A reflow in progress has not yet had the reader's position restored,
+      // and mid-reflow the viewport legitimately reads as "at the bottom".
+      // Hiding on that would snap the reader to the live screen while the
+      // overlay stays logically open — visibly a jump, and afterwards the
+      // wheel scrolls a terminal nobody can see.
+      if (scrollbackResizeAnchorRef.current !== null) return;
       const reveal = buffer ? buffer.baseY > 0 && buffer.viewportY < buffer.baseY : false;
       setScrollbackReadyState(reveal);
       if (reveal) rememberScrolledView();
@@ -1632,12 +1644,47 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // A resize changes checkpoint geometry, so any cached replay is laid out at
   // the old width. Drop the rendered copy and fetch a fresh checkpoint at the new
   // geometry instead of presenting stale-width history.
+  /**
+   * Put the reader back where they were reading after a reflow.
+   *
+   * Rewrapping renumbers every line, so the pre-resize viewport line means
+   * nothing afterwards. Distance from the bottom survives it well enough to
+   * keep the same text on screen, and — more importantly — keeps the reader
+   * off the live edge, which is what decides whether the overlay stays up.
+   */
+  const restoreScrollbackAfterResize = useCallback(() => {
+    const fromBottom = scrollbackResizeAnchorRef.current;
+    if (fromBottom === null) return;
+    const historyTerm = scrollbackTermRef.current;
+    if (!historyTerm) {
+      scrollbackResizeAnchorRef.current = null;
+      return;
+    }
+    const buffer = historyTerm.buffer.active;
+    // Never restore onto the live edge: landing there would hide the overlay
+    // and drop the reader into the live screen mid-resize.
+    const target = Math.max(0, Math.min(buffer.baseY - 1, buffer.baseY - fromBottom));
+    if (buffer.baseY > 0) historyTerm.scrollToLine(target);
+    scrollbackResizeAnchorRef.current = null;
+    updateScrollbackRevealRef.current(scrollbackOverlayRef.current as HTMLElement);
+  }, []);
+  restoreScrollbackAfterResizeRef.current = restoreScrollbackAfterResize;
+
   const invalidateScrollbackForResize = useCallback(() => {
     if (historyStreamActiveRef.current) {
       // Delta mode: committed history is flowing text — xterm reflows it on
       // resize with nothing refetched. Only the tail repaints.
+      const historyTerm = scrollbackTermRef.current;
+      if (scrollbackVisibleRef.current && historyTerm) {
+        const buffer = historyTerm.buffer.active;
+        scrollbackResizeAnchorRef.current = Math.max(0, buffer.baseY - buffer.viewportY);
+      }
       const { cols, rows } = lastSizeRef.current;
       committedHistoryRef.current?.resize(cols, rows);
+      // The reflow lands with xterm's own resize; restore once it has.
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => restoreScrollbackAfterResizeRef.current()),
+      );
       return;
     }
     scrollbackCacheDirtyRef.current = true;
