@@ -617,3 +617,25 @@ class Invite(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+
+
+class EmailLog(Base):
+    """One outbound email attempt, kept so an operator can see what was sent.
+
+    The body is stored with credentials redacted: password-reset and invite
+    links admit whoever holds them, and an audit trail that stores live
+    credentials is a liability rather than a record.
+    """
+
+    __tablename__ = "email_log"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    to_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_redacted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )

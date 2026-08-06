@@ -105,6 +105,7 @@ async def send_verification_email(session: AsyncSession, user: User) -> None:
         await send_email(
             to=user.email,
             subject="Verify your spawn email address",
+            kind="email_verify",
             body=(
                 "Confirm this address to finish setting up your spawn account:\n\n"
                 f"{link}\n\n"
@@ -140,6 +141,7 @@ async def request_password_reset(
             await send_email(
                 to=user.email,
                 subject="Reset your spawn password",
+                kind="password_reset",
                 body=(
                     "Someone asked to reset the password for this spawn account.\n\n"
                     f"{link}\n\n"

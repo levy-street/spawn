@@ -16,10 +16,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
+from ..config import get_settings
 from ..db import get_session
 from ..invites import create_invite, invite_state, invite_url
-from ..mail import send_email
-from ..models import Agent, BrowserDevice, Host, Invite, User
+from ..mail import mailer_ready, send_email
+from ..models import Agent, BrowserDevice, EmailLog, Host, Invite, User
 
 log = logging.getLogger(__name__)
 
@@ -55,9 +56,7 @@ async def list_users(
     _: User = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> list[schemas.AdminUserOut]:
-    users = (
-        (await session.execute(select(User).order_by(User.created_at.asc()))).scalars().all()
-    )
+    users = (await session.execute(select(User).order_by(User.created_at.asc()))).scalars().all()
 
     # One grouped query per relation rather than per user: this list is small
     # today and should not become N+1 the week it is not.
@@ -129,6 +128,7 @@ async def create_invite_endpoint(
             await send_email(
                 to=body.email,
                 subject="You're invited to spawn",
+                kind="invite",
                 body=(
                     "You have been invited to create an account on spawn.\n\n"
                     f"{url}\n\n"
@@ -157,3 +157,90 @@ async def revoke_invite(
         await session.commit()
         await session.refresh(invite)
     return _invite_out(invite)
+
+
+@router.get("/mail", response_model=schemas.AdminMailStatus)
+async def mail_status(_: User = Depends(require_admin)) -> schemas.AdminMailStatus:
+    settings = get_settings()
+    backend = settings.email_backend.strip().lower()
+    return schemas.AdminMailStatus(
+        backend=backend,
+        delivering=mailer_ready(),
+        from_address=settings.email_from,
+        smtp_host=settings.smtp_host or None,
+    )
+
+
+@router.get("/emails", response_model=list[schemas.AdminEmailOut])
+async def list_emails(
+    limit: int = 100,
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.AdminEmailOut]:
+    rows = (
+        (
+            await session.execute(
+                select(EmailLog).order_by(EmailLog.created_at.desc()).limit(max(1, min(limit, 500)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        schemas.AdminEmailOut(
+            id=row.id,
+            to_email=row.to_email,
+            subject=row.subject,
+            kind=row.kind,
+            status=row.status,
+            error=row.error,
+            body_redacted=row.body_redacted,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@router.post("/emails/test", response_model=schemas.AdminEmailOut)
+async def send_test_email(
+    body: schemas.AdminTestEmail,
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AdminEmailOut:
+    """Send a message to prove the mailer works, and surface the failure if not.
+
+    Delivery problems are otherwise invisible until a user cannot reset their
+    password, so this reports the transport error verbatim instead of the
+    deliberately vague message the public endpoints use.
+    """
+
+    recipient = body.to or admin.email
+    error: str | None = None
+    try:
+        await send_email(
+            to=recipient,
+            subject="spawn test email",
+            body=(
+                "This is a test message from your spawn deployment.\n\n"
+                "If you are reading it, outbound email works.\n"
+            ),
+            kind="test",
+        )
+    except Exception as exc:
+        error = str(exc)
+
+    row = (
+        await session.execute(select(EmailLog).order_by(EmailLog.created_at.desc()).limit(1))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=500, detail=error or "the mailer recorded nothing")
+    return schemas.AdminEmailOut(
+        id=row.id,
+        to_email=row.to_email,
+        subject=row.subject,
+        kind=row.kind,
+        status=row.status,
+        error=row.error,
+        body_redacted=row.body_redacted,
+        created_at=row.created_at,
+    )

@@ -481,7 +481,36 @@ export const AdminInviteSchema = z.object({
 });
 export type AdminInvite = z.infer<typeof AdminInviteSchema>;
 
+export const AdminMailStatusSchema = z.object({
+  backend: z.string(),
+  delivering: z.boolean(),
+  from_address: z.string(),
+  smtp_host: z.string().nullable().default(null),
+});
+export type AdminMailStatus = z.infer<typeof AdminMailStatusSchema>;
+
+export const AdminEmailSchema = z.object({
+  id: z.string().uuid(),
+  to_email: z.string(),
+  subject: z.string(),
+  kind: z.string(),
+  status: z.enum(["sent", "failed", "not_delivered"]),
+  error: z.string().nullable().default(null),
+  /** Stored with reset/invite credentials stripped — see mail.redact_credentials. */
+  body_redacted: z.string().default(""),
+  created_at: z.string(),
+});
+export type AdminEmail = z.infer<typeof AdminEmailSchema>;
+
 export const admin = {
+  mailStatus: () => api("/api/admin/mail", { method: "GET", schema: AdminMailStatusSchema }),
+  emails: () => api("/api/admin/emails", { method: "GET", schema: z.array(AdminEmailSchema) }),
+  sendTestEmail: (to?: string | null) =>
+    api("/api/admin/emails/test", {
+      method: "POST",
+      body: JSON.stringify({ to: to || null }),
+      schema: AdminEmailSchema,
+    }),
   users: () => api("/api/admin/users", { method: "GET", schema: z.array(AdminUserSchema) }),
   invites: () => api("/api/admin/invites", { method: "GET", schema: z.array(AdminInviteSchema) }),
   createInvite: (body: { email?: string | null; ttl_hours?: number | null }) =>

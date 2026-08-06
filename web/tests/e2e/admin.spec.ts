@@ -40,6 +40,43 @@ async function mockAdminApi(page: import("@playwright/test").Page, options: { is
       ],
     });
   });
+  await page.route("**/api/admin/mail", async (route) => {
+    if (!options.isAdmin) {
+      await route.fulfill({ status: 404, json: { detail: "not found" } });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      json: {
+        backend: "console",
+        delivering: false,
+        from_address: "spawn <no-reply@example.com>",
+        smtp_host: null,
+      },
+    });
+  });
+  await page.route("**/api/admin/emails", async (route) => {
+    if (!options.isAdmin) {
+      await route.fulfill({ status: 404, json: { detail: "not found" } });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      json: [
+        {
+          id: "00000000-0000-4000-8000-0000000000e1",
+          to_email: "friend@example.com",
+          subject: "You're invited to spawn",
+          kind: "invite",
+          status: "not_delivered",
+          error: "email backend is 'console' (logged, not sent)",
+          body_redacted:
+            "You have been invited to create an account on spawn.\n\nhttps://spawn.example/signup?invite=<redacted>\n",
+          created_at: "2026-08-06T12:00:00Z",
+        },
+      ],
+    });
+  });
   await page.route("**/api/admin/invites", async (route) => {
     if (!options.isAdmin) {
       await route.fulfill({ status: 404, json: { detail: "not found" } });
@@ -127,4 +164,23 @@ test("an invite link carries its code into signup", async ({ page }) => {
   expect(submitted[0]).toMatchObject({ email: "guest@example.com", invite: "abc123xyz" });
   // The server's refusal is surfaced rather than swallowed.
   await expect(page.getByText("this invite is not valid")).toBeVisible();
+});
+
+
+test("the email log shows delivery state without exposing credentials", async ({ page }) => {
+  await mockAdminApi(page, { isAdmin: true });
+  await page.goto("/admin");
+
+  // A deployment that only logs must say so rather than looking healthy.
+  const status = page.getByTestId("mail-status");
+  await expect(status).toContainText("Not delivering");
+  await expect(status).toContainText("console");
+
+  const log = page.getByTestId("admin-emails");
+  await expect(log).toContainText("friend@example.com");
+  await expect(log).toContainText("not delivered");
+
+  // Expanding a row shows the body with the invite code stripped out.
+  await log.getByText("You're invited to spawn").click();
+  await expect(page.getByText("invite=<redacted>")).toBeVisible();
 });

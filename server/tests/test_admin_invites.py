@@ -7,13 +7,17 @@ import pytest
 from spawn_server import mail
 from spawn_server.config import get_settings
 
+# Bound before any fixture patches the module attribute, so tests that want
+# the REAL mailer (to exercise logging) can reach past the capture stub.
+REAL_SEND_EMAIL = mail.send_email
+
 
 @pytest.fixture(autouse=True)
 def captured_mail(monkeypatch):
     sent: list[dict[str, str]] = []
 
-    async def fake_send(*, to: str, subject: str, body: str) -> None:
-        sent.append({"to": to, "subject": subject, "body": body})
+    async def fake_send(*, to: str, subject: str, body: str, kind: str = "other") -> None:
+        sent.append({"to": to, "subject": subject, "body": body, "kind": kind})
 
     monkeypatch.setattr(mail, "send_email", fake_send)
     import spawn_server.routes.account_recovery as recovery
@@ -180,3 +184,85 @@ async def test_configured_admin_email_is_promoted_on_login(client, monkeypatch):
     # And an address that is not configured stays ordinary.
     other = await _signup(client, "nobody@example.com")
     assert other.json()["user"]["is_admin"] is False
+
+
+async def test_every_send_is_logged_with_credentials_redacted(client, monkeypatch):
+    """The log answers "did that go out" without becoming a credential vault."""
+
+    # Exercise the real send_email (not the captured stub) against the console
+    # backend, which records but does not deliver.
+    monkeypatch.setattr(get_settings(), "email_backend", "console", raising=False)
+    import spawn_server.routes.account_recovery as recovery
+    import spawn_server.routes.admin as admin_routes
+
+    monkeypatch.setattr(recovery, "send_email", REAL_SEND_EMAIL)
+    monkeypatch.setattr(admin_routes, "send_email", REAL_SEND_EMAIL)
+
+    owner = await _signup(client, "owner@example.com")
+    headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+
+    created = await client.post(
+        "/api/admin/invites", json={"email": "friend@example.com"}, headers=headers
+    )
+    assert created.status_code == 200
+    real_url = created.json()["url"]
+    code = code_from_url(real_url)
+
+    logged = await client.get("/api/admin/emails", headers=headers)
+    assert logged.status_code == 200
+    rows = logged.json()
+    invite_rows = [row for row in rows if row["kind"] == "invite"]
+    assert len(invite_rows) == 1
+    entry = invite_rows[0]
+    assert entry["to_email"] == "friend@example.com"
+    # Console backend records the attempt as undelivered rather than claiming success.
+    assert entry["status"] == "not_delivered"
+    # The prose survives; the live credential does not.
+    assert "invited to create an account" in entry["body_redacted"]
+    assert code not in entry["body_redacted"]
+    assert "invite=<redacted>" in entry["body_redacted"]
+
+    # Signup verification mail is logged too, and its token is stripped.
+    verify_rows = [row for row in rows if row["kind"] == "email_verify"]
+    assert verify_rows and "token=<redacted>" in verify_rows[0]["body_redacted"]
+
+
+async def test_mail_status_and_test_send_report_the_truth(client, monkeypatch):
+
+    monkeypatch.setattr(get_settings(), "email_backend", "console", raising=False)
+    import spawn_server.routes.admin as admin_routes
+
+    monkeypatch.setattr(admin_routes, "send_email", REAL_SEND_EMAIL)
+
+    owner = await _signup(client, "owner@example.com")
+    headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+
+    status = await client.get("/api/admin/mail", headers=headers)
+    assert status.status_code == 200
+    # Console is honest about not delivering rather than reporting healthy.
+    assert status.json() == {
+        "backend": "console",
+        "delivering": False,
+        "from_address": status.json()["from_address"],
+        "smtp_host": None,
+    }
+
+    sent = await client.post("/api/admin/emails/test", json={}, headers=headers)
+    assert sent.status_code == 200
+    assert sent.json()["kind"] == "test"
+    assert sent.json()["to_email"] == "owner@example.com"
+    assert sent.json()["status"] == "not_delivered"
+
+
+async def test_email_log_is_admin_only(client):
+    owner = await _signup(client, "owner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+    invite = (await client.post("/api/admin/invites", json={}, headers=owner_headers)).json()
+    guest = await _signup(client, "guest@example.com", invite=code_from_url(invite["url"]))
+    guest_headers = {"Authorization": f"Bearer {guest.json()['access_token']}"}
+
+    for path in ("/api/admin/emails", "/api/admin/mail"):
+        assert (await client.get(path, headers=guest_headers)).status_code == 404
+    assert (
+        await client.post("/api/admin/emails/test", json={}, headers=guest_headers)
+    ).status_code == 404

@@ -2,11 +2,11 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, Fragment, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { type AdminInvite, ApiError, admin } from "@/lib/api";
+import { type AdminEmail, type AdminInvite, ApiError, admin } from "@/lib/api";
 
 const STATE_STYLE: Record<AdminInvite["state"], string> = {
   pending: "border-emerald-600/50 text-emerald-600 dark:text-emerald-400",
@@ -25,7 +25,156 @@ export default function AdminPage() {
     <div className="space-y-10">
       <Invites />
       <Users />
+      <Emails />
     </div>
+  );
+}
+
+const EMAIL_STATUS_STYLE: Record<AdminEmail["status"], string> = {
+  sent: "border-emerald-600/50 text-emerald-600 dark:text-emerald-400",
+  failed: "border-destructive/60 text-destructive",
+  not_delivered: "border-amber-600/50 text-amber-600 dark:text-amber-400",
+};
+
+function Emails() {
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["admin", "mail"], queryFn: admin.mailStatus });
+  const emails = useQuery({ queryKey: ["admin", "emails"], queryFn: admin.emails });
+  const [note, setNote] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+
+  const test = useMutation({
+    mutationFn: () => admin.sendTestEmail(null),
+    onSuccess: (row) => {
+      setNote(
+        row.status === "sent"
+          ? `Sent to ${row.to_email}.`
+          : `Not delivered: ${row.error ?? "unknown reason"}`,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["admin", "emails"] });
+    },
+    onError: (cause) =>
+      setNote(cause instanceof ApiError ? cause.message : "Could not send a test email"),
+  });
+
+  const delivering = status.data?.delivering ?? false;
+
+  return (
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-lg font-semibold">Email</h2>
+        <p className="text-sm text-muted-foreground">
+          Every message this deployment tried to send. Reset and invite links are stored with their
+          codes stripped, so this log cannot be used to take over an account.
+        </p>
+      </div>
+
+      <div
+        className={`flex flex-wrap items-center justify-between gap-3 rounded-md border p-3 ${
+          delivering ? "border-border" : "border-amber-600/50"
+        }`}
+        data-testid="mail-status"
+      >
+        <div className="min-w-0 text-sm">
+          {status.isLoading ? (
+            <span className="text-muted-foreground">Checking mail configuration…</span>
+          ) : delivering ? (
+            <>
+              <span className="font-medium">Delivering</span>
+              <span className="text-muted-foreground">
+                {" "}
+                via {status.data?.smtp_host} as {status.data?.from_address}
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="font-medium">Not delivering</span>
+              <span className="text-muted-foreground">
+                {" "}
+                — backend is <code className="font-mono">{status.data?.backend}</code>. Password
+                resets and invitations are recorded but never sent. Set SPAWN_SMTP_HOST to turn
+                delivery on.
+              </span>
+            </>
+          )}
+          {note !== null && (
+            <p className="mt-1" role="status">
+              {note}
+            </p>
+          )}
+        </div>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={test.isPending}
+          onClick={() => test.mutate()}
+        >
+          {test.isPending ? "Sending…" : "Send test email"}
+        </Button>
+      </div>
+
+      <div className="overflow-x-auto rounded-md border border-border">
+        <table className="w-full min-w-[46rem] text-sm">
+          <thead className="border-b border-border text-left text-xs text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 font-medium">When</th>
+              <th className="px-3 py-2 font-medium">To</th>
+              <th className="px-3 py-2 font-medium">Subject</th>
+              <th className="px-3 py-2 font-medium">Kind</th>
+              <th className="px-3 py-2 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border" data-testid="admin-emails">
+            {emails.isLoading && (
+              <tr>
+                <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
+                  Loading…
+                </td>
+              </tr>
+            )}
+            {!emails.isLoading && (emails.data ?? []).length === 0 && (
+              <tr>
+                <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
+                  No email sent yet.
+                </td>
+              </tr>
+            )}
+            {(emails.data ?? []).map((email) => (
+              <Fragment key={email.id}>
+                <tr
+                  className="cursor-pointer hover:bg-accent/40"
+                  onClick={() => setOpen(open === email.id ? null : email.id)}
+                >
+                  <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                    {when(email.created_at)}
+                  </td>
+                  <td className="px-3 py-2">{email.to_email}</td>
+                  <td className="px-3 py-2">{email.subject}</td>
+                  <td className="px-3 py-2 text-muted-foreground">{email.kind}</td>
+                  <td className="px-3 py-2">
+                    <span
+                      className={`rounded border px-1.5 py-0.5 text-[11px] ${EMAIL_STATUS_STYLE[email.status]}`}
+                    >
+                      {email.status.replace("_", " ")}
+                    </span>
+                  </td>
+                </tr>
+                {open === email.id && (
+                  <tr>
+                    <td className="px-3 pb-3 text-xs" colSpan={5}>
+                      {email.error && <p className="mb-2 text-destructive">{email.error}</p>}
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted p-2 font-mono">
+                        {email.body_redacted || "(body not recorded)"}
+                      </pre>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 

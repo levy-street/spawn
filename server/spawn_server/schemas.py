@@ -162,6 +162,32 @@ class AdminInviteOut(BaseModel):
     url: str | None = None
 
 
+class AdminMailStatus(BaseModel):
+    backend: str
+    # False when the backend only logs (console) or is switched off.
+    delivering: bool
+    from_address: str
+    smtp_host: str | None = None
+
+
+class AdminEmailOut(BaseModel):
+    id: str
+    to_email: str
+    subject: str
+    kind: str
+    status: Literal["sent", "failed", "not_delivered"]
+    error: str | None = None
+    # Credentials are stripped before storage; see mail.redact_credentials.
+    body_redacted: str = ""
+    created_at: datetime
+
+
+class AdminTestEmail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    to: EmailStr | None = None
+
+
 class AuthProviderOut(BaseModel):
     id: Literal["google", "microsoft", "github"]
     name: str
