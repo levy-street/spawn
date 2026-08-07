@@ -197,11 +197,10 @@ describe("CommittedHistoryOverlay", () => {
     const writesBeforeReveal = term.writes.length;
     overlay.reveal();
     term.flush();
-    const painted = term.writes
-      .slice(writesBeforeReveal)
-      .join("")
-      .split("SCREEN").length - 1;
+    const painted = term.writes.slice(writesBeforeReveal).join("").split("SCREEN").length - 1;
     expect(painted).toBeLessThanOrEqual(1);
+    // The overlay reported a render rather than stalling mid-rebuild.
+    expect(rendered).toBeGreaterThan(0);
   });
 });
 
@@ -215,5 +214,4 @@ describe("decodeHistoryDelta", () => {
   test("rejects malformed input", () => {
     expect(decodeHistoryDelta("not b64!!")).toBeNull();
   });
-
 });
