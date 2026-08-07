@@ -234,7 +234,10 @@ export class CommittedHistoryOverlay {
 
   #unanchorAndReseed(): void {
     this.#anchor = null;
-    this.#tail = null;
+    // #tail is deliberately NOT cleared here. A painted tail may still be on
+    // screen, and forgetting it lets the next reveal paint a second copy on
+    // top while the seed is still in flight. The seed's reset clears both;
+    // callers that have already removed the tail themselves null it first.
     this.#requestSeed();
   }
 
@@ -255,10 +258,17 @@ export class CommittedHistoryOverlay {
       const buffer = term.buffer.active;
       const screenRow = tail.line - buffer.baseY + 1;
       if (screenRow < 1 || screenRow > term.rows) {
-        // The tail start left the screen region — invariants broken (e.g. a
-        // huge write raced the erase). Rebuild rather than corrupt.
+        // The tail no longer begins on the addressable screen: painting a
+        // screen-tall tail scrolls its own start away, and a narrower overlay
+        // wraps it taller still. Cursor addressing cannot reach it.
+        //
+        // Returning "" here left it in the buffer, where it stopped being a
+        // transient overlay artifact and became permanent history — and since
+        // the record was cleared, the next reveal painted a second copy below
+        // it, compounding one screenful per open/close. Wipe in-band (screen
+        // AND scrollback) so nothing survives, then rebuild from a seed.
         this.#unanchorAndReseed();
-        return "";
+        return "\x1b[H\x1b[2J\x1b[3J";
       }
       return `\x1b[${screenRow};${tail.col + 1}H\x1b[0J`;
     };

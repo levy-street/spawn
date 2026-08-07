@@ -167,6 +167,42 @@ describe("CommittedHistoryOverlay", () => {
     term.flush();
     expect(term.writes.at(-1)).toBe("\x1b[1;13H\x1b[0J");
   });
+
+  test("an unerasable tail is wiped, never left behind for the next reveal", () => {
+    // The reported failure: right-click snapped to the bottom, and scrolling
+    // back showed three viewports of repeated screen before history resumed.
+    overlay.seed("hist", { epoch: "7", offset: 100 }, { cols: 40, rows: 10 });
+    term.flush();
+
+    overlay.reveal();
+    term.flush();
+    expect(term.writes.at(-1)).toContain("SCREEN");
+
+    // Painting a screen-tall tail scrolls the buffer, so the tail's own start
+    // is no longer addressable by cursor row — the same thing a narrower
+    // overlay does by wrapping the tail taller than the viewport.
+    term.buffer.active.baseY = 50;
+
+    const writesBefore = term.writes.length;
+    overlay.conceal();
+    term.flush();
+    const eraseAttempt = term.writes.slice(writesBefore).join("");
+
+    // It cannot be erased in place, so the buffer must be cleared rather than
+    // leaving the live screen promoted to permanent history.
+    expect(eraseAttempt).toContain("\x1b[3J");
+    expect(seedRequests).toBeGreaterThan(0);
+
+    // And reopening must not stack a second copy on top of a stale one.
+    const writesBeforeReveal = term.writes.length;
+    overlay.reveal();
+    term.flush();
+    const painted = term.writes
+      .slice(writesBeforeReveal)
+      .join("")
+      .split("SCREEN").length - 1;
+    expect(painted).toBeLessThanOrEqual(1);
+  });
 });
 
 describe("decodeHistoryDelta", () => {
@@ -179,4 +215,5 @@ describe("decodeHistoryDelta", () => {
   test("rejects malformed input", () => {
     expect(decodeHistoryDelta("not b64!!")).toBeNull();
   });
+
 });
