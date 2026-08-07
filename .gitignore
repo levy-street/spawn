@@ -56,3 +56,7 @@ spawn.log
 # Local agent workspace: worktrees, settings, and mailbox state. Never
 # something a clone or a contributor's `git add -A` should pick up.
 .claude/
+
+# Downloaded credential files: never let `git add -A` publish one.
+*credentials.csv
+*.pem
