@@ -86,7 +86,25 @@ _dmarc.example.com     TXT  "v=DMARC1; p=none; rua=mailto:you@example.com"
 If a TXT record already exists on the apex, merge the SPF into it rather than
 adding a second one — two SPF records is a hard failure, not a warning.
 
-### 3. Leave the sandbox
+### 3. Leave the sandbox (check first — you may already have)
+
+Production access is granted per AWS account **and per region**, as are domain
+identities and SMTP credentials. An account that left the sandbox for another
+product in one region is still sandboxed everywhere else, which is an easy
+half-day to lose. Check before requesting:
+
+```
+aws sesv2 get-account --region <region> --query ProductionAccessEnabled
+aws sesv2 list-email-identities --region <region> --query 'EmailIdentities[].IdentityName'
+```
+
+If another region already has it, point this deployment there instead of
+filing a second request — the server's own region does not constrain which
+SES region it talks to; only `SPAWN_SMTP_HOST` changes. Generate the SMTP
+credentials in whichever region you settle on: the password is derived using
+the region and does not carry across.
+
+If you do need to request it:
 
 **SES → Account dashboard → Request production access.** Vague requests get
 rejected; say specifically what you send and how you handle bounces. For a
