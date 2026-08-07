@@ -98,7 +98,9 @@ def _send_smtp(message: EmailMessage) -> None:
             pass
 
 
-async def send_email(*, to: str, subject: str, body: str, kind: str = "other") -> None:
+async def send_email(
+    *, to: str, subject: str, body: str, kind: str = "other", html_body: str | None = None
+) -> None:
     """Deliver one message, or raise.
 
     Every attempt is recorded (sent, failed, or never delivered because the
@@ -128,7 +130,18 @@ async def send_email(*, to: str, subject: str, body: str, kind: str = "other") -
     message["From"] = settings.email_from
     message["To"] = to
     message["Subject"] = subject
+    # Transactional mail should say so: these stop out-of-office autoresponders
+    # and ticketing systems from replying to a no-reply address, and mark the
+    # message as machine-generated for filters that look.
+    message["Auto-Submitted"] = "auto-generated"
+    message["X-Auto-Response-Suppress"] = "All"
+    reply_to = settings.email_reply_to.strip()
+    if reply_to:
+        message["Reply-To"] = reply_to
     message.set_content(body)
+    if html_body:
+        # multipart/alternative: text first, HTML as the richer alternative.
+        message.add_alternative(html_body, subtype="html")
 
     if backend == "console":
         # Never quietly acceptable in production: an operator reading logs is

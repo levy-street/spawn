@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, email_templates, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..invites import create_invite, invite_state, invite_url
@@ -25,6 +25,11 @@ from ..models import Agent, BrowserDevice, EmailLog, Host, Invite, User
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+def _site_url() -> str:
+    settings = get_settings()
+    return (settings.web_url or settings.public_url).rstrip("/")
 
 
 async def require_admin(user: User = Depends(auth.current_user)) -> User:
@@ -124,16 +129,14 @@ async def create_invite_endpoint(
 
     url = invite_url(code)
     if body.email:
+        rendered = email_templates.invite(link=url, site_url=_site_url(), inviter=admin.email)
         try:
             await send_email(
                 to=body.email,
-                subject="You're invited to spawn",
+                subject=rendered.subject,
+                body=rendered.text,
+                html_body=rendered.html,
                 kind="invite",
-                body=(
-                    "You have been invited to create an account on spawn.\n\n"
-                    f"{url}\n\n"
-                    "The link works once and expires with the invite.\n"
-                ),
             )
         except Exception as exc:
             # The URL is returned regardless: the admin can always hand it over
@@ -216,14 +219,13 @@ async def send_test_email(
 
     recipient = body.to or admin.email
     error: str | None = None
+    rendered = email_templates.test_email(site_url=_site_url())
     try:
         await send_email(
             to=recipient,
-            subject="spawn test email",
-            body=(
-                "This is a test message from your spawn deployment.\n\n"
-                "If you are reading it, outbound email works.\n"
-            ),
+            subject=rendered.subject,
+            body=rendered.text,
+            html_body=rendered.html,
             kind="test",
         )
     except Exception as exc:

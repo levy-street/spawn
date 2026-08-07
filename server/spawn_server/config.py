@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # only — bodies contain live credentials); "disabled" refuses to send.
     email_backend: str = Field(default="console")
     email_from: str = Field(default="spawn <no-reply@localhost>")
+    # Where replies should go. Empty means recipients reply into the void,
+    # which is a poor experience on an account-security email.
+    email_reply_to: str = Field(default="")
     smtp_host: str = Field(default="")
     smtp_port: int = Field(default=587)
     smtp_username: str = Field(default="")

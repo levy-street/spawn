@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, rate_limit, schemas
+from .. import auth, email_templates, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..mail import send_email
@@ -101,17 +101,14 @@ async def send_verification_email(session: AsyncSession, user: User) -> None:
 
     token = await issue_email_token(session, user, PURPOSE_EMAIL_VERIFY, VERIFY_TTL)
     link = f"{_web_base()}/verify-email?token={token}"
+    rendered = email_templates.verify_email(link=link, site_url=_web_base())
     try:
         await send_email(
             to=user.email,
-            subject="Verify your spawn email address",
+            subject=rendered.subject,
+            body=rendered.text,
+            html_body=rendered.html,
             kind="email_verify",
-            body=(
-                "Confirm this address to finish setting up your spawn account:\n\n"
-                f"{link}\n\n"
-                "The link works once and expires in two days.\n"
-                "If you did not create a spawn account, ignore this message.\n"
-            ),
         )
     except Exception as exc:
         # Signup must still succeed: the user can request another mail, and
@@ -137,19 +134,14 @@ async def request_password_reset(
         token = await issue_email_token(session, user, PURPOSE_PASSWORD_RESET, RESET_TTL)
         await session.commit()
         link = f"{_web_base()}/reset-password?token={token}"
+        rendered = email_templates.password_reset(link=link, site_url=_web_base())
         try:
             await send_email(
                 to=user.email,
-                subject="Reset your spawn password",
+                subject=rendered.subject,
+                body=rendered.text,
+                html_body=rendered.html,
                 kind="password_reset",
-                body=(
-                    "Someone asked to reset the password for this spawn account.\n\n"
-                    f"{link}\n\n"
-                    "The link works once and expires in one hour. Using it signs\n"
-                    "out every device currently signed in to this account.\n"
-                    "If this was not you, no action is needed — the password is\n"
-                    "unchanged until the link is used.\n"
-                ),
             )
         except Exception as exc:
             # Swallowed on purpose: a send failure must not turn into a signal

@@ -14,8 +14,17 @@ def captured_mail(monkeypatch):
 
     sent: list[dict[str, str]] = []
 
-    async def fake_send(*, to: str, subject: str, body: str, kind: str = "other") -> None:
-        sent.append({"to": to, "subject": subject, "body": body, "kind": kind})
+    async def fake_send(
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        kind: str = "other",
+        html_body: str | None = None,
+    ) -> None:
+        sent.append(
+            {"to": to, "subject": subject, "body": body, "kind": kind, "html": html_body or ""}
+        )
 
     monkeypatch.setattr(mail, "send_email", fake_send)
     # The routes import the symbol directly.

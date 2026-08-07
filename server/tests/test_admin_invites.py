@@ -16,8 +16,17 @@ REAL_SEND_EMAIL = mail.send_email
 def captured_mail(monkeypatch):
     sent: list[dict[str, str]] = []
 
-    async def fake_send(*, to: str, subject: str, body: str, kind: str = "other") -> None:
-        sent.append({"to": to, "subject": subject, "body": body, "kind": kind})
+    async def fake_send(
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        kind: str = "other",
+        html_body: str | None = None,
+    ) -> None:
+        sent.append(
+            {"to": to, "subject": subject, "body": body, "kind": kind, "html": html_body or ""}
+        )
 
     monkeypatch.setattr(mail, "send_email", fake_send)
     import spawn_server.routes.account_recovery as recovery
@@ -218,7 +227,7 @@ async def test_every_send_is_logged_with_credentials_redacted(client, monkeypatc
     # Console backend records the attempt as undelivered rather than claiming success.
     assert entry["status"] == "not_delivered"
     # The prose survives; the live credential does not.
-    assert "invited to create an account" in entry["body_redacted"]
+    assert "invitation works once" in entry["body_redacted"]
     assert code not in entry["body_redacted"]
     assert "invite=<redacted>" in entry["body_redacted"]
 
