@@ -25,7 +25,7 @@ import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { NAV } from "@/components/nav/BottomTabs";
 import { ScreenIcon } from "@/components/screens/ScreenIcon";
 import { openSettings } from "@/components/settings/settings-dialog-store";
-import { useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
+import { type AgentConnState, useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
 import {
   DropdownMenu,
   type DropdownMenuHandle,
@@ -476,28 +476,32 @@ function agentRecency(agent: Agent): number {
   return Number.isFinite(time) ? time : 0;
 }
 
-/** Small dot showing whether this browser currently holds a live connection to
- *  the agent (via the warm terminal pool): solid = viewing now, hollow = warm
- *  in the background, amber pulse = connecting. Absent when not connected. */
-function PoolConnDot({ agentId }: { agentId: string }) {
-  const state = useAgentConnState(agentId);
-  if (state === "off") return null;
+const CONN_LABEL: Record<Exclude<AgentConnState, "off">, string> = {
+  connected: "Connected",
+  warm: "Warm — connected in the background",
+  connecting: "Connecting…",
+};
+
+/**
+ * Whether this browser holds a live connection to the agent, as an edge marker
+ * on the row rather than a dot on the icon.
+ *
+ * The icon already carries the activity dot, and two 8px circles stacked on one
+ * 16px glyph read as a single smudge — worse, they encode unrelated things
+ * (what the agent is doing vs whether we are attached to it) in the same shape
+ * and nearly the same colour. A bar on the row edge is a different axis
+ * entirely, so neither has to be told apart from the other.
+ */
+function PoolConnMarker({ state }: { state: Exclude<AgentConnState, "off"> }) {
   return (
     <span
-      title={
-        state === "connected"
-          ? "Connected"
-          : state === "warm"
-            ? "Warm — connected in the background"
-            : "Connecting…"
-      }
+      aria-hidden
+      title={CONN_LABEL[state]}
       className={cn(
-        "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
-        state === "connected"
-          ? "bg-emerald-500"
-          : state === "warm"
-            ? "bg-emerald-500/40"
-            : "animate-pulse bg-amber-400",
+        "pointer-events-none absolute left-0 top-1/2 w-[3px] -translate-y-1/2 rounded-r-full transition-all",
+        state === "connecting" ? "h-3 animate-pulse bg-amber-400" : "h-5",
+        state === "connected" && "bg-emerald-500",
+        state === "warm" && "bg-emerald-500/45",
       )}
     />
   );
@@ -527,6 +531,8 @@ function AgentRow({
   onDelete: () => void;
 }) {
   const menuHandle = useRef<DropdownMenuHandle>(null);
+  const conn = useAgentConnState(agent.id);
+  const attached = conn === "connected" || conn === "warm";
   return (
     <li
       className="group/agentrow relative my-0.5"
@@ -540,7 +546,9 @@ function AgentRow({
       }
     >
       <RailTooltip
-        label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}`}
+        label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}${
+          conn === "off" ? "" : ` · ${CONN_LABEL[conn]}`
+        }`}
         disabled={!collapsed}
       >
         <Link
@@ -550,13 +558,19 @@ function AgentRow({
           onDragStart={(event) => {
             setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
           }}
-          className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
+          className={cn(
+            rowClass(active),
+            "h-10",
+            !collapsed && "pr-7",
+            // An attached agent is one you are already holding open; let it
+            // read at full strength instead of the resting muted tone.
+            attached && !active && "text-foreground",
+          )}
         >
           <IconSlot>
             <span className="relative">
               <AgentKindIcon agent={agent} />
               <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
-              <PoolConnDot agentId={agent.id} />
             </span>
           </IconSlot>
           <RowLabel collapsed={collapsed}>
@@ -572,6 +586,7 @@ function AgentRow({
           </RowLabel>
         </Link>
       </RailTooltip>
+      {conn !== "off" && <PoolConnMarker state={conn} />}
       {!collapsed && (
         <DropdownMenu
           ref={menuHandle}
