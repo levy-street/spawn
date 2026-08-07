@@ -6,25 +6,29 @@ chroma — and the values below are those same tokens converted to hex, because
 email has no oklch and no custom properties. Keep the two in step: if a token
 moves there, move it here.
 
-Email rendering is also a hostile environment, and the structural rules follow
-from that rather than from taste:
+Email rendering is a hostile environment, and the structure follows from that
+rather than from taste:
 
 - Tables for layout, inline styles for anything that must survive. Gmail on a
   non-Gmail account strips <style> entirely, so the design ships inline and
   <style> only defends it.
-- No external images. The wordmark is built from a table cell and a character,
-  so nothing breaks when images are blocked — which for a security email is
-  the default, not the exception.
+- No external images. The wordmark is a table cell and a character, so nothing
+  breaks when images are blocked — which for a security email is the default,
+  not the exception.
 - Every message is multipart: a real plain-text part, not a stripped-tag
   afterthought, because plenty of people read mail as text and every spam
   filter reads it that way.
 - The action is always available as a bare URL as well as a button. Buttons
   fail; a link the reader can copy always works.
 
-On being dark: the app is dark-only, so the mail is too, and it declares that
-with `color-scheme: dark` rather than leaving clients to guess. Clients that
-re-tint mail (Outlook.com) tag what they changed with data-ogsc/data-ogsb, and
-the <style> block claims those back.
+On being dark in a light client: the message is one self-contained dark card
+on an unpainted canvas, never a dark canvas. Painting the canvas is the
+tempting version and it looks wrong everywhere it half-works — a light client
+renders a black band jammed edge-to-edge into a white pane, and anything
+sitting outside the card (a wordmark, a footer) turns invisible the moment a
+client drops that background, which Gmail does routinely by deleting <body>.
+Leaving the canvas alone costs nothing in a dark client and reads as a
+deliberate card in a light one, so every pixel we colour is inside the border.
 """
 
 from __future__ import annotations
@@ -35,23 +39,36 @@ from dataclasses import dataclass
 BRAND = "spawn"
 
 # --- spawn tokens, transcribed ----------------------------------------------
-# Converted from web/src/app/globals.css @theme; the marketing pages use the
-# same hexes literally (bg-[#080808], bg-[#0d0d0d]).
-BG = "#080808"  # page
+# Converted from web/src/app/globals.css @theme; the marketing pages use these
+# same hexes literally (bg-[#0d0d0d], bg-black, text-zinc-300).
 CARD = "#0d0d0d"  # --color-card, oklch(0.16 0 0)
-WELL = "#050505"  # inset code/terminal surface
+CHROME = "#0a0a0a"  # --color-terminal-bg; the header/footer bands
+WELL = "#000000"  # bg-black, the app's code/terminal boxes
 BORDER = "#262626"  # --color-border, oklch(0.27 0 0)
+INK = "#080808"  # the app's page colour, used for text on the light button
 FG = "#f5f5f5"  # --color-foreground, oklch(0.97 0 0)
 BODY = "#d4d4d8"  # zinc-300, the app's body copy on dark
 MUTED = "#a1a1aa"  # zinc-400
 FAINT = "#71717a"  # zinc-500
 
-# Semantic accents, matching Badge's variants and the landing page's eyebrow
-# labels. These are never the brand colour — spawn has no brand colour, it has
-# neutrals plus meaning.
-EMERALD = "#6ee7b7"  # emerald-300 — the `$` prompt, success
-SKY = "#7dd3fc"  # sky-300 — informational
-AMBER = "#fcd34d"  # amber-300 — security, attention
+
+@dataclass(frozen=True)
+class Accent:
+    """One Badge variant, flattened.
+
+    The app writes these as `bg-emerald-500/10 border-emerald-500/25
+    text-emerald-400`. Email has no alpha compositing worth relying on, so the
+    translucent pair is precomputed over CARD.
+    """
+
+    text: str
+    chip_bg: str
+    chip_border: str
+
+
+EMERALD = Accent("#34d399", "#0d1e19", "#0e382a")  # success — the `$` prompt
+SKY = Accent("#38bdf8", "#0d1c23", "#0d3344")  # informational
+AMBER = Accent("#fbbf24", "#241c0d", "#47310c")  # security, attention
 
 SANS = (
     "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,"
@@ -67,19 +84,40 @@ class RenderedEmail:
     html: str
 
 
-def _wordmark() -> str:
-    """The app's lockup without an image: a bordered square holding a mono `$`,
-    then the wordmark. Mirrors the install-command motif on the landing page.
-    Outlook squares off the corners; that is the whole degradation."""
+def _header(*, eyebrow: str, accent: Accent) -> str:
+    """The app's own header: wordmark left, bordered chip right.
+
+    Same lockup as the admin dashboard (`spawn` beside an `admin` chip), and
+    the chip is the Badge component. The `$` stands in for the icon so the
+    header survives blocked images.
+    """
 
     return f"""
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
       <tr>
-        <td width="30" height="30" align="center" valign="middle" bgcolor="#000000"
-            style="width:30px;height:30px;background-color:#000000;border:1px solid {BORDER};border-radius:8px;
-                   font-family:{MONO};font-size:14px;font-weight:700;color:{EMERALD};line-height:30px;">$</td>
-        <td style="padding-left:10px;font-family:{SANS};font-size:17px;font-weight:600;
-                   letter-spacing:-0.01em;color:{FG};">{BRAND}</td>
+        <td>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td width="26" height="26" align="center" valign="middle" bgcolor="{WELL}"
+                  style="width:26px;height:26px;background-color:{WELL};border:1px solid {BORDER};
+                         border-radius:7px;font-family:{MONO};font-size:13px;font-weight:700;
+                         color:{EMERALD.text};line-height:26px;">$</td>
+              <td style="padding-left:9px;font-family:{SANS};font-size:16px;font-weight:600;
+                         letter-spacing:-0.01em;color:{FG};">{BRAND}</td>
+            </tr>
+          </table>
+        </td>
+        <td align="right">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="right">
+            <tr>
+              <td bgcolor="{accent.chip_bg}"
+                  style="background-color:{accent.chip_bg};border:1px solid {accent.chip_border};
+                         border-radius:999px;padding:3px 10px;font-family:{SANS};font-size:11px;
+                         font-weight:500;line-height:16px;color:{accent.text};
+                         white-space:nowrap;">{html.escape(eyebrow)}</td>
+            </tr>
+          </table>
+        </td>
       </tr>
     </table>
     """
@@ -89,7 +127,7 @@ def _layout(
     *,
     preheader: str,
     eyebrow: str,
-    accent: str,
+    accent: Accent,
     heading: str,
     paragraphs: list[str],
     action: tuple[str, str] | None,
@@ -119,19 +157,20 @@ def _layout(
             <td align="center" bgcolor="{FG}" style="background-color:{FG};border-radius:8px;">
               <a href="{safe_url}" class="sp-btn"
                  style="display:inline-block;padding:12px 22px;font-family:{SANS};font-size:15px;
-                        font-weight:600;color:{BG};text-decoration:none;mso-padding-alt:0;">{html.escape(label)}</a>
+                        font-weight:600;color:{INK};text-decoration:none;mso-padding-alt:0;">{html.escape(label)}</a>
             </td>
           </tr>
         </table>
 
         <!-- Fallback: the same link, plain, in the app's code-well styling. -->
-        <p class="sp-faint" style="margin:26px 0 8px;font-family:{SANS};font-size:12px;line-height:18px;color:{FAINT};">
+        <p class="sp-faint" style="margin:24px 0 8px;font-family:{SANS};font-size:12px;
+                                   line-height:18px;color:{FAINT};">
           Or paste this link into your browser
         </p>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
           <tr>
             <td class="sp-well" bgcolor="{WELL}"
-                style="background-color:{WELL};border:1px solid {BORDER};border-radius:8px;padding:12px 14px;">
+                style="background-color:{WELL};border:1px solid {BORDER};border-radius:8px;padding:11px 13px;">
               <a href="{safe_url}" class="sp-mono"
                  style="font-family:{MONO};font-size:12px;line-height:20px;color:{BODY};
                         text-decoration:none;word-break:break-all;">{safe_url}</a>
@@ -142,11 +181,13 @@ def _layout(
 
     note = (
         f"""
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 0;">
-          <tr><td style="border-top:1px solid {BORDER};font-size:0;line-height:0;">&nbsp;</td></tr>
-        </table>
-        <p class="sp-faint" style="margin:16px 0 0;font-family:{SANS};font-size:12px;line-height:19px;
-                                   mso-line-height-rule:exactly;color:{FAINT};">{footnote}</p>
+          <tr>
+            <td class="sp-card" bgcolor="{CARD}"
+                style="background-color:{CARD};border-top:1px solid {BORDER};padding:18px 26px;">
+              <p class="sp-faint" style="margin:0;font-family:{SANS};font-size:12px;line-height:19px;
+                                         mso-line-height-rule:exactly;color:{FAINT};">{footnote}</p>
+            </td>
+          </tr>
         """
         if footnote
         else ""
@@ -157,64 +198,63 @@ def _layout(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<!-- The app is dark-only. Say so, so clients stop guessing and stop inverting. -->
+<!-- The card is already dark. Say so, so clients stop guessing and stop inverting. -->
 <meta name="color-scheme" content="dark">
 <meta name="supported-color-schemes" content="dark">
 <title>{html.escape(heading)}</title>
 <style>
   /* Outlook.com re-tints mail and tags what it touched with data-ogsc (text)
      and data-ogsb (background). Claim our colours back. */
-  [data-ogsc] .sp-bg, [data-ogsb] .sp-bg {{ background-color:{BG} !important; }}
   [data-ogsc] .sp-card, [data-ogsb] .sp-card {{ background-color:{CARD} !important; }}
+  [data-ogsc] .sp-chrome, [data-ogsb] .sp-chrome {{ background-color:{CHROME} !important; }}
   [data-ogsc] .sp-well, [data-ogsb] .sp-well {{ background-color:{WELL} !important; }}
   [data-ogsc] .sp-head {{ color:{FG} !important; }}
   [data-ogsc] .sp-body, [data-ogsc] .sp-mono {{ color:{BODY} !important; }}
   [data-ogsc] .sp-faint {{ color:{FAINT} !important; }}
   [data-ogsc] .sp-link {{ color:{MUTED} !important; }}
-  [data-ogsc] .sp-btn {{ color:{BG} !important; }}
-  [data-ogsc] .sp-eyebrow {{ color:{accent} !important; }}
-  /* Every surface carries its own bgcolor inline, so a client that forces a
-     light canvas changes the gutter and nothing else. */
+  [data-ogsc] .sp-btn {{ color:{INK} !important; }}
   @media (max-width:620px) {{
-    .sp-card {{ padding:22px !important; }}
-    .sp-gutter {{ padding:24px 12px !important; }}
+    .sp-pad {{ padding:22px 18px !important; }}
+    .sp-gutter {{ padding:20px 10px !important; }}
   }}
 </style>
 </head>
-<body class="sp-bg" style="margin:0;padding:0;background-color:{BG};">
+<body style="margin:0;padding:0;">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;">{html.escape(preheader)}</div>
   <!-- Stops the client pulling body copy in after the preheader. -->
   <div style="display:none;max-height:0;overflow:hidden;">{"&#8199;&#65279;" * 30}</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-         class="sp-bg" bgcolor="{BG}" style="background-color:{BG};">
+  <!-- No background on the canvas: see the module docstring. -->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
     <tr>
-      <td class="sp-gutter" align="center" style="padding:36px 16px;">
+      <td class="sp-gutter" align="center" style="padding:28px 16px;">
         <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
-               style="width:100%;max-width:600px;">
+               style="width:100%;max-width:600px;border:1px solid {BORDER};border-radius:12px;">
           <tr>
-            <td style="padding:0 2px 18px;">{_wordmark()}</td>
+            <td class="sp-chrome sp-pad" bgcolor="{CHROME}"
+                style="background-color:{CHROME};border-bottom:1px solid {BORDER};
+                       border-radius:12px 12px 0 0;padding:15px 26px;">{_header(eyebrow=eyebrow, accent=accent)}</td>
           </tr>
           <tr>
-            <td class="sp-card" bgcolor="{CARD}"
-                style="background-color:{CARD};border:1px solid {BORDER};border-radius:10px;padding:30px;">
-              <p class="sp-eyebrow" style="margin:0 0 10px;font-family:{SANS};font-size:13px;font-weight:500;
-                        line-height:18px;color:{accent};">{html.escape(eyebrow)}</p>
-              <h1 class="sp-head" style="margin:0 0 14px;font-family:{SANS};font-size:21px;line-height:29px;
-                                         mso-line-height-rule:exactly;font-weight:600;letter-spacing:-0.01em;
+            <td class="sp-card sp-pad" bgcolor="{CARD}"
+                style="background-color:{CARD};padding:28px 26px;">
+              <h1 class="sp-head" style="margin:0 0 14px;font-family:{SANS};font-size:22px;line-height:30px;
+                                         mso-line-height-rule:exactly;font-weight:600;letter-spacing:-0.02em;
                                          color:{FG};">{html.escape(heading)}</h1>
               {body}
               {action_block}
-              {note}
             </td>
           </tr>
+          {note}
           <tr>
-            <td style="padding:20px 4px 0;font-family:{SANS};">
-              <p class="sp-faint" style="margin:0 0 6px;font-size:12px;line-height:18px;color:{FAINT};">
+            <td class="sp-chrome sp-pad" bgcolor="{CHROME}"
+                style="background-color:{CHROME};border-top:1px solid {BORDER};
+                       border-radius:0 0 12px 12px;padding:16px 26px;font-family:{SANS};">
+              <p class="sp-faint" style="margin:0 0 5px;font-size:12px;line-height:18px;color:{FAINT};">
                 Sent by {BRAND} · <a href="{html.escape(site_url, quote=True)}" class="sp-link"
                    style="color:{MUTED};text-decoration:underline;">{html.escape(site_url)}</a>
               </p>
               <p class="sp-faint" style="margin:0;font-size:12px;line-height:18px;color:{FAINT};">
-                This is an automated message about your account — we don't send marketing.
+                An automated message about your account — we don't send marketing.
               </p>
             </td>
           </tr>
@@ -254,7 +294,7 @@ def _render(
     subject: str,
     preheader: str,
     eyebrow: str,
-    accent: str,
+    accent: Accent,
     heading: str,
     paragraphs: list[str],
     site_url: str,
