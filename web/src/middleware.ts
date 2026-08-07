@@ -18,6 +18,12 @@ export function middleware(request: NextRequest) {
 
   if (!isAdminHost) return NextResponse.next();
 
+  // Anything served from public/ lives at the root on every host. Rewriting
+  // it under /admin 404s the favicon, the manifest, and the service worker,
+  // and a 404 favicon is invisible until you notice the tab is blank. Static
+  // files are the only paths here carrying an extension; app routes never do.
+  if (/\.[a-z0-9]+$/i.test(pathname)) return NextResponse.next();
+
   // API, auth pages, and Next internals must pass through untouched: the
   // admin origin still signs in and still talks to the same backend.
   if (
