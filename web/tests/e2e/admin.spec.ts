@@ -166,7 +166,6 @@ test("an invite link carries its code into signup", async ({ page }) => {
   await expect(page.getByText("this invite is not valid")).toBeVisible();
 });
 
-
 test("the email log shows delivery state without exposing credentials", async ({ page }) => {
   await mockAdminApi(page, { isAdmin: true });
   await page.goto("/admin");

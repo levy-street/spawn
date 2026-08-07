@@ -88,8 +88,14 @@ def _header(*, eyebrow: str, accent: Accent) -> str:
     """The app's own header: wordmark left, bordered chip right.
 
     Same lockup as the admin dashboard (`spawn` beside an `admin` chip), and
-    the chip is the Badge component. The `$` stands in for the icon so the
-    header survives blocked images.
+    the chip is the Badge component.
+
+    The mark is the app's icon rebuilt from markup rather than fetched: lucide
+    square-terminal is a rounded frame around a chevron and an underscore, so
+    a bordered cell holding `>_` is the same drawing by other means. An image
+    would be the obvious approach and the wrong one — Outlook blocks images by
+    default, and the logo on a security email is the last thing that should
+    render as an empty box.
     """
 
     return f"""
@@ -98,10 +104,10 @@ def _header(*, eyebrow: str, accent: Accent) -> str:
         <td>
           <table role="presentation" cellpadding="0" cellspacing="0" border="0">
             <tr>
-              <td width="26" height="26" align="center" valign="middle" bgcolor="{WELL}"
-                  style="width:26px;height:26px;background-color:{WELL};border:1px solid {BORDER};
-                         border-radius:7px;font-family:{MONO};font-size:13px;font-weight:700;
-                         color:{EMERALD.text};line-height:26px;">$</td>
+              <td width="28" height="28" align="center" valign="middle" bgcolor="{WELL}"
+                  style="width:28px;height:28px;background-color:{WELL};border:1px solid {BORDER};
+                         border-radius:7px;font-family:{MONO};font-size:12px;font-weight:700;
+                         color:{FG};line-height:28px;letter-spacing:-0.5px;">&gt;_</td>
               <td style="padding-left:9px;font-family:{SANS};font-size:16px;font-weight:600;
                          letter-spacing:-0.01em;color:{FG};">{BRAND}</td>
             </tr>

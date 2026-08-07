@@ -14,7 +14,12 @@ export const metadata: Metadata = {
     statusBarStyle: "black-translucent",
   },
   icons: {
-    icon: "/icon-192.png",
+    // SVG first: browsers that support it scale the mark crisply at any tab
+    // size, where the PNG's maskable padding would leave it small and soft.
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    ],
     apple: "/icon-192.png",
   },
 };
