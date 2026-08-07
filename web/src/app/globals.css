@@ -2,39 +2,85 @@
 @import "tw-animate-css";
 
 /*
- * Tailwind v4 design tokens. We use a dark default theme and surface a small
- * set of CSS custom properties for shadcn-compatible color names + safe-area
- * insets + a JS-driven viewport height that the keyboard hook updates.
+ * Tailwind v4 design tokens.
+ *
+ * Both themes are pure neutral — every grey is `oklch(L 0 0)`, zero chroma —
+ * so light mode is the same palette read from the other end rather than a
+ * different one. The dark values are unchanged from when this was dark-only.
+ *
+ * The indirection matters: `@theme inline` makes utilities compile to
+ * `var(--background)` rather than to a value frozen at build time, which is
+ * what lets `[data-theme]` swap the whole palette at runtime. Hand-written CSS
+ * below reads the raw `--background` names for the same reason.
  */
 
+@custom-variant dark ([data-theme="dark"] &);
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-terminal-bg: var(--terminal-bg);
+  /* Brand surfaces: the landing and download pages are a darker, flatter
+     stack than the app chrome, and they need to stay that way relative to
+     whichever theme is active. */
+  --color-brand-bg: var(--brand-bg);
+  --color-brand-panel: var(--brand-panel);
+  --color-brand-well: var(--brand-well);
+  --color-brand-hairline: var(--brand-hairline);
+}
+
 @theme {
-  --color-background: oklch(0.13 0 0);
-  --color-foreground: oklch(0.97 0 0);
-  --color-muted: oklch(0.21 0 0);
-  --color-muted-foreground: oklch(0.71 0 0);
-  --color-card: oklch(0.16 0 0);
-  --color-card-foreground: oklch(0.97 0 0);
-  --color-popover: oklch(0.16 0 0);
-  --color-popover-foreground: oklch(0.97 0 0);
-  --color-primary: oklch(0.97 0 0);
-  --color-primary-foreground: oklch(0.13 0 0);
-  --color-secondary: oklch(0.24 0 0);
-  --color-secondary-foreground: oklch(0.97 0 0);
-  --color-accent: oklch(0.27 0 0);
-  --color-accent-foreground: oklch(0.97 0 0);
-  --color-destructive: oklch(0.62 0.21 25);
-  --color-destructive-foreground: oklch(0.97 0 0);
-  --color-border: oklch(0.27 0 0);
-  --color-input: oklch(0.27 0 0);
-  --color-ring: oklch(0.55 0 0);
-  --color-terminal-bg: #0a0a0a;
   --radius-lg: 0.625rem;
   --radius-md: 0.5rem;
   --radius-sm: 0.375rem;
 }
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.17 0 0);
+  --muted: oklch(0.955 0 0);
+  --muted-foreground: oklch(0.47 0 0); /* 6.5:1 on --background */
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.17 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.17 0 0);
+  --primary: oklch(0.2 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.95 0 0);
+  --secondary-foreground: oklch(0.2 0 0);
+  --accent: oklch(0.93 0 0);
+  --accent-foreground: oklch(0.17 0 0);
+  --destructive: oklch(0.53 0.2 25);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(0.9 0 0);
+  --input: oklch(0.9 0 0);
+  --ring: oklch(0.55 0 0);
+  --terminal-bg: oklch(0.99 0 0);
+
+  --brand-bg: oklch(0.97 0 0);
+  --brand-panel: oklch(1 0 0);
+  --brand-well: oklch(0.94 0 0);
+  --brand-hairline: oklch(0.88 0 0);
+
   /* Updated by useViewportInset() to track on-screen keyboard. */
   --vv-height: 100dvh;
   --vv-keyboard: 0px;
@@ -44,11 +90,41 @@
   --safe-right: env(safe-area-inset-right, 0px);
 }
 
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --background: oklch(0.13 0 0);
+  --foreground: oklch(0.97 0 0);
+  --muted: oklch(0.21 0 0);
+  --muted-foreground: oklch(0.71 0 0);
+  --card: oklch(0.16 0 0);
+  --card-foreground: oklch(0.97 0 0);
+  --popover: oklch(0.16 0 0);
+  --popover-foreground: oklch(0.97 0 0);
+  --primary: oklch(0.97 0 0);
+  --primary-foreground: oklch(0.13 0 0);
+  --secondary: oklch(0.24 0 0);
+  --secondary-foreground: oklch(0.97 0 0);
+  --accent: oklch(0.27 0 0);
+  --accent-foreground: oklch(0.97 0 0);
+  --destructive: oklch(0.62 0.21 25);
+  --destructive-foreground: oklch(0.97 0 0);
+  --border: oklch(0.27 0 0);
+  --input: oklch(0.27 0 0);
+  --ring: oklch(0.55 0 0);
+  --terminal-bg: oklch(0.145 0 0);
+
+  --brand-bg: oklch(0.115 0 0);
+  --brand-panel: oklch(0.15 0 0);
+  --brand-well: oklch(0.08 0 0);
+  --brand-hairline: oklch(0.29 0 0);
+}
+
 html,
 body {
   height: 100%;
-  background: var(--color-background);
-  color: var(--color-foreground);
+  background: var(--background);
+  color: var(--foreground);
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior-y: contain;
@@ -64,14 +140,14 @@ body {
 
 /*
  * Consistent, unobtrusive scrollbars app-wide. Default OS scrollbars clash
- * with the dark theme (chunky light tracks on some platforms, invisible
- * overlays on others); this gives one thin, muted bar that brightens on
- * hover. Firefox uses scrollbar-* ; WebKit/Chromium uses ::-webkit-scrollbar.
- * The xterm viewport is excluded — the terminal manages its own scrollback.
+ * with the theme (chunky light tracks on some platforms, invisible overlays
+ * on others); this gives one thin, muted bar that brightens on hover. Firefox
+ * uses scrollbar-* ; WebKit/Chromium uses ::-webkit-scrollbar. The xterm
+ * viewport is excluded — the terminal manages its own scrollback.
  */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--color-border) transparent;
+  scrollbar-color: var(--border) transparent;
 }
 *::-webkit-scrollbar {
   width: 10px;
@@ -81,13 +157,13 @@ body {
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background-color: var(--color-border);
+  background-color: var(--border);
   background-clip: content-box;
   border: 2px solid transparent;
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background-color: var(--color-muted-foreground);
+  background-color: var(--muted-foreground);
 }
 *::-webkit-scrollbar-corner {
   background: transparent;

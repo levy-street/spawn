@@ -44,6 +44,66 @@ export const TERMINAL_SCROLLBACK_THEME = Object.freeze({
 });
 
 /**
+ * Light terminal.
+ *
+ * Unlike the dark theme this cannot leave the ANSI palette alone. xterm.js's
+ * defaults are chosen for a dark background — index 7 ("white") is near-white
+ * and index 11 ("bright yellow") is a pale straw, both invisible on a light
+ * one, and TUIs use those constantly. The 16 below are VS Code's Light+
+ * terminal palette, which exists precisely to be legible on white.
+ *
+ * Conformance is unaffected: grid states store palette indices, never RGB.
+ */
+const LIGHT_ANSI = Object.freeze({
+  black: "#000000",
+  red: "#cd3131",
+  green: "#00bc00",
+  yellow: "#949800",
+  blue: "#0451a5",
+  magenta: "#bc05bc",
+  cyan: "#0598bc",
+  white: "#555555",
+  brightBlack: "#666666",
+  brightRed: "#cd3131",
+  brightGreen: "#14ce14",
+  brightYellow: "#b5ba00",
+  brightBlue: "#0451a5",
+  brightMagenta: "#bc05bc",
+  brightCyan: "#0598bc",
+  brightWhite: "#a5a5a5",
+});
+
+const LIGHT_BACKGROUND = "#fcfcfc";
+const LIGHT_FOREGROUND = "#1f1f1f";
+
+export const TERMINAL_THEME_LIGHT = Object.freeze({
+  ...LIGHT_ANSI,
+  background: LIGHT_BACKGROUND,
+  foreground: LIGHT_FOREGROUND,
+  cursor: LIGHT_FOREGROUND,
+  cursorAccent: LIGHT_BACKGROUND,
+  // xterm's default selection is a pale wash that vanishes on a light
+  // background, taking "what have I highlighted" with it.
+  selectionBackground: "#accef7",
+  selectionInactiveBackground: "#e1e6eb",
+});
+
+export const TERMINAL_SCROLLBACK_THEME_LIGHT = Object.freeze({
+  ...TERMINAL_THEME_LIGHT,
+  cursor: LIGHT_BACKGROUND,
+});
+
+/** @param {"light"|"dark"} resolved */
+export function terminalTheme(resolved) {
+  return resolved === "light" ? TERMINAL_THEME_LIGHT : TERMINAL_THEME;
+}
+
+/** @param {"light"|"dark"} resolved */
+export function terminalScrollbackTheme(resolved) {
+  return resolved === "light" ? TERMINAL_SCROLLBACK_THEME_LIGHT : TERMINAL_SCROLLBACK_THEME;
+}
+
+/**
  * Unicode tables version used for character widths (wcwidth). "11" via
  * @xterm/addon-unicode11 gives emoji width 2, matching iTerm2/modern
  * terminals; xterm.js's built-in default is Unicode 6 where emoji are

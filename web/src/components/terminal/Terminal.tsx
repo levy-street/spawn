@@ -36,15 +36,16 @@ import {
   TERMINAL_FONT_SIZE,
   TERMINAL_LINE_HEIGHT,
   TERMINAL_SCROLLBACK_LINES,
-  TERMINAL_SCROLLBACK_THEME,
   TERMINAL_SNAPSHOT_LINES,
-  TERMINAL_THEME,
+  terminalScrollbackTheme,
+  terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
 import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import { agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
+import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -465,6 +466,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackTermRef = useRef<XTerm | null>(null);
   const scrollbackVisibleRef = useRef(false);
   const scrollbackReadyRef = useRef(false);
+
+  // Restyle both terminals in place when the theme changes. Terminals are kept
+  // warm across navigation and portaled from the root, so tearing them down to
+  // pick up a colour would drop the session — and this component is outside
+  // the tree the settings dialog lives in, hence the external subscription
+  // rather than a prop.
+  useEffect(() => {
+    const applyThemeToTerminals = () => {
+      const resolved = getResolvedTheme();
+      const live = termRef.current;
+      if (live) live.options.theme = { ...terminalTheme(resolved) };
+      const history = scrollbackTermRef.current;
+      if (history) history.options.theme = { ...terminalScrollbackTheme(resolved) };
+    };
+    applyThemeToTerminals();
+    return subscribeToTheme(applyThemeToTerminals);
+  }, []);
   const scrollbackSnapshotInFlightRef = useRef(false);
   const scrollbackSnapshotPurposeRef = useRef<ScrollbackSnapshotPurpose | null>(null);
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1710,7 +1728,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       lineHeight: TERMINAL_LINE_HEIGHT,
       scrollback: TERMINAL_SNAPSHOT_LINES,
       smoothScrollDuration: 0,
-      theme: { ...TERMINAL_SCROLLBACK_THEME },
+      theme: { ...terminalScrollbackTheme(getResolvedTheme()) },
     });
     historyTerm.loadAddon(new WebLinksAddon());
     activateUnicodeVersion(historyTerm, Unicode11Addon);
@@ -1822,7 +1840,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
-      theme: { ...TERMINAL_THEME },
+      theme: { ...terminalTheme(getResolvedTheme()) },
     });
     const fit = new FitAddon();
     const links = new WebLinksAddon();
@@ -3496,7 +3514,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           front and center; input is blocked until control is claimed. */}
       {controlState && !controlState.owner && (
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2.5 bg-background/60 backdrop-blur-[1px]">
-          <span className="rounded bg-black/50 px-2 py-0.5 text-xs text-muted-foreground">
+          <span className="rounded bg-popover/90 px-2 py-0.5 text-xs text-muted-foreground ring-1 ring-border">
             Another session has control
             {typeof controlState.cols === "number" && typeof controlState.rows === "number"
               ? ` · ${controlState.cols}x${controlState.rows}`
@@ -3506,7 +3524,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           <button
             type="button"
             onClick={() => takeControlNow()}
-            className="rounded-lg border border-border bg-popover px-4 py-2 text-sm font-medium shadow-lg shadow-black/40 transition-colors hover:bg-accent"
+            className="rounded-lg border border-border bg-popover px-4 py-2 text-sm font-medium shadow-lg shadow-black/20 transition-colors hover:bg-accent dark:shadow-black/40"
           >
             Take control
           </button>
@@ -3518,7 +3536,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       <div
         className={
           socket.state !== "open" || channelPending || exitBanner || uploadStatus
-            ? "pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-muted-foreground"
+            ? "pointer-events-none absolute right-2 top-2 rounded bg-popover/90 px-2 py-0.5 text-[10px] text-muted-foreground ring-1 ring-border"
             : "sr-only"
         }
         aria-live="polite"

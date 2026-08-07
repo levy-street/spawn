@@ -1,8 +1,16 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Download, LogIn, Network, Server, ShieldCheck, Terminal } from "lucide-react";
-import Image from "next/image";
+import {
+  ArrowRight,
+  Download,
+  LogIn,
+  Network,
+  Server,
+  ShieldCheck,
+  SquareTerminal,
+  Terminal,
+} from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
@@ -39,13 +47,13 @@ function LandingPage() {
   const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
 
   return (
-    <main className="min-h-vv overflow-hidden bg-[#080808] text-white">
+    <main className="min-h-vv overflow-hidden bg-brand-bg text-foreground">
       <section className="relative min-h-[88svh] overflow-hidden border-border border-b">
         <TerminalBackdrop />
 
         <nav className="relative z-10 mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
           <Link href="/" className="flex items-center gap-3 text-lg font-semibold">
-            <Image src="/icon-192.png" alt="" width={36} height={36} className="rounded-md" />
+            <SquareTerminal className="size-7 shrink-0" aria-hidden />
             <span>spawn</span>
           </Link>
           <div className="flex items-center gap-2">
@@ -66,12 +74,12 @@ function LandingPage() {
 
         <div className="relative z-10 mx-auto flex min-h-[calc(88svh-5rem)] w-full max-w-7xl flex-col justify-center px-4 pb-16 sm:px-6 lg:px-8">
           <div className="max-w-3xl">
-            <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-white/15 bg-black/45 px-3 py-1 text-sm text-zinc-300">
-              <Network className="size-4 text-sky-300" />
+            <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-brand-hairline bg-brand-panel/70 px-3 py-1 text-sm text-foreground/85">
+              <Network className="size-4 text-sky-600 dark:text-sky-300" />
               Browser control for CLI coding agents
             </p>
             <h1 className="text-6xl font-semibold leading-none sm:text-7xl md:text-8xl">spawn</h1>
-            <p className="mt-6 max-w-lg text-balance text-xl leading-8 text-zinc-200 sm:text-2xl sm:leading-9">
+            <p className="mt-6 max-w-lg text-balance text-xl leading-8 text-foreground sm:text-2xl sm:leading-9">
               Run Codex, Claude, shell agents, and host tools across your laptop, workstations, and
               servers from one fast control plane.
             </p>
@@ -89,8 +97,8 @@ function LandingPage() {
                 </Link>
               </Button>
             </div>
-            <div className="mt-8 max-w-2xl rounded-md border border-white/15 bg-black/70 p-3 font-mono text-xs text-zinc-200 shadow-2xl shadow-black/40 sm:text-sm">
-              <span className="mr-2 text-emerald-300">$</span>
+            <div className="mt-8 max-w-2xl rounded-md border border-brand-hairline bg-brand-panel/80 p-3 font-mono text-xs text-foreground shadow-2xl shadow-black/10 dark:shadow-black/40 sm:text-sm">
+              <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
               <code className="break-all">{installCommand}</code>
             </div>
           </div>
@@ -99,15 +107,17 @@ function LandingPage() {
 
       <section
         id="install"
-        className="border-border border-b bg-[#0d0d0d] px-4 py-12 sm:px-6 lg:px-8"
+        className="border-border border-b bg-brand-panel px-4 py-12 sm:px-6 lg:px-8"
       >
         <div className="mx-auto grid w-full max-w-7xl gap-8 lg:grid-cols-[1fr_1.1fr]">
           <div>
-            <p className="mb-3 text-sm font-medium text-amber-300">Host setup</p>
+            <p className="mb-3 text-sm font-medium text-amber-600 dark:text-amber-300">
+              Host setup
+            </p>
             <h2 className="text-3xl font-semibold leading-tight sm:text-4xl">
               One installer for macOS and Linux hosts.
             </h2>
-            <p className="mt-4 max-w-xl text-base leading-7 text-zinc-300">
+            <p className="mt-4 max-w-xl text-base leading-7 text-foreground/85">
               The hosted script picks a prebuilt daemon for the host, falls back to a source build
               when needed, runs device-code login, and starts a user service where the OS supports
               it.
@@ -131,11 +141,11 @@ function LandingPage() {
         </div>
       </section>
 
-      <section className="bg-[#101010] px-4 py-10 sm:px-6 lg:px-8">
+      <section className="bg-brand-panel px-4 py-10 sm:px-6 lg:px-8">
         <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h2 className="text-2xl font-semibold">Bring a host online.</h2>
-            <p className="mt-2 text-sm text-zinc-400">
+            <p className="mt-2 text-sm text-muted-foreground">
               Install the daemon, approve the device code, then start agents from the browser.
             </p>
           </div>
@@ -156,39 +166,45 @@ function TerminalBackdrop() {
     <div aria-hidden className="absolute inset-0">
       <div className="absolute inset-0 grid grid-cols-6 opacity-35 sm:grid-cols-10 lg:grid-cols-[repeat(14,minmax(0,1fr))]">
         {BACKDROP_CELLS.map((cell) => (
-          <div key={cell} className="min-h-14 border-[#171717] border-r border-b" />
+          <div key={cell} className="min-h-14 border-brand-hairline border-r border-b" />
         ))}
       </div>
-      <div className="absolute top-[14%] right-[-8rem] hidden w-[56rem] rotate-[-3deg] rounded-md border border-white/10 bg-black/70 p-4 shadow-2xl shadow-black/70 md:block">
-        <div className="mb-4 flex items-center gap-2 text-xs text-zinc-500">
+      <div className="absolute top-[14%] right-[-8rem] hidden w-[56rem] rotate-[-3deg] rounded-md border border-brand-hairline bg-brand-panel/80 p-4 shadow-2xl shadow-black/15 dark:shadow-black/70 md:block">
+        <div className="mb-4 flex items-center gap-2 text-xs text-muted-foreground">
           <span className="size-3 rounded-full bg-rose-400" />
-          <span className="size-3 rounded-full bg-amber-300" />
+          <span className="size-3 rounded-full bg-amber-600 dark:bg-amber-300" />
           <span className="size-3 rounded-full bg-emerald-400" />
           <span className="ml-3">spawn / hosts / agents</span>
         </div>
         <div className="grid gap-3">
-          <BackdropLine accent="bg-emerald-300" text="dream online - 8 agents - codex ready" />
-          <BackdropLine accent="bg-sky-300" text="nightmare online - gpu queue - nvtop active" />
           <BackdropLine
-            accent="bg-amber-300"
+            accent="bg-emerald-600 dark:bg-emerald-300"
+            text="dream online - 8 agents - codex ready"
+          />
+          <BackdropLine
+            accent="bg-sky-600 dark:bg-sky-300"
+            text="nightmare online - gpu queue - nvtop active"
+          />
+          <BackdropLine
+            accent="bg-amber-600 dark:bg-amber-300"
             text="macbook online - local review agent - skills granted"
           />
-          <div className="mt-2 h-40 rounded-md border border-white/10 bg-[#050505] p-4 font-mono text-sm text-zinc-300">
+          <div className="mt-2 h-40 rounded-md border border-brand-hairline bg-brand-well p-4 font-mono text-sm text-foreground/85">
             <p>
-              <span className="text-emerald-300">$</span> spawn agent create --preset codex --host
-              dream
+              <span className="text-emerald-600 dark:text-emerald-300">$</span> spawn agent create
+              --preset codex --host dream
             </p>
-            <p className="mt-3 text-zinc-500">routing terminal frames over WSS...</p>
-            <p className="mt-3 text-sky-300">agent ready - ~/projects/spawn</p>
+            <p className="mt-3 text-muted-foreground">routing terminal frames over WSS...</p>
+            <p className="mt-3 text-sky-600 dark:text-sky-300">agent ready - ~/projects/spawn</p>
           </div>
         </div>
       </div>
-      <div className="absolute bottom-10 left-4 hidden w-[22rem] rounded-md border border-white/10 bg-black/65 p-4 shadow-xl shadow-black/60 sm:left-8 sm:block">
-        <div className="font-mono text-xs leading-6 text-zinc-300">
-          <p className="text-emerald-300">spawnd 0.1.0</p>
+      <div className="absolute bottom-10 left-4 hidden w-[22rem] rounded-md border border-brand-hairline bg-brand-panel/80 p-4 shadow-xl shadow-black/15 dark:shadow-black/60 sm:left-8 sm:block">
+        <div className="font-mono text-xs leading-6 text-foreground/85">
+          <p className="text-emerald-600 dark:text-emerald-300">spawnd 0.1.0</p>
           <p>host registered</p>
-          <p className="text-sky-300">terminal attached</p>
-          <p className="text-amber-300">skills granted</p>
+          <p className="text-sky-600 dark:text-sky-300">terminal attached</p>
+          <p className="text-amber-600 dark:text-amber-300">skills granted</p>
         </div>
       </div>
     </div>
@@ -197,7 +213,7 @@ function TerminalBackdrop() {
 
 function BackdropLine({ accent, text }: { accent: string; text: string }) {
   return (
-    <div className="flex items-center gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 font-mono text-sm text-zinc-300">
+    <div className="flex items-center gap-3 rounded-md border border-brand-hairline bg-foreground/[0.03] px-3 py-2 font-mono text-sm text-foreground/85">
       <span className={`size-2 rounded-full ${accent}`} />
       <span>{text}</span>
     </div>
@@ -214,12 +230,12 @@ function Capability({
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-md border border-white/10 bg-black/25 p-4">
+    <div className="rounded-md border border-brand-hairline bg-brand-panel/50 p-4">
       <div className="mb-3 flex size-9 items-center justify-center rounded-md bg-white text-black">
         {icon}
       </div>
       <h3 className="font-semibold">{title}</h3>
-      <p className="mt-2 text-sm leading-6 text-zinc-400">{children}</p>
+      <p className="mt-2 text-sm leading-6 text-muted-foreground">{children}</p>
     </div>
   );
 }

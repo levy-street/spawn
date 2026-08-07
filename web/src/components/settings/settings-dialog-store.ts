@@ -8,7 +8,7 @@ import { useSyncExternalStore } from "react";
  * doing, and closing it returns them exactly there. /settings and /trust stay
  * deep-linkable via redirect pages that call `openSettings` on mount.
  */
-export type SettingsTab = "account" | "devices" | "trust" | "skills";
+export type SettingsTab = "account" | "appearance" | "devices" | "trust" | "skills";
 
 let openTab: SettingsTab | null = null;
 const listeners = new Set<() => void>();

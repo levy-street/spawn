@@ -293,7 +293,7 @@ function AgentRow({
               {agentCommand(agent)} · {agent.cwd}
             </span>
             {tail != null && tail !== "" && (
-              <span className="mt-1 block truncate font-mono text-[11px] leading-4 text-zinc-500">
+              <span className="mt-1 block truncate font-mono text-[11px] leading-4 text-muted-foreground/70">
                 {lastNonEmptyLine(tail)}
               </span>
             )}

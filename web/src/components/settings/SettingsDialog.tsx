@@ -1,10 +1,11 @@
 "use client";
 
 import * as Dialog from "@radix-ui/react-dialog";
-import { MonitorSmartphone, ShieldCheck, User, Wrench, X } from "lucide-react";
+import { MonitorSmartphone, Palette, ShieldCheck, User, Wrench, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 import type { ComponentType } from "react";
 import { AccountPanel } from "@/components/settings/AccountPanel";
+import { AppearancePanel } from "@/components/settings/AppearancePanel";
 import { DevicesPanel } from "@/components/settings/DevicesPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
 import {
@@ -22,6 +23,7 @@ const TABS: Array<{
   icon: ComponentType<{ className?: string }>;
 }> = [
   { key: "account", label: "Account", icon: User },
+  { key: "appearance", label: "Appearance", icon: Palette },
   { key: "devices", label: "Browser devices", icon: MonitorSmartphone },
   { key: "trust", label: "Device trust", icon: ShieldCheck },
   { key: "skills", label: "Skills", icon: Wrench },
@@ -56,12 +58,12 @@ export function SettingsDialog() {
             // Mobile: full screen. Desktop: a centered, bounded panel.
             "inset-0 pad-safe-top pad-safe-bottom",
             "md:inset-auto md:left-1/2 md:top-1/2 md:h-[min(100vh-4rem,680px)] md:w-[min(100vw-3rem,920px)] md:-translate-x-1/2 md:-translate-y-1/2",
-            "md:flex-row md:rounded-xl md:border md:border-border md:shadow-2xl md:shadow-black/50",
+            "md:flex-row md:rounded-xl md:border md:border-border md:shadow-2xl md:shadow-black/20 md:dark:shadow-black/50",
             "data-[state=open]:animate-in data-[state=open]:fade-in-0 md:data-[state=open]:zoom-in-95",
           )}
         >
           <Dialog.Description className="sr-only">
-            Account, browser devices, device trust, and skills.
+            Account, appearance, browser devices, device trust, and skills.
           </Dialog.Description>
 
           {/* Tab rail: left column on desktop, horizontal strip on mobile. */}
@@ -102,6 +104,7 @@ export function SettingsDialog() {
           <div className="@container/settings min-w-0 flex-1 overflow-y-auto">
             <div className="mx-auto flex w-full max-w-xl flex-col gap-6 p-4 pt-5 md:p-6">
               {tab === "account" && <AccountPanel />}
+              {tab === "appearance" && <AppearancePanel />}
               {tab === "devices" && <DevicesPanel />}
               {tab === "trust" && <TrustPanel />}
               {tab === "skills" && <SkillsPanel />}
