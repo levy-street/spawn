@@ -309,6 +309,7 @@ struct ActivityState {
     last_input_at: Option<Instant>,
     suppress_output_until: Option<Instant>,
     output_classifier: activity::OutputClassifier,
+    input_classifier: activity::InputClassifier,
     output_generation: u64,
 }
 
@@ -418,14 +419,27 @@ impl ForwarderControl {
 
     /// Record local DataChannel input without revealing its contents. The
     /// caller emits `agent.input_activity` only when this returns true.
-    pub fn note_input(&self) -> bool {
-        self.note_input_at(Instant::now())
+    ///
+    /// `bytes` is inspected but never retained or forwarded: the classifier
+    /// answers one question — was a person responsible for this — and the
+    /// answer is a bool. The bytes still reach the agent either way; only the
+    /// activity ping is withheld, because a terminal answering a question the
+    /// application asked it is not the user doing anything.
+    pub fn note_input(&self, bytes: &[u8]) -> bool {
+        self.note_input_at(Instant::now(), bytes)
     }
 
-    fn note_input_at(&self, now: Instant) -> bool {
+    fn note_input_at(&self, now: Instant, bytes: &[u8]) -> bool {
         let Ok(mut state) = self.activity.lock() else {
             return false;
         };
+        // Observe before the throttle check: the parser must see every byte in
+        // order, or a sequence split across a throttled boundary leaves it
+        // misaligned and the next reply reads as typing.
+        let user_input = state.input_classifier.observe(bytes);
+        if !user_input {
+            return false;
+        }
         if state.last_input_at.is_some_and(|last| {
             now.saturating_duration_since(last) < activity::INPUT_TOUCH_INTERVAL
         }) {
@@ -1354,11 +1368,42 @@ mod tests {
         let control = ForwarderControl::new();
         let start = Instant::now();
 
-        assert!(control.note_input_at(start));
-        assert!(!control
-            .note_input_at(start + activity::INPUT_TOUCH_INTERVAL - Duration::from_millis(1)));
-        assert!(control.note_input_at(start + activity::INPUT_TOUCH_INTERVAL));
+        assert!(control.note_input_at(start, b"a"));
+        assert!(!control.note_input_at(
+            start + activity::INPUT_TOUCH_INTERVAL - Duration::from_millis(1),
+            b"b"
+        ));
+        assert!(control.note_input_at(start + activity::INPUT_TOUCH_INTERVAL, b"c"));
         assert!(control.note_output_at(start, b"independent output"));
+    }
+
+    #[test]
+    fn terminal_replies_never_register_as_input() {
+        // Clicking an agent to see what it is doing makes xterm.js send focus
+        // and mouse reports. Counting those made the badge say "Input sent"
+        // because somebody looked at it.
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(!control.note_input_at(start, b"\x1b[I"));
+        assert!(!control.note_input_at(start + Duration::from_secs(5), b"\x1b[<0;40;12M"));
+        assert!(!control.note_input_at(start + Duration::from_secs(10), b"\x1b[24;80R"));
+
+        // …and a real keystroke still counts, on the very next chunk.
+        assert!(control.note_input_at(start + Duration::from_secs(15), b"x"));
+    }
+
+    #[test]
+    fn a_reply_split_across_chunks_stays_a_reply() {
+        // The parser has to see every byte in order; a throttled or partial
+        // chunk that skipped it would leave the next reply looking like input.
+        let control = ForwarderControl::new();
+        let start = Instant::now();
+
+        assert!(!control.note_input_at(start, b"\x1b["));
+        assert!(!control.note_input_at(start + Duration::from_secs(5), b"I"));
+        assert!(!control.note_input_at(start + Duration::from_secs(10), b"\x1b[<0;1;1"));
+        assert!(!control.note_input_at(start + Duration::from_secs(15), b"M"));
     }
 
     #[tokio::test]

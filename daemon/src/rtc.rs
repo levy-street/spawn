@@ -3186,7 +3186,7 @@ where
     // Focus-weighted scheduling: the agent being typed into gets its CPU
     // scope boosted so its response wins the scheduler under host load.
     crate::cpu_scopes::note_input(agent_id);
-    if control.note_input() {
+    if control.note_input(data) {
         crate::pty::try_emit_activity(out_tx, agent_id, crate::pty::ActivityKind::Input);
     }
     Ok(true)

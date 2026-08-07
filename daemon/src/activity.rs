@@ -308,3 +308,198 @@ mod tests {
         }
     }
 }
+
+/// Streaming classifier for the browser→agent direction.
+///
+/// Not every byte arriving on the data channel is someone typing. A terminal
+/// answers questions the application asked it — where the cursor is, whether
+/// it has focus, where the mouse went — and xterm.js emits those replies
+/// through the same path as keystrokes. Counting them as input makes an agent
+/// report "Input sent" because somebody clicked on it to see what it was
+/// doing, which is exactly when the badge should say nothing at all.
+///
+/// The distinction is directional rather than structural: arrow keys and
+/// replies are both CSI sequences, so shape alone cannot separate them. In
+/// this direction, though, the final byte can. `I`/`O` are focus in/out,
+/// `R` a cursor-position report, `n` a device-status reply, `c` a device
+/// attributes reply, `t` a window report, and `M`/`m` mouse tracking — none
+/// of which any key produces. Everything else, CSI or not, is a person.
+///
+/// Stateful because a sequence can be split across data-channel messages, and
+/// half a report must not read as input on the strength of its first half.
+#[derive(Debug, Default)]
+pub struct InputClassifier {
+    state: InputState,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum InputState {
+    #[default]
+    Ground,
+    Escape,
+    /// `had_params` separates the two mouse encodings, which share a final
+    /// byte: bare `ESC [ M` is X10 and swallows three coordinate bytes, while
+    /// `ESC [ < 0;1;1 M` is SGR and ends there. Reading SGR as X10 eats the
+    /// three bytes after it, which is usually the keystroke that followed.
+    CsiParams {
+        had_params: bool,
+    },
+    CsiIntermediate,
+    /// X10 mouse: `ESC [ M` is followed by exactly three raw bytes, which are
+    /// coordinates and can hold any value, including ESC.
+    X10Mouse(u8),
+    /// OSC and DCS both run to a string terminator; replies to colour and
+    /// terminfo queries arrive this way.
+    StringUntilTerminator {
+        escape_pending: bool,
+    },
+}
+
+/// CSI finals that only a terminal sends, never a key.
+fn is_report_final(byte: u8) -> bool {
+    matches!(byte, b'I' | b'O' | b'R' | b'n' | b'c' | b't' | b'M' | b'm')
+}
+
+impl InputClassifier {
+    /// True when `payload` contains anything a person could have produced.
+    /// Must be called for every chunk so the parser stays aligned.
+    pub fn observe(&mut self, payload: &[u8]) -> bool {
+        let mut user = false;
+        for &byte in payload {
+            self.consume(byte, &mut user);
+        }
+        user
+    }
+
+    fn consume(&mut self, byte: u8, user: &mut bool) {
+        match std::mem::take(&mut self.state) {
+            InputState::Ground => match byte {
+                0x1b => self.state = InputState::Escape,
+                // A bare ESC is a keypress, but it is indistinguishable from
+                // the start of a sequence until the next byte arrives, so it
+                // is charged to whatever follows.
+                _ => *user = true,
+            },
+            InputState::Escape => match byte {
+                b'[' => self.state = InputState::CsiParams { had_params: false },
+                b']' | b'P' | b'X' | b'^' | b'_' => {
+                    self.state = InputState::StringUntilTerminator {
+                        escape_pending: false,
+                    }
+                }
+                // ESC ESC, alt-modified keys, SS3 function keys: all typed.
+                _ => *user = true,
+            },
+            InputState::CsiParams { had_params } => match byte {
+                0x30..=0x3f => self.state = InputState::CsiParams { had_params: true },
+                0x20..=0x2f => self.state = InputState::CsiIntermediate,
+                b'M' if !had_params => self.state = InputState::X10Mouse(0),
+                0x40..=0x7e => {
+                    if !is_report_final(byte) {
+                        *user = true;
+                    }
+                }
+                // Malformed: treat the stray byte as ground rather than
+                // silently swallowing real input after it.
+                _ => *user = true,
+            },
+            InputState::CsiIntermediate => match byte {
+                0x20..=0x2f => self.state = InputState::CsiIntermediate,
+                0x40..=0x7e => {
+                    if !is_report_final(byte) {
+                        *user = true;
+                    }
+                }
+                _ => *user = true,
+            },
+            InputState::X10Mouse(seen) => {
+                if seen < 2 {
+                    self.state = InputState::X10Mouse(seen + 1);
+                }
+            }
+            InputState::StringUntilTerminator { escape_pending } => {
+                if byte == 0x07 || (escape_pending && byte == b'\\') {
+                    // Terminated.
+                } else {
+                    self.state = InputState::StringUntilTerminator {
+                        escape_pending: byte == 0x1b,
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn observe_every_split(payload: &[u8], expected: bool) {
+        for split in 0..=payload.len() {
+            let mut classifier = InputClassifier::default();
+            let got = classifier.observe(&payload[..split]) | classifier.observe(&payload[split..]);
+            assert_eq!(got, expected, "split {split} of {payload:?}");
+        }
+        let mut bytewise = InputClassifier::default();
+        let mut got = false;
+        for byte in payload {
+            got |= bytewise.observe(std::slice::from_ref(byte));
+        }
+        assert_eq!(got, expected, "byte-at-a-time {payload:?}");
+    }
+
+    #[test]
+    fn terminal_replies_are_not_input() {
+        observe_every_split(b"\x1b[I", false); // focus in
+        observe_every_split(b"\x1b[O", false); // focus out
+        observe_every_split(b"\x1b[24;80R", false); // cursor position report
+        observe_every_split(b"\x1b[0n", false); // device status
+        observe_every_split(b"\x1b[?1;2c", false); // primary device attributes
+        observe_every_split(b"\x1b[>0;276;0c", false); // secondary device attributes
+        observe_every_split(b"\x1b[8;24;80t", false); // window size report
+    }
+
+    #[test]
+    fn mouse_tracking_is_not_input() {
+        observe_every_split(b"\x1b[<0;24;12M", false); // SGR press
+        observe_every_split(b"\x1b[<0;24;12m", false); // SGR release
+        observe_every_split(b"\x1b[M\x20\x21\x22", false); // X10
+    }
+
+    #[test]
+    fn x10_mouse_coordinates_are_never_read_as_input() {
+        // Coordinates are raw bytes and may legitimately be ESC or a letter;
+        // reading them as content would make a click look like typing.
+        observe_every_split(b"\x1b[M\x1b\x1b\x1b", false);
+        observe_every_split(b"\x1b[Mabc", false);
+    }
+
+    #[test]
+    fn keystrokes_are_input() {
+        observe_every_split(b"a", true);
+        observe_every_split(b"\r", true);
+        observe_every_split(b"\x03", true); // ctrl-c
+        observe_every_split(b"\x1b[A", true); // up arrow
+        observe_every_split(b"\x1b[1;5C", true); // ctrl-right
+        observe_every_split(b"\x1bOP", true); // F1 via SS3
+        observe_every_split(b"\x1b[3~", true); // delete
+        observe_every_split(b"\x1b\x1b", true); // escape pressed twice
+    }
+
+    #[test]
+    fn a_reply_followed_by_typing_still_counts() {
+        observe_every_split(b"\x1b[Ihello", true);
+        observe_every_split(b"\x1b[<0;1;1Mx", true);
+    }
+
+    #[test]
+    fn bracketed_paste_is_input() {
+        observe_every_split(b"\x1b[200~pasted\x1b[201~", true);
+    }
+
+    #[test]
+    fn osc_and_dcs_replies_are_not_input() {
+        observe_every_split(b"\x1b]11;rgb:0a0a/0a0a/0a0a\x1b\\", false);
+        observe_every_split(b"\x1bP1+r544e=787465726d\x1b\\", false);
+    }
+}
