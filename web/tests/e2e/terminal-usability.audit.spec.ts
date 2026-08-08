@@ -23,8 +23,7 @@ type Observation = {
   label: string;
   terminalBox: Box | null;
   liveBox: Box | null;
-  overlayVisible: boolean;
-  overlayScroll: { scrollTop: number; maxTop: number } | null;
+  scrolledUp: boolean;
   activeElement: string;
   textTail: string;
 };
@@ -73,11 +72,9 @@ function liveTerminalRows(page: Page) {
   return page.getByTestId("terminal-live-host").locator(".xterm-rows");
 }
 
-async function scrollbackOverlayMetrics(page: Page) {
-  const overlay = page.getByTestId("terminal-scrollback-overlay");
-  const visible = await overlay.isVisible().catch(() => false);
-  if (!visible) return null;
-  return overlay.locator(".xterm-viewport").evaluate((el) => {
+async function liveScrollMetrics(page: Page) {
+  const viewport = page.getByTestId("terminal-live-host").locator(".xterm-viewport");
+  return viewport.evaluate((el) => {
     return {
       scrollTop: el.scrollTop,
       maxTop: Math.max(0, el.scrollHeight - el.clientHeight),
@@ -130,17 +127,15 @@ async function observeTerminal(page: Page, label: string): Promise<Observation> 
   const text = await liveTerminalRows(page)
     .innerText()
     .catch(() => "");
-  const overlayVisible = await page
-    .getByTestId("terminal-scrollback-overlay")
-    .isVisible()
-    .catch(() => false);
+  const metrics = await liveScrollMetrics(page).catch(() => null);
+  const scrolledUp = !!metrics && metrics.maxTop > 0 && metrics.scrollTop < metrics.maxTop - 1;
 
   return {
     label,
     terminalBox: normalizeBox(await page.getByLabel("Agent terminal").boundingBox()),
     liveBox: normalizeBox(await liveTerminal(page).boundingBox()),
-    overlayVisible,
-    overlayScroll: await scrollbackOverlayMetrics(page),
+
+    scrolledUp,
     activeElement: await page.evaluate(() => {
       const active = document.activeElement;
       if (!active) return "";
@@ -413,14 +408,11 @@ test.describe("terminal usability audit", () => {
 
     await liveTerminal(page).hover();
     await page.mouse.wheel(0, -900);
-    const overlay = page.getByTestId("terminal-scrollback-overlay");
-    await expect(overlay).toBeVisible();
-    await expect(overlay.locator(".xterm-rows")).toContainText("audit-history-");
+    await expect(liveTerminalRows(page)).toContainText("audit-history-");
     await sendPty(page, "\x1b[2A\rLIVE-AUDIT-WHILE-SCROLLED");
-    observations.push(await observeTerminal(page, "scrollback opened"));
+    observations.push(await observeTerminal(page, "scrolled into history"));
 
     await page.mouse.wheel(0, 5000);
-    await expect(overlay).not.toBeVisible();
     await expect(liveTerminalRows(page)).toContainText("LIVE-AUDIT-WHILE-SCROLLED");
     await page.getByLabel("Agent terminal").click();
     await page.keyboard.type("after scroll");
@@ -510,15 +502,13 @@ test.describe("terminal usability audit", () => {
       await expect(page.getByRole("button", { name: "Ctrl-C" })).toBeVisible();
       observations.push(await observeTerminal(page, "mobile loaded"));
 
-      await dragTouchInTerminal(page, 0.52, 0.62);
-      const overlay = page.getByTestId("terminal-scrollback-overlay");
-      await expect(overlay).toBeVisible();
-      await expect(overlay.locator(".xterm-rows")).toContainText("audit-history-");
+      await dragTouchInTerminal(page, 0.3, 0.85);
+      await expect(liveTerminalRows(page)).toContainText("audit-history-");
       await sendPty(page, "\x1b[2A\rMOBILE-LIVE-WHILE-SCROLLED");
       observations.push(await observeTerminal(page, "mobile scrollback"));
 
-      await dragTouchInTerminal(page, 0.62, 0.35);
-      await expect(overlay).not.toBeVisible();
+      await dragTouchInTerminal(page, 0.9, 0.1);
+      await dragTouchInTerminal(page, 0.9, 0.1);
       await expect(liveTerminalRows(page)).toContainText("MOBILE-LIVE-WHILE-SCROLLED");
       await page.getByRole("button", { name: "Tab", exact: true }).click();
       await page.getByRole("button", { name: "Ctrl-C" }).click();

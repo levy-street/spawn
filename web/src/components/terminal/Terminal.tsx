@@ -20,12 +20,10 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
-  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
-import { CommittedHistoryOverlay } from "@/components/terminal/committed-history";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { useAgentSocket } from "@/components/terminal/useAgentSocket";
 // Terminal configuration shared with the conformance harness
@@ -37,14 +35,12 @@ import {
   TERMINAL_LINE_HEIGHT,
   TERMINAL_SCROLLBACK_LINES,
   TERMINAL_SNAPSHOT_LINES,
-  terminalScrollbackTheme,
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
 import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import { agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { unifiedScrollbackEnabled } from "@/lib/scrollback-mode";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
@@ -90,7 +86,6 @@ type ImagePasteMode = "deferred" | "bracketed-path";
 type PendingAttachmentStatus = "uploading" | "ready" | "error";
 type ScrollAnchor = { viewportY: number; atBottom: boolean };
 type TerminalGeometry = { cols: number; rows: number };
-type ScrollbackSnapshotPurpose = "overlay" | "cache";
 
 type PendingAttachment = {
   id: string;
@@ -240,7 +235,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // addon so the warm pool can never exhaust the browser's WebGL context
   // budget; a lost context falls back to the DOM renderer silently.
   const webglAddonRef = useRef<WebglAddon | null>(null);
-  const scrollbackWebglAddonRef = useRef<WebglAddon | null>(null);
   const attachGpuRenderer = useCallback((term: XTerm, ref: { current: WebglAddon | null }) => {
     if (ref.current) return;
     try {
@@ -279,24 +273,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const term = termRef.current;
       if (!term) return;
       attachGpuRenderer(term, webglAddonRef);
-    },
-    [attachGpuRenderer],
-  );
-  // The scrollback overlay must render with the SAME renderer as the live
-  // terminal: WebGL rounds glyph cells to whole device pixels while the DOM
-  // renderer lays out fractional CSS pixels, so mixing them makes scrolled
-  // content sit at visibly different font metrics than the live screen. The
-  // addon lives only while the overlay is actually revealed — one extra
-  // context at most, so the warm pool and multi-pane screens pay nothing.
-  const syncScrollbackWebglRenderer = useCallback(
-    (visible: boolean) => {
-      if (!visible || !wantsGpuRenderer()) {
-        scrollbackWebglAddonRef.current?.dispose();
-        scrollbackWebglAddonRef.current = null;
-        return;
-      }
-      const term = scrollbackTermRef.current;
-      if (term) attachGpuRenderer(term, scrollbackWebglAddonRef);
     },
     [attachGpuRenderer],
   );
@@ -339,7 +315,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       !surface ||
       pending.length === 0 ||
       !activeRef.current ||
-      scrollbackVisibleRef.current ||
       buffer.type === "alternate" ||
       buffer.viewportY < buffer.baseY
     ) {
@@ -462,15 +437,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     rows: number;
   } | null>(null);
   const socketStartedRef = useRef(false);
-  const scrollbackOverlayRef = useRef<HTMLDivElement>(null);
-  const scrollbackTerminalHostRef = useRef<HTMLDivElement>(null);
-  const scrollbackTermRef = useRef<XTerm | null>(null);
-  const scrollbackVisibleRef = useRef(false);
-  const scrollbackReadyRef = useRef(false);
-  // Unified-scrollback experiment: committed history lives in the live
-  // terminal's own buffer and wheel/touch scroll it natively; the overlay
-  // machinery stays dormant. Latched at mount — the settings toggle reloads.
-  const unifiedScrollbackRef = useRef(unifiedScrollbackEnabled());
   // Set once the deep post-connect snapshot has rebuilt the live buffer at
   // full history depth (the connect seed carries only a shallow prefix).
   const unifiedDeepSeededRef = useRef(false);
@@ -482,45 +448,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // rather than a prop.
   useEffect(() => {
     const applyThemeToTerminals = () => {
-      const resolved = getResolvedTheme();
       const live = termRef.current;
-      if (live) live.options.theme = { ...terminalTheme(resolved) };
-      const history = scrollbackTermRef.current;
-      if (history) history.options.theme = { ...terminalScrollbackTheme(resolved) };
+      if (live) live.options.theme = { ...terminalTheme(getResolvedTheme()) };
     };
     applyThemeToTerminals();
     return subscribeToTheme(applyThemeToTerminals);
   }, []);
   const scrollbackSnapshotInFlightRef = useRef(false);
-  const scrollbackSnapshotPurposeRef = useRef<ScrollbackSnapshotPurpose | null>(null);
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scrollbackSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackCachedSnapshotBytesRef = useRef<Uint8Array | null>(null);
   const scrollbackRenderedSnapshotBytesRef = useRef<Uint8Array | null>(null);
-  const scrollbackRenderGenerationRef = useRef(0);
   const scrollbackCacheDirtyRef = useRef(true);
   const scrollbackLiveBytesAtRef = useRef(0);
   const scrollbackSnapshotRequestedAtRef = useRef(0);
-  const scrollbackOverlayHasSnapshotRef = useRef(false);
-  const scrollbackPendingDeltaPxRef = useRef(0);
-  const scrollbackUserScrollGenerationRef = useRef(0);
-  const scrollbackDesiredScrollTopRef = useRef<number | null>(null);
-  const scrollbackRestoreLineRef = useRef<number | null>(null);
   const scrollbackCacheRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollbackCacheRefreshDeadlineRef = useRef<number | null>(null);
-  const scrollbackLastUserScrollAtRef = useRef(0);
-  // The most recent scrolled-up overlay view (rows + position), remembered as
-  // the reader scrolls. Diagnostics read this so a refresh reports what the
-  // user was looking at even if the overlay closed in the instant before the
-  // click — the overlay buffer itself scrolls to the bottom on close, so it
-  // cannot be recovered from there.
-  const lastScrolledViewRef = useRef<{
-    at: number;
-    viewportY: number;
-    baseY: number;
-    length: number;
-    rows: string[];
-  } | null>(null);
   // Resize->repaint instrumentation: when a resize is sent, mark the time;
   // record when the app's repaint bytes first arrive and when they settle, so
   // the reshape lag is measured (and surfaced in diagnostics), not guessed.
@@ -538,35 +480,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const markResizeSentRef = useRef((cols: number, rows: number) => {
     resizeMarkRef.current = { sentAt: Date.now(), cols, rows, firstByteAt: null, lastByteAt: null };
   });
-  // Committed-history delta mode: the worker streams every committed line
-  // over spawn.ctl and the hidden overlay terminal becomes a pure view of the
-  // worker's log (raw PTY bytes never touch it). Engaged the moment any
-  // response or event carries a history anchor; the legacy snapshot/replay
-  // pipeline below stays for old workers that cannot stream deltas.
-  const committedHistoryRef = useRef<CommittedHistoryOverlay | null>(null);
-  const historyStreamActiveRef = useRef(false);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
-  // Set when a wheel-open is waiting for the controller's write queue to
-  // drain; consumed by finishDeltaReveal.
-  const scrollbackRevealPendingRef = useRef(false);
-  const finishDeltaRevealRef = useRef<() => void>(() => {});
-  const updateScrollbackRevealRef = useRef<(overlay: HTMLElement) => void>(() => {});
   // Daemon-stamped DataChannel stream offset for each snapshot payload.
   const scrollbackSnapshotOffsetsRef = useRef(new WeakMap<Uint8Array, number>());
-  const scrollbackRenderInFlightRef = useRef(false);
   // Set when the terminal width changes: the next anchored snapshot rewrites
   // the live buffer so seeded history reflows at the new width.
   const historyReseedPendingRef = useRef(false);
   // Whether the live buffer's current seed came from an exact worker stream
   // (vs a plain endpoint replay without geometry markers).
   const liveSeedWasExactRef = useRef(false);
-  // Last trustworthy reader position (buffer line of the viewport top),
-  // recorded only while no rewrite is collapsing the buffer. Rebuilt content
-  // only grows at the bottom, so a line anchor keeps the reader's lines
-  // steady; positions are tracked in xterm's internal line space because raw
-  // DOM scrollTop writes race with xterm's own viewport syncing under
-  // concurrent writes.
-  const scrollbackStableLineRef = useRef<number | null>(null);
   const recentDcChunksRef = useRef<{ offsetAfter: number; bytes: Uint8Array }[]>([]);
   const recentDcChunksSizeRef = useRef(0);
   const dcActiveRef = useRef(false);
@@ -581,84 +503,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const flushPendingLiveSeedWritesRef = useRef<() => void>(() => {});
   const liveViewportPinFrameRef = useRef<number | null>(null);
   const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
-  const renderScrollbackSnapshotRef = useRef<(bytes: Uint8Array | null, reveal: boolean) => void>(
-    () => {},
-  );
-  const requestScrollbackSnapshotRef = useRef<(initialDeltaY?: number) => boolean>(() => false);
-  const requestSnapshotRef = useRef<(purpose: ScrollbackSnapshotPurpose) => boolean>(() => false);
+  const requestSnapshotRef = useRef<() => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
-  const scrollbackWheelHandlerRef = useRef<(event: WheelEvent) => boolean>(() => true);
   // True once a snapshot/history proved this agent ships exact worker
   // replays; used to widen the overlay fetch budget (the daemon maps lines
   // to a byte budget, and TUI redraw churn dwarfs line-based sizing).
   const exactStreamRef = useRef(false);
   const invalidateScrollbackForResizeRef = useRef<() => void>(() => {});
-  const restoreScrollbackAfterResizeRef = useRef<() => void>(() => {});
   const terminalRowHeightRef = useRef(TERMINAL_LINE_HEIGHT_PX);
-  // Lines between the reader's view and the bottom, captured before a
-  // reflow. A resize rewraps the overlay buffer, which moves every line
-  // number under the reader; without this the view collapses to the live
-  // edge and the overlay hides itself out from under them.
-  const scrollbackResizeAnchorRef = useRef<number | null>(null);
-  const [scrollbackVisible, setScrollbackVisible] = useState(false);
-  const [scrollbackReady, setScrollbackReady] = useState(false);
-
-  const applyScrollbackOverlayVisibility = useCallback((visible: boolean) => {
-    const overlay = scrollbackOverlayRef.current;
-    if (!overlay) return;
-    overlay.style.visibility = visible ? "visible" : "hidden";
-    overlay.setAttribute("aria-hidden", visible ? "false" : "true");
-  }, []);
-
-  const setScrollbackReadyState = useCallback(
-    (ready: boolean) => {
-      applyScrollbackOverlayVisibility(scrollbackVisibleRef.current && ready);
-      if (scrollbackReadyRef.current === ready) return;
-      scrollbackReadyRef.current = ready;
-      setScrollbackReady(ready);
-    },
-    [applyScrollbackOverlayVisibility],
-  );
-
-  const getScrollbackViewport = useCallback(() => {
-    return scrollbackTerminalHostRef.current?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
-  }, []);
-
-  // Snapshot the overlay's currently-visible rows while it is scrolled up, so
-  // a diagnostics refresh can report the reader's view even after the overlay
-  // has closed (which resets its buffer to the live edge). Cheap — one screen
-  // of translateToString — and only runs when there is scrolled history to
-  // capture.
-  const rememberScrolledView = useCallback(() => {
-    const historyTerm = scrollbackTermRef.current;
-    const buffer = historyTerm?.buffer.active;
-    if (!historyTerm || !buffer || buffer.viewportY >= buffer.baseY) return;
-    const rows: string[] = [];
-    for (let i = 0; i < historyTerm.rows; i += 1) {
-      rows.push(buffer.getLine(buffer.viewportY + i)?.translateToString(true) ?? "");
-    }
-    lastScrolledViewRef.current = {
-      at: Date.now(),
-      viewportY: buffer.viewportY,
-      baseY: buffer.baseY,
-      length: buffer.length,
-      rows,
-    };
-  }, []);
-
-  const recordScrollbackUserPosition = useCallback(
-    (overlay: HTMLElement) => {
-      scrollbackUserScrollGenerationRef.current += 1;
-      scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-      scrollbackLastUserScrollAtRef.current = Date.now();
-      if (!scrollbackRenderInFlightRef.current) {
-        scrollbackStableLineRef.current =
-          scrollbackTermRef.current?.buffer.active.viewportY ?? null;
-      }
-      rememberScrolledView();
-    },
-    [rememberScrolledView],
-  );
+  const [_scrollbackVisible, _setScrollbackVisible] = useState(false);
+  const [_scrollbackReady, _setScrollbackReady] = useState(false);
 
   // Live DataChannel chunks newer than the snapshot's capture offset. The
   // first replayed chunk may straddle the offset; slice off the part the
@@ -689,6 +543,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }
     return slices;
   }, []);
+
+  // Geometry changed: captures taken at the old size are stale. The next
+  // heal/top-up fetches at current geometry; history itself reflows natively.
+  const invalidateSnapshotCacheForResize = useCallback(() => {
+    scrollbackCacheDirtyRef.current = true;
+    scrollbackRenderedSnapshotBytesRef.current = null;
+    scheduleScrollbackCacheRefreshRef.current();
+  }, []);
+  invalidateScrollbackForResizeRef.current = invalidateSnapshotCacheForResize;
 
   const syncLiveTerminalFromSnapshot = useCallback(
     (bytes: Uint8Array | null, opts?: { force?: boolean }): boolean => {
@@ -741,7 +604,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       predictorRef.current.clear();
       const ops: SequencedWrite[] = [
         { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
-        ...liveSeedWriteOps(text, unifiedScrollbackRef.current),
+        ...liveSeedWriteOps(text),
       ];
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
         term.scrollToBottom();
@@ -751,200 +614,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [takeDcReplaySlices],
   );
-
-  // xterm's Viewport translates DOM scrollTop into buffer lines by dividing
-  // by its measured row height. While the overlay host is hidden or
-  // mid-relayout that height can be 0, and 0/0 poisons the buffer's scroll
-  // offset (ydisp) with NaN — which never heals because every public scroll
-  // API is delta-based (NaN + n = NaN), leaving the overlay wedged shut
-  // under the reader (upstream xterm.js Viewport bug, observed on 5.5.0
-  // under slow-frame conditions). Reset the internal offset directly;
-  // pinned-version internals, degrades to a no-op if they move.
-  const healScrollbackScrollState = useCallback(() => {
-    const historyTerm = scrollbackTermRef.current;
-    if (!historyTerm || Number.isFinite(historyTerm.buffer.active.viewportY)) return;
-    const buffer = (
-      historyTerm as unknown as {
-        _core?: { _bufferService?: { buffer?: { ydisp?: unknown } } };
-      }
-    )._core?._bufferService?.buffer;
-    if (buffer && typeof buffer.ydisp === "number" && !Number.isFinite(buffer.ydisp)) {
-      buffer.ydisp = 0;
-    }
-  }, []);
-
-  const hideScrollbackOverlay = useCallback(() => {
-    if (!scrollbackVisibleRef.current) return;
-    syncLiveTerminalFromSnapshot(scrollbackRenderedSnapshotBytesRef.current);
-    scrollbackVisibleRef.current = false;
-    scrollbackRevealPendingRef.current = false;
-    committedHistoryRef.current?.conceal();
-    syncScrollbackWebglRenderer(false);
-    scrollbackRenderInFlightRef.current = false;
-    scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
-    scrollbackStableLineRef.current = null;
-    scrollbackSnapshotBytesRef.current = null;
-    scrollbackOverlayHasSnapshotRef.current = false;
-    scrollbackPendingDeltaPxRef.current = 0;
-    scrollbackDesiredScrollTopRef.current = null;
-    scrollbackUserScrollGenerationRef.current += 1;
-    setScrollbackReadyState(false);
-    setScrollbackVisible(false);
-    scrollbackTermRef.current?.scrollToBottom();
-    termRef.current?.scrollToBottom();
-    // Selecting text focuses the overlay terminal; hand focus back to the
-    // live terminal so typing resumes. Skip on touch devices, where focusing
-    // would pop the virtual keyboard.
-    if (
-      !coarsePointerRef.current &&
-      scrollbackTerminalHostRef.current?.contains(document.activeElement)
-    ) {
-      termRef.current?.focus();
-    }
-    if (scrollbackCacheDirtyRef.current) scheduleScrollbackCacheRefreshRef.current(100);
-  }, [setScrollbackReadyState, syncLiveTerminalFromSnapshot, syncScrollbackWebglRenderer]);
-
-  const updateScrollbackReveal = useCallback(
-    (_overlay: HTMLElement) => {
-      // While a reset+rewrite is in flight the buffer is transiently
-      // collapsed; deciding visibility against it would blink the overlay
-      // out under the reader. The render's own completion callback re-runs
-      // this with the rebuilt buffer.
-      if (scrollbackRenderInFlightRef.current) return;
-      healScrollbackScrollState();
-      const buffer = scrollbackTermRef.current?.buffer.active;
-      // A reflow in progress has not yet had the reader's position restored,
-      // and mid-reflow the viewport legitimately reads as "at the bottom".
-      // Hiding on that would snap the reader to the live screen while the
-      // overlay stays logically open — visibly a jump, and afterwards the
-      // wheel scrolls a terminal nobody can see.
-      if (scrollbackResizeAnchorRef.current !== null) return;
-      const reveal = buffer ? buffer.baseY > 0 && buffer.viewportY < buffer.baseY : false;
-      setScrollbackReadyState(reveal);
-      if (reveal) rememberScrolledView();
-    },
-    [healScrollbackScrollState, rememberScrolledView, setScrollbackReadyState],
-  );
-  updateScrollbackRevealRef.current = updateScrollbackReveal;
-
-  // Delta-mode reveal completion: the controller's write queue drained after a
-  // wheel-open (history + live-screen tail are in the buffer), so position at
-  // the live edge, apply the wheel deltas banked while rendering, and reveal.
-  const finishDeltaReveal = useCallback(() => {
-    const overlay = getScrollbackViewport();
-    const historyTerm = scrollbackTermRef.current;
-    if (!overlay || !historyTerm || !scrollbackVisibleRef.current) return;
-    healScrollbackScrollState();
-    scrollbackOverlayHasSnapshotRef.current = true;
-    historyTerm.scrollToBottom();
-    const pendingDelta = scrollbackPendingDeltaPxRef.current;
-    const pendingLines = Math.trunc(pendingDelta / Math.max(1, terminalRowHeightRef.current));
-    if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-    scrollbackPendingDeltaPxRef.current = 0;
-    scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-    scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
-    updateScrollbackReveal(overlay);
-  }, [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal]);
-  finishDeltaRevealRef.current = finishDeltaReveal;
-
-  // Rebuild the delta-mode overlay from a v2 replay's history text. The
-  // screen chunk is ignored: the reveal tail is painted from the local live
-  // terminal, which is always fresher than any capture.
-  const seedCommittedHistory = useCallback(
-    (bytes: Uint8Array, anchor: { epoch: string; offset: number }) => {
-      const controller = committedHistoryRef.current;
-      if (!controller) return;
-      const storied = parseHistoryReplay(parseExactReplay(decodeUtf8(bytes)));
-      const { cols, rows } = lastSizeRef.current;
-      controller.seed(storied ? storied.history : "", anchor, { cols, rows });
-    },
-    [],
-  );
-
-  const renderScrollbackSnapshot = useCallback(
-    (bytes: Uint8Array | null, reveal: boolean) => {
-      const historyTerm = scrollbackTermRef.current;
-      if (!bytes || !historyTerm) return;
-      // Delta mode owns the hidden terminal; a legacy rewrite would corrupt
-      // the controller's anchored buffer.
-      if (historyStreamActiveRef.current) return;
-      const renderAlreadyInFlight = scrollbackRenderInFlightRef.current;
-      const generation = scrollbackRenderGenerationRef.current + 1;
-      scrollbackRenderGenerationRef.current = generation;
-      scrollbackRenderInFlightRef.current = true;
-      scrollbackOverlayRef.current?.setAttribute("aria-busy", "true");
-
-      // A visible re-render must preserve the reader's place even when the
-      // idle-gate didn't stage an explicit restore. Measure the distance
-      // from the bottom before the rewrite collapses the buffer — unless a
-      // previous rewrite is still in flight, in which case the live buffer
-      // is untrustworthy and the last stable position wins.
-      if (
-        scrollbackVisibleRef.current &&
-        scrollbackOverlayHasSnapshotRef.current &&
-        scrollbackRestoreLineRef.current === null
-      ) {
-        if (renderAlreadyInFlight) {
-          scrollbackRestoreLineRef.current = scrollbackStableLineRef.current;
-        } else {
-          scrollbackRestoreLineRef.current = historyTerm.buffer.active.viewportY;
-        }
-      }
-
-      const { cols, rows } = lastSizeRef.current;
-      const text = decodeUtf8(bytes);
-      historyTerm.reset();
-      // Legacy (pre-delta) workers get a static render of the capture: the
-      // overlay is correct at open time and refreshed on the next open. No
-      // live bytes, ring slices, or convergence tracking ever touch this
-      // terminal — that machinery was the source of the mangled-history
-      // class the committed-history stream eliminated.
-      writeSequenced(historyTerm, overlayWriteOps(text, { cols, rows }), () => {
-        // Two frames let xterm's renderer settle the viewport height, but
-        // ALL scroll mutations happen atomically in the final frame: a
-        // half-applied scrollToBottom from a render superseded mid-sequence
-        // used to pin the overlay to the bottom, which the next render then
-        // captured as the position to preserve, hiding the overlay under an
-        // actively-reading user.
-        requestAnimationFrame(() => {
-          if (scrollbackRenderGenerationRef.current !== generation) return;
-          requestAnimationFrame(() => {
-            if (scrollbackRenderGenerationRef.current !== generation) return;
-            scrollbackRenderInFlightRef.current = false;
-            scrollbackOverlayRef.current?.setAttribute("aria-busy", "false");
-            scrollbackRenderedSnapshotBytesRef.current = bytes;
-            const overlay = getScrollbackViewport();
-            if (!overlay) return;
-            if (!reveal && !scrollbackVisibleRef.current) {
-              historyTerm.scrollToBottom();
-              overlay.scrollTop = maxElementScrollTop(overlay);
-              return;
-            }
-            scrollbackOverlayHasSnapshotRef.current = true;
-            healScrollbackScrollState();
-            const restoreLine = scrollbackRestoreLineRef.current;
-            scrollbackRestoreLineRef.current = null;
-            if (restoreLine !== null) {
-              historyTerm.scrollToLine(restoreLine);
-            } else {
-              historyTerm.scrollToBottom();
-            }
-            const pendingDelta = scrollbackPendingDeltaPxRef.current;
-            const pendingLines = Math.trunc(
-              pendingDelta / Math.max(1, terminalRowHeightRef.current),
-            );
-            if (pendingLines !== 0) historyTerm.scrollLines(pendingLines);
-            scrollbackPendingDeltaPxRef.current = 0;
-            scrollbackDesiredScrollTopRef.current = overlay.scrollTop;
-            scrollbackStableLineRef.current = historyTerm.buffer.active.viewportY;
-            updateScrollbackReveal(overlay);
-          });
-        });
-      });
-    },
-    [getScrollbackViewport, healScrollbackScrollState, updateScrollbackReveal],
-  );
-  renderScrollbackSnapshotRef.current = renderScrollbackSnapshot;
 
   const showUploadStatus = useCallback((message: string) => {
     setUploadStatus(message);
@@ -1056,8 +725,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [takeReadyAttachmentPrefix],
   );
 
+  // Input and control actions return the reader to the live edge — the
+  // one-buffer equivalent of the old "close the scrollback overlay".
+  const snapToLiveEdge = useCallback(() => {
+    termRef.current?.scrollToBottom();
+  }, []);
+
   const takeControlNow = useCallback((): boolean => {
-    hideScrollbackOverlay();
+    snapToLiveEdge();
     const term = termRef.current;
     if (!term) return false;
     displayOwnerRef.current = true;
@@ -1079,7 +754,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     socketRef.current.sendJson({ type: "take_control", cols, rows });
     term.focus();
     return true;
-  }, [hideScrollbackOverlay]);
+  }, [snapToLiveEdge]);
   takeControlNowRef.current = takeControlNow;
 
   const applyDisplayControl = useCallback(
@@ -1210,7 +885,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       liveSeedWriteInFlightRef.current = false;
       historyReseedPendingRef.current = true;
       scrollbackCacheDirtyRef.current = true;
-      if (!requestSnapshotRef.current("cache")) {
+      if (!requestSnapshotRef.current()) {
         scheduleScrollbackCacheRefreshRef.current(100);
       }
       pinLiveViewportToBottomRef.current();
@@ -1334,10 +1009,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           }
         }, 250);
       }
-      // Delta mode keeps the overlay exact from the committed-history stream;
-      // legacy (pre-delta) workers render a fresh capture per overlay open,
-      // so raw live bytes never touch the hidden terminal on either path.
-      committedHistoryRef.current?.liveScreenChanged();
       const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
@@ -1359,10 +1030,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
       }
       if (historyAnchor) {
-        // Delta-capable worker: the connect seed anchors the committed-line
-        // overlay; the scheduled deep refresh below re-seeds at full depth.
-        historyStreamActiveRef.current = true;
-        seedCommittedHistory(bytes, historyAnchor);
+        // Delta-capable worker; the scheduled deep refresh below rebuilds
+        // the live buffer at full history depth.
       }
       pendingLiveSeedWritesRef.current.clear();
       liveSeedCoveredOffsetRef.current = typeof dcOffset === "number" ? dcOffset : null;
@@ -1396,14 +1065,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       term.reset();
       unifiedDeepSeededRef.current = false;
-      writeSequenced(
-        term,
-        liveSeedWriteOps(decodeUtf8(bytes), unifiedScrollbackRef.current),
-        () => {
-          term.scrollToBottom();
-          flushPendingLiveSeedWritesRef.current();
-        },
-      );
+      writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
+        term.scrollToBottom();
+        flushPendingLiveSeedWritesRef.current();
+      });
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset, historyAnchor) => {
@@ -1421,7 +1086,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotTimeoutRef.current = null;
       }
       scrollbackSnapshotInFlightRef.current = false;
-      scrollbackSnapshotPurposeRef.current = null;
       scrollbackCachedSnapshotBytesRef.current = bytes;
       if (typeof dcOffset === "number") {
         // Offset-anchored snapshot: renders are made exact by replaying live
@@ -1444,7 +1108,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // Reseeds prefer an anchored capture. A plain endpoint replay can be
       // accepted only through the cache-clean gate while the stream is quiet.
       const anchorOk = typeof dcOffset === "number" || !dcActiveRef.current;
-      if (historyReseedPendingRef.current && anchorOk && !scrollbackVisibleRef.current) {
+      if (historyReseedPendingRef.current && anchorOk) {
         // A width change left seeded history wrapped at the old width;
         // rewrite the live buffer from this anchored capture so it reflows.
         // Stays pending until a rewrite actually succeeds (alternate-screen
@@ -1465,15 +1129,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // Delta mode: this snapshot is a seed/heal for the committed-line
         // overlay. The controller re-anchors from it; deltas keep it exact
         // afterwards, so the cache is clean by construction.
-        historyStreamActiveRef.current = true;
         scrollbackCacheDirtyRef.current = false;
-        // Unified scrollback: the connect seed carried a shallow history
-        // prefix; this is the full-depth capture. Rebuild the live buffer
-        // from it once — xterm cannot prepend, so depth only ever arrives
-        // via a rebuild. Guarded to the bottom-pinned viewport so a reader
-        // already scrolled back is never yanked; the offset-exact replay
-        // slices inside the sync keep every live byte.
-        if (unifiedScrollbackRef.current && !unifiedDeepSeededRef.current) {
+        // The connect seed carried a shallow history prefix; this is the
+        // full-depth capture. Rebuild the live buffer from it once — xterm
+        // cannot prepend, so depth only ever arrives via a rebuild. Guarded
+        // to the bottom-pinned viewport so a reader already scrolled back is
+        // never yanked; the offset-exact replay slices inside the sync keep
+        // every live byte.
+        if (!unifiedDeepSeededRef.current) {
           const liveTerm = termRef.current;
           const atBottom =
             !liveTerm || liveTerm.buffer.active.viewportY >= liveTerm.buffer.active.baseY;
@@ -1481,15 +1144,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             unifiedDeepSeededRef.current = true;
           }
         }
-        seedCommittedHistory(bytes, historyAnchor);
         return;
-      }
-      // Legacy (pre-delta) worker: the overlay renders only while open, from
-      // the capture its open requested. Nothing pre-renders in the
-      // background, and nothing rewrites under the reader afterwards.
-      if (scrollbackVisibleRef.current && bytes !== scrollbackRenderedSnapshotBytesRef.current) {
-        scrollbackSnapshotBytesRef.current = bytes;
-        renderScrollbackSnapshotRef.current(bytes, true);
       }
     },
     onSnapshotError: (message) => {
@@ -1501,18 +1156,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotTimeoutRef.current = null;
       }
       scrollbackSnapshotInFlightRef.current = false;
-      scrollbackSnapshotPurposeRef.current = null;
-    },
-    onHistoryDelta: (epoch, offset, bytes) => {
-      historyStreamActiveRef.current = true;
-      committedHistoryRef.current?.applyDelta(epoch, offset, bytes);
-    },
-    onHistoryWipe: (epoch) => {
-      historyStreamActiveRef.current = true;
-      committedHistoryRef.current?.applyWipe(epoch);
-    },
-    onHistoryGap: () => {
-      committedHistoryRef.current?.applyGap();
     },
     onExit: (code, sig) => {
       const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
@@ -1567,34 +1210,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
 
-  const requestSnapshot = useCallback((purpose: ScrollbackSnapshotPurpose) => {
+  const requestSnapshot = useCallback(() => {
     if (socketRef.current.state !== "open" || scrollbackSnapshotInFlightRef.current) return false;
 
     scrollbackSnapshotInFlightRef.current = true;
-    scrollbackSnapshotPurposeRef.current = purpose;
     scrollbackSnapshotRequestedAtRef.current = Date.now();
     const sent = socketRef.current.sendJson({
       type: "snapshot",
-      lines:
-        purpose === "cache" && !dcActiveRef.current
-          ? SCROLLBACK_UNANCHORED_CACHE_LINES
-          : // TERMINAL_SNAPSHOT_LINES equals the daemon's MAX_HISTORY_LINES,
-            // which it maps to its full replay budget (the whole retained
-            // log). Anything above it fails request validation outright, and
-            // the snapshot silently never arrives ("can't scroll").
-            TERMINAL_SNAPSHOT_LINES,
+      lines: !dcActiveRef.current
+        ? SCROLLBACK_UNANCHORED_CACHE_LINES
+        : // TERMINAL_SNAPSHOT_LINES equals the daemon's MAX_HISTORY_LINES,
+          // which it maps to its full replay budget (the whole retained
+          // log). Anything above it fails request validation outright, and
+          // the snapshot silently never arrives ("can't scroll").
+          TERMINAL_SNAPSHOT_LINES,
       plain: false,
     });
     if (!sent) {
       scrollbackSnapshotInFlightRef.current = false;
-      scrollbackSnapshotPurposeRef.current = null;
       return false;
     }
     if (scrollbackSnapshotTimeoutRef.current) clearTimeout(scrollbackSnapshotTimeoutRef.current);
     scrollbackSnapshotTimeoutRef.current = setTimeout(() => {
       scrollbackSnapshotTimeoutRef.current = null;
       scrollbackSnapshotInFlightRef.current = false;
-      scrollbackSnapshotPurposeRef.current = null;
     }, SCROLLBACK_SNAPSHOT_TIMEOUT_MS);
     return true;
   }, []);
@@ -1631,12 +1270,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // whichever terminal the user is actually typing into. The cache
         // stays dirty and one refresh runs on foregrounding instead.
         if (!activeRef.current) return;
-        // No refresh under an open overlay: the open render is made exact by
-        // replaying DataChannel bytes past the capture offset, and direct
-        // live appends keep it complete from then on — a mid-read rewrite
-        // would only flash and reflow content under the reader.
-        if (scrollbackVisibleRef.current) return;
-        if (!requestSnapshot("cache") && scrollbackSnapshotInFlightRef.current) {
+        if (!requestSnapshot() && scrollbackSnapshotInFlightRef.current) {
           // Another capture is pending; try again once it resolves or times out.
           scheduleScrollbackCacheRefreshRef.current(500);
         }
@@ -1645,178 +1279,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [requestSnapshot],
   );
   scheduleScrollbackCacheRefreshRef.current = scheduleScrollbackCacheRefresh;
-
-  const requestScrollbackSnapshot = useCallback(
-    (initialDeltaY = 0) => {
-      if (initialDeltaY !== 0) {
-        scrollbackPendingDeltaPxRef.current += initialDeltaY;
-      }
-
-      if (!scrollbackVisibleRef.current) {
-        scrollbackVisibleRef.current = true;
-        scrollbackOverlayHasSnapshotRef.current = false;
-        scrollbackSnapshotBytesRef.current = null;
-        scrollbackRenderedSnapshotBytesRef.current = null;
-        // Null = start at the live edge; renders that overlap the open
-        // scroll to bottom plus whatever wheel deltas banked.
-        scrollbackStableLineRef.current = null;
-        // Renderer parity with the live terminal from the first painted
-        // frame; released again when the overlay closes.
-        syncScrollbackWebglRenderer(true);
-        setScrollbackReadyState(false);
-        setScrollbackVisible(true);
-      }
-
-      if (historyStreamActiveRef.current) {
-        // Delta mode: the hidden terminal already holds the exact committed
-        // history. Reveal paints the live-screen tail below it; when no seed
-        // has anchored yet, the controller requests one and the seed's render
-        // completes this reveal.
-        scrollbackRevealPendingRef.current = true;
-        committedHistoryRef.current?.reveal();
-        return true;
-      }
-
-      // Legacy (pre-delta) worker: every open fetches and renders a fresh
-      // capture; onSnapshot completes the reveal when it lands.
-      requestSnapshot("overlay");
-      return true;
-    },
-    [requestSnapshot, setScrollbackReadyState, syncScrollbackWebglRenderer],
-  );
-  requestScrollbackSnapshotRef.current = requestScrollbackSnapshot;
-
-  // A resize changes checkpoint geometry, so any cached replay is laid out at
-  // the old width. Drop the rendered copy and fetch a fresh checkpoint at the new
-  // geometry instead of presenting stale-width history.
-  /**
-   * Put the reader back where they were reading after a reflow.
-   *
-   * Rewrapping renumbers every line, so the pre-resize viewport line means
-   * nothing afterwards. Distance from the bottom survives it well enough to
-   * keep the same text on screen, and — more importantly — keeps the reader
-   * off the live edge, which is what decides whether the overlay stays up.
-   */
-  const restoreScrollbackAfterResize = useCallback(() => {
-    const fromBottom = scrollbackResizeAnchorRef.current;
-    if (fromBottom === null) return;
-    const historyTerm = scrollbackTermRef.current;
-    if (!historyTerm) {
-      scrollbackResizeAnchorRef.current = null;
-      return;
-    }
-    const buffer = historyTerm.buffer.active;
-    // Never restore onto the live edge: landing there would hide the overlay
-    // and drop the reader into the live screen mid-resize.
-    const target = Math.max(0, Math.min(buffer.baseY - 1, buffer.baseY - fromBottom));
-    if (buffer.baseY > 0) historyTerm.scrollToLine(target);
-    scrollbackResizeAnchorRef.current = null;
-    updateScrollbackRevealRef.current(scrollbackOverlayRef.current as HTMLElement);
-  }, []);
-  restoreScrollbackAfterResizeRef.current = restoreScrollbackAfterResize;
-
-  const invalidateScrollbackForResize = useCallback(() => {
-    if (historyStreamActiveRef.current) {
-      // Delta mode: committed history is flowing text — xterm reflows it on
-      // resize with nothing refetched. Only the tail repaints.
-      const historyTerm = scrollbackTermRef.current;
-      if (scrollbackVisibleRef.current && historyTerm) {
-        const buffer = historyTerm.buffer.active;
-        scrollbackResizeAnchorRef.current = Math.max(0, buffer.baseY - buffer.viewportY);
-      }
-      const { cols, rows } = lastSizeRef.current;
-      committedHistoryRef.current?.resize(cols, rows);
-      // The reflow lands with xterm's own resize; restore once it has.
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => restoreScrollbackAfterResizeRef.current()),
-      );
-      return;
-    }
-    scrollbackCacheDirtyRef.current = true;
-    scrollbackRenderedSnapshotBytesRef.current = null;
-    if (scrollbackVisibleRef.current) {
-      requestSnapshot("overlay");
-    } else {
-      scheduleScrollbackCacheRefresh();
-    }
-  }, [requestSnapshot, scheduleScrollbackCacheRefresh]);
-  invalidateScrollbackForResizeRef.current = invalidateScrollbackForResize;
-
-  useLayoutEffect(() => {
-    const host = scrollbackTerminalHostRef.current;
-    if (!host || scrollbackTermRef.current) return;
-
-    const historyTerm = new XTerm({
-      ...XTERM_EMULATION_OPTIONS,
-      cursorBlink: false,
-      disableStdin: true,
-      fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: TERMINAL_FONT_SIZE,
-      lineHeight: TERMINAL_LINE_HEIGHT,
-      scrollback: TERMINAL_SNAPSHOT_LINES,
-      smoothScrollDuration: 0,
-      theme: { ...terminalScrollbackTheme(getResolvedTheme()) },
-    });
-    historyTerm.loadAddon(new WebLinksAddon());
-    activateUnicodeVersion(historyTerm, Unicode11Addon);
-    historyTerm.open(host);
-    scrollbackTermRef.current = historyTerm;
-    committedHistoryRef.current = new CommittedHistoryOverlay({
-      term: () => scrollbackTermRef.current,
-      serializeLiveScreen: () => {
-        const addon = serializeAddonRef.current;
-        if (!addon || !termRef.current) return "";
-        try {
-          return addon.serialize({ scrollback: 0, excludeModes: true, excludeAltBuffer: true });
-        } catch {
-          return "";
-        }
-      },
-      requestSeed: () => {
-        scrollbackCacheDirtyRef.current = true;
-        if (scrollbackVisibleRef.current) {
-          requestSnapshotRef.current("overlay");
-        } else {
-          scheduleScrollbackCacheRefreshRef.current();
-        }
-      },
-      onRendered: () => {
-        if (scrollbackRevealPendingRef.current) {
-          scrollbackRevealPendingRef.current = false;
-          finishDeltaRevealRef.current();
-          return;
-        }
-        if (scrollbackVisibleRef.current) {
-          const overlay = getScrollbackViewport();
-          if (overlay) updateScrollbackRevealRef.current(overlay);
-        }
-      },
-    });
-    // Route wheel through the shared scrollback logic (close-at-bottom,
-    // snapshot refresh) instead of xterm's native buffer scrolling.
-    historyTerm.attachCustomWheelEventHandler((event) => scrollbackWheelHandlerRef.current(event));
-    const copySelectionOnMouseUp = () => {
-      const selection = historyTerm.getSelection();
-      if (!selection) return;
-      void navigator.clipboard?.writeText(selection).catch(() => {});
-    };
-    host.addEventListener("mouseup", copySelectionOnMouseUp);
-    const viewport = getScrollbackViewport();
-    if (viewport) {
-      viewport.style.scrollbarWidth = "none";
-      viewport.style.touchAction = "none";
-      viewport.style.overscrollBehavior = "contain";
-    }
-    return () => {
-      host.removeEventListener("mouseup", copySelectionOnMouseUp);
-      committedHistoryRef.current?.dispose();
-      committedHistoryRef.current = null;
-      scrollbackWebglAddonRef.current?.dispose();
-      scrollbackWebglAddonRef.current = null;
-      historyTerm.dispose();
-      if (scrollbackTermRef.current === historyTerm) scrollbackTermRef.current = null;
-    };
-  }, [getScrollbackViewport]);
 
   useEffect(() => {
     if (socket.state !== "open") return;
@@ -2016,12 +1478,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     // the current PTY tail. Reconcile after xterm consumes a write and
     // coalesce streaming chunks to one refresh per animation frame.
     pinLiveViewportToBottomRef.current = () => {
-      // Unified scrollback: the reader may legitimately be scrolled up in
-      // this buffer. Pin only from the bottom — the pin exists to heal a
-      // slow-frame lag behind streaming output, not to enforce position.
-      if (unifiedScrollbackRef.current && term.buffer.active.viewportY < term.buffer.active.baseY) {
-        return;
-      }
+      // The reader may legitimately be scrolled up in this buffer. Pin only
+      // from the bottom — the pin exists to heal a slow-frame lag behind
+      // streaming output, not to enforce position.
+      if (term.buffer.active.viewportY < term.buffer.active.baseY) return;
       if (liveViewportPinFrameRef.current !== null) return;
       liveViewportPinFrameRef.current = requestAnimationFrame(() => {
         if (termRef.current !== term) {
@@ -2053,10 +1513,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const maxTop = maxScrollTop(viewport);
       if (rowHeight <= 0 || maxTop <= 0) return false;
 
-      const snapped = Math.max(
+      let snapped = Math.max(
         0,
         Math.min(maxTop, Math.round(viewport.scrollTop / rowHeight) * rowHeight),
       );
+      // The bottom is rarely a row multiple; a row-snap here would park the
+      // viewport a few sub-row pixels shy of the live edge forever. Within
+      // the last row, the edge wins.
+      if (maxTop - snapped < rowHeight) snapped = maxTop;
       if (Math.abs(snapped - viewport.scrollTop) < 0.5) return false;
       viewport.scrollTop = snapped;
       return true;
@@ -2064,88 +1528,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const activeBufferIsAlternate = () => term.buffer.active.type === "alternate";
 
-    const overlayIsAtBottom = (_overlay: HTMLElement) => {
-      // Mid-rewrite the buffer is collapsed and everything looks like
-      // "bottom"; never close the overlay off that reading.
-      if (scrollbackRenderInFlightRef.current) return false;
-      const buffer = scrollbackTermRef.current?.buffer.active;
-      return buffer ? buffer.viewportY >= buffer.baseY : true;
-    };
-
-    let overlayWheelRemainderPx = 0;
-    const scrollOverlayPixels = (deltaY: number) => {
-      const overlay = getScrollbackViewport();
-      const historyTerm = scrollbackTermRef.current;
-      if (!overlay || !historyTerm || deltaY === 0) return false;
-      // Scrolling the buffer while a rewrite is collapsing it is a lost
-      // update; bank the delta and let the render's completion apply it on
-      // top of the restored position.
-      if (scrollbackRenderInFlightRef.current) {
-        scrollbackPendingDeltaPxRef.current += deltaY;
-        scrollbackLastUserScrollAtRef.current = Date.now();
-        return true;
-      }
-      // Scroll through xterm's internal line state: raw DOM scrollTop writes
-      // race with the viewport syncing xterm performs on concurrent writes.
-      healScrollbackScrollState();
-      overlayWheelRemainderPx += deltaY;
-      const rowHeight = Math.max(1, terminalRowHeightRef.current);
-      const lines = Math.trunc(overlayWheelRemainderPx / rowHeight);
-      if (lines === 0) return true;
-      overlayWheelRemainderPx -= lines * rowHeight;
-      const before = historyTerm.buffer.active.viewportY;
-      historyTerm.scrollLines(lines);
-      const moved = historyTerm.buffer.active.viewportY !== before;
-      if (moved) recordScrollbackUserPosition(overlay);
-      updateScrollbackReveal(overlay);
-      return moved;
-    };
-
-    const handleScrollbackOverlayWheel = (amount: number) => {
-      const overlay = getScrollbackViewport();
-      if (!overlay) {
-        requestScrollbackSnapshotRef.current(amount);
-        return true;
-      }
-
-      if (amount > 0 && overlayIsAtBottom(overlay)) {
-        hideScrollbackOverlay();
-        return true;
-      }
-
-      const moved = scrollOverlayPixels(amount);
-      if (moved && amount > 0 && overlayIsAtBottom(overlay)) {
-        hideScrollbackOverlay();
-      } else if (!moved && (scrollbackTermRef.current?.buffer.active.baseY ?? 0) <= 0) {
-        requestScrollbackSnapshotRef.current(amount);
-      }
-      return true;
-    };
-
-    // The overlay receives pointer events directly (text selection, links),
-    // so its wheel events no longer reach the live terminal underneath.
-    // Route them through the same scrollback logic.
-    scrollbackWheelHandlerRef.current = (event) => {
-      if (event.ctrlKey) return true;
-      const amount = wheelEventToPixels(event, term.rows);
-      if (amount === 0) return true;
-      handleScrollbackOverlayWheel(amount);
-      event.preventDefault();
-      event.stopPropagation();
-      return false;
-    };
-
+    // History lives in this terminal's own buffer: wheel is native xterm
+    // scrolling (and native arrow-key conversion in the alternate buffer).
+    // Only ctrl-zoom and the viewer pan frame are intercepted.
     term.attachCustomWheelEventHandler((event) => {
       if (event.ctrlKey) return true;
       const amount = wheelEventToPixels(event, term.rows);
       if (amount === 0) return true;
-
-      if (scrollbackVisibleRef.current) {
-        handleScrollbackOverlayWheel(amount);
-        event.preventDefault();
-        event.stopPropagation();
-        return false;
-      }
 
       if (usesViewerPanFrame()) {
         const frameScroll = scrollViewerPanFrame(
@@ -2157,26 +1546,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           event.stopPropagation();
           return false;
         }
-      }
-
-      if (unifiedScrollbackRef.current) {
-        // Unified scrollback: history lives in this terminal's own buffer, so
-        // wheel-up is native xterm scrolling, and alt-screen wheel gets
-        // xterm's native arrow-key conversion instead of a swallow.
-        return true;
-      }
-
-      if (amount < 0) {
-        requestScrollbackSnapshotRef.current(amount);
-        event.preventDefault();
-        event.stopPropagation();
-        return false;
-      }
-
-      if (activeBufferIsAlternate()) {
-        event.preventDefault();
-        event.stopPropagation();
-        return false;
       }
 
       return true;
@@ -2193,37 +1562,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
 
-      if (scrollbackVisibleRef.current) {
-        if (deltaY > 0) {
-          const overlay = getScrollbackViewport();
-          if (overlay && overlayIsAtBottom(overlay)) {
-            hideScrollbackOverlay();
-            state.scrollRemainderPx = 0;
-            return false;
-          }
-        }
-        state.scrollRemainderPx = 0;
-        const moved = scrollOverlayPixels(deltaY);
-        const overlay = getScrollbackViewport();
-        if (moved && deltaY > 0 && overlay && overlayIsAtBottom(overlay)) {
-          hideScrollbackOverlay();
-        }
-        return moved || scrollbackSnapshotInFlightRef.current;
-      }
-
       if (coarsePointerRef.current && usesViewerPanFrame()) {
         const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
         if (frameScroll.movedX || frameScroll.movedY) {
           state.scrollRemainderPx = 0;
           return true;
         }
-      }
-
-      if (deltaY < 0 && !unifiedScrollbackRef.current) {
-        requestScrollbackSnapshotRef.current(deltaY);
-        state.openedScrollback = true;
-        state.scrollRemainderPx = 0;
-        return true;
       }
 
       if (activeBufferIsAlternate()) {
@@ -2248,7 +1592,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       state.momentumLastTime = 0;
       state.scrollRemainderPx = 0;
-      if (!scrollbackVisibleRef.current && !usesViewerPanFrame()) alignViewportToRows();
+      if (!usesViewerPanFrame()) alignViewportToRows();
     };
 
     const sendMobilePromptNewline = () => {
@@ -2260,7 +1604,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return false;
       }
       lastMobileReturnAtRef.current = performance.now();
-      hideScrollbackOverlay();
+      snapToLiveEdge();
       socketRef.current.sendBinary(mobileReturnBytesRef.current);
       if (term.textarea) term.textarea.value = "";
       return true;
@@ -2526,7 +1870,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const onClick = (event: MouseEvent) => {
       if (!touchScrollRef.current.pendingTapFocus) return;
       touchScrollRef.current.pendingTapFocus = false;
-      hideScrollbackOverlay();
+      snapToLiveEdge();
       term.focus();
       event.preventDefault();
       event.stopPropagation();
@@ -2544,7 +1888,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (event.shiftKey && rawInputRef.current) {
         if (event.type === "keydown") {
           event.preventDefault();
-          hideScrollbackOverlay();
+          snapToLiveEdge();
           // Also mute the textarea input fallback (virtual keyboards) for
           // this press so it cannot double-send.
           lastMobileReturnAtRef.current = performance.now();
@@ -2565,12 +1909,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
     terminalElement.addEventListener("mouseup", copyLiveSelectionOnMouseUp);
 
-    // The scrollback overlay accepts pointer events for text selection and
-    // links, so the touch-scroll machinery must listen there too — touch
-    // events over the visible overlay no longer reach the live viewport.
-    const touchTargets: HTMLElement[] = scrollbackOverlayRef.current
-      ? [terminalTouchTarget, scrollbackOverlayRef.current]
-      : [terminalTouchTarget];
+    const touchTargets: HTMLElement[] = [terminalTouchTarget];
     const usePointerEvents = window.PointerEvent !== undefined;
     for (const target of touchTargets) {
       target.addEventListener("click", onClick, { capture: true });
@@ -2746,7 +2085,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         target.removeEventListener("touchend", onTouchEnd, { capture: true });
         target.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       }
-      scrollbackWheelHandlerRef.current = () => true;
       stopTouchMomentum();
       if (resizeTimer) clearTimeout(resizeTimer);
       onDataDisposableRef.current?.dispose();
@@ -2776,13 +2114,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
     // through `socketRef`, so it doesn't need to be in deps.
-  }, [
-    getScrollbackViewport,
-    healScrollbackScrollState,
-    hideScrollbackOverlay,
-    recordScrollbackUserPosition,
-    updateScrollbackReveal,
-  ]);
+  }, [snapToLiveEdge]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {
@@ -3037,7 +2369,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!rawInput) return;
     const enc = new TextEncoder();
     onDataDisposableRef.current = term.onData((d) => {
-      hideScrollbackOverlay();
       const filtered = stripDeviceAttributeResponses(d);
       const mapped = rewriteMobileReturn(
         filtered,
@@ -3079,13 +2410,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDataDisposableRef.current?.dispose();
       onDataDisposableRef.current = null;
     };
-  }, [
-    appendAttachmentsForSubmit,
-    hideScrollbackOverlay,
-    rawInput,
-    socket,
-    schedulePredictionSweep,
-  ]);
+  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep]);
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
@@ -3099,7 +2424,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     ref,
     () => ({
       sendInput: (data) => {
-        hideScrollbackOverlay();
+        snapToLiveEdge();
         socket.sendBinary(data);
       },
       resize: (cols, rows) => {
@@ -3132,25 +2457,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               tail.push(buf.getLine(i)?.translateToString(true) ?? "");
             }
           }
-          // What the user is actually looking at — decided from ground truth,
-          // not a single boolean that can flip in the instant before the
-          // click. In priority order:
-          //   1. overlay genuinely on-screen and scrolled up  -> its live rows
-          //   2. overlay just closed, but the reader was scrolled up a moment
-          //      ago                                          -> remembered rows
-          //      (the overlay buffer resets to the live edge on close, so it
-          //      can't be recovered from there — hence lastScrolledViewRef)
-          //   3. the live terminal is itself scrolled up      -> its rows
-          //   4. otherwise                                    -> the live edge
-          const overlayOnScreen = scrollbackOverlayRef.current?.style.visibility === "visible";
-          const historyTerm = scrollbackTermRef.current;
-          const historyBuf = historyTerm?.buffer.active;
-          const overlayScrolledUp =
-            !!historyBuf && historyBuf.baseY > 0 && historyBuf.viewportY < historyBuf.baseY;
+          // What the user is actually looking at: the live terminal is the
+          // only buffer, so either they are scrolled up in it or at the edge.
           const liveScrolledUp = !!buf && buf.viewportY < buf.baseY;
-          const remembered = lastScrolledViewRef.current;
-          const rememberedAgeMs = remembered ? Date.now() - remembered.at : null;
-          const rememberedFresh = rememberedAgeMs !== null && rememberedAgeMs < 12_000;
           const rowsFrom = (t: XTerm, b: NonNullable<typeof buf>) => {
             const out: string[] = [];
             for (let i = 0; i < t.rows; i += 1) {
@@ -3158,21 +2467,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             }
             return out;
           };
-          let viewSource: string;
-          let visibleRows: string[] = [];
-          if (overlayOnScreen && overlayScrolledUp && historyTerm && historyBuf) {
-            viewSource = "scrollback-overlay";
-            visibleRows = rowsFrom(historyTerm, historyBuf);
-          } else if (!overlayOnScreen && rememberedFresh && remembered) {
-            viewSource = "scrollback-overlay-recent";
-            visibleRows = remembered.rows;
-          } else if (liveScrolledUp && term && buf) {
-            viewSource = "live-scrolled";
-            visibleRows = rowsFrom(term, buf);
-          } else {
-            viewSource = "live";
-            if (term && buf) visibleRows = rowsFrom(term, buf);
-          }
+          const viewSource = liveScrolledUp ? "live-scrolled" : "live";
+          const visibleRows = term && buf ? rowsFrom(term, buf) : [];
           return {
             at: new Date().toISOString(),
             term: term ? { cols: term.cols, rows: term.rows } : null,
@@ -3197,26 +2493,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             socketState: socketRef.current.state,
             dcActive: dcActiveRef.current,
             exactStream: exactStreamRef.current,
-            overlay: {
-              // flagVisible is the transient ref; onScreen is the DOM truth.
-              // If they disagree, the flag raced the click.
-              flagVisible: scrollbackVisibleRef.current,
-              onScreen: overlayOnScreen,
-              scrolledUp: overlayScrolledUp,
-              buffer: historyBuf
-                ? {
-                    viewportY: historyBuf.viewportY,
-                    baseY: historyBuf.baseY,
-                    length: historyBuf.length,
-                  }
-                : null,
-              sinceLastScrollMs: scrollbackLastUserScrollAtRef.current
-                ? Date.now() - scrollbackLastUserScrollAtRef.current
-                : null,
-              rememberedAgeMs,
+            scrollback: {
               cacheDirty: scrollbackCacheDirtyRef.current,
               reseedPending: historyReseedPendingRef.current,
-              renderInFlight: scrollbackRenderInFlightRef.current,
+              deepSeeded: unifiedDeepSeededRef.current,
             },
             fonts: document.fonts?.status ?? "unknown",
             dpr: window.devicePixelRatio,
@@ -3229,40 +2509,35 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           };
         };
         const before = capture();
-        // A refresh heals the frame; it must NOT yank the reader's viewport.
-        // Drop the remembered scroll so the post-heal `after` snapshot reports
-        // the healed state rather than replaying the old position.
-        lastScrolledViewRef.current = null;
         fitTerminalRef.current(true);
         if (displayOwnerRef.current === true) {
           const { cols, rows } = lastSizeRef.current;
           socketRef.current.sendJson({ type: "resize", cols, rows });
         }
-        if (scrollbackVisibleRef.current) {
-          // Scrolled up: re-render the overlay in place from a fresh capture.
-          // Never rewrite the live buffer under an open overlay.
-          invalidateScrollbackForResizeRef.current();
-          await new Promise((resolve) => setTimeout(resolve, 2200));
+        const liveAtEdge = () => {
+          const b = termRef.current?.buffer.active;
+          return !b || b.viewportY >= b.baseY;
+        };
+        if (!liveAtEdge()) {
+          // Scrolled up reading history: never rewrite the buffer under the
+          // reader. The refit above is the whole heal.
+          await new Promise((resolve) => setTimeout(resolve, 800));
         } else {
           // At the live edge: drive a fresh authoritative reseed to
-          // convergence. The reseed only applies a snapshot that lands "clean"
-          // (no live bytes since it was requested), so without a PTY offset
-          // anchor a single 5s-debounced
-          // request almost never lands inside the window, and the panel looks
-          // unrefreshed until a manual scroll. Keep requesting promptly until
-          // one converges (or we give up); only clean snapshots apply, so this
-          // can never roll the live terminal back.
+          // convergence. Only clean snapshots apply (offset-anchored replay
+          // slices cover live bytes), so this can never roll the terminal
+          // back. Keep requesting promptly until one converges or we give up.
           historyReseedPendingRef.current = true;
           const deadline = Date.now() + 6000;
           while (
             historyReseedPendingRef.current &&
-            !scrollbackVisibleRef.current &&
+            liveAtEdge() &&
             socketRef.current.state === "open" &&
             Date.now() < deadline
           ) {
             if (!scrollbackSnapshotInFlightRef.current) {
               scrollbackCacheDirtyRef.current = true;
-              requestSnapshotRef.current("cache");
+              requestSnapshotRef.current();
             }
             await new Promise((resolve) => setTimeout(resolve, 300));
           }
@@ -3311,7 +2586,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       },
       focus: () => termRef.current?.focus(),
       submit: () => {
-        hideScrollbackOverlay();
+        snapToLiveEdge();
         socket.sendBinary(appendAttachmentsForSubmit("\r"));
         termRef.current?.focus();
       },
@@ -3325,7 +2600,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       appendAttachmentsForSubmit,
       assertUploadReconciliation,
       dismissUploadReconciliation,
-      hideScrollbackOverlay,
+      snapToLiveEdge,
       pasteDataTransfer,
       pasteFromClipboard,
       pasteText,
@@ -3431,24 +2706,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             }}
           />
         </div>
-      </div>
-      <div
-        ref={scrollbackOverlayRef}
-        data-testid="terminal-scrollback-overlay"
-        aria-hidden={!scrollbackVisible}
-        className="pointer-events-auto absolute inset-0 z-10 touch-none bg-[var(--color-terminal-bg)] text-[#e5e5e5]"
-        style={{
-          visibility: scrollbackVisible && scrollbackReady ? "visible" : "hidden",
-        }}
-      >
-        <div
-          ref={scrollbackTerminalHostRef}
-          className="size-full touch-none"
-          style={{
-            WebkitOverflowScrolling: "touch",
-            overscrollBehavior: "contain",
-          }}
-        />
       </div>
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
@@ -4076,7 +3333,7 @@ function writeSequenced(term: XTerm, ops: SequencedWrite[], done: () => void) {
  *  reflows — then flush the viewport and paint the live screen. Legacy exact
  *  replays get per-chunk geometry; plain endpoint replays get a fallback
  *  reformat. All shapes end at `finalSize`. */
-function overlayWriteOps(
+function _overlayWriteOps(
   text: string,
   finalSize: { cols: number; rows: number },
 ): SequencedWrite[] {
@@ -4115,25 +3372,22 @@ function overlayWriteOps(
  *  from its container). Exact worker replays end with a self-contained chunk
  *  — a full idempotent repaint at the current PTY geometry — so the final
  *  chunk alone seeds the screen. Plain endpoint replay is reformatted. */
-function liveSeedWriteOps(text: string, unified: boolean): SequencedWrite[] {
+function liveSeedWriteOps(text: string): SequencedWrite[] {
   const exact = parseExactReplay(text);
   if (!exact) {
     return [{ data: formatSnapshotForXterm(text) }];
   }
-  if (unified) {
-    // Unified scrollback: the committed history becomes the live terminal's
-    // own scrollback, exactly as the overlay renders it — flowing text, then
-    // a viewport flush so the screen repaint below cannot overwrite the
-    // newest history lines. No resize ops: the live terminal is fit-sized
-    // and must never be geometry-walked; history reflows natively instead.
-    const storied = parseHistoryReplay(exact);
-    if (storied) {
-      return [
-        { data: storied.history },
-        { data: flushViewportIntoScrollback },
-        { data: storied.screen.data },
-      ];
-    }
+  // Committed history becomes the live terminal's own scrollback: flowing
+  // text, then a viewport flush so the screen repaint below cannot overwrite
+  // the newest history lines. No resize ops: the live terminal is fit-sized
+  // and must never be geometry-walked; history reflows natively instead.
+  const storied = parseHistoryReplay(exact);
+  if (storied) {
+    return [
+      { data: storied.history },
+      { data: flushViewportIntoScrollback },
+      { data: storied.screen.data },
+    ];
   }
   return [{ data: exact[exact.length - 1].data }];
 }

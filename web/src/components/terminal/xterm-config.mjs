@@ -20,8 +20,8 @@ export const TERMINAL_LINE_HEIGHT = 1.2;
 export const TERMINAL_FONT_FAMILY =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
 
-/** Scrollback depths. The live terminal keeps a deep local buffer for replay;
- * the history overlay renders endpoint worker snapshots capped at this depth. */
+/** Scrollback depths. The live terminal's buffer holds committed history
+ * plus live output; snapshot fetches are capped at the daemon's line limit. */
 export const TERMINAL_SCROLLBACK_LINES = 100_000;
 export const TERMINAL_SNAPSHOT_LINES = 10_000;
 
@@ -33,14 +33,6 @@ export const TERMINAL_THEME = Object.freeze({
   background: "#0a0a0a",
   foreground: "#e5e5e5",
   cursor: "#e5e5e5",
-});
-
-/** Theme for the scrollback/history overlay terminal: identical, but the
- * cursor is painted in the background color so it is invisible. */
-export const TERMINAL_SCROLLBACK_THEME = Object.freeze({
-  background: "#0a0a0a",
-  foreground: "#e5e5e5",
-  cursor: "#0a0a0a",
 });
 
 /**
@@ -88,19 +80,9 @@ export const TERMINAL_THEME_LIGHT = Object.freeze({
   selectionInactiveBackground: "#e1e6eb",
 });
 
-export const TERMINAL_SCROLLBACK_THEME_LIGHT = Object.freeze({
-  ...TERMINAL_THEME_LIGHT,
-  cursor: LIGHT_BACKGROUND,
-});
-
 /** @param {"light"|"dark"} resolved */
 export function terminalTheme(resolved) {
   return resolved === "light" ? TERMINAL_THEME_LIGHT : TERMINAL_THEME;
-}
-
-/** @param {"light"|"dark"} resolved */
-export function terminalScrollbackTheme(resolved) {
-  return resolved === "light" ? TERMINAL_SCROLLBACK_THEME_LIGHT : TERMINAL_SCROLLBACK_THEME;
 }
 
 /**

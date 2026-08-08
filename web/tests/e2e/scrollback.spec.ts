@@ -2,11 +2,11 @@ import { expect, type Page, test } from "@playwright/test";
 import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
 import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 
-// Unified scrollback (experiment): committed history is seeded into the LIVE
-// terminal's own buffer and wheel/touch scroll it natively — the snapshot
-// overlay never opens. These tests pin the mode's contract, including the
-// duplication scenarios that historically broke the overlay: reseeds and
-// resizes must never leave a second copy of anything in the buffer.
+// Unified scrollback: committed history is seeded into the live terminal's
+// own buffer and wheel/touch scroll it natively — one buffer, one coordinate
+// space. These tests pin that contract, including the duplication scenarios
+// that broke the old overlay design: seeds, deep rebuilds, and resizes must
+// never leave a second copy of anything in the buffer.
 
 const V2_MARKER = "\x1b[8;12;80t";
 const V2_SENTINEL = "\x1b_sp:h1\x1b\\";
@@ -26,9 +26,6 @@ function v2Replay(lines: number) {
 }
 
 async function openUnifiedTerminal(page: Page) {
-  await page.addInitScript(() => {
-    window.localStorage.setItem("spawnScrollback", "unified");
-  });
   const messages: Array<string | Buffer> = [];
   await installAgentRtcMock(page, messages, {
     history: v2Replay(150),
@@ -55,6 +52,14 @@ async function openUnifiedTerminal(page: Page) {
   await expect(page.getByTestId("terminal-live-host").locator(".xterm-rows")).toContainText(
     "SCREEN-ROW-00",
   );
+  return messages;
+}
+
+function binaryText(messages: Array<string | Buffer>) {
+  return messages
+    .filter((message): message is Buffer => Buffer.isBuffer(message))
+    .map((message) => message.toString("latin1"))
+    .join("");
 }
 
 /** Count a marker across the LIVE terminal's whole buffer by walking the
@@ -147,9 +152,7 @@ test("resizing while scrolled back keeps history single-copy", async ({ page }) 
   expect(await countInLiveBuffer(page, "SCREEN-ROW-00")).toBe(1);
 });
 
-test("live output while scrolled back does not yank the reader to the bottom", async ({
-  page,
-}) => {
+test("live output while scrolled back does not yank the reader to the bottom", async ({ page }) => {
   await openUnifiedTerminal(page);
   const live = page.getByTestId("terminal-live-host");
 
@@ -166,4 +169,81 @@ test("live output while scrolled back does not yank the reader to the bottom", a
 
   // Still reading history, not staring at the live screen.
   await expect(live.locator(".xterm-rows")).toContainText("commit-");
+});
+
+test("the newest history line sits immediately above the live screen", async ({ page }) => {
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -400);
+  await page.waitForTimeout(250);
+
+  // Seam order: the last committed line, then the screen — nothing between.
+  const text = await live.locator(".xterm-rows").innerText();
+  const history = text.indexOf("commit-149");
+  const screen = text.indexOf("SCREEN-ROW-00");
+  expect(history).toBeGreaterThanOrEqual(0);
+  expect(screen).toBeGreaterThan(history);
+});
+
+test("right-clicking while scrolled up keeps the reader where they were", async ({ page }) => {
+  const messages = await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -600);
+  await page.waitForTimeout(200);
+
+  const viewport = live.locator(".xterm-viewport");
+  const before = await viewport.evaluate((el) => el.scrollTop);
+  expect(before).toBeGreaterThanOrEqual(0);
+
+  const box = await live.boundingBox();
+  if (!box) throw new Error("terminal not visible");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down({ button: "right" });
+  await page.mouse.up({ button: "right" });
+  await page.waitForTimeout(400);
+
+  // The reader stays scrolled up: a click is not "take me to the bottom".
+  // (With mouse tracking enabled an app would receive the click — native
+  // terminal semantics — but without it, nothing is typed on the user's
+  // behalf either.)
+  const after = await viewport.evaluate((el) => el.scrollTop);
+  expect(after).toBe(before);
+  expect(binaryText(messages)).not.toContain("\x1b[<");
+});
+
+test("typing while scrolled up returns to the live edge", async ({ page }) => {
+  const messages = await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -600);
+  await page.waitForTimeout(200);
+  await expect(live.locator(".xterm-rows")).toContainText("commit-");
+
+  await page.keyboard.type("x");
+
+  await expect.poll(() => binaryText(messages)).toContain("x");
+  await expect
+    .poll(async () => {
+      const viewport = live.locator(".xterm-viewport");
+      return viewport.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop < 2);
+    })
+    .toBe(true);
+  await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-00");
+});
+
+test("an in-band scrollback wipe (ED3) empties history", async ({ page }) => {
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+
+  // The app clears its scrollback; xterm applies it natively to the buffer.
+  await sendPty(page, "\x1b[3J");
+  await page.waitForTimeout(200);
+
+  expect(await countInLiveBuffer(page, "commit-000")).toBe(0);
+  // The visible screen survives an ED3.
+  await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-00");
 });

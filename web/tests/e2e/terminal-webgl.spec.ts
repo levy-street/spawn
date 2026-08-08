@@ -51,17 +51,14 @@ test("forced GPU renderer attaches a WebGL canvas to the live terminal", async (
   await expect(live.locator(".xterm-screen canvas").first()).toBeAttached();
 });
 
-test("scrollback overlay renders with the same GPU renderer while open", async ({ page }) => {
+test("scrolled-back history renders through the same GPU canvas", async ({ page }) => {
   await openGpuTerminal(page);
-  await page.getByTestId("terminal-live-host").locator(".xterm").hover();
+  const live = page.getByTestId("terminal-live-host");
+  await live.locator(".xterm").hover();
   await page.mouse.wheel(0, -600);
-  const overlay = page.getByTestId("terminal-scrollback-overlay");
-  await expect(overlay).toBeVisible();
-  // Renderer parity: the overlay gets its own WebGL canvas while revealed.
-  await expect(overlay.locator(".xterm-screen canvas").first()).toBeAttached({ timeout: 10_000 });
-  // Closing the overlay releases the context (the canvas detaches) so the
-  // warm pool and multi-pane screens never accumulate hidden GPU contexts.
+  // One buffer, one renderer: scrolled-back history is the same WebGL canvas,
+  // so there is no second context to leak and nothing to release on return.
+  await expect(live.locator(".xterm-screen canvas").first()).toBeAttached({ timeout: 10_000 });
   await page.mouse.wheel(0, 40_000);
-  await expect(overlay).toBeHidden();
-  await expect(overlay.locator(".xterm-screen canvas")).toHaveCount(0);
+  await expect(live.locator(".xterm-screen canvas").first()).toBeAttached();
 });

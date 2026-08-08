@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { decodeHistoryDelta } from "@/components/terminal/committed-history";
 import {
   AGENT_CTL_MAX_PENDING_PTY_BYTES,
   AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER,
@@ -80,9 +79,6 @@ export interface UseAgentSocketOptions {
   onSnapshotError?: (message: string) => void;
   /** Committed-history delta stream (present after `history_subscribe` is
    *  acknowledged by a delta-capable daemon+worker pair). */
-  onHistoryDelta?: (epoch: string, offset: number, bytes: Uint8Array) => void;
-  onHistoryWipe?: (epoch: string) => void;
-  onHistoryGap?: () => void;
 }
 
 export interface DirectAgentUploadOptions {
@@ -186,9 +182,6 @@ export function useAgentSocket({
   onStatus,
   onSnapshot,
   onSnapshotError,
-  onHistoryDelta,
-  onHistoryWipe,
-  onHistoryGap,
 }: UseAgentSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
@@ -266,9 +259,6 @@ export function useAgentSocket({
     onStatus,
     onSnapshot,
     onSnapshotError,
-    onHistoryDelta,
-    onHistoryWipe,
-    onHistoryGap,
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
@@ -280,9 +270,6 @@ export function useAgentSocket({
     onStatus,
     onSnapshot,
     onSnapshotError,
-    onHistoryDelta,
-    onHistoryWipe,
-    onHistoryGap,
   };
 
   useEffect(() => {
@@ -1132,23 +1119,17 @@ export function useAgentSocket({
                   startBootstrap();
                   return;
                 }
-                if (message.event === "history_delta") {
-                  const bytes = decodeHistoryDelta(message.data);
-                  if (bytes) {
-                    currentHandlers()?.onHistoryDelta?.(
-                      message.history_epoch,
-                      message.history_offset,
-                      bytes,
-                    );
-                  }
-                  return;
-                }
-                if (message.event === "history_wipe") {
-                  currentHandlers()?.onHistoryWipe?.(message.history_epoch);
-                  return;
-                }
-                if (message.event === "history_gap") {
-                  currentHandlers()?.onHistoryGap?.();
+                if (
+                  message.event === "history_delta" ||
+                  message.event === "history_wipe" ||
+                  message.event === "history_gap"
+                ) {
+                  // Committed-line deltas reach this client but nothing
+                  // consumes them: history lives in the live terminal's own
+                  // buffer, fed by the byte stream itself. Swallow the events
+                  // so they cannot fall through to the display-control
+                  // parser. Teaching the daemon not to stream them at all is
+                  // a follow-up (bandwidth, not correctness).
                   return;
                 }
                 currentHandlers()?.onDisplayControl?.({
