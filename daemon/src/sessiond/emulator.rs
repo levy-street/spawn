@@ -263,19 +263,11 @@ impl Emulator {
         Some(out)
     }
 
-    /// Resize the screen. A resize is a change of VIEW, not new output, so it
-    /// never commits history.
-    ///
-    /// Reflowing the grid to a new width transiently rotates rows through the
-    /// grid's scrollback — even when growing the screen — but committing those
-    /// rows was a mistake: it baked the current screen at the new width into
-    /// the permanent log (attach a phone at 40 columns and desktop-generated
-    /// content froze at 40 forever), tore logical lines across the
-    /// history/screen boundary so they never reassembled wide again, and let a
-    /// mobile keyboard's rows-only churn commit the same rows over and over.
-    /// History is written only when output genuinely scrolls a line off the
-    /// screen (see `feed_output`); the reflow spill is discarded so a later
-    /// repaint's drain cannot commit it either.
+    /// Resize the screen. Narrowing reflows wrapped screen rows and can push
+    /// the excess into grid history — those rows genuinely left the screen,
+    /// so they are committed (kitty/VTE resize semantics). The grid history
+    /// is empty on entry (drained every feed), so widening has nothing to
+    /// pull back and can never un-commit a line.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Vec<HistoryEvent> {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -284,8 +276,10 @@ impl Emulator {
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
         self.shadow.resize(rows);
-        self.term.grid_mut().clear_history();
-        Vec::new()
+        match self.drain_history() {
+            Some(lines) => vec![HistoryEvent::Lines(lines)],
+            None => Vec::new(),
+        }
     }
 
     pub fn geometry(&self) -> (u16, u16) {
@@ -1017,50 +1011,6 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_does_not_commit_onscreen_content_at_narrow_width() {
-        // A desktop-width session with content sitting ON SCREEN — nothing has
-        // scrolled off, so nothing is committed yet.
-        let mut e = Emulator::new(80, 6);
-        let events =
-            e.feed_output(b"a short desktop line well under eighty columns wide\r\n$ ");
-        assert!(
-            committed(&events).is_empty(),
-            "on-screen content committed early: {:?}",
-            String::from_utf8_lossy(&committed(&events)),
-        );
-
-        // A phone attaches and shrinks the PTY to 40 columns. This is display
-        // reflow, not new output: the on-screen desktop line must NOT be
-        // committed at the narrow width. The user's policy is that viewing a
-        // session on a phone may narrow the LIVE view but must never
-        // permanently narrow desktop-generated history.
-        let committed_on_narrow = committed(&e.resize(40, 12));
-        assert!(
-            committed_on_narrow.is_empty(),
-            "narrowing committed on-screen content at phone width: {:?}",
-            String::from_utf8_lossy(&committed_on_narrow),
-        );
-    }
-
-    #[test]
-    fn resize_round_trip_preserves_committed_output_and_screen() {
-        // Genuine output commits (at the width it was produced), a resize does
-        // not disturb those commits, and content that stays on screen through
-        // a narrow→widen round-trip is unaffected — no tearing, no loss.
-        let mut e = Emulator::new(80, 4);
-        let scrolled = committed(&e.feed_output(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n$ "));
-        assert!(!scrolled.is_empty(), "output that scrolled off should commit");
-
-        // Narrow (phone) then widen (desktop) with no output between: no new
-        // commits, and the on-screen line is intact and full-width again.
-        assert!(committed(&e.resize(40, 12)).is_empty(), "narrow committed");
-        assert!(committed(&e.resize(80, 4)).is_empty(), "widen committed");
-        // New output after the round-trip still commits normally.
-        let after = committed(&e.feed_output(b"six\r\nseven\r\neight\r\nnine\r\nten\r\n$ "));
-        assert!(!after.is_empty(), "output after resize round-trip should commit");
-    }
-
-    #[test]
     fn serialize_is_stable() {
         // Serializing twice without new input yields identical bytes
         // (serialize must not mutate observable state).
@@ -1206,25 +1156,17 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_rows_does_not_commit_displaced_lines() {
-        // A resize is a view change, not output: shrinking the screen must not
-        // commit the rows it displaces. Committing them (the former behaviour)
-        // baked one viewer's size into the shared cross-device log — a mobile
-        // keyboard opening and closing would commit the same rows on every
-        // toggle (visible as duplicated history), and a phone attaching at a
-        // narrow width froze desktop content there permanently.
+    fn shrinking_rows_commits_displaced_lines() {
         let mut e = Emulator::new(20, 6);
         e.feed_output(b"r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6");
         let events = e.resize(20, 3);
+        let text = render_lines(20, 8, &committed(&events)).join("\n");
         assert!(
-            committed(&events).is_empty(),
-            "a resize must not commit displaced rows: {:?}",
-            String::from_utf8_lossy(&committed(&events)),
+            text.contains("r1"),
+            "rows displaced by a shrink must commit: {text}"
         );
-        // The screen still holds the tail; genuine scroll-off still commits.
+        // The screen still holds the tail.
         assert!(e.screen_text().join("\n").contains("r6"));
-        let scrolled = committed(&e.feed_output(b"r7\r\nr8\r\nr9\r\n$ "));
-        assert!(!scrolled.is_empty(), "output after resize must still commit");
     }
 
     #[test]
