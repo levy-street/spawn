@@ -242,20 +242,31 @@ impl Emulator {
         if count == 0 {
             return None;
         }
-        let mut out = Vec::with_capacity(count * 48);
+        // Trim fully-blank rows from the edges of the batch, and skip a batch
+        // that is all blank. A `clear` (ED 2) scrolls the WHOLE viewport into
+        // history, blanks and all — so a full-screen TUI that repaints by
+        // clearing (claude/codex on SIGWINCH, and every keyboard-driven resize
+        // on mobile) would otherwise commit a screenful of empty rows each
+        // time. On a tall narrow phone that is a band of ~25 blank lines per
+        // repaint, which is what the scrollback "blank bands" were. Genuine
+        // interior blank lines between content are preserved; only edge blanks,
+        // which are always frame padding rather than authored output, are cut.
+        // A blank row is never a soft-wrap continuation, so re-wrapping is
+        // unaffected.
+        let grid = self.term.grid();
+        let offsets: Vec<usize> = (1..=count).rev().collect(); // oldest → newest
+        let is_blank = |offset: usize| is_blank_history_row(&grid[Line(-(offset as i32))]);
+        let first = offsets.iter().position(|&o| !is_blank(o))?;
+        let last = offsets.iter().rposition(|&o| !is_blank(o))?;
+
+        let mut out = Vec::with_capacity((last - first + 1) * 48);
         // Each batch is self-contained: an evicted or truncated predecessor
         // batch must not leak pen or hyperlink state into this one.
         out.extend_from_slice(b"\x1b[0m");
         let mut pen = Pen::default();
         let mut hyperlink: Option<alacritty_terminal::term::cell::Hyperlink> = None;
-        let grid = self.term.grid();
-        for offset in (1..=count).rev() {
-            paint_history_row(
-                &grid[Line(-(offset as i32))],
-                &mut pen,
-                &mut hyperlink,
-                &mut out,
-            );
+        for &offset in &offsets[first..=last] {
+            paint_history_row(&grid[Line(-(offset as i32))], &mut pen, &mut hyperlink, &mut out);
         }
         set_hyperlink(&mut out, &mut hyperlink, None);
         out.extend_from_slice(b"\x1b[0m");
@@ -739,6 +750,17 @@ fn paint_history_row(
     }
 }
 
+/// A history row that carries no authored content: not a soft-wrap
+/// continuation, and every cell default. Such rows at a batch's edges are
+/// clear/repaint padding, not output, and are dropped before committing.
+fn is_blank_history_row(line: &alacritty_terminal::grid::Row<Cell>) -> bool {
+    let cols = line.len();
+    if cols > 0 && line[Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+        return false; // soft-wrap continuation; part of a logical line
+    }
+    (0..cols).all(|col| is_default_cell(&line[Column(col)]))
+}
+
 fn is_default_cell(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.fg == Color::Named(NamedColor::Foreground)
@@ -1008,6 +1030,36 @@ mod tests {
         e.resize(30, 10);
         assert!(e.shadow.margins.is_none());
         assert_eq!(e.geometry(), (30, 10));
+    }
+
+    #[test]
+    fn ed2_clear_does_not_commit_blank_padding() {
+        // A full-screen TUI (claude/codex) repaints by clearing the screen.
+        // On a tall, sparse phone screen the cleared viewport is mostly empty,
+        // and ED 2 scrolls the whole viewport into history. The empty padding
+        // must NOT be committed, or scrollback fills with blank bands.
+        let mut e = Emulator::new(48, 29);
+        // Content only near the bottom; the top ~26 rows are blank.
+        e.feed_output(b"\x1b[27;1H> some prompt text\x1b[28;1H---footer---");
+        let events = e.feed_output(b"\x1b[2J\x1b[Hredraw");
+        let bytes = committed(&events);
+        let text = String::from_utf8_lossy(&bytes);
+        let blank = text
+            .split('\n')
+            .filter(|l| l.trim_end_matches('\r').trim().is_empty())
+            .count();
+        // The two content rows survive; the ~26 blank padding rows do not.
+        assert!(text.contains("some prompt text"), "content lost: {text:?}");
+        assert!(text.contains("---footer---"), "content lost: {text:?}");
+        assert!(blank <= 2, "blank padding committed as a band: {blank} blank lines in {text:?}");
+    }
+
+    #[test]
+    fn ed2_clear_of_blank_screen_commits_nothing() {
+        // Clearing an already-empty screen must add nothing to history.
+        let mut e = Emulator::new(48, 29);
+        let events = e.feed_output(b"\x1b[2J\x1b[H");
+        assert!(committed(&events).is_empty(), "blank clear committed: {:?}", String::from_utf8_lossy(&committed(&events)));
     }
 
     #[test]
