@@ -53,6 +53,11 @@ const SCROLLBACK_WARM_DELAY_MS = 1_200;
 // window the pin and destructive rewrites treat the reader's edge position as
 // unknown and hold off. Covers the gap between rapid mobile-keyboard resizes.
 const RESIZE_QUIET_MS = 350;
+// A visualViewport inset larger than this (on a coarse pointer) is treated as
+// the on-screen keyboard rather than URL-bar chrome jitter. Above it the
+// terminal freezes its row count and pans instead of reflowing, so the soft
+// keyboard opening/closing never rewraps history or churns the PTY geometry.
+const KEYBOARD_MIN_INSET_PX = 120;
 // Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
@@ -1406,12 +1411,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return terminalRowHeightRef.current;
     };
 
+    // How much of the layout the on-screen keyboard is covering right now.
+    // visualViewport shrinks (and can offset) under the keyboard while the
+    // layout viewport may not, so this is the authoritative signal.
+    const readKeyboardInset = () => {
+      const vv = window.visualViewport;
+      if (!vv) return 0;
+      return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    };
+
+    // The soft keyboard is up. In this state we must NOT refit: shrinking the
+    // row count to fit above the keyboard reflows the whole buffer (rewrapping
+    // history, manufacturing blank bands) and churns the PTY geometry — the two
+    // things that keep the scrollback heal from ever firing on mobile. Instead
+    // we freeze the geometry and pan the (now taller-than-viewport) terminal so
+    // the live input line stays visible above the keyboard.
+    const keyboardPanActive = () =>
+      coarsePointerRef.current && readKeyboardInset() > KEYBOARD_MIN_INSET_PX;
+
     const usesViewerPanFrame = () => {
-      return (
-        coarsePointerRef.current &&
-        displayOwnerRef.current === false &&
-        displayGeometryRef.current !== null
-      );
+      if (!coarsePointerRef.current) return false;
+      if (displayOwnerRef.current === false && displayGeometryRef.current !== null) {
+        return true;
+      }
+      return keyboardPanActive();
     };
 
     const getTerminalPixelSize = () => {
@@ -2001,6 +2024,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (cols === last.cols && rows === last.rows) return;
       const colsChanged = cols !== last.cols;
       lastSizeRef.current = { cols, rows };
+      // A genuine fit changed the grid, so it just reflowed: open the
+      // reflow-quiet window here rather than on every fitTerminal() call, so a
+      // no-op fit (e.g. the keyboard closing back to the same rows) never
+      // needlessly blocks the heal.
+      resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
       invalidateScrollbackForResizeRef.current();
       markResizeSentRef.current(cols, rows);
       if (displayOwnerRef.current === true) {
@@ -2019,10 +2047,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // geometry and disturb whoever is actually looking at this agent. It
       // reclaims + fits when re-activated (see the `active` effect).
       if (!activeRef.current) return;
-      // Open the reflow-quiet window: for the next beat, any at-edge reading
-      // is untrustworthy (see resizeQuietUntilRef).
-      resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
       const anchor = preserveScroll ? captureScrollAnchor() : null;
+      // Soft keyboard up: freeze the geometry and pan instead of refitting.
+      // Shrinking rows to fit above the keyboard would reflow the whole buffer
+      // (rewrapping history, spilling blank bands) and churn the PTY size on
+      // every open/close — the exact churn that jams the scrollback heal on
+      // mobile. No fit()/resize() here means no reflow, no PTY notify, and the
+      // reflow-quiet window stays closed so the heal keeps running.
+      if (keyboardPanActive()) {
+        layoutTerminalSurface(anchor?.atBottom ?? true);
+        requestAnimationFrame(() => layoutTerminalSurface(anchor?.atBottom ?? true));
+        return;
+      }
       const followerGeometry =
         coarsePointerRef.current && displayOwnerRef.current === false
           ? displayGeometryRef.current
@@ -2036,6 +2072,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         lastSizeRef.current = followerGeometry;
         if (followerGeometry.cols !== last.cols || followerGeometry.rows !== last.rows) {
+          // A real reflow just happened: hold the pin and destructive rewrites
+          // off until it settles.
+          resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
           invalidateScrollbackForResizeRef.current();
         }
         layoutTerminalSurface(anchor?.atBottom ?? true);
@@ -2085,6 +2124,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
     ro.observe(terminalViewport);
 
+    // The on-screen keyboard shrinks visualViewport; depending on the browser
+    // (notably iOS Safari) the layout viewport — and thus the ResizeObserver
+    // above — may not move at all. Drive a relayout directly off visualViewport
+    // so the keyboard freeze/pan engages regardless. Coarse pointers only: on a
+    // desktop this event fires for pinch-zoom, which must still refit normally.
+    const vv = window.visualViewport;
+    const onVisualViewport = () => {
+      if (coarsePointerRef.current) scheduleFit();
+    };
+    vv?.addEventListener("resize", onVisualViewport);
+    vv?.addEventListener("scroll", onVisualViewport);
+
     // ResizeObserver only fires on size changes; two mount-time races leave
     // the terminal misfitted at a stable size until something (like toggling
     // the sidebar) nudges the container: the monospace font finishing its
@@ -2102,6 +2153,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     return () => {
       ro.disconnect();
+      vv?.removeEventListener("resize", onVisualViewport);
+      vv?.removeEventListener("scroll", onVisualViewport);
       document.removeEventListener("visibilitychange", onVisibility);
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });

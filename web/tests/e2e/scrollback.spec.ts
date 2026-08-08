@@ -101,6 +101,16 @@ async function countInLiveBuffer(page: Page, needle: string): Promise<number> {
   }, needle);
 }
 
+/** The live terminal renders exactly `term.rows` row elements, so the count of
+ *  `.xterm-rows` children is the grid's current row count. A reflow (refit)
+ *  changes it; a freeze-and-pan does not. */
+async function gridRowCount(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const rows = document.querySelector('[data-testid="terminal-live-host"] .xterm-rows');
+    return rows ? rows.children.length : -1;
+  });
+}
+
 test("wheel-up scrolls native history in the live terminal; the overlay never opens", async ({
   page,
 }) => {
@@ -288,6 +298,104 @@ test("rows-only resize churn while scrolled back keeps history single-copy", asy
   expect(await countInLiveBuffer(page, "commit-000")).toBe(1);
   expect(await countInLiveBuffer(page, "SCREEN-ROW-00")).toBeLessThanOrEqual(1);
   void scrolledTo;
+});
+
+// Mobile: the on-screen keyboard shrinks visualViewport WITHOUT changing
+// window.innerHeight (iOS Safari). Option 1's contract: while the keyboard is up
+// the terminal FREEZES its row count and pans, so it never refits/reflows
+// (rewrapping history, spilling blank bands, churning the PTY) on every
+// open/close — that churn is what jammed the scrollback heal on mobile.
+// setViewportSize can't model this (it moves innerHeight too), so we stub
+// visualViewport and a coarse pointer.
+test("soft keyboard inset freezes the grid and pans instead of reflowing", async ({ page }) => {
+  await page.addInitScript(() => {
+    const realMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = ((q: string) =>
+      q.includes("pointer: coarse")
+        ? {
+            matches: true,
+            media: q,
+            onchange: null,
+            addEventListener() {},
+            removeEventListener() {},
+            addListener() {},
+            removeListener() {},
+            dispatchEvent: () => true,
+          }
+        : realMatchMedia(q)) as typeof window.matchMedia;
+
+    let inset = 0;
+    const resizeListeners = new Set<EventListenerOrEventListenerObject>();
+    const fire = (fn: EventListenerOrEventListenerObject) =>
+      typeof fn === "function" ? fn(new Event("resize")) : fn.handleEvent(new Event("resize"));
+    const vv = {
+      get width() {
+        return window.innerWidth;
+      },
+      get height() {
+        return window.innerHeight - inset;
+      },
+      offsetTop: 0,
+      offsetLeft: 0,
+      pageTop: 0,
+      pageLeft: 0,
+      scale: 1,
+      addEventListener: (t: string, fn: EventListenerOrEventListenerObject) => {
+        if (t === "resize") resizeListeners.add(fn);
+      },
+      removeEventListener: (_t: string, fn: EventListenerOrEventListenerObject) =>
+        resizeListeners.delete(fn),
+      dispatchEvent: () => true,
+    };
+    Object.defineProperty(window, "visualViewport", { configurable: true, get: () => vv });
+    (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset = (
+      px,
+    ) => {
+      inset = px;
+      for (const fn of resizeListeners) fire(fn);
+    };
+  });
+
+  const setInset = (px: number) =>
+    page.evaluate(
+      (p) => (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset(p),
+      px,
+    );
+
+  await page.setViewportSize({ width: 420, height: 860 });
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+  await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-00");
+  await page.waitForTimeout(300);
+
+  // Keyboard-down row count. A 380px inset would drop ~22 rows if we reflowed,
+  // so there is ample headroom for a reflow to be detectable.
+  const rowsBefore = await gridRowCount(page);
+  expect(rowsBefore).toBeGreaterThan(20);
+
+  // Keyboard opens: large inset, innerHeight unchanged.
+  await setInset(380);
+  await page.waitForTimeout(400);
+
+  // No reflow: every row kept. The frame panned to the bottom, so the newest
+  // screen row is still on-screen above where the keyboard would be.
+  expect(await gridRowCount(page)).toBe(rowsBefore);
+  await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-10");
+
+  // Toggle open/close/open/close — the churn that used to reflow every time.
+  for (const px of [0, 380, 0, 380]) {
+    await setInset(px);
+    await page.waitForTimeout(200);
+  }
+  await setInset(0);
+  await page.waitForTimeout(400);
+
+  // Geometry restored identically; history intact and single-copy.
+  expect(await gridRowCount(page)).toBe(rowsBefore);
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -3000);
+  await page.waitForTimeout(300);
+  expect(await countInLiveBuffer(page, "commit-000")).toBe(1);
 });
 
 // History width integrity (the geometry-policy guarantee): committed history
