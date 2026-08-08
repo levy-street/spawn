@@ -1,7 +1,8 @@
 "use client";
 
-import { Monitor, Moon, Sun } from "lucide-react";
-import type { ComponentType } from "react";
+import { Monitor, Moon, ScrollText, Sun } from "lucide-react";
+import { type ComponentType, useState } from "react";
+import { setUnifiedScrollbackEnabled, unifiedScrollbackEnabled } from "@/lib/scrollback-mode";
 import { type ThemePreference, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
@@ -70,6 +71,48 @@ export function AppearancePanel() {
       {preference === "system" && (
         <p className="text-xs text-muted-foreground">This device currently prefers {resolved}.</p>
       )}
+
+      <UnifiedScrollbackToggle />
     </section>
+  );
+}
+
+/**
+ * Experiment: scroll through committed history inside the live terminal
+ * itself (one buffer, like a desktop terminal) instead of the snapshot
+ * overlay. Applying it reloads the app — terminals are kept warm across
+ * navigation, and a mid-session flip would leave pool instances straddling
+ * both behaviours.
+ */
+function UnifiedScrollbackToggle() {
+  const [enabled] = useState(() => unifiedScrollbackEnabled());
+
+  const toggle = () => {
+    setUnifiedScrollbackEnabled(!enabled);
+    window.location.reload();
+  };
+
+  return (
+    <div className="mt-2 border-t border-border pt-4">
+      <h3 className="text-sm font-semibold">Experiments</h3>
+      <label className="mt-2 flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={toggle}
+          className="mt-0.5 size-4 accent-foreground"
+        />
+        <span>
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <ScrollText className="size-4" aria-hidden />
+            Unified scrollback
+          </span>
+          <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+            Scroll through history inside the terminal itself, like a desktop terminal, instead of
+            the snapshot overlay. Changing this reloads the app; terminal sessions are unaffected.
+          </span>
+        </span>
+      </label>
+    </div>
   );
 }

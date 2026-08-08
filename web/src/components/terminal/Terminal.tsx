@@ -44,6 +44,7 @@ import {
 import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import { agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { unifiedScrollbackEnabled } from "@/lib/scrollback-mode";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
@@ -466,6 +467,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const scrollbackTermRef = useRef<XTerm | null>(null);
   const scrollbackVisibleRef = useRef(false);
   const scrollbackReadyRef = useRef(false);
+  // Unified-scrollback experiment: committed history lives in the live
+  // terminal's own buffer and wheel/touch scroll it natively; the overlay
+  // machinery stays dormant. Latched at mount — the settings toggle reloads.
+  const unifiedScrollbackRef = useRef(unifiedScrollbackEnabled());
+  // Set once the deep post-connect snapshot has rebuilt the live buffer at
+  // full history depth (the connect seed carries only a shallow prefix).
+  const unifiedDeepSeededRef = useRef(false);
 
   // Restyle both terminals in place when the theme changes. Terminals are kept
   // warm across navigation and portaled from the root, so tearing them down to
@@ -733,7 +741,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       predictorRef.current.clear();
       const ops: SequencedWrite[] = [
         { data: "\x1b[0m\x1b[H\x1b[2J\x1b[3J" },
-        ...liveSeedWriteOps(text),
+        ...liveSeedWriteOps(text, unifiedScrollbackRef.current),
       ];
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
         term.scrollToBottom();
@@ -1387,10 +1395,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackCacheDirtyRef.current = true;
       scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       term.reset();
-      writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
-        term.scrollToBottom();
-        flushPendingLiveSeedWritesRef.current();
-      });
+      unifiedDeepSeededRef.current = false;
+      writeSequenced(
+        term,
+        liveSeedWriteOps(decodeUtf8(bytes), unifiedScrollbackRef.current),
+        () => {
+          term.scrollToBottom();
+          flushPendingLiveSeedWritesRef.current();
+        },
+      );
     },
     onDisplayControl: applyDisplayControl,
     onSnapshot: (bytes, _plain, dcOffset, historyAnchor) => {
@@ -1454,6 +1467,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // afterwards, so the cache is clean by construction.
         historyStreamActiveRef.current = true;
         scrollbackCacheDirtyRef.current = false;
+        // Unified scrollback: the connect seed carried a shallow history
+        // prefix; this is the full-depth capture. Rebuild the live buffer
+        // from it once — xterm cannot prepend, so depth only ever arrives
+        // via a rebuild. Guarded to the bottom-pinned viewport so a reader
+        // already scrolled back is never yanked; the offset-exact replay
+        // slices inside the sync keep every live byte.
+        if (unifiedScrollbackRef.current && !unifiedDeepSeededRef.current) {
+          const liveTerm = termRef.current;
+          const atBottom =
+            !liveTerm || liveTerm.buffer.active.viewportY >= liveTerm.buffer.active.baseY;
+          if (atBottom && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
+            unifiedDeepSeededRef.current = true;
+          }
+        }
         seedCommittedHistory(bytes, historyAnchor);
         return;
       }
@@ -1989,6 +2016,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     // the current PTY tail. Reconcile after xterm consumes a write and
     // coalesce streaming chunks to one refresh per animation frame.
     pinLiveViewportToBottomRef.current = () => {
+      // Unified scrollback: the reader may legitimately be scrolled up in
+      // this buffer. Pin only from the bottom — the pin exists to heal a
+      // slow-frame lag behind streaming output, not to enforce position.
+      if (unifiedScrollbackRef.current && term.buffer.active.viewportY < term.buffer.active.baseY) {
+        return;
+      }
       if (liveViewportPinFrameRef.current !== null) return;
       liveViewportPinFrameRef.current = requestAnimationFrame(() => {
         if (termRef.current !== term) {
@@ -2126,6 +2159,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
       }
 
+      if (unifiedScrollbackRef.current) {
+        // Unified scrollback: history lives in this terminal's own buffer, so
+        // wheel-up is native xterm scrolling, and alt-screen wheel gets
+        // xterm's native arrow-key conversion instead of a swallow.
+        return true;
+      }
+
       if (amount < 0) {
         requestScrollbackSnapshotRef.current(amount);
         event.preventDefault();
@@ -2179,7 +2219,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
       }
 
-      if (deltaY < 0) {
+      if (deltaY < 0 && !unifiedScrollbackRef.current) {
         requestScrollbackSnapshotRef.current(deltaY);
         state.openedScrollback = true;
         state.scrollRemainderPx = 0;
@@ -4075,10 +4115,25 @@ function overlayWriteOps(
  *  from its container). Exact worker replays end with a self-contained chunk
  *  — a full idempotent repaint at the current PTY geometry — so the final
  *  chunk alone seeds the screen. Plain endpoint replay is reformatted. */
-function liveSeedWriteOps(text: string): SequencedWrite[] {
+function liveSeedWriteOps(text: string, unified: boolean): SequencedWrite[] {
   const exact = parseExactReplay(text);
   if (!exact) {
     return [{ data: formatSnapshotForXterm(text) }];
+  }
+  if (unified) {
+    // Unified scrollback: the committed history becomes the live terminal's
+    // own scrollback, exactly as the overlay renders it — flowing text, then
+    // a viewport flush so the screen repaint below cannot overwrite the
+    // newest history lines. No resize ops: the live terminal is fit-sized
+    // and must never be geometry-walked; history reflows natively instead.
+    const storied = parseHistoryReplay(exact);
+    if (storied) {
+      return [
+        { data: storied.history },
+        { data: flushViewportIntoScrollback },
+        { data: storied.screen.data },
+      ];
+    }
   }
   return [{ data: exact[exact.length - 1].data }];
 }
