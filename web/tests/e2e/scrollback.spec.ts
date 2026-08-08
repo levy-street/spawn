@@ -398,6 +398,29 @@ test("soft keyboard inset freezes the grid and pans instead of reflowing", async
   expect(await countInLiveBuffer(page, "commit-000")).toBe(1);
 });
 
+test("jump-to-latest button appears when scrolled up and returns to the live edge", async ({
+  page,
+}) => {
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+  const jump = page.getByTestId("terminal-jump-to-latest");
+
+  // At the live edge on connect: the button is not rendered at all.
+  await expect(jump).toHaveCount(0);
+
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -1500);
+  await page.waitForTimeout(200);
+  await expect(live.locator(".xterm-rows")).toContainText("commit-");
+  await expect(jump).toBeVisible();
+
+  // Tapping it snaps back to the live screen and the button hides again.
+  await jump.click();
+  await page.waitForTimeout(200);
+  await expect(jump).toHaveCount(0);
+  await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-10");
+});
+
 // History width integrity (the geometry-policy guarantee): committed history
 // is stored as flowing logical lines, so viewing it at a narrow width wraps it
 // for display only — the logical content is never lost or truncated, and it

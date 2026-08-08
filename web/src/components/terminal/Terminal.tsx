@@ -11,6 +11,7 @@ import { LatencyHud, latencyHudEnabled } from "./latency-hud";
 import { PredictiveEcho } from "./predictive-echo";
 import "@xterm/xterm/css/xterm.css";
 import { useQuery } from "@tanstack/react-query";
+import { ArrowDown } from "lucide-react";
 import Image from "next/image";
 import {
   type ChangeEvent,
@@ -172,6 +173,8 @@ export interface TerminalHandle {
   takeControl: () => void;
   /** Open the native file picker to upload files to this agent. */
   openUpload: () => void;
+  /** Scroll the viewport back to the live edge (bottom of the buffer). */
+  snapToLiveEdge: () => void;
 }
 
 export interface TerminalProps {
@@ -441,6 +444,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const [dropActive, setDropActive] = useState(false);
+  // Live-edge tracking drives the "jump to latest" button. `atLiveEdge` is the
+  // rendered state; the ref mirrors it for synchronous reads inside output
+  // handlers without a stale closure. `newOutputWhileAway` upgrades the button
+  // to signal that content arrived below while the reader is scrolled up.
+  const [atLiveEdge, setAtLiveEdge] = useState(true);
+  const [newOutputWhileAway, setNewOutputWhileAway] = useState(false);
+  const atLiveEdgeRef = useRef(true);
+  const refreshLiveEdgeRef = useRef<() => void>(() => {});
   const [socketInitialSize, setSocketInitialSize] = useState<{
     cols: number;
     rows: number;
@@ -745,6 +756,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // one-buffer equivalent of the old "close the scrollback overlay".
   const snapToLiveEdge = useCallback(() => {
     termRef.current?.scrollToBottom();
+    refreshLiveEdgeRef.current();
   }, []);
 
   const takeControlNow = useCallback((): boolean => {
@@ -1032,6 +1044,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         termRef.current?.write(bytes, () => {
           pinLiveViewportToBottomRef.current();
           reconcilePredictionRef.current();
+          // Output landed below a reader who is scrolled up (the pin is a
+          // no-op unless already at the edge): light up the jump button.
+          if (!atLiveEdgeRef.current) setNewOutputWhileAway(true);
           if (closeHudSample) {
             requestAnimationFrame(() => closeHudSample(performance.now()));
           }
@@ -1379,6 +1394,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    // Track whether the viewport sits at the live edge so the "jump to latest"
+    // button can appear only when the reader has scrolled up. State is written
+    // only on transitions. Detection is doubled up for reliability across
+    // renderers/paths: xterm's onScroll (buffer-level, gives the new ydisp) and
+    // a DOM scroll listener on the xterm viewport element.
+    const setLiveEdge = (atBottom: boolean) => {
+      if (atBottom === atLiveEdgeRef.current) return;
+      atLiveEdgeRef.current = atBottom;
+      setAtLiveEdge(atBottom);
+      if (atBottom) setNewOutputWhileAway(false);
+    };
+    const refreshLiveEdge = () => {
+      const t = termRef.current;
+      if (!t) return;
+      const buf = t.buffer.active;
+      setLiveEdge(buf.viewportY >= buf.baseY);
+    };
+    refreshLiveEdgeRef.current = refreshLiveEdge;
+    const scrollDisposable = term.onScroll((ydisp) => {
+      const t = termRef.current;
+      setLiveEdge(t ? ydisp >= t.buffer.active.baseY : true);
+    });
+    const xtermViewportEl = containerRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    xtermViewportEl?.addEventListener("scroll", refreshLiveEdge, { passive: true });
     // The renderer addon needs the opened element; the active-state effect
     // has already run by the time this bootstrap effect mounts.
     syncWebglRendererRef.current(activeRef.current);
@@ -2153,6 +2192,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     return () => {
       ro.disconnect();
+      scrollDisposable.dispose();
+      xtermViewportEl?.removeEventListener("scroll", refreshLiveEdge);
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
       document.removeEventListener("visibilitychange", onVisibility);
@@ -2686,6 +2727,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteText,
       takeControl: () => takeControlNowRef.current(),
       openUpload: () => fileInputRef.current?.click(),
+      snapToLiveEdge,
     }),
     [
       appendAttachmentsForSubmit,
@@ -2917,6 +2959,31 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             Take control
           </button>
         </div>
+      )}
+      {/* Jump-to-latest: appears only when the reader has scrolled up off the
+          live edge. Sits above the mobile modifier bar (which lives outside the
+          terminal, below it) and clears the room's right edge. Icon-only when
+          quiet; grows a label + pulse when output arrived while scrolled away. */}
+      {!atLiveEdge && (
+        <button
+          type="button"
+          data-testid="terminal-jump-to-latest"
+          aria-label={newOutputWhileAway ? "Jump to latest output (new output)" : "Jump to latest"}
+          onClick={() => {
+            snapToLiveEdge();
+            setNewOutputWhileAway(false);
+            termRef.current?.focus();
+          }}
+          className="pointer-events-auto absolute bottom-3 right-3 z-30 flex items-center gap-1.5 rounded-full border border-border bg-popover/95 py-2 pr-3 pl-2.5 text-xs font-medium text-foreground shadow-lg backdrop-blur transition-colors hover:bg-accent"
+        >
+          <ArrowDown className="size-4" aria-hidden />
+          {newOutputWhileAway && (
+            <>
+              <span>New</span>
+              <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden />
+            </>
+          )}
+        </button>
       )}
       {/* Live region stays mounted so screen readers hear transitions; the
           visible chip only appears when there is something worth saying —
