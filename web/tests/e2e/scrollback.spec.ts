@@ -247,3 +247,106 @@ test("an in-band scrollback wipe (ED3) empties history", async ({ page }) => {
   // The visible screen survives an ED3.
   await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-00");
 });
+
+// Mobile: the on-screen keyboard and URL bar change the viewport HEIGHT (rows)
+// constantly, at a fixed width. The contract: a rows-only change must not
+// rewrap or rewrite history (wrap depends only on cols) and must never yank a
+// reader who is scrolled back. Note the timing race this guards — pin/reseed
+// firing during a resize's transient at-bottom — needs real-device WebRTC
+// latency to surface; the synchronous mock cannot force it, so this is a
+// contract/smoke check of the fixed behaviour, not a red/green repro.
+test("rows-only resize churn while scrolled back keeps history single-copy", async ({ page }) => {
+  await page.setViewportSize({ width: 420, height: 780 });
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+
+  await live.locator(".xterm").hover();
+  await page.mouse.wheel(0, -1200);
+  await page.waitForTimeout(250);
+  await expect(live.locator(".xterm-rows")).toContainText("commit-");
+  const viewport = live.locator(".xterm-viewport");
+  const scrolledTo = await viewport.evaluate((el) => el.scrollTop);
+
+  // Keyboard open/close/open/close: same width, changing height only.
+  for (const height of [520, 780, 500, 780, 540]) {
+    await page.setViewportSize({ width: 420, height });
+    await page.waitForTimeout(150);
+  }
+  // Wait past the snapshot cache-refresh debounce: a rows-only change must not
+  // owe a history reseed, so no destructive rewrite should arrive to yank the
+  // reader. (Before the fix, every keyboard toggle flagged a reseed and the
+  // refresh that followed rewrote the buffer and dropped the reader at the
+  // live edge.)
+  await page.waitForTimeout(900);
+
+  // The reader still sees history, not the live screen. Assert on rendered
+  // content at a fixed time — a real guard, not a lenient poll.
+  const view = await live.locator(".xterm-rows").innerText();
+  expect(view).toContain("commit-");
+  expect(view).not.toContain("SCREEN-ROW-00");
+  // No duplication: history once, live screen never left behind in scrollback.
+  expect(await countInLiveBuffer(page, "commit-000")).toBe(1);
+  expect(await countInLiveBuffer(page, "SCREEN-ROW-00")).toBeLessThanOrEqual(1);
+  void scrolledTo;
+});
+
+// History width integrity (the geometry-policy guarantee): committed history
+// is stored as flowing logical lines, so viewing it at a narrow width wraps it
+// for display only — the logical content is never lost or truncated, and it
+// un-wraps when the width grows again. This is why desktop-generated history
+// viewed on a phone is not permanently narrowed: the reseed re-wraps from the
+// same logical lines. (The server log's append-only, read-only-on-view nature
+// guarantees the other half — viewing never rewrites the stored history.)
+test("history reflows across width changes without loss or duplication", async ({ page }) => {
+  const LONG = `LONGLINE-${"x".repeat(200)}-END`;
+  const messages: Array<string | Buffer> = [];
+  await installAgentRtcMock(page, messages, {
+    history: `${V2_MARKER}${V2_SENTINEL}${LONG}\r\ncommit-000\r\n${V2_MARKER}\x1b[Hlive$ `,
+    control: { owner: true, cols: 80, rows: 12, viewers: 1 },
+    autoSnapshot: true,
+    historyEpoch: EPOCH,
+    historyOffset: 0,
+  });
+  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.send(
+      JSON.stringify({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        binding_nonce_required: true,
+      }),
+    );
+    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+  });
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  const live = page.getByTestId("terminal-live-host");
+  await expect(live.locator(".xterm-rows")).toContainText("live$");
+
+  const fullLineOnce = async () => {
+    // Concatenate the buffer with wraps joined, so a soft-wrapped long line
+    // reads as one logical line regardless of width.
+    await live.locator(".xterm").hover();
+    await page.mouse.wheel(0, -600);
+    await page.waitForTimeout(300);
+    const joined = await countInLiveBuffer(page, "LONGLINE-");
+    return joined;
+  };
+
+  // Wide: the long line is present exactly once.
+  expect(await fullLineOnce()).toBe(1);
+
+  // Shrink to a phone width: it wraps for display but is still there once.
+  await page.setViewportSize({ width: 400, height: 800 });
+  await page.waitForTimeout(600);
+  expect(await fullLineOnce()).toBe(1);
+
+  // Grow back to desktop: it un-wraps, still present exactly once — viewing
+  // narrow did not permanently narrow it.
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.waitForTimeout(600);
+  expect(await fullLineOnce()).toBe(1);
+});

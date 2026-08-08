@@ -49,6 +49,10 @@ const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
 // Defer the deep (10k-line) endpoint replay warm so connecting can paint the
 // small endpoint-provided seed first.
 const SCROLLBACK_WARM_DELAY_MS = 1_200;
+// How long after a resize the viewport may still be reflowing. Within this
+// window the pin and destructive rewrites treat the reader's edge position as
+// unknown and hold off. Covers the gap between rapid mobile-keyboard resizes.
+const RESIZE_QUIET_MS = 350;
 // Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
@@ -474,6 +478,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     lastByteAt: number | null;
   } | null>(null);
   const resizeSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Timestamp (performance.now) until which a resize reflow may still be
+  // settling. A reflow transiently collapses the viewport onto the bottom, so
+  // for this brief window the instantaneous "is the reader at the live edge?"
+  // check is untrustworthy: the pin and destructive rewrites hold off, rather
+  // than yank a reader who is actually up in history. The mobile on-screen
+  // keyboard, which resizes constantly, is what made this routine.
+  const resizeQuietUntilRef = useRef(0);
   const resizeTimingsRef = useRef<
     Array<{ at: string; cols: number; rows: number; toFirstByteMs: number; toSettleMs: number }>
   >([]);
@@ -1120,7 +1131,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           !finalChunk ||
           (finalChunk.cols === lastSizeRef.current.cols &&
             finalChunk.rows === lastSizeRef.current.rows);
-        if (geometryReady && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
+        // A reseed clears and rewrites the whole buffer, so never run it under
+        // a reader who is up in history: defer until they are back at the live
+        // edge (the pending flag keeps the heal owed). Skip during the
+        // resize-quiet window too, where the at-edge reading is transiently
+        // wrong mid-reflow.
+        const liveTerm = termRef.current;
+        const atEdge =
+          !liveTerm || liveTerm.buffer.active.viewportY >= liveTerm.buffer.active.baseY;
+        const reflowQuiet = performance.now() >= resizeQuietUntilRef.current;
+        if (
+          atEdge &&
+          reflowQuiet &&
+          geometryReady &&
+          syncLiveTerminalFromSnapshot(bytes, { force: true })
+        ) {
           historyReseedPendingRef.current = false;
           liveSeedWasExactRef.current = snapshotIsExact;
         }
@@ -1140,7 +1165,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           const liveTerm = termRef.current;
           const atBottom =
             !liveTerm || liveTerm.buffer.active.viewportY >= liveTerm.buffer.active.baseY;
-          if (atBottom && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
+          // Same guards as the width heal: only top up depth at the live edge,
+          // and not mid-reflow. If the reader is up in history the top-up
+          // waits for the next snapshot after they return to the bottom.
+          const reflowQuiet = performance.now() >= resizeQuietUntilRef.current;
+          if (atBottom && reflowQuiet && syncLiveTerminalFromSnapshot(bytes, { force: true })) {
             unifiedDeepSeededRef.current = true;
           }
         }
@@ -1480,7 +1509,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     pinLiveViewportToBottomRef.current = () => {
       // The reader may legitimately be scrolled up in this buffer. Pin only
       // from the bottom — the pin exists to heal a slow-frame lag behind
-      // streaming output, not to enforce position.
+      // streaming output, not to enforce position. During a reflow the
+      // viewport transiently reads as bottom, so also hold off until the
+      // resize-quiet window closes, or the pin would yank a scrolled-up
+      // reader on every mobile-keyboard resize.
+      if (performance.now() < resizeQuietUntilRef.current) return;
       if (term.buffer.active.viewportY < term.buffer.active.baseY) return;
       if (liveViewportPinFrameRef.current !== null) return;
       liveViewportPinFrameRef.current = requestAnimationFrame(() => {
@@ -1966,16 +1999,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       const last = lastSizeRef.current;
       if (cols === last.cols && rows === last.rows) return;
+      const colsChanged = cols !== last.cols;
       lastSizeRef.current = { cols, rows };
       invalidateScrollbackForResizeRef.current();
       markResizeSentRef.current(cols, rows);
       if (displayOwnerRef.current === true) {
         socketRef.current.sendJson({ type: "resize", cols, rows });
       }
-      // History already written into the live buffer keeps its old wrap after
-      // a width change. Once a fresh offset-anchored checkpoint arrives,
-      // rewrite the live buffer so history reflows at the new width too.
-      historyReseedPendingRef.current = true;
+      // Only a WIDTH change rewraps history, so only a width change owes a
+      // reseed. A rows-only change — above all a mobile on-screen keyboard
+      // opening and closing, which fires constantly — must not, or every
+      // toggle would rewrite the whole buffer.
+      if (colsChanged) historyReseedPendingRef.current = true;
     };
 
     const fitTerminal = (preserveScroll: boolean) => {
@@ -1984,6 +2019,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // geometry and disturb whoever is actually looking at this agent. It
       // reclaims + fits when re-activated (see the `active` effect).
       if (!activeRef.current) return;
+      // Open the reflow-quiet window: for the next beat, any at-edge reading
+      // is untrustworthy (see resizeQuietUntilRef).
+      resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
       const anchor = preserveScroll ? captureScrollAnchor() : null;
       const followerGeometry =
         coarsePointerRef.current && displayOwnerRef.current === false
