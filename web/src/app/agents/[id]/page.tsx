@@ -1,11 +1,12 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, FolderOpen, LayoutGrid } from "lucide-react";
+import { ArrowLeft, ChevronsUpDown, FolderOpen, LayoutGrid } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { type TouchEvent as ReactTouchEvent, useEffect, useRef, useState } from "react";
 import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
+import { AgentSwitchSheet, useAgentSwitcher } from "@/components/agents/AgentSwitcher";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
@@ -63,6 +64,46 @@ function AgentTerminal() {
   const memberScreens = (screensQ.data ?? []).filter((item) =>
     collectAgentIds(item.layout.root ?? null).includes(id as string),
   );
+
+  // Agent quick-switch: swipe the top bar left/right to hop to the adjacent
+  // recent agent, or open the sheet for the full searchable list. Switching is
+  // a plain route push — instant because the target terminal stays warm.
+  const agentsListQ = useQuery({
+    queryKey: ["agents", { includeArchived: false }],
+    queryFn: () => agents.list(),
+    refetchInterval: 5_000,
+  });
+  const {
+    list: switchList,
+    index: switchIndex,
+    prevId,
+    nextId,
+  } = useAgentSwitcher(agentsListQ.data, id);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const switchTo = (targetId: string) => {
+    if (targetId && targetId !== id) router.push(`/agents/${targetId}`);
+  };
+  const swipeRef = useRef<{ x: number; y: number } | null>(null);
+  const headerSwipe = {
+    onTouchStart: (event: ReactTouchEvent<HTMLElement>) => {
+      const t = event.touches[0];
+      swipeRef.current = t ? { x: t.clientX, y: t.clientY } : null;
+    },
+    onTouchEnd: (event: ReactTouchEvent<HTMLElement>) => {
+      const start = swipeRef.current;
+      swipeRef.current = null;
+      if (!start || switcherOpen) return;
+      const t = event.changedTouches[0];
+      if (!t) return;
+      const dx = t.clientX - start.x;
+      const dy = t.clientY - start.y;
+      // Require a clear, horizontal-dominant swipe so taps on the header
+      // buttons and vertical gestures never switch agents.
+      if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+      if (dx < 0 && nextId) switchTo(nextId);
+      else if (dx > 0 && prevId) switchTo(prevId);
+    },
+  };
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["agents"] });
@@ -136,6 +177,7 @@ function AgentTerminal() {
             setEditingName(true);
           }}
           onDeleted={() => router.push("/agents")}
+          headerProps={headerSwipe}
           leading={
             <Button
               variant="ghost"
@@ -185,6 +227,20 @@ function AgentTerminal() {
           trailing={
             <>
               <TerminalDisplayControl state={displayState} />
+              <button
+                type="button"
+                aria-label="Switch agent"
+                title="Switch agent (or swipe the bar left/right)"
+                onClick={() => setSwitcherOpen(true)}
+                className="flex h-8 shrink-0 items-center gap-1 rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+              >
+                {switchIndex >= 0 && switchList.length > 1 && (
+                  <span className="text-[11px] tabular-nums leading-none">
+                    {switchIndex + 1}/{switchList.length}
+                  </span>
+                )}
+                <ChevronsUpDown className="size-4" aria-hidden />
+              </button>
               <Button
                 variant={filesOpen ? "secondary" : "ghost"}
                 size="icon"
@@ -255,6 +311,13 @@ function AgentTerminal() {
           getHandle()?.submit();
           requestAnimationFrame(() => getHandle()?.focus());
         }}
+      />
+      <AgentSwitchSheet
+        open={switcherOpen}
+        onClose={() => setSwitcherOpen(false)}
+        list={switchList}
+        currentId={id}
+        onPick={switchTo}
       />
     </div>
   );
