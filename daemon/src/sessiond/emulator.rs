@@ -242,30 +242,44 @@ impl Emulator {
         if count == 0 {
             return None;
         }
-        // Trim fully-blank rows from the edges of the batch, and skip a batch
-        // that is all blank. A `clear` (ED 2) scrolls the WHOLE viewport into
-        // history, blanks and all — so a full-screen TUI that repaints by
-        // clearing (claude/codex on SIGWINCH, and every keyboard-driven resize
-        // on mobile) would otherwise commit a screenful of empty rows each
-        // time. On a tall narrow phone that is a band of ~25 blank lines per
-        // repaint, which is what the scrollback "blank bands" were. Genuine
-        // interior blank lines between content are preserved; only edge blanks,
-        // which are always frame padding rather than authored output, are cut.
-        // A blank row is never a soft-wrap continuation, so re-wrapping is
-        // unaffected.
+        // Trim frame padding from the edges of the batch without eating
+        // authored blank lines. A `clear` (ED 2) scrolls the WHOLE viewport
+        // into history, blanks and all — so a full-screen TUI that repaints by
+        // clearing (claude/codex on SIGWINCH) would commit a screenful of empty
+        // rows, the scrollback "blank bands". But a blank line between two
+        // paragraphs is real output, and while streaming it constantly lands at
+        // a batch edge — trimming *all* edge blanks collapsed every such double
+        // newline to a single one. So an edge blank RUN is dropped only when it
+        // is large enough to be padding (at least half a screenful); short edge
+        // gaps are kept. Interior blanks are always kept, and a blank row is
+        // never a soft-wrap continuation, so re-wrapping is unaffected.
+        let band_min = (self.rows as usize / 2).max(4);
         let grid = self.term.grid();
         let offsets: Vec<usize> = (1..=count).rev().collect(); // oldest → newest
         let is_blank = |offset: usize| is_blank_history_row(&grid[Line(-(offset as i32))]);
-        let first = offsets.iter().position(|&o| !is_blank(o))?;
-        let last = offsets.iter().rposition(|&o| !is_blank(o))?;
+        let n = offsets.len();
+        let (start, end) = match offsets.iter().position(|&o| !is_blank(o)) {
+            Some(first) => {
+                let last = offsets.iter().rposition(|&o| !is_blank(o)).unwrap_or(first);
+                let leading = first;
+                let trailing = n - 1 - last;
+                let start = if leading >= band_min { first } else { 0 };
+                let end = if trailing >= band_min { last } else { n - 1 };
+                (start, end)
+            }
+            // A batch with no content at all is clear/repaint padding — drop
+            // it. An authored blank line travels inside a content batch or at
+            // its edge, where the threshold above keeps it.
+            None => return None,
+        };
 
-        let mut out = Vec::with_capacity((last - first + 1) * 48);
+        let mut out = Vec::with_capacity((end - start + 1) * 48);
         // Each batch is self-contained: an evicted or truncated predecessor
         // batch must not leak pen or hyperlink state into this one.
         out.extend_from_slice(b"\x1b[0m");
         let mut pen = Pen::default();
         let mut hyperlink: Option<alacritty_terminal::term::cell::Hyperlink> = None;
-        for &offset in &offsets[first..=last] {
+        for &offset in &offsets[start..=end] {
             paint_history_row(&grid[Line(-(offset as i32))], &mut pen, &mut hyperlink, &mut out);
         }
         set_hyperlink(&mut out, &mut hyperlink, None);
@@ -1060,6 +1074,25 @@ mod tests {
         let mut e = Emulator::new(48, 29);
         let events = e.feed_output(b"\x1b[2J\x1b[H");
         assert!(committed(&events).is_empty(), "blank clear committed: {:?}", String::from_utf8_lossy(&committed(&events)));
+    }
+
+    #[test]
+    fn authored_blank_line_at_batch_edge_is_preserved() {
+        // A blank line between paragraphs is real output. While streaming it
+        // constantly lands at a batch edge (content scrolls off in one drain,
+        // the blank in the next). A short edge blank run must NOT be trimmed as
+        // padding, or double newlines collapse to single across scrollback.
+        let mut e = Emulator::new(20, 2);
+        let mut out = Vec::new();
+        out.extend(committed(&e.feed_output(b"A\r\n\r\n"))); // commits [A]; blank still on screen
+        out.extend(committed(&e.feed_output(b"B\r\nC\r\nD"))); // scrolls off [blank, B]
+        // Committed history is A, blank, B (C and D remain on screen). The
+        // single blank between A and B is a leading edge run well under half a
+        // screenful, so it survives.
+        let rows = render_lines(20, 10, &out);
+        assert_eq!(rows[0], "A", "history: {rows:?}");
+        assert_eq!(rows[1], "", "authored blank between A and B was trimmed: {rows:?}");
+        assert_eq!(rows[2], "B", "history: {rows:?}");
     }
 
     #[test]
