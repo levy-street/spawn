@@ -33,6 +33,48 @@ export function useAgentSwitcher(agents: Agent[] | undefined, currentId: string 
   }, [agents, currentId]);
 }
 
+/**
+ * A slim, coarse-pointer-only strip of position dots under the session bar:
+ * one dot per live agent, the current one elongated, giving swipe feedback and
+ * a tap target to jump directly. Hidden with a single agent. Horizontally
+ * scrollable so a long roster never overflows.
+ */
+export function AgentSwitchDots({
+  list,
+  currentId,
+  onPick,
+}: {
+  list: Agent[];
+  currentId: string | undefined;
+  onPick: (id: string) => void;
+}) {
+  if (list.length <= 1) return null;
+  return (
+    <div className="hidden shrink-0 items-center justify-center gap-1.5 overflow-x-auto border-b border-border bg-background/95 px-3 py-1.5 [scrollbar-width:none] [@media(pointer:coarse)]:flex">
+      {list.map((agent) => {
+        const active = agent.id === currentId;
+        return (
+          <button
+            key={agent.id}
+            type="button"
+            aria-label={`Switch to ${agentTitle(agent)}`}
+            aria-current={active ? "true" : undefined}
+            onClick={() => {
+              if (!active) onPick(agent.id);
+            }}
+            className={cn(
+              "h-1.5 shrink-0 rounded-full transition-all",
+              active
+                ? "w-4 bg-foreground"
+                : "w-1.5 bg-muted-foreground/40 hover:bg-muted-foreground",
+            )}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 /** A live per-agent connection indicator (distinct from the activity dot). */
 function ConnPip({ state }: { state: AgentConnState }) {
   const style: Record<AgentConnState, [string, string]> = {

@@ -2601,6 +2601,75 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           };
           const viewSource = liveScrolledUp ? "live-scrolled" : "live";
           const visibleRows = term && buf ? rowsFrom(term, buf) : [];
+          // Whole-buffer scan: turn "there's a blank section / duplicate
+          // content" into precise data. Blank RUNS locate empty bands; the
+          // width histogram exposes the narrow(≈phone)+wide(≈desktop) mix that
+          // is the phone-reflow-baking signature; duplicateLines surface
+          // repeated content (same line committed twice). Bounded so a huge
+          // scrollback can't wedge the capture.
+          const scanBuffer = (b: NonNullable<typeof buf>) => {
+            const max = Math.min(b.length, 20000);
+            const widths = { "1-40": 0, "41-64": 0, "65-100": 0, "101-140": 0, "141+": 0 };
+            const blankRuns: Array<{ start: number; len: number }> = [];
+            const counts = new Map<string, number>();
+            let blankTotal = 0;
+            let runStart = -1;
+            let runLen = 0;
+            const lineAt = (i: number) => b.getLine(i)?.translateToString(true) ?? "";
+            for (let i = 0; i < max; i += 1) {
+              const s = lineAt(i);
+              if (s.length === 0) {
+                blankTotal += 1;
+                if (runStart < 0) {
+                  runStart = i;
+                  runLen = 1;
+                } else runLen += 1;
+                continue;
+              }
+              if (runStart >= 0) {
+                if (runLen >= 4) blankRuns.push({ start: runStart, len: runLen });
+                runStart = -1;
+                runLen = 0;
+              }
+              const n = s.length;
+              if (n <= 40) widths["1-40"] += 1;
+              else if (n <= 64) widths["41-64"] += 1;
+              else if (n <= 100) widths["65-100"] += 1;
+              else if (n <= 140) widths["101-140"] += 1;
+              else widths["141+"] += 1;
+              if (n >= 20) counts.set(s, (counts.get(s) ?? 0) + 1);
+            }
+            if (runStart >= 0 && runLen >= 4) blankRuns.push({ start: runStart, len: runLen });
+            blankRuns.sort((a, c) => c.len - a.len);
+            const topBlankRuns = blankRuns.slice(0, 8);
+            const context: string[] = [];
+            const top = topBlankRuns[0];
+            if (top) {
+              for (
+                let i = Math.max(0, top.start - 2);
+                i < Math.min(max, top.start + top.len + 2);
+                i += 1
+              ) {
+                context.push(`${i}:${lineAt(i).slice(0, 70)}`);
+              }
+            }
+            const duplicateLines = [...counts.entries()]
+              .filter(([, c]) => c >= 2)
+              .sort((a, c) => c[1] - a[1])
+              .slice(0, 8)
+              .map(([line, count]) => ({ count, sample: line.slice(0, 70) }));
+            return {
+              scanned: max,
+              length: b.length,
+              blankTotal,
+              blankRunCount: blankRuns.length,
+              topBlankRuns,
+              largestBlankRunContext: context,
+              widths,
+              duplicateLines,
+            };
+          };
+          const bufferScan = term && buf ? scanBuffer(buf) : null;
           return {
             at: new Date().toISOString(),
             term: term ? { cols: term.cols, rows: term.rows } : null,
@@ -2638,6 +2707,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             // first response, toSettle is when the repaint burst went quiet.
             resizeTimings: resizeTimingsRef.current.slice(-12),
             tail,
+            bufferScan,
           };
         };
         const before = capture();

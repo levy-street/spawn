@@ -8,6 +8,10 @@ import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
 // adjacent recent agent; swipe feel itself needs a real device, so this pins
 // the button + sheet + navigation contract.
 
+// The switcher rail is coarse-pointer-only, so drive this spec as a touch
+// device (Chromium's isMobile makes CSS `pointer: coarse` match).
+test.use({ viewport: { width: 390, height: 780 }, isMobile: true, hasTouch: true });
+
 const SECOND_AGENT_ID = "00000000-0000-4000-8000-000000000005";
 const V2_MARKER = "\x1b[8;12;80t";
 const V2_SENTINEL = "\x1b_sp:h1\x1b\\";

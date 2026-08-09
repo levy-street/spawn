@@ -6,7 +6,11 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { type TouchEvent as ReactTouchEvent, useEffect, useRef, useState } from "react";
 import { AgentSurfaceHeader } from "@/components/agents/AgentSurfaceHeader";
-import { AgentSwitchSheet, useAgentSwitcher } from "@/components/agents/AgentSwitcher";
+import {
+  AgentSwitchDots,
+  AgentSwitchSheet,
+  useAgentSwitcher,
+} from "@/components/agents/AgentSwitcher";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AgentFilesAside } from "@/components/files/AgentFilesAside";
 import { AppShell } from "@/components/nav/AppShell";
@@ -232,7 +236,7 @@ function AgentTerminal() {
                 aria-label="Switch agent"
                 title="Switch agent (or swipe the bar left/right)"
                 onClick={() => setSwitcherOpen(true)}
-                className="flex h-8 shrink-0 items-center gap-1 rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                className="hidden h-8 shrink-0 items-center gap-1 rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground [@media(pointer:coarse)]:flex"
               >
                 {switchIndex >= 0 && switchList.length > 1 && (
                   <span className="text-[11px] tabular-nums leading-none">
@@ -269,6 +273,8 @@ function AgentTerminal() {
           <span className="text-sm text-muted-foreground">loading…</span>
         </header>
       )}
+
+      <AgentSwitchDots list={switchList} currentId={id} onPick={switchTo} />
 
       {q.error && (
         <p className="p-4 text-sm text-destructive">Failed to load agent: {String(q.error)}</p>
