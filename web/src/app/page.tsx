@@ -3,6 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   ArrowRight,
+  ChevronRight,
   Download,
   LogIn,
   Network,
@@ -14,10 +15,11 @@ import {
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
+import { AgentListRow } from "@/components/agents/AgentListRow";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { agentActivityDetail, agentTitle } from "@/lib/agents";
+import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { type Agent, agents, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
@@ -241,53 +243,69 @@ function Capability({
 }
 
 function Dashboard() {
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list });
+  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 30_000 });
   const agentsQ = useQuery({
     queryKey: ["agents"],
     queryFn: () => agents.list(),
     refetchInterval: 5_000,
   });
+  const recentAgents = [...(agentsQ.data ?? [])]
+    .sort((a, b) => (b.last_activity_at ?? "").localeCompare(a.last_activity_at ?? ""))
+    .slice(0, 6);
 
   return (
     <div className="mx-auto w-full max-w-5xl p-4 @container/dash">
-      <header className="mb-4 flex items-center justify-between">
+      <header className="mb-4 flex items-center justify-between gap-2">
         <h1 className="text-xl font-semibold">Dashboard</h1>
-        <Button asChild>
+        <Button asChild size="sm">
           <Link href="/agents/new">New agent</Link>
         </Button>
       </header>
 
       <section className="grid gap-4 @md/dash:grid-cols-2">
         <Card>
-          <CardHeader>
-            <CardTitle>Hosts</CardTitle>
-            <CardDescription>
-              {hostsQ.isLoading
-                ? "Loading..."
-                : hostsQ.error
-                  ? "Failed to load hosts"
-                  : `${hostsQ.data?.length ?? 0} registered`}
-            </CardDescription>
+          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+            <div className="min-w-0">
+              <CardTitle>Hosts</CardTitle>
+              <CardDescription>
+                {hostsQ.isLoading
+                  ? "Loading…"
+                  : hostsQ.error
+                    ? "Failed to load hosts"
+                    : `${hostsQ.data?.length ?? 0} registered`}
+              </CardDescription>
+            </div>
+            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
+              <Link href="/hosts">All</Link>
+            </Button>
           </CardHeader>
-          <CardContent>
-            <ul className="space-y-2">
+          <CardContent className="p-0">
+            <ul className="border-t border-border">
               {(hostsQ.data ?? []).slice(0, 5).map((h: Host) => (
-                <li key={h.id} className="flex items-center justify-between text-sm">
-                  <span className="truncate">
-                    <span
-                      className={`mr-2 inline-block size-2 rounded-full ${
-                        h.status === "online" ? "bg-green-500" : "bg-zinc-500"
-                      }`}
+                <li key={h.id} className="border-b border-border last:border-b-0">
+                  <Link
+                    href={`/hosts/${h.id}`}
+                    className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
+                  >
+                    <StatusDot
+                      tone={hostStatusTone(h.status)}
+                      label={h.status}
+                      pulse={h.status === "online"}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{h.name}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      {h.agent_count} agent{h.agent_count === 1 ? "" : "s"}
+                    </span>
+                    <ChevronRight
+                      className="size-4 shrink-0 text-muted-foreground/50"
                       aria-hidden
                     />
-                    {h.name}
-                  </span>
-                  <span className="text-xs text-muted-foreground">{h.agent_count} agents</span>
+                  </Link>
                 </li>
               ))}
               {!hostsQ.isLoading && (hostsQ.data?.length ?? 0) === 0 && (
-                <li className="text-sm text-muted-foreground">
-                  No hosts yet. Run <code>spawnd login</code> on a machine and approve it from{" "}
+                <li className="px-4 py-3 text-sm text-muted-foreground">
+                  No hosts yet. Run <code>spawnd login</code> on a machine and approve it at{" "}
                   <Link href="/device" className="underline">
                     /device
                   </Link>
@@ -299,33 +317,28 @@ function Dashboard() {
         </Card>
 
         <Card>
-          <CardHeader>
-            <CardTitle>Recent agents</CardTitle>
-            <CardDescription>
-              {agentsQ.isLoading
-                ? "Loading..."
-                : agentsQ.error
-                  ? "Failed to load agents"
-                  : `${agentsQ.data?.length ?? 0} total`}
-            </CardDescription>
+          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+            <div className="min-w-0">
+              <CardTitle>Recent agents</CardTitle>
+              <CardDescription>
+                {agentsQ.isLoading
+                  ? "Loading…"
+                  : agentsQ.error
+                    ? "Failed to load agents"
+                    : `${agentsQ.data?.length ?? 0} total`}
+              </CardDescription>
+            </div>
+            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
+              <Link href="/agents">All</Link>
+            </Button>
           </CardHeader>
-          <CardContent>
-            <ul className="space-y-2">
-              {(agentsQ.data ?? []).slice(0, 5).map((a: Agent) => (
-                <li key={a.id} className="text-sm">
-                  <Link
-                    href={`/agents/${a.id}`}
-                    className="flex items-center justify-between hover:underline"
-                  >
-                    <span className="truncate text-xs font-medium">{agentTitle(a)}</span>
-                    <span className="text-[11px] text-muted-foreground">
-                      {agentActivityDetail(a)}
-                    </span>
-                  </Link>
-                </li>
+          <CardContent className="p-0">
+            <ul className="border-t border-border">
+              {recentAgents.map((a: Agent) => (
+                <AgentListRow key={a.id} agent={a} href={`/agents/${a.id}`} />
               ))}
-              {!agentsQ.isLoading && (agentsQ.data?.length ?? 0) === 0 && (
-                <li className="text-sm text-muted-foreground">No agents yet.</li>
+              {!agentsQ.isLoading && recentAgents.length === 0 && (
+                <li className="px-4 py-3 text-sm text-muted-foreground">No agents yet.</li>
               )}
             </ul>
           </CardContent>

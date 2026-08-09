@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
+import { AgentListRow } from "@/components/agents/AgentListRow";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Badge } from "@/components/ui/badge";
@@ -26,14 +26,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AgentStatusDot } from "@/components/ui/status";
-import {
-  agentActivityDetail,
-  agentActivityLabel,
-  agentCommand,
-  agentTitle,
-  isAgentArchived,
-} from "@/lib/agents";
+import { agentTitle, isAgentArchived } from "@/lib/agents";
 import { type Agent, ApiError, agents } from "@/lib/api";
 
 export default function AgentsPage() {
@@ -55,10 +48,6 @@ function AgentsView() {
     queryFn: () => agents.list({ include_archived: includeArchived }),
     refetchInterval: 5_000,
   });
-  // Terminal previews are no longer fetched through the server. A future
-  // endpoint-owned preview can populate this without exposing history.
-  const tails: Record<string, string | null> = {};
-
   const invalidateAgents = () => {
     qc.invalidateQueries({ queryKey: ["agents"] });
     qc.invalidateQueries({ queryKey: ["hosts"] });
@@ -196,18 +185,17 @@ function AgentsView() {
 
       <div className="space-y-5">
         {pinned.length > 0 && (
-          <AgentSection title="Pinned" agentList={pinned} tails={tails} actions={rowActions} />
+          <AgentSection title="Pinned" agentList={pinned} actions={rowActions} />
         )}
         {recent.length > 0 && (
           <AgentSection
             title={pinned.length > 0 ? "Recent" : undefined}
             agentList={recent}
-            tails={tails}
             actions={rowActions}
           />
         )}
         {includeArchived && archived.length > 0 && (
-          <AgentSection title="Archived" agentList={archived} tails={tails} actions={rowActions} />
+          <AgentSection title="Archived" agentList={archived} actions={rowActions} />
         )}
       </div>
     </div>
@@ -226,12 +214,10 @@ type RowActions = {
 function AgentSection({
   title,
   agentList,
-  tails,
   actions,
 }: {
   title?: string;
   agentList: Agent[];
-  tails: Record<string, string | null>;
   actions: (agent: Agent) => RowActions;
 }) {
   return (
@@ -243,7 +229,7 @@ function AgentSection({
       )}
       <ul className="overflow-hidden rounded-xl border border-border">
         {agentList.map((agent) => (
-          <AgentRow key={agent.id} agent={agent} tail={tails[agent.id]} {...actions(agent)} />
+          <AgentRow key={agent.id} agent={agent} {...actions(agent)} />
         ))}
       </ul>
     </section>
@@ -252,7 +238,6 @@ function AgentSection({
 
 function AgentRow({
   agent,
-  tail,
   busy,
   onRename,
   onPin,
@@ -261,58 +246,30 @@ function AgentRow({
   onDelete,
 }: {
   agent: Agent;
-  tail?: string | null;
 } & RowActions) {
   const archived = isAgentArchived(agent);
   return (
-    <li className="group border-b border-border transition-colors last:border-b-0 hover:bg-accent/40">
-      <div className="flex items-center gap-3 px-4 py-3">
-        <Link
-          href={`/agents/${agent.id}`}
-          className="flex min-w-0 flex-1 items-center gap-3"
-          aria-label={`Open ${agentTitle(agent)}`}
-        >
-          <span className="relative shrink-0">
-            <AgentKindIcon agent={agent} className="size-9" iconClassName="size-4.5" />
-            <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-2">
-              <span className="truncate text-sm font-medium">{agentTitle(agent)}</span>
-              {agent.pinned_at && (
-                <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
-              )}
-              {archived && <Badge variant="outline">archived</Badge>}
-              {agent.status === "exited" && (
-                <Badge variant={agent.exit_code === 0 ? "outline" : "destructive"}>
-                  exit {agent.exit_code ?? "?"}
-                </Badge>
-              )}
-            </span>
-            <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
-              {agentCommand(agent)} · {agent.cwd}
-            </span>
-            {tail != null && tail !== "" && (
-              <span className="mt-1 block truncate font-mono text-[11px] leading-4 text-muted-foreground/70">
-                {lastNonEmptyLine(tail)}
-              </span>
-            )}
-          </span>
-          <span className="hidden shrink-0 text-right sm:block">
-            <span className="block text-xs">{agent.host_name ?? "—"}</span>
-            <span className="mt-0.5 block text-[11px] text-muted-foreground">
-              {agentActivityDetail(agent)}
-            </span>
-          </span>
-          <span className="sr-only">{agentActivityLabel(agent)}</span>
-        </Link>
+    <AgentListRow
+      agent={agent}
+      href={`/agents/${agent.id}`}
+      badges={
+        <>
+          {archived && <Badge variant="outline">archived</Badge>}
+          {agent.status === "exited" && (
+            <Badge variant={agent.exit_code === 0 ? "outline" : "destructive"}>
+              exit {agent.exit_code ?? "?"}
+            </Badge>
+          )}
+        </>
+      }
+      trailing={
         <DropdownMenu
           renderTrigger={(props) => (
             <Button
               {...props}
               variant="ghost"
               size="icon"
-              className="size-8 shrink-0 text-muted-foreground opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
+              className="mr-1 size-8 shrink-0 text-muted-foreground opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
               aria-label={`${agentTitle(agent)} actions`}
             >
               <MoreHorizontal className="size-4" />
@@ -349,14 +306,9 @@ function AgentRow({
             Delete
           </DropdownMenuItem>
         </DropdownMenu>
-      </div>
-    </li>
+      }
+    />
   );
-}
-
-function lastNonEmptyLine(tail: string): string {
-  const lines = tail.split("\n").filter((line) => line.trim() !== "");
-  return lines.at(-1) ?? "";
 }
 
 function sortAgents(agentList: Agent[]): Agent[] {

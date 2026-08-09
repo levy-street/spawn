@@ -24,7 +24,9 @@ test("logged-in root shows the dashboard", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByRole("main").getByText("Hosts")).toBeVisible();
   await expect(page.getByText("Recent agents")).toBeVisible();
-  await expect(page.getByRole("main").getByText(host.name)).toBeVisible();
+  // The host appears in the Hosts card as a link to its detail page (the host
+  // name now also shows in each agent row's meta, so scope to the link).
+  await expect(page.getByRole("main").getByRole("link", { name: host.name })).toBeVisible();
 });
 
 test("new agent form posts with the authenticated session context", async ({ page }) => {

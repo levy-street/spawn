@@ -4,15 +4,11 @@ import { Plus, Search } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
-import { type AgentConnState, useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
+import { AgentAttentionDot, AgentConnPip } from "@/components/agents/AgentListRow";
+import { useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
 import { BottomSheet } from "@/components/ui/sheet";
 import { AgentStatusDot } from "@/components/ui/status";
-import {
-  agentActivityDetail,
-  agentNeedsAttention,
-  agentTitle,
-  isAgentArchived,
-} from "@/lib/agents";
+import { agentActivityDetail, agentTitle, isAgentArchived } from "@/lib/agents";
 import type { Agent } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -75,25 +71,6 @@ export function AgentSwitchDots({
   );
 }
 
-/** A live per-agent connection indicator (distinct from the activity dot). */
-function ConnPip({ state }: { state: AgentConnState }) {
-  const style: Record<AgentConnState, [string, string]> = {
-    connected: ["bg-emerald-500", "Connected"],
-    warm: ["bg-sky-500", "Warm — connected in the background"],
-    connecting: ["bg-amber-400 animate-pulse", "Connecting"],
-    off: ["bg-muted-foreground/40", "Not connected"],
-  };
-  const [cls, label] = style[state];
-  return (
-    <span
-      role="img"
-      title={label}
-      aria-label={label}
-      className={cn("size-2 shrink-0 rounded-full", cls)}
-    />
-  );
-}
-
 function AgentSwitchRow({
   agent,
   active,
@@ -104,7 +81,6 @@ function AgentSwitchRow({
   onPick: () => void;
 }) {
   const conn = useAgentConnState(agent.id);
-  const attention = agentNeedsAttention(agent);
   return (
     <li>
       <button
@@ -125,21 +101,13 @@ function AgentSwitchRow({
             <span className="truncate text-sm font-medium text-foreground">
               {agentTitle(agent)}
             </span>
-            {attention && (
-              <span
-                title={attention === "dead" ? "Agent exited" : "Awaiting input"}
-                className={cn(
-                  "size-1.5 shrink-0 rounded-full",
-                  attention === "dead" ? "bg-red-500" : "animate-pulse bg-amber-400",
-                )}
-              />
-            )}
+            <AgentAttentionDot agent={agent} />
           </span>
           <span className="block truncate text-xs text-muted-foreground">
             {`${agent.host_name ?? "?"} · ${agentActivityDetail(agent)}`}
           </span>
         </span>
-        <ConnPip state={conn} />
+        <AgentConnPip state={conn} />
       </button>
     </li>
   );
