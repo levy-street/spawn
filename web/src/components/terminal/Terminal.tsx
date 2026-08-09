@@ -3504,15 +3504,26 @@ function parseHistoryReplay(
 }
 
 /**
- * Emitted between the history text and the screen repaint: scrolls every
- * viewport row the history writes occupied up into the scrollback region, so
- * the absolute-addressed screen repaint that follows paints a blank viewport
- * instead of overwriting the newest history lines. Computed at write time —
- * wrapping against the live overlay width decides how many rows are occupied.
+ * Emitted between the history text and the screen repaint: scrolls the viewport
+ * rows the history occupies up into scrollback, so the absolute-addressed screen
+ * repaint that follows paints a blank viewport instead of overwriting the newest
+ * history lines.
+ *
+ * Scroll by the last NON-BLANK viewport row, not the cursor row. When the
+ * seeded history ends in blank lines — which old-worker committed logs still
+ * carry — the cursor sits well below the last content, and scrolling to the
+ * cursor pushed a screenful of blank rows into scrollback: the "gap" wedged at
+ * the history↔live-screen seam that a reseed left behind. Trailing blank rows
+ * are frame padding, never content, so excluding them loses nothing; interior
+ * blanks (rows above the last content) are still scrolled up intact.
  */
 function flushViewportIntoScrollback(term: XTerm): string {
   const buffer = term.buffer.active;
-  const occupied = buffer.cursorY + (buffer.cursorX > 0 ? 1 : 0);
+  let occupied = 0;
+  for (let row = 0; row < term.rows; row += 1) {
+    const line = buffer.getLine(buffer.viewportY + row);
+    if (line && line.translateToString(true).length > 0) occupied = row + 1;
+  }
   if (occupied <= 0) return "";
   return `\x1b[${term.rows};1H${"\n".repeat(occupied)}`;
 }
