@@ -421,6 +421,80 @@ test("jump-to-latest button appears when scrolled up and returns to the live edg
   await expect(live.locator(".xterm-rows")).toContainText("SCREEN-ROW-10");
 });
 
+// Column-garble repro (#43): wide-authored committed history, re-wrapped to a
+// phone width, rendered each word's first char stranded at the last column.
+// The signature is a rendered row of "content … spaces … single trailing
+// char". Assert no history row looks like that.
+async function columnGarbledRows(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const rows = document.querySelectorAll<HTMLElement>(
+      '[data-testid="terminal-live-host"] .xterm-rows > div',
+    );
+    const out: string[] = [];
+    for (const row of rows) {
+      const text = (row.textContent ?? "").replace(/\s+$/, "");
+      if (/\S {6,}\S$/.test(text)) out.push(text);
+    }
+    return out;
+  });
+}
+
+test("wide-authored history does not column-garble at phone width", async ({ page }) => {
+  const SENTENCE =
+    "capture for the duplicate content width histogram want me to pick up number forty two next or keep shaking out terminal issues first";
+  const messages: Array<string | Buffer> = [];
+  await installAgentRtcMock(page, messages, {
+    history: `${V2_MARKER}${V2_SENTINEL}${SENTENCE}\r\ncommit-000\r\n${V2_MARKER}\x1b[Hlive$ `,
+    control: { owner: true, cols: 80, rows: 12, viewers: 1 },
+    autoSnapshot: true,
+    historyEpoch: EPOCH,
+    historyOffset: 0,
+  });
+  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.send(
+      JSON.stringify({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        binding_nonce_required: true,
+      }),
+    );
+    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+  });
+  const live = page.getByTestId("terminal-live-host");
+  const revealHistory = async () => {
+    await live.locator(".xterm").hover();
+    await page.mouse.wheel(0, -1500);
+    await page.waitForTimeout(350);
+  };
+
+  // Author wide (seed at a desktop width), then step down through the widths
+  // the real session took (≈165 → 126 → 48 cols) so xterm reflows the
+  // wide-authored history repeatedly, as it did on the phone.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto(`/agents/${AGENT_ID}`);
+  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(live.locator(".xterm-rows")).toContainText("live$");
+  await revealHistory();
+  expect(await columnGarbledRows(page)).toEqual([]);
+
+  for (const width of [1000, 640, 390]) {
+    await page.setViewportSize({ width, height: 780 });
+    await page.waitForTimeout(500);
+  }
+  await revealHistory();
+  expect(await columnGarbledRows(page)).toEqual([]);
+
+  // And a direct open at phone width (write-path), for completeness.
+  await page.setViewportSize({ width: 390, height: 780 });
+  await page.reload();
+  await expect(live.locator(".xterm-rows")).toContainText("live$");
+  await revealHistory();
+  expect(await columnGarbledRows(page)).toEqual([]);
+});
+
 // History width integrity (the geometry-policy guarantee): committed history
 // is stored as flowing logical lines, so viewing it at a narrow width wraps it
 // for display only — the logical content is never lost or truncated, and it

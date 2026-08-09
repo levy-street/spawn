@@ -452,6 +452,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const [newOutputWhileAway, setNewOutputWhileAway] = useState(false);
   const atLiveEdgeRef = useRef(true);
   const refreshLiveEdgeRef = useRef<() => void>(() => {});
+  // A ring of recent buffer-shaping ops (seed / reseed / snapshot / resize) so
+  // a refresh+diagnostics capture shows the sequence that led to a corrupted
+  // render — the async races (a write or reseed landing mid-reflow) that the
+  // synchronous e2e mock cannot reproduce.
+  const opLogRef = useRef<Array<{ t: number; op: string; info: string }>>([]);
+  const pushOp = useCallback((op: string, info = "") => {
+    const log = opLogRef.current;
+    log.push({ t: Date.now(), op, info });
+    if (log.length > 48) log.shift();
+  }, []);
   const [socketInitialSize, setSocketInitialSize] = useState<{
     cols: number;
     rows: number;
@@ -616,6 +626,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (replaySlices === null) return false;
 
       const { cols, rows } = lastSizeRef.current;
+      pushOp(
+        "reseed",
+        `${cols}x${rows} exact=${exact} force=${!!opts?.force} slices=${replaySlices.length}`,
+      );
       try {
         term.resize(cols, rows);
       } catch {
@@ -639,7 +653,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
       return true;
     },
-    [takeDcReplaySlices],
+    [takeDcReplaySlices, pushOp],
   );
 
   const showUploadStatus = useCallback((message: string) => {
@@ -1096,6 +1110,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       term.reset();
       unifiedDeepSeededRef.current = false;
+      pushOp(
+        "seed",
+        `${lastSizeRef.current.cols}x${lastSizeRef.current.rows} exact=${liveSeedWasExactRef.current} reseedPending=${historyReseedPendingRef.current}`,
+      );
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
         flushPendingLiveSeedWritesRef.current();
@@ -2062,6 +2080,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const last = lastSizeRef.current;
       if (cols === last.cols && rows === last.rows) return;
       const colsChanged = cols !== last.cols;
+      pushOp("resize", `${last.cols}x${last.rows}→${cols}x${rows}${colsChanged ? " cols" : ""}`);
       lastSizeRef.current = { cols, rows };
       // A genuine fit changed the grid, so it just reflowed: open the
       // reflow-quiet window here rather than on every fitTerminal() call, so a
@@ -2245,8 +2264,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pinLiveViewportToBottomRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
-    // through `socketRef`, so it doesn't need to be in deps.
-  }, [snapToLiveEdge]);
+    // through `socketRef`, so it doesn't need to be in deps. pushOp is stable.
+  }, [snapToLiveEdge, pushOp]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {
@@ -2706,6 +2725,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             // Recent resize->repaint latencies (ms): toFirstByte is the app's
             // first response, toSettle is when the repaint burst went quiet.
             resizeTimings: resizeTimingsRef.current.slice(-12),
+            // Recent buffer-shaping ops (ms before this capture) — the seed /
+            // reseed / resize sequence that produced the current render.
+            opLog: opLogRef.current.slice(-48).map((entry) => ({
+              msAgo: Math.round(Date.now() - entry.t),
+              op: entry.op,
+              info: entry.info,
+            })),
             tail,
             bufferScan,
           };
