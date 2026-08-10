@@ -792,6 +792,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (cols !== last.cols || rows !== last.rows) {
       invalidateScrollbackForResizeRef.current();
     }
+    // A WIDTH change owes a history reseed, exactly as notifyResizeIfChanged
+    // enforces for a container fit. Take-control reflows the grid to our own
+    // geometry (a device/focus switch back to this tab is the common trigger),
+    // so committed history must be re-fetched and re-rendered at the new width;
+    // without arming the heal here, that width change silently skips it.
+    if (cols !== last.cols) {
+      historyReseedPendingRef.current = true;
+      resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
+    }
     markResizeSentRef.current(cols, rows);
     socketRef.current.sendJson({ type: "take_control", cols, rows });
     term.focus();
@@ -865,6 +874,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         lastSizeRef.current = geometry;
         if (geometry.cols !== last.cols || geometry.rows !== last.rows) {
           invalidateScrollbackForResizeRef.current();
+        }
+        // Following the owner's geometry can change our width; that owes a
+        // history reseed just like a local fit (see notifyResizeIfChanged).
+        if (geometry.cols !== last.cols) {
+          historyReseedPendingRef.current = true;
+          resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
         }
         layoutTerminalSurfaceRef.current(atBottom);
         requestAnimationFrame(() => layoutTerminalSurfaceRef.current(atBottom));
@@ -2583,6 +2598,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         lastSizeRef.current = { cols, rows };
         if (cols !== last.cols || rows !== last.rows) {
           invalidateScrollbackForResizeRef.current();
+        }
+        // A width change owes a history reseed (see notifyResizeIfChanged).
+        if (cols !== last.cols) {
+          historyReseedPendingRef.current = true;
+          resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
         }
         if (displayOwnerRef.current === true) {
           socket.sendJson({ type: "resize", cols, rows });
