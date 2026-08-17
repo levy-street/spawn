@@ -118,7 +118,7 @@ export default function DownloadPage() {
       <nav className="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
         <Link href="/" className="flex items-center gap-3 text-lg font-semibold">
           <SquareTerminal className="size-7 shrink-0" aria-hidden />
-          <span>spawn</span>
+          <span>spawnd</span>
         </Link>
         <Button asChild variant="ghost" size="sm">
           <Link href="/">
@@ -133,14 +133,15 @@ export default function DownloadPage() {
           <div>
             <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-brand-hairline bg-brand-panel/70 px-3 py-1 text-sm text-foreground/85">
               <Download className="size-4 text-sky-600 dark:text-sky-300" />
-              Spawn daemon installer
+              Possess a host
             </p>
             <h1 className="text-4xl font-semibold leading-tight sm:text-5xl">
-              Download the right daemon for this host.
+              Install the daemon. Possess the host.
             </h1>
             <p className="mt-5 max-w-xl text-lg leading-8 text-foreground/85">
               The installer detects macOS or Linux on the machine where it runs, downloads the
-              matching prebuilt binary, then starts the daemon as a user service.
+              matching prebuilt daemon, then starts it as a user service. One line, then the pairing
+              ceremony — consensual, auditable, revocable.
             </p>
           </div>
 

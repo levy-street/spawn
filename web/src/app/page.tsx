@@ -4,14 +4,15 @@ import { useQuery } from "@tanstack/react-query";
 import {
   ArrowRight,
   ChevronRight,
-  Download,
-  LogIn,
-  Network,
+  Flame,
+  Ghost,
+  KeyRound,
+  Lock,
   Server,
-  ShieldCheck,
-  SquareTerminal,
+  Smartphone,
   Terminal,
 } from "lucide-react";
+import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
@@ -22,8 +23,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { type Agent, agents, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-
-const BACKDROP_CELLS = Array.from({ length: 140 }, (_, index) => `cell-${index}`);
 
 export default function HomePage() {
   const { user } = useAuth();
@@ -49,196 +48,405 @@ function LandingPage() {
   const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
 
   return (
-    <main className="min-h-vv overflow-hidden bg-brand-bg text-foreground">
-      <section className="relative min-h-[88svh] overflow-hidden border-border border-b">
-        <TerminalBackdrop />
+    <main className="grimoire min-h-vv overflow-hidden">
+      {/* ── Hero ─────────────────────────────────────────────── */}
+      <section className="relative isolate overflow-hidden border-line-g border-b">
+        <Image
+          src="/possession.png"
+          alt=""
+          aria-hidden
+          fill
+          priority
+          sizes="100vw"
+          className="pointer-events-none object-cover object-[70%_center] opacity-90"
+        />
+        <div
+          aria-hidden
+          className="absolute inset-0"
+          style={{
+            background:
+              "linear-gradient(90deg, rgba(10,6,7,.96) 0%, rgba(10,6,7,.9) 28%, rgba(10,6,7,.5) 58%, rgba(10,6,7,.22) 100%), linear-gradient(180deg, rgba(10,6,7,.55) 0%, transparent 16%, transparent 72%, rgba(10,6,7,.92) 100%)",
+          }}
+        />
 
-        <nav className="relative z-10 mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
-          <Link href="/" className="flex items-center gap-3 text-lg font-semibold">
-            <SquareTerminal className="size-7 shrink-0" aria-hidden />
-            <span>spawn</span>
+        <nav className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-6 sm:px-8">
+          <Link href="/" className="flex items-center gap-2.5">
+            <Sigil className="size-7" />
+            <span className="font-sigil text-[15px] tracking-[0.3em] text-hellfire lowercase">
+              spawnd
+            </span>
           </Link>
-          <div className="flex items-center gap-2">
-            <Button asChild variant="ghost" size="sm">
-              <Link href="/login">
-                <LogIn className="size-4" />
-                Log in
-              </Link>
-            </Button>
-            <Button asChild size="sm">
-              <Link href="/signup">
-                Sign up
-                <ArrowRight className="size-4" />
-              </Link>
-            </Button>
+          <div className="flex items-center gap-4 font-sigil text-[12px] tracking-[0.18em] uppercase sm:gap-5">
+            <Link
+              href="/veil"
+              className="hidden text-ash transition-colors hover:text-bone sm:inline"
+            >
+              The&nbsp;Veil
+            </Link>
+            <Link
+              href="/login"
+              className="hidden text-ash transition-colors hover:text-bone sm:inline"
+            >
+              Log&nbsp;in
+            </Link>
+            <Link
+              href="/signup"
+              className="rounded-sm border border-hellfire/60 px-3 py-1.5 text-ember transition-colors hover:border-hellfire hover:text-hellfire"
+            >
+              Sign&nbsp;up
+            </Link>
           </div>
         </nav>
 
-        <div className="relative z-10 mx-auto flex min-h-[calc(88svh-5rem)] w-full max-w-7xl flex-col justify-center px-4 pb-16 sm:px-6 lg:px-8">
-          <div className="max-w-3xl">
-            <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-brand-hairline bg-brand-panel/70 px-3 py-1 text-sm text-foreground/85">
-              <Network className="size-4 text-sky-600 dark:text-sky-300" />
-              Browser control for CLI coding agents
-            </p>
-            <h1 className="text-6xl font-semibold leading-none sm:text-7xl md:text-8xl">spawn</h1>
-            <p className="mt-6 max-w-lg text-balance text-xl leading-8 text-foreground sm:text-2xl sm:leading-9">
-              Run Codex, Claude, shell agents, and host tools across your laptop, workstations, and
-              servers from one fast control plane.
-            </p>
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <Button asChild size="lg">
-                <Link href="/signup">
-                  <ArrowRight className="size-5" />
-                  Start using spawn
-                </Link>
-              </Button>
-              <Button asChild variant="outline" size="lg">
-                <Link href="/download">
-                  <Download className="size-5" />
-                  Install daemon
-                </Link>
-              </Button>
-            </div>
-            <div className="mt-8 max-w-2xl rounded-md border border-brand-hairline bg-brand-panel/80 p-3 font-mono text-xs text-foreground shadow-2xl shadow-black/10 dark:shadow-black/40 sm:text-sm">
-              <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
-              <code className="break-all">{installCommand}</code>
-            </div>
-          </div>
-        </div>
-      </section>
+        <div className="relative z-10 mx-auto flex min-h-[86svh] w-full max-w-6xl flex-col justify-center px-5 pt-10 pb-20 sm:px-8">
+          <p className="mb-6 font-sigil text-[12px] tracking-[0.34em] text-hellfire uppercase">
+            <span className="text-ash">daemon</span> · <span className="text-ash">host</span> ·
+            possession
+          </p>
+          <h1 className="max-w-3xl font-grimoire text-[clamp(44px,9vw,92px)] font-medium leading-[0.98] text-bone [text-wrap:balance]">
+            Possess your machines.
+          </h1>
+          <p className="mt-7 max-w-[54ch] text-[18px] leading-8 text-ash sm:text-[19px]">
+            The open-source control plane that possesses every machine you own with a single daemon
+            — <em className="text-bone not-italic">summon, drive, and banish</em> CLI coding agents
+            from any browser, including your phone, while the server that coordinates it all is{" "}
+            <em className="text-bone not-italic">
+              structurally unable to read a byte of your terminal.
+            </em>
+          </p>
 
-      <section
-        id="install"
-        className="border-border border-b bg-brand-panel px-4 py-12 sm:px-6 lg:px-8"
-      >
-        <div className="mx-auto grid w-full max-w-7xl gap-8 lg:grid-cols-[1fr_1.1fr]">
-          <div>
-            <p className="mb-3 text-sm font-medium text-amber-600 dark:text-amber-300">
-              Host setup
-            </p>
-            <h2 className="text-3xl font-semibold leading-tight sm:text-4xl">
-              One installer for macOS and Linux hosts.
-            </h2>
-            <p className="mt-4 max-w-xl text-base leading-7 text-foreground/85">
-              The hosted script picks a prebuilt daemon for the host, falls back to a source build
-              when needed, runs device-code login, and starts a user service where the OS supports
-              it.
-            </p>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Capability icon={<Download className="size-5" />} title="Prebuilt first">
-              Downloads a prebuilt daemon binary before attempting any Rust or git build path.
-            </Capability>
-            <Capability icon={<Server className="size-5" />} title="User services">
-              Uses LaunchAgent on macOS and user systemd on Linux with a background fallback.
-            </Capability>
-            <Capability icon={<Terminal className="size-5" />} title="CLI native">
-              Runs your existing agent CLIs in real terminals with durable host registration.
-            </Capability>
-            <Capability icon={<ShieldCheck className="size-5" />} title="Outbound only">
-              Hosts dial the Spawn server over HTTPS/WSS, so no inbound SSH or agent ports are
-              exposed.
-            </Capability>
-          </div>
-        </div>
-      </section>
-
-      <section className="bg-brand-panel px-4 py-10 sm:px-6 lg:px-8">
-        <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-2xl font-semibold">Bring a host online.</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Install the daemon, approve the device code, then start agents from the browser.
-            </p>
-          </div>
-          <Button asChild size="lg">
-            <Link href="/download">
-              Download installer
-              <ArrowRight className="size-5" />
+          <div className="mt-9 flex flex-col gap-3 sm:flex-row sm:items-center">
+            <Link
+              href="/signup"
+              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
+            >
+              Begin the possession
+              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
-          </Button>
+            <Link
+              href="/veil"
+              className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
+            >
+              Read the threat model
+            </Link>
+          </div>
+
+          <div className="mt-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char/80 px-4 py-3 font-sigil text-[13px] text-bone backdrop-blur-sm">
+            <span className="text-hellfire">$</span>
+            <code className="whitespace-nowrap">{installCommand}</code>
+            <span className="whitespace-nowrap text-ash">
+              &nbsp;&nbsp;# the possession takes one line
+            </span>
+          </div>
         </div>
       </section>
+
+      {/* ── Pillars ──────────────────────────────────────────── */}
+      <section className="border-line-g border-b px-5 py-24 sm:px-8">
+        <div className="mx-auto w-full max-w-6xl">
+          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+            One roof, three pillars
+          </p>
+          <h2 className="mb-14 max-w-2xl font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
+            A demon in your house that answers only to you.
+          </h2>
+          <div className="grid gap-px overflow-hidden rounded-md border border-line-g bg-line-g md:grid-cols-3">
+            <Pillar
+              icon={<Server className="size-5" />}
+              kicker="Sovereignty"
+              title="The demon lives in your house."
+            >
+              Agents run on hardware you own, signed into the subscriptions you already pay for.
+              Each CLI does its own <code className="text-ember">claude /login</code>. We never
+              touch your API keys, because we never <em className="text-bone not-italic">have</em>{" "}
+              them.
+            </Pillar>
+            <Pillar
+              icon={<Lock className="size-5" />}
+              kicker="Silence"
+              title="It answers only to you."
+            >
+              Terminal I/O runs end-to-end encrypted, browser to daemon, over WebRTC. The control
+              plane carries signaling only — there is no server code path for terminal content. The
+              server <em className="text-bone not-italic">cannot</em> read your terminal.
+              Cryptography, not a pinky promise.
+            </Pillar>
+            <Pillar
+              icon={<Smartphone className="size-5" />}
+              kicker="Ubiquity"
+              title="Any demon, any host, any circle."
+            >
+              claude, codex, opencode, aider, a bare shell — if it runs in a PTY, it can be
+              possessed. macOS and Linux hosts, one installer, outbound-only. The real TUI over
+              xterm.js, phone in hand, a second device taking control mid-keystroke.
+            </Pillar>
+          </div>
+        </div>
+      </section>
+
+      {/* ── The objection / inversion ────────────────────────── */}
+      <section className="relative overflow-hidden border-line-g border-b px-5 py-24 sm:px-8">
+        <div
+          aria-hidden
+          className="absolute inset-0"
+          style={{
+            background:
+              "radial-gradient(ellipse 70% 60% at 50% 120%, rgba(142,31,22,.4), transparent 62%)",
+          }}
+        />
+        <div className="relative mx-auto w-full max-w-3xl text-center">
+          <Flame className="mx-auto mb-6 size-8 text-hellfire" aria-hidden />
+          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+            The objection
+          </p>
+          <h2 className="mb-7 font-grimoire text-[clamp(26px,4.4vw,38px)] font-medium leading-[1.15] text-bone">
+            “This is literally what malware does.”
+          </h2>
+          <p className="mx-auto max-w-[62ch] text-[17px] leading-8 text-ash">
+            A botnet is possession <em className="text-bone not-italic">without</em> consent, run
+            from a C2 server that reads everything. spawnd is the inversion on every axis:{" "}
+            <span className="text-bone">you</span> run the installer,{" "}
+            <span className="text-bone">you</span> approve the pairing ceremony against a key
+            fingerprint, and the coordinating server is engineered to be unable to read the session.
+            The daemon opens no inbound ports; it only dials out. Revocation is one click and the
+            socket dies. And it is open source — so you don’t have to take a single sentence of this
+            on faith, including this one.
+          </p>
+          <p className="mt-8 font-sigil text-[13px] tracking-[0.08em] text-ember">
+            We simply reversed every axis of evil.
+          </p>
+        </div>
+      </section>
+
+      {/* ── Lexicon: every term teaches a mechanism ──────────── */}
+      <section className="border-line-g border-b px-5 py-24 sm:px-8">
+        <div className="mx-auto w-full max-w-6xl">
+          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+            The lexicon
+          </p>
+          <h2 className="mb-4 max-w-2xl font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
+            Every term earns its mechanism.
+          </h2>
+          <p className="mb-12 max-w-[60ch] text-[16px] leading-7 text-ash">
+            The theme is a mnemonic system, not paint. A word is admitted only if it teaches real
+            architecture. If it maps to nothing, it gets cut.
+          </p>
+          <div className="grid gap-px overflow-hidden rounded-md border border-line-g bg-line-g sm:grid-cols-2">
+            <Lex icon={<Ghost className="size-4" />} term="revenants">
+              Session workers that survive the daemon’s death and are re-adopted on restart. Your
+              agent outlives its daemon; the work does not stop.
+            </Lex>
+            <Lex icon={<KeyRound className="size-4" />} term="the sigil">
+              An Ed25519 key fingerprint. You verify the sigil before trust is granted; a changed
+              sigil is refused, loudly.
+            </Lex>
+            <Lex icon={<Lock className="size-4" />} term="the veil">
+              The control plane. It introduces your browser to the daemon, then goes deaf —
+              signaling only, never content.
+            </Lex>
+            <Lex icon={<Terminal className="size-4" />} term="the circle">
+              The terminal pane — the summoning circle where the agent appears. A real PTY, the raw
+              TUI, every keybinding and color intact.
+            </Lex>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Silence / claims ─────────────────────────────────── */}
+      <section className="border-line-g border-b px-5 py-24 sm:px-8">
+        <div className="mx-auto grid w-full max-w-6xl gap-12 lg:grid-cols-[1fr_1fr] lg:items-center">
+          <div>
+            <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+              We introduce. We never listen.
+            </p>
+            <h2 className="mb-6 font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
+              End-to-end encrypted, browser to daemon.
+            </h2>
+            <p className="max-w-[56ch] text-[17px] leading-8 text-ash">
+              Session traffic runs directly between your browser and the daemon over encrypted
+              WebRTC DataChannels. The relay is a fallback only — when NAT demands it, TURN carries
+              ciphertext it cannot decrypt. Either way, there is no server code path for terminal
+              content, no transcript store, nothing to subpoena. The threat model in the repo names
+              our own infrastructure as an adversary, because you should treat it as one.
+            </p>
+          </div>
+          <ul className="space-y-px overflow-hidden rounded-md border border-line-g bg-line-g">
+            <Claim>Terminal traffic never touches our server in plaintext.</Claim>
+            <Claim>
+              The relay, when NAT forces one, carries only ciphertext it cannot decrypt.
+            </Claim>
+            <Claim>No inbound ports. No exposed SSH. No tailnet. The daemon dials out.</Claim>
+            <Claim>No central credential store — each agent uses its own login on the host.</Claim>
+            <Claim>Consensual. Auditable. Revocable — one click and the socket dies.</Claim>
+          </ul>
+        </div>
+      </section>
+
+      {/* ── Final CTA ────────────────────────────────────────── */}
+      <section className="relative overflow-hidden px-5 py-28 sm:px-8">
+        <div
+          aria-hidden
+          className="absolute inset-0"
+          style={{
+            background:
+              "radial-gradient(ellipse 60% 50% at 50% 0%, rgba(255,73,48,.1), transparent 60%)",
+          }}
+        />
+        <div className="relative mx-auto w-full max-w-3xl text-center">
+          <Sigil className="mx-auto mb-8 size-16" />
+          <h2 className="mb-5 font-grimoire text-[clamp(32px,5.5vw,52px)] font-medium leading-[1.05] text-bone">
+            Your legion awaits.
+          </h2>
+          <p className="mx-auto mb-9 max-w-[46ch] text-[17px] leading-8 text-ash">
+            One line to possess the first host. A ceremony you control, a key you verify, a demon
+            that answers only to you.
+          </p>
+          <div className="mb-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char px-4 py-3 font-sigil text-[13px] text-bone">
+            <span className="text-hellfire">$</span>
+            <code className="whitespace-nowrap">{installCommand}</code>
+          </div>
+          <div className="flex flex-col items-center justify-center gap-3 sm:flex-row">
+            <Link
+              href="/signup"
+              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
+            >
+              Begin the possession
+              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+            </Link>
+            <Link
+              href="/download"
+              className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
+            >
+              Possess a host
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      <footer className="border-line-g border-t px-5 py-10 sm:px-8">
+        <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[12px] tracking-[0.08em] text-ash sm:flex-row">
+          <span>
+            <span className="text-hellfire">spawnd</span> · consensual · auditable · revocable
+          </span>
+          <div className="flex items-center gap-5">
+            <Link href="/veil" className="transition-colors hover:text-bone">
+              The Veil
+            </Link>
+            <Link href="/download" className="transition-colors hover:text-bone">
+              Install
+            </Link>
+            <Link href="/login" className="transition-colors hover:text-bone">
+              Log in
+            </Link>
+          </div>
+        </div>
+      </footer>
     </main>
   );
 }
 
-function TerminalBackdrop() {
-  return (
-    <div aria-hidden className="absolute inset-0">
-      <div className="absolute inset-0 grid grid-cols-6 opacity-35 sm:grid-cols-10 lg:grid-cols-[repeat(14,minmax(0,1fr))]">
-        {BACKDROP_CELLS.map((cell) => (
-          <div key={cell} className="min-h-14 border-brand-hairline border-r border-b" />
-        ))}
-      </div>
-      <div className="absolute top-[14%] right-[-8rem] hidden w-[56rem] rotate-[-3deg] rounded-md border border-brand-hairline bg-brand-panel/80 p-4 shadow-2xl shadow-black/15 dark:shadow-black/70 md:block">
-        <div className="mb-4 flex items-center gap-2 text-xs text-muted-foreground">
-          <span className="size-3 rounded-full bg-rose-400" />
-          <span className="size-3 rounded-full bg-amber-600 dark:bg-amber-300" />
-          <span className="size-3 rounded-full bg-emerald-400" />
-          <span className="ml-3">spawn / hosts / agents</span>
-        </div>
-        <div className="grid gap-3">
-          <BackdropLine
-            accent="bg-emerald-600 dark:bg-emerald-300"
-            text="dream online - 8 agents - codex ready"
-          />
-          <BackdropLine
-            accent="bg-sky-600 dark:bg-sky-300"
-            text="nightmare online - gpu queue - nvtop active"
-          />
-          <BackdropLine
-            accent="bg-amber-600 dark:bg-amber-300"
-            text="macbook online - local review agent - skills granted"
-          />
-          <div className="mt-2 h-40 rounded-md border border-brand-hairline bg-brand-well p-4 font-mono text-sm text-foreground/85">
-            <p>
-              <span className="text-emerald-600 dark:text-emerald-300">$</span> spawn agent create
-              --preset codex --host dream
-            </p>
-            <p className="mt-3 text-muted-foreground">routing terminal frames over WSS...</p>
-            <p className="mt-3 text-sky-600 dark:text-sky-300">agent ready - ~/projects/spawn</p>
-          </div>
-        </div>
-      </div>
-      <div className="absolute bottom-10 left-4 hidden w-[22rem] rounded-md border border-brand-hairline bg-brand-panel/80 p-4 shadow-xl shadow-black/15 dark:shadow-black/60 sm:left-8 sm:block">
-        <div className="font-mono text-xs leading-6 text-foreground/85">
-          <p className="text-emerald-600 dark:text-emerald-300">spawnd 0.1.0</p>
-          <p>host registered</p>
-          <p className="text-sky-600 dark:text-sky-300">terminal attached</p>
-          <p className="text-amber-600 dark:text-amber-300">skills granted</p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function BackdropLine({ accent, text }: { accent: string; text: string }) {
-  return (
-    <div className="flex items-center gap-3 rounded-md border border-brand-hairline bg-foreground/[0.03] px-3 py-2 font-mono text-sm text-foreground/85">
-      <span className={`size-2 rounded-full ${accent}`} />
-      <span>{text}</span>
-    </div>
-  );
-}
-
-function Capability({
+function Pillar({
   icon,
+  kicker,
   title,
   children,
 }: {
   icon: ReactNode;
+  kicker: string;
   title: string;
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-md border border-brand-hairline bg-brand-panel/50 p-4">
-      <div className="mb-3 flex size-9 items-center justify-center rounded-md bg-white text-black">
+    <div className="bg-void p-8">
+      <div className="mb-5 flex size-10 items-center justify-center rounded-sm border border-hellfire/40 text-hellfire">
         {icon}
       </div>
-      <h3 className="font-semibold">{title}</h3>
-      <p className="mt-2 text-sm leading-6 text-muted-foreground">{children}</p>
+      <p className="mb-2 font-sigil text-[11px] tracking-[0.24em] text-ember uppercase">{kicker}</p>
+      <h3 className="mb-3 font-grimoire text-[21px] font-medium leading-tight text-bone">
+        {title}
+      </h3>
+      <p className="text-[15px] leading-7 text-ash">{children}</p>
     </div>
+  );
+}
+
+function Lex({ icon, term, children }: { icon: ReactNode; term: string; children: ReactNode }) {
+  return (
+    <div className="bg-void p-7">
+      <div className="mb-3 flex items-center gap-3">
+        <span className="text-hellfire">{icon}</span>
+        <span className="font-sigil text-[14px] tracking-[0.06em] text-hellfire">{term}</span>
+      </div>
+      <p className="text-[15px] leading-7 text-ash">{children}</p>
+    </div>
+  );
+}
+
+function Claim({ children }: { children: ReactNode }) {
+  return (
+    <li className="flex items-start gap-3 bg-void px-6 py-4 text-[15px] leading-7 text-bone">
+      <Flame className="mt-1 size-3.5 shrink-0 text-hellfire" aria-hidden />
+      <span>{children}</span>
+    </li>
+  );
+}
+
+/** The brand sigil — concentric rings of a key fingerprint around the wordmark. */
+function Sigil({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 250 250" className={className} aria-hidden role="img">
+      <title>spawnd sigil</title>
+      <defs>
+        <path id="sigilRingA" d="M125,125 m-96,0 a96,96 0 1,1 192,0 a96,96 0 1,1 -192,0" />
+        <path id="sigilRingB" d="M125,125 m-70,0 a70,70 0 1,1 140,0 a70,70 0 1,1 -140,0" />
+      </defs>
+      <circle
+        cx="125"
+        cy="125"
+        r="106"
+        fill="none"
+        stroke="rgba(233,225,211,.16)"
+        strokeWidth="1"
+      />
+      <circle cx="125" cy="125" r="58" fill="none" stroke="rgba(255,73,48,.35)" strokeWidth="1" />
+      <g className="grimoire-ring">
+        <text
+          fontFamily="ui-monospace,Menlo,monospace"
+          fontSize="9.5"
+          letterSpacing="3"
+          fill="#FF4930"
+          opacity=".8"
+        >
+          <textPath href="#sigilRingA">
+            ed25519 4f:9a:c3:e1:0b:77:d2:5c:88:1a:f0:63:be:2d:41:97:6e:0c:a5:3f
+          </textPath>
+        </text>
+      </g>
+      <g className="grimoire-ring-rev">
+        <text
+          fontFamily="ui-monospace,Menlo,monospace"
+          fontSize="8"
+          letterSpacing="2.5"
+          fill="#A89B8E"
+          opacity=".6"
+        >
+          <textPath href="#sigilRingB">
+            no inbound ports · outbound only · the server never hears ·
+          </textPath>
+        </text>
+      </g>
+      <text
+        x="125"
+        y="132"
+        textAnchor="middle"
+        fontFamily="ui-monospace,Menlo,monospace"
+        fontSize="30"
+        letterSpacing="1"
+        fill="#E9E1D3"
+      >
+        d
+      </text>
+    </svg>
   );
 }
 
@@ -258,7 +466,7 @@ function Dashboard() {
       <header className="mb-4 flex items-center justify-between gap-2">
         <h1 className="text-xl font-semibold">Dashboard</h1>
         <Button asChild size="sm">
-          <Link href="/agents/new">New agent</Link>
+          <Link href="/agents/new">Summon</Link>
         </Button>
       </header>
 
@@ -272,7 +480,7 @@ function Dashboard() {
                   ? "Loading…"
                   : hostsQ.error
                     ? "Failed to load hosts"
-                    : `${hostsQ.data?.length ?? 0} registered`}
+                    : `${hostsQ.data?.length ?? 0} possessed`}
               </CardDescription>
             </div>
             <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
@@ -305,7 +513,8 @@ function Dashboard() {
               ))}
               {!hostsQ.isLoading && (hostsQ.data?.length ?? 0) === 0 && (
                 <li className="px-4 py-3 text-sm text-muted-foreground">
-                  No hosts yet. Run <code>spawnd login</code> on a machine and approve it at{" "}
+                  No hosts possessed yet. Run <code>spawnd login</code> on a machine and approve it
+                  at{" "}
                   <Link href="/device" className="underline">
                     /device
                   </Link>
@@ -325,7 +534,7 @@ function Dashboard() {
                   ? "Loading…"
                   : agentsQ.error
                     ? "Failed to load agents"
-                    : `${agentsQ.data?.length ?? 0} total`}
+                    : `${agentsQ.data?.length ?? 0} in the legion`}
               </CardDescription>
             </div>
             <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
@@ -338,7 +547,7 @@ function Dashboard() {
                 <AgentListRow key={a.id} agent={a} href={`/agents/${a.id}`} />
               ))}
               {!agentsQ.isLoading && recentAgents.length === 0 && (
-                <li className="px-4 py-3 text-sm text-muted-foreground">No agents yet.</li>
+                <li className="px-4 py-3 text-sm text-muted-foreground">No agents summoned yet.</li>
               )}
             </ul>
           </CardContent>

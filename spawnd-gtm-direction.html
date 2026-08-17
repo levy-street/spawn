@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html><head><!-- frame-runtime --><base href="/_f/1786941728-b183/"><script>window.__FRAME_PREAMBLE={"capabilities":{"artifact":"artifact.BWD0CGLd.js","assets":"assets.a_mJ8q_Q.js","comments":"comments.DGBrvfFR.js","db":"db.VpIrzqr_.js","downloads":"downloads.BXsoAvg9.js","mcp":"mcp.D3B2EyQu.js","permissions":"permissions.BNySkLV5.js","room":"room.BgXZkiYR.js","sample":"sample.kXGC3wc0.js","self":"artifact.BWD0CGLd.js","user":"user.CGub7vEP.js"},"transforms":"_transforms.BI3gXbbT.js","comments":"_comments.hMHmCz0l.js","translate":"_translate.3AdCy0Ua.js"}</script><script>(function(){"use strict";var ce=["light","dark","system"],ue=/^[A-Za-z0-9_-]{1,64}$/,V=/^[a-zA-Z_:][a-zA-Z0-9_:.-]{0,127}$/,fe=new Set(["class","hidden","value","checked"]);function de(e){const t=e.toLowerCase();return t.startsWith("data-")||t.startsWith("aria-")||fe.has(t)}var pe="http://www.w3.org/1999/xhtml",me="http://www.w3.org/2000/svg",ge=new Set(["script","style","iframe","noscript","noframes","noembed","xmp","plaintext","template","title","textarea","object","embed"]),_e=new Set(["script","style"]);function ve(e){const t=e.localName.toLowerCase();return e.namespaceURI===pe?!ge.has(t):e.namespaceURI===me?!_e.has(t):!1}function he(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_patch;if(t===null||typeof t!="object")return!1;const{seq:n,elements:a}=t;if(typeof n!="number"||!Number.isSafeInteger(n)||!Array.isArray(a)||a.length===0||a.length>64)return!1;for(const i of a){if(i===null||typeof i!="object")return!1;const r=i;if(typeof r.target!="string"||!ue.test(r.target)||r.text!==void 0&&typeof r.text!="string")return!1;if(r.attrsSet!==void 0){if(r.attrsSet===null||typeof r.attrsSet!="object")return!1;for(const[l,c]of Object.entries(r.attrsSet))if(!V.test(l)||typeof c!="string")return!1}if(r.attrsRemoved!==void 0){if(!Array.isArray(r.attrsRemoved))return!1;for(const l of r.attrsRemoved)if(typeof l!="string"||!V.test(l))return!1}}return!0}function ye(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function be(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function Ee(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const n=t.theme;return typeof n=="string"&&ce.includes(n)}function we(e){try{typeof reportError=="function"?reportError(e):setTimeout(()=>{throw e},0)}catch{}}var X=["#62744c","#b04e72","#5b7596","#a3651f","#7a6ba8","#3f7a75"],J=e=>{let t=0;for(let n=0;n<e.length;n++)t=t*31+e.charCodeAt(n)>>>0;return X[t%X.length]??"#788c5d"},Z="#c7c9d1",Ae=["data:image","/svg+xml,"].join(""),Q=e=>Ae+"%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2'%3E%3Ccircle cx='1' cy='1' r='1' fill='"+encodeURIComponent(e)+"'/%3E%3C/svg%3E",Se=Object.freeze({id:null,name:"",avatarUrl:Q(Z),color:Z,email:null,isOwner:!1,canEdit:!1}),je=(...e)=>{const t=e[0],n=typeof t=="string"?[t]:Array.isArray(t)?t.filter(i=>typeof i=="string"):[],a=Object.create(null);for(const i of n)a[i]={id:i,name:"",avatarUrl:Q(J(i)),color:J(i),email:null,isMe:!1};return a},ee=Object.freeze(Object.assign(Object.create(null),{user:Object.freeze(Object.assign(Object.create(null),{id:null,isOwner:!1,canEdit:!1,me:Se,profiles:je,name:"",avatarUrl:null,search:Object.freeze([]),email:null}))})),Re={sample:"sample"};function te(){const e=new Uint8Array(20);try{crypto.getRandomValues(e)}catch{for(let n=0;n<e.length;n++)e[n]=Math.floor(Math.random()*256)}let t="";for(const n of e)t+=(n%36).toString(36);return t}function Oe(e,t){const n=r=>{const l={path:r},c=r.split("/");return{id:c[c.length-1],path:r,get:()=>t("get",[l]),set:d=>t("set",[l,d]),update:d=>t("update",[l,d]),delete:()=>t("delete",[l]),acquire:d=>t("acquire",[l,d]),onSnapshot:(d,E)=>t("subscribe",[l,d,E]),collection:d=>i(r+"/"+String(d))}},a=r=>({where:(l,c,d)=>a({...r,where:[...r.where??[],{f:String(l),op:String(c),v:d}]}),orderBy:(l,c)=>a({...r,orderBy:{f:String(l),dir:c===void 0?"asc":String(c)}}),limit:l=>a({...r,limit:Number(l)}),get:()=>t("query",[r]),onSnapshot:(l,c)=>t("subscribe",[r,l,c])}),i=r=>({...a({collection:r}),path:r,doc:l=>n(r+"/"+(l===void 0?te():String(l))),add:l=>{const c=n(r+"/"+te());return Promise.resolve(c.set(l)).then(()=>c)}});e.doc=r=>n(String(r)),e.collection=r=>i(String(r))}var Pe=Object.freeze([]);function Te(e,t){let n=null,a=null;const i=()=>e.__settled;e.peers=()=>Pe,e.connected=()=>!1,e.emit=()=>i()?.()??Promise.resolve(),e.presence=r=>{const l=i();if(l)return l();let c=null;if(r!==null&&typeof r=="object")try{Array.isArray(r)||(c={...r})}catch{}return c===null?Promise.reject({code:"invalid_argument",message:"presence takes an object"}):(n===null&&(n=Object.create(null),a=Promise.resolve(t("presence",[n]))),Object.assign(n,c),a)}}var B="__frame_scroll",Me=150,Le=310,ke=160,Ce=3e4;function Ne(){let e=0,t=!1,n=!1,a=!1,i=0,r=null;const l=u=>{try{sessionStorage.setItem(B,JSON.stringify({y:u}))}catch{}},c=()=>{if(clearTimeout(e),r===null)return;const u=r;r=null,l(u)},d=()=>{if(t){t=!1;return}n=!0,r=scrollY,clearTimeout(e),e=setTimeout(c,Me)};try{addEventListener("scroll",d,{passive:!0}),addEventListener("pagehide",c)}catch{}const E=()=>{let u;try{u=sessionStorage.getItem(B)}catch{return null}if(u===null)return null;let g;try{g=JSON.parse(u)}catch{g=null}const f=g?.y;if(!(typeof f=="number"&&Number.isFinite(f)&&f>=0)){try{sessionStorage.removeItem(B)}catch{}return null}return f};let T=!1;const h=u=>{try{const g=scrollY;scrollTo({top:u,left:0,behavior:"instant"}),i=u,a=!0,clearTimeout(e),r=null,l(u);const f=scrollY;f!==g&&(t=!0),f!==u&&!T&&(T=!0,addEventListener("load",()=>{try{if(scrollY===f){const p=E();h(p!==null?p:i)}}catch{}},{once:!0}))}catch{}},R=()=>{try{return!!location.hash}catch{return!0}};let A=!1;const O=()=>{try{if(A||innerWidth>Le||innerHeight>ke)return;A=!0;const u=Date.now(),g=()=>{try{removeEventListener("resize",g)}catch{}if(Date.now()-u>Ce||n||R())return;const f=E();h(f!==null?f:i)};addEventListener("resize",g)}catch{}};let M=!1,o=!1;return{restore(){if(M||(M=!0,R()))return;const u=E();u!==null&&(h(u),O())},promoted(){if(o||(o=!0,R()))return;const u=E();u!==null?(h(u),O()):a&&h(i)}}}var Ye="modulepreload",We=function(e){return"/"+e},Ke={},Ue=function(t,n,a){let i=Promise.resolve();function r(l){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=l,window.dispatchEvent(c),!c.defaultPrevented)throw l}return i.then(l=>{for(const c of l||[])c.status==="rejected"&&r(c.reason);return t().catch(r)})};(function(){const e=Object.defineProperty,t=globalThis,n=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let a=0;for(let i=0;i<n.length;i++){const r=n[i];try{e(t,r,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[r]}catch{}try{e(t,r,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[r]=="function"&&a++}if(a&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:a},"*")}catch{}})();var qe=1e4,Ie=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function re(e){for(const t of Ie)if(t.endsWith(":*"))try{const n=new URL(e);if(`${n.protocol}//${n.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}var k=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),x=window.__FRAME_PREAMBLE?.transforms,$=window.__FRAME_PREAMBLE?.comments,z=window.__FRAME_PREAMBLE?.translate,q=/^[\w.-]+\.js$/,De=/^[a-z][a-z0-9_-]{0,63}$/,I=e=>Ue(()=>import("/_runtime/"+e),void 0);function Be(e,t){return{contract:e.contract,changes:new Set(e.changes??[]),flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:new Map,shellOrigin:t,mount:Y,pipe:()=>({wrap:(n,a)=>(...i)=>{try{return a(...i)}catch(r){return Promise.reject(r)}}})}}var ne=null,C=null;function F(e,t,n){try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!0,enumerable:!0})}catch{}}}var H=!1;function xe(e,t){const n=[];for(const a of e.elements){const i=document.querySelector(`[data-id="${a.target}"]`);if(!i){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}if([...Object.keys(a.attrsSet??{}),...a.attrsRemoved??[]].some(r=>!de(r))){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}if(a.text!==void 0&&!ve(i)){parent.postMessage({__frame_patch_miss:{seq:e.seq}},t);return}for(const[r,l]of Object.entries(a.attrsSet??{}))if(!oe(i,r)){try{i.setAttribute(r,l)}catch{}se(i,r,l)}for(const r of a.attrsRemoved??[])oe(i,r)||(i.removeAttribute(r),se(i,r,null));typeof a.text=="string"&&(i.textContent=a.text),n.push(a.target)}try{document.dispatchEvent(new CustomEvent("claude:edit",{detail:{seq:e.seq,targets:n}}))}catch{}}function se(e,t,n){if(!(e instanceof HTMLInputElement))return;const a=t.toLowerCase();a==="checked"?e.checked=n!==null:a==="value"&&e.type!=="file"&&(e.value=n??"")}function oe(e,t){const n=t.toLowerCase(),a=e;return n==="data-id"||(n==="value"||n==="checked")&&(a.__artifactSecret===!0||/^(password|hidden|file)$/.test(a.type??"")||/(^|\s)(cc-|one-time-code|current-password|new-password)/i.test(`${e.getAttribute("autocomplete")??""} ${a.autocomplete??""}`))}function ae(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,H=!0):H&&(delete t.dataset.theme,t.style.colorScheme="",H=!1)}var ie=256,N=Object.assign(Object.create(null),{mcp:Object.assign(Object.create(null),{watchTool:{handlerArg:3}}),db:Object.assign(Object.create(null),{subscribe:{handlerArg:1,errArg:2}}),room:Object.assign(Object.create(null),{on:{handlerArg:1,errArg:2},onPeers:{handlerArg:0,errArg:1},onConnection:{handlerArg:0,errArg:1}})}),$e=Object.assign(Object.create(null),{db:(e,t)=>Oe(e,t),room:(e,t,n)=>Te(e,n)}),j=new Map;function Y(e,t){const n=j.get(e);if(!n)return;const a=Object.assign(Object.create(null),t);Object.assign(n.impl,a),n.r(n.ns),n.impl.__settled=()=>Promise.reject({code:"capability_removed",message:`${e}: method not in this runtime`});const i=n.queue;n.queue=[];for(const r of i){const l=a[r.method];if(l)if(N[e]?.[r.method])try{r.resolve(l(...r.args))}catch{U(r,N[e][r.method],{code:"transform_error",message:`${e}.${r.method} rejected its arguments`})}else l(...r.args).then(r.resolve,r.reject);else{const c={code:"capability_removed",message:`${e}.${r.method} is not in this runtime`},d=N[e]?.[r.method];if(d){U(r,d,c);continue}r.reject(c)}}}function ze(e,t){const n=j.get(e);if(!n)return;n.impl.__settled=()=>Promise.reject(t),n.r(null);const a=n.queue;n.queue=[];for(const i of a){const r=N[e]?.[i.method];if(r){U(i,r,t);continue}i.reject(t)}}function le(e,t){if(typeof e=="function")try{return e(...t)}catch{return Object.create(null)}return Array.isArray(e)?[...e]:e!==null&&typeof e=="object"?{...e}:e}function D(e,t){const n=ee[e];if(!n){ze(e,t);return}j.get(e)?.r(null),Y(e,Object.fromEntries(Object.entries(n).map(([a,i])=>[a,(...r)=>Promise.resolve(le(i,r))])))}function U(e,t,n){if(e.syncState?.dead)return;const a=t.errArg===void 0?void 0:e.args[t.errArg],i=t.errArg===void 0?e.args[t.handlerArg]:a;typeof i=="function"&&queueMicrotask(()=>{if(!e.syncState?.dead)try{i(t.errArg===void 0?{type:"error",error:n}:n)}catch(r){we(r)}})}var W=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(W&&W.writable===!1)){const e=x&&q.test(x)?I(x).catch(()=>{}):Promise.resolve(void 0),t=o=>{if(o.type==="auxclick"&&o.button!==1)return;const u=o.target,g=u&&u.closest?u.closest("a[href],area[href]"):null;if(!g)return;const f=g.getAttribute("href");if(!f)return;let p,P;try{p=new URL(f,document.baseURI),P=new URL(document.baseURI).origin}catch{return}if((p.protocol==="http:"||p.protocol==="https:")&&p.origin!==P){o.preventDefault();const w=(g.getAttribute("target")??"").toLowerCase(),y=o.type==="auxclick"||o.metaKey||o.ctrlKey||o.shiftKey||o.altKey||!["","_self","_top","_parent"].includes(w);parent.postMessage({__frame_nav:!0,url:p.href,newTab:y},"*")}};addEventListener("click",t,!0),addEventListener("auxclick",t,!0);const n={},a=o=>{o.isTrusted&&(n.pointer=!0)},i=o=>{o.isTrusted&&(n.click=!0)};addEventListener("pointermove",a,{capture:!0,passive:!0}),addEventListener("click",i,{capture:!0,passive:!0}),e.then(o=>{o?.wireNav&&(o.wireNav(),removeEventListener("click",t,!0),removeEventListener("auxclick",t,!0),removeEventListener("pointermove",a,!0),removeEventListener("click",i,!0),o.wireEngagement?.(n))});let r=null;try{r=Ne()}catch{}const l=W?.value??{};F(window,"claude",l);const c=o=>{let u;const g=new Promise(v=>{u=v}),f={impl:Object.create(null),queue:[],u:g,r:u,ns:null};j.set(o,f);const p=f.impl,P=v=>({code:"queue_overflow",message:`${o}.${v}: pre-init call queue is full`}),w=(v,s)=>{if(f.queue.length>=ie){const m=ee[o];return m&&v in m?Promise.resolve(le(m[v],s)):Promise.reject(P(v))}return new Promise((m,_)=>{f.queue.push({method:v,args:s,resolve:m,reject:_})})},y=Re[o],L=new Proxy(y===void 0?p:(()=>{}),{apply:(v,s,m)=>{const _=y,b=p[_]??p.__settled;return b?b(...m):w(_,m)},get:(v,s)=>{if(typeof s!="string"||s==="then"||s==="toJSON"||s==="valueOf")return;if(s==="toString")return Object.prototype.toString;if(y!==void 0&&(s==="call"||s==="apply"||s==="bind"))return Function.prototype[s];const m=N[o]?.[s];return m?(..._)=>{if(typeof _[m.handlerArg]!="function")throw new TypeError(`${o}.${s} requires a handler function`);const b=p[s];if(b)return b(..._);if(p.__settled){const S={dead:!1},Fe={args:[..._],syncState:S};return p.__settled().catch(He=>U(Fe,m,He)),()=>{S.dead=!0}}if(f.queue.length>=ie){const S={dead:!1};return U({args:[..._],syncState:S},m,P(s)),()=>{S.dead=!0}}let K=null;const G={dead:!1};return f.queue.push({method:s,args:_,resolve:S=>{K=typeof S=="function"?S:null,G.dead&&K?.()},reject:()=>{},syncState:G}),()=>{G.dead=!0,K?.()}}:(..._)=>{const b=p[s]??p.__settled;return b?b(..._):w(s,_)}},set:()=>!1});$e[o]?.(p,(v,s)=>L[v](...s),w),f.ns=L,F(l,o,L)};for(const o of Object.keys(k)){if(l[o]!==void 0){F(l,o,l[o]);continue}c(o)}if(l.use===void 0){const o=u=>{if(typeof u!="string"||!Object.hasOwn(k,u))return Promise.resolve(null);const g=j.get(u);return g?g.u:Promise.resolve(l[u]??null)};try{Object.defineProperty(l,"use",{value:o,writable:!0,configurable:!0,enumerable:!1})}catch{}}let d=null,E=null,T=0;const h=o=>{o.source!==parent||!re(o.origin)||ye(o.data)&&(d=o.data.__frame_init,C=o.origin,removeEventListener("message",h),clearTimeout(T),E?.())};addEventListener("message",h),parent.postMessage({__frame_connect:!0},"*");const R=new Promise(o=>{E=o,T=setTimeout(()=>{removeEventListener("message",h),o()},qe)}),A=document.readyState==="loading"?new Promise(o=>document.addEventListener("DOMContentLoaded",()=>o(),{once:!0})):Promise.resolve();A.then(()=>{try{r?.restore()}catch{}});const O={cb:null},M=o=>{if(!(o.source!==parent||!re(o.origin))&&be(o.data)){try{r?.promoted()}catch{}O.cb?.()}};addEventListener("message",M),R.then(async()=>{if(!d||!C){for(const s of j.keys())D(s,{code:"not_granted",message:"frame initialization did not arrive - capability unavailable"});return}ae(d.theme);const o=C;let u=!1,g=!1;addEventListener("message",s=>{if(s.source!==parent||s.origin!==o)return;Ee(s.data)&&ae(s.data.__frame_theme.theme),he(s.data)&&xe(s.data.__frame_patch,o);const m=s.data?.__fc_mode;m&&typeof m=="object"&&!u&&$&&q.test($)&&(u=!0,I($).then(b=>b.install?.(o,m.on===!0)).catch(()=>{}));const _=s.data?.__ft_cmd;_&&typeof _=="object"&&!g&&z&&q.test(z)&&(g=!0,I(z).then(b=>b.install?.(o,_)).catch(()=>{}))});const f=Object.keys(d.capabilities??{});for(const s of f)Object.hasOwn(k,s)||De.test(s)&&l[s]===void 0&&(c(s),D(s,{code:"capability_disabled",message:"capability not in this runtime generation"}));const p=f.filter(s=>Object.hasOwn(k,s)).map(s=>[s,k[s]]).filter(s=>typeof s[1]=="string"&&q.test(s[1])),P=await Promise.allSettled(p.map(([,s])=>I(s))),w=await e,y=C;w?.buildBoot||parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},y),ne=w?.buildBoot?w.buildBoot(d,w.TRANSFORMS??{},{shellOrigin:y,mount:Y},s=>parent.postMessage({__frame_cap_telemetry:s},y)):Be(d,y);const L=s=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:s}},y),v=ne;P.forEach((s,m)=>{const _=p[m][0];if(s.status!=="fulfilled"){L(_);return}try{s.value?.install?.(v)}catch{L(_)}});for(const[s,m]of j)if(m.impl.__settled===void 0){if(f.includes(s)){D(s,{code:"capability_disabled",message:"capability not available in this session"});continue}D(s,{code:"not_granted",message:"capability not available in this session"})}await A,parent.postMessage({__frame_ready:!0},C),e.then(s=>s?.installSizeReporter?.(y,O))})}})();</script><!-- /frame-runtime --><meta charset="utf8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>The Spawnd Grimoire</title>
+<style>
+  :root{
+    --void:#0A0607;
+    --char:#151011;
+    --panel:#1B1414;
+    --line:rgba(233,225,211,.13);
+    --line-strong:rgba(233,225,211,.25);
+    --bone:#E9E1D3;
+    --ash:#A89B8E;
+    --hellfire:#FF4930;
+    --blood:#8E1F16;
+    --ember:#FFA46B;
+    --serif:"Palatino","Palatino Linotype","Book Antiqua",Georgia,"Times New Roman",serif;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  html{background:var(--void);}
+  body{
+    background:var(--void);
+    color:var(--bone);
+    font-family:var(--serif);
+    font-size:17px;
+    line-height:1.7;
+    margin:0;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px;}
+  a{color:var(--ember);text-decoration:none;border-bottom:1px solid rgba(255,164,107,.35);}
+  a:hover,a:focus-visible{color:var(--hellfire);border-bottom-color:var(--hellfire);}
+  a:focus-visible{outline:2px solid var(--hellfire);outline-offset:2px;}
+
+  /* ---------- hero ---------- */
+  header.hero{
+    position:relative;
+    overflow:hidden;
+    border-bottom:1px solid var(--line);
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 110%, rgba(142,31,22,.38), transparent 65%),
+      radial-gradient(ellipse 50% 40% at 80% 0%, rgba(255,73,48,.07), transparent 70%),
+      var(--void);
+  }
+  .hero-inner{
+    display:flex;align-items:center;gap:40px;
+    padding:88px 0 72px;
+  }
+  .hero-copy{flex:1 1 400px;min-width:0;}
+  .wordmark{
+    font-family:var(--mono);
+    font-size:14px;letter-spacing:.35em;text-transform:lowercase;
+    color:var(--hellfire);
+    margin:0 0 20px;
+  }
+  .wordmark .dim{color:var(--ash);letter-spacing:.2em;}
+  h1.hero-title{
+    font-size:clamp(40px,7vw,64px);
+    line-height:1.04;
+    font-weight:500;
+    letter-spacing:-.01em;
+    margin:0 0 24px;
+    text-wrap:balance;
+  }
+  .hero-sub{
+    color:var(--ash);
+    font-size:18px;
+    max-width:52ch;
+    margin:0 0 28px;
+  }
+  .hero-sub em{color:var(--bone);font-style:italic;}
+  .install{
+    font-family:var(--mono);
+    font-size:13.5px;
+    background:var(--char);
+    border:1px solid var(--line);
+    border-radius:4px;
+    padding:14px 18px;
+    color:var(--bone);
+    display:inline-block;
+    max-width:100%;
+    overflow-x:auto;
+    white-space:nowrap;
+  }
+  .install .p{color:var(--hellfire);}
+  .install .c{color:var(--ash);}
+  /* sigil */
+  .sigil{flex:0 0 auto;width:250px;height:250px;position:relative;}
+  .sigil svg{width:100%;height:100%;display:block;}
+  .sigil .ring{animation:spin 90s linear infinite;transform-origin:50% 50%;}
+  .sigil .ring2{animation:spin 140s linear infinite reverse;transform-origin:50% 50%;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  @media (prefers-reduced-motion:reduce){.sigil .ring,.sigil .ring2{animation:none;}}
+  .sigil-caption{
+    position:absolute;left:0;right:0;bottom:-8px;text-align:center;
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;color:var(--ash);
+  }
+  @media (max-width:720px){
+    .hero-inner{flex-direction:column-reverse;align-items:flex-start;padding:56px 0 56px;}
+    .sigil{width:170px;height:170px;align-self:center;}
+  }
+
+  /* ---------- chapters ---------- */
+  main{padding:16px 0 80px;}
+  section.ch{padding:56px 0 8px;border-bottom:1px solid var(--line);}
+  section.ch:last-of-type{border-bottom:none;}
+  .ch-eyebrow{
+    font-family:var(--mono);
+    font-size:12px;letter-spacing:.3em;text-transform:uppercase;
+    color:var(--hellfire);
+    margin:0 0 10px;
+  }
+  .ch-eyebrow .num{color:var(--ash);margin-right:.9em;}
+  h2{
+    font-size:clamp(26px,4vw,34px);
+    font-weight:500;line-height:1.15;
+    margin:0 0 22px;
+    text-wrap:balance;
+  }
+  h3{
+    font-size:19px;font-weight:600;line-height:1.3;
+    margin:36px 0 10px;
+  }
+  p{max-width:68ch;margin:0 0 18px;}
+  ul,ol{max-width:66ch;margin:0 0 18px;padding-left:24px;}
+  li{margin-bottom:8px;}
+  li::marker{color:var(--hellfire);}
+  strong{color:var(--bone);font-weight:600;}
+  .muted{color:var(--ash);}
+  code{
+    font-family:var(--mono);font-size:.85em;
+    background:var(--char);border:1px solid var(--line);
+    border-radius:3px;padding:.1em .4em;color:var(--ember);
+  }
+
+  /* ---------- specimen cards ---------- */
+  .specimen{
+    background:var(--char);
+    border:1px solid var(--line);
+    border-left:2px solid var(--hellfire);
+    border-radius:4px;
+    padding:20px 24px 18px;
+    margin:22px 0 26px;
+  }
+  .specimen .tag{
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.22em;
+    text-transform:uppercase;color:var(--ash);
+    display:block;margin-bottom:12px;
+  }
+  .specimen .big{
+    font-size:24px;line-height:1.25;margin:0 0 10px;font-weight:500;
+  }
+  .specimen p{margin:0 0 10px;}
+  .specimen p:last-child{margin-bottom:0;}
+  .specimen .mono{font-family:var(--mono);font-size:13.5px;color:var(--bone);}
+
+  /* ---------- tables ---------- */
+  .tbl-wrap{overflow-x:auto;margin:22px 0 30px;border:1px solid var(--line);border-radius:4px;}
+  table{border-collapse:collapse;width:100%;min-width:640px;font-size:15px;line-height:1.55;}
+  th{
+    font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--ash);text-align:left;font-weight:500;
+    padding:12px 16px;border-bottom:1px solid var(--line-strong);
+    background:var(--char);
+    white-space:nowrap;
+  }
+  td{padding:12px 16px;border-bottom:1px solid var(--line);vertical-align:top;}
+  tr:last-child td{border-bottom:none;}
+  td.term{font-family:var(--mono);font-size:13.5px;color:var(--hellfire);white-space:nowrap;}
+  td.k{color:var(--bone);font-weight:600;white-space:nowrap;}
+  .tbl-wrap .note{font-size:13px;color:var(--ash);}
+
+  /* say / don't say */
+  .claims{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:22px 0 30px;}
+  @media (max-width:640px){.claims{grid-template-columns:1fr;}}
+  .claim{
+    border:1px solid var(--line);border-radius:4px;padding:16px 18px;
+    background:var(--char);font-size:15px;
+  }
+  .claim .lbl{
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.22em;text-transform:uppercase;
+    display:block;margin-bottom:10px;
+  }
+  .claim.say .lbl{color:var(--ember);}
+  .claim.dont .lbl{color:var(--ash);}
+  .claim.dont{opacity:.85;}
+  .claim p{margin:0 0 8px;font-size:15px;}
+  .claim p:last-child{margin:0;}
+
+  footer{
+    border-top:1px solid var(--line);
+    padding:32px 0 48px;
+    font-family:var(--mono);font-size:12px;color:var(--ash);letter-spacing:.06em;
+  }
+  footer .f-red{color:var(--hellfire);}
+</style>
+
+<header class="hero">
+  <div class="wrap hero-inner">
+    <div class="hero-copy">
+      <p class="wordmark">spawnd <span class="dim">/ brand grimoire</span></p>
+      <h1 class="hero-title">Possess your machines.</h1>
+      <p class="hero-sub">Positioning, messaging, and a working lexicon for the demonic angle — built from what spawnd <em>actually does</em>, so the bit teaches the architecture instead of decorating it.</p>
+      <span class="install"><span class="p">$</span> curl -fsSL https://spawnd.dev/install.sh | sh &nbsp;<span class="c"># the possession takes one line</span></span>
+    </div>
+    <div class="sigil" aria-hidden="true">
+      <svg viewBox="0 0 250 250">
+        <defs>
+          <path id="ringA" d="M125,125 m-96,0 a96,96 0 1,1 192,0 a96,96 0 1,1 -192,0"></path>
+          <path id="ringB" d="M125,125 m-70,0 a70,70 0 1,1 140,0 a70,70 0 1,1 -140,0"></path>
+        </defs>
+        <circle cx="125" cy="125" r="106" fill="none" stroke="rgba(233,225,211,.16)" stroke-width="1"></circle>
+        <circle cx="125" cy="125" r="84" fill="none" stroke="rgba(233,225,211,.10)" stroke-width="1"></circle>
+        <circle cx="125" cy="125" r="58" fill="none" stroke="rgba(255,73,48,.35)" stroke-width="1"></circle>
+        <g class="ring">
+          <text font-family="ui-monospace,Menlo,monospace" font-size="9.5" letter-spacing="3" fill="#FF4930" opacity=".8">
+            <textPath href="#ringA">ed25519 4f:9a:c3:e1:0b:77:d2:5c:88:1a:f0:63:be:2d:41:97:6e:0c:a5:3f:d8</textPath>
+          </text>
+        </g>
+        <g class="ring2">
+          <text font-family="ui-monospace,Menlo,monospace" font-size="8" letter-spacing="2.5" fill="#A89B8E" opacity=".65">
+            <textPath href="#ringB">no inbound ports · outbound only · the server never hears ·</textPath>
+          </text>
+        </g>
+        <text x="125" y="130" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="13" letter-spacing="4" fill="#E9E1D3">spawnd</text>
+      </svg>
+      <span class="sigil-caption">the sigil is a key fingerprint</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">I</span>The thesis</p>
+  <h2>The joke is structural, not cosmetic</h2>
+  <p>Unix has shipped daemons for sixty years — the word comes to computing via Maxwell's demon, borrowed at MIT's Project MAC in 1963 for invisible background processes that do work unseen. Every ops team on earth runs demons and euphemizes it. spawnd stops euphemizing.</p>
+  <p>What makes this more than a Halloween skin is that <strong>every beat of the demonology maps one-to-one onto the real architecture</strong>:</p>
+  <ul>
+    <li>A <strong>daemon</strong> is installed on a <strong>host</strong> — both already the literal technical terms <em>and</em> the literal demonology terms. Nobody had to reach for this. It was sitting there.</li>
+    <li>Installation is <strong>possession</strong>: one line, then a pairing ritual. The trust docs in the repo already call device pairing "the ceremony" — the codebase arrived at occult vocabulary on its own.</li>
+    <li>The daemon <strong>answers only to you</strong>: terminal traffic runs browser↔daemon over WebRTC DataChannels. The server only introduces the parties — TRUST.md's own words: <em>"The server introduces the parties; it never sees the conversation."</em></li>
+    <li>It <strong>opens no doors</strong>: outbound-only WSS, zero inbound ports, no exposed SSH. Nothing can get in; the demon dials out from inside.</li>
+    <li>Session workers <strong>survive the daemon's death</strong> and are re-adopted on restart. That's not a metaphor we invented — it's SESSIOND.md. Your agents are revenants.</li>
+    <li>The demo hosts on the landing page are already named <strong>dream</strong> and <strong>nightmare</strong>.</li>
+  </ul>
+  <p>And the deepest cut, the one that makes the theme <em>safe</em> to run hard: <strong>the architecture is the exact inversion of the imagery.</strong> Real malware is non-consensual possession with a C2 server that reads everything. spawnd is consensual possession with a control plane engineered to be structurally deaf. The scarier the copy sounds, the more satisfying the reveal that this is the most paranoid-friendly way to run agents that exists. That inversion <em>is</em> the marketing.</p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">II</span>Positioning</p>
+  <h2>Where spawnd stands</h2>
+
+  <div class="specimen">
+    <span class="tag">Positioning statement</span>
+    <p>For engineers who run CLI coding agents across more than one machine, <strong>spawnd</strong> is the open-source control plane that possesses every host you own with a single daemon and lets you summon, drive, and banish agents from any browser — including your phone — while the server that coordinates it all is structurally unable to read a byte of your terminal. Unlike cloud agent platforms, the work happens on machines you own, with the subscriptions you already pay for. Unlike relay-based rivals, session traffic never touches the operator.</p>
+  </div>
+
+  <h3>Category</h3>
+  <p>Don't say "agent platform" — that bucket is crowded and cloud-flavored. The category claim is <strong>self-hosted agent infrastructure</strong>, said plainly: <em>a control plane for CLI coding agents that can't read your terminal.</em> One clause of category, one clause of differentiation.</p>
+
+  <h3>Who it's for</h3>
+  <ul>
+    <li><strong>The multi-machine operator.</strong> Laptop + dev box + GPU rig. Already runs Claude Code or Codex in three terminals and resents every one of them being marooned on one machine.</li>
+    <li><strong>The subscription maximalist.</strong> Pays for Claude Max or ChatGPT Pro and wants to drive it from a phone at dinner — without API-key markup or a per-seat cloud bill. spawnd uses each agent CLI's own login on the host; there is deliberately no central credential store.</li>
+    <li><strong>The self-host paranoid.</strong> Reads threat models for fun. Will check whether "E2E" means cryptography or policy. This person is the seed crystal for HN and r/selfhosted, and spawnd's TRUST.md is written in their native language.</li>
+  </ul>
+
+  <h3>Competitive frame</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tbody><tr><th>Against</th><th>Their shape</th><th>The line</th></tr>
+      <tr>
+        <td class="k">Cloud agent platforms</td>
+        <td>Agents run on their machines; your repo lives in their sandbox; you pay their meter.</td>
+        <td>"Your code never leaves machines you own. The demon lives in <em>your</em> house."</td>
+      </tr>
+      <tr>
+        <td class="k">Happy (nearest neighbour)</td>
+        <td>Relays all traffic through its server (E2E encrypted); presents a structured web UI. Claude/Codex-focused.</td>
+        <td>"No middlemen — not even encrypted ones. Session traffic never touches our server. And you get the real terminal, not a rendering of one."</td>
+      </tr>
+      <tr>
+        <td class="k">DIY: ssh + tmux + Tailscale</td>
+        <td>All substance, no product. No mobile UX, no replay, no take-control, tailnet required.</td>
+        <td>"This is that, productized: phone-first, multi-device, replay on attach, zero inbound ports, no tailnet."</td>
+      </tr>
+      <tr>
+        <td class="k">Harness-locked tools</td>
+        <td>The two main competitors support Claude and Codex only.</td>
+        <td>"Any CLI is a demon: claude, codex, opencode, aider, a bare shell. If it runs in a PTY, it can be possessed."</td>
+      </tr>
+    </tbody></table>
+  </div>
+  <p class="muted" style="font-size:14px;">One precision rule for the Happy comparison: spawnd's TURN fallback <em>is</em> a relay — but it carries ciphertext it cannot decrypt. Phrase it "session traffic never touches our server in plaintext; there is no server code path for terminal content," and you're airtight.</p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">III</span>The lexicon</p>
+  <h2>Terminology — every term earns its mechanism</h2>
+  <p>The rule that keeps this from becoming cringe: <strong>a demonic term is only admitted if it teaches real architecture.</strong> The theme is a mnemonic system, not paint. If a term maps to nothing, it gets cut.</p>
+  <div class="tbl-wrap">
+    <table>
+      <tbody><tr><th>Term</th><th>What it actually is</th><th>Where it lives</th></tr>
+      <tr><td class="term">spawnd</td><td>The daemon, and the brand. A spawn daemon — say it out loud. Pronounced "spawned."</td><td>Everywhere. The daemon <em>is</em> the product.</td></tr>
+      <tr><td class="term">host</td><td>A machine carrying the daemon. The industry term and the demonology term were already the same word.</td><td>/hosts, docs, CLI — unchanged, now load-bearing</td></tr>
+      <tr><td class="term">possession</td><td>Installing spawnd: <code>curl … | sh</code> + device-code approval. Consensual, auditable, revocable.</td><td>Install docs ("Possess a host"), CTA ("Begin the possession")</td></tr>
+      <tr><td class="term">the ceremony</td><td>Device-code pairing with fingerprint verification. TRUST.md already calls it this.</td><td>/device page, pairing docs</td></tr>
+      <tr><td class="term">sigil</td><td>An Ed25519 key fingerprint. You verify the sigil before trust is granted; a changed sigil is refused loudly.</td><td>Fingerprint UI, <code>spawnd status</code>, pairing screen</td></tr>
+      <tr><td class="term">summon</td><td>Creating an agent on a host.</td><td>"Summon agent" button; <code>spawn agent create</code></td></tr>
+      <tr><td class="term">banish</td><td>Killing an agent.</td><td>Agent kill action, confirm dialog: "Banish this agent?"</td></tr>
+      <tr><td class="term">exorcism</td><td>Full revocation: <code>spawnd logout</code>, host revoke (kills the socket), uninstall.</td><td>The uninstall doc is titled "Exorcism." Non-negotiable.</td></tr>
+      <tr><td class="term">the legion</td><td>All your agents across all your hosts.</td><td>Dashboard heading: "Your legion" / empty state: "No hosts possessed yet."</td></tr>
+      <tr><td class="term">the veil</td><td>The control plane — introduces browser to daemon, then goes deaf. Signaling only.</td><td>Architecture docs, status page ("The veil is intact.")</td></tr>
+      <tr><td class="term">speaking in tongues</td><td>The TURN fallback: a relay that carries only ciphertext it cannot decrypt.</td><td>Networking docs, FAQ</td></tr>
+      <tr><td class="term">revenants</td><td>Session workers that survive daemon death and are adopted on restart. Your agent outlives its daemon.</td><td>Reliability docs, release notes, one hell of a demo clip</td></tr>
+      <tr><td class="term">the circle</td><td>The terminal pane — the summoning circle where the agent appears. Real PTY, raw TUI, xterm.js.</td><td>Terminal UI naming, marketing screenshots</td></tr>
+      <tr><td class="term">grimoire</td><td>The skill library ("skills granted" on the landing page today).</td><td>Skills UI, docs section name</td></tr>
+      <tr><td class="term">whispers</td><td>Content-free activity signals — the server learns <em>that</em> something stirred, never <em>what</em>.</td><td>Metadata honesty section, notifications</td></tr>
+      <tr><td class="term">rites</td><td>Presets — a prepared invocation: agent kind, argv, environment.</td><td>Preset picker (optional; use if "presets" feels flat)</td></tr>
+    </tbody></table>
+  </div>
+  <h3>The name resolves itself</h3>
+  <p>The CLI today reads <code>$ spawn agent create</code> while the daemon is <code>spawnd</code>. Don't fight it — canonize it: <strong>spawn is the verb, spawnd is the being.</strong> Spawning is what you do; spawnd is what does it. The brand, the domain, the repo, and the binary are all <strong>spawnd</strong>; <code>spawn</code> survives only as the command you speak into the circle.</p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">IV</span>The messaging house</p>
+  <h2>One roof, three pillars</h2>
+
+  <div class="specimen">
+    <span class="tag">Umbrella line</span>
+    <p class="big">Possess your machines.</p>
+    <p class="muted">Two words of threat, one word of ownership. It states the product (daemon on every host), the audience (people with machines, plural), and the power dynamic (you are the one doing the possessing).</p>
+  </div>
+
+  <h3>Pillar 1 — Sovereignty <span class="muted">(“The demon lives in your house”)</span></h3>
+  <ul>
+    <li><strong>Claim:</strong> Agents run on hardware you own, with the subscriptions you already pay for. Code never leaves.</li>
+    <li><strong>Proof:</strong> Each agent CLI does its own <code>claude /login</code> / <code>codex login</code> on the host. No central credential store — a documented deliberate non-goal. Open source (Apache-2.0/MIT), fully self-hostable; spawnd.dev is just the convenience instance.</li>
+  </ul>
+  <div class="specimen">
+    <span class="tag">Specimen — section copy</span>
+    <p>Your laptop. Your dev box. The GPU rig in the spare room. One daemon on each, and every agent you're already paying for — summonable from any browser you're holding. We never touch your API keys because we never <em>have</em> your API keys.</p>
+  </div>
+
+  <h3>Pillar 2 — Silence <span class="muted">(“It answers only to you”)</span></h3>
+  <ul>
+    <li><strong>Claim:</strong> The control plane cannot read your terminal. Cryptography, not policy.</li>
+    <li><strong>Proof:</strong> Terminal I/O runs on direct browser↔daemon WebRTC DataChannels; the server carries auth, lifecycle, and signaling only — there is no server code path for terminal content, no transcript store, no relay fallback. TURN, when NAT demands it, sees ciphertext. The threat model in TRUST.md names spawnd's own infrastructure as an adversary.</li>
+  </ul>
+  <div class="specimen">
+    <span class="tag">Specimen — section copy</span>
+    <p>We introduce you to the daemon. We never hear what it says. The distinction we build to is "the server <em>cannot</em> see your terminal," not "the server does not look" — one is architecture, the other is a pinky promise. Read the threat model; it lists us as an adversary, because you should.</p>
+  </div>
+
+  <h3>Pillar 3 — Ubiquity <span class="muted">(“Any demon, any host, any circle”)</span></h3>
+  <ul>
+    <li><strong>Claim:</strong> Any CLI agent, on any machine, from any browser — the real terminal, not a wrapper.</li>
+    <li><strong>Proof:</strong> claude, codex, opencode, aider, bare shells. macOS and Linux hosts, one installer, outbound-only. Raw TUI over xterm.js; phone-first PWA with a modifier bar; a second device can take control of a live session mid-keystroke.</li>
+  </ul>
+  <div class="specimen">
+    <span class="tag">Specimen — section copy</span>
+    <p>No inbound ports. No exposed SSH. No tailnet. The daemon dials out and holds the line; you attach from a browser and the terminal frames come to you. It's the actual TUI — every keybinding, every color, every crash — because you're a terminal person, and a rendering of a terminal is not a terminal.</p>
+  </div>
+
+  <h3>The tagline stack</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tbody><tr><th>Line</th><th>Use where</th></tr>
+      <tr><td class="k">Possess your machines.</td><td>Hero. The umbrella.</td></tr>
+      <tr><td class="k">It answers only to you.</td><td>Security section header, sticker two.</td></tr>
+      <tr><td class="k">Demon spawn for every machine you own.</td><td>X bio, README first line.</td></tr>
+      <tr><td class="k">We introduce. We never listen.</td><td>Trust page. Direct descendant of TRUST.md's own principle.</td></tr>
+      <tr><td class="k">Zero open ports. Zero trust. Full possession.</td><td>Sticker one, launch tweet.</td></tr>
+      <tr><td class="k">Your legion awaits.</td><td>Signup confirmation, dashboard empty state.</td></tr>
+      <tr><td class="k">Consensual. Auditable. Revocable.</td><td>The safety triad — everywhere the possession bit needs its exit ramp.</td></tr>
+    </tbody></table>
+  </div>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">V</span>Voice</p>
+  <h2>Rules of the tongue</h2>
+  <ol>
+    <li><strong>Deadpan, total commitment.</strong> The bit is funnier the straighter the face. Never wink twice — no "😈 see what we did there," no ironic distance. Hell's Pizza didn't apologize; neither do we.</li>
+    <li><strong>Every term teaches.</strong> A demonic word with no mechanism behind it gets cut. The lexicon is closed until a new mechanism ships.</li>
+    <li><strong>Precision survives the bit.</strong> Security claims stay exact inside jokes, memes, and 280 characters. This audience will diff your tweet against your threat model.</li>
+    <li><strong>Honesty is the moat.</strong> TRUST.md documents residual risks, accepted regressions, and what the server still sees. Quote it, screenshot it, lead with it. "A trust document that hides its weaknesses is worthless" is already in the repo — that sentence is marketing.</li>
+    <li><strong>Punch at clouds, not people.</strong> The rivalry is with the cloud-agent <em>model</em>. Name-dropping competitors' founders or dunking on individuals breaks the register.</li>
+    <li><strong>Occult-playful, not shock-edgy.</strong> Ars Goetia, possession, exorcism, revenants: yes. Actual blasphemy, gore, or anything that spooks an app-store reviewer or payment processor: no. Keep OAuth consent screens and the PWA manifest neutral — the ceremony is sacred, the plumbing is boring.</li>
+    <li><strong>Banned words:</strong> seamless, empower, supercharge, unlock, revolutionize, game-changer, "AI-powered." If a sentence would survive on a corporate slide, it dies here.</li>
+  </ol>
+
+  <h3>Say / don't say — the claims ledger</h3>
+  <div class="claims">
+    <div class="claim say"><span class="lbl">Say now</span>
+      <p>"Terminal traffic never touches our server in plaintext — there is no server code path for it."</p>
+      <p>"The relay, when NAT forces one, carries ciphertext it cannot decrypt."</p>
+      <p>"The threat model lists our own server as an adversary."</p>
+    </div>
+    <div class="claim dont"><span class="lbl">Don't say (yet)</span>
+      <p>"The server cannot see <em>any</em> of your data." — Launch args, env values, and skill bodies are still migrating to endpoint-only storage (Phase 2); metadata (who, when, how much) is visible by design.</p>
+      <p>"Fully E2E, period." — Signed signaling (Phase 3) ships the MITM-detection half; until then say "the server is deaf, and we're making it blind to tampering next."</p>
+    </div>
+  </div>
+  <p class="muted" style="font-size:14px;">Gate the absolute claims on the Phase 2 purge and Phase 3 enforcement landing. Under-claiming and over-delivering is exactly the reputation that compounds on HN.</p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">VI</span>The objection</p>
+  <h2>“This is literally what malware does”</h2>
+  <p>The theme walks straight into this, so the answer gets written once, made canonical, and pinned everywhere. It's also the best growth surface the brand has — every skeptic who raises it hands you the stage for the inversion:</p>
+  <div class="specimen">
+    <span class="tag">Canonical response — FAQ, HN comment, pinned reply</span>
+    <p>Fair — a botnet is possession without consent, run from a C2 server that reads everything. spawnd is the inversion on every axis: <strong>you</strong> run the installer, <strong>you</strong> approve the pairing ceremony against a key fingerprint, and the coordinating server is engineered to be unable to read the session — there's no code path for terminal content, and the threat model treats our own infrastructure as hostile. The daemon opens no inbound ports; it only dials out. Revocation is one click and the socket dies. And it's open source, so you don't have to take any sentence of this paragraph on faith — including this one.</p>
+  </div>
+  <p>Short form for X: <span class="muted">"a botnet is non-consensual possession with a C2 that reads everything. spawnd is consensual possession with a C2 that can't read anything. we simply reversed every axis of evil."</span></p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">VII</span>The channels</p>
+  <h2>Playbook by congregation</h2>
+  <p>The theme's intensity is a dial, not a switch. HN gets substance with the name doing the work; X gets the full bit; Reddit gets tuned per parish.</p>
+
+  <h3>Hacker News — substance first, the name is the joke</h3>
+  <p>HN norms strip marketing from titles, and the crowd punishes forced whimsy — but they will happily make the demon jokes <em>for you</em> in the comments if the substance holds. Seed, don't force.</p>
+  <div class="specimen">
+    <span class="tag">Show HN title</span>
+    <p class="mono">Show HN: Spawnd – open-source control plane for CLI coding agents; the server can't read your terminal</p>
+    <span class="tag" style="margin-top:14px;">First comment skeleton (from the founder account)</span>
+    <p>Lead with architecture: WebRTC DataChannels browser↔daemon, signaling-only server, ciphertext-only TURN, outbound-only hosts, per-host CLI auth (your existing Claude/OpenAI subscription — no key custody). Then link TRUST.md and volunteer the warts unprompted: metadata visibility, the Phase 2 migration still in flight, the hosted-JS delivery problem and the reproducible-build work. Close with the etymology footnote — Maxwell's demon, Project MAC, 1963 — and let the thread take it from there. HN's highest compliment is "refreshingly honest threat model," and it's sitting in the repo already.</p>
+  </div>
+
+  <h3>X — the full possession</h3>
+  <div class="specimen">
+    <span class="tag">Launch thread opener</span>
+    <p class="mono">today we're releasing a demon that possesses your computers.<br><br>this is not a metaphor. it is a daemon. you install it. it possesses the host. it answers only to you — we made sure we can't hear it even if we wanted to.<br><br>spawnd. zero open ports. zero trust. full possession. 🧵</p>
+  </div>
+  <ul>
+    <li><strong>Clip 1:</strong> phone at a café summoning Claude Code on the home GPU rig, nvtop glowing in the circle. Caption: "speak of the devil and he shall appear."</li>
+    <li><strong>Clip 2:</strong> <code>kill -9</code> the daemon mid-session, restart, the worker is re-adopted, scrollback intact. Caption: "your agents are revenants. the daemon dies; the work does not."</li>
+    <li><strong>Clip 3:</strong> the ceremony — device code, sigil verification, "possession complete." Caption: "consensual. auditable. revocable."</li>
+    <li><strong>Recurring bit:</strong> screenshots of real TRUST.md sentences presented as forbidden texts. The doc is genuinely quotable: "a trust document that hides its weaknesses is worthless."</li>
+  </ul>
+
+  <h3>Reddit — one angle per parish</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tbody><tr><th>Subreddit</th><th>Lead angle</th></tr>
+      <tr><td class="k">r/ClaudeAI</td><td>"Drive Claude Code from your phone, on your Max subscription, on your own hardware." Demo-first; theme in the flair, not the title.</td></tr>
+      <tr><td class="k">r/LocalLLaMA</td><td>The GPU rig as a possessed host: queue jobs, watch nvtop, drive any CLI agent from bed. Sovereignty pillar hits hardest here.</td></tr>
+      <tr><td class="k">r/selfhosted</td><td>Self-host the whole stack; metadata honesty as the hook ("here's exactly what the control plane still sees, and here's how to run it so it's yours"). This sub will canonize the exorcism docs.</td></tr>
+      <tr><td class="k">r/programming</td><td>Post TRUST.md itself as an essay: "Designing a control plane that can't read your data." The product is the footnote; the doc is the content.</td></tr>
+      <tr><td class="k">r/homelab</td><td>"No inbound ports, no tailnet, no reverse proxy — the daemon dials out." Networking elegance as the hook.</td></tr>
+    </tbody></table>
+  </div>
+
+  <h3>The calendar writes itself</h3>
+  <ul>
+    <li><strong>Now → October:</strong> quiet build-in-public on X; TRUST.md excerpts; revenant clips. Flip the repo public when the open-source checklist (secret scan, reproducible builds, self-host guide) is done — the launch claim depends on it.</li>
+    <li><strong>October 31, 2026 — the Halloween launch.</strong> Show HN in the morning US time, X thread at peak, Reddit staggered over the week. Ten weeks out: real, and non-negotiable as a date. A demonic infrastructure product launching any other day is marketing malpractice.</li>
+    <li><strong>Release naming — the Ars Goetia.</strong> Seventy-two demons, in canonical order, one per minor release: 0.1 "Bael," 0.2 "Agares," 0.3 "Vassago"… HN adores systematic lore, and it hands you 72 pre-written release-day posts. Reserve one number for the obvious bit: somewhere down the line, <strong>v0.6.66</strong> ships and the changelog simply does not mention it.</li>
+  </ul>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">VIII</span>The rites</p>
+  <h2>Product-surface copy — where the theme lives daily</h2>
+  <div class="tbl-wrap">
+    <table>
+      <tbody><tr><th>Surface</th><th>Copy</th></tr>
+      <tr><td class="k">Install CTA</td><td>"Begin the possession"</td></tr>
+      <tr><td class="k">Hosts empty state</td><td>"No hosts possessed yet."</td></tr>
+      <tr><td class="k">Pairing success</td><td>"Possession complete. dream is yours."</td></tr>
+      <tr><td class="k">Agent create button</td><td>"Summon"</td></tr>
+      <tr><td class="k">Kill confirm</td><td>"Banish this agent? The work in its circle ends."</td></tr>
+      <tr><td class="k">Host revoke</td><td>"Exorcise this host — the daemon's token dies and the socket drops."</td></tr>
+      <tr><td class="k">Status page, all green</td><td>"The veil is intact."</td></tr>
+      <tr><td class="k">Daemon reconnected</td><td>"The daemon returned. 2 revenants adopted."</td></tr>
+      <tr><td class="k">404</td><td>"Nothing was summoned here."</td></tr>
+      <tr><td class="k">Uninstall doc title</td><td>"Exorcism"</td></tr>
+      <tr><td class="k">Community name</td><td>"The Legion" (Discord). Members are Legionnaires; maintainers are Archdaemons.</td></tr>
+    </tbody></table>
+  </div>
+  <p>Restraint note: <strong>error states that block a user's work stay plain.</strong> A failed upload or a broken pairing explains what happened and how to fix it in ordinary words — the theme decorates triumph and idle states, never failure. Nothing kills a bit like being winked at while your session is down.</p>
+</section>
+
+<section class="ch">
+  <p class="ch-eyebrow"><span class="num">IX</span>Housekeeping</p>
+  <h2>Make the name true before launch</h2>
+  <ul>
+    <li><strong>Rename everywhere:</strong> the landing page <code>&lt;title&gt;</code>, hero wordmark, and README all currently say "spawn." The brand is <strong>spawnd</strong> — repo becomes <code>levy-street/spawnd</code>, site copy follows, "spawn" persists only as the CLI verb.</li>
+    <li><strong>Gate the absolute claims:</strong> "cannot see your protected content" goes on the homepage only after the Phase 2 purge completes; until then the deaf-server phrasing from the claims ledger is the ceiling.</li>
+    <li><strong>Ship the exorcism doc at launch.</strong> The uninstall page being excellent is itself a trust signal — the demon that documents its own banishment is the demon people install.</li>
+    <li><strong>Halloween is the deadline.</strong> Open-source checklist, rename, and the claims ledger — all done by October 31. The date is the campaign.</li>
+  </ul>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span class="f-red">spawnd</span> · brand grimoire · prepared 2026-08-17 · consensual · auditable · revocable
+  </div>
+</footer>
+
+</body></html>

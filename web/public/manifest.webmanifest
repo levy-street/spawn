@@ -1,13 +1,13 @@
 {
-  "name": "spawn",
-  "short_name": "spawn",
-  "description": "Multi-tenant control plane for CLI coding agents.",
+  "name": "spawnd",
+  "short_name": "spawnd",
+  "description": "Possess your machines. Summon CLI coding agents from any browser; the server can't read your terminal.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#000000",
-  "theme_color": "#000000",
+  "background_color": "#0A0607",
+  "theme_color": "#0A0607",
   "icons": [
     {
       "src": "/icon-192.png",

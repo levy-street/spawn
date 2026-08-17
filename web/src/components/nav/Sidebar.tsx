@@ -126,7 +126,7 @@ export function Sidebar({
             </Link>
           )}
           <RowLabel collapsed={collapsed} className="text-base font-semibold tracking-tight">
-            spawn
+            spawnd
           </RowLabel>
           <button
             type="button"

@@ -5,13 +5,34 @@ import { THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme-bootstrap";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "spawn",
-  description: "Multi-tenant control plane for CLI coding agents.",
-  applicationName: "spawn",
+  metadataBase: new URL("https://spawnd.dev"),
+  title: {
+    default: "spawnd — possess your machines",
+    template: "%s · spawnd",
+  },
+  description:
+    "The open-source control plane that possesses every machine you own with a single daemon. Summon, drive, and banish CLI coding agents from any browser — while the server that coordinates it all is structurally unable to read your terminal.",
+  applicationName: "spawnd",
   manifest: "/manifest.webmanifest",
+  openGraph: {
+    title: "spawnd — possess your machines",
+    description:
+      "A daemon on every host you own. Summon CLI coding agents from any browser. The server can't read your terminal — cryptography, not policy.",
+    url: "https://spawnd.dev",
+    siteName: "spawnd",
+    images: [{ url: "/possession.png", width: 1280, height: 720 }],
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "spawnd — possess your machines",
+    description:
+      "A daemon on every host you own. The server can't read your terminal — cryptography, not policy.",
+    images: ["/possession.png"],
+  },
   appleWebApp: {
     capable: true,
-    title: "spawn",
+    title: "spawnd",
     statusBarStyle: "black-translucent",
   },
   icons: {
@@ -34,7 +55,7 @@ export const viewport: Viewport = {
   // A single tag rather than a light/dark media pair: an explicit theme choice
   // has to beat the OS preference, and only script can express that. applyTheme
   // rewrites this on load and on every change.
-  themeColor: "#070707",
+  themeColor: "#0A0607",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
