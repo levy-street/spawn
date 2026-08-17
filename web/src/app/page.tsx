@@ -52,14 +52,26 @@ function LandingPage() {
       {/* ── Hero ─────────────────────────────────────────────── */}
       <section className="relative isolate overflow-hidden border-line-g border-b">
         <Image
-          src="/possession.png"
+          src="/hero-poster.jpg"
           alt=""
           aria-hidden
           fill
           priority
           sizes="100vw"
-          className="pointer-events-none object-cover object-[70%_center] opacity-90"
+          className="pointer-events-none object-cover object-[58%_center] opacity-90"
         />
+        <video
+          className="pointer-events-none absolute inset-0 h-full w-full object-cover object-[58%_center] opacity-90 motion-reduce:hidden"
+          autoPlay
+          muted
+          loop
+          playsInline
+          preload="metadata"
+          poster="/hero-poster.jpg"
+          aria-hidden
+        >
+          <source src="/hero.mp4" type="video/mp4" />
+        </video>
         <div
           aria-hidden
           className="absolute inset-0"
@@ -71,7 +83,7 @@ function LandingPage() {
 
         <nav className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-6 sm:px-8">
           <Link href="/" className="flex items-center gap-2.5">
-            <Sigil className="size-7" />
+            <Trident className="size-7" />
             <span className="font-sigil text-[15px] tracking-[0.3em] text-hellfire lowercase">
               spawnd
             </span>
@@ -293,7 +305,7 @@ function LandingPage() {
           }}
         />
         <div className="relative mx-auto w-full max-w-3xl text-center">
-          <Sigil className="mx-auto mb-8 size-16" />
+          <Trident className="mx-auto mb-8 size-16" />
           <h2 className="mb-5 font-grimoire text-[clamp(32px,5.5vw,52px)] font-medium leading-[1.05] text-bone">
             Your legion awaits.
           </h2>
@@ -391,62 +403,12 @@ function Claim({ children }: { children: ReactNode }) {
   );
 }
 
-/** The brand sigil — concentric rings of a key fingerprint around the wordmark. */
-function Sigil({ className }: { className?: string }) {
+/** The brand mark — the spawnd trident. Fits inside a square `size-N` box. */
+function Trident({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 250 250" className={className} aria-hidden role="img">
-      <title>spawnd sigil</title>
-      <defs>
-        <path id="sigilRingA" d="M125,125 m-96,0 a96,96 0 1,1 192,0 a96,96 0 1,1 -192,0" />
-        <path id="sigilRingB" d="M125,125 m-70,0 a70,70 0 1,1 140,0 a70,70 0 1,1 -140,0" />
-      </defs>
-      <circle
-        cx="125"
-        cy="125"
-        r="106"
-        fill="none"
-        stroke="rgba(233,225,211,.16)"
-        strokeWidth="1"
-      />
-      <circle cx="125" cy="125" r="58" fill="none" stroke="rgba(255,73,48,.35)" strokeWidth="1" />
-      <g className="grimoire-ring">
-        <text
-          fontFamily="ui-monospace,Menlo,monospace"
-          fontSize="9.5"
-          letterSpacing="3"
-          fill="#FF4930"
-          opacity=".8"
-        >
-          <textPath href="#sigilRingA">
-            ed25519 4f:9a:c3:e1:0b:77:d2:5c:88:1a:f0:63:be:2d:41:97:6e:0c:a5:3f
-          </textPath>
-        </text>
-      </g>
-      <g className="grimoire-ring-rev">
-        <text
-          fontFamily="ui-monospace,Menlo,monospace"
-          fontSize="8"
-          letterSpacing="2.5"
-          fill="#A89B8E"
-          opacity=".6"
-        >
-          <textPath href="#sigilRingB">
-            no inbound ports · outbound only · the server never hears ·
-          </textPath>
-        </text>
-      </g>
-      <text
-        x="125"
-        y="132"
-        textAnchor="middle"
-        fontFamily="ui-monospace,Menlo,monospace"
-        fontSize="30"
-        letterSpacing="1"
-        fill="#E9E1D3"
-      >
-        d
-      </text>
-    </svg>
+    <span className={`relative inline-block ${className ?? ""}`}>
+      <Image src="/trident.png" alt="" aria-hidden fill sizes="64px" className="object-contain" />
+    </span>
   );
 }
 

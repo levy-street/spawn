@@ -20,7 +20,7 @@ export const metadata: Metadata = {
       "A daemon on every host you own. Summon CLI coding agents from any browser. The server can't read your terminal — cryptography, not policy.",
     url: "https://spawnd.dev",
     siteName: "spawnd",
-    images: [{ url: "/possession.png", width: 1280, height: 720 }],
+    images: [{ url: "/og.jpg", width: 1200, height: 630 }],
     type: "website",
   },
   twitter: {
@@ -28,7 +28,7 @@ export const metadata: Metadata = {
     title: "spawnd — possess your machines",
     description:
       "A daemon on every host you own. The server can't read your terminal — cryptography, not policy.",
-    images: ["/possession.png"],
+    images: ["/og.jpg"],
   },
   appleWebApp: {
     capable: true,
@@ -36,11 +36,10 @@ export const metadata: Metadata = {
     statusBarStyle: "black-translucent",
   },
   icons: {
-    // SVG first: browsers that support it scale the mark crisply at any tab
-    // size, where the PNG's maskable padding would leave it small and soft.
     icon: [
-      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/favicon-48.png", sizes: "48x48", type: "image/png" },
       { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512.png", sizes: "512x512", type: "image/png" },
     ],
     apple: "/icon-192.png",
   },
