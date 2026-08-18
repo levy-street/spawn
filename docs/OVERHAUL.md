@@ -206,6 +206,8 @@ Frame renames (all payload fields `agent_id → session_id`):
 
 `proto/README.md` is rewritten for v3 by the daemon workstream (it owns the protocol), reviewed by the server workstream.
 
+**As-implemented notes (binding):** RTC signaling frames carry the scope tuple only — the redundant v2 `agent_id` field is **dropped**, not renamed (session routing = `scope_type:"session"` + `scope_id`). `host.agents.check_result`'s payload key is `agents` (was `tools`). The worker `Hello` frame keeps a serde alias for the pre-rename `agent_id` key so a v3 spawnd still adopts pre-rename workers. The per-agent DataChannel wire protocols (`spawn.pty`, `spawn.ctl` v1 incl. its `agent_generation` field and `stale_agent_generation`/`agent_unavailable` error codes, `spawn.host.ctl` v1) are **locked verbatim** — no vocabulary renames inside them. The `SPAWN_AGENT_CONFIG_DIR` env var keeps its name (it configures agent CLIs — valid new vocabulary); the on-disk skills root is `config_dir/sessions/<id>`.
+
 ### 4.4 Workspace grid — layout schema v2 and algebra
 
 **Schema (wire + DB):**
@@ -478,7 +480,13 @@ rg    "emerald-|amber-|sky-|violet-|zinc-|red-5" web/src --glob '!app/globals.cs
 rg    "spawn.control.v2|agent\.create|agent\.exit|host\.tools\." server daemon web/src proto
 ```
 
-Plus: `bun run lint && bun run test:unit && bun run test:e2e` (web), `pytest` (server), `cargo test` (daemon), `bun run build`.
+**Documented exceptions** (the only permitted hits — verify each hit is one of these, then move on):
+- `daemon/src` worker `Hello` serde alias for the pre-rename `agent_id` key (worker adoption compat — see §4.3 as-implemented notes).
+- `agent_generation` / `stale_agent_generation` / `agent_unavailable` inside the locked `spawn.ctl` v1 wire (daemon + web mirrors).
+- `SPAWN_AGENT_CONFIG_DIR` env var name (valid new vocabulary; also consumed by `scripts/smoke-local-daemon.sh`).
+- Migration files and this spec.
+
+Plus: `bun run lint && bun run test:unit && bun run test:e2e` (web), `pytest` (server), `cargo test` (daemon), `bun run build`. Also purge palette literals from `components/auth/BrowserDeviceRegistrationStatus.tsx` and `components/trust/introduction-panel.tsx` (missed by every Phase A/B ownership list).
 
 ---
 
