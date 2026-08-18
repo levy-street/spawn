@@ -52,6 +52,13 @@ esac
     )
     _write_executable(fakebin / "cc", "#!/bin/sh\nexit 0\n")
     _write_executable(
+        fakebin / "rustup",
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/rustup.log"
+exit 0
+""",
+    )
+    _write_executable(
         fakebin / "curl",
         f"""#!/bin/sh
 set -eu
@@ -116,6 +123,10 @@ mkdir -p "$dest/daemon"
         fakebin / "cargo",
         f"""#!/bin/sh
 set -eu
+if [ "${{1:-}}" = "--version" ]; then
+  printf 'cargo %s (aaaaaaa 2024-01-01)\\n' "${{SPAWN_FAKE_CARGO_VERSION:-1.86.0}}"
+  exit 0
+fi
 printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/cargo.log"
 root=""
 previous=""
@@ -434,6 +445,46 @@ async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_pat
     assert "install --path" in _log(logs, "cargo.log")
     assert (install_root / "bin" / "spawnd").is_file()
     assert (install_root / "bin" / "spawn-worker").is_file()
+
+
+async def test_installer_updates_stale_cargo_before_source_build(client, tmp_path: Path):
+    # A pre-existing toolchain too old to read the lock file (v4 ⇒ Cargo >= 1.78)
+    # must be bumped via rustup, not left to die on "lock file version `4`".
+    script = await _install_script_file(client, tmp_path)
+
+    result, logs, _home, install_root = _run_installer(
+        script,
+        tmp_path,
+        os_name="Darwin",
+        arch="aarch64",
+        args=["--no-login", "--no-start", "--no-service"],
+        curl_mode="bad",  # force the source build
+        extra_env={"SPAWN_FAKE_CARGO_VERSION": "1.75.0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cargo 1.75.0 is too old for this lock file; updating Rust" in result.stdout
+    assert "update stable" in _log(logs, "rustup.log")
+    assert (install_root / "bin" / "spawnd").is_file()
+
+
+async def test_installer_leaves_recent_cargo_untouched(client, tmp_path: Path):
+    script = await _install_script_file(client, tmp_path)
+
+    result, logs, _home, install_root = _run_installer(
+        script,
+        tmp_path,
+        os_name="Darwin",
+        arch="aarch64",
+        args=["--no-login", "--no-start", "--no-service"],
+        curl_mode="bad",
+        extra_env={"SPAWN_FAKE_CARGO_VERSION": "1.86.0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "updating Rust" not in result.stdout
+    assert _log(logs, "rustup.log") == ""
+    assert (install_root / "bin" / "spawnd").is_file()
 
 
 async def test_installer_writes_and_starts_macos_launchagent(client, tmp_path: Path):

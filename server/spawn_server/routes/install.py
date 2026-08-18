@@ -318,8 +318,35 @@ INSTALL_SCRIPT = dedent(
       fi
     }
 
+    # The source build runs with --locked, so cargo must understand the repo's
+    # lock file (format v4 ⇒ Cargo >= 1.78). A stale pre-existing toolchain —
+    # common on macOS, where an old rustup 'stable' or a Homebrew rust lingers —
+    # dies on "lock file version `4`". A freshly installed toolchain is always
+    # new enough; an old one we bump when rustup can, else stop with guidance.
+    MIN_CARGO_MINOR=78
+
+    ensure_cargo_recent() {
+      _ver=$(cargo --version 2>/dev/null | awk '{print $2}')
+      _major=$(printf '%s' "$_ver" | cut -d. -f1)
+      _minor=$(printf '%s' "$_ver" | cut -d. -f2)
+      # Unparseable or non-1.x version (custom/nightly builds): let it try.
+      case "$_major:$_minor" in
+        1:[0-9]*) ;;
+        *) return 0 ;;
+      esac
+      case "$_minor" in *[!0-9]*) return 0 ;; esac
+      [ "$_minor" -ge "$MIN_CARGO_MINOR" ] && return 0
+      if need rustup; then
+        say "cargo $_ver is too old for this lock file; updating Rust"
+        rustup update stable || die "failed to update Rust; run 'rustup update' and rerun"
+      else
+        die "cargo $_ver is too old (need >= 1.$MIN_CARGO_MINOR); update Rust (e.g. 'rustup update' or 'brew upgrade rust') and rerun"
+      fi
+    }
+
     ensure_rust() {
       if need cargo; then
+        ensure_cargo_recent
         return
       fi
 
