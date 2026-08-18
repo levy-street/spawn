@@ -62,13 +62,25 @@ pub const T_REPLAY2: u8 = 0x0F;
 /// `T_HISTORY`/`T_HISTORY_WIPE`/`T_REPLAY2` unsubscribed, because daemons
 /// reject frame types they do not know (the connection would drop).
 pub const T_HISTORY_SUB: u8 = 0x10;
+/// Worker → daemon: foreground process report — the UTF-8 basename of the
+/// executable whose process group owns the PTY foreground (max
+/// `MAX_FOREGROUND_BASENAME_BYTES`). Sent when the polled value changes
+/// (1 s cadence) and re-sent once to each new supervisor connection.
+/// Additive at `PROTO_VERSION` 5: a new spawnd still adopts old workers,
+/// which simply never send it, so their sessions report no foreground
+/// command.
+pub const T_FOREGROUND: u8 = 0x11;
 
 /// First frame on every accepted connection, worker → daemon. Lets a
 /// restarted `spawnd` adopt a running worker without any handshake state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u32,
-    pub agent_id: Uuid,
+    /// The session this worker owns. Serialized as `session_id`; the alias
+    /// keeps decoding the pre-v3 `agent_id` key so a new spawnd still adopts
+    /// workers started before the rename (the wire stays `PROTO_VERSION` 5).
+    #[serde(alias = "agent_id")]
+    pub session_id: Uuid,
     /// Random identity of this exact worker process. Lifecycle requests carry
     /// it so a stale supervisor can never signal a replacement at the same
     /// filesystem path.
@@ -92,7 +104,7 @@ pub struct Hello {
     pub history: bool,
 }
 
-/// daemon → worker: spawn the agent. Sent over the private socket rather than
+/// daemon → worker: spawn the session command. Sent over the private socket rather than
 /// argv so env values (which may hold real secrets) never appear in `/proc`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSpec {
@@ -349,6 +361,23 @@ pub fn decode_replay2(payload: &[u8]) -> Result<(u64, HistoryAnchor, &[u8])> {
     Ok((watermark, HistoryAnchor { epoch, offset }, &payload[24..]))
 }
 
+/// Upper bound on a `T_FOREGROUND` payload. The worker truncates to 64
+/// characters; 256 bytes leaves room for multi-byte UTF-8 without letting a
+/// hostile peer allocate more.
+pub const MAX_FOREGROUND_BASENAME_BYTES: usize = 256;
+
+/// Payload of `T_FOREGROUND`: the raw UTF-8 basename, no framing.
+pub fn encode_foreground(basename: &str) -> Vec<u8> {
+    basename.as_bytes().to_vec()
+}
+
+pub fn decode_foreground(payload: &[u8]) -> Result<&str> {
+    if payload.len() > MAX_FOREGROUND_BASENAME_BYTES {
+        bail!("foreground payload too large: {}", payload.len());
+    }
+    std::str::from_utf8(payload).map_err(|_| anyhow::anyhow!("foreground basename is not UTF-8"))
+}
+
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     frame_type: u8,
@@ -534,17 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn hello_history_field_defaults_off_for_old_workers() {
-        // An old worker's Hello omits `history`; decoding must not fail and
-        // must not accidentally enable the delta stream.
+    fn hello_from_an_old_worker_still_decodes() {
+        // An old worker's Hello names its session `agent_id` and omits
+        // `history`; decoding must adopt it under the alias without failing
+        // and must not accidentally enable the delta stream.
+        let session = Uuid::new_v4();
         let old = serde_json::json!({
             "version": PROTO_VERSION,
-            "agent_id": Uuid::new_v4(),
+            "agent_id": session,
             "instance_id": Uuid::new_v4(),
             "state": "running",
         });
         let hello: Hello = serde_json::from_value(old).unwrap();
+        assert_eq!(hello.session_id, session);
         assert!(!hello.history);
+    }
+
+    #[test]
+    fn foreground_round_trip_is_bounded_utf8() {
+        let framed = encode_foreground("claude");
+        assert_eq!(decode_foreground(&framed).unwrap(), "claude");
+        assert!(decode_foreground(&[0xff, 0xfe]).is_err());
+        assert!(decode_foreground(&vec![b'x'; MAX_FOREGROUND_BASENAME_BYTES + 1]).is_err());
     }
 
     #[tokio::test]

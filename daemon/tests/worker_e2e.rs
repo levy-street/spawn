@@ -17,13 +17,13 @@ use spawnd::sessiond::wire;
 const WORKER_BIN: &str = env!("CARGO_BIN_EXE_spawn-worker");
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn worker_command(socket: &Path, agent_id: Uuid, log_dir: &Path) -> Command {
+fn worker_command(socket: &Path, session_id: Uuid, log_dir: &Path) -> Command {
     let mut command = Command::new(WORKER_BIN);
     command
         .arg("--socket")
         .arg(socket)
-        .arg("--agent-id")
-        .arg(agent_id.to_string())
+        .arg("--session-id")
+        .arg(session_id.to_string())
         .arg("--log-dir")
         .arg(log_dir)
         .arg("--segment-bytes")
@@ -46,7 +46,7 @@ struct WorkerFixture {
 impl WorkerFixture {
     async fn launch() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("agent.sock");
+        let socket = dir.path().join("session.sock");
         let log_dir = dir.path().join("scrollback");
         let child = worker_command(&socket, Uuid::new_v4(), &log_dir)
             .spawn()
@@ -113,14 +113,14 @@ async fn duplicate_worker_is_rejected_and_crash_stale_endpoints_recover() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let socket = dir.path().join("agent.sock");
+    let socket = dir.path().join("session.sock");
     let lifecycle = wire::lifecycle_socket_path(&socket);
     let logs = dir.path().join("scrollback");
-    let agent_id = Uuid::new_v4();
-    let mut first = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let session_id = Uuid::new_v4();
+    let mut first = worker_command(&socket, session_id, &logs).spawn().unwrap();
     let mut first_conn = connect_with_retry(&socket).await;
     let first_hello = expect_hello(&mut first_conn, "awaiting_start").await;
-    assert_eq!(first_hello.agent_id, agent_id);
+    assert_eq!(first_hello.session_id, session_id);
     assert_eq!(
         std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
         0o700
@@ -132,7 +132,7 @@ async fn duplicate_worker_is_rejected_and_crash_stale_endpoints_recover() {
         );
     }
 
-    let mut duplicate = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let mut duplicate = worker_command(&socket, session_id, &logs).spawn().unwrap();
     let duplicate_status = tokio::time::timeout(Duration::from_secs(3), duplicate.wait())
         .await
         .expect("duplicate worker did not reject promptly")
@@ -152,10 +152,10 @@ async fn duplicate_worker_is_rejected_and_crash_stale_endpoints_recover() {
     assert!(lifecycle.exists());
     drop(first_conn);
 
-    let mut replacement = worker_command(&socket, agent_id, &logs).spawn().unwrap();
+    let mut replacement = worker_command(&socket, session_id, &logs).spawn().unwrap();
     let mut replacement_conn = connect_with_retry(&socket).await;
     let replacement_hello = expect_hello(&mut replacement_conn, "awaiting_start").await;
-    assert_eq!(replacement_hello.agent_id, agent_id);
+    assert_eq!(replacement_hello.session_id, session_id);
     assert_ne!(replacement_hello.instance_id, first_hello.instance_id);
     wire::write_json_frame(
         &mut replacement_conn,
@@ -338,6 +338,92 @@ fn start_spec(argv: &[&str]) -> wire::StartSpec {
         cols: 80,
         rows: 24,
     }
+}
+
+/// Read frames until a `T_FOREGROUND` report matching `expected` arrives;
+/// other frame types (output, history) are drained and ignored. Returns every
+/// distinct foreground value observed on the way, `expected` last.
+async fn collect_foreground_until(stream: &mut UnixStream, expected: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for foreground {expected:?}; saw {seen:?}"
+        );
+        let (frame_type, payload) = read_frame(stream).await;
+        if frame_type != wire::T_FOREGROUND {
+            continue;
+        }
+        let basename = wire::decode_foreground(&payload)
+            .expect("valid foreground frame")
+            .to_string();
+        assert!(!basename.trim().is_empty(), "foreground must be non-empty");
+        assert!(
+            basename.chars().count() <= 64,
+            "foreground basename must be truncated to 64 chars: {basename:?}"
+        );
+        if seen.last().map(String::as_str) != Some(basename.as_str()) {
+            seen.push(basename.clone());
+        }
+        if basename == expected {
+            return seen;
+        }
+    }
+}
+
+/// Real-PTY foreground detection: spawn an interactive shell, run `sleep`,
+/// and observe the reported basename transition shell → sleep → shell.
+#[tokio::test]
+async fn foreground_reports_transition_shell_to_sleep_and_back() {
+    let fixture = WorkerFixture::launch().await;
+    let mut conn = fixture.connect().await;
+    expect_hello(&mut conn, "awaiting_start").await;
+
+    // An interactive shell on the PTY runs with job control, so each command
+    // becomes its own foreground process group — exactly the production
+    // shell-first session shape.
+    let spec = start_spec(&["/bin/sh", "-i"]);
+    wire::write_json_frame(&mut conn, wire::T_START, &spec)
+        .await
+        .unwrap();
+    let (frame_type, _) = read_frame(&mut conn).await;
+    assert_eq!(frame_type, wire::T_STARTED);
+
+    // The idle prompt's foreground group is the shell itself. The exact
+    // basename is platform-dependent (`sh` via /proc comm on Linux, `bash`
+    // via libproc on macOS where /bin/sh is bash), so capture it rather than
+    // asserting a name.
+    let (frame_type, payload) = loop {
+        let frame = read_frame(&mut conn).await;
+        if frame.0 == wire::T_FOREGROUND {
+            break frame;
+        }
+    };
+    assert_eq!(frame_type, wire::T_FOREGROUND);
+    let shell = wire::decode_foreground(&payload)
+        .expect("valid foreground frame")
+        .to_string();
+    assert_ne!(shell, "sleep");
+
+    // `sleep` takes the foreground within one poll interval...
+    wire::write_frame(&mut conn, wire::T_INPUT, b"set -m\nsleep 5\n")
+        .await
+        .unwrap();
+    collect_foreground_until(&mut conn, "sleep").await;
+
+    // ...and the shell reclaims it when the command exits.
+    collect_foreground_until(&mut conn, &shell).await;
+
+    wire::write_json_frame(
+        &mut conn,
+        wire::T_SHUTDOWN,
+        &wire::Shutdown {
+            signal: Some(wire::LifecycleSignal::Kill),
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

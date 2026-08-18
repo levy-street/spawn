@@ -1,18 +1,16 @@
 // spawnd — the spawn daemon.
 //
 // `spawnd` is the small static binary that runs on a user's host. It dials WSS
-// out to the central spawn-server, registers the host, and accepts agent
-// lifecycle frames. For each agent it launches a purpose-built session worker
+// out to the central spawn-server, registers the host, and accepts session
+// lifecycle frames. For each session it launches a purpose-built session worker
 // that owns the PTY and multiplexes control through spawnd. Agent provider auth
 // (e.g. `claude /login`) is handled by each CLI itself on the host — spawn does
-// not manage agent credentials.
+// not manage agent-CLI credentials.
 //
-// Process model: one spawn-worker owns each agent process and survives `spawnd`
+// Process model: one spawn-worker owns each session process and survives `spawnd`
 // restarts. On reconnect the daemon adopts live workers and re-registers them.
 
 mod activity;
-mod agent_ctl;
-mod agents;
 mod cli;
 mod config;
 mod cpu_scopes;
@@ -26,6 +24,8 @@ mod proto;
 mod pty;
 mod rtc;
 mod run;
+mod session_ctl;
+mod sessions;
 mod upload;
 mod worker_backend;
 mod ws;

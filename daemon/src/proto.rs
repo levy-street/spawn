@@ -61,47 +61,52 @@ pub enum Outbound {
         os: String,
         arch: String,
         version: String,
-        existing_agents: Vec<Uuid>,
+        existing_sessions: Vec<Uuid>,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
     #[serde(rename = "host.pong")]
     HostPong { request_id: String },
-    #[serde(rename = "agent.exit")]
-    AgentExit {
-        agent_id: Uuid,
+    #[serde(rename = "session.exit")]
+    SessionExit {
+        session_id: Uuid,
         exit_code: Option<i32>,
         signal: Option<String>,
     },
-    #[serde(rename = "agent.started")]
-    AgentStarted { agent_id: Uuid, pid: u32 },
+    #[serde(rename = "session.started")]
+    SessionStarted { session_id: Uuid, pid: u32 },
     /// Content-free "meaningful output happened" ping (trust Phase 2): lets the
     /// server stamp `last_output_at` without seeing PTY bytes. Throttled and
     /// classified daemon-side (see `activity.rs`).
-    #[serde(rename = "agent.activity")]
-    AgentActivity { agent_id: Uuid },
+    #[serde(rename = "session.activity")]
+    SessionActivity { session_id: Uuid },
     /// Content-free input-activity ping for WebRTC DataChannel input. The
     /// server cannot observe `spawn.pty` bytes, so this daemon-throttled signal
-    /// is the only metadata it needs to maintain `last_input_at` for v2.
-    #[serde(rename = "agent.input_activity")]
-    AgentInputActivity { agent_id: Uuid },
-    #[serde(rename = "host.tools.check_result")]
-    HostToolsCheckResult {
+    /// is the only metadata it needs to maintain `last_input_at`.
+    #[serde(rename = "session.input_activity")]
+    SessionInputActivity { session_id: Uuid },
+    /// Foreground process report: the basename of the executable currently in
+    /// the PTY's foreground process group. A deliberate, documented exception
+    /// to the content-free activity design (docs/TRUST.md): a bare basename,
+    /// max 64 chars, no arguments/paths/output, so the UI can label panes.
+    /// Emitted only when the value changes, at most once per second.
+    #[serde(rename = "session.foreground")]
+    SessionForeground { session_id: Uuid, command: String },
+    #[serde(rename = "host.agents.check_result")]
+    HostAgentsCheckResult {
         request_id: String,
-        tools: Vec<HostToolStatus>,
+        agents: Vec<HostAgentStatus>,
     },
-    #[serde(rename = "host.tools.install_result")]
-    HostToolsInstallResult {
+    #[serde(rename = "host.agents.install_result")]
+    HostAgentsInstallResult {
         request_id: String,
-        result: HostToolInstallResult,
+        result: HostAgentInstallResult,
     },
     #[serde(rename = "rtc.answer")]
     RtcAnswer {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,8 +133,6 @@ pub enum Outbound {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<Uuid>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_id: Option<Uuid>,
@@ -145,8 +148,6 @@ pub enum Outbound {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<Uuid>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_id: Option<Uuid>,
@@ -159,7 +160,7 @@ pub enum Outbound {
         message: Option<String>,
     },
     Error {
-        agent_id: Option<Uuid>,
+        session_id: Option<Uuid>,
         code: String,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,24 +223,24 @@ pub enum Inbound {
     HostHeartbeat,
     #[serde(rename = "host.ping")]
     HostPing { request_id: String },
-    #[serde(rename = "host.tools.check")]
-    HostToolsCheck {
+    #[serde(rename = "host.agents.check")]
+    HostAgentsCheck {
         request_id: String,
         #[serde(default)]
-        targets: Vec<HostToolTarget>,
+        targets: Vec<HostAgentTarget>,
     },
-    #[serde(rename = "host.tools.install")]
-    HostToolsInstall {
+    #[serde(rename = "host.agents.install")]
+    HostAgentsInstall {
         request_id: String,
-        target: HostToolTarget,
+        target: HostAgentTarget,
     },
-    #[serde(rename = "agent.create")]
-    AgentCreate(AgentCreate),
-    #[serde(rename = "agent.restart")]
-    AgentRestart(AgentCreate),
-    #[serde(rename = "agent.kill")]
-    AgentKill {
-        agent_id: Uuid,
+    #[serde(rename = "session.create")]
+    SessionCreate(SessionCreate),
+    #[serde(rename = "session.restart")]
+    SessionRestart(SessionCreate),
+    #[serde(rename = "session.kill")]
+    SessionKill {
+        session_id: Uuid,
         #[serde(default)]
         signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
     },
@@ -250,8 +251,6 @@ pub enum Inbound {
         binding_nonce: Option<String>,
         #[serde(default)]
         binding_generation: Option<u64>,
-        #[serde(default)]
-        agent_id: Option<Uuid>,
         #[serde(default)]
         scope_type: Option<String>,
         #[serde(default)]
@@ -282,8 +281,6 @@ pub enum Inbound {
         #[serde(default)]
         binding_generation: Option<u64>,
         #[serde(default)]
-        agent_id: Option<Uuid>,
-        #[serde(default)]
         scope_type: Option<String>,
         #[serde(default)]
         scope_id: Option<Uuid>,
@@ -300,8 +297,6 @@ pub enum Inbound {
         binding_nonce: Option<String>,
         #[serde(default)]
         binding_generation: Option<u64>,
-        #[serde(default)]
-        agent_id: Option<Uuid>,
         #[serde(default)]
         scope_type: Option<String>,
         #[serde(default)]
@@ -322,37 +317,35 @@ pub struct RtcIceServerConfig {
     pub credential: Option<String>,
 }
 
+/// `session.create` / `session.restart` payload. A session always starts as
+/// the user's login shell in `cwd`: the daemon resolves the shell itself, so
+/// the frame carries no argv, env, or install command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentCreate {
-    pub agent_id: Uuid,
+pub struct SessionCreate {
+    pub session_id: Uuid,
     pub cwd: String,
     #[serde(default)]
-    pub argv: Vec<String>,
-    #[serde(default)]
-    pub env: std::collections::BTreeMap<String, String>,
-    /// Optional shell command. If `argv[0]` isn't on the daemon's PATH at
-    /// agent.create time, the daemon runs this via `bash -c` and streams
-    /// no server-visible output. Then it retries the PATH lookup before launch.
-    #[serde(default)]
-    pub install: Option<String>,
-    #[serde(default)]
-    pub skills: Vec<AgentSkillConfig>,
+    pub skills: Vec<SkillConfig>,
     #[serde(default)]
     pub create_cwd: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSkillConfig {
+pub struct SkillConfig {
     pub id: String,
     pub name: String,
     pub description: String,
     pub content: String,
 }
 
+/// One agent definition to probe or install on this host. `agent_id` and
+/// `agent_name` identify the agent definition (the launchable CLI tool), not a
+/// session; `command` is the binary name to `which` (the first word of the
+/// agent definition's command string, computed server-side).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostToolTarget {
-    pub preset_id: String,
-    pub preset_name: String,
+pub struct HostAgentTarget {
+    pub agent_id: String,
+    pub agent_name: String,
     pub agent_kind: String,
     pub command: String,
     #[serde(default)]
@@ -360,9 +353,9 @@ pub struct HostToolTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostToolStatus {
-    pub preset_id: String,
-    pub preset_name: String,
+pub struct HostAgentStatus {
+    pub agent_id: String,
+    pub agent_name: String,
     pub agent_kind: String,
     pub command: String,
     #[serde(default)]
@@ -381,9 +374,9 @@ pub struct HostToolStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostToolInstallResult {
-    pub preset_id: String,
-    pub preset_name: String,
+pub struct HostAgentInstallResult {
+    pub agent_id: String,
+    pub agent_name: String,
     pub agent_kind: String,
     pub command: String,
     #[serde(default)]
@@ -395,7 +388,7 @@ pub struct HostToolInstallResult {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
-    pub status: Option<HostToolStatus>,
+    pub status: Option<HostAgentStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -481,8 +474,7 @@ mod signed_rtc_relay_tests {
             "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
             "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "binding_generation": 7,
-            "agent_id": "11111111-2222-4333-8444-555555555555",
-            "scope_type": "agent",
+            "scope_type": "session",
             "scope_id": "11111111-2222-4333-8444-555555555555",
             "protocol": "spawn.pty",
             "protocol_version": 2,
@@ -594,7 +586,6 @@ mod signed_rtc_relay_tests {
         let answer = Outbound::RtcAnswer {
             session_id: "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1".to_owned(),
             binding_nonce: Some("a".repeat(32)),
-            agent_id: None,
             scope_type: Some("host".to_owned()),
             scope_id: Some(Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap()),
             protocol: Some("spawn.host.ctl".to_owned()),
@@ -612,7 +603,6 @@ mod signed_rtc_relay_tests {
         let oversized = Outbound::RtcAnswer {
             session_id: "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1".to_owned(),
             binding_nonce: None,
-            agent_id: None,
             scope_type: None,
             scope_id: None,
             protocol: None,

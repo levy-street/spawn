@@ -124,6 +124,21 @@ contain no terminal bytes and are throttled, but their timing is behavioral
 metadata and can reveal when a person or agent is active. Self-hosting is the
 answer for users for whom this metadata is itself sensitive.
 
+**Foreground process basename (deliberate content-free exception).** With
+shell-first sessions the daemon reports, per session, the basename of the
+executable whose process group owns the PTY foreground (`session.foreground`,
+stored as `sessions.foreground_command`). This is a knowing, documented
+exception to the content-free activity design, scoped as narrowly as it can
+be: a bare executable basename, truncated to 64 characters — never arguments,
+paths, environment, window titles, or output — emitted only when the value
+changes, at most once per second. Its sole purpose is UI labeling: pane
+headers and sidebar icons show what is running, and the agent shortcut bar
+appears only while the shell itself is in the foreground. The server thereby
+learns *which program* is running in a session (e.g. `claude`, `vim`,
+`sleep`) and when that changes; users for whom even program names are
+sensitive should self-host, exactly as with the activity-timing metadata
+above.
+
 **Protected-content migration inventory:**
 
 | Content class | Current or historical path | Migration state |

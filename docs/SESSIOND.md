@@ -2,14 +2,14 @@
 
 **Status: implemented as the mandatory backend; cutover review pending.**
 `spawn-worker` plus `spawnd` supervision is the only production session path.
-There is no backend selector, per-agent escape hatch, or fallback. The accepted
+There is no backend selector, per-session escape hatch, or fallback. The accepted
 cutover boundary and old-session drain procedure are in
 [TMUX_REMOVAL.md](TMUX_REMOVAL.md). Where this document and code drift,
 `daemon/src/sessiond/` and `daemon/src/worker_backend.rs` are authoritative.
 
 Governing trust document: [TRUST.md](TRUST.md). Every design choice below is
 tied back to it; the short version is that tmux was the last piece of
-infrastructure between the agent process and the browser that (a) we don't
+infrastructure between the session process and the browser that (a) we don't
 control, (b) holds terminal plaintext at rest, and (c) contains a full
 server-side terminal emulator we neither need nor test.
 
@@ -17,26 +17,26 @@ server-side terminal emulator we neither need nor test.
 
 ## 1. Why replace tmux
 
-tmux earned its place: detached sessions gave us agent survival across
+tmux earned its place: detached sessions gave us session survival across
 `spawnd` restarts for free. But it fights the operator model and the
 product in specific, structural ways:
 
 | Problem | Consequence |
 |---|---|
 | tmux server holds scrollback **in plaintext**, in memory and with no at-rest encryption story | the one place terminal content persists on the host is the one place we can't encrypt |
-| tmux is a **terminal emulator in the middle**: agent → tmux grid → re-emitted escape codes → browser xterm.js | double emulation causes fidelity bugs (repaint gaps, mouse/copy-mode weirdness) that we've been patching with `refresh-client` and SIGWINCH hacks |
-| one tmux server per user socket owns **all** sessions | a tmux server crash or wedge kills every agent on the host at once |
+| tmux is a **terminal emulator in the middle**: session → tmux grid → re-emitted escape codes → browser xterm.js | double emulation causes fidelity bugs (repaint gaps, mouse/copy-mode weirdness) that we've been patching with `refresh-client` and SIGWINCH hacks |
+| one tmux server per user socket owns **all** sessions | a tmux server crash or wedge kills every session on the host at once |
 | control is subprocess-based (`tmux send-keys`, `capture-pane`, `pane_in_mode` polls) | per-keystroke subprocess costs we had to cache around (`copy_mode_cached`), and content transits argv/pipes of a third-party binary |
 | copy-mode intercepts input | browsers had to detect-and-cancel it (`tmux::cancel_copy_mode`) because a remote viewer must never be trapped in a server-side mode |
 | scrollback is line/grid-based | replay re-serializes the grid instead of replaying the byte stream the browser's emulator actually consumed |
 
-The replacement keeps the two properties tmux actually gave us — **agent
+The replacement keeps the two properties tmux actually gave us — **session
 survival across spawnd restarts** and **reattach with history** — and drops
 everything else.
 
 ## 2. Design principles
 
-1. **The agent terminal path is endpoint-owned at the P2-AGENT-02
+1. **The session terminal path is endpoint-owned at the P2-AGENT-02
    implementation checkpoint** (review pending; TRUST.md). The worker protocol stays on a Unix
    socket in a `0700` directory, and the browser's low-latency copy travels over
    mandatory WebRTC DataChannels. `spawnd` sends only content-free activity and
@@ -52,7 +52,7 @@ everything else.
    live forwarded bytes. This is a deliberate revision of the original
    "workers are byte pipes" rule: the byte-pipe design needed a SIGWINCH
    jiggle to provoke checkpoint repaints from the app, which disturbed the
-   agent, stacked duplicate frames into scrollback on every rotation, and
+   session, stacked duplicate frames into scrollback on every rotation, and
    made checkpoint quality depend on each app's WINCH behavior. The
    emulator's fidelity is a tested contract (`feed → serialize → re-feed ⇒
    identical state`), not an assumption.
@@ -64,8 +64,8 @@ everything else.
    exactly once — at the moment it scrolls off the screen — serialized as
    styled text, and only those committed lines are logged. Replay is
    "committed history + a freshly synthesized screen repaint."
-4. **One process per agent.** Crash isolation, per-agent keys, per-agent
-   lifecycle, no shared mux server.
+4. **One process per session.** Crash isolation, per-session keys,
+   per-session lifecycle, no shared mux server.
 5. **Honest crypto claims.** Encrypted-at-rest scrollback protects the segment
    files. It does not mean "encrypted before DRAM": the PTY path, emulator
    grid, committed-line serialization, replay, and forwarding all require
@@ -78,32 +78,32 @@ spawnd (host supervisor, one per host)
  ├── ws/rtc: content-free signaling/lifecycle; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
- ├── spawn-worker --agent-id A … (one process per agent, own process group)
+ ├── spawn-worker --session-id A … (one process per session, own process group)
  │    ├── owns the PTY master (portable-pty)
- │    ├── agent process (session leader on the PTY slave)
+ │    ├── session process — the user's login shell (session leader on the PTY slave)
  │    ├── headless emulator (grid state + bounded history drain window)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
- │    ├── lifetime flock: $WORKER_DIR/<agent-id>.lock
- │    ├── supervisor listener: $WORKER_DIR/<agent-id>.sock
- │    └── lifecycle datagram: $WORKER_DIR/<agent-id>.lifecycle.sock
- └── spawn-worker --agent-id B …
+ │    ├── lifetime flock: $WORKER_DIR/<session-id>.lock
+ │    ├── supervisor listener: $WORKER_DIR/<session-id>.sock
+ │    └── lifecycle datagram: $WORKER_DIR/<session-id>.lifecycle.sock
+ └── spawn-worker --session-id B …
 ```
 
 - **spawnd stays the host supervisor.** It owns the control-plane connection,
-  WebRTC, and agent registry. It launches workers, adopts orphaned ones, routes
+  WebRTC, and session registry. It launches workers, adopts orphaned ones, routes
   input/output, and reaps exits.
 - **`spawn-worker`** (`daemon/src/bin/spawn-worker.rs`, logic in
-  `daemon/src/sessiond/worker.rs`) is one process per agent. It binds its
-  socket, waits for `Start`, spawns the agent argv on a PTY it owns
+  `daemon/src/sessiond/worker.rs`) is one process per session. It binds its
+  socket, waits for `Start`, spawns the session's login shell on a PTY it owns
   with portable-pty,
   and from then on: streams output, accepts input/resize, maintains the
   scrollback log, serves replay.
 - The worker is spawned with `process_group(0)`: its fate is tied to the
-  agent (it holds the PTY master), **not** to spawnd. spawnd dying, being
-  upgraded, or being restarted leaves workers and their agents running.
+  session (it holds the PTY master), **not** to spawnd. spawnd dying, being
+  upgraded, or being restarted leaves workers and their sessions running.
   Deployment note: under systemd, spawnd's unit needs `KillMode=process`
   or workers get killed with the cgroup on `systemctl restart`.
-- Worker runtime cost is scoped per agent: a tokio runtime pinned to 2 threads,
+- Worker runtime cost is scoped per session: a tokio runtime pinned to 2 threads,
   two blocking PTY I/O threads, and headless primary/alternate screen grids
   whose size follows the current terminal geometry. It does not retain a
   session-length plaintext grid history.
@@ -115,15 +115,15 @@ spawnd (host supervisor, one per host)
 
 ```
 workers/
-  <agent-id>.lock          # lifetime exclusive reservation (0600)
-  <agent-id>.sock          # ordinary supervisor listener
-  <agent-id>.lifecycle.sock # atomic fixed-size TERM/KILL datagrams
-  <agent-id>.scrollback/   # 0700; seg-00000001.log … (ciphertext only, 0600)
+  <session-id>.lock          # lifetime exclusive reservation (0600)
+  <session-id>.sock          # ordinary supervisor listener
+  <session-id>.lifecycle.sock # atomic fixed-size TERM/KILL datagrams
+  <session-id>.scrollback/   # 0700; seg-00000001.log … (ciphertext only, 0600)
 ```
 
 The directory is ownership-checked and forced to `0700`; failure is fatal.
 Both sockets and the reservation are ownership-checked and forced to `0600`.
-`spawnd` acquires the per-agent flock before it spawns a worker and exposes the
+`spawnd` acquires the per-session flock before it spawns a worker and exposes the
 locked fd only in that post-fork child. The worker holds it for its lifetime.
 Duplicate creates therefore fail before a second worker is spawned. A lock
 released by a crash authorizes stale-socket recovery; no code unlinks an
@@ -154,22 +154,23 @@ guessed at.
 
 | Type | Dir | Payload | Purpose |
 |---|---|---|---|
-| `T_HELLO` 0x01 | w→d | JSON `{version, agent_id, instance_id, state, pid?, cols, rows, cwd?, history?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct agent uploads. `history: true` advertises the committed-history delta stream (§8.4) |
-| `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the agent. Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
-| `T_STARTED` 0x03 | w→d | JSON `{pid}` | agent is running (the **real** agent pid, unlike the tmux backend's attach pid) |
+| `T_HELLO` 0x01 | w→d | JSON `{version, session_id, instance_id, state, pid?, cols, rows, cwd?, history?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct session uploads. `history: true` advertises the committed-history delta stream (§8.4). Decoders accept the pre-v3 `agent_id` spelling as an alias so a new spawnd adopts workers started before the rename |
+| `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the session command (spawnd always sends the user's login shell with `-l`). Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
+| `T_STARTED` 0x03 | w→d | JSON `{pid}` | session is running (the **real** shell pid, unlike the tmux backend's attach pid) |
 | `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
 | `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); lines displaced by a narrowing reflow commit to history |
 | `T_REDRAW` 0x07 | d→w | empty | obsolete (ignored by workers; reserved — see §8.2) |
 | `T_REPLAY_REQ` 0x08 | d→w | `max_bytes u32 LE` | request decrypted scrollback |
 | `T_REPLAY` 0x09 | w→d | `watermark u64 LE ‖ raw bytes` | self-describing v2 replay: geometry marker + history sentinel + committed lines, then geometry marker + live screen repaint (§8.1); watermark = cumulative lifetime PTY output bytes at capture, including output never committed to history |
-| `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | agent exited |
+| `T_EXIT` 0x0A | w→d | JSON `{exit_code?, signal?}` | session exited |
 | `T_SHUTDOWN` 0x0B | d→w | JSON `{signal?: TERM\|KILL}` | compatibility command; current spawnd lifecycle delivery uses the independent endpoint below |
 | `T_ERROR` 0x0C | w→d | JSON `{message}` | recoverable command failure |
 | `T_HISTORY` 0x0D | w→d | `epoch u64 LE ‖ start_offset u64 LE ‖ committed bytes` | one committed-line batch, streamed live as it is persisted (§8.4). Only sent after `T_HISTORY_SUB` |
 | `T_HISTORY_WIPE` 0x0E | w→d | `epoch u64 LE` | the app erased its scrollback (`ED 3`); carries the new epoch, offsets restart at 0. Only sent after `T_HISTORY_SUB` |
 | `T_REPLAY2` 0x0F | w→d | `watermark u64 LE ‖ epoch u64 LE ‖ history_end_offset u64 LE ‖ raw bytes` | replay response with the committed-history anchor at capture; replaces `T_REPLAY` for subscribed supervisors. The end offset always lands on a batch boundary, so a delta starting there appends seamlessly |
 | `T_HISTORY_SUB` 0x10 | d→w | empty | subscribe to the delta stream. Sent only to workers whose `Hello` advertises `history: true`; a worker never emits the three frames above unsubscribed, because supervisors reject unknown frame types by dropping the connection |
+| `T_FOREGROUND` 0x11 | w→d | raw UTF-8 basename, ≤ 256 bytes | foreground process report (§4.1). Sent when the polled value changes and once per new supervisor connection. Additive at `PROTO_VERSION` 5: old workers never send it |
 
 Connection semantics: the worker serves **one live supervisor connection**.
 It validates the candidate peer's effective UID and sends that candidate its
@@ -178,14 +179,14 @@ and install one new reader. Thus only one task/fd can feed the bounded command
 queue. Generation tags also discard anything the old peer queued immediately
 before cancellation. A restarted spawnd connects and wins without leaving a
 stale reader able to flood the worker. `spawnd` verifies that
-`Hello.agent_id` matches the agent implied by the socket path before trusting
+`Hello.session_id` matches the session implied by the socket path before trusting
 the instance token. Unknown frame types are rejected. The five-byte header is
 parsed before allocation and a strict per-type cap is applied (`T_INPUT` is at
 most 64 KiB; fixed commands require their exact size); a command never inherits
 the generic 32 MiB replay ceiling.
 
 Lifecycle timers: a worker that never receives `Start` exits after 120 s; a
-worker whose agent exited lingers 60 s to deliver `T_EXIT` to a reconnecting
+worker whose session exited lingers 60 s to deliver `T_EXIT` to a reconnecting
 spawnd, then cleans up regardless. On exit the worker deletes its scrollback
 (the key dies with it anyway), unlinks its socket, and terminates.
 
@@ -204,22 +205,42 @@ monitor; while holding that stable ownership it validates the child and calls
 `killpg` only. `ESRCH` means safely gone. There is deliberately no fallback to
 `kill(pid)`, so PID reuse can never redirect a delayed request.
 
+### 4.1 Foreground reporting (`T_FOREGROUND`)
+
+Once per second, while its session is running, the worker asks the kernel
+which process group owns the PTY foreground — `tcgetpgrp` on the PTY master
+fd — and resolves that group's leader to an executable basename:
+`/proc/<pgid>/comm` on Linux, libproc `proc_name` (falling back to
+`proc_pidpath`) on macOS (`sessiond/foreground.rs`). The result is sent as
+`T_FOREGROUND` only when it changes, and re-sent once to each newly accepted
+supervisor connection so an adopting spawnd learns the current value without
+waiting for a change.
+
+spawnd relays it to the server as `session.foreground` — deduplicated by
+value, rate-limited to one frame per second per session, and re-announced when
+the control websocket reconnects. The payload is deliberately minimal: the
+**basename only**, truncated to 64 characters — no arguments, no paths, no
+output, no titles. This is a documented content-free-design exception
+(docs/TRUST.md); it exists so the UI can label panes and decide when the
+shell is in the foreground. Old workers (pre-rename) simply never send the
+frame; their sessions report no foreground command.
+
 ## 5. Data path — where bytes flow, who can read them
 
 ```
-agent process
+session process (login shell + whatever it runs)
   │ PTY slave → kernel → PTY master (plaintext, kernel buffers, user's host)
   ▼
 spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
   ▼ T_OUTPUT (unix socket, 0700 dir, same host)
-spawnd: bounded per-agent outbox → forwarder ──→ DataChannel direct sinks
+spawnd: bounded per-session outbox → forwarder ──→ DataChannel direct sinks
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
 browser: xterm.js — the user-facing terminal renderer and scrollback owner
 ```
 
 `pty::run_forwarder` and `ForwarderControl` provide bounded outbox → direct-sink
-routing. `AgentHandle` has one implementation: `write_stdin`, `resize`, and
+routing. `SessionHandle` has one implementation: `write_stdin`, `resize`, and
 `replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
 short-lived `0600` datagram endpoint in the same private directory and sends to
 the separate worker-owned lifecycle socket with the instance ID captured from
@@ -228,13 +249,13 @@ retries, and acknowledgement. It therefore cannot sit behind queued or
 partially written PTY input. Registry delivery also revalidates the immutable
 generation+lifecycle pair while holding the generation-transition lock.
 Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
-does not hold a local agent PTY, a child process handle, or a backend
+does not hold a local session PTY, a child process handle, or a backend
 discriminator.
 
 The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removes daemon
 WS terminal binary frames, browser relay/history/snapshot frames, transcripts,
 and content pubsub. `spawn.ctl` replay carries a stream-position watermark
-directly to the browser. This agent cut does not make all of Phase 2 true:
+directly to the browser. This cut does not make all of Phase 2 true:
 uploads, host operations, launch manifests, error detail, historical purge,
 and the final audit remain separate tracked tasks.
 
@@ -508,7 +529,7 @@ scrollback/selection lives in xterm.js.
 handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
 each. The worker logs and forwards each chunk it consumes. If the supervisor
 socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
-PTY backpressures the agent instead of accumulating an unbounded worker `Vec`
+PTY backpressures the session instead of accumulating an unbounded worker `Vec`
 queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 ordinary
 worker commands; each input command is capped at 64 KiB before spawnd copies
 the caller's slice. The worker's separate lifecycle datagram endpoint accepts

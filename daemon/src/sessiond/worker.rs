@@ -1,24 +1,24 @@
-//! The session worker runtime: one process per agent, owning the agent's PTY.
+//! The session worker runtime: one process per session, owning the session's PTY.
 //!
 //! Lifecycle:
-//! 1. `spawn-worker --socket <p> --agent-id <uuid> --log-dir <p>` binds the
+//! 1. `spawn-worker --socket <p> --session-id <uuid> --log-dir <p>` binds the
 //!    ordinary unix socket and an independent lifecycle socket, then waits
 //!    for the supervising `spawnd` to connect.
 //! 2. Every accepted connection is greeted with a `Hello` frame carrying the
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
-//! 3. `Start` spawns the agent argv on a PTY the worker owns. Raw output
+//! 3. `Start` spawns the session's command on a PTY the worker owns. Raw output
 //!    feeds a headless screen emulator (`sessiond::emulator`), which commits
 //!    lines to history exactly when they scroll off the screen; committed
 //!    lines are encrypted into the scrollback log before any disk write, and
 //!    the raw bytes are forwarded live through a bounded connection queue.
 //!    Plaintext chunks and PTY scratch are zeroized after each hop/drop.
 //!    Replays are committed history plus a screen repaint synthesized from
-//!    the emulator — the agent process is never signaled to provoke one.
+//!    the emulator — the session's process is never signaled to provoke one.
 //! 4. On PTY EOF the worker reports `Exit`, deletes its scrollback (the key
 //!    dies with the process anyway), unlinks its socket, and exits.
 //!
-//! The agent's fate is tied to the worker (the worker holds the PTY master),
+//! The session's fate is tied to the worker (the worker holds the PTY master),
 //! but NOT to spawnd: the worker runs in its own process group and keeps
 //! serving across spawnd restarts/upgrades without an intermediate terminal
 //! multiplexer.
@@ -221,15 +221,15 @@ fn discard_events(events: Vec<HistoryEvent>) {
     }
 }
 
-/// How long a worker with no agent yet waits for `Start` before giving up.
+/// How long a worker with no session command yet waits for `Start` before giving up.
 const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
-/// After the agent exits, how long the worker lingers to deliver `Exit` to a
+/// After the session exits, how long the worker lingers to deliver `Exit` to a
 /// (re)connecting spawnd before cleaning up regardless.
 const EXIT_LINGER: Duration = Duration::from_secs(60);
 
 pub struct WorkerArgs {
     pub socket: PathBuf,
-    pub agent_id: Uuid,
+    pub session_id: Uuid,
     pub log_dir: PathBuf,
     pub segment_bytes: u64,
     pub max_log_bytes: u64,
@@ -238,7 +238,7 @@ pub struct WorkerArgs {
 
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs> {
     let mut socket = None;
-    let mut agent_id = None;
+    let mut session_id = None;
     let mut log_dir = None;
     let mut segment_bytes = super::scrollback::DEFAULT_SEGMENT_BYTES;
     let mut max_log_bytes = super::scrollback::DEFAULT_MAX_LOG_BYTES;
@@ -250,8 +250,8 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
         };
         match arg.as_str() {
             "--socket" => socket = Some(PathBuf::from(value("--socket")?)),
-            "--agent-id" => {
-                agent_id = Some(Uuid::parse_str(&value("--agent-id")?).context("agent id")?)
+            "--session-id" => {
+                session_id = Some(Uuid::parse_str(&value("--session-id")?).context("session id")?)
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--segment-bytes" => segment_bytes = value("--segment-bytes")?.parse()?,
@@ -262,7 +262,7 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
     }
     Ok(WorkerArgs {
         socket: socket.context("--socket is required")?,
-        agent_id: agent_id.context("--agent-id is required")?,
+        session_id: session_id.context("--session-id is required")?,
         log_dir: log_dir.context("--log-dir is required")?,
         segment_bytes,
         max_log_bytes,
@@ -326,7 +326,7 @@ struct ConnFrame {
 }
 
 /// Everything needed to open the scrollback log at `Start` time (the log's
-/// initial checkpoint needs the agent's geometry, which arrives with the
+/// initial checkpoint needs the session's geometry, which arrives with the
 /// `StartSpec`).
 struct LogSetup {
     dir: PathBuf,
@@ -380,9 +380,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         lifecycle_listener,
         instance_id,
         Arc::clone(&child_state),
-        args.agent_id,
+        args.session_id,
     ));
-    tracing::info!(agent_id = %args.agent_id, socket = %args.socket.display(), "worker listening");
+    tracing::info!(session_id = %args.session_id, socket = %args.socket.display(), "worker listening");
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<ConnFrame>(CONNECTION_FRAME_QUEUE_DEPTH);
     let (pty_tx, mut pty_rx) = pty_output_channel();
@@ -398,7 +398,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut pty_open = false;
     let mut exit_reported = false;
     let mut pty_source_offset = 0u64;
-    let mut agent_cwd: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
     // Committed-history delta anchor. The epoch is a per-process nonce so a
     // reconnecting client can tell a worker restart (or `ED 3` wipe, which
     // bumps it) from a continuation; the offset counts committed plaintext
@@ -414,6 +414,20 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // (`T_HISTORY_SUB`). Never emit new-protocol frames unsubscribed: an old
     // daemon rejects unknown frame types and drops the whole connection.
     let mut history_sub = false;
+
+    // Foreground reporting: poll the PTY's foreground process group once per
+    // second and send `T_FOREGROUND` only when the basename changes. Reset on
+    // every new supervisor connection so an adopting spawnd learns the current
+    // value without waiting for a change. The first tick is deferred one full
+    // interval: polling in the fork→exec window would resolve the pre-exec
+    // child to this worker's own image name, and any residual race
+    // self-corrects on the next change-triggered report anyway.
+    let mut foreground_poll = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    foreground_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut foreground_sent: Option<String> = None;
 
     let started_at = tokio::time::Instant::now();
     let mut exited_at: Option<tokio::time::Instant> = None;
@@ -442,7 +456,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 let (read_half, mut write_half) = stream.into_split();
                 let hello = wire::Hello {
                     version: wire::PROTO_VERSION,
-                    agent_id: args.agent_id,
+                    session_id: args.session_id,
                     instance_id,
                     state: match &state {
                         State::AwaitingStart => "awaiting_start".into(),
@@ -452,7 +466,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     pid: pty.as_ref().map(|p| p.pid),
                     cols: pty.as_ref().map(|p| p.size.lock().unwrap().0).unwrap_or(0),
                     rows: pty.as_ref().map(|p| p.size.lock().unwrap().1).unwrap_or(0),
-                    cwd: agent_cwd.clone(),
+                    cwd: session_cwd.clone(),
                     history: true,
                 };
                 let hello_sent = tokio::time::timeout(
@@ -463,7 +477,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 if !matches!(hello_sent, Ok(Ok(()))) {
                     continue;
                 }
-                // If the agent already exited, deliver Exit immediately.
+                // If the session already exited, deliver Exit immediately.
                 if let State::Exited(info) = &state {
                     let _ = wire::write_json_frame(&mut write_half, wire::T_EXIT, info).await;
                     tracing::info!("delivered exit to late connection; cleaning up");
@@ -480,6 +494,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 // Subscriptions are per-connection; the replacement daemon
                 // re-subscribes if it speaks the delta protocol.
                 history_sub = false;
+                foreground_sent = None;
                 tracing::debug!(generation, "connection accepted");
             }
 
@@ -504,13 +519,18 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     &mut pty_tx,
                     &mut exit_tx,
                     &child_state,
-                    &mut agent_cwd,
+                    &mut session_cwd,
                     pty_source_offset,
                     &mut history_anchor,
                     &mut history_sub,
                 ).await {
                     Ok(LoopAction::Continue) => {}
-                    Ok(LoopAction::PtyStarted) => pty_open = true,
+                    Ok(LoopAction::PtyStarted) => {
+                        pty_open = true;
+                        // First poll a full interval after exec, not on an
+                        // overdue tick that raced the fork→exec window.
+                        foreground_poll.reset();
+                    }
                     Ok(LoopAction::Quit) => break,
                     Err(e) => {
                         tracing::warn!(error = %e, "frame handling failed");
@@ -530,7 +550,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     Some(chunk) => {
                         // Feed the screen emulator; lines it commits (or
                         // truncates) are persisted encrypted before the raw
-                        // bytes are forwarded live. The agent process is
+                        // bytes are forwarded live. The session's process is
                         // never signaled or disturbed by any of it.
                         let mut replay_failed = false;
                         if let Some(emu) = emulator.as_mut() {
@@ -571,7 +591,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             exit_code: None,
                             signal: None,
                         });
-                        tracing::info!(exit_code = ?info.exit_code, signal = ?info.signal, "agent exited");
+                        tracing::info!(exit_code = ?info.exit_code, signal = ?info.signal, "session exited");
                         exited_at = Some(tokio::time::Instant::now());
                         if let Some(w) = conn_write.as_mut() {
                             if wire::write_json_frame(w, wire::T_EXIT, &info).await.is_ok() {
@@ -584,6 +604,32 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         }
                         // No live connection: linger so a reconnecting spawnd
                         // can pick the exit up.
+                    }
+                }
+            }
+
+            _ = foreground_poll.tick(), if pty_open => {
+                if !matches!(state, State::Running) {
+                    continue;
+                }
+                let master_fd = pty
+                    .as_ref()
+                    .and_then(|p| p.master.lock().ok().and_then(|master| master.as_raw_fd()));
+                let Some(master_fd) = master_fd else {
+                    continue;
+                };
+                let Some(name) = super::foreground::foreground_basename(master_fd) else {
+                    continue;
+                };
+                if foreground_sent.as_deref() == Some(name.as_str()) {
+                    continue;
+                }
+                if let Some(w) = conn_write.as_mut() {
+                    let framed = wire::encode_foreground(&name);
+                    if wire::write_frame(w, wire::T_FOREGROUND, &framed).await.is_err() {
+                        conn_write = None;
+                    } else {
+                        foreground_sent = Some(name);
                     }
                 }
             }
@@ -633,7 +679,7 @@ async fn handle_frame(
     pty_tx: &mut Option<mpsc::Sender<PlaintextChunk>>,
     exit_tx: &mut Option<oneshot::Sender<wire::ExitInfo>>,
     child_state: &SharedChild,
-    agent_cwd: &mut Option<String>,
+    session_cwd: &mut Option<String>,
     pty_source_offset: u64,
     history_anchor: &mut wire::HistoryAnchor,
     history_sub: &mut bool,
@@ -641,17 +687,17 @@ async fn handle_frame(
     match frame_type {
         wire::T_START => {
             if !matches!(state, State::AwaitingStart) {
-                bail!("Start received but agent is already {}", state_name(state));
+                bail!("Start received but session is already {}", state_name(state));
             }
             let mut spec: wire::StartSpec = wire::decode_json(&payload)?;
             let canonical_cwd =
-                std::fs::canonicalize(&spec.cwd).context("resolving agent cwd capability root")?;
+                std::fs::canonicalize(&spec.cwd).context("resolving session cwd capability root")?;
             if !canonical_cwd.is_dir() {
-                bail!("agent cwd capability root is not a directory");
+                bail!("session cwd capability root is not a directory");
             }
             spec.cwd = canonical_cwd
                 .to_str()
-                .context("agent cwd capability root is not UTF-8")?
+                .context("session cwd capability root is not UTF-8")?
                 .to_string();
             let (cols, rows) = (spec.cols.max(1), spec.rows.max(1));
             let opened = ScrollbackLog::with_limits(
@@ -666,9 +712,9 @@ async fn handle_frame(
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
             let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
-                .context("spawning agent PTY")?;
+                .context("spawning session PTY")?;
             let pid = started.pid;
-            *agent_cwd = Some(spec.cwd.clone());
+            *session_cwd = Some(spec.cwd.clone());
             *pty = Some(started);
             *state = State::Running;
             if let Some(w) = conn_write.as_mut() {
@@ -682,7 +728,7 @@ async fn handle_frame(
                 )
                 .await;
             }
-            tracing::info!(pid, "agent started");
+            tracing::info!(pid, "session started");
             Ok(LoopAction::PtyStarted)
         }
         wire::T_INPUT => {
@@ -690,7 +736,7 @@ async fn handle_frame(
                 p.input_tx
                     .send(payload)
                     .await
-                    .map_err(|_| anyhow::anyhow!("agent PTY input channel closed"))?;
+                    .map_err(|_| anyhow::anyhow!("session PTY input channel closed"))?;
             }
             Ok(LoopAction::Continue)
         }
@@ -729,7 +775,7 @@ async fn handle_frame(
         }
         wire::T_REDRAW => {
             // Obsolete: repaints are synthesized from the emulator via replay
-            // (`T_REPLAY_REQ`); the agent process is never disturbed.
+            // (`T_REPLAY_REQ`); the session's process is never disturbed.
             tracing::debug!("ignoring redraw request (emulator-backed worker)");
             Ok(LoopAction::Continue)
         }
@@ -741,7 +787,7 @@ async fn handle_frame(
             let max_bytes = wire::decode_replay_req(&payload)?;
             let active_log = log
                 .as_mut()
-                .context("worker replay is unavailable for this agent")?;
+                .context("worker replay is unavailable for this session")?;
             let emu = emulator
                 .as_mut()
                 .context("worker replay is unavailable before start")?;
@@ -913,10 +959,10 @@ fn spawn_pty(
     let child = pair
         .slave
         .spawn_command(cmd)
-        .context("spawning agent in PTY")?;
+        .context("spawning session command in PTY")?;
     let pid = child.process_id().unwrap_or(0);
     if pid <= 1 || i32::try_from(pid).is_err() {
-        bail!("agent PTY returned an invalid process id");
+        bail!("session PTY returned an invalid process id");
     }
     drop(pair.slave);
 
@@ -925,7 +971,7 @@ fn spawn_pty(
             .lock()
             .map_err(|_| anyhow::anyhow!("child state lock poisoned"))?;
         if !matches!(*state, ChildState::AwaitingStart) {
-            bail!("agent child state is already occupied");
+            bail!("session child state is already occupied");
         }
         *state = ChildState::Running { child, pid };
     }
@@ -936,7 +982,7 @@ fn spawn_pty(
         .context("cloning PTY reader")?;
     let mut writer = pair.master.take_writer().context("taking PTY writer")?;
 
-    // Blocking writer thread: PTY input can block when the agent stops
+    // Blocking writer thread: PTY input can block when the session's process stops
     // reading; keep that off the async loop.
     let (input_tx, mut input_rx) = mpsc::channel::<PlaintextChunk>(PTY_INPUT_QUEUE_DEPTH);
     std::thread::spawn(move || {
@@ -1027,7 +1073,7 @@ fn signal_owned_child(
         Ok(()) => LifecycleOutcome::Delivered,
         Err(Errno::ESRCH) => LifecycleOutcome::Gone,
         Err(error) => {
-            tracing::warn!(pid = *pid, %error, "agent process-group signal failed");
+            tracing::warn!(pid = *pid, %error, "session process-group signal failed");
             LifecycleOutcome::Failed
         }
     }
@@ -1075,7 +1121,7 @@ async fn run_lifecycle_listener(
     socket: UnixDatagram,
     instance_id: Uuid,
     child_state: SharedChild,
-    agent_id: Uuid,
+    session_id: Uuid,
 ) {
     // One fixed buffer and one task serve atomic datagrams. Partial writers
     // cannot retain a connection, handler slot, fd, or allocation, and the
@@ -1107,7 +1153,7 @@ async fn run_lifecycle_listener(
             continue;
         };
         if socket.try_send_to(&[ack], peer_path).is_err() {
-            tracing::debug!(%agent_id, "lifecycle requester closed before acknowledgement");
+            tracing::debug!(%session_id, "lifecycle requester closed before acknowledgement");
         }
     }
 }
@@ -1124,7 +1170,7 @@ mod tests {
         let ok = args(&[
             "--socket",
             "/tmp/x.sock",
-            "--agent-id",
+            "--session-id",
             "00000000-0000-0000-0000-000000000001",
             "--log-dir",
             "/tmp/x.scroll",
@@ -1207,7 +1253,7 @@ mod tests {
     async fn exited_child_identity_cannot_signal_an_unrelated_process_after_pid_churn() {
         use std::os::unix::process::CommandExt;
 
-        let child = std::process::Command::new("/bin/true")
+        let child = std::process::Command::new("/usr/bin/true")
             .process_group(0)
             .spawn()
             .expect("short-lived child");
@@ -1226,7 +1272,7 @@ mod tests {
 
         // Exercise allocator/PID churn after the stable child was reaped.
         for _ in 0..128 {
-            std::process::Command::new("/bin/true")
+            std::process::Command::new("/usr/bin/true")
                 .status()
                 .expect("pid churn child");
         }
@@ -1255,7 +1301,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("agent.lifecycle.sock");
+        let socket = dir.path().join("session.lifecycle.sock");
         let listener = UnixDatagram::bind(&socket).unwrap();
         let child = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -1314,7 +1360,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let server_path = dir.path().join("agent.lifecycle.sock");
+        let server_path = dir.path().join("session.lifecycle.sock");
         let listener = UnixDatagram::bind(&server_path).unwrap();
         let child = std::process::Command::new("/bin/sh")
             .arg("-c")

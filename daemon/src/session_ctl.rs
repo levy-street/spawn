@@ -1,4 +1,4 @@
-//! Versioned, bounded protocol for the per-agent `spawn.ctl` DataChannel.
+//! Versioned, bounded protocol for the per-session `spawn.ctl` DataChannel.
 //!
 //! Control messages never transit the control-plane websocket. Requests and
 //! metadata responses are JSON text messages. Potentially large replay bytes
@@ -697,7 +697,7 @@ pub fn decode_upload_chunk(bytes: &[u8]) -> Result<UploadChunk, ProtocolError> {
 }
 
 #[derive(Clone, Default)]
-pub struct AgentControlHub {
+pub struct SessionControlHub {
     inner: Arc<Mutex<HashMap<Uuid, DisplayState>>>,
     transactions: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
@@ -715,28 +715,28 @@ struct ViewerEntry {
     display: DisplaySender,
 }
 
-impl AgentControlHub {
-    pub async fn transaction(&self, agent_id: Uuid) -> Arc<Mutex<()>> {
+impl SessionControlHub {
+    pub async fn transaction(&self, session_id: Uuid) -> Arc<Mutex<()>> {
         self.transactions
             .lock()
             .await
-            .entry(agent_id)
+            .entry(session_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    pub async fn register(&self, agent_id: Uuid, session_id: String, display: DisplaySender) {
-        let transaction = self.transaction(agent_id).await;
+    pub async fn register(&self, session_id: Uuid, viewer_id: String, display: DisplaySender) {
+        let transaction = self.transaction(session_id).await;
         let _guard = transaction.lock().await;
         {
             let mut states = self.inner.lock().await;
-            let state = states.entry(agent_id).or_default();
-            if !state.viewers.contains_key(&session_id) {
-                state.order.push(session_id.clone());
+            let state = states.entry(session_id).or_default();
+            if !state.viewers.contains_key(&viewer_id) {
+                state.order.push(viewer_id.clone());
             }
             state
                 .viewers
-                .insert(session_id.clone(), ViewerEntry { display });
+                .insert(viewer_id.clone(), ViewerEntry { display });
             state.order.retain(|id| state.viewers.contains_key(id));
             if state
                 .owner
@@ -746,60 +746,60 @@ impl AgentControlHub {
                 state.owner = state.order.first().cloned();
             }
         }
-        self.broadcast(agent_id).await;
+        self.broadcast(session_id).await;
     }
 
-    pub async fn unregister(&self, agent_id: Uuid, session_id: &str) {
-        let transaction = self.transaction(agent_id).await;
+    pub async fn unregister(&self, session_id: Uuid, viewer_id: &str) {
+        let transaction = self.transaction(session_id).await;
         {
             let _guard = transaction.lock().await;
-            self.unregister_in_transaction(agent_id, session_id).await;
+            self.unregister_in_transaction(session_id, viewer_id).await;
         }
-        self.evict_transaction_if_idle(agent_id, &transaction).await;
+        self.evict_transaction_if_idle(session_id, &transaction).await;
     }
 
-    async fn unregister_in_transaction(&self, agent_id: Uuid, session_id: &str) {
+    async fn unregister_in_transaction(&self, session_id: Uuid, viewer_id: &str) {
         let should_broadcast = {
             let mut states = self.inner.lock().await;
-            let Some(state) = states.get_mut(&agent_id) else {
+            let Some(state) = states.get_mut(&session_id) else {
                 return;
             };
-            state.viewers.remove(session_id);
-            state.order.retain(|id| id != session_id);
-            if state.owner.as_deref() == Some(session_id) {
+            state.viewers.remove(viewer_id);
+            state.order.retain(|id| id != viewer_id);
+            if state.owner.as_deref() == Some(viewer_id) {
                 state.owner = state.order.first().cloned();
             }
             if state.viewers.is_empty() {
-                states.remove(&agent_id);
+                states.remove(&session_id);
                 false
             } else {
                 true
             }
         };
         if should_broadcast {
-            self.broadcast(agent_id).await;
+            self.broadcast(session_id).await;
         }
     }
 
-    /// Remove all display/lifecycle state when an agent backend is removed.
-    pub async fn remove_agent(&self, agent_id: Uuid) {
-        let transaction = self.transaction(agent_id).await;
+    /// Remove all display/lifecycle state when a session backend is removed.
+    pub async fn remove_session(&self, session_id: Uuid) {
+        let transaction = self.transaction(session_id).await;
         {
             let _guard = transaction.lock().await;
-            self.inner.lock().await.remove(&agent_id);
+            self.inner.lock().await.remove(&session_id);
         }
-        self.evict_transaction_if_idle(agent_id, &transaction).await;
+        self.evict_transaction_if_idle(session_id, &transaction).await;
     }
 
-    async fn evict_transaction_if_idle(&self, agent_id: Uuid, transaction: &Arc<Mutex<()>>) {
-        if self.inner.lock().await.contains_key(&agent_id) {
+    async fn evict_transaction_if_idle(&self, session_id: Uuid, transaction: &Arc<Mutex<()>>) {
+        if self.inner.lock().await.contains_key(&session_id) {
             return;
         }
         let mut transactions = self.transactions.lock().await;
-        if transactions.get(&agent_id).is_some_and(|current| {
+        if transactions.get(&session_id).is_some_and(|current| {
             Arc::ptr_eq(current, transaction) && Arc::strong_count(current) == 2
         }) {
-            transactions.remove(&agent_id);
+            transactions.remove(&session_id);
         }
     }
 
@@ -811,75 +811,75 @@ impl AgentControlHub {
         )
     }
 
-    pub async fn unregister_session(&self, session_id: &str) {
-        let agent_ids = {
+    pub async fn unregister_viewer(&self, viewer_id: &str) {
+        let session_ids = {
             let states = self.inner.lock().await;
             states
                 .iter()
-                .filter_map(|(agent_id, state)| {
-                    state.viewers.contains_key(session_id).then_some(*agent_id)
+                .filter_map(|(session_id, state)| {
+                    state.viewers.contains_key(viewer_id).then_some(*session_id)
                 })
                 .collect::<Vec<_>>()
         };
-        for agent_id in agent_ids {
-            self.unregister(agent_id, session_id).await;
+        for session_id in session_ids {
+            self.unregister(session_id, viewer_id).await;
         }
     }
 
-    pub async fn is_owner(&self, agent_id: Uuid, session_id: &str) -> bool {
+    pub async fn is_owner(&self, session_id: Uuid, viewer_id: &str) -> bool {
         self.inner
             .lock()
             .await
-            .get(&agent_id)
-            .is_some_and(|state| state.owner.as_deref() == Some(session_id))
+            .get(&session_id)
+            .is_some_and(|state| state.owner.as_deref() == Some(viewer_id))
     }
 
-    pub async fn contains_viewer(&self, agent_id: Uuid, session_id: &str) -> bool {
+    pub async fn contains_viewer(&self, session_id: Uuid, viewer_id: &str) -> bool {
         self.inner
             .lock()
             .await
-            .get(&agent_id)
-            .is_some_and(|state| state.viewers.contains_key(session_id))
+            .get(&session_id)
+            .is_some_and(|state| state.viewers.contains_key(viewer_id))
     }
 
     pub async fn take_control(
         &self,
-        agent_id: Uuid,
-        session_id: &str,
+        session_id: Uuid,
+        viewer_id: &str,
         cols: u16,
         rows: u16,
     ) -> bool {
         let changed = {
             let mut states = self.inner.lock().await;
-            let Some(state) = states.get_mut(&agent_id) else {
+            let Some(state) = states.get_mut(&session_id) else {
                 return false;
             };
-            if !state.viewers.contains_key(session_id) {
+            if !state.viewers.contains_key(viewer_id) {
                 return false;
             }
-            let changed = state.owner.as_deref() != Some(session_id)
+            let changed = state.owner.as_deref() != Some(viewer_id)
                 || state.cols != Some(cols)
                 || state.rows != Some(rows);
-            state.owner = Some(session_id.to_string());
+            state.owner = Some(viewer_id.to_string());
             state.cols = Some(cols);
             state.rows = Some(rows);
             changed
         };
-        self.broadcast(agent_id).await;
+        self.broadcast(session_id).await;
         changed
     }
 
     pub async fn update_size(
         &self,
-        agent_id: Uuid,
-        session_id: &str,
+        session_id: Uuid,
+        viewer_id: &str,
         cols: u16,
         rows: u16,
     ) -> Option<bool> {
         let changed = {
             let mut states = self.inner.lock().await;
-            let state = states.get_mut(&agent_id)?;
-            if state.owner.as_deref() != Some(session_id) {
+            let state = states.get_mut(&session_id)?;
+            if state.owner.as_deref() != Some(viewer_id) {
                 return None;
             }
             let changed = state.cols != Some(cols) || state.rows != Some(rows);
@@ -888,27 +888,27 @@ impl AgentControlHub {
             changed
         };
         if changed {
-            self.broadcast(agent_id).await;
+            self.broadcast(session_id).await;
         }
         Some(changed)
     }
 
-    async fn broadcast(&self, agent_id: Uuid) {
+    async fn broadcast(&self, session_id: Uuid) {
         let messages = {
             let states = self.inner.lock().await;
-            let Some(state) = states.get(&agent_id) else {
+            let Some(state) = states.get(&session_id) else {
                 return;
             };
             let viewers = state.viewers.len();
             state
                 .viewers
                 .iter()
-                .filter_map(|(session_id, viewer)| {
+                .filter_map(|(viewer_id, viewer)| {
                     let event = DisplayEvent {
                         version: PROTOCOL_VERSION,
                         kind: "event",
                         event: "display_state",
-                        owner: state.owner.as_deref() == Some(session_id),
+                        owner: state.owner.as_deref() == Some(viewer_id),
                         cols: state.cols,
                         rows: state.rows,
                         viewers,
@@ -1122,14 +1122,14 @@ mod tests {
 
     #[tokio::test]
     async fn display_ownership_promotes_and_notifies_multiple_viewers() {
-        let hub = AgentControlHub::default();
-        let agent_id = Uuid::new_v4();
+        let hub = SessionControlHub::default();
+        let session_id = Uuid::new_v4();
         let (first_tx, first_rx) = watch::channel(None);
         let (second_tx, second_rx) = watch::channel(None);
-        hub.register(agent_id, "first".into(), first_tx).await;
-        assert!(hub.is_owner(agent_id, "first").await);
-        hub.register(agent_id, "second".into(), second_tx).await;
-        assert!(!hub.is_owner(agent_id, "second").await);
+        hub.register(session_id, "first".into(), first_tx).await;
+        assert!(hub.is_owner(session_id, "first").await);
+        hub.register(session_id, "second".into(), second_tx).await;
+        assert!(!hub.is_owner(session_id, "second").await);
         assert!(first_rx
             .borrow()
             .as_ref()
@@ -1139,10 +1139,10 @@ mod tests {
             .as_ref()
             .is_some_and(|text| text.contains("\"owner\":false")));
 
-        let transaction = hub.transaction(agent_id).await;
+        let transaction = hub.transaction(session_id).await;
         let guard = transaction.lock().await;
-        hub.take_control(agent_id, "second", 132, 40).await;
-        assert!(hub.is_owner(agent_id, "second").await);
+        hub.take_control(session_id, "second", 132, 40).await;
+        assert!(hub.is_owner(session_id, "second").await);
         assert!(first_rx
             .borrow()
             .as_ref()
@@ -1153,8 +1153,8 @@ mod tests {
             .is_some_and(|text| text.contains("\"owner\":true")));
         drop(guard);
 
-        hub.unregister(agent_id, "second").await;
-        assert!(hub.is_owner(agent_id, "first").await);
+        hub.unregister(session_id, "second").await;
+        assert!(hub.is_owner(session_id, "first").await);
         assert!(first_rx
             .borrow()
             .as_ref()
@@ -1162,15 +1162,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ownership_backend_await_and_disconnect_are_one_agent_transaction() {
-        let hub = AgentControlHub::default();
-        let agent_id = Uuid::new_v4();
+    async fn ownership_backend_await_and_disconnect_are_one_session_transaction() {
+        let hub = SessionControlHub::default();
+        let session_id = Uuid::new_v4();
         let (first_tx, first_rx) = watch::channel(None);
         let (second_tx, second_rx) = watch::channel(None);
-        hub.register(agent_id, "first".into(), first_tx).await;
-        hub.register(agent_id, "second".into(), second_tx).await;
+        hub.register(session_id, "first".into(), first_tx).await;
+        hub.register(session_id, "second".into(), second_tx).await;
 
-        let transaction = hub.transaction(agent_id).await;
+        let transaction = hub.transaction(session_id).await;
         let transfer_hub = hub.clone();
         let transfer_transaction = transaction.clone();
         let transfer = tokio::spawn(async move {
@@ -1178,19 +1178,19 @@ mod tests {
             // Represents the awaited backend resize. Ownership is not exposed
             // until the same transaction commits its geometry.
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            transfer_hub.take_control(agent_id, "second", 140, 44).await;
+            transfer_hub.take_control(session_id, "second", 140, 44).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let disconnect_hub = hub.clone();
         let disconnect = tokio::spawn(async move {
-            disconnect_hub.unregister(agent_id, "second").await;
+            disconnect_hub.unregister(session_id, "second").await;
         });
         assert!(!disconnect.is_finished());
 
         transfer.await.unwrap();
         disconnect.await.unwrap();
-        assert!(hub.is_owner(agent_id, "first").await);
+        assert!(hub.is_owner(session_id, "first").await);
         assert!(first_rx.borrow().as_ref().is_some_and(|text| {
             text.contains("\"owner\":true")
                 && text.contains("\"cols\":140")
@@ -1203,19 +1203,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_agent_state_and_transaction_mutex_are_evicted() {
-        let hub = AgentControlHub::default();
-        let agent_id = Uuid::new_v4();
+    async fn idle_session_state_and_transaction_mutex_are_evicted() {
+        let hub = SessionControlHub::default();
+        let session_id = Uuid::new_v4();
         let (display, _events) = watch::channel(None);
-        hub.register(agent_id, "viewer".into(), display).await;
+        hub.register(session_id, "viewer".into(), display).await;
         assert_eq!(hub.retained_counts().await, (1, 1));
 
-        hub.unregister(agent_id, "viewer").await;
+        hub.unregister(session_id, "viewer").await;
         assert_eq!(hub.retained_counts().await, (0, 0));
 
         let (display, _events) = watch::channel(None);
-        hub.register(agent_id, "replacement".into(), display).await;
-        hub.remove_agent(agent_id).await;
+        hub.register(session_id, "replacement".into(), display).await;
+        hub.remove_session(session_id).await;
         assert_eq!(hub.retained_counts().await, (0, 0));
     }
 }

@@ -1,11 +1,11 @@
 //! spawnd-side supervision of mandatory session workers (docs/SESSIOND.md).
 //!
-//! For each worker agent, spawnd:
+//! For each session, spawnd:
 //! - spawns `spawn-worker` in its own process group (so it survives spawnd
 //!   restarts and upgrades),
 //! - connects to its unix socket and drives the framed `sessiond::wire`
 //!   protocol,
-//! - bridges worker output into the per-agent outbox → forwarder →
+//! - bridges worker output into the per-session outbox → forwarder →
 //!   {WS sink, DataChannel direct sinks} pipeline,
 //! - delivers fixed-size TERM/KILL requests through the worker's independent
 //!   lifecycle socket, where stable child ownership guards the signal,
@@ -27,7 +27,7 @@ use spawnd::sessiond::wire;
 use spawnd::sessiond::{endpoint, endpoint::LockAttempt};
 
 use crate::config;
-use crate::pty::{self, AgentHandle, ExitReason, ForwarderControl, WorkerCmd, WorkerHandleParts};
+use crate::pty::{self, ExitReason, ForwarderControl, SessionHandle, WorkerCmd, WorkerHandleParts};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ADOPT_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -49,6 +49,7 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
         // an `ED 2` on a huge screen can commit a full viewport at once.
         wire::T_HISTORY => Some(wire::MAX_FRAME_LEN),
         wire::T_HISTORY_WIPE => Some(8),
+        wire::T_FOREGROUND => Some(wire::MAX_FOREGROUND_BASENAME_BYTES),
         wire::T_EXIT => Some(MAX_EXIT_FRAME_BYTES),
         wire::T_ERROR => Some(MAX_WORKER_ERROR_FRAME_BYTES),
         _ => None,
@@ -148,12 +149,12 @@ fn short_worker_dir() -> Result<PathBuf> {
     Ok(base.join("workers"))
 }
 
-fn socket_path(dir: &std::path::Path, agent_id: Uuid) -> PathBuf {
-    dir.join(format!("{agent_id}.sock"))
+fn socket_path(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
+    dir.join(format!("{session_id}.sock"))
 }
 
-fn log_dir(dir: &std::path::Path, agent_id: Uuid) -> PathBuf {
-    dir.join(format!("{agent_id}.scrollback"))
+fn log_dir(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
+    dir.join(format!("{session_id}.scrollback"))
 }
 
 /// Resolve the spawn-worker binary: `$SPAWND_WORKER_BIN` → sibling of the
@@ -173,11 +174,11 @@ fn worker_bin() -> PathBuf {
     PathBuf::from("spawn-worker")
 }
 
-/// Launch a fresh worker for `agent.create` and start the agent inside it.
+/// Launch a fresh worker for `session.create` and start the login shell inside it.
 pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     let dir = worker_dir()?;
-    let socket = socket_path(&dir, spec.agent_id);
-    let logs = log_dir(&dir, spec.agent_id);
+    let socket = socket_path(&dir, spec.session_id);
+    let logs = log_dir(&dir, spec.session_id);
     let reservation = match endpoint::try_reserve(&socket)? {
         LockAttempt::Acquired(lock) => lock,
         LockAttempt::Busy => bail!("worker endpoint is already owned"),
@@ -186,8 +187,8 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--socket")
         .arg(&socket)
-        .arg("--agent-id")
-        .arg(spec.agent_id.to_string())
+        .arg("--session-id")
+        .arg(spec.session_id.to_string())
         .arg("--log-dir")
         .arg(&logs)
         .arg("--lock-fd")
@@ -198,7 +199,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Own process group: the worker (and its agent) must not die with
+        // Own process group: the worker (and its session) must not die with
         // spawnd. Note: under systemd, spawnd's unit needs KillMode=process
         // for this to survive `systemctl restart` (docs/SESSIOND.md).
         cmd.process_group(0);
@@ -224,17 +225,17 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
         .with_context(|| format!("spawning {}", bin.display()));
     let child = child_result?;
     drop(reservation);
-    tracing::info!(agent_id = %spec.agent_id, worker_pid = child.id(), "spawned session worker");
-    // Move the worker into its per-agent CPU scope before the agent spawns
-    // (T_START below) so the whole agent tree inherits the cgroup.
-    crate::cpu_scopes::enroll_worker(spec.agent_id, child.id()).await;
+    tracing::info!(session_id = %spec.session_id, worker_pid = child.id(), "spawned session worker");
+    // Move the worker into its per-session CPU scope before the shell spawns
+    // (T_START below) so the whole session tree inherits the cgroup.
+    crate::cpu_scopes::enroll_worker(spec.session_id, child.id()).await;
 
     let mut stream = connect_with_retry(&socket, CONNECT_TIMEOUT)
         .await
         .context("connecting to session worker")?;
-    let hello = read_hello(&mut stream, spec.agent_id).await?;
+    let hello = read_hello(&mut stream, spec.session_id).await?;
     if hello.state != "awaiting_start" {
-        bail!("worker is not available for a new agent");
+        bail!("worker is not available for a new session");
     }
     subscribe_history(&mut stream, &hello).await?;
 
@@ -256,7 +257,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
                 }
                 Some((wire::T_ERROR, payload)) => {
                     let err: wire::WorkerError = wire::decode_json(&payload)?;
-                    bail!("worker failed to start agent: {}", err.message);
+                    bail!("worker failed to start session: {}", err.message);
                 }
                 Some(_) => continue,
                 None => bail!("worker closed connection before Started"),
@@ -267,7 +268,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     .map_err(|_| anyhow!("timed out waiting for worker Started"))??;
 
     Ok(assemble(
-        spec.agent_id,
+        spec.session_id,
         started.pid,
         WorkerConnection {
             cwd: started.cwd,
@@ -294,10 +295,10 @@ async fn subscribe_history(stream: &mut UnixStream, hello: &wire::Hello) -> Resu
 }
 
 /// Adopt an already-running worker (spawnd restart / lazy attach). Returns
-/// `Ok(None)` when no live worker socket exists for this agent.
-pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
+/// `Ok(None)` when no live worker socket exists for this session.
+pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
     let dir = worker_dir()?;
-    let socket = socket_path(&dir, agent_id);
+    let socket = socket_path(&dir, session_id);
     if !socket.exists() {
         return Ok(None);
     }
@@ -308,7 +309,7 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
             return Ok(None);
         }
     };
-    let hello = read_hello(&mut stream, agent_id).await?;
+    let hello = read_hello(&mut stream, session_id).await?;
     if hello.state == "awaiting_start" {
         // Orphan that never got its Start; tell it to go away.
         let _ = wire::write_json_frame(
@@ -319,10 +320,10 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
         .await;
         return Ok(None);
     }
-    tracing::info!(%agent_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
+    tracing::info!(%session_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
     subscribe_history(&mut stream, &hello).await?;
     Ok(Some(assemble(
-        agent_id,
+        session_id,
         hello.pid.unwrap_or(0),
         WorkerConnection {
             cwd: hello
@@ -340,14 +341,14 @@ pub async fn adopt(agent_id: Uuid) -> Result<Option<pty::Launched>> {
 /// Whether the worker socket still exists. This deliberately does not connect:
 /// accepting a probe would displace the active supervisor connection and
 /// could fence a queued TERM/KILL command during restart.
-pub fn socket_exists(agent_id: Uuid) -> bool {
+pub fn socket_exists(session_id: Uuid) -> bool {
     let Ok(dir) = worker_dir() else {
         return false;
     };
-    socket_path(&dir, agent_id).exists()
+    socket_path(&dir, session_id).exists()
 }
 
-/// Agent ids with a worker socket present (candidates for adoption).
+/// Session ids with a worker socket present (candidates for adoption).
 pub fn discover_ids() -> Vec<Uuid> {
     let Ok(dir) = worker_dir() else {
         return Vec::new();
@@ -366,7 +367,7 @@ pub fn discover_ids() -> Vec<Uuid> {
         .collect()
 }
 
-/// Wire a connected worker stream into the standard per-agent plumbing:
+/// Wire a connected worker stream into the standard per-session plumbing:
 /// outbox → forwarder, a command channel for stdin/resize/replay, a separate
 /// acknowledged lifecycle channel, and an exit oneshot.
 struct WorkerConnection {
@@ -378,7 +379,7 @@ struct WorkerConnection {
     stream: UnixStream,
 }
 
-fn assemble(agent_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Launched {
+fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Launched {
     let WorkerConnection {
         cwd,
         cols,
@@ -389,7 +390,7 @@ fn assemble(agent_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Laun
     } = connection;
     let (outbox_tx, outbox_rx) = mpsc::channel::<pty::OutputChunk>(pty::WORKER_OUTPUT_QUEUE_DEPTH);
     let control = ForwarderControl::new();
-    tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
+    tokio::spawn(pty::run_forwarder(session_id, outbox_rx, control.clone()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(pty::WORKER_COMMAND_QUEUE_DEPTH);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
@@ -403,7 +404,7 @@ fn assemble(agent_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Laun
         cmd_rx,
         pending.clone(),
         Arc::clone(&alive),
-        agent_id,
+        session_id,
     ));
     tokio::spawn(run_reader(
         read_half,
@@ -412,14 +413,14 @@ fn assemble(agent_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Laun
         exit_tx,
         pending,
         Arc::clone(&alive),
-        agent_id,
+        session_id,
     ));
 
-    let handle = AgentHandle::new_worker(WorkerHandleParts {
-        agent_id,
+    let handle = SessionHandle::new_worker(WorkerHandleParts {
+        session_id,
         cwd,
         cmd_tx,
-        lifecycle: pty::AgentLifecycle::new(lifecycle_socket, lifecycle_instance),
+        lifecycle: pty::SessionLifecycle::new(lifecycle_socket, lifecycle_instance),
         alive,
         cols,
         rows,
@@ -444,7 +445,7 @@ async fn run_writer(
     mut cmd_rx: mpsc::Receiver<WorkerCmd>,
     pending: PendingReplays,
     alive: Arc<AtomicBool>,
-    agent_id: Uuid,
+    session_id: Uuid,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         if !alive.load(Ordering::Acquire) {
@@ -477,7 +478,7 @@ async fn run_writer(
             }
         };
         if let Err(e) = res {
-            tracing::debug!(%agent_id, error = %e, "worker write failed");
+            tracing::debug!(%session_id, error = %e, "worker write failed");
             break;
         }
     }
@@ -512,7 +513,7 @@ async fn run_reader(
     exit_tx: oneshot::Sender<ExitReason>,
     pending: PendingReplays,
     alive: Arc<AtomicBool>,
-    agent_id: Uuid,
+    session_id: Uuid,
 ) {
     let mut exit_tx = Some(exit_tx);
     loop {
@@ -531,7 +532,7 @@ async fn run_reader(
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%agent_id, %error, "invalid worker output frame");
+                        tracing::warn!(%session_id, %error, "invalid worker output frame");
                         break;
                     }
                 }
@@ -581,7 +582,7 @@ async fn run_reader(
                             .await;
                     }
                     Err(error) => {
-                        tracing::warn!(%agent_id, %error, "invalid worker history frame");
+                        tracing::warn!(%session_id, %error, "invalid worker history frame");
                     }
                 }
             }
@@ -590,7 +591,15 @@ async fn run_reader(
                 match wire::decode_history_wipe(&payload) {
                     Ok(epoch) => control.route_history(epoch, None, &[]).await,
                     Err(error) => {
-                        tracing::warn!(%agent_id, %error, "invalid worker history wipe frame");
+                        tracing::warn!(%session_id, %error, "invalid worker history wipe frame");
+                    }
+                }
+            }
+            Ok(Some((wire::T_FOREGROUND, payload))) => {
+                match wire::decode_foreground(&payload) {
+                    Ok(basename) => control.note_foreground(session_id, basename).await,
+                    Err(error) => {
+                        tracing::warn!(%session_id, %error, "invalid worker foreground frame");
                     }
                 }
             }
@@ -611,7 +620,7 @@ async fn run_reader(
             Ok(Some((wire::T_ERROR, payload))) => {
                 let payload = Zeroizing::new(payload);
                 if let Ok(err) = wire::decode_json::<wire::WorkerError>(&payload) {
-                    tracing::warn!(%agent_id, message = %err.message, "worker error");
+                    tracing::warn!(%session_id, message = %err.message, "worker error");
                     if let Some(waiter) = pending.lock().expect("pending lock").pop_front() {
                         let _ = waiter.send(Err(anyhow!("worker replay failed: {}", err.message)));
                     }
@@ -622,7 +631,7 @@ async fn run_reader(
             }
             Ok(Some((other, payload))) => {
                 drop(Zeroizing::new(payload));
-                tracing::debug!(%agent_id, frame_type = other, "ignoring worker frame");
+                tracing::debug!(%session_id, frame_type = other, "ignoring worker frame");
             }
             Ok(None) | Err(_) => {
                 // Connection lost without an Exit: distinguish "we dropped
@@ -679,7 +688,7 @@ fn cleanup_crashed_worker_endpoints(socket: &std::path::Path) {
     let _ = endpoint::remove_stale_socket(&wire::lifecycle_socket_path(socket));
 }
 
-async fn read_hello(stream: &mut UnixStream, expected_agent_id: Uuid) -> Result<wire::Hello> {
+async fn read_hello(stream: &mut UnixStream, expected_session_id: Uuid) -> Result<wire::Hello> {
     let frame = tokio::time::timeout(
         CONNECT_TIMEOUT,
         wire::read_frame_limited(stream, |frame_type| {
@@ -692,7 +701,7 @@ async fn read_hello(stream: &mut UnixStream, expected_agent_id: Uuid) -> Result<
         bail!("worker did not send Hello first");
     };
     let hello: wire::Hello = wire::decode_json(&payload)?;
-    if hello.agent_id != expected_agent_id {
+    if hello.session_id != expected_session_id {
         bail!("worker Hello identity validation failed");
     }
     if hello.version != wire::PROTO_VERSION {
@@ -761,7 +770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_agent_identity_is_validated_before_instance_trust() {
+    async fn hello_session_identity_is_validated_before_instance_trust() {
         let expected = Uuid::new_v4();
         let received = Uuid::new_v4();
         let (mut client, mut peer) = UnixStream::pair().unwrap();
@@ -771,7 +780,7 @@ mod tests {
                 wire::T_HELLO,
                 &wire::Hello {
                     version: wire::PROTO_VERSION,
-                    agent_id: received,
+                    session_id: received,
                     instance_id: Uuid::new_v4(),
                     state: "running".into(),
                     pid: Some(10),
@@ -829,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_worker_socket_caps_and_rejects_fast_input() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let (daemon_stream, worker_stream) = UnixStream::pair().expect("unix pair");
         let (read_half, write_half) = daemon_stream.into_split();
         drop(read_half);
@@ -842,13 +851,13 @@ mod tests {
             cmd_rx,
             Default::default(),
             Arc::clone(&alive),
-            agent_id,
+            session_id,
         ));
-        let handle = AgentHandle::new_worker(WorkerHandleParts {
-            agent_id,
+        let handle = SessionHandle::new_worker(WorkerHandleParts {
+            session_id,
             cwd: "/".into(),
             cmd_tx,
-            lifecycle: pty::AgentLifecycle::new(
+            lifecycle: pty::SessionLifecycle::new(
                 PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
                 Uuid::new_v4(),
             ),
@@ -887,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_output_emits_content_free_activity_without_status_filtering() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let (daemon_stream, mut worker_stream) = UnixStream::pair().expect("unix pair");
         let (read_half, _write_half) = daemon_stream.into_split();
 
@@ -895,7 +904,7 @@ mod tests {
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(pty::run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(pty::run_forwarder(session_id, outbox_rx, control.clone()));
         let (exit_tx, _exit_rx) = oneshot::channel();
         let reader = tokio::spawn(run_reader(
             read_half,
@@ -904,7 +913,7 @@ mod tests {
             exit_tx,
             Default::default(),
             Arc::new(AtomicBool::new(true)),
-            agent_id,
+            session_id,
         ));
 
         wire::write_frame(
@@ -915,7 +924,7 @@ mod tests {
         .await
         .expect("worker output");
         let activity = sink_rx.recv().await.unwrap();
-        assert!(activity.as_str().contains("agent.activity"));
+        assert!(activity.as_str().contains("session.activity"));
         assert!(!activity.as_str().contains("12:34"));
         assert!(sink_rx.try_recv().is_err());
 
@@ -991,7 +1000,7 @@ mod tests {
         std::env::set_var("SPAWND_WORKER_DIR", dir.path());
         std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
 
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let argv: Vec<String> = ["/bin/sh", "-c", "trap '' TERM; printf 'wb-hello\\n'; cat"]
             .iter()
             .map(|s| s.to_string())
@@ -1004,7 +1013,7 @@ mod tests {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let launched = launch(pty::LaunchSpec {
-            agent_id,
+            session_id,
             cwd: "/",
             cols: 80,
             rows: 24,
@@ -1016,7 +1025,7 @@ mod tests {
         assert!(launched.pid > 0);
 
         let duplicate = launch(pty::LaunchSpec {
-            agent_id,
+            session_id,
             cwd: "/",
             cols: 80,
             rows: 24,
@@ -1025,7 +1034,7 @@ mod tests {
         })
         .await;
         let duplicate_error = match duplicate {
-            Ok(_) => panic!("duplicate same-agent launch unexpectedly succeeded"),
+            Ok(_) => panic!("duplicate same-session launch unexpectedly succeeded"),
             Err(error) => error,
         };
         assert_eq!(
@@ -1083,7 +1092,7 @@ mod tests {
         // Simulate a spawnd restart: drop the handle, adopt the live worker.
         drop(launched);
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let adopted = adopt(agent_id)
+        let adopted = adopt(session_id)
             .await
             .expect("adopt ok")
             .expect("worker should still be alive");
@@ -1128,8 +1137,8 @@ mod tests {
         }
         assert_eq!(stalled_cmd_tx.capacity(), 0);
         let (priority_outbox, _priority_outbox_rx) = mpsc::channel(pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let priority_handle = AgentHandle::new_worker(WorkerHandleParts {
-            agent_id,
+        let priority_handle = SessionHandle::new_worker(WorkerHandleParts {
+            session_id,
             cwd: "/".into(),
             cmd_tx: stalled_cmd_tx,
             lifecycle: adopted.handle.lifecycle(),
@@ -1142,7 +1151,7 @@ mod tests {
 
         // Restart shutdown must not probe by connecting: a probe would become
         // the worker's current supervisor generation and fence this TERM.
-        // The agent ignores TERM, so the independent lifecycle path must
+        // The child ignores TERM, so the independent lifecycle path must
         // remain usable for KILL escalation even if ordinary commands stall.
         let lifecycle = priority_handle.lifecycle();
         lifecycle
@@ -1154,9 +1163,9 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(300), &mut exit_rx)
                 .await
                 .is_err(),
-            "TERM unexpectedly stopped the signal-ignoring test agent"
+            "TERM unexpectedly stopped the signal-ignoring test child"
         );
-        assert!(socket_exists(agent_id));
+        assert!(socket_exists(session_id));
         lifecycle
             .shutdown(wire::LifecycleSignal::Kill)
             .await
@@ -1170,7 +1179,7 @@ mod tests {
             "exit reason should carry a code or signal: {reason:?}"
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while socket_exists(agent_id) {
+        while socket_exists(session_id) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "worker socket never went away"

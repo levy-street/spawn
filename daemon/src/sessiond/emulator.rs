@@ -3,7 +3,7 @@
 //! The worker feeds every PTY output byte through this emulator so that, at
 //! any moment, it can serialize the *current screen state* as an ANSI byte
 //! stream that reconstructs it in the browser's xterm.js — replays open with
-//! an exact synthesized repaint, and the agent process is never signaled to
+//! an exact synthesized repaint, and the session process is never signaled to
 //! provoke one.
 //!
 //! The emulator is also the single authority on *scrollback history*: raw TUI

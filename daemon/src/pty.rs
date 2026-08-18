@@ -1,11 +1,11 @@
-//! Per-agent terminal routing shared by `spawnd` and the mandatory session
+//! Per-session terminal routing shared by `spawnd` and the mandatory session
 //! worker backend.
 //!
-//! A `spawn-worker` owns each agent's PTY. Its output enters a bounded
-//! per-agent outbox and a long-lived forwarder routes it to the current server
-//! connection plus bounded direct DataChannel sinks. Workers and their PTYs
-//! survive `spawnd` reconnects/restarts; `spawnd` never owns a second terminal
-//! emulator or shells out to a multiplexer.
+//! A `spawn-worker` owns each session's PTY. Its output enters a bounded
+//! per-session outbox and a long-lived forwarder routes it to the current
+//! server connection plus bounded direct DataChannel sinks. Workers and their
+//! PTYs survive `spawnd` reconnects/restarts; `spawnd` never owns a second
+//! terminal emulator or shells out to a multiplexer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future;
@@ -53,7 +53,7 @@ impl Drop for WsOutbound {
     }
 }
 
-/// The thing the WS session hands to a per-agent forwarder so that bytes
+/// The thing the WS connection hands to a per-session forwarder so that bytes
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 
@@ -151,6 +151,11 @@ pub const WORKER_OUTPUT_QUEUE_DEPTH: usize = 32;
 pub const WORKER_COMMAND_QUEUE_DEPTH: usize = 32;
 pub const MAX_WORKER_INPUT_BYTES: usize = 64 * 1024;
 const LIFECYCLE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// `session.foreground` emits at most this often per session, however fast
+/// worker reports arrive (reconnect re-sends can beat the worker's 1 s poll).
+pub(crate) const FOREGROUND_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Server-visible foreground command bound: a bare basename, nothing longer.
+pub(crate) const MAX_FOREGROUND_COMMAND_CHARS: usize = 64;
 
 /// Immutable result of handling one output event at its producer. Immediate
 /// activity and the eligibility/generation of an ambiguous idle candidate are
@@ -255,18 +260,18 @@ pub(crate) enum ActivityKind {
 
 /// The only activity serializer: its API cannot accept terminal bytes or any
 /// content-carrying outbound frame.
-fn activity_message(agent_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> {
+fn activity_message(session_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> {
     let event = match kind {
-        ActivityKind::Output => Outbound::AgentActivity { agent_id },
-        ActivityKind::Input => Outbound::AgentInputActivity { agent_id },
+        ActivityKind::Output => Outbound::SessionActivity { session_id },
+        ActivityKind::Input => Outbound::SessionInputActivity { session_id },
     };
     serde_json::to_string(&event).ok().map(WsOutbound::json)
 }
 
 /// Best-effort emission used by the WebRTC input callback. The sink accepts
 /// serialized control-plane JSON only; it has no terminal-byte variant.
-pub(crate) fn try_emit_activity(out_tx: &SessionSink, agent_id: Uuid, kind: ActivityKind) -> bool {
-    let Some(message) = activity_message(agent_id, kind) else {
+pub(crate) fn try_emit_activity(out_tx: &SessionSink, session_id: Uuid, kind: ActivityKind) -> bool {
+    let Some(message) = activity_message(session_id, kind) else {
         return false;
     };
     out_tx.try_send(message).is_ok()
@@ -283,7 +288,7 @@ struct DirectSinkEntry {
     bytes_sent: Arc<AtomicU64>,
 }
 
-/// Shared between an agent's forwarder task and the WS session lifecycle.
+/// Shared between a session's forwarder task and the WS connection lifecycle.
 /// `slot` holds the current session's bounded outbound sink (or `None` between
 /// sessions).
 #[derive(Clone)]
@@ -299,8 +304,25 @@ pub struct ForwarderControl {
     source_notify: Arc<Notify>,
     /// Monotonic activity state. Input/output pings have independent throttle
     /// clocks; injected input/resize/redraw extend the output suppression
-    /// deadline so their echoes and repaints do not count as agent work.
+    /// deadline so their echoes and repaints do not count as session work.
     activity: Arc<Mutex<ActivityState>>,
+    /// Foreground-report state: the latest worker-observed basename and the
+    /// change-only, rate-limited emission bookkeeping behind
+    /// `session.foreground`.
+    foreground: Arc<Mutex<ForegroundState>>,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundState {
+    /// Latest basename observed by the worker (already re-sent by the worker
+    /// on reconnection, so this survives supervisor restarts).
+    observed: Option<String>,
+    /// Latest basename actually emitted to the server.
+    emitted: Option<String>,
+    last_emit_at: Option<Instant>,
+    /// A delayed emit task is already scheduled; it reads `observed` when the
+    /// rate-limit window closes, so later observations need no new task.
+    delayed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -323,11 +345,104 @@ impl ForwarderControl {
             source_offset: Arc::new(AtomicU64::new(0)),
             source_notify: Arc::new(Notify::new()),
             activity: Arc::new(Mutex::new(ActivityState::default())),
+            foreground: Arc::new(Mutex::new(ForegroundState::default())),
+        }
+    }
+
+    /// Record a worker foreground report and relay it to the server as
+    /// `session.foreground`: emitted only when the basename changes, at most
+    /// once per `FOREGROUND_MIN_INTERVAL` per session. A change that lands
+    /// inside the window is deferred, never dropped, so the server always
+    /// converges on the latest value.
+    pub(crate) async fn note_foreground(&self, session_id: Uuid, command: &str) {
+        let command: String = command.chars().take(MAX_FOREGROUND_COMMAND_CHARS).collect();
+        let emit_now = {
+            let Ok(mut state) = self.foreground.lock() else {
+                return;
+            };
+            if state.observed.as_deref() == Some(command.as_str()) {
+                return;
+            }
+            state.observed = Some(command.clone());
+            if state.delayed {
+                return;
+            }
+            let now = Instant::now();
+            let wait = state
+                .last_emit_at
+                .map(|last| FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last)))
+                .unwrap_or(Duration::ZERO);
+            if wait.is_zero() {
+                if state.emitted.as_deref() == Some(command.as_str()) {
+                    return;
+                }
+                state.emitted = Some(command.clone());
+                state.last_emit_at = Some(now);
+                true
+            } else {
+                state.delayed = true;
+                let control = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    control.flush_delayed_foreground(session_id).await;
+                });
+                false
+            }
+        };
+        if emit_now {
+            emit_foreground(self, session_id, command).await;
+        }
+    }
+
+    async fn flush_delayed_foreground(&self, session_id: Uuid) {
+        let pending = {
+            let Ok(mut state) = self.foreground.lock() else {
+                return;
+            };
+            state.delayed = false;
+            if state.observed == state.emitted {
+                None
+            } else {
+                let command = state.observed.clone();
+                state.emitted = command.clone();
+                state.last_emit_at = Some(Instant::now());
+                command
+            }
+        };
+        if let Some(command) = pending {
+            emit_foreground(self, session_id, command).await;
+        }
+    }
+
+    /// Re-announce the current foreground command through a freshly installed
+    /// server sink. Frames emitted while no WS connection existed were
+    /// dropped; this heals the server's copy without waiting for a change.
+    pub(crate) async fn resend_foreground(&self, session_id: Uuid) {
+        let command = {
+            let Ok(mut state) = self.foreground.lock() else {
+                return;
+            };
+            state.emitted = None;
+            if state.delayed {
+                None
+            } else {
+                match state.observed.clone() {
+                    Some(command) => {
+                        state.emitted = Some(command.clone());
+                        state.last_emit_at = Some(Instant::now());
+                        Some(command)
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(command) = command {
+            emit_foreground(self, session_id, command).await;
         }
     }
 
     /// Suppress output-activity classification for `window` — an injected
-    /// resize/redraw or local input echo must not register as agent work.
+    /// resize/redraw or local input echo must not register as session work.
     pub fn suppress_activity(&self, window: Duration) {
         self.suppress_activity_at(Instant::now(), window);
     }
@@ -345,7 +460,7 @@ impl ForwarderControl {
         }
     }
 
-    /// Decide whether this output chunk should emit an `agent.activity` ping:
+    /// Decide whether this output chunk should emit a `session.activity` ping:
     /// outside the throttle window, not suppressed, and carrying meaningful
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
@@ -418,11 +533,11 @@ impl ForwarderControl {
     }
 
     /// Record local DataChannel input without revealing its contents. The
-    /// caller emits `agent.input_activity` only when this returns true.
+    /// caller emits `session.input_activity` only when this returns true.
     ///
     /// `bytes` is inspected but never retained or forwarded: the classifier
     /// answers one question — was a person responsible for this — and the
-    /// answer is a bool. The bytes still reach the agent either way; only the
+    /// answer is a bool. The bytes still reach the session either way; only the
     /// activity ping is withheld, because a terminal answering a question the
     /// application asked it is not the user doing anything.
     pub fn note_input(&self, bytes: &[u8]) -> bool {
@@ -719,12 +834,12 @@ pub enum WorkerCmd {
 }
 
 #[derive(Clone)]
-pub struct AgentLifecycle {
+pub struct SessionLifecycle {
     socket: PathBuf,
     instance_id: Uuid,
 }
 
-impl AgentLifecycle {
+impl SessionLifecycle {
     pub(crate) fn new(socket: PathBuf, instance_id: Uuid) -> Self {
         Self {
             socket,
@@ -791,7 +906,7 @@ impl AgentLifecycle {
             };
             return match ack[0] {
                 wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
-                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("agent process already exited"),
+                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("session process already exited"),
                 wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
                     anyhow::bail!("worker lifecycle instance changed")
                 }
@@ -801,22 +916,22 @@ impl AgentLifecycle {
     }
 }
 
-/// Per-agent runtime handle.
-pub struct AgentHandle {
-    pub agent_id: Uuid,
+/// Per-session runtime handle.
+pub struct SessionHandle {
+    pub session_id: Uuid,
     /// Canonical cwd capability root reported by the worker that owns this
     /// exact backend generation.
     pub cwd: Arc<str>,
     /// Last size applied through this handle.
     size: Arc<Mutex<(u16, u16)>>,
-    /// Held alive while the agent is alive; when dropped, the per-agent
+    /// Held alive while the session is alive; when dropped, the per-session
     /// forwarder task exits after the worker connection closes.
     #[allow(dead_code)]
     outbox_tx: mpsc::Sender<OutputChunk>,
     /// Lets the WS session install/clear the forwarder's current sink.
     pub control: ForwarderControl,
     cmd_tx: mpsc::Sender<WorkerCmd>,
-    lifecycle: AgentLifecycle,
+    lifecycle: SessionLifecycle,
     alive: Arc<AtomicBool>,
     #[cfg(test)]
     input_copies: Arc<AtomicU64>,
@@ -824,10 +939,10 @@ pub struct AgentHandle {
 
 /// Everything `worker_backend` needs to assemble a worker-backed handle.
 pub struct WorkerHandleParts {
-    pub agent_id: Uuid,
+    pub session_id: Uuid,
     pub cwd: String,
     pub cmd_tx: mpsc::Sender<WorkerCmd>,
-    pub lifecycle: AgentLifecycle,
+    pub lifecycle: SessionLifecycle,
     pub alive: Arc<AtomicBool>,
     pub cols: u16,
     pub rows: u16,
@@ -835,10 +950,10 @@ pub struct WorkerHandleParts {
     pub control: ForwarderControl,
 }
 
-impl AgentHandle {
+impl SessionHandle {
     pub fn new_worker(parts: WorkerHandleParts) -> Self {
         Self {
-            agent_id: parts.agent_id,
+            session_id: parts.session_id,
             cwd: Arc::from(parts.cwd),
             size: Arc::new(Mutex::new((parts.cols, parts.rows))),
             outbox_tx: parts.outbox_tx,
@@ -910,7 +1025,7 @@ impl AgentHandle {
         Ok(true)
     }
 
-    pub fn lifecycle(&self) -> AgentLifecycle {
+    pub fn lifecycle(&self) -> SessionLifecycle {
         self.lifecycle.clone()
     }
 
@@ -938,19 +1053,19 @@ impl AgentHandle {
 }
 
 pub struct LaunchSpec<'a> {
-    pub agent_id: Uuid,
+    pub session_id: Uuid,
     pub cwd: &'a str,
     pub cols: u16,
     pub rows: u16,
     pub argv: &'a [String],
-    /// Final env to pass to the launched agent.
+    /// Final env to pass to the session's login shell.
     pub env: &'a BTreeMap<String, String>,
 }
 
 /// Result of a successful launch.
 pub struct Launched {
-    pub handle: AgentHandle,
-    /// PID of the real agent process, reported by its session worker.
+    pub handle: SessionHandle,
+    /// PID of the session's shell process, reported by its session worker.
     pub pid: u32,
     /// Future-style: receives the exit reason once the PTY EOFs.
     pub exit_rx: oneshot::Receiver<ExitReason>,
@@ -962,12 +1077,12 @@ pub struct ExitReason {
     pub signal: Option<String>,
 }
 
-/// Long-lived per-agent task: route raw PTY bytes only to bounded direct
+/// Long-lived per-session task: route raw PTY bytes only to bounded direct
 /// DataChannel sinks and emit content-free activity metadata to the current
 /// control-plane session. Worker replay is the only catch-up source.
 /// Exits when every bounded-outbox sender is dropped.
 pub(crate) async fn run_forwarder(
-    agent_id: Uuid,
+    session_id: Uuid,
     mut outbox_rx: mpsc::Receiver<OutputChunk>,
     control: ForwarderControl,
 ) {
@@ -976,7 +1091,7 @@ pub(crate) async fn run_forwarder(
         tokio::select! {
             chunk = outbox_rx.recv() => match chunk {
                 Some(chunk) => queue_output_chunk(
-                    agent_id,
+                    session_id,
                     chunk,
                     &control,
                     &mut idle_timer,
@@ -986,18 +1101,18 @@ pub(crate) async fn run_forwarder(
             generation = wait_for_idle(&mut idle_timer) => {
                 idle_timer = None;
                 if control.resolve_output_idle(generation) {
-                    if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+                    if let Some(activity) = activity_message(session_id, ActivityKind::Output) {
                         try_mirror(&control, activity).await;
                     }
                 }
             }
         }
     }
-    tracing::debug!(%agent_id, "forwarder exiting (outbox closed)");
+    tracing::debug!(%session_id, "forwarder exiting (outbox closed)");
 }
 
 async fn queue_output_chunk(
-    agent_id: Uuid,
+    session_id: Uuid,
     chunk: OutputChunk,
     control: &ForwarderControl,
     idle_timer: &mut Option<IdleResolutionTimer>,
@@ -1008,9 +1123,19 @@ async fn queue_output_chunk(
         return;
     }
     if chunk.activity {
-        if let Some(activity) = activity_message(agent_id, ActivityKind::Output) {
+        if let Some(activity) = activity_message(session_id, ActivityKind::Output) {
             try_mirror(control, activity).await;
         }
+    }
+}
+
+async fn emit_foreground(control: &ForwarderControl, session_id: Uuid, command: String) {
+    let frame = Outbound::SessionForeground {
+        session_id,
+        command,
+    };
+    if let Ok(text) = serde_json::to_string(&frame) {
+        try_mirror(control, WsOutbound::json(text)).await;
     }
 }
 
@@ -1104,7 +1229,7 @@ mod tests {
                 .spawn()
                 .expect("spawn unrelated sentinel process"),
         );
-        let lifecycle = AgentLifecycle::new(server_path, Uuid::new_v4());
+        let lifecycle = SessionLifecycle::new(server_path, Uuid::new_v4());
         let started = tokio::time::Instant::now();
         let error = tokio::time::timeout(
             LIFECYCLE_DELIVERY_TIMEOUT + Duration::from_secs(1),
@@ -1134,13 +1259,13 @@ mod tests {
         control: ForwarderControl,
         cmd_tx: mpsc::Sender<WorkerCmd>,
         alive: Arc<AtomicBool>,
-    ) -> AgentHandle {
+    ) -> SessionHandle {
         let (outbox_tx, _outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
-        AgentHandle::new_worker(WorkerHandleParts {
-            agent_id: Uuid::new_v4(),
+        SessionHandle::new_worker(WorkerHandleParts {
+            session_id: Uuid::new_v4(),
             cwd: "/".into(),
             cmd_tx,
-            lifecycle: AgentLifecycle::new(
+            lifecycle: SessionLifecycle::new(
                 PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
                 Uuid::new_v4(),
             ),
@@ -1251,14 +1376,14 @@ mod tests {
 
     #[tokio::test]
     async fn verbose_output_with_absent_then_stalled_mirror_keeps_direct_viewer_healthy() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let direct = control.add_direct_sink("healthy".into()).await;
         let mut direct_rx = direct.receiver;
         let mut disconnected = direct.disconnected;
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
         assert_eq!(outbox_tx.max_capacity(), WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
         let received = Arc::new(AtomicUsize::new(0));
         let received_task = Arc::clone(&received);
         let chunk = vec![b'x'; 8 * 1024];
@@ -1379,7 +1504,7 @@ mod tests {
 
     #[test]
     fn terminal_replies_never_register_as_input() {
-        // Clicking an agent to see what it is doing makes xterm.js send focus
+        // Clicking a session to see what it is doing makes xterm.js send focus
         // and mouse reports. Counting those made the badge say "Input sent"
         // because somebody looked at it.
         let control = ForwarderControl::new();
@@ -1408,11 +1533,11 @@ mod tests {
 
     #[tokio::test]
     async fn activity_frames_serialize_without_terminal_content() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(2);
 
-        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Output));
-        assert!(try_emit_activity(&tx, agent_id, ActivityKind::Input));
+        assert!(try_emit_activity(&tx, session_id, ActivityKind::Output));
+        assert!(try_emit_activity(&tx, session_id, ActivityKind::Input));
 
         let output = rx.recv().await.unwrap();
         let output_json = output.as_str();
@@ -1420,22 +1545,22 @@ mod tests {
         let input_json = input.as_str();
         assert_eq!(
             output_json,
-            &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"session.activity","session_id":"{session_id}"}}"#)
         );
         assert_eq!(
             input_json,
-            &format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"session.input_activity","session_id":"{session_id}"}}"#)
         );
     }
 
     #[tokio::test]
     async fn forwarder_keeps_output_off_server_and_emits_content_free_activity() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (sink_tx, mut sink_rx) = mpsc::channel(4);
         control.set_sink(sink_tx).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
 
         outbox_tx
             .try_send(source_output(&control, b"sensitive terminal output"))
@@ -1446,7 +1571,7 @@ mod tests {
         let activity_json = activity_message.as_str();
         assert_eq!(
             activity_json,
-            &format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"session.activity","session_id":"{session_id}"}}"#)
         );
         assert!(!activity_json.contains("sensitive terminal output"));
         assert!(sink_rx.try_recv().is_err());
@@ -1455,7 +1580,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_mirror_is_detached_while_direct_output_continues() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let mut direct = control.add_direct_sink("test".into()).await;
 
@@ -1464,7 +1589,7 @@ mod tests {
         let (sink_tx, mut sink_rx) = mpsc::channel(1);
         control.set_sink(sink_tx).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
 
         let mut first_activity = source_output(&control, b"ok");
         first_activity.activity = true;
@@ -1489,7 +1614,7 @@ mod tests {
         let first = sink_rx.recv().await.unwrap();
         assert_eq!(
             first.as_str(),
-            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            format!(r#"{{"type":"session.activity","session_id":"{session_id}"}}"#)
         );
         assert!(sink_rx.try_recv().is_err());
         assert!(control.slot.lock().await.is_none());
@@ -1497,11 +1622,11 @@ mod tests {
 
     #[tokio::test]
     async fn forwarder_does_not_reclassify_suppressed_output_when_sink_reconnects() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let mut direct = control.add_direct_sink("test".into()).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
 
         // There is intentionally no server sink while both chunks are
         // classified. A later suppression cannot erase the first decision.
@@ -1528,13 +1653,13 @@ mod tests {
 
     #[tokio::test]
     async fn direct_sink_anchor_tracks_exact_source_bytes_across_capture_boundary() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (mirror_tx, mut mirror_rx) = mpsc::channel(64);
         control.set_sink(mirror_tx).await;
         tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
 
         // Adoption establishes a durable worker coordinate before this viewer
         // exists; those historical bytes must not count in spawn.pty offsets.
@@ -1589,14 +1714,14 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_direct_sink_is_bounded_and_disconnected_for_replay_catchup() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (mirror_tx, mut mirror_rx) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH * 4);
         control.set_sink(mirror_tx).await;
         tokio::spawn(async move { while mirror_rx.recv().await.is_some() {} });
         let mut direct = control.add_direct_sink("stalled".into()).await;
         let (outbox_tx, outbox_rx) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH + 1);
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control.clone()));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control.clone()));
 
         for _ in 0..=DIRECT_SINK_QUEUE_DEPTH {
             outbox_tx.send(source_output(&control, b"x")).await.unwrap();
@@ -1615,7 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn producer_decision_precedes_enqueue_and_later_suppression() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
 
@@ -1628,12 +1753,12 @@ mod tests {
 
         let (sink_tx, mut sink_rx) = mpsc::channel(2);
         control.set_sink(sink_tx).await;
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control));
         drop(outbox_tx);
 
         assert_eq!(
             sink_rx.recv().await.unwrap().as_str(),
-            format!(r#"{{"type":"agent.activity","agent_id":"{agent_id}"}}"#)
+            format!(r#"{{"type":"session.activity","session_id":"{session_id}"}}"#)
         );
         assert!(sink_rx.try_recv().is_err());
         forwarder.await.unwrap();
@@ -1641,7 +1766,7 @@ mod tests {
 
     #[tokio::test]
     async fn suppression_preceding_producer_decision_stays_with_queued_output() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = ForwarderControl::new();
         let (outbox_tx, outbox_rx) = mpsc::channel(WORKER_OUTPUT_QUEUE_DEPTH);
 
@@ -1654,7 +1779,7 @@ mod tests {
 
         let (sink_tx, mut sink_rx) = mpsc::channel(2);
         control.set_sink(sink_tx).await;
-        let forwarder = tokio::spawn(run_forwarder(agent_id, outbox_rx, control));
+        let forwarder = tokio::spawn(run_forwarder(session_id, outbox_rx, control));
         drop(outbox_tx);
 
         forwarder.await.unwrap();

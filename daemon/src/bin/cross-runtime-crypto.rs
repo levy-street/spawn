@@ -130,7 +130,7 @@ fn produce() -> Result<ExchangeArtifact> {
         SignalKind::Offer,
         2,
         Uuid::new_v4().to_string(),
-        ScopeType::Agent,
+        ScopeType::Session,
         Uuid::new_v4().to_string(),
         SenderRole::Browser,
         *host_key.verifying_key().as_bytes(),
@@ -142,7 +142,7 @@ fn produce() -> Result<ExchangeArtifact> {
         signal_kind: "offer".to_owned(),
         protocol_version: transcript.protocol_version(),
         session_id: transcript.session_id().to_owned(),
-        scope_type: "agent".to_owned(),
+        scope_type: "session".to_owned(),
         scope_id: transcript.scope_id().to_owned(),
         sender_role: "browser".to_owned(),
         intended_peer_public_key: host_public_key.clone(),
@@ -152,20 +152,20 @@ fn produce() -> Result<ExchangeArtifact> {
         signature: sign_transcript_wire(&browser_key, &transcript)
             .context("signing Rust signed signal")?,
     };
-    let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &transcript)
+    let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Session, &transcript)
         .context("signing Rust RTC wire envelope")?;
     let answer_transcript = SignedSignalTranscript::new(
         SignalKind::Answer,
         2,
         transcript.session_id().to_owned(),
-        ScopeType::Agent,
+        ScopeType::Session,
         transcript.scope_id().to_owned(),
         SenderRole::Daemon,
         *browser_key.verifying_key().as_bytes(),
         exact_sdp.clone(),
     )
     .context("constructing Rust live answer transcript")?;
-    let live_answer = sign_rtc_signal_wire(&host_key, RtcProtocol::Agent, &answer_transcript)
+    let live_answer = sign_rtc_signal_wire(&host_key, RtcProtocol::Session, &answer_transcript)
         .context("signing Rust live answer envelope")?;
 
     let user_id = Uuid::new_v4().to_string();
@@ -274,7 +274,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
             SignalKind::Offer,
             2,
             invalid,
-            ScopeType::Agent,
+            ScopeType::Session,
             &artifact.signal.scope_id,
             SenderRole::Browser,
             *host_key.as_bytes(),
@@ -287,7 +287,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
             SignalKind::Offer,
             2,
             &artifact.signal.session_id,
-            ScopeType::Agent,
+            ScopeType::Session,
             invalid,
             SenderRole::Browser,
             *host_key.as_bytes(),
@@ -308,7 +308,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
             SignalKind::Offer,
             2,
             &artifact.signal.session_id,
-            ScopeType::Agent,
+            ScopeType::Session,
             &artifact.signal.scope_id,
             SenderRole::Browser,
             raw,
@@ -325,7 +325,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
             SignalKind::Offer,
             2,
             &artifact.signal.session_id,
-            ScopeType::Agent,
+            ScopeType::Session,
             &artifact.signal.scope_id,
             SenderRole::Browser,
             raw,
@@ -354,7 +354,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
     )?;
     let verified = verify_rtc_signal_wire(&artifact.wire.envelope, &browser_key, &host_key)
         .context("verifying WebCrypto RTC wire envelope in Rust")?;
-    if verified.protocol() != RtcProtocol::Agent
+    if verified.protocol() != RtcProtocol::Session
         || verified.sender_public_key() != &browser_key
         || verified.transcript() != &transcript
     {
@@ -369,7 +369,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
         SignalKind::Answer,
         transcript.protocol_version(),
         transcript.session_id().to_owned(),
-        ScopeType::Agent,
+        ScopeType::Session,
         transcript.scope_id().to_owned(),
         SenderRole::Daemon,
         *browser_key.as_bytes(),
@@ -379,7 +379,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
     let verified_answer =
         verify_rtc_signal_wire(&artifact.live_answer.envelope, &host_key, &browser_key)
             .context("verifying WebCrypto live answer envelope in Rust")?;
-    if verified_answer.protocol() != RtcProtocol::Agent
+    if verified_answer.protocol() != RtcProtocol::Session
         || verified_answer.sender_public_key() != &host_key
         || verified_answer.transcript() != &expected_answer
     {
@@ -448,7 +448,7 @@ fn signal_transcript(
     host_key: &VerifyingKey,
 ) -> Result<SignedSignalTranscript> {
     if signal.signal_kind != "offer"
-        || signal.scope_type != "agent"
+        || signal.scope_type != "session"
         || signal.sender_role != "browser"
     {
         bail!("WebCrypto signal enums do not match the live offer contract");
@@ -457,7 +457,7 @@ fn signal_transcript(
         SignalKind::Offer,
         signal.protocol_version,
         signal.session_id.clone(),
-        ScopeType::Agent,
+        ScopeType::Session,
         signal.scope_id.clone(),
         SenderRole::Browser,
         *host_key.as_bytes(),
