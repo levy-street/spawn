@@ -416,23 +416,37 @@ impl ForwarderControl {
 
     /// Re-announce the current foreground command through a freshly installed
     /// server sink. Frames emitted while no WS connection existed were
-    /// dropped; this heals the server's copy without waiting for a change.
+    /// dropped; this heals the server's copy without waiting for a change,
+    /// under the same per-session rate limit as ordinary reports.
     pub(crate) async fn resend_foreground(&self, session_id: Uuid) {
         let command = {
             let Ok(mut state) = self.foreground.lock() else {
                 return;
             };
             state.emitted = None;
-            if state.delayed {
+            if state.delayed || state.observed.is_none() {
                 None
             } else {
-                match state.observed.clone() {
-                    Some(command) => {
-                        state.emitted = Some(command.clone());
-                        state.last_emit_at = Some(Instant::now());
-                        Some(command)
-                    }
-                    None => None,
+                let now = Instant::now();
+                let wait = state
+                    .last_emit_at
+                    .map(|last| {
+                        FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last))
+                    })
+                    .unwrap_or(Duration::ZERO);
+                if wait.is_zero() {
+                    let command = state.observed.clone();
+                    state.emitted = command.clone();
+                    state.last_emit_at = Some(now);
+                    command
+                } else {
+                    state.delayed = true;
+                    let control = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        control.flush_delayed_foreground(session_id).await;
+                    });
+                    None
                 }
             }
         };
@@ -1529,6 +1543,71 @@ mod tests {
         assert!(!control.note_input_at(start + Duration::from_secs(5), b"I"));
         assert!(!control.note_input_at(start + Duration::from_secs(10), b"\x1b[<0;1;1"));
         assert!(!control.note_input_at(start + Duration::from_secs(15), b"M"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_reports_are_change_only_rate_limited_and_truncated() {
+        let control = ForwarderControl::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        control.set_sink(tx).await;
+        let session_id = Uuid::new_v4();
+
+        control.note_foreground(session_id, "zsh").await;
+        let first = rx.recv().await.unwrap();
+        assert!(first.as_str().contains("session.foreground"));
+        assert!(first.as_str().contains("\"zsh\""));
+        assert!(first.as_str().contains(&session_id.to_string()));
+
+        // The same observation again is not re-emitted.
+        control.note_foreground(session_id, "zsh").await;
+        assert!(rx.try_recv().is_err());
+
+        // A change inside the rate-limit window is deferred, never dropped,
+        // and the deferred emit carries the LATEST observation.
+        control.note_foreground(session_id, "claude").await;
+        control.note_foreground(session_id, "vim").await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::sleep(FOREGROUND_MIN_INTERVAL + Duration::from_millis(50)).await;
+        let second = rx.recv().await.unwrap();
+        assert!(second.as_str().contains("\"vim\""));
+        assert!(rx.try_recv().is_err());
+
+        // Basenames are truncated to the documented 64-character bound.
+        tokio::time::sleep(FOREGROUND_MIN_INTERVAL).await;
+        let long = "x".repeat(100);
+        control.note_foreground(session_id, &long).await;
+        let third = rx.recv().await.unwrap();
+        assert!(third.as_str().contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS)));
+        assert!(!third
+            .as_str()
+            .contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS + 1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_resend_reannounces_after_reconnect_within_the_rate_limit() {
+        let control = ForwarderControl::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        control.set_sink(tx).await;
+        let session_id = Uuid::new_v4();
+
+        control.note_foreground(session_id, "claude").await;
+        assert!(rx.recv().await.unwrap().as_str().contains("\"claude\""));
+
+        // Reconnect: a fresh sink is installed and the current value is
+        // re-announced, but not inside the one-second window.
+        let (tx, mut rx) = mpsc::channel(8);
+        control.set_sink(tx).await;
+        control.resend_foreground(session_id).await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::sleep(FOREGROUND_MIN_INTERVAL + Duration::from_millis(50)).await;
+        assert!(rx.recv().await.unwrap().as_str().contains("\"claude\""));
+
+        // A later reconnect outside the window re-announces immediately.
+        tokio::time::sleep(FOREGROUND_MIN_INTERVAL).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        control.set_sink(tx).await;
+        control.resend_foreground(session_id).await;
+        assert!(rx.recv().await.unwrap().as_str().contains("\"claude\""));
     }
 
     #[tokio::test]
