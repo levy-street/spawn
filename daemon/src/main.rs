@@ -22,10 +22,12 @@ mod host_direct;
 mod host_files;
 mod host_signal;
 mod login;
+mod possess;
 mod proto;
 mod pty;
 mod rtc;
 mod run;
+mod service;
 mod upload;
 mod worker_backend;
 mod ws;
@@ -45,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
+        Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
+        Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
             login::run(cli.server.clone(), args).await?;

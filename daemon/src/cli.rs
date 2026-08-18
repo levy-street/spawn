@@ -29,6 +29,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Register this host and run it in the background (idempotent). Runs the
+    /// login flow if needed, installs a supervised service, then detaches;
+    /// re-running an already-registered host just resumes it.
+    Possess(PossessArgs),
+    /// Authenticate, then stop and remove this host's spawn daemon.
+    Exorcise(ExorciseArgs),
     /// Interactive device-code flow; stores a long-lived daemon token.
     Login(LoginArgs),
     /// Foreground; connects WSS and services frames.
@@ -37,6 +43,21 @@ pub enum Command {
     Logout,
     /// Print credential state and redacted host/browser fingerprints.
     Status,
+}
+
+#[derive(Debug, Args)]
+pub struct PossessArgs {
+    /// Override the host name reported to the server (defaults to system
+    /// hostname).
+    #[arg(long)]
+    pub host_name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ExorciseArgs {
+    /// Remove every spawn instance on this host, not just the selected one.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
