@@ -1,222 +1,183 @@
-# spawn — design
+# spawn — UI standards
 
-## Goals
+The living design-system reference for `spawn-web`. Every visual decision
+flows through the tokens in `web/src/app/globals.css` and the primitives in
+`web/src/components/ui/` — this document is the inventory of both and the
+rules for extending them. Product/feature specs live in `docs/OVERHAUL.md`
+while the overhaul is in flight; system architecture lives in `README.md`,
+`docs/TRUST.md`, and `proto/README.md`.
 
-- Spin up arbitrary CLI agents (claude code, codex, opencode, aider, ...) on
-  any machine you own, from a single web app.
-- No inbound ports on remote hosts. Daemons dial out.
-- Multi-tenant from day one (sign up + scoped agents).
-- Per-host agent auth: each agent CLI handles its own provider login
-  interactively on the host where it runs. spawn does not manage credentials.
-- First-class mobile UX, including PWA installable.
-- **Operator model**: the server negotiates auth and connections but is
-  structurally unable to read terminal content. Data flows only between
-  the host daemon, the browser, and (when NAT demands) a TURN relay
-  carrying ciphertext. See `TRUST.md` — the governing document for this;
-  where the two disagree, TRUST.md describes the target and this file
-  the current mechanics.
+## Rules
 
-## Components
+1. **No Tailwind palette literals.** `emerald-500`, `amber-400`, `sky-300`,
+   `zinc-600`, `red-500`, … must not appear anywhere in `web/src/` outside
+   `globals.css`. Use the semantic tokens below. The Phase C grep gate
+   (`docs/OVERHAUL.md` §9) enforces this; Biome cannot.
+   - The sanctioned exceptions are fixed brand constants: the grimoire
+     marketing palette (`bg-void`, `text-hellfire`, …), and third-party brand
+     marks in `components/icons/` whose plate colors are arbitrary-value hex
+     (`bg-[#D97757]`) because a logo keeps its identity in both themes.
+2. **A new visual pattern becomes a primitive first.** If a surface needs a
+   dropdown/dialog/menu/spinner/empty state that doesn't exist yet, add it to
+   `web/src/components/ui/` (tokens only, both themes), then use it. No
+   component-local one-offs, no copy-pasted panels.
+3. **Both themes, always.** Every color token is defined for `:root` (light)
+   and `[data-theme="dark"]`, and exposed through the `@theme inline` block so
+   Tailwind utilities (`bg-success`, `text-warning`, `border-info/25`)
+   resolve at runtime via CSS vars. Never define a color in only one theme;
+   never write `dark:` pairs of raw colors when a token would swap itself.
+4. **`destructive` is the canonical danger name.** There is no `--danger`
+   family. Buttons, badges, text, and borders all use the `destructive`
+   tokens.
+5. **Container queries for layout, viewport queries for overlays.** See
+   below.
+6. **No timing-dependent UI.** Animations are decorative; logic never waits
+   on them. Global reduced-motion support collapses all transitions.
 
-### `spawn-server` — Python / FastAPI
+## Tokens (`web/src/app/globals.css`)
 
-- **Stack**: Python 3.13, FastAPI, SQLAlchemy 2.0 + Alembic, asyncpg,
-  Pydantic v2, argon2 for password hashing, PyJWT for short-lived tokens,
-  redis-py for cross-worker presence, signaling, and owner-fenced control results.
-- **State**: Postgres currently holds durable user/host/agent/preset/skill
-  records, including protected launch/preset/skill fields that Phase 2 must
-  remove. The target Postgres state is disclosed registry/lifecycle metadata
-  only. Redis coordinates presence, WebRTC signaling, and owner-fenced
-  content-free control results between API workers; it is not a protected-data
-  store and never carries terminal content.
-- **Public surface**:
-  - HTTP/JSON REST under `/api/...`
-  - `/ws/daemon` — daemon WebSocket
-  - `/ws/browser` — browser WebSocket (per-agent attach)
-- **Control and signaling**: the server keeps auth, registry, lifecycle,
-  presence, WebRTC signaling, owner fencing, and TURN credential minting.
-  `/ws/daemon` is JSON-only `spawn.control.v2`; `/ws/browser` requires
-  `spawn.v2`. The server has no terminal input/output, transcript, history,
-  snapshot, viewport, or display-owner relay. Terminal data, history and
-  viewport operations and capability-bound agent uploads travel on mandatory,
-  fully reliable ordered `spawn.pty` + `spawn.ctl` direct channels. Launch
-  manifests, preset environment/install/tool values, and skill bodies still
-  have server-readable paths or stores pending P2-DATA-02. The MCP
-  surface (endpoint, managed-server registry, MCP-client OAuth) was
-  removed entirely on 2026-07-09 per TRUST.md.
+### Surfaces and chrome (theme-swapped, all-neutral oklch)
 
-### `spawnd` — Rust
+`--background`, `--foreground`, `--muted`, `--muted-foreground`, `--card`,
+`--card-foreground`, `--popover`, `--popover-foreground`, `--primary`,
+`--primary-foreground`, `--secondary`, `--secondary-foreground`, `--accent`,
+`--accent-foreground`, `--border`, `--input`, `--ring`, `--terminal-bg`, and
+the brand-page stack `--brand-bg` / `--brand-panel` / `--brand-well` /
+`--brand-hairline`. Both themes are pure neutral (`oklch(L 0 0)`); light is
+the same ramp read from the other end.
 
-- **Stack**: tokio, tokio-tungstenite, clap, serde / serde_json, anyhow,
-  portable-pty, keyring (with file fallback in `~/.config/spawn/`).
-- **CLI**:
-  - `spawnd login` — interactive device-code flow against the server. Stores
-    a long-lived daemon token in OS keyring.
-  - `spawnd run` — foreground; connects WSS, registers, services frames.
-  - `spawnd logout` — wipes stored token.
-  - `spawnd status` — prints connection / agent state.
-- **Process model**: each agent runs inside a mandatory per-agent
-  `spawn-worker`, which owns its PTY, plaintext current-screen checkpoint grid,
-  and encrypted-at-rest resource-budgeted scrollback.
-  Workers survive `spawnd` crashes/restarts and are adopted over Unix sockets;
-  see `SESSIOND.md` and the cutover ADR in `TMUX_REMOVAL.md`.
-- **Agent environment**: the daemon launches the agent under the host user's
-  process env (HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally),
-  overlaid with the `env` from `agent.create`. spawn does not manage agent
-  credentials; each agent CLI handles its own login on the host.
-- **Reconnect**: on WS disconnect, daemon retries with exponential backoff.
-  On reconnect, sends a `register` frame with `existing_agents: [...]` so the
-  server resyncs its routing map without killing session workers.
-- **Agent terminal data ownership (P2-AGENT-02 checkpoint)**: the live worker is the source
-  of resource-budgeted replay, using encrypted-at-rest rolling segments and an
-  ephemeral key. The conservative total charge covers ciphertext/framing,
-  replay/scratch, and retained bookkeeping; this is not a durable transcript
-  archive. Browsers fetch history over
-  the DataChannel at attach. The server keeps no copy.
-- **Durable protected state (proposed target, review pending; not implemented)**: `spawnd`
-  owns one independently keyed, endpoint-local canonical store for launch and
-  restart manifests, preset/tool operational values, and skill bodies. It is
-  available after daemon restart and exposed only over `spawn.host.ctl`.
-  Endpoint-durable monotonic anti-replay heads and reconciliation records lock
-  ambiguous external effects across result expiry, daemon/browser restart, and
-  same-lineage restore; the control plane stores neither their protected detail
-  nor their presence. Dismissing an ambiguity never authorizes retry.
-  `DURABLE_SENSITIVE_DATA.md` defines its envelope, recovery, conflicts,
-  quotas, migration, and proposed offline/cross-host regressions.
+### Semantic status (theme-swapped; the only chroma in the app palette)
 
-### `spawn-web` — Next.js 15 PWA
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| `--success` | `oklch(0.52 0.13 152)` | `oklch(0.74 0.15 152)` | positive text/icons/borders |
+| `--success-soft` | same hue `/ 0.12` | same hue `/ 0.14` | chip/badge/callout fills |
+| `--warning` | `oklch(0.55 0.13 75)` | `oklch(0.78 0.14 80)` | attention text/icons/borders |
+| `--warning-soft` | same hue `/ 0.14` | same hue `/ 0.14` | fills |
+| `--info` | `oklch(0.52 0.11 240)` | `oklch(0.72 0.12 235)` | neutral-informative accents |
+| `--info-soft` | same hue `/ 0.12` | same hue `/ 0.14` | fills |
+| `--destructive` | `oklch(0.53 0.2 25)` | `oklch(0.62 0.21 25)` | dangerous actions/errors |
+| `--destructive-soft` | same hue `/ 0.1` | same hue `/ 0.14` | fills |
 
-- **Stack**: Next.js 15 App Router, React 19, Tailwind v4, shadcn/ui, Biome,
-  Bun. xterm.js + `@xterm/addon-fit` + `@xterm/addon-web-links`. TanStack
-  Query for REST. Native WebSocket for content-free signaling and lifecycle.
-- **Pages**:
-  - `/` — dashboard (active agents, recent activity).
-  - `/login`, `/signup`, `/device` (device-code approval).
-  - `/hosts` — list of registered daemons with status, last-seen, kill/rename.
-  - `/agents` — grid + detail. New-agent modal: pick host, pick preset,
-    optional cwd / argv override.
-  - `/agents/[id]` — full terminal view + composer + modifier bar.
-  - `/settings` — account, daemons, danger zone.
-- **Mobile**:
-  - Composer pattern: textarea above terminal with Send button. Toggle to raw
-    mode for power users.
-  - On-screen modifier bar (`Esc`, `Tab`, `Ctrl-C`, `↑`, `↓`, `↩`) sticky
-    above the keyboard via `visualViewport`.
-  - Container queries (Tailwind v4) for agent panes.
-  - PWA manifest + service worker for installability and offline shell.
-  - `viewport-fit=cover` and safe-area-insets honored.
+Light values sit at L ≤ 0.55 so status text clears 4.5:1 on `--background`.
+The `*-soft` tints are translucent so they sit correctly on any surface
+(card, popover, background). The standard chip recipe is the Badge's:
+`border-<status>/25 bg-<status>-soft text-<status>`.
 
-## Auth model
+"Attention" states (a session waiting for input) use the `warning` family.
 
-- **Web users**: email + argon2id password. Sessions are JWTs in HTTP-only
-  cookies, 30-day refresh / 15-min access.
-- **Daemons**: device-code flow.
-  1. Daemon `POST /api/auth/device/start` with its Ed25519 public key →
-     `{device_code, user_code, verification_uri, interval, expires_in}`.
-  2. Daemon prints `Open https://spawn.dev/device and enter code QZ4K-7HMT`.
-  3. Daemon polls `POST /api/auth/device/poll` with the device code and exact
-     public-key binding until success.
-  4. Browser (logged-in user) opens `/device`, enters `user_code`, reviews the
-     server-derived host fingerprint, then echoes that exact identity tuple to
-     `POST /api/auth/device/approve`; stale or changed reviews are rejected.
-  5. Next poll returns the daemon token, host ID, pinned host identity, and the
-     approving browser's canonical device ID/key/fingerprint tuple. Daemon
-     verifies the host binding first, independently validates and fingerprints
-     the browser key second, then atomically stores the token, private host
-     identity, and bounded immutable browser pin in its credential backends.
-     Existing local pins survive explicit relogin.
-     Credential backends store versioned whole-record generations rather than
-     overlaying keyring secrets onto file metadata. A monotonic generation and
-     unique record ID provide deterministic recovery from interrupted or
-     concurrent writes without ever constructing a mixed credential set.
-     A short-lived OS credential lock covers an in-lock durable reread, base
-     revision compare-and-swap, and both backend writes. Stale writers abort
-     before writing; the lock is never held during the interactive ceremony.
-- Daemon tokens are scoped: `host:<host_id>:control`. Revocable from the web
-  UI (kills the WS).
-- Browser pins are daemon-local first-contact state. Server revocation does not
-  erase one; explicit re-pair/local pin management is future work. Pins are not
-  consumed by live signaling yet.
+### Status-dot tones (theme-swapped)
 
-## Multi-tenancy
+| Token | Light | Dark | Meaning |
+|---|---|---|---|
+| `--tone-active` | `oklch(0.6 0.16 152)` | `oklch(0.74 0.17 152)` | producing output / online |
+| `--tone-waiting` | `oklch(0.6 0.13 240)` | `oklch(0.72 0.13 235)` | waiting for input, starting |
+| `--tone-idle` | `oklch(0.6 0 0)` | `oklch(0.68 0 0)` | running, quiet |
+| `--tone-offline` | `oklch(0.78 0 0)` | `oklch(0.44 0 0)` | exited / host offline |
 
-- Single `users` table to start. (Orgs/teams are a follow-up; design now so
-  every record carries `owner_user_id`.)
-- All REST endpoints require auth and filter by `owner_user_id`.
-- The server enforces that a daemon's `host_id` belongs to the daemon
-  token's user, and an agent's `host_id` belongs to the same user as the
-  spawn request.
+These map 1:1 to `DotTone` in `ui/status.tsx` and to
+`sessionActivityTone()` in `lib/sessions.ts`. Dots are brighter than the
+text hues on purpose — an 8px dot needs punch, not reading contrast.
 
-## Data model
+### Chrome geometry (theme-invariant)
 
-The SQL below is the current server-readable shape, not the Phase 2 target:
+| Token | Value | Use |
+|---|---|---|
+| `--sidebar-width` | `264px` | expanded sidebar / drawer width |
+| `--sidebar-rail-width` | `56px` | collapsed sidebar rail |
+| `--row-h` | `2.25rem` | the 36px nav-row rhythm (sidebar rows, list rows) |
+| `--pane-gap` | `6px` | workspace grid gutter |
 
-```sql
-users(id, email, password_hash, created_at)
-hosts(id, owner_user_id, name, os, arch, version, status, last_seen_at)
-presets(id, owner_user_id|null, name, agent_kind, default_argv jsonb,
-        env_template jsonb)
-  -- owner_user_id null = built-in preset visible to all users
-agents(id, owner_user_id, host_id, preset_id|null, cwd, argv jsonb, env jsonb,
-       status, started_at, exited_at, exit_code)
-device_codes(device_code, user_code, host_name, status, user_id|null,
-             expires_at)
-```
+No Tailwind utility names; consume as arbitrary values —
+`w-(--sidebar-width)`, `h-(--row-h)`, `gap-(--pane-gap)`. Never re-declare
+these as TS constants in components.
 
-After P2-DATA-02, Postgres retains the IDs/ownership, names/descriptions,
-grants, policy/lifecycle fields, and neutral/explicit labels allowed by
-`TRUST.md`, but not `cwd`, `argv`, `env`, preset default/install/environment
-values, tool executable targets, or skill bodies. The current design proposes
-versioned AEAD objects in the per-host store specified by
-`DURABLE_SENSITIVE_DATA.md`. Built-in operational preset values move to a
-versioned daemon-local catalog; their IDs/names/kinds may remain disclosed.
+### Radius, motion, viewport
 
-This split is intentionally non-atomic across the server metadata plane and
-endpoint content plane. The browser binds both by stable ID, while protected
-writes use exact endpoint revisions. Missing/offline endpoint values fail
-closed; the server never fills the gap from a cache.
+- Radius: `--radius-sm` 0.375rem, `--radius-md` 0.5rem, `--radius-lg`
+  0.625rem (`rounded-sm/md/lg`).
+- `.ease-swift` — the shared decelerating easing
+  (`cubic-bezier(0.32, 0.72, 0, 1)`) for shell chrome animation. Grid tile
+  moves use `transform 150ms` with it.
+- `prefers-reduced-motion` collapses every animation/transition globally; do
+  not add per-component motion opt-outs.
+- `--vv-height` / `--vv-keyboard` track the visual viewport (on-screen
+  keyboard); `--safe-*` are the safe-area insets. Utilities: `h-vv`,
+  `min-h-vv`, `pad-safe-top/bottom/x`. Every full-height overlay (dialog,
+  drawer, sheet) caps itself to `--vv-height`.
 
-## Wire protocol (summary — see `proto/README.md` for full)
+### Grimoire (marketing only)
 
-- Daemon `/ws/daemon`:
-  - Subprotocol `spawn.control.v2`, JSON only.
-  - Out: `register`, `host.heartbeat`, content-free `agent.activity` /
-    `agent.input_activity`, lifecycle, and bound `rtc.*` signaling.
-  - In: `agent.create`, `agent.kill`, remaining lifecycle/control operations,
-    and bound `rtc.*` signaling. There is no agent-upload frame.
-- Browser `/ws/browser?agent_id=...`:
-  - Mandatory subprotocol `spawn.v2`; text-only auth, disclosed lifecycle,
-    TURN config, and bound `rtc.*` signaling. There is no upload/content leg.
-  - Binary frames and terminal viewport/history commands fail closed.
-- Terminal data plane: mandatory WebRTC DataChannels `spawn.pty` (bytes) and
-  `spawn.ctl` (history/snapshot/viewport/display ownership and agent uploads),
-  negotiated via the content-free WS signaling plane. Both are ordered and
-  fully reliable. TURN is an encrypted reachability fallback, not a server
-  terminal-content fallback.
+`--color-void/char/panelg/line-g/line-strong/bone/ash/hellfire/blood/ember`
+plus `--font-grimoire/sigil` — fixed constants for the `.grimoire` landing
+skin. Never used inside app chrome.
 
-## Roadmap
+## Primitives (`web/src/components/ui/`)
 
-Phases 1–4 of the original scaffold roadmap (skeleton, first agent,
-mobile polish, multi-agent UX) have shipped. The roadmap is now the
-operator-model migration, specified in `TRUST.md`:
+Conventions: hand-rolled shadcn-style unless Radix is already the right tool
+(`dialog` builds on `@radix-ui/react-dialog`); `cn()` for class merging;
+`cva` where real variants exist; `forwardRef` when a caller needs the node;
+tokens only.
 
-1. **TURN + WebRTC-only terminal path** — source implementation under review:
-   coturn with ephemeral server-minted credentials; WS PTY relay deleted;
-   `spawn.v2`.
-2. **Endpoint-owned data** — history and snapshots now use agent
-   DataChannels, and server transcripts plus the Redis PTY ring are deleted.
-   Agent uploads and host fs-listing/transfer now use direct endpoint channels.
-   Launch-manifest, preset, tool-target, and skill migrations remain tracked
-   Phase 2 work; the server still sees those values until their individual
-   cutovers land. (The
-   `/mcp` visibility question is resolved: the MCP surface was cut
-   entirely on 2026-07-09.)
-3. **Endpoint identity** — Ed25519 host keys + WebCrypto browser device
-   keys bound via the device-code flow; signed SDP; TOFU pinning with
-   fingerprint verification UX.
-4. **Open source** — license, history secret-scan, SECURITY.md,
-   reproducible builds, self-host guide; spawnd.dev becomes the hosted
-   convenience instance.
+| File | Exports | Use it for |
+|---|---|---|
+| `button.tsx` | `Button` (`variant`: default/secondary/outline/ghost/destructive/link; `size`: default/sm/lg/icon) | every clickable action |
+| `input.tsx`, `textarea.tsx`, `label.tsx` | form fields | all text entry |
+| `badge.tsx` | `Badge` (`variant`: default/outline/success/warning/info/destructive) | status chips |
+| `status.tsx` | `DotTone`, `StatusDot`, `SessionStatusDot`, `hostStatusTone` | activity/presence dots |
+| `card.tsx` | `Card`, `CardHeader`, `CardTitle`, `CardContent` | grouped content panels |
+| `skeleton.tsx` | `Skeleton` | loading placeholders for known layouts |
+| `spinner.tsx` | `Spinner` (`size`, `label`) | indeterminate loading; replaces "Loading..." text |
+| `empty-state.tsx` | `EmptyState` (`icon`, `title`, `body`, `action`) | empty workspace, no hosts, empty lists |
+| `dialog.tsx` | `Dialog`, `DialogContent` (`size`: `sm`/`md`/`lg`/`full-mobile`), `DialogHeader/Title/Description/Footer/Trigger/Close` | every modal. `full-mobile` = full screen under `md:`, large panel above |
+| `confirm.tsx` | `confirm(opts): Promise<boolean>`, `useConfirm`, `ConfirmHost` | destructive/irreversible actions. `ConfirmHost` is mounted once in the app shell; never build ad-hoc confirm dialogs |
+| `dropdown-menu.tsx` | `DropdownMenu` (render-prop trigger, `openAt` handle), `DropdownMenuItem/Separator/Label` | single-level menus, kebabs, right-click menus |
+| `cascade-menu.tsx` | `CascadeMenu`, `CascadePanel`, `CascadeItem` | multi-step pick-one flows (the `+` new-session cascade). Panels are data; per-panel `loading`; renders as a bottom sheet on small viewports |
+| `sheet.tsx` | `BottomSheet` | mobile bottom-sheet container (drag handle, scrim, `--vv-height` cap) |
+| `drawer.tsx` | `Drawer` | left slide-in panel (the mobile sidebar): scrim, drag-to-dismiss, focus trap |
+| `tooltip.tsx` | tooltip primitives | hover/focus hints |
 
-Ongoing hardening (audit log, daemon auto-update, rate limiting,
-observability) continues alongside.
+Usage rules:
+
+- Menus: one level → `DropdownMenu`; steps → `CascadeMenu`. Never nest
+  dropdowns manually.
+- Anything that asks "are you sure" goes through `confirm()`. `window.confirm`
+  / `window.prompt` are banned.
+- Overlays own their own scrim, Escape handling, focus behavior, and scroll
+  locking — callers only control `open`.
+
+## Icons
+
+- `components/icons/AgentIcon.tsx` — agent identity everywhere (sidebar
+  session rows, pane headers, shortcut bar). Resolves definition `kind`
+  first, then the foreground/command basename: bundled marks for
+  `claude-code`, `codex`, `opencode`, `aider`; terminal glyph for
+  `bash|zsh|fish|sh|dash`; first-letter monogram otherwise. Props:
+  `{kind?, command?, size?, className?}`.
+- Everything else uses `lucide-react` at `size-4` (16px) inside `size-7`+
+  hit areas.
+
+## Responsiveness
+
+- **Container queries drive layout.** Components adapt to the container they
+  live in, not the window — the app shell publishes `@container/shell`, the
+  settings dialog `@container/settings`; panes and panels use `@md/shell:`
+  style variants. A terminal pane at 400px wide inside a wide window must lay
+  out like a 400px screen.
+- **Viewport `md:` is reserved for overlay presentation** — where a surface
+  materializes (dialog vs full screen, anchored menu vs bottom sheet, sidebar
+  vs drawer). `DialogContent size="full-mobile"` and `CascadeMenu`'s auto
+  sheet mode are the canonical examples.
+- Touch targets on coarse pointers: min `h-11` (44px).
+- Mobile chrome details (keyboard-aware `--vv-height`, safe areas,
+  `ModifierBar`) are part of every feature, not a follow-up.
+
+## Adding a token or primitive
+
+1. Define the token in `:root` **and** `[data-theme="dark"]`, wire it in
+   `@theme inline`, and add it to the inventory above — same PR.
+2. Check light-mode contrast (text ≥ 4.5:1 on its surface; non-text ≥ 3:1).
+3. New primitive: tokens only, keyboard + focus behavior included, works in
+   both themes and both pointer types, then documented in the table above.
+4. If an existing surface hand-rolls the pattern, migrate it in the same PR —
+   primitives don't ship with zero consumers and a TODO.
