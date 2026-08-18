@@ -185,7 +185,7 @@ async def test_host_agent_check_roundtrip(client):
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, Agent, User
+    from spawn_server.models import Agent, Host, User
     from spawn_server.ws.broker import DaemonConn, get_broker
 
     sm = get_sessionmaker()
@@ -452,7 +452,7 @@ async def test_host_agent_policy_auto_update_schedules_install(client):
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, Agent, User
+    from spawn_server.models import Agent, Host, User
     from spawn_server.ws.broker import DaemonConn, get_broker
 
     sm = get_sessionmaker()
@@ -561,7 +561,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, HostAgentPolicy, Agent, User
+    from spawn_server.models import Agent, Host, HostAgentPolicy, User
     from spawn_server.routes import hosts as hosts_routes
     from spawn_server.ws.broker import DaemonConn, get_broker
 
