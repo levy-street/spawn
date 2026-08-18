@@ -81,7 +81,11 @@ const KIND_DETAIL: Record<NonNullable<ConnInfo["kind"]>, string> = {
 
 function viewFor(info: SessionConnectionInfo): ChipView {
   if (info.signedRtcRefusal) {
-    return { dot: "bg-destructive", label: "blocked", detail: REFUSAL_DETAIL[info.signedRtcRefusal] };
+    return {
+      dot: "bg-destructive",
+      label: "blocked",
+      detail: REFUSAL_DETAIL[info.signedRtcRefusal],
+    };
   }
   if (info.socketState === "closed" || info.socketState === "error") {
     return { dot: "bg-destructive", label: "offline", detail: "Control connection lost" };
