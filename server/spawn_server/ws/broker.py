@@ -31,7 +31,7 @@ class DaemonConn:
     websocket: WebSocket
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     host_generation: int | None = None
-    agent_ids: set[str] = field(default_factory=set)
+    session_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     superseded_close_started: bool = False
     rtc_revocation_started: bool = False
@@ -45,7 +45,7 @@ class DaemonConn:
 @dataclass(eq=False)
 class BrowserConn:
     user_id: str
-    agent_id: str
+    session_id: str
     websocket: WebSocket
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -111,7 +111,7 @@ class Broker:
     def __init__(self) -> None:
         self._daemons_by_host: dict[str, DaemonConn] = {}
         self._accepted_daemon_owners: dict[str, tuple[str, int]] = {}
-        self._daemon_by_agent: dict[str, DaemonConn] = {}
+        self._daemon_by_session: dict[str, DaemonConn] = {}
         self._rtc_sessions: dict[str, RtcSessionBinding] = {}
         self._retired_rtc_bindings: dict[tuple[str, str, int, str], float] = {}
         self._rtc_tombstone_cleanup_task: asyncio.Task[None] | None = None
@@ -137,9 +137,9 @@ class Broker:
             existing = self._daemons_by_host.get(conn.host_id)
             if existing is not None and existing is not conn:
                 superseded = existing
-                for aid in list(existing.agent_ids):
-                    self._daemon_by_agent.pop(aid, None)
-                existing.agent_ids.clear()
+                for sid in list(existing.session_ids):
+                    self._daemon_by_session.pop(sid, None)
+                existing.session_ids.clear()
                 # Host sessions are actively revoked by the distributed owner
                 # event after the replacement daemon claims its Redis lease.
                 # Keep them long enough to send unavailable/rtc.close instead
@@ -156,10 +156,10 @@ class Broker:
                 conn.host_id
             ) == (conn.id, conn.host_generation):
                 self._accepted_daemon_owners.pop(conn.host_id, None)
-            for aid in list(conn.agent_ids):
-                if self._daemon_by_agent.get(aid) is conn:
-                    self._daemon_by_agent.pop(aid, None)
-            conn.agent_ids.clear()
+            for sid in list(conn.session_ids):
+                if self._daemon_by_session.get(sid) is conn:
+                    self._daemon_by_session.pop(sid, None)
+            conn.session_ids.clear()
             self._drop_rtc_sessions_for_daemon_locked(conn)
 
     def _drop_rtc_sessions_for_daemon_locked(
@@ -198,10 +198,10 @@ class Broker:
             if existing is not None and existing is not conn:
                 superseded = existing
                 superseded_connection_id = existing.id
-                for aid in list(existing.agent_ids):
-                    if self._daemon_by_agent.get(aid) is existing:
-                        self._daemon_by_agent.pop(aid, None)
-                existing.agent_ids.clear()
+                for sid in list(existing.session_ids):
+                    if self._daemon_by_session.get(sid) is existing:
+                        self._daemon_by_session.pop(sid, None)
+                existing.session_ids.clear()
                 self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
 
             self._daemons_by_host[conn.host_id] = conn
@@ -220,9 +220,9 @@ class Broker:
             and self._accepted_daemon_owners.get(conn.host_id) == (conn.id, generation)
         )
 
-    async def attach_agent_to_daemon(
+    async def attach_session_to_daemon(
         self,
-        agent_id: str,
+        session_id: str,
         conn: DaemonConn,
         *,
         expected_host_generation: int | None = None,
@@ -235,19 +235,19 @@ class Broker:
                 == (conn.id, expected_host_generation)
             ):
                 return False
-            conn.agent_ids.add(agent_id)
-            self._daemon_by_agent[agent_id] = conn
+            conn.session_ids.add(session_id)
+            self._daemon_by_session[session_id] = conn
             return True
 
-    async def detach_agent(
+    async def detach_session(
         self,
-        agent_id: str,
+        session_id: str,
         *,
         expected_daemon: DaemonConn | None = None,
         expected_host_generation: int | None = None,
     ) -> bool:
         async with self._lock:
-            conn = self._daemon_by_agent.get(agent_id)
+            conn = self._daemon_by_session.get(session_id)
             if expected_daemon is not None and (
                 conn is not expected_daemon
                 or expected_host_generation is None
@@ -256,16 +256,16 @@ class Broker:
                 )
             ):
                 return False
-            conn = self._daemon_by_agent.pop(agent_id, None)
+            conn = self._daemon_by_session.pop(session_id, None)
             if conn is not None:
-                conn.agent_ids.discard(agent_id)
+                conn.session_ids.discard(session_id)
             return conn is not None
 
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
 
-    def get_daemon_for_agent(self, agent_id: str) -> DaemonConn | None:
-        return self._daemon_by_agent.get(agent_id)
+    def get_daemon_for_session(self, session_id: str) -> DaemonConn | None:
+        return self._daemon_by_session.get(session_id)
 
     async def register_rtc_session(
         self,
@@ -557,7 +557,7 @@ class Broker:
         binding = await self.rtc_session_for(session_id)
         return binding.browser if binding is not None else None
 
-    async def request_tool_check(
+    async def request_agent_check(
         self,
         daemon: DaemonConn,
         *,
@@ -567,10 +567,10 @@ class Broker:
         request_id = str(uuid.uuid4())
         return await self._request_owner_result(
             daemon,
-            "host.tools.check_result",
+            "host.agents.check_result",
             request_id,
             {
-                "type": "host.tools.check",
+                "type": "host.agents.check",
                 "request_id": request_id,
                 "targets": targets,
             },
@@ -611,7 +611,7 @@ class Broker:
             payload,
         )
 
-    async def resolve_tool_check(
+    async def resolve_agent_check(
         self,
         request_id: str,
         payload: dict,
@@ -624,12 +624,12 @@ class Broker:
         return await self._publish_owner_result(
             daemon,
             expected_host_generation,
-            "host.tools.check_result",
+            "host.agents.check_result",
             request_id,
             payload,
         )
 
-    async def request_tool_install(
+    async def request_agent_install(
         self,
         daemon: DaemonConn,
         *,
@@ -639,17 +639,17 @@ class Broker:
         request_id = str(uuid.uuid4())
         return await self._request_owner_result(
             daemon,
-            "host.tools.install_result",
+            "host.agents.install_result",
             request_id,
             {
-                "type": "host.tools.install",
+                "type": "host.agents.install",
                 "request_id": request_id,
                 "target": target,
             },
             timeout=timeout,
         )
 
-    async def resolve_tool_install(
+    async def resolve_agent_install(
         self,
         request_id: str,
         payload: dict,
@@ -662,7 +662,7 @@ class Broker:
         return await self._publish_owner_result(
             daemon,
             expected_host_generation,
-            "host.tools.install_result",
+            "host.agents.install_result",
             request_id,
             payload,
         )

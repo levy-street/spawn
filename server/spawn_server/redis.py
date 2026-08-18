@@ -20,9 +20,9 @@ from .config import get_settings
 from .limits import MAX_SAFE_FENCING_GENERATION
 
 
-def agent_event_channel(agent_id: str) -> str:
-    """Cross-worker JSON control events for browsers attached to an agent."""
-    return f"spawn:agent:{agent_id}:events"
+def session_event_channel(session_id: str) -> str:
+    """Cross-worker JSON control events for browsers attached to a session."""
+    return f"spawn:session:{session_id}:events"
 
 
 def _lease_generation(value: bytes) -> int | None:

@@ -1,4 +1,4 @@
-"""`/ws/browser?agent_id=<uuid>` endpoint."""
+"""`/ws/browser?session_id=<uuid>` endpoint."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from .. import auth as auth_mod
 from ..config import get_settings
 from ..db import get_sessionmaker
-from ..models import Agent, User
-from ..redis import agent_event_channel, get_backend
+from ..models import Session, User
+from ..redis import get_backend, session_event_channel
 from ..turn import ice_servers_for_session
 from .broker import BrowserConn, RtcSessionBinding, get_broker
 from .host_signal import (
@@ -40,8 +40,8 @@ from .signed_signal_relay import (
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
-AGENT_RTC_PROTOCOL = "spawn.pty"
-AGENT_RTC_PROTOCOL_VERSION = 2
+SESSION_RTC_PROTOCOL = "spawn.pty"
+SESSION_RTC_PROTOCOL_VERSION = 2
 BROWSER_WS_PROTOCOL = "spawn.v2"
 WS_CLOSE_PROTOCOL_REQUIRED = 4003
 WS_CLOSE_CONTENT_FORBIDDEN = 4002
@@ -83,18 +83,17 @@ def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     return dict(value)
 
 
-def _valid_browser_agent_rtc_tuple(obj: dict, agent_id: str) -> bool:
+def _valid_browser_session_rtc_tuple(obj: dict, session_id: str) -> bool:
     """Require the browser to bind every signal to the exact direct-PTY tuple."""
     return (
-        obj.get("agent_id") == agent_id
-        and obj.get("scope_type") == "agent"
-        and obj.get("scope_id") == agent_id
-        and obj.get("protocol") == AGENT_RTC_PROTOCOL
-        and obj.get("protocol_version") == AGENT_RTC_PROTOCOL_VERSION
+        obj.get("scope_type") == "session"
+        and obj.get("scope_id") == session_id
+        and obj.get("protocol") == SESSION_RTC_PROTOCOL
+        and obj.get("protocol_version") == SESSION_RTC_PROTOCOL_VERSION
     )
 
 
-async def _publish_agent_rtc_signal(
+async def _publish_session_rtc_signal(
     host_id: str,
     binding: RtcSessionBinding,
     response_channel: str,
@@ -160,7 +159,7 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
 @router.websocket("/ws/browser")
 async def browser_ws(
     websocket: WebSocket,
-    agent_id: str = Query(...),
+    pty_session_id: str = Query(..., alias="session_id"),
     token: str | None = Query(default=None),
 ) -> None:
     offered = websocket.scope.get("subprotocols") or []
@@ -178,21 +177,23 @@ async def browser_ws(
 
     sm = get_sessionmaker()
     async with sm() as session:
-        agent = await session.get(Agent, agent_id)
-        if agent is None or agent.owner_user_id != user.id:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="agent not found")
+        session_row = await session.get(Session, pty_session_id)
+        if session_row is None or session_row.owner_user_id != user.id:
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION, reason="session not found"
+            )
             return
-        host_id = agent.host_id
-        agent_status = agent.status
+        host_id = session_row.host_id
+        session_status = session_row.status
 
     broker = get_broker()
-    conn = BrowserConn(user_id=user.id, agent_id=agent_id, websocket=websocket)
-    log.info("browser signaling attached agent=%s user=%s", agent_id, user.id)
+    conn = BrowserConn(user_id=user.id, session_id=pty_session_id, websocket=websocket)
+    log.info("browser signaling attached session=%s user=%s", pty_session_id, user.id)
 
     # Only content-free signaling/lifecycle metadata is sent on this socket.
     try:
         await conn.send_text(_rtc_config_payload(user.id, binding_nonce_required=True))
-        await conn.send_text({"type": "agent.status", "status": agent_status})
+        await conn.send_text({"type": "session.status", "status": session_status})
     except Exception as e:
         log.warning("initial signaling state send failed: %s", e)
 
@@ -204,7 +205,9 @@ async def browser_ws(
 
     async def _pump_events() -> None:
         try:
-            async with get_backend().subscribe_channel(agent_event_channel(agent_id)) as stream:
+            async with get_backend().subscribe_channel(
+                session_event_channel(pty_session_id)
+            ) as stream:
                 event_ready.set()
                 async for raw_event in stream:
                     try:
@@ -212,17 +215,17 @@ async def browser_ws(
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
                     if not isinstance(event, dict) or event.get("type") not in {
-                        "agent.status",
-                        "agent.exit",
+                        "session.status",
+                        "session.exit",
                     }:
                         continue
                     try:
                         await conn.send_text(event)
                     except Exception as e:
-                        log.warning("agent event forward to browser failed: %s", e)
+                        log.warning("session event forward to browser failed: %s", e)
                         return
         except Exception as e:  # noqa: BLE001
-            log.warning("agent event subscribe loop crashed: %s", e)
+            log.warning("session event subscribe loop crashed: %s", e)
         finally:
             event_ready.set()
 
@@ -235,7 +238,11 @@ async def browser_ws(
                     if dispatch is None or dispatch.host_id != host_id:
                         continue
                     signal = dispatch.signal
-                    if not isinstance(signal, dict) or signal.get("agent_id") != agent_id:
+                    if (
+                        not isinstance(signal, dict)
+                        or signal.get("scope_type") != "session"
+                        or signal.get("scope_id") != pty_session_id
+                    ):
                         continue
                     session_id = _valid_rtc_session_id(signal.get("session_id"))
                     if session_id is None:
@@ -375,10 +382,10 @@ async def browser_ws(
                     )
                     break
                 if ftype == "upload":
-                    log.warning("retired server-visible agent upload frame; closing")
+                    log.warning("retired server-visible upload frame; closing")
                     await websocket.close(
                         code=WS_CLOSE_CONTENT_FORBIDDEN,
-                        reason="agent uploads belong on spawn.ctl",
+                        reason="uploads belong on spawn.ctl",
                     )
                     break
                 elif ftype == "rtc.offer":
@@ -387,7 +394,7 @@ async def browser_ws(
                     if (
                         session_id is None
                         or not valid_rtc_binding_nonce(proposed_nonce)
-                        or not _valid_browser_agent_rtc_tuple(obj, agent_id)
+                        or not _valid_browser_session_rtc_tuple(obj, pty_session_id)
                     ):
                         continue
                     signed_signal = signed_mode_selected(obj)
@@ -398,10 +405,10 @@ async def browser_ws(
                                 obj[SIGNED_ENVELOPE_FIELD],
                                 expected_type="rtc.offer",
                                 expected_session_id=session_id,
-                                expected_scope_type="agent",
-                                expected_scope_id=agent_id,
-                                expected_protocol=AGENT_RTC_PROTOCOL,
-                                expected_protocol_version=AGENT_RTC_PROTOCOL_VERSION,
+                                expected_scope_type="session",
+                                expected_scope_id=pty_session_id,
+                                expected_protocol=SESSION_RTC_PROTOCOL,
+                                expected_protocol_version=SESSION_RTC_PROTOCOL_VERSION,
                             ).wire
                             sdp = None
                         else:
@@ -417,18 +424,17 @@ async def browser_ws(
                         disabled: dict[str, object] = {
                             "type": "rtc.status",
                             "session_id": session_id,
-                            "agent_id": agent_id,
                             "binding_nonce": proposed_nonce,
-                            "scope_type": "agent",
-                            "scope_id": agent_id,
-                            "protocol": AGENT_RTC_PROTOCOL,
-                            "protocol_version": AGENT_RTC_PROTOCOL_VERSION,
+                            "scope_type": "session",
+                            "scope_id": pty_session_id,
+                            "protocol": SESSION_RTC_PROTOCOL,
+                            "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
                             "status": "disabled",
                             "message": "WebRTC direct terminal transport is disabled.",
                         }
                         await conn.send_text(disabled)
                         continue
-                    daemon = broker.get_daemon_for_agent(agent_id) or broker.get_daemon_for_host(
+                    daemon = broker.get_daemon_for_session(pty_session_id) or broker.get_daemon_for_host(
                         host_id
                     )
                     if daemon is None:
@@ -467,10 +473,10 @@ async def browser_ws(
                         session_id,
                         route,
                         daemon=daemon,
-                        scope_type="agent",
-                        scope_id=agent_id,
-                        protocol=AGENT_RTC_PROTOCOL,
-                        protocol_version=AGENT_RTC_PROTOCOL_VERSION,
+                        scope_type="session",
+                        scope_id=pty_session_id,
+                        protocol=SESSION_RTC_PROTOCOL,
+                        protocol_version=SESSION_RTC_PROTOCOL_VERSION,
                         binding_nonce=binding_nonce,
                         signed_signal=signed_signal,
                         ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
@@ -494,8 +500,7 @@ async def browser_ws(
                             {
                                 "type": "rtc.status",
                                 "session_id": session_id,
-                                "agent_id": agent_id,
-                                "binding_nonce": binding.nonce,
+                                    "binding_nonce": binding.nonce,
                                 "binding_generation": binding.daemon_generation,
                                 "scope_type": binding.scope_type,
                                 "scope_id": binding.scope_id,
@@ -507,15 +512,14 @@ async def browser_ws(
                     offer_payload: dict[str, object] = {
                         "type": "rtc.offer",
                         "session_id": session_id,
-                        "agent_id": agent_id,
                         "binding_nonce": binding.nonce if binding is not None else binding_nonce,
                         "binding_generation": (
                             binding.daemon_generation if binding is not None else generation
                         ),
-                        "scope_type": "agent",
-                        "scope_id": agent_id,
-                        "protocol": AGENT_RTC_PROTOCOL,
-                        "protocol_version": AGENT_RTC_PROTOCOL_VERSION,
+                        "scope_type": "session",
+                        "scope_id": pty_session_id,
+                        "protocol": SESSION_RTC_PROTOCOL,
+                        "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
                         "ice_servers": ice_servers_for_session(get_settings(), label=user.id),
                     }
                     if signed_signal:
@@ -524,7 +528,7 @@ async def browser_ws(
                     else:
                         assert sdp is not None
                         offer_payload["sdp"] = sdp
-                    published = binding is not None and await _publish_agent_rtc_signal(
+                    published = binding is not None and await _publish_session_rtc_signal(
                         host_id,
                         binding,
                         rtc_response_channel,
@@ -549,7 +553,7 @@ async def browser_ws(
                     if (
                         session_id is None
                         or candidate is None
-                        or not _valid_browser_agent_rtc_tuple(obj, agent_id)
+                        or not _valid_browser_session_rtc_tuple(obj, pty_session_id)
                     ):
                         continue
                     route = rtc_routes.get(session_id)
@@ -558,21 +562,20 @@ async def browser_ws(
                         route is None
                         or binding is None
                         or binding.browser is not route
-                        or binding.scope_type != "agent"
-                        or binding.scope_id != agent_id
-                        or binding.protocol != AGENT_RTC_PROTOCOL
-                        or binding.protocol_version != AGENT_RTC_PROTOCOL_VERSION
+                        or binding.scope_type != "session"
+                        or binding.scope_id != pty_session_id
+                        or binding.protocol != SESSION_RTC_PROTOCOL
+                        or binding.protocol_version != SESSION_RTC_PROTOCOL_VERSION
                         or obj.get("binding_nonce") != binding.nonce
                     ):
                         continue
-                    await _publish_agent_rtc_signal(
+                    await _publish_session_rtc_signal(
                         host_id,
                         binding,
                         rtc_response_channel,
                         {
                             "type": "rtc.candidate",
                             "session_id": session_id,
-                            "agent_id": agent_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
                             "scope_type": binding.scope_type,
@@ -584,30 +587,29 @@ async def browser_ws(
                     )
                 elif ftype == "rtc.close":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    if session_id is None or not _valid_browser_agent_rtc_tuple(obj, agent_id):
+                    if session_id is None or not _valid_browser_session_rtc_tuple(obj, pty_session_id):
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
                     if route is None or binding is None or binding.browser is not route:
                         continue
                     if (
-                        binding.scope_type != "agent"
-                        or binding.scope_id != agent_id
-                        or binding.protocol != AGENT_RTC_PROTOCOL
-                        or binding.protocol_version != AGENT_RTC_PROTOCOL_VERSION
+                        binding.scope_type != "session"
+                        or binding.scope_id != pty_session_id
+                        or binding.protocol != SESSION_RTC_PROTOCOL
+                        or binding.protocol_version != SESSION_RTC_PROTOCOL_VERSION
                         or obj.get("binding_nonce") != binding.nonce
                     ):
                         continue
                     rtc_routes.pop(session_id, None)
                     await broker.unregister_rtc_session(session_id, route)
-                    await _publish_agent_rtc_signal(
+                    await _publish_session_rtc_signal(
                         host_id,
                         binding,
                         rtc_response_channel,
                         {
                             "type": "rtc.close",
                             "session_id": session_id,
-                            "agent_id": agent_id,
                             "binding_nonce": binding.nonce,
                             "binding_generation": binding.daemon_generation,
                             "scope_type": binding.scope_type,
@@ -636,14 +638,13 @@ async def browser_ws(
             bindings.extend(await broker.unregister_rtc_sessions_for(route))
         rtc_routes.clear()
         for binding in bindings:
-            await _publish_agent_rtc_signal(
+            await _publish_session_rtc_signal(
                 host_id,
                 binding,
                 rtc_response_channel,
                 {
                     "type": "rtc.close",
                     "session_id": binding.session_id,
-                    "agent_id": agent_id,
                     "binding_nonce": binding.nonce,
                     "binding_generation": binding.daemon_generation,
                     "scope_type": binding.scope_type,
@@ -652,4 +653,4 @@ async def browser_ws(
                     "protocol_version": binding.protocol_version,
                 },
             )
-        log.info("browser detached agent=%s user=%s", agent_id, user.id)
+        log.info("browser detached session=%s user=%s", pty_session_id, user.id)
