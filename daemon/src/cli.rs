@@ -1,5 +1,7 @@
 //! Clap derive structs for the `spawnd` CLI.
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -9,6 +11,13 @@ pub struct Cli {
     /// https://localhost:8000).
     #[arg(long, global = true, env = "SPAWN_SERVER_URL")]
     pub server: Option<String>,
+
+    /// Root directory for this instance's credentials and state (default: env
+    /// SPAWN_CONFIG_DIR or the platform config dir). Give each spawn user or
+    /// registration its own root to run fully isolated daemons side by side on
+    /// one host.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
 
     /// Increase log verbosity (-v, -vv).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
