@@ -642,23 +642,29 @@ INSTALL_SCRIPT = dedent(
       exit 0
     fi
 
-    "$BIN" --server "$SERVER" login --no-run
-
+    # --no-start: register the host but do not start it.
     if [ "$START_AFTER_LOGIN" = "0" ]; then
+      "$BIN" --server "$SERVER" login --no-run
       say "login complete; not starting daemon because --no-start was set"
       exit 0
     fi
 
+    # --foreground: register, then run in the foreground.
     if [ "$FOREGROUND" = "1" ]; then
+      "$BIN" --server "$SERVER" login --no-run
       exec "$BIN" --server "$SERVER" run
     fi
 
-    if start_launchd_service; then
-      :
-    elif ! start_systemd_service; then
+    # --no-service: register, then background without a service manager.
+    if [ "$USE_SERVICE" = "0" ]; then
+      "$BIN" --server "$SERVER" login --no-run
       start_background
+      say "done"
+      exit 0
     fi
 
-    say "done"
+    # Default: possess runs the login flow (if needed) and installs a supervised
+    # background service, idempotently — it owns the service lifecycle now.
+    exec "$BIN" --server "$SERVER" possess
     """
 ).lstrip()
