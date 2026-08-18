@@ -91,11 +91,32 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
         ));
     }
 
-    println!(
-        "spawn: open {} and enter code:  {}",
-        start.verification_uri, start.user_code
-    );
+    // Match a browser login's ease: open the approval page with the code
+    // prefilled and poll to completion ourselves. On a headless host we fall
+    // back to printing the link. The host-key possession proof above is
+    // unchanged — this only touches how the human reaches the approval page.
+    let approve_url = match url::Url::parse(&start.verification_uri) {
+        Ok(mut parsed) => {
+            parsed
+                .query_pairs_mut()
+                .append_pair("code", &start.user_code);
+            parsed.to_string()
+        }
+        Err(_) => start.verification_uri.clone(),
+    };
+    if open_browser(&approve_url) {
+        println!("spawn: opened your browser to approve this host.");
+        println!(
+            "spawn:   code {}   (didn't open? visit {})",
+            start.user_code, approve_url
+        );
+    } else {
+        println!("spawn: approve this host in your browser:");
+        println!("spawn:   {approve_url}");
+        println!("spawn:   code {}", start.user_code);
+    }
     println!("spawn: verify host fingerprint: {}", identity.fingerprint);
+    println!("spawn: waiting for approval…");
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
@@ -160,6 +181,35 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 return Err(anyhow!("device/poll returned error: {other}"));
             }
         }
+    }
+}
+
+/// Best-effort: open `url` in the operator's default browser. Returns whether a
+/// launcher was started. Never blocks and never fails login — on a headless host
+/// (no display) or where no opener exists, the caller prints the URL instead.
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let mut _cmd: Option<Command> = None;
+    #[cfg(target_os = "macos")]
+    {
+        _cmd = Some(Command::new("open"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No display ⇒ headless (SSH/server): don't try; the caller prints it.
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            _cmd = Some(Command::new("xdg-open"));
+        }
+    }
+    match _cmd {
+        Some(mut cmd) => cmd
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok(),
+        None => false,
     }
 }
 
