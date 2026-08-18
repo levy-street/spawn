@@ -33,6 +33,21 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  /* Semantic status set. `destructive` is the canonical "danger" name (the
+     spec's --danger alias was dropped in its favor). *-soft is a 10–20%
+     translucent tint of the same hue for chips/badges/callout fills. */
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  /* Status-dot tones (sidebar rows, pane headers, host cards). */
+  --color-tone-active: var(--tone-active);
+  --color-tone-waiting: var(--tone-waiting);
+  --color-tone-idle: var(--tone-idle);
+  --color-tone-offline: var(--tone-offline);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -126,6 +141,21 @@
   --accent-foreground: oklch(0.17 0 0);
   --destructive: oklch(0.53 0.2 25);
   --destructive-foreground: oklch(0.99 0 0);
+  --destructive-soft: oklch(0.53 0.2 25 / 0.1);
+  /* Status hues: the one place chroma enters the palette. Light values sit at
+     L ≤ 0.55 so status text clears 4.5:1 on --background. */
+  --success: oklch(0.52 0.13 152);
+  --success-soft: oklch(0.52 0.13 152 / 0.12);
+  --warning: oklch(0.55 0.13 75);
+  --warning-soft: oklch(0.55 0.13 75 / 0.14);
+  --info: oklch(0.52 0.11 240);
+  --info-soft: oklch(0.52 0.11 240 / 0.12);
+  /* Status dots: brighter than the text hues (a dot needs punch, not
+     contrast-for-reading). active/waiting mirror success/info hues. */
+  --tone-active: oklch(0.6 0.16 152);
+  --tone-waiting: oklch(0.6 0.13 240);
+  --tone-idle: oklch(0.6 0 0);
+  --tone-offline: oklch(0.78 0 0);
   --border: oklch(0.9 0 0);
   --input: oklch(0.9 0 0);
   --ring: oklch(0.55 0 0);
@@ -135,6 +165,14 @@
   --brand-panel: oklch(1 0 0);
   --brand-well: oklch(0.94 0 0);
   --brand-hairline: oklch(0.88 0 0);
+
+  /* Chrome geometry — theme-invariant (not redefined in dark), so components
+     never hardcode these. Consume as arbitrary values: w-(--sidebar-width),
+     h-(--row-h), gap-(--pane-gap). */
+  --sidebar-width: 264px;
+  --sidebar-rail-width: 56px;
+  --row-h: 2.25rem; /* the 36px nav row rhythm */
+  --pane-gap: 6px; /* workspace grid gutter */
 
   /* Updated by useViewportInset() to track on-screen keyboard. */
   --vv-height: 100dvh;
@@ -164,6 +202,17 @@
   --accent-foreground: oklch(0.97 0 0);
   --destructive: oklch(0.62 0.21 25);
   --destructive-foreground: oklch(0.97 0 0);
+  --destructive-soft: oklch(0.62 0.21 25 / 0.14);
+  --success: oklch(0.74 0.15 152);
+  --success-soft: oklch(0.74 0.15 152 / 0.14);
+  --warning: oklch(0.78 0.14 80);
+  --warning-soft: oklch(0.78 0.14 80 / 0.14);
+  --info: oklch(0.72 0.12 235);
+  --info-soft: oklch(0.72 0.12 235 / 0.14);
+  --tone-active: oklch(0.74 0.17 152);
+  --tone-waiting: oklch(0.72 0.13 235);
+  --tone-idle: oklch(0.68 0 0);
+  --tone-offline: oklch(0.44 0 0);
   --border: oklch(0.27 0 0);
   --input: oklch(0.27 0 0);
   --ring: oklch(0.55 0 0);
