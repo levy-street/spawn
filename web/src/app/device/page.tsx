@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
@@ -91,14 +91,17 @@ function DeviceInner() {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const onReview = async (e: FormEvent) => {
-    e.preventDefault();
+  // Load the pending approval for a code and land on the fingerprint screen.
+  // Extracted from the form handler so the auto-flow (code baked into the URL
+  // by `spawnd possess`) can call it directly — the operator types nothing.
+  const reviewCode = async (rawCode: string) => {
+    const userCode = rawCode.trim().toUpperCase();
+    if (!userCode) return;
+    setCode(userCode);
     setError(null);
     setSubmitting(true);
     try {
-      const r = await auth.pendingDevice({
-        user_code: code.trim().toUpperCase(),
-      });
+      const r = await auth.pendingDevice({ user_code: userCode });
       const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
       if (r.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
@@ -127,6 +130,24 @@ function DeviceInner() {
       setSubmitting(false);
     }
   };
+
+  const onReview = (e: FormEvent) => {
+    e.preventDefault();
+    void reviewCode(code);
+  };
+
+  // The daemon opens this page with the pending code baked into the URL
+  // (`/device?code=…`), so an approval needs nothing typed. Auto-load it once,
+  // as soon as the account is known, landing straight on the fingerprint check.
+  const autoTriedRef = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; reviewCode intentionally omitted
+  useEffect(() => {
+    if (autoTriedRef.current || !user) return;
+    const urlCode = new URLSearchParams(window.location.search).get("code");
+    if (!urlCode) return;
+    autoTriedRef.current = true;
+    void reviewCode(urlCode);
+  }, [user]);
 
   const onApprove = async () => {
     if (!pending || !user || registration.data?.status !== "ready") return;
@@ -228,9 +249,8 @@ function DeviceInner() {
         <CardHeader>
           <CardTitle>Connect a host</CardTitle>
           <CardDescription>
-            Run <code>spawnd login</code> on the machine you want to reach. It prints a short code
-            and a key fingerprint — you&apos;ll enter the code here, then check the fingerprint
-            matches.
+            Run <code>spawnd possess</code> on the host you want to reach. It opens this page for
+            you — check that the fingerprint here matches the one in your terminal, then approve.
           </CardDescription>
         </CardHeader>
         <CardContent>
