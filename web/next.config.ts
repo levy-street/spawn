@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { NextConfig } from "next";
 
 // Where the FastAPI server lives. Used for rewrites so /api/* and /ws/* go
@@ -32,6 +33,9 @@ function buildId(): string {
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // Keep Next rooted in this workspace even when a parent directory contains
+  // an unrelated npm lockfile.
+  outputFileTracingRoot: path.resolve(process.cwd()),
   generateBuildId: buildId,
   experimental: {
     // Next buffers proxied request bodies (rewrites share the middleware

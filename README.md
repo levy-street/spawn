@@ -42,6 +42,20 @@ demand), Rust stable (via `rustup`), Bun 1.x, and `ripgrep` (`rg`, required by
 the source guards that `scripts/test-all.sh` runs). Agent hosts install both
 `spawnd` and its paired `spawn-worker` binary.
 
+Once PostgreSQL and Redis are running and the local `spawn` database has been
+created, start the reloadable web app, API, and paired local daemon from the
+repository root:
+
+```bash
+npm run dev
+```
+
+The web app uses port 3000 and proxies to the private API on port 8010. Both
+Next and FastAPI reload on source changes. Rust daemon source changes trigger a
+rebuild and supervisor restart; its purpose-built session workers remain alive.
+The command refuses to take over occupied ports and stops only the process
+groups it started when you press Ctrl-C.
+
 ## Daemon install
 
 From any host that should run agents, use the hosted installer from your spawn

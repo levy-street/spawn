@@ -54,7 +54,7 @@ def upgrade() -> None:
     # anyone, so the earliest account becomes the owner. On a fresh install
     # this table is empty and the first signup takes the role instead.
     op.execute(
-        "UPDATE users SET is_admin = 1 WHERE id = "
+        "UPDATE users SET is_admin = TRUE WHERE id = "
         "(SELECT id FROM users ORDER BY created_at ASC LIMIT 1)"
     )
 
