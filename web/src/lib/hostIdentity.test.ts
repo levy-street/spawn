@@ -8,7 +8,7 @@ describe("host identity API schemas", () => {
       name: "host",
       status: "offline",
       last_seen_at: null,
-      agent_count: 0,
+      session_count: 0,
       host_key_algorithm: "ed25519",
       host_public_key: "A".repeat(43),
       host_key_fingerprint: "SHA256:0123456789abcdef",

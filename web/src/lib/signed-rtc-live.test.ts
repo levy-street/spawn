@@ -14,7 +14,7 @@ import {
 } from "./signed-signal";
 import { signRtcSignalWire } from "./signed-signal-wire";
 
-const AGENT_ID = "11111111-2222-4333-8444-555555555555";
+const SESSION_ID = "11111111-2222-4333-8444-555555555555";
 const HOST_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const SESSION_ID = "01234567-89ab-4cde-8fab-0123456789ab";
 const VERIFIED_SDP = "v=0\r\ns=verified\r\na=fingerprint:sha-256 11:22:33:44:55:66:77:88\r\n";
@@ -23,8 +23,8 @@ const HOSTILE_RAW_SDP =
 
 const routes: SignedRtcRoute[] = [
   {
-    scopeType: "agent",
-    scopeId: AGENT_ID,
+    scopeType: "session",
+    scopeId: SESSION_ID,
     protocol: "spawn.pty",
     protocolVersion: 2,
   },

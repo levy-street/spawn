@@ -119,7 +119,7 @@ function mutate(original: SignedSignalTranscript, field: string): SignedSignalTr
       mutated.sessionId = mutatedSessionId;
       break;
     case "scope_type":
-      mutated.scopeType = original.scopeType === "agent" ? "host" : "agent";
+      mutated.scopeType = original.scopeType === "session" ? "host" : "session";
       break;
     case "scope_id":
       mutated.scopeId = mutatedScopeId;
@@ -168,8 +168,9 @@ describe("signed signaling transcript", () => {
     const invalidMagic = encoded.slice();
     invalidMagic[0] ^= 1;
     expect(() => decodeSignedSignalTranscript(invalidMagic)).toThrow("invalid transcript magic");
+    // Revision 1 (scope label "agent") is retired; it must fail closed.
     const invalidVersion = encoded.slice();
-    invalidVersion[SIGNED_SIGNAL_MAGIC.byteLength] = 2;
+    invalidVersion[SIGNED_SIGNAL_MAGIC.byteLength] = 1;
     expect(() => decodeSignedSignalTranscript(invalidVersion)).toThrow(
       "unsupported transcript version",
     );

@@ -4,7 +4,9 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export const SIGNED_SIGNAL_MAGIC = textEncoder.encode("SPAWN-RTC-SIGNAL-SIG-V1");
-export const SIGNED_SIGNAL_VERSION = 1;
+// Spec revision 2: the PTY scope label is "session" (was "agent", byte code
+// unchanged). Revision-1 envelopes fail closed with unsupported_version.
+export const SIGNED_SIGNAL_VERSION = 2;
 export const ED25519_PUBLIC_KEY_BYTES = 32;
 export const ED25519_SIGNATURE_BYTES = 64;
 export const ED25519_PUBLIC_KEY_WIRE_CHARS = 43;
@@ -14,7 +16,7 @@ export const MAX_SCOPE_ID_BYTES = 36;
 export const MAX_SDP_BYTES = 1024 * 1024;
 
 export type SignalKind = "offer" | "answer";
-export type ScopeType = "agent" | "host";
+export type ScopeType = "session" | "host";
 export type SenderRole = "browser" | "daemon";
 
 export interface SignedSignalTranscript {
@@ -57,7 +59,7 @@ export class CryptoUnavailableError extends Error {
 }
 
 const signalKindCode: Record<SignalKind, number> = { offer: 1, answer: 2 };
-const scopeTypeCode: Record<ScopeType, number> = { agent: 1, host: 2 };
+const scopeTypeCode: Record<ScopeType, number> = { session: 1, host: 2 };
 const senderRoleCode: Record<SenderRole, number> = { browser: 1, daemon: 2 };
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
@@ -282,7 +284,7 @@ export function decodeSignedSignalTranscript(input: Uint8Array): SignedSignalTra
     "sessionId",
     MAX_SESSION_ID_BYTES,
   );
-  const scopeType = enumValue(reader.u8("scopeType"), { 1: "agent", 2: "host" }, "scopeType");
+  const scopeType = enumValue(reader.u8("scopeType"), { 1: "session", 2: "host" }, "scopeType");
   const scopeId = canonicalUuidText(
     reader.utf8(reader.u16("scopeIdLength"), "scopeId", MAX_SCOPE_ID_BYTES),
     "scopeId",

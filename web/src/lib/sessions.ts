@@ -15,7 +15,8 @@ export function sessionTitle(session: Session): string {
   const hostName = session.host_name?.trim();
   const folder = lastCwdDir(session.cwd);
   if (hostName) return `${hostName} - ${folder}`;
-  return folder || session.id.slice(0, 8);
+  if (session.cwd.trim()) return folder;
+  return session.id.slice(0, 8);
 }
 
 function lastCwdDir(cwd: string): string {

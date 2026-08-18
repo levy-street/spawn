@@ -117,7 +117,7 @@ function mutate(envelope: WireEnvelope, field: string): WireEnvelope {
       value.session_id += "-mutated";
       break;
     case "scope_type":
-      value.scope_type = value.scope_type === "agent" ? "host" : "agent";
+      value.scope_type = value.scope_type === "session" ? "host" : "session";
       break;
     case "scope_id":
       value.scope_id += "-mutated";
@@ -185,7 +185,7 @@ describe("signed RTC JSON wire adapter", () => {
       signalKind: "offer",
       protocolVersion: 2,
       sessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-      scopeType: "agent",
+      scopeType: "session",
       scopeId: "11111111-2222-4333-8444-555555555555",
       senderRole: "browser",
       intendedPeerPublicKey: decodeBase64Url(
