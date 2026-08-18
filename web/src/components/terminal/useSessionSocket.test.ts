@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { newRtcBindingNonce } from "./useAgentSocket";
+import { newRtcBindingNonce } from "./useSessionSocket";
 
 describe("newRtcBindingNonce", () => {
   test("fails closed when cryptographic randomness is unavailable", () => {

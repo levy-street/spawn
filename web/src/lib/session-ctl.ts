@@ -1,21 +1,21 @@
-export const AGENT_CTL_VERSION = 1;
-export const AGENT_CTL_MAX_REQUEST_BYTES = 16 * 1024;
-export const AGENT_CTL_MAX_REPLAY_BYTES = 12 * 1024 * 1024;
-export const AGENT_CTL_MAX_PENDING_PTY_BYTES = 12 * 1024 * 1024;
-export const AGENT_CTL_CHUNK_PAYLOAD_BYTES = 48 * 1024;
-export const AGENT_CTL_MAX_REPLAY_CHUNKS = Math.ceil(
-  AGENT_CTL_MAX_REPLAY_BYTES / AGENT_CTL_CHUNK_PAYLOAD_BYTES,
+export const SESSION_CTL_VERSION = 1;
+export const SESSION_CTL_MAX_REQUEST_BYTES = 16 * 1024;
+export const SESSION_CTL_MAX_REPLAY_BYTES = 12 * 1024 * 1024;
+export const SESSION_CTL_MAX_PENDING_PTY_BYTES = 12 * 1024 * 1024;
+export const SESSION_CTL_CHUNK_PAYLOAD_BYTES = 48 * 1024;
+export const SESSION_CTL_MAX_REPLAY_CHUNKS = Math.ceil(
+  SESSION_CTL_MAX_REPLAY_BYTES / SESSION_CTL_CHUNK_PAYLOAD_BYTES,
 );
-export const AGENT_CTL_MAX_OUTSTANDING_REQUESTS = 128;
-export const AGENT_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
-export const AGENT_CTL_UPLOAD_CHUNK_BYTES = 48 * 1024;
-export const AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER = 256 * 1024;
-export const AGENT_CTL_UPLOAD_BUFFER_LOW_WATER = 128 * 1024;
+export const SESSION_CTL_MAX_OUTSTANDING_REQUESTS = 128;
+export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+export const SESSION_CTL_UPLOAD_CHUNK_BYTES = 48 * 1024;
+export const SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER = 256 * 1024;
+export const SESSION_CTL_UPLOAD_BUFFER_LOW_WATER = 128 * 1024;
 
 const CHUNK_HEADER_BYTES = 28;
 const CHUNK_MAGIC = [0x53, 0x50, 0x43, 0x54]; // SPCT
 
-export type AgentCtlOperation =
+export type SessionCtlOperation =
   | "history"
   | "snapshot"
   | "resize"
@@ -27,11 +27,11 @@ export type AgentCtlOperation =
   | "upload_complete"
   | "history_subscribe";
 
-export interface AgentCtlResponse {
+export interface SessionCtlResponse {
   version: number;
   kind: "response";
   request_id?: string | null;
-  operation?: AgentCtlOperation;
+  operation?: SessionCtlOperation;
   ok: boolean;
   plain?: boolean;
   pty_offset?: number | null;
@@ -49,7 +49,7 @@ export interface AgentCtlResponse {
   history_offset?: number;
 }
 
-export interface AgentCtlDisplayEvent {
+export interface SessionCtlDisplayEvent {
   version: number;
   kind: "event";
   event: "display_state";
@@ -59,11 +59,12 @@ export interface AgentCtlDisplayEvent {
   viewers: number;
 }
 
-export interface AgentCtlReadyEvent {
+export interface SessionCtlReadyEvent {
   version: number;
   kind: "event";
   event: "ready";
   upload_capability: string;
+  /** spawn.ctl protocol v1 keeps its historical wire key for this value. */
   agent_generation: number;
   upload_max_bytes: number;
   upload_chunk_bytes: number;
@@ -74,7 +75,7 @@ export interface AgentCtlReadyEvent {
  *  `history_offset` within `history_epoch`; `history_wipe` announces an `ED 3`
  *  scrollback erase (new epoch, offset restarts at 0); `history_gap` means
  *  deltas were lost and the client must re-anchor from a fresh snapshot. */
-export interface AgentCtlHistoryDeltaEvent {
+export interface SessionCtlHistoryDeltaEvent {
   version: number;
   kind: "event";
   event: "history_delta";
@@ -83,40 +84,40 @@ export interface AgentCtlHistoryDeltaEvent {
   data: string;
 }
 
-export interface AgentCtlHistoryWipeEvent {
+export interface SessionCtlHistoryWipeEvent {
   version: number;
   kind: "event";
   event: "history_wipe";
   history_epoch: string;
 }
 
-export interface AgentCtlHistoryGapEvent {
+export interface SessionCtlHistoryGapEvent {
   version: number;
   kind: "event";
   event: "history_gap";
 }
 
-export type AgentCtlHistoryEvent =
-  | AgentCtlHistoryDeltaEvent
-  | AgentCtlHistoryWipeEvent
-  | AgentCtlHistoryGapEvent;
+export type SessionCtlHistoryEvent =
+  | SessionCtlHistoryDeltaEvent
+  | SessionCtlHistoryWipeEvent
+  | SessionCtlHistoryGapEvent;
 
-export type AgentCtlTextMessage =
-  | AgentCtlResponse
-  | AgentCtlDisplayEvent
-  | AgentCtlReadyEvent
-  | AgentCtlHistoryEvent;
+export type SessionCtlTextMessage =
+  | SessionCtlResponse
+  | SessionCtlDisplayEvent
+  | SessionCtlReadyEvent
+  | SessionCtlHistoryEvent;
 
-export interface AgentCtlChunk {
+export interface SessionCtlChunk {
   requestId: string;
   sequence: number;
   last: boolean;
   payload: Uint8Array;
 }
 
-export interface AgentCtlUploadStart {
+export interface SessionCtlUploadStart {
   capability: string;
-  agentGeneration: number;
+  sessionGeneration: number;
   uploadId: string;
   name: string;
   mimeType: string;
@@ -126,19 +127,19 @@ export interface AgentCtlUploadStart {
   sha256: string;
 }
 
-export interface AgentCtlUploadResult {
+export interface SessionCtlUploadResult {
   uploadId: string;
   path: string;
   totalBytes: number;
   sha256: string;
 }
 
-export class DirectAgentUploadError extends Error {
+export class DirectSessionUploadError extends Error {
   readonly code: string;
 
   constructor(code: string, message: string) {
     super(message);
-    this.name = "DirectAgentUploadError";
+    this.name = "DirectSessionUploadError";
     this.code = code;
   }
 }
@@ -148,13 +149,13 @@ export interface AnchoredPtySlice {
   anchor: number | null;
 }
 
-export type AgentCtlTrackedResult =
-  | { kind: "response"; response: AgentCtlResponse }
-  | { kind: "replay"; response: AgentCtlResponse; bytes: Uint8Array };
+export type SessionCtlTrackedResult =
+  | { kind: "response"; response: SessionCtlResponse }
+  | { kind: "replay"; response: SessionCtlResponse; bytes: Uint8Array };
 
-type PendingAgentCtlRequest = {
-  operation: AgentCtlOperation;
-  metadata: AgentCtlResponse | null;
+type PendingSessionCtlRequest = {
+  operation: SessionCtlOperation;
+  metadata: SessionCtlResponse | null;
   chunks: Map<number, Uint8Array>;
 };
 
@@ -163,19 +164,19 @@ type PendingAgentCtlRequest = {
  * Unknown, duplicate, cross-operation, and structurally impossible replies
  * are ignored instead of consuming browser memory.
  */
-export class AgentCtlRequestTracker {
-  readonly #pending = new Map<string, PendingAgentCtlRequest>();
+export class SessionCtlRequestTracker {
+  readonly #pending = new Map<string, PendingSessionCtlRequest>();
   #bufferedBytes = 0;
 
   get size(): number {
     return this.#pending.size;
   }
 
-  register(requestId: string, operation: AgentCtlOperation): boolean {
+  register(requestId: string, operation: SessionCtlOperation): boolean {
     if (
-      !isAgentCtlRequestId(requestId) ||
+      !isSessionCtlRequestId(requestId) ||
       this.#pending.has(requestId) ||
-      this.#pending.size >= AGENT_CTL_MAX_OUTSTANDING_REQUESTS
+      this.#pending.size >= SESSION_CTL_MAX_OUTSTANDING_REQUESTS
     ) {
       return false;
     }
@@ -192,9 +193,9 @@ export class AgentCtlRequestTracker {
     this.#bufferedBytes = 0;
   }
 
-  acceptResponse(response: AgentCtlResponse): AgentCtlTrackedResult | null {
+  acceptResponse(response: SessionCtlResponse): SessionCtlTrackedResult | null {
     const requestId = response.request_id;
-    if (typeof requestId !== "string" || !isAgentCtlRequestId(requestId)) return null;
+    if (typeof requestId !== "string" || !isSessionCtlRequestId(requestId)) return null;
     const pending = this.#pending.get(requestId);
     if (!pending) return null;
 
@@ -217,12 +218,12 @@ export class AgentCtlRequestTracker {
       typeof totalBytes !== "number" ||
       !Number.isSafeInteger(totalBytes) ||
       totalBytes < 0 ||
-      totalBytes > AGENT_CTL_MAX_REPLAY_BYTES ||
+      totalBytes > SESSION_CTL_MAX_REPLAY_BYTES ||
       typeof chunks !== "number" ||
       !Number.isSafeInteger(chunks) ||
       chunks < 0 ||
-      chunks > AGENT_CTL_MAX_REPLAY_CHUNKS ||
-      chunks !== Math.ceil(totalBytes / AGENT_CTL_CHUNK_PAYLOAD_BYTES) ||
+      chunks > SESSION_CTL_MAX_REPLAY_CHUNKS ||
+      chunks !== Math.ceil(totalBytes / SESSION_CTL_CHUNK_PAYLOAD_BYTES) ||
       typeof response.plain !== "boolean" ||
       (ptyOffset !== null &&
         ptyOffset !== undefined &&
@@ -236,7 +237,7 @@ export class AgentCtlRequestTracker {
     return { kind: "replay", response, bytes: new Uint8Array() };
   }
 
-  acceptChunk(chunk: AgentCtlChunk): AgentCtlTrackedResult | null {
+  acceptChunk(chunk: SessionCtlChunk): SessionCtlTrackedResult | null {
     const pending = this.#pending.get(chunk.requestId);
     const metadata = pending?.metadata;
     if (!pending || !metadata || pending.chunks.has(chunk.sequence)) return null;
@@ -252,12 +253,12 @@ export class AgentCtlRequestTracker {
     const finalSequence = expectedChunks - 1;
     const expectedPayloadBytes =
       chunk.sequence === finalSequence
-        ? expectedBytes - AGENT_CTL_CHUNK_PAYLOAD_BYTES * finalSequence
-        : AGENT_CTL_CHUNK_PAYLOAD_BYTES;
+        ? expectedBytes - SESSION_CTL_CHUNK_PAYLOAD_BYTES * finalSequence
+        : SESSION_CTL_CHUNK_PAYLOAD_BYTES;
     if (
       chunk.last !== (chunk.sequence === finalSequence) ||
       chunk.payload.byteLength !== expectedPayloadBytes ||
-      this.#bufferedBytes + chunk.payload.byteLength > AGENT_CTL_MAX_REPLAY_BYTES
+      this.#bufferedBytes + chunk.payload.byteLength > SESSION_CTL_MAX_REPLAY_BYTES
     ) {
       return null;
     }
@@ -265,7 +266,7 @@ export class AgentCtlRequestTracker {
     this.#bufferedBytes += chunk.payload.byteLength;
     if (pending.chunks.size !== expectedChunks) return null;
 
-    const bytes = combineAgentCtlChunks(pending.chunks, expectedChunks, expectedBytes);
+    const bytes = combineSessionCtlChunks(pending.chunks, expectedChunks, expectedBytes);
     if (!bytes) return null;
     this.#remove(chunk.requestId);
     return { kind: "replay", response: metadata, bytes };
@@ -293,8 +294,8 @@ export class OrderedAsyncQueue {
   }
 }
 
-/** Bounded input held for one committed agent-effect generation only. */
-export class AgentGenerationInputQueue {
+/** Bounded input held for one committed session-effect generation only. */
+export class SessionGenerationInputQueue {
   readonly #entries: Array<{ generation: number; bytes: Uint8Array }> = [];
   #bytes = 0;
 
@@ -344,36 +345,36 @@ export function slicePtyChunkAfterAnchor(
   };
 }
 
-export function makeAgentCtlRequest(
+export function makeSessionCtlRequest(
   requestId: string,
-  operation: AgentCtlOperation,
+  operation: SessionCtlOperation,
   parameters: Record<string, unknown> = {},
 ): string | null {
-  if (!isAgentCtlRequestId(requestId)) return null;
+  if (!isSessionCtlRequestId(requestId)) return null;
   try {
     const text = JSON.stringify({
       ...parameters,
-      version: AGENT_CTL_VERSION,
+      version: SESSION_CTL_VERSION,
       kind: "request",
       request_id: requestId,
       operation,
     });
-    return new TextEncoder().encode(text).byteLength <= AGENT_CTL_MAX_REQUEST_BYTES ? text : null;
+    return new TextEncoder().encode(text).byteLength <= SESSION_CTL_MAX_REQUEST_BYTES ? text : null;
   } catch {
     return null;
   }
 }
 
-export function makeAgentCtlUploadStart(start: AgentCtlUploadStart): string | null {
+export function makeSessionCtlUploadStart(start: SessionCtlUploadStart): string | null {
   if (
-    !isAgentCtlRequestId(start.capability) ||
-    !isAgentCtlRequestId(start.uploadId) ||
-    !Number.isSafeInteger(start.agentGeneration) ||
-    start.agentGeneration <= 0 ||
+    !isSessionCtlRequestId(start.capability) ||
+    !isSessionCtlRequestId(start.uploadId) ||
+    !Number.isSafeInteger(start.sessionGeneration) ||
+    start.sessionGeneration <= 0 ||
     !Number.isSafeInteger(start.totalBytes) ||
     start.totalBytes <= 0 ||
-    start.totalBytes > AGENT_CTL_MAX_UPLOAD_BYTES ||
-    start.chunks !== Math.ceil(start.totalBytes / AGENT_CTL_UPLOAD_CHUNK_BYTES) ||
+    start.totalBytes > SESSION_CTL_MAX_UPLOAD_BYTES ||
+    start.chunks !== Math.ceil(start.totalBytes / SESSION_CTL_UPLOAD_CHUNK_BYTES) ||
     start.name.length === 0 ||
     new TextEncoder().encode(start.name).byteLength > 255 ||
     start.name === "." ||
@@ -393,9 +394,9 @@ export function makeAgentCtlUploadStart(start: AgentCtlUploadStart): string | nu
   ) {
     return null;
   }
-  return makeAgentCtlRequest(start.uploadId, "upload_start", {
+  return makeSessionCtlRequest(start.uploadId, "upload_start", {
     capability: start.capability,
-    agent_generation: start.agentGeneration,
+    agent_generation: start.sessionGeneration,
     name: start.name,
     mime_type: start.mimeType,
     destination: start.destination,
@@ -405,40 +406,40 @@ export function makeAgentCtlUploadStart(start: AgentCtlUploadStart): string | nu
   });
 }
 
-export function makeAgentCtlUploadCancel(
+export function makeSessionCtlUploadCancel(
   requestId: string,
   uploadId: string,
   capability: string,
-  agentGeneration: number,
+  sessionGeneration: number,
 ): string | null {
   if (
-    !isAgentCtlRequestId(uploadId) ||
-    !isAgentCtlRequestId(capability) ||
-    !Number.isSafeInteger(agentGeneration) ||
-    agentGeneration <= 0
+    !isSessionCtlRequestId(uploadId) ||
+    !isSessionCtlRequestId(capability) ||
+    !Number.isSafeInteger(sessionGeneration) ||
+    sessionGeneration <= 0
   ) {
     return null;
   }
-  return makeAgentCtlRequest(requestId, "upload_cancel", {
+  return makeSessionCtlRequest(requestId, "upload_cancel", {
     capability,
-    agent_generation: agentGeneration,
+    agent_generation: sessionGeneration,
     upload_id: uploadId,
   });
 }
 
-export function encodeAgentCtlUploadChunk(
+export function encodeSessionCtlUploadChunk(
   uploadId: string,
   sequence: number,
   last: boolean,
   payload: Uint8Array,
 ): Uint8Array | null {
   if (
-    !isAgentCtlRequestId(uploadId) ||
+    !isSessionCtlRequestId(uploadId) ||
     !Number.isSafeInteger(sequence) ||
     sequence < 0 ||
     sequence > 0xffff_ffff ||
     payload.byteLength === 0 ||
-    payload.byteLength > AGENT_CTL_UPLOAD_CHUNK_BYTES
+    payload.byteLength > SESSION_CTL_UPLOAD_CHUNK_BYTES
   ) {
     return null;
   }
@@ -446,7 +447,7 @@ export function encodeAgentCtlUploadChunk(
   if (!requestBytes) return null;
   const frame = new Uint8Array(CHUNK_HEADER_BYTES + payload.byteLength);
   frame.set(CHUNK_MAGIC);
-  frame[4] = AGENT_CTL_VERSION;
+  frame[4] = SESSION_CTL_VERSION;
   frame[5] = 2;
   const view = new DataView(frame.buffer);
   view.setUint16(6, last ? 1 : 0, true);
@@ -456,12 +457,12 @@ export function encodeAgentCtlUploadChunk(
   return frame;
 }
 
-export function parseAgentCtlUploadResponse(
-  response: AgentCtlResponse,
-  expected: AgentCtlUploadStart,
+export function parseSessionCtlUploadResponse(
+  response: SessionCtlResponse,
+  expected: SessionCtlUploadStart,
 ):
   | { kind: "ready"; nextSequence: number; receivedBytes: number }
-  | { kind: "complete"; result: AgentCtlUploadResult }
+  | { kind: "complete"; result: SessionCtlUploadResult }
   | { kind: "error"; code: string; message: string }
   | null {
   if (response.request_id !== expected.uploadId) return null;
@@ -483,7 +484,7 @@ export function parseAgentCtlUploadResponse(
     (response.received_bytes as number) <= expected.totalBytes &&
     (response.received_bytes as number) ===
       Math.min(
-        (response.next_sequence as number) * AGENT_CTL_UPLOAD_CHUNK_BYTES,
+        (response.next_sequence as number) * SESSION_CTL_UPLOAD_CHUNK_BYTES,
         expected.totalBytes,
       )
   ) {
@@ -517,7 +518,7 @@ export function parseAgentCtlUploadResponse(
 
 export async function sha256Blob(blob: Blob, checkpoint?: () => void): Promise<string | null> {
   if (!globalThis.crypto?.subtle) return null;
-  if (blob.size <= 0 || blob.size > AGENT_CTL_MAX_UPLOAD_BYTES) return null;
+  if (blob.size <= 0 || blob.size > SESSION_CTL_MAX_UPLOAD_BYTES) return null;
   let buffer: ArrayBuffer | null = null;
   try {
     try {
@@ -541,32 +542,32 @@ export async function sha256Blob(blob: Blob, checkpoint?: () => void): Promise<s
   }
 }
 
-export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
-  if (new TextEncoder().encode(raw).byteLength > AGENT_CTL_MAX_REQUEST_BYTES) return null;
+export function parseSessionCtlText(raw: string): SessionCtlTextMessage | null {
+  if (new TextEncoder().encode(raw).byteLength > SESSION_CTL_MAX_REQUEST_BYTES) return null;
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
-    if (value.version !== AGENT_CTL_VERSION) return null;
+    if (value.version !== SESSION_CTL_VERSION) return null;
     if (
       value.kind === "response" &&
       typeof value.ok === "boolean" &&
       (value.request_id === null ||
         value.request_id === undefined ||
-        (typeof value.request_id === "string" && isAgentCtlRequestId(value.request_id))) &&
-      (value.operation === undefined || isAgentCtlOperation(value.operation))
+        (typeof value.request_id === "string" && isSessionCtlRequestId(value.request_id))) &&
+      (value.operation === undefined || isSessionCtlOperation(value.operation))
     ) {
-      return value as unknown as AgentCtlResponse;
+      return value as unknown as SessionCtlResponse;
     }
     if (
       value.kind === "event" &&
       value.event === "ready" &&
       typeof value.upload_capability === "string" &&
-      isAgentCtlRequestId(value.upload_capability) &&
+      isSessionCtlRequestId(value.upload_capability) &&
       Number.isSafeInteger(value.agent_generation) &&
       (value.agent_generation as number) > 0 &&
-      value.upload_max_bytes === AGENT_CTL_MAX_UPLOAD_BYTES &&
-      value.upload_chunk_bytes === AGENT_CTL_UPLOAD_CHUNK_BYTES
+      value.upload_max_bytes === SESSION_CTL_MAX_UPLOAD_BYTES &&
+      value.upload_chunk_bytes === SESSION_CTL_UPLOAD_CHUNK_BYTES
     ) {
-      return value as unknown as AgentCtlReadyEvent;
+      return value as unknown as SessionCtlReadyEvent;
     }
     const validEpoch =
       typeof value.history_epoch === "string" && /^\d{1,20}$/.test(value.history_epoch);
@@ -579,13 +580,13 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
       ) {
         return null;
       }
-      return value as unknown as AgentCtlHistoryDeltaEvent;
+      return value as unknown as SessionCtlHistoryDeltaEvent;
     }
     if (value.kind === "event" && value.event === "history_wipe") {
-      return validEpoch ? (value as unknown as AgentCtlHistoryWipeEvent) : null;
+      return validEpoch ? (value as unknown as SessionCtlHistoryWipeEvent) : null;
     }
     if (value.kind === "event" && value.event === "history_gap") {
-      return value as unknown as AgentCtlHistoryGapEvent;
+      return value as unknown as SessionCtlHistoryGapEvent;
     }
     if (
       value.kind === "event" &&
@@ -603,7 +604,7 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
           (value.rows as number) <= 200)) &&
       (value.cols === null) === (value.rows === null)
     ) {
-      return value as unknown as AgentCtlDisplayEvent;
+      return value as unknown as SessionCtlDisplayEvent;
     }
     return null;
   } catch {
@@ -611,14 +612,14 @@ export function parseAgentCtlText(raw: string): AgentCtlTextMessage | null {
   }
 }
 
-export function isAgentCtlRequestId(value: string): boolean {
+export function isSessionCtlRequestId(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
-export function newAgentCtlRequestId(): string {
+export function newSessionCtlRequestId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     const requestId = crypto.randomUUID();
-    if (isAgentCtlRequestId(requestId)) return requestId;
+    if (isSessionCtlRequestId(requestId)) return requestId;
   }
   const bytes = new Uint8Array(16);
   if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
@@ -633,17 +634,17 @@ export function newAgentCtlRequestId(): string {
   return bytesToUuid(bytes) ?? "00000000-0000-4000-8000-000000000000";
 }
 
-export function decodeAgentCtlChunk(bytes: Uint8Array): AgentCtlChunk | null {
+export function decodeSessionCtlChunk(bytes: Uint8Array): SessionCtlChunk | null {
   if (
     bytes.byteLength < CHUNK_HEADER_BYTES ||
-    bytes.byteLength > CHUNK_HEADER_BYTES + AGENT_CTL_CHUNK_PAYLOAD_BYTES
+    bytes.byteLength > CHUNK_HEADER_BYTES + SESSION_CTL_CHUNK_PAYLOAD_BYTES
   ) {
     return null;
   }
   for (let index = 0; index < CHUNK_MAGIC.length; index += 1) {
     if (bytes[index] !== CHUNK_MAGIC[index]) return null;
   }
-  if (bytes[4] !== AGENT_CTL_VERSION || bytes[5] !== 1) return null;
+  if (bytes[4] !== SESSION_CTL_VERSION || bytes[5] !== 1) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const flags = view.getUint16(6, true);
   if ((flags & ~1) !== 0) return null;
@@ -657,7 +658,7 @@ export function decodeAgentCtlChunk(bytes: Uint8Array): AgentCtlChunk | null {
   };
 }
 
-export function combineAgentCtlChunks(
+export function combineSessionCtlChunks(
   chunks: Map<number, Uint8Array>,
   expectedChunks: number,
   expectedBytes: number,
@@ -665,10 +666,10 @@ export function combineAgentCtlChunks(
   if (
     !Number.isSafeInteger(expectedChunks) ||
     expectedChunks < 0 ||
-    expectedChunks > AGENT_CTL_MAX_REPLAY_CHUNKS ||
+    expectedChunks > SESSION_CTL_MAX_REPLAY_CHUNKS ||
     !Number.isSafeInteger(expectedBytes) ||
     expectedBytes < 0 ||
-    expectedBytes > AGENT_CTL_MAX_REPLAY_BYTES ||
+    expectedBytes > SESSION_CTL_MAX_REPLAY_BYTES ||
     chunks.size !== expectedChunks
   ) {
     return null;
@@ -694,7 +695,7 @@ function bytesToUuid(bytes: Uint8Array): string | null {
 }
 
 function uuidToBytes(value: string): Uint8Array | null {
-  if (!isAgentCtlRequestId(value)) return null;
+  if (!isSessionCtlRequestId(value)) return null;
   const hex = value.replaceAll("-", "");
   const bytes = new Uint8Array(16);
   for (let index = 0; index < bytes.length; index += 1) {
@@ -705,7 +706,7 @@ function uuidToBytes(value: string): Uint8Array | null {
   return bytes;
 }
 
-function isAgentCtlOperation(value: unknown): value is AgentCtlOperation {
+function isSessionCtlOperation(value: unknown): value is SessionCtlOperation {
   return (
     value === "history" ||
     value === "snapshot" ||

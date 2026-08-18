@@ -11,7 +11,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -22,21 +22,21 @@ const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 // first once this is exceeded.
 const WARM_LIMIT = 6;
 
-export type AgentLive = {
-  connInfo: AgentConnectionInfo | null;
+export type SessionLive = {
+  connInfo: SessionConnectionInfo | null;
   displayState: DisplayControlState | null;
 };
 
 /** Stable actions — this context value never changes, so a placeholder's
  *  `attach` ref callback (which depends on it) never re-fires spuriously. */
 type Actions = {
-  claim: (agentId: string, container: HTMLElement, token: symbol) => void;
-  release: (agentId: string, token: symbol) => void;
-  getHandle: (agentId: string) => TerminalHandle | null;
+  claim: (sessionId: string, container: HTMLElement, token: symbol) => void;
+  release: (sessionId: string, token: symbol) => void;
+  getHandle: (sessionId: string) => TerminalHandle | null;
 };
 /** Reactive state — changes as terminals connect / move foreground. */
 type State = {
-  live: Record<string, AgentLive>;
+  live: Record<string, SessionLive>;
   warm: Record<string, boolean>;
   claimed: Record<string, boolean>;
 };
@@ -56,7 +56,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   const parkRef = useRef<HTMLDivElement | null>(null);
   const [warmIds, setWarmIds] = useState<string[]>([]);
   const [claimed, setClaimed] = useState<Record<string, boolean>>({});
-  const [live, setLive] = useState<Record<string, AgentLive>>({});
+  const [live, setLive] = useState<Record<string, SessionLive>>({});
   // Monotonic clock without Date.now in render; bumped per claim for LRU order.
   const clockRef = useRef(0);
   const nextClock = useCallback(() => {
@@ -64,20 +64,20 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     return clockRef.current;
   }, []);
 
-  const evict = useCallback((agentId: string) => {
-    const entry = entriesRef.current.get(agentId);
+  const evict = useCallback((sessionId: string) => {
+    const entry = entriesRef.current.get(sessionId);
     if (!entry || entry.token !== null) return; // never evict a claimed terminal
-    entriesRef.current.delete(agentId);
+    entriesRef.current.delete(sessionId);
     entry.host.parentElement?.removeChild(entry.host);
-    setWarmIds((ids) => ids.filter((id) => id !== agentId));
+    setWarmIds((ids) => ids.filter((id) => id !== sessionId));
     setClaimed((m) => {
-      if (!(agentId in m)) return m;
-      const { [agentId]: _drop, ...rest } = m;
+      if (!(sessionId in m)) return m;
+      const { [sessionId]: _drop, ...rest } = m;
       return rest;
     });
     setLive((m) => {
-      if (!(agentId in m)) return m;
-      const { [agentId]: _drop, ...rest } = m;
+      if (!(sessionId in m)) return m;
+      const { [sessionId]: _drop, ...rest } = m;
       return rest;
     });
   }, []);
@@ -97,48 +97,48 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   }, [evict]);
 
   const claim = useCallback(
-    (agentId: string, container: HTMLElement, token: symbol) => {
-      let entry = entriesRef.current.get(agentId);
+    (sessionId: string, container: HTMLElement, token: symbol) => {
+      let entry = entriesRef.current.get(sessionId);
       if (!entry) {
         const host = document.createElement("div");
         host.style.display = "contents";
         entry = { host, handleRef: { current: null }, token, lastAt: nextClock() };
-        entriesRef.current.set(agentId, entry);
-        setWarmIds((ids) => (ids.includes(agentId) ? ids : [...ids, agentId]));
+        entriesRef.current.set(sessionId, entry);
+        setWarmIds((ids) => (ids.includes(sessionId) ? ids : [...ids, sessionId]));
       }
       entry.token = token;
       entry.lastAt = nextClock();
       if (entry.host.parentElement !== container) container.appendChild(entry.host);
-      setClaimed((m) => (m[agentId] ? m : { ...m, [agentId]: true }));
+      setClaimed((m) => (m[sessionId] ? m : { ...m, [sessionId]: true }));
       enforceLimit();
     },
     [enforceLimit, nextClock],
   );
 
-  const release = useCallback((agentId: string, token: symbol) => {
-    const entry = entriesRef.current.get(agentId);
+  const release = useCallback((sessionId: string, token: symbol) => {
+    const entry = entriesRef.current.get(sessionId);
     if (!entry || entry.token !== token) return; // superseded by a newer claim
     entry.token = null;
     const park = parkRef.current;
     if (park && entry.host.parentElement !== park) park.appendChild(entry.host);
-    setClaimed((m) => (m[agentId] ? { ...m, [agentId]: false } : m));
+    setClaimed((m) => (m[sessionId] ? { ...m, [sessionId]: false } : m));
   }, []);
 
   const getHandle = useCallback(
-    (agentId: string) => entriesRef.current.get(agentId)?.handleRef.current ?? null,
+    (sessionId: string) => entriesRef.current.get(sessionId)?.handleRef.current ?? null,
     [],
   );
 
-  const onInfo = useCallback((agentId: string, connInfo: AgentConnectionInfo) => {
+  const onInfo = useCallback((sessionId: string, connInfo: SessionConnectionInfo) => {
     setLive((m) => ({
       ...m,
-      [agentId]: { ...m[agentId], connInfo, displayState: m[agentId]?.displayState ?? null },
+      [sessionId]: { ...m[sessionId], connInfo, displayState: m[sessionId]?.displayState ?? null },
     }));
   }, []);
-  const onDisplay = useCallback((agentId: string, displayState: DisplayControlState) => {
+  const onDisplay = useCallback((sessionId: string, displayState: DisplayControlState) => {
     setLive((m) => ({
       ...m,
-      [agentId]: { ...m[agentId], displayState, connInfo: m[agentId]?.connInfo ?? null },
+      [sessionId]: { ...m[sessionId], displayState, connInfo: m[sessionId]?.connInfo ?? null },
     }));
   }, []);
 
@@ -176,7 +176,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
           return (
             <PooledTerminal
               key={id}
-              agentId={id}
+              sessionId={id}
               active={!!claimed[id]}
               host={entry.host}
               handleRef={entry.handleRef}
@@ -191,42 +191,42 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
 }
 
 function PooledTerminal({
-  agentId,
+  sessionId,
   active,
   host,
   handleRef,
   onInfo,
   onDisplay,
 }: {
-  agentId: string;
+  sessionId: string;
   active: boolean;
   host: HTMLDivElement;
   handleRef: { current: TerminalHandle | null };
-  onInfo: (agentId: string, info: AgentConnectionInfo) => void;
-  onDisplay: (agentId: string, state: DisplayControlState) => void;
+  onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
+  onDisplay: (sessionId: string, state: DisplayControlState) => void;
 }) {
   return createPortal(
     <div className="size-full @container/term">
       <Terminal
         ref={handleRef}
-        agentId={agentId}
+        sessionId={sessionId}
         rawInput
         mobileReturnMode="newline"
         mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
         imagePasteMode="bracketed-path"
         active={active}
         autoTakeControl={active}
-        onConnectionInfo={(info) => onInfo(agentId, info)}
-        onDisplayControl={(state) => onDisplay(agentId, state)}
+        onConnectionInfo={(info) => onInfo(sessionId, info)}
+        onDisplayControl={(state) => onDisplay(sessionId, state)}
       />
     </div>,
     host,
   );
 }
 
-/** Claim the shared warm terminal for `agentId` into a placeholder. Attach the
+/** Claim the shared warm terminal for `sessionId` into a placeholder. Attach the
  *  returned `attach` ref to the div where the terminal body should render. */
-export function useLiveTerminal(agentId: string | null) {
+export function useLiveTerminal(sessionId: string | null) {
   const actions = useContext(ActionsCtx);
   if (!actions) throw new Error("useLiveTerminal must be used within LiveTerminalProvider");
   const tokenRef = useRef<symbol | null>(null);
@@ -236,41 +236,44 @@ export function useLiveTerminal(agentId: string | null) {
   const attach = useCallback(
     (el: HTMLElement | null) => {
       containerRef.current = el;
-      if (el && agentId) actions.claim(agentId, el, tokenRef.current as symbol);
+      if (el && sessionId) actions.claim(sessionId, el, tokenRef.current as symbol);
     },
-    [agentId, actions],
+    [sessionId, actions],
   );
 
   useEffect(() => {
-    if (agentId && containerRef.current) {
-      actions.claim(agentId, containerRef.current, tokenRef.current as symbol);
+    if (sessionId && containerRef.current) {
+      actions.claim(sessionId, containerRef.current, tokenRef.current as symbol);
     }
     return () => {
-      if (agentId) actions.release(agentId, tokenRef.current as symbol);
+      if (sessionId) actions.release(sessionId, tokenRef.current as symbol);
     };
-  }, [agentId, actions]);
+  }, [sessionId, actions]);
 
-  const info = useAgentLive(agentId);
+  const info = useSessionLive(sessionId);
   return {
     attach,
-    getHandle: useCallback(() => (agentId ? actions.getHandle(agentId) : null), [agentId, actions]),
+    getHandle: useCallback(
+      () => (sessionId ? actions.getHandle(sessionId) : null),
+      [sessionId, actions],
+    ),
     connInfo: info.connInfo,
     displayState: info.displayState,
   };
 }
 
-/** Reactive live info for one agent (connInfo/displayState); {} if not warm. */
-export function useAgentLive(agentId: string | null): AgentLive {
+/** Reactive live info for one session (connInfo/displayState); {} if not warm. */
+export function useSessionLive(sessionId: string | null): SessionLive {
   const { live } = useContext(StateCtx);
-  return (agentId ? live[agentId] : null) ?? { connInfo: null, displayState: null };
+  return (sessionId ? live[sessionId] : null) ?? { connInfo: null, displayState: null };
 }
 
-/** Connection state for an agent, for indicators. */
-export type AgentConnState = "connected" | "connecting" | "warm" | "off";
-export function useAgentConnState(agentId: string | null): AgentConnState {
+/** Connection state for a session, for indicators. */
+export type SessionConnState = "connected" | "connecting" | "warm" | "off";
+export function useSessionConnState(sessionId: string | null): SessionConnState {
   const { live, warm, claimed } = useContext(StateCtx);
-  if (!agentId || !warm[agentId]) return "off";
-  const sock = live[agentId]?.connInfo?.socketState;
-  if (sock === "open") return claimed[agentId] ? "connected" : "warm";
+  if (!sessionId || !warm[sessionId]) return "off";
+  const sock = live[sessionId]?.connInfo?.socketState;
+  if (sock === "open") return claimed[sessionId] ? "connected" : "warm";
   return "connecting";
 }

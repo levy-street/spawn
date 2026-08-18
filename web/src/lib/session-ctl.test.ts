@@ -1,25 +1,25 @@
 import assert from "node:assert/strict";
 import {
-  AGENT_CTL_CHUNK_PAYLOAD_BYTES,
-  AGENT_CTL_MAX_OUTSTANDING_REQUESTS,
-  AGENT_CTL_MAX_REPLAY_BYTES,
-  AGENT_CTL_MAX_UPLOAD_BYTES,
-  AGENT_CTL_UPLOAD_CHUNK_BYTES,
-  AgentCtlRequestTracker,
-  AgentGenerationInputQueue,
-  combineAgentCtlChunks,
-  decodeAgentCtlChunk,
-  encodeAgentCtlUploadChunk,
-  isAgentCtlRequestId,
-  makeAgentCtlRequest,
-  makeAgentCtlUploadCancel,
-  makeAgentCtlUploadStart,
+  combineSessionCtlChunks,
+  decodeSessionCtlChunk,
+  encodeSessionCtlUploadChunk,
+  isSessionCtlRequestId,
+  makeSessionCtlRequest,
+  makeSessionCtlUploadCancel,
+  makeSessionCtlUploadStart,
   OrderedAsyncQueue,
-  parseAgentCtlText,
-  parseAgentCtlUploadResponse,
+  parseSessionCtlText,
+  parseSessionCtlUploadResponse,
+  SESSION_CTL_CHUNK_PAYLOAD_BYTES,
+  SESSION_CTL_MAX_OUTSTANDING_REQUESTS,
+  SESSION_CTL_MAX_REPLAY_BYTES,
+  SESSION_CTL_MAX_UPLOAD_BYTES,
+  SESSION_CTL_UPLOAD_CHUNK_BYTES,
+  SessionCtlRequestTracker,
+  SessionGenerationInputQueue,
   sha256Blob,
   slicePtyChunkAfterAnchor,
-} from "./agent-ctl";
+} from "./session-ctl";
 
 declare function describe(name: string, callback: () => void): void;
 declare function test(name: string, callback: () => void | Promise<void>): void;
@@ -31,10 +31,10 @@ function requestId(index: number): string {
 describe("spawn.ctl browser protocol", () => {
   test("builds versioned requests and rejects oversized metadata", () => {
     const id = "00112233-4455-4677-8899-aabbccddeeff";
-    assert.match(makeAgentCtlRequest(id, "resize", { cols: 120, rows: 32 }) ?? "", /"version":1/);
+    assert.match(makeSessionCtlRequest(id, "resize", { cols: 120, rows: 32 }) ?? "", /"version":1/);
     assert.deepEqual(
       JSON.parse(
-        makeAgentCtlRequest(id, "redraw", {
+        makeSessionCtlRequest(id, "redraw", {
           version: 99,
           kind: "event",
           request_id: requestId(999),
@@ -43,27 +43,27 @@ describe("spawn.ctl browser protocol", () => {
       ),
       { version: 1, kind: "request", request_id: id, operation: "redraw" },
     );
-    assert.equal(makeAgentCtlRequest(id, "redraw", { padding: "x".repeat(20_000) }), null);
-    assert.equal(makeAgentCtlRequest("not-a-request-id", "redraw"), null);
-    assert.equal(isAgentCtlRequestId(id), true);
+    assert.equal(makeSessionCtlRequest(id, "redraw", { padding: "x".repeat(20_000) }), null);
+    assert.equal(makeSessionCtlRequest("not-a-request-id", "redraw"), null);
+    assert.equal(isSessionCtlRequestId(id), true);
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    assert.equal(makeAgentCtlRequest(id, "redraw", circular), null);
+    assert.equal(makeSessionCtlRequest(id, "redraw", circular), null);
   });
 
   test("parses readiness and display events and rejects other protocol versions", () => {
     const capability = "00112233-4455-4677-8899-aabbccddeeff";
-    assert.equal(parseAgentCtlText('{"version":1,"kind":"event","event":"ready"}'), null);
+    assert.equal(parseSessionCtlText('{"version":1,"kind":"event","event":"ready"}'), null);
     assert.deepEqual(
-      parseAgentCtlText(
+      parseSessionCtlText(
         JSON.stringify({
           version: 1,
           kind: "event",
           event: "ready",
           upload_capability: capability,
           agent_generation: 7,
-          upload_max_bytes: AGENT_CTL_MAX_UPLOAD_BYTES,
-          upload_chunk_bytes: AGENT_CTL_UPLOAD_CHUNK_BYTES,
+          upload_max_bytes: SESSION_CTL_MAX_UPLOAD_BYTES,
+          upload_chunk_bytes: SESSION_CTL_UPLOAD_CHUNK_BYTES,
         }),
       ),
       {
@@ -72,12 +72,12 @@ describe("spawn.ctl browser protocol", () => {
         event: "ready",
         upload_capability: capability,
         agent_generation: 7,
-        upload_max_bytes: AGENT_CTL_MAX_UPLOAD_BYTES,
-        upload_chunk_bytes: AGENT_CTL_UPLOAD_CHUNK_BYTES,
+        upload_max_bytes: SESSION_CTL_MAX_UPLOAD_BYTES,
+        upload_chunk_bytes: SESSION_CTL_UPLOAD_CHUNK_BYTES,
       },
     );
     assert.deepEqual(
-      parseAgentCtlText(
+      parseSessionCtlText(
         '{"version":1,"kind":"event","event":"display_state","owner":true,"cols":120,"rows":32,"viewers":2}',
       ),
       {
@@ -90,7 +90,7 @@ describe("spawn.ctl browser protocol", () => {
         viewers: 2,
       },
     );
-    assert.equal(parseAgentCtlText('{"version":2,"kind":"response","ok":true}'), null);
+    assert.equal(parseSessionCtlText('{"version":2,"kind":"response","ok":true}'), null);
   });
 
   test("frames bounded uploads and validates resumable direct responses", async () => {
@@ -101,7 +101,7 @@ describe("spawn.ctl browser protocol", () => {
     assert.equal(sha256, "2d119f1cd272958a492a144af600b9dc36531f73027b34073967345b027021b1");
     const start = {
       capability,
-      agentGeneration: 9,
+      sessionGeneration: 9,
       uploadId,
       name: "note.txt",
       mimeType: "text/plain",
@@ -110,7 +110,7 @@ describe("spawn.ctl browser protocol", () => {
       chunks: 1,
       sha256: sha256 ?? "",
     };
-    assert.deepEqual(JSON.parse(makeAgentCtlUploadStart(start) ?? "null"), {
+    assert.deepEqual(JSON.parse(makeSessionCtlUploadStart(start) ?? "null"), {
       version: 1,
       kind: "request",
       request_id: uploadId,
@@ -124,21 +124,21 @@ describe("spawn.ctl browser protocol", () => {
       chunks: 1,
       sha256,
     });
-    assert.equal(makeAgentCtlUploadStart({ ...start, name: "../escape" }), null);
+    assert.equal(makeSessionCtlUploadStart({ ...start, name: "../escape" }), null);
     assert.equal(
-      makeAgentCtlUploadStart({ ...start, totalBytes: AGENT_CTL_MAX_UPLOAD_BYTES + 1 }),
+      makeSessionCtlUploadStart({ ...start, totalBytes: SESSION_CTL_MAX_UPLOAD_BYTES + 1 }),
       null,
     );
-    assert.equal(makeAgentCtlUploadCancel(requestId(3), uploadId, capability, 0), null);
+    assert.equal(makeSessionCtlUploadCancel(requestId(3), uploadId, capability, 0), null);
 
-    const frame = encodeAgentCtlUploadChunk(uploadId, 0, true, bytes);
+    const frame = encodeSessionCtlUploadChunk(uploadId, 0, true, bytes);
     assert.ok(frame);
     assert.deepEqual(Array.from(frame.subarray(0, 8)), [0x53, 0x50, 0x43, 0x54, 1, 2, 1, 0]);
     assert.equal(new DataView(frame.buffer).getUint32(24, true), 0);
     assert.deepEqual(frame.subarray(28), bytes);
 
     assert.deepEqual(
-      parseAgentCtlUploadResponse(
+      parseSessionCtlUploadResponse(
         {
           version: 1,
           kind: "response",
@@ -154,7 +154,7 @@ describe("spawn.ctl browser protocol", () => {
       { kind: "ready", nextSequence: 1, receivedBytes: bytes.length },
     );
     assert.equal(
-      parseAgentCtlUploadResponse(
+      parseSessionCtlUploadResponse(
         {
           version: 1,
           kind: "response",
@@ -171,7 +171,7 @@ describe("spawn.ctl browser protocol", () => {
       null,
     );
     assert.deepEqual(
-      parseAgentCtlUploadResponse(
+      parseSessionCtlUploadResponse(
         {
           version: 1,
           kind: "response",
@@ -204,19 +204,22 @@ describe("spawn.ctl browser protocol", () => {
     );
     new DataView(frame.buffer).setUint32(24, 0, true);
     frame.set([7, 8, 9], 28);
-    assert.deepEqual(decodeAgentCtlChunk(frame), {
+    assert.deepEqual(decodeSessionCtlChunk(frame), {
       requestId: "00112233-4455-4677-8899-aabbccddeeff",
       sequence: 0,
       last: true,
       payload: new Uint8Array([7, 8, 9]),
     });
-    assert.equal(decodeAgentCtlChunk(new Uint8Array(28 + AGENT_CTL_CHUNK_PAYLOAD_BYTES + 1)), null);
+    assert.equal(
+      decodeSessionCtlChunk(new Uint8Array(28 + SESSION_CTL_CHUNK_PAYLOAD_BYTES + 1)),
+      null,
+    );
     const unknownFlags = frame.slice();
     new DataView(unknownFlags.buffer).setUint16(6, 2, true);
-    assert.equal(decodeAgentCtlChunk(unknownFlags), null);
+    assert.equal(decodeSessionCtlChunk(unknownFlags), null);
 
     assert.deepEqual(
-      combineAgentCtlChunks(
+      combineSessionCtlChunks(
         new Map([
           [0, new Uint8Array([1, 2])],
           [1, new Uint8Array([3])],
@@ -226,7 +229,7 @@ describe("spawn.ctl browser protocol", () => {
       ),
       new Uint8Array([1, 2, 3]),
     );
-    assert.equal(combineAgentCtlChunks(new Map(), 0, AGENT_CTL_MAX_REPLAY_BYTES + 1), null);
+    assert.equal(combineSessionCtlChunks(new Map(), 0, SESSION_CTL_MAX_REPLAY_BYTES + 1), null);
   });
 
   test("holds an ahead-of-arrival PTY anchor and slices a straddling chunk", () => {
@@ -245,7 +248,7 @@ describe("spawn.ctl browser protocol", () => {
   });
 
   test("only assembles bounded replies for outstanding request IDs", () => {
-    const tracker = new AgentCtlRequestTracker();
+    const tracker = new SessionCtlRequestTracker();
     const snapshotId = requestId(1);
     assert.equal(tracker.register(snapshotId, "snapshot"), true);
     assert.equal(tracker.register(snapshotId, "snapshot"), false);
@@ -259,7 +262,7 @@ describe("spawn.ctl browser protocol", () => {
         request_id: requestId(999),
         operation: "snapshot",
         ok: true,
-        total_bytes: AGENT_CTL_MAX_REPLAY_BYTES,
+        total_bytes: SESSION_CTL_MAX_REPLAY_BYTES,
         chunks: 256,
       }),
       null,
@@ -325,11 +328,11 @@ describe("spawn.ctl browser protocol", () => {
     );
     assert.equal(tracker.size, 0);
 
-    for (let index = 0; index < AGENT_CTL_MAX_OUTSTANDING_REQUESTS; index += 1) {
+    for (let index = 0; index < SESSION_CTL_MAX_OUTSTANDING_REQUESTS; index += 1) {
       assert.equal(tracker.register(requestId(index + 10), "redraw"), true);
     }
     assert.equal(tracker.register(requestId(10_000), "redraw"), false);
-    assert.equal(tracker.size, AGENT_CTL_MAX_OUTSTANDING_REQUESTS);
+    assert.equal(tracker.size, SESSION_CTL_MAX_OUTSTANDING_REQUESTS);
   });
 
   test("preserves message order when an earlier asynchronous decode finishes late", async () => {
@@ -361,8 +364,8 @@ describe("spawn.ctl browser protocol", () => {
     assert.deepEqual(delivered, ["blob-first", "array-buffer-second"]);
   });
 
-  test("never drains queued input into another agent generation", () => {
-    const queue = new AgentGenerationInputQueue(4);
+  test("never drains queued input into another session generation", () => {
+    const queue = new SessionGenerationInputQueue(4);
     assert.equal(queue.enqueue(1, new Uint8Array([1, 2])), true);
     assert.equal(queue.enqueue(2, new Uint8Array([3, 4])), true);
     assert.equal(queue.enqueue(2, new Uint8Array([5])), false);

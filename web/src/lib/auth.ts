@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ApiError, auth, type AuthConfig, type User } from "@/lib/api";
+import { ApiError, type AuthConfig, auth, type User } from "@/lib/api";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses

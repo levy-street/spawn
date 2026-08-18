@@ -2,51 +2,51 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  AGENT_CTL_MAX_PENDING_PTY_BYTES,
-  AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER,
-  AGENT_CTL_UPLOAD_BUFFER_LOW_WATER,
-  AGENT_CTL_UPLOAD_CHUNK_BYTES,
-  type AgentCtlOperation,
-  AgentCtlRequestTracker,
-  type AgentCtlResponse,
-  type AgentCtlTrackedResult,
-  type AgentCtlUploadResult,
-  type AgentCtlUploadStart,
-  AgentGenerationInputQueue,
-  DirectAgentUploadError,
-  decodeAgentCtlChunk,
-  encodeAgentCtlUploadChunk,
-  makeAgentCtlRequest,
-  makeAgentCtlUploadCancel,
-  makeAgentCtlUploadStart,
-  newAgentCtlRequestId,
+  DirectSessionUploadError,
+  decodeSessionCtlChunk,
+  encodeSessionCtlUploadChunk,
+  makeSessionCtlRequest,
+  makeSessionCtlUploadCancel,
+  makeSessionCtlUploadStart,
+  newSessionCtlRequestId,
   OrderedAsyncQueue,
-  parseAgentCtlText,
-  parseAgentCtlUploadResponse,
+  parseSessionCtlText,
+  parseSessionCtlUploadResponse,
+  SESSION_CTL_MAX_PENDING_PTY_BYTES,
+  SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER,
+  SESSION_CTL_UPLOAD_BUFFER_LOW_WATER,
+  SESSION_CTL_UPLOAD_CHUNK_BYTES,
+  type SessionCtlOperation,
+  SessionCtlRequestTracker,
+  type SessionCtlResponse,
+  type SessionCtlTrackedResult,
+  type SessionCtlUploadResult,
+  type SessionCtlUploadStart,
+  SessionGenerationInputQueue,
   sha256Blob,
   slicePtyChunkAfterAnchor,
-} from "@/lib/agent-ctl";
+} from "@/lib/session-ctl";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
 import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import {
-  agentRtcTuple,
-  buildAgentWsUrl,
+  buildSessionWsUrl,
   type DisplayControlState,
   parseInbound,
   rtcBindingFrameMatches,
   SPAWN_WS_SUBPROTOCOL,
+  sessionRtcTuple,
 } from "@/lib/ws";
 
 /**
- * Lifecycle hook for the per-agent browser WS.
+ * Lifecycle hook for the per-session browser WS.
  *
  * Manages connect, reconnect (linear backoff up to 10s), and surface state
  * via callbacks.  The caller is responsible for actually wiring `onData` to
  * the xterm.js instance (we keep this hook framework-agnostic so it could
  * also maintain local replay state).
  */
-export interface UseAgentSocketOptions {
-  agentId: string;
+export interface UseSessionSocketOptions {
+  sessionId: string;
   enabled?: boolean;
   /** Resolve, once per RTC generation, whether this host requires signed
    * signaling, may use raw (unpinned TOFU first-contact), or must be refused.
@@ -81,7 +81,7 @@ export interface UseAgentSocketOptions {
    *  acknowledged by a delta-capable daemon+worker pair). */
 }
 
-export interface DirectAgentUploadOptions {
+export interface DirectSessionUploadOptions {
   name: string;
   mimeType: string;
   destination?: "attachments" | "cwd";
@@ -114,13 +114,13 @@ export interface ConnInfo {
 const EMPTY_CONN_INFO: ConnInfo = { kind: null, rttMs: null, protocol: null };
 
 type RtcState = {
-  agentId: string | null;
-  agentGeneration: number;
+  sessionId: string | null;
+  sessionGeneration: number;
   rtcGeneration: number;
   pc: RTCPeerConnection | null;
   ptyDc: RTCDataChannel | null;
   ctlDc: RTCDataChannel | null;
-  sessionId: string | null;
+  rtcSessionId: string | null;
   ptyOpen: boolean;
   ctlOpen: boolean;
   bindingNonce: string | null;
@@ -170,8 +170,8 @@ export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): st
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
-export function useAgentSocket({
-  agentId,
+export function useSessionSocket({
+  sessionId,
   enabled = true,
   resolveSignedRtcTrust,
   initialSize = null,
@@ -182,10 +182,10 @@ export function useAgentSocket({
   onStatus,
   onSnapshot,
   onSnapshotError,
-}: UseAgentSocketOptions) {
+}: UseSessionSocketOptions) {
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
-  const [v2, setV2] = useState(false);
+  const [v3, setV3] = useState(false);
   // True after both DataChannels are open, the daemon has acknowledged their
   // shared readiness gate, and the initial replay has completed.
   const [dcOpen, setDcOpen] = useState(false);
@@ -198,18 +198,18 @@ export function useAgentSocket({
   // key), or "raw" (unsigned legacy path). Null until a decision is made.
   const [signalingTrust, setSignalingTrust] = useState<SignalingTrustLevel | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const activeAgentIdRef = useRef<string | null>(null);
-  const agentGenerationRef = useRef(0);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const sessionGenerationRef = useRef(0);
   const rtcGenerationRef = useRef(0);
-  const pendingInputRef = useRef(new AgentGenerationInputQueue(MAX_PENDING_INPUT_BYTES));
+  const pendingInputRef = useRef(new SessionGenerationInputQueue(MAX_PENDING_INPUT_BYTES));
   const rtcRef = useRef<RtcState>({
-    agentId: null,
-    agentGeneration: 0,
+    sessionId: null,
+    sessionGeneration: 0,
     rtcGeneration: 0,
     pc: null,
     ptyDc: null,
     ctlDc: null,
-    sessionId: null,
+    rtcSessionId: null,
     ptyOpen: false,
     ctlOpen: false,
     bindingNonce: null,
@@ -218,12 +218,12 @@ export function useAgentSocket({
     bytesReceived: 0,
   });
   const sendControlRef = useRef<
-    (operation: AgentCtlOperation, parameters?: Record<string, unknown>) => boolean
+    (operation: SessionCtlOperation, parameters?: Record<string, unknown>) => boolean
   >(() => false);
   const uploadRef = useRef<
-    (blob: Blob, options: DirectAgentUploadOptions) => Promise<AgentCtlUploadResult>
+    (blob: Blob, options: DirectSessionUploadOptions) => Promise<SessionCtlUploadResult>
   >(async () => {
-    throw new Error("Direct agent upload channel is not ready.");
+    throw new Error("Direct session upload channel is not ready.");
   });
   const cancelUploadsRef = useRef<(reason: Error) => void>(() => {});
   // Upload readiness latch. An upload requested before the ctl channel has
@@ -233,7 +233,7 @@ export function useAgentSocket({
   // transient RTC teardown may still be followed by a retry that restores
   // readiness. Waiters are therefore never rejected by lifecycle churn — only
   // the caller's own abort signal or the bounded wait ends one early; a
-  // staleness re-check after the wait rejects callers whose agent moved on.
+  // staleness re-check after the wait rejects callers whose session moved on.
   const uploadReadyRef = useRef(false);
   const uploadReadyWaitersRef = useRef(new Set<() => void>());
   const settleUploadReadiness = useCallback((ready: boolean) => {
@@ -251,7 +251,7 @@ export function useAgentSocket({
   resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
-    agentId,
+    sessionId,
     onData,
     onHistory,
     onDisplayControl,
@@ -262,7 +262,7 @@ export function useAgentSocket({
   });
   initialSizeRef.current = initialSize;
   handlersRef.current = {
-    agentId,
+    sessionId,
     onData,
     onHistory,
     onDisplayControl,
@@ -273,21 +273,21 @@ export function useAgentSocket({
   };
 
   useEffect(() => {
-    const agentGeneration = agentGenerationRef.current + 1;
-    agentGenerationRef.current = agentGeneration;
+    const sessionGeneration = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = sessionGeneration;
     pendingInputRef.current.clear();
     sendControlRef.current = () => false;
     uploadRef.current = async () => {
-      throw new Error("Direct agent upload channel is not ready.");
+      throw new Error("Direct session upload channel is not ready.");
     };
     settleUploadReadiness(false);
-    cancelUploadsRef.current(new Error("Agent upload generation changed."));
+    cancelUploadsRef.current(new Error("Session upload generation changed."));
     cancelUploadsRef.current = () => {};
-    activeAgentIdRef.current = enabled && agentId ? agentId : null;
-    setV2(false);
+    activeSessionIdRef.current = enabled && sessionId ? sessionId : null;
+    setV3(false);
     setDcOpen(false);
     setSignalingTrust(null);
-    if (!enabled || !agentId) return;
+    if (!enabled || !sessionId) return;
     let cancelled = false;
     let attempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -299,21 +299,21 @@ export function useAgentSocket({
     let lastRtcIceServers: RTCIceServer[] | null = null;
     let signedRtcSession: SignedRtcLiveSession | null = null;
 
-    const isCurrentAgentGeneration = () => agentGenerationRef.current === agentGeneration;
-    const isActiveAgentGeneration = () => !cancelled && isCurrentAgentGeneration();
+    const isCurrentSessionGeneration = () => sessionGenerationRef.current === sessionGeneration;
+    const isActiveSessionGeneration = () => !cancelled && isCurrentSessionGeneration();
     const currentHandlers = () =>
-      isActiveAgentGeneration() && handlersRef.current.agentId === agentId
+      isActiveSessionGeneration() && handlersRef.current.sessionId === sessionId
         ? handlersRef.current
         : null;
 
     const sendJsonOverWs = (msg: unknown) => {
-      if (!isCurrentAgentGeneration()) return false;
+      if (!isCurrentSessionGeneration()) return false;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
       ws.send(JSON.stringify(msg));
       return true;
     };
-    const boundAgentRtcTuple = agentRtcTuple(agentId);
+    const boundSessionRtcTuple = sessionRtcTuple(sessionId);
 
     const clearRtcConnectTimer = () => {
       if (rtcConnectTimer) clearTimeout(rtcConnectTimer);
@@ -328,32 +328,32 @@ export function useAgentSocket({
     const cleanupRtc = (signal = true, retry = false, expectedRtcGeneration?: number) => {
       const rtc = rtcRef.current;
       if (
-        rtc.agentId !== agentId ||
-        rtc.agentGeneration !== agentGeneration ||
+        rtc.sessionId !== sessionId ||
+        rtc.sessionGeneration !== sessionGeneration ||
         (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
       ) {
         return;
       }
-      const sessionId = rtc.sessionId;
+      const rtcSessionId = rtc.rtcSessionId;
       const bindingNonce = rtc.bindingNonce;
       clearRtcConnectTimer();
       clearRtcDisconnectedTimer();
-      if (signal && sessionId && bindingNonce) {
+      if (signal && rtcSessionId && bindingNonce) {
         sendJsonOverWs({
           type: "rtc.close",
-          session_id: sessionId,
+          session_id: rtcSessionId,
           binding_nonce: bindingNonce,
-          ...boundAgentRtcTuple,
+          ...boundSessionRtcTuple,
         });
       }
       rtcRef.current = {
-        agentId: null,
-        agentGeneration: 0,
+        sessionId: null,
+        sessionGeneration: 0,
         rtcGeneration: 0,
         pc: null,
         ptyDc: null,
         ctlDc: null,
-        sessionId: null,
+        rtcSessionId: null,
         ptyOpen: false,
         ctlOpen: false,
         bindingNonce: null,
@@ -376,20 +376,20 @@ export function useAgentSocket({
       }
       sendControlRef.current = () => false;
       uploadRef.current = async () => {
-        throw new Error("Direct agent upload channel is not ready.");
+        throw new Error("Direct session upload channel is not ready.");
       };
       settleUploadReadiness(false);
-      cancelUploadsRef.current(new Error("Direct agent upload channel closed."));
+      cancelUploadsRef.current(new Error("Direct session upload channel closed."));
       cancelUploadsRef.current = () => {};
       pendingRemoteRtcCandidatesRef.current = [];
       rtcStartInFlight = false;
-      if (isCurrentAgentGeneration()) setDcOpen(false);
+      if (isCurrentSessionGeneration()) setDcOpen(false);
       if (retry) scheduleRtcRetry();
     };
 
     // Retry transient WebRTC failures without opening a content fallback.
     const scheduleRtcRetry = () => {
-      if (!isActiveAgentGeneration() || rtcRetryTimer || !lastRtcIceServers) return;
+      if (!isActiveSessionGeneration() || rtcRetryTimer || !lastRtcIceServers) return;
       const delay = Math.min(
         RTC_RETRY_MAX_DELAY_MS,
         RTC_RETRY_BASE_DELAY_MS * 2 ** rtcRetryAttempts,
@@ -397,19 +397,19 @@ export function useAgentSocket({
       rtcRetryAttempts += 1;
       rtcRetryTimer = setTimeout(() => {
         rtcRetryTimer = null;
-        if (!isActiveAgentGeneration() || rtcRef.current.pc) return;
+        if (!isActiveSessionGeneration() || rtcRef.current.pc) return;
         if (wsRef.current?.readyState !== WebSocket.OPEN) return;
         if (lastRtcIceServers) void startRtc(lastRtcIceServers);
       }, delay);
     };
 
     const startRtc = async (iceServers: RTCIceServer[]) => {
-      if (!isActiveAgentGeneration() || rtcStartInFlight || rtcRef.current.pc) return;
+      if (!isActiveSessionGeneration() || rtcStartInFlight || rtcRef.current.pc) return;
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
       const rtcGeneration = rtcGenerationRef.current + 1;
       rtcGenerationRef.current = rtcGeneration;
-      const sessionId = newRtcSessionId();
+      const rtcSessionId = newRtcSessionId();
       const bindingNonce = newRtcBindingNonce();
       if (!bindingNonce) {
         rtcStartInFlight = false;
@@ -429,7 +429,7 @@ export function useAgentSocket({
         iceServers,
         iceTransportPolicy: forceRelay ? "relay" : "all",
       });
-      // Omitting both partial-reliability fields is intentional: both agent
+      // Omitting both partial-reliability fields is intentional: both session
       // channels are fully reliable as well as ordered, and the daemon rejects
       // unordered, lifetime-limited, or retransmit-limited peers.
       const reliableOrderedChannel: RTCDataChannelInit = { ordered: true };
@@ -437,10 +437,10 @@ export function useAgentSocket({
       const ctlDc = pc.createDataChannel("spawn.ctl", reliableOrderedChannel);
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       const pendingControlTexts: string[] = [];
-      const requests = new AgentCtlRequestTracker();
-      type UploadMessage = NonNullable<ReturnType<typeof parseAgentCtlUploadResponse>>;
+      const requests = new SessionCtlRequestTracker();
+      type UploadMessage = NonNullable<ReturnType<typeof parseSessionCtlUploadResponse>>;
       type PendingUpload = {
-        expected: AgentCtlUploadStart;
+        expected: SessionCtlUploadStart;
         messages: UploadMessage[];
         controller: AbortController;
         cancel?: () => void;
@@ -465,18 +465,18 @@ export function useAgentSocket({
       let bootstrapStarted = false;
       let serverReady = false;
       let uploadCapability: string | null = null;
-      let uploadAgentGeneration: number | null = null;
+      let uploadSessionGeneration: number | null = null;
       let bootstrapPtyAnchor: number | null = null;
       let initialHistoryRequestId: string | null = null;
       let offerSent = false;
       const isCurrentRtcGeneration = () => {
         const current = rtcRef.current;
         return (
-          isActiveAgentGeneration() &&
-          current.agentId === agentId &&
-          current.agentGeneration === agentGeneration &&
+          isActiveSessionGeneration() &&
+          current.sessionId === sessionId &&
+          current.sessionGeneration === sessionGeneration &&
           current.rtcGeneration === rtcGeneration &&
-          current.sessionId === sessionId
+          current.rtcSessionId === rtcSessionId
         );
       };
       const rejectPendingUploads = (reason: Error) => {
@@ -493,13 +493,13 @@ export function useAgentSocket({
       cancelUploadsRef.current = rejectPendingUploads;
 
       const deliverUploadMessage = (
-        response: Parameters<typeof parseAgentCtlUploadResponse>[0],
+        response: Parameters<typeof parseSessionCtlUploadResponse>[0],
       ) => {
         const requestId = response.request_id;
         if (typeof requestId !== "string") return false;
         const pending = pendingUploads.get(requestId);
         if (!pending) return false;
-        const message = parseAgentCtlUploadResponse(response, pending.expected);
+        const message = parseSessionCtlUploadResponse(response, pending.expected);
         if (!message) return true;
         if (pending.controller.signal.aborted || !isCurrentRtcGeneration()) return true;
         if (pending.waiter) {
@@ -562,8 +562,8 @@ export function useAgentSocket({
       };
 
       const waitForUploadBackpressure = async (signal?: AbortSignal) => {
-        if (ctlDc.bufferedAmount <= AGENT_CTL_UPLOAD_BUFFER_HIGH_WATER) return;
-        ctlDc.bufferedAmountLowThreshold = AGENT_CTL_UPLOAD_BUFFER_LOW_WATER;
+        if (ctlDc.bufferedAmount <= SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER) return;
+        ctlDc.bufferedAmountLowThreshold = SESSION_CTL_UPLOAD_BUFFER_LOW_WATER;
         await new Promise<void>((resolve, reject) => {
           let timer: ReturnType<typeof setTimeout>;
           const onLow = () => finish();
@@ -589,8 +589,8 @@ export function useAgentSocket({
 
       const runUpload = async (
         blob: Blob,
-        options: DirectAgentUploadOptions,
-      ): Promise<AgentCtlUploadResult> => {
+        options: DirectSessionUploadOptions,
+      ): Promise<SessionCtlUploadResult> => {
         const uploadContextError = (signal?: AbortSignal): Error | null => {
           if (signal?.aborted) {
             return signal.reason instanceof Error
@@ -604,7 +604,7 @@ export function useAgentSocket({
             current.ctlDc !== ctlDc ||
             ctlDc.readyState !== "open"
           ) {
-            return new Error("Direct agent upload channel closed.");
+            return new Error("Direct session upload channel closed.");
           }
           return null;
         };
@@ -613,25 +613,25 @@ export function useAgentSocket({
           if (error) throw error;
         };
         assertUploadContext(options.signal);
-        if (!uploadCapability || uploadAgentGeneration === null) {
-          throw new Error("Direct agent upload channel is not ready.");
+        if (!uploadCapability || uploadSessionGeneration === null) {
+          throw new Error("Direct session upload channel is not ready.");
         }
         const sha256 = await sha256Blob(blob, () => assertUploadContext(options.signal));
         assertUploadContext(options.signal);
         if (!sha256) throw new Error("Could not securely hash the upload.");
-        const uploadId = options.uploadId ?? newAgentCtlRequestId();
-        const expected: AgentCtlUploadStart = {
+        const uploadId = options.uploadId ?? newSessionCtlRequestId();
+        const expected: SessionCtlUploadStart = {
           capability: uploadCapability,
-          agentGeneration: uploadAgentGeneration,
+          sessionGeneration: uploadSessionGeneration,
           uploadId,
           name: options.name,
           mimeType: options.mimeType,
           destination: options.destination ?? "attachments",
           totalBytes: blob.size,
-          chunks: Math.ceil(blob.size / AGENT_CTL_UPLOAD_CHUNK_BYTES),
+          chunks: Math.ceil(blob.size / SESSION_CTL_UPLOAD_CHUNK_BYTES),
           sha256,
         };
-        const startText = makeAgentCtlUploadStart(expected);
+        const startText = makeSessionCtlUploadStart(expected);
         if (!startText) throw new Error("Upload metadata is outside protocol limits.");
         if (pendingUploads.has(uploadId)) throw new Error("Upload id is already active.");
         const controller = new AbortController();
@@ -646,11 +646,11 @@ export function useAgentSocket({
         const sendCancel = () => {
           if (!startDispatched || cancelSent) return;
           cancelSent = true;
-          const text = makeAgentCtlUploadCancel(
-            newAgentCtlRequestId(),
+          const text = makeSessionCtlUploadCancel(
+            newSessionCtlRequestId(),
             uploadId,
             expected.capability,
-            expected.agentGeneration,
+            expected.sessionGeneration,
           );
           if (text && ctlDc.readyState === "open") {
             try {
@@ -667,11 +667,11 @@ export function useAgentSocket({
         if (uploadSignal.aborted) cancelOnAbort();
         let finalDispatched = false;
         const unknownAfterFinal = (error: unknown) => {
-          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+          if (error instanceof DirectSessionUploadError && error.code === "outcome_unknown") {
             return error;
           }
           const detail = error instanceof Error ? error.message : "upload acknowledgement was lost";
-          return new DirectAgentUploadError(
+          return new DirectSessionUploadError(
             "outcome_unknown",
             `Upload may have been published; reconcile the destination before retrying. ${detail}`,
           );
@@ -693,12 +693,12 @@ export function useAgentSocket({
             }
             if (message.kind === "complete") return message.result;
             if (message.kind === "error") {
-              throw new DirectAgentUploadError(message.code, message.message);
+              throw new DirectSessionUploadError(message.code, message.message);
             }
             break;
           }
           if (!message || message.kind !== "ready") {
-            throw new Error("Direct agent upload did not start after bounded retries.");
+            throw new Error("Direct session upload did not start after bounded retries.");
           }
           for (let sequence = message.nextSequence; sequence < expected.chunks; sequence += 1) {
             assertUploadContext(uploadSignal);
@@ -706,14 +706,14 @@ export function useAgentSocket({
               throw finalDispatched ? unknownAfterFinal(error) : error;
             });
             assertUploadContext(uploadSignal);
-            const start = sequence * AGENT_CTL_UPLOAD_CHUNK_BYTES;
-            const end = Math.min(start + AGENT_CTL_UPLOAD_CHUNK_BYTES, blob.size);
+            const start = sequence * SESSION_CTL_UPLOAD_CHUNK_BYTES;
+            const end = Math.min(start + SESSION_CTL_UPLOAD_CHUNK_BYTES, blob.size);
             const chunkBuffer = await blob.slice(start, end).arrayBuffer();
             const payload = new Uint8Array(chunkBuffer);
-            let frame: ReturnType<typeof encodeAgentCtlUploadChunk>;
+            let frame: ReturnType<typeof encodeSessionCtlUploadChunk>;
             try {
               assertUploadContext(uploadSignal);
-              frame = encodeAgentCtlUploadChunk(
+              frame = encodeSessionCtlUploadChunk(
                 uploadId,
                 sequence,
                 sequence + 1 === expected.chunks,
@@ -745,14 +745,14 @@ export function useAgentSocket({
           }
           if (message.kind === "complete") return message.result;
           if (message.kind === "error") {
-            throw new DirectAgentUploadError(message.code, message.message);
+            throw new DirectSessionUploadError(message.code, message.message);
           }
           throw finalDispatched
             ? unknownAfterFinal(new Error("Endpoint returned an invalid final upload response."))
             : new Error("Endpoint returned an invalid upload response.");
         } catch (error) {
           sendCancel();
-          throw finalDispatched && !(error instanceof DirectAgentUploadError)
+          throw finalDispatched && !(error instanceof DirectSessionUploadError)
             ? unknownAfterFinal(error)
             : error;
         } finally {
@@ -767,13 +767,13 @@ export function useAgentSocket({
       ptyDc.binaryType = "arraybuffer";
       ctlDc.binaryType = "arraybuffer";
       rtcRef.current = {
-        agentId,
-        agentGeneration,
+        sessionId,
+        sessionGeneration,
         rtcGeneration,
         pc,
         ptyDc,
         ctlDc,
-        sessionId,
+        rtcSessionId,
         ptyOpen: false,
         ctlOpen: false,
         bindingNonce,
@@ -783,7 +783,7 @@ export function useAgentSocket({
       };
 
       const flushPendingInput = () => {
-        const queued = pendingInputRef.current.drain(agentGeneration);
+        const queued = pendingInputRef.current.drain(sessionGeneration);
         for (const chunk of queued) {
           try {
             ptyDc.send(
@@ -816,7 +816,7 @@ export function useAgentSocket({
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
         settleUploadReadiness(true);
-        if (isCurrentAgentGeneration()) setDcOpen(true);
+        if (isCurrentSessionGeneration()) setDcOpen(true);
         flushPendingInput();
       };
 
@@ -829,7 +829,7 @@ export function useAgentSocket({
       };
 
       const responseHistoryAnchor = (
-        response: AgentCtlResponse,
+        response: SessionCtlResponse,
       ): { epoch: string; offset: number } | null =>
         typeof response.history_epoch === "string" &&
         Number.isSafeInteger(response.history_offset) &&
@@ -873,7 +873,7 @@ export function useAgentSocket({
         markReady();
       };
 
-      const acceptTrackedResult = (result: AgentCtlTrackedResult | null) => {
+      const acceptTrackedResult = (result: SessionCtlTrackedResult | null) => {
         if (!result || !isCurrentRtcGeneration()) return;
         const requestId = result.response.request_id;
         if (result.kind === "response") {
@@ -928,9 +928,9 @@ export function useAgentSocket({
           return;
         }
         bootstrapStarted = true;
-        initialHistoryRequestId = newAgentCtlRequestId();
+        initialHistoryRequestId = newSessionCtlRequestId();
         const size = initialSizeRef.current;
-        const historyText = makeAgentCtlRequest(initialHistoryRequestId, "history", {
+        const historyText = makeSessionCtlRequest(initialHistoryRequestId, "history", {
           lines: 400,
           plain: false,
           ...(size ? { cols: size.cols, rows: size.rows } : {}),
@@ -960,12 +960,12 @@ export function useAgentSocket({
       };
 
       const sendControl = (
-        operation: AgentCtlOperation,
+        operation: SessionCtlOperation,
         parameters: Record<string, unknown> = {},
       ): boolean => {
         if (!ctlDc || !isCurrentRtcGeneration()) return false;
-        const requestId = newAgentCtlRequestId();
-        const text = makeAgentCtlRequest(requestId, operation, parameters);
+        const requestId = newSessionCtlRequestId();
+        const text = makeSessionCtlRequest(requestId, operation, parameters);
         if (!text) return false;
         const canSend = serverReady && ctlDc.readyState === "open";
         if (!canSend && pendingControlTexts.length >= 128) return false;
@@ -992,9 +992,9 @@ export function useAgentSocket({
       const sendRtcCandidate = (candidate: RTCIceCandidateInit) =>
         sendJsonOverWs({
           type: "rtc.candidate",
-          session_id: sessionId,
+          session_id: rtcSessionId,
           binding_nonce: bindingNonce,
-          ...boundAgentRtcTuple,
+          ...boundSessionRtcTuple,
           candidate,
         });
 
@@ -1013,7 +1013,10 @@ export function useAgentSocket({
         if (pc.connectionState === "disconnected") {
           if (!rtcDisconnectedTimer) {
             rtcDisconnectedTimer = setTimeout(() => {
-              if (rtcRef.current.sessionId === sessionId && pc.connectionState === "disconnected") {
+              if (
+                rtcRef.current.rtcSessionId === rtcSessionId &&
+                pc.connectionState === "disconnected"
+              ) {
                 cleanupRtc(true, true, rtcGeneration);
               }
             }, RTC_DISCONNECTED_GRACE_MS);
@@ -1042,7 +1045,7 @@ export function useAgentSocket({
         if (!isCurrentRtcGeneration()) return;
         current.bytesReceived += bytes.byteLength;
         if (!bootstrapDone) {
-          if (pendingBootstrapPtyBytes + bytes.byteLength > AGENT_CTL_MAX_PENDING_PTY_BYTES) {
+          if (pendingBootstrapPtyBytes + bytes.byteLength > SESSION_CTL_MAX_PENDING_PTY_BYTES) {
             cleanupRtc(true, true, rtcGeneration);
             return;
           }
@@ -1081,7 +1084,7 @@ export function useAgentSocket({
         ctlDc.onerror = () => cleanupRtc(true, true, rtcGeneration);
         const deliverControlBinary = (bytes: Uint8Array) => {
           if (!isCurrentRtcGeneration()) return;
-          const chunk = decodeAgentCtlChunk(bytes);
+          const chunk = decodeSessionCtlChunk(bytes);
           if (!chunk) return;
           acceptTrackedResult(requests.acceptChunk(chunk));
         };
@@ -1109,12 +1112,12 @@ export function useAgentSocket({
                 deliverControlBinary(decoded);
                 return;
               }
-              const message = parseAgentCtlText(decoded);
+              const message = parseSessionCtlText(decoded);
               if (!message) return;
               if (message.kind === "event") {
                 if (message.event === "ready") {
                   uploadCapability = message.upload_capability;
-                  uploadAgentGeneration = message.agent_generation;
+                  uploadSessionGeneration = message.agent_generation;
                   serverReady = true;
                   startBootstrap();
                   return;
@@ -1193,12 +1196,12 @@ export function useAgentSocket({
           signedRtcDecision.mode === "signed"
             ? new SignedRtcLiveSession(
                 {
-                  scopeType: "agent",
-                  scopeId: agentId,
+                  scopeType: "session",
+                  scopeId: sessionId,
                   protocol: "spawn.pty",
                   protocolVersion: 2,
                 },
-                sessionId,
+                rtcSessionId,
                 signedRtcDecision.capability,
               )
             : null;
@@ -1210,9 +1213,9 @@ export function useAgentSocket({
         if (
           !sendJsonOverWs({
             type: "rtc.offer",
-            session_id: sessionId,
+            session_id: rtcSessionId,
             binding_nonce: bindingNonce,
-            ...boundAgentRtcTuple,
+            ...boundSessionRtcTuple,
             ...carrier,
           })
         ) {
@@ -1229,11 +1232,11 @@ export function useAgentSocket({
     };
 
     const connect = () => {
-      if (!isActiveAgentGeneration()) return;
+      if (!isActiveSessionGeneration()) return;
       setState("connecting");
       let ws: WebSocket;
       try {
-        ws = new WebSocket(buildAgentWsUrl(agentId), SPAWN_WS_SUBPROTOCOL);
+        ws = new WebSocket(buildSessionWsUrl(sessionId), SPAWN_WS_SUBPROTOCOL);
       } catch {
         setState("error");
         scheduleReconnect();
@@ -1241,7 +1244,7 @@ export function useAgentSocket({
       }
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
-      const isCurrentWs = () => isActiveAgentGeneration() && wsRef.current === ws;
+      const isCurrentWs = () => isActiveSessionGeneration() && wsRef.current === ws;
 
       ws.onopen = () => {
         if (!isCurrentWs()) return;
@@ -1250,7 +1253,7 @@ export function useAgentSocket({
           ws.close(1002, "Required terminal signaling protocol was not selected");
           return;
         }
-        setV2(true);
+        setV3(true);
         setState("open");
       };
       ws.onmessage = (ev) => {
@@ -1263,9 +1266,9 @@ export function useAgentSocket({
             if (signedRtcSession) cleanupRtc(true, true, rtcRef.current.rtcGeneration);
             return;
           }
-          if (msg.type === "agent.exit") {
+          if (msg.type === "session.exit") {
             h.onExit?.(msg.exit_code, msg.signal);
-          } else if (msg.type === "agent.status") {
+          } else if (msg.type === "session.status") {
             h.onStatus?.(msg.status);
           } else if (msg.type === "rtc.config") {
             if (msg.enabled) {
@@ -1285,21 +1288,21 @@ export function useAgentSocket({
             if (current.pc && signedRtcSession) {
               const pc = current.pc;
               const acceptedBinding = {
-                sessionId: current.sessionId,
+                rtcSessionId: current.rtcSessionId,
                 bindingNonce: current.bindingNonce,
                 bindingGeneration: current.bindingGeneration,
               };
               const acceptedRtcGeneration = current.rtcGeneration;
               if (
-                !current.sessionId ||
+                !current.rtcSessionId ||
                 !current.bindingNonce ||
                 current.bindingGeneration === null ||
                 !rtcBindingFrameMatches(
                   {
-                    sessionId: current.sessionId,
+                    rtcSessionId: current.rtcSessionId,
                     bindingNonce: current.bindingNonce,
                     bindingGeneration: current.bindingGeneration,
-                    agentId,
+                    sessionId,
                   },
                   msg,
                 )
@@ -1314,10 +1317,10 @@ export function useAgentSocket({
                   if (
                     !isCurrentWs() ||
                     latest.pc !== pc ||
-                    latest.agentId !== agentId ||
-                    latest.agentGeneration !== agentGeneration ||
+                    latest.sessionId !== sessionId ||
+                    latest.sessionGeneration !== sessionGeneration ||
                     latest.rtcGeneration !== acceptedRtcGeneration ||
-                    latest.sessionId !== acceptedBinding.sessionId ||
+                    latest.rtcSessionId !== acceptedBinding.rtcSessionId ||
                     latest.bindingNonce !== acceptedBinding.bindingNonce ||
                     latest.bindingGeneration !== acceptedBinding.bindingGeneration
                   )
@@ -1329,23 +1332,23 @@ export function useAgentSocket({
                 })
                 .catch(() => cleanupRtc(true, true, acceptedRtcGeneration));
             } else if (
-              current.sessionId &&
+              current.rtcSessionId &&
               current.bindingNonce &&
               (!bindingRequired || current.bindingGeneration !== null) &&
               current.pc &&
               rtcBindingFrameMatches(
                 {
-                  sessionId: current.sessionId,
+                  rtcSessionId: current.rtcSessionId,
                   bindingNonce: current.bindingNonce,
                   bindingGeneration: current.bindingGeneration,
-                  agentId,
+                  sessionId,
                 },
                 msg,
               )
             ) {
               const pc = current.pc;
               const acceptedBinding = {
-                sessionId: current.sessionId,
+                rtcSessionId: current.rtcSessionId,
                 bindingNonce: current.bindingNonce,
                 bindingGeneration: current.bindingGeneration,
               };
@@ -1361,10 +1364,10 @@ export function useAgentSocket({
                   if (
                     !isCurrentWs() ||
                     latest.pc !== pc ||
-                    latest.agentId !== agentId ||
-                    latest.agentGeneration !== agentGeneration ||
+                    latest.sessionId !== sessionId ||
+                    latest.sessionGeneration !== sessionGeneration ||
                     latest.rtcGeneration !== acceptedRtcGeneration ||
-                    latest.sessionId !== acceptedBinding.sessionId ||
+                    latest.rtcSessionId !== acceptedBinding.rtcSessionId ||
                     latest.bindingNonce !== acceptedBinding.bindingNonce ||
                     latest.bindingGeneration !== acceptedBinding.bindingGeneration
                   )
@@ -1380,16 +1383,16 @@ export function useAgentSocket({
             const current = rtcRef.current;
             const bindingRequired = true;
             if (
-              current.sessionId &&
+              current.rtcSessionId &&
               current.bindingNonce &&
               (!bindingRequired || current.bindingGeneration !== null) &&
               current.pc &&
               rtcBindingFrameMatches(
                 {
-                  sessionId: current.sessionId,
+                  rtcSessionId: current.rtcSessionId,
                   bindingNonce: current.bindingNonce,
                   bindingGeneration: current.bindingGeneration,
-                  agentId,
+                  sessionId,
                 },
                 msg,
               )
@@ -1404,15 +1407,14 @@ export function useAgentSocket({
             const current = rtcRef.current;
             if (
               msg.status === "negotiating" &&
-              current.sessionId === msg.session_id &&
+              current.rtcSessionId === msg.session_id &&
               current.bindingNonce === msg.binding_nonce &&
               current.bindingGeneration === null &&
               typeof msg.binding_generation === "number" &&
               Number.isSafeInteger(msg.binding_generation) &&
               msg.binding_generation > 0 &&
-              msg.agent_id === agentId &&
-              msg.scope_type === "agent" &&
-              msg.scope_id === agentId &&
+              msg.scope_type === "session" &&
+              msg.scope_id === sessionId &&
               msg.protocol === "spawn.pty" &&
               msg.protocol_version === 2
             ) {
@@ -1424,18 +1426,18 @@ export function useAgentSocket({
             }
             const exactPrebindFailure =
               current.bindingGeneration === null &&
-              current.sessionId === msg.session_id &&
+              current.rtcSessionId === msg.session_id &&
               current.bindingNonce === msg.binding_nonce &&
               msg.binding_generation === undefined;
             const exactBoundStatus =
-              current.sessionId !== null &&
+              current.rtcSessionId !== null &&
               current.bindingNonce !== null &&
               rtcBindingFrameMatches(
                 {
-                  sessionId: current.sessionId,
+                  rtcSessionId: current.rtcSessionId,
                   bindingNonce: current.bindingNonce,
                   bindingGeneration: current.bindingGeneration,
-                  agentId,
+                  sessionId,
                 },
                 msg,
               );
@@ -1456,7 +1458,7 @@ export function useAgentSocket({
         setState("error");
       };
       ws.onclose = () => {
-        if (!isCurrentAgentGeneration() || wsRef.current !== ws) return;
+        if (!isCurrentSessionGeneration() || wsRef.current !== ws) return;
         cleanupRtc(false);
         wsRef.current = null;
         setState("closed");
@@ -1465,7 +1467,7 @@ export function useAgentSocket({
     };
 
     const scheduleReconnect = () => {
-      if (!isActiveAgentGeneration()) return;
+      if (!isActiveSessionGeneration()) return;
       attempt += 1;
       const delay = Math.min(10_000, 500 * attempt);
       reconnectTimer = setTimeout(connect, delay);
@@ -1477,7 +1479,7 @@ export function useAgentSocket({
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-      if (isCurrentAgentGeneration() && wsRef.current) {
+      if (isCurrentSessionGeneration() && wsRef.current) {
         const ws = wsRef.current;
         try {
           cleanupRtc(true);
@@ -1492,9 +1494,9 @@ export function useAgentSocket({
         }
       }
       pendingInputRef.current.clear();
-      if (isCurrentAgentGeneration()) activeAgentIdRef.current = null;
+      if (isCurrentSessionGeneration()) activeSessionIdRef.current = null;
     };
-  }, [agentId, enabled, settleUploadReadiness]);
+  }, [sessionId, enabled, settleUploadReadiness]);
 
   // Poll WebRTC stats while the channel is up: the selected candidate pair
   // tells us whether bytes flow direct, via STUN-discovered addresses, or
@@ -1517,8 +1519,8 @@ export function useAgentSocket({
       }
       if (
         rtcRef.current.pc !== pc ||
-        rtcRef.current.agentId !== observed.agentId ||
-        rtcRef.current.agentGeneration !== observed.agentGeneration ||
+        rtcRef.current.sessionId !== observed.sessionId ||
+        rtcRef.current.sessionGeneration !== observed.sessionGeneration ||
         rtcRef.current.rtcGeneration !== observed.rtcGeneration
       ) {
         return;
@@ -1577,7 +1579,7 @@ export function useAgentSocket({
   }, [dcOpen]);
 
   const sendBinary = (bytes: Uint8Array | string) => {
-    if (activeAgentIdRef.current !== agentId) return false;
+    if (activeSessionIdRef.current !== sessionId) return false;
     const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     const rtc = rtcRef.current;
     if (rtc.open && rtc.ptyDc?.readyState === "open") {
@@ -1586,11 +1588,11 @@ export function useAgentSocket({
       );
       return true;
     }
-    return pendingInputRef.current.enqueue(agentGenerationRef.current, buf);
+    return pendingInputRef.current.enqueue(sessionGenerationRef.current, buf);
   };
 
   const sendJson = (msg: unknown) => {
-    if (activeAgentIdRef.current !== agentId) return false;
+    if (activeSessionIdRef.current !== sessionId) return false;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     if (typeof msg === "object" && msg !== null) {
@@ -1633,7 +1635,7 @@ export function useAgentSocket({
       const timer = setTimeout(() => {
         uploadReadyWaitersRef.current.delete(waiter);
         cleanup();
-        reject(new Error("Direct agent upload channel is not ready."));
+        reject(new Error("Direct session upload channel is not ready."));
       }, UPLOAD_READY_WAIT_MS);
       const cleanup = () => {
         clearTimeout(timer);
@@ -1643,20 +1645,20 @@ export function useAgentSocket({
       uploadReadyWaitersRef.current.add(waiter);
     });
 
-  const uploadFile = async (blob: Blob, options: DirectAgentUploadOptions) => {
+  const uploadFile = async (blob: Blob, options: DirectSessionUploadOptions) => {
     if (!uploadReadyRef.current) await waitForUploadReadiness(options.signal);
-    // A caller holding this hook's return from an earlier agent must not
-    // dispatch into the current agent's channel — re-checked after the wait
+    // A caller holding this hook's return from an earlier session must not
+    // dispatch into the current session's channel — re-checked after the wait
     // because readiness may have been restored by a successor generation.
-    if (activeAgentIdRef.current !== agentId) {
-      throw new Error("Agent upload generation changed.");
+    if (activeSessionIdRef.current !== sessionId) {
+      throw new Error("Session upload generation changed.");
     }
     return uploadRef.current(blob, options);
   };
 
   return {
     state,
-    v2,
+    v3,
     dcOpen,
     connInfo,
     signedRtcRefusal,

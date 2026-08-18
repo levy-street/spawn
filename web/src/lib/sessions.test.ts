@@ -71,9 +71,9 @@ describe("activity derivation", () => {
     expect(sessionActivityTone(makeSession({ activity_state: "starting" }))).toBe("waiting");
     expect(sessionActivityTone(makeSession({ activity_state: "quiet" }))).toBe("idle");
     expect(sessionActivityTone(makeSession({ activity_state: "unknown" }))).toBe("idle");
-    expect(
-      sessionActivityTone(makeSession({ activity_state: "exited", status: "exited" })),
-    ).toBe("offline");
+    expect(sessionActivityTone(makeSession({ activity_state: "exited", status: "exited" }))).toBe(
+      "offline",
+    );
   });
 });
 

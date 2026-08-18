@@ -105,8 +105,6 @@ describe("workspaceRecency", () => {
     ]);
     expect(workspaceRecency(workspace, sessionsById)).toBe(Date.parse(newest));
     expect(workspaceRecency(workspace, new Map())).toBe(Date.parse("2026-08-19T10:00:00Z"));
-    expect(
-      workspaceRecency(makeWorkspace([], { updated_at: "garbage" }), new Map()),
-    ).toBe(0);
+    expect(workspaceRecency(makeWorkspace([], { updated_at: "garbage" }), new Map())).toBe(0);
   });
 });

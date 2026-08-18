@@ -24,9 +24,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
-import { useAgentSocket } from "@/components/terminal/useAgentSocket";
+import { type PromptState, PromptStateTracker } from "@/components/terminal/prompt-state";
+import { useSessionSocket } from "@/components/terminal/useSessionSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
 import {
@@ -39,9 +40,9 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { DirectAgentUploadError } from "@/lib/agent-ctl";
-import { agents, hosts } from "@/lib/api";
+import { hosts, sessions } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
@@ -62,7 +63,7 @@ const KEYBOARD_MIN_INSET_PX = 120;
 // Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
-// The cache refresh debounces on output, but a continuously-streaming agent
+// The cache refresh debounces on output, but a continuously-streaming app
 // would postpone it forever — bound how stale the cache is allowed to get.
 const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
 // Before an offset-anchored PTY stream is active, refresh less aggressively;
@@ -143,9 +144,9 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
-  /** Raw stdin into the agent (binary frame). */
+  /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
-  /** Tell the agent the new TTY size. */
+  /** Tell the daemon the new TTY size. */
   resize: (cols: number, rows: number) => void;
   /** Force a re-fit against the current container size. */
   fit: () => void;
@@ -171,14 +172,26 @@ export interface TerminalHandle {
   pasteText: (text: string) => void;
   /** Promote this browser to the shared PTY geometry controller. */
   takeControl: () => void;
-  /** Open the native file picker to upload files to this agent. */
+  /** Open the native file picker to upload files to this session. */
   openUpload: () => void;
   /** Scroll the viewport back to the live edge (bottom of the buffer). */
   snapToLiveEdge: () => void;
+  /** Pixel rect of the input cursor cell, relative to the terminal container;
+   *  null while the cursor row is scrolled out of view. Anchors the shortcut
+   *  bar (§5.5). */
+  getCursorRect: () => {
+    left: number;
+    top: number;
+    cellWidth: number;
+    cellHeight: number;
+  } | null;
+  /** Reset the empty-prompt heuristic to "empty" — called by the pane when
+   *  the foreground process changes (§5.5). */
+  resetPromptState: () => void;
 }
 
 export interface TerminalProps {
-  agentId: string;
+  sessionId: string;
   /** When false, keystrokes don't go to the WS; the Composer handles it. */
   rawInput?: boolean;
   /** On mobile soft keyboards, Return can be reserved for multiline prompts. */
@@ -198,18 +211,22 @@ export interface TerminalProps {
    *  reclaims control and fits to its container. Default true. */
   active?: boolean;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
-  onConnectionInfo?: (info: AgentConnectionInfo) => void;
+  onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
+  /** xterm onCursorMove passthrough — reposition cursor-anchored overlays. */
+  onCursorMove?: () => void;
+  /** Empty-prompt heuristic transitions (§5.5), tracked from sent bytes. */
+  onPromptStateChange?: (state: PromptState) => void;
 }
 
 /**
- * Mounts xterm.js in a container, pipes its output through the per-agent
+ * Mounts xterm.js in a container, pipes its output through the per-session
  * WebSocket, and applies fit + resize handling. The component is a ref-forwarding
  * shell so the parent (terminal page) can poke it from the Composer / ModifierBar.
  */
 export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
   {
-    agentId,
+    sessionId,
     rawInput = false,
     mobileReturnMode = "submit",
     mobileReturnBytes = ALT_ENTER,
@@ -219,6 +236,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     autoTakeControl = true,
     active = true,
     onExit,
+    onCursorMove,
+    onPromptStateChange,
   },
   ref,
 ) {
@@ -235,6 +254,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const firstControlSeenRef = useRef(false);
   const autoTakeControlRef = useRef(autoTakeControl);
   autoTakeControlRef.current = autoTakeControl;
+  // §5.5 shortcut-bar contract: cursor passthrough + empty-prompt heuristic.
+  const onCursorMoveRef = useRef(onCursorMove);
+  onCursorMoveRef.current = onCursorMove;
+  const onPromptStateChangeRef = useRef(onPromptStateChange);
+  onPromptStateChangeRef.current = onPromptStateChange;
+  const promptTrackerRef = useRef(new PromptStateTracker());
+  promptTrackerRef.current.onChange = (state) => onPromptStateChangeRef.current?.(state);
+  // Every user byte that reaches the PTY flows through here first, so the
+  // heuristic sees exactly what the shell sees.
+  const trackPromptBytes = useCallback((data: string | Uint8Array) => {
+    promptTrackerRef.current.feed(typeof data === "string" ? data : new TextDecoder().decode(data));
+  }, []);
   // Foreground/parked state for the warm pool. A parked instance stays
   // connected but never fits or resizes (see fitTerminal), so moving its host
   // into an offscreen park can't churn the PTY geometry.
@@ -542,7 +573,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
   const requestSnapshotRef = useRef<() => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
-  // True once a snapshot/history proved this agent ships exact worker
+  // True once a snapshot/history proved this session ships exact worker
   // replays; used to widen the overlay fetch budget (the daemon maps lines
   // to a byte budget, and TUI redraw churn dwarfs line-based sizing).
   const exactStreamRef = useRef(false);
@@ -638,7 +669,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       // Clear via escape sequences instead of term.reset(): reset() also
       // wipes terminal modes (bracketed paste, mouse reporting, application
-      // cursor keys) that the agent still believes are active, garbling
+      // cursor keys) that the app still believes are active, garbling
       // input until the next full repaint. The 3J matters: without wiping
       // local scrollback, the seed's replayed output would duplicate lines
       // the buffer already scrolled in.
@@ -666,49 +697,49 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
 
   const syncUploadReconciliations = useCallback(() => {
-    const state = loadUploadReconciliationState(agentId);
+    const state = loadUploadReconciliationState(sessionId);
     setUploadReconciliations(state.records);
     setUploadReconciliationFault(state.fault);
-  }, [agentId]);
+  }, [sessionId]);
 
   useEffect(() => syncUploadReconciliations(), [syncUploadReconciliations]);
 
   useEffect(() => {
     const sync = (event: Event) => {
-      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      if (!(event instanceof CustomEvent) || event.detail?.sessionId !== sessionId) return;
       syncUploadReconciliations();
     };
     window.addEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
     return () => window.removeEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
-  }, [agentId, syncUploadReconciliations]);
+  }, [sessionId, syncUploadReconciliations]);
 
   const reserveUploadReconciliation = useCallback(
     (uploadId: string, fileName: string) =>
-      reserveUploadReconciliationSlot(agentId, uploadId, fileName),
-    [agentId],
+      reserveUploadReconciliationSlot(sessionId, uploadId, fileName),
+    [sessionId],
   );
 
   const promoteUploadReconciliation = useCallback(
     (uploadId: string, fileName: string, message: string) =>
-      promoteUploadReconciliationSlot(agentId, uploadId, fileName, message),
-    [agentId],
+      promoteUploadReconciliationSlot(sessionId, uploadId, fileName, message),
+    [sessionId],
   );
 
   const assertUploadReconciliation = useCallback(
-    (uploadId: string) => assertUploadReconciliationActive(agentId, uploadId),
-    [agentId],
+    (uploadId: string) => assertUploadReconciliationActive(sessionId, uploadId),
+    [sessionId],
   );
 
   const dismissUploadReconciliation = useCallback(
     (uploadId: string, recoverFault = false) => {
       try {
-        dismissUploadReconciliationSlot(agentId, uploadId, recoverFault);
+        dismissUploadReconciliationSlot(sessionId, uploadId, recoverFault);
       } catch {
         // The store emitted a fault event and retained the record. A later
         // explicit dismissal after storage recovers is the only safe unlock.
       }
     },
-    [agentId],
+    [sessionId],
   );
 
   const updatePendingAttachments = useCallback(
@@ -909,7 +940,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       if (imagePasteMode === "bracketed-path") {
         removePendingAttachment(targetId);
-        socketRef.current.sendBinary(bracketedPaste(shellSingleQuote(path)));
+        const pasted = bracketedPaste(shellSingleQuote(path));
+        trackPromptBytes(pasted);
+        socketRef.current.sendBinary(pasted);
         showUploadStatus("Image pasted");
         termRef.current?.focus();
         return;
@@ -923,7 +956,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
       showUploadStatus("Image attached");
     },
-    [imagePasteMode, removePendingAttachment, showUploadStatus, updatePendingAttachments],
+    [
+      imagePasteMode,
+      removePendingAttachment,
+      showUploadStatus,
+      updatePendingAttachments,
+      trackPromptBytes,
+    ],
   );
 
   flushPendingLiveSeedWritesRef.current = () => {
@@ -964,17 +1003,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     );
   };
 
-  // Signed-signaling trust inputs. Terminal only receives agentId, so it
-  // derives the account, the agent's host, and that host's server-claimed key
+  // Signed-signaling trust inputs. Terminal only receives sessionId, so it
+  // derives the account, the session's host, and that host's server-claimed key
   // and fingerprint (all react-query cached and shared with the pages). The
   // claimed values are untrusted; the local pin gate decides how to use them.
   const { user: authUser } = useAuth();
-  const agentIdentityQuery = useQuery({
-    queryKey: ["agent", agentId],
-    queryFn: () => agents.get(agentId),
+  const sessionIdentityQuery = useQuery({
+    queryKey: ["session", sessionId],
+    queryFn: () => sessions.get(sessionId),
     staleTime: 30_000,
   });
-  const signalingHostId = agentIdentityQuery.data?.host_id ?? null;
+  const signalingHostId = sessionIdentityQuery.data?.host_id ?? null;
   const hostIdentityQuery = useQuery({
     queryKey: ["host", signalingHostId],
     queryFn: () => hosts.get(signalingHostId as string),
@@ -1012,8 +1051,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
   );
 
-  const socket = useAgentSocket({
-    agentId,
+  const socket = useSessionSocket({
+    sessionId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
     resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
     initialSize: socketInitialSize,
@@ -1105,7 +1144,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (lastChunk) {
         const { cols, rows } = lastSizeRef.current;
         if (lastChunk.cols !== cols || lastChunk.rows !== rows) {
-          // The seed renders at the agent's previous PTY geometry (set by
+          // The seed renders at the session's previous PTY geometry (set by
           // another window/session). The owner assertion converges the PTY,
           // but no LOCAL size change follows, so nothing else would trigger
           // the rewrap — request a reseed from a fresh checkpoint.
@@ -1240,11 +1279,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
     },
     onExit: (code, sig) => {
-      const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
+      const banner = `\r\n\x1b[33m[session exited code=${code ?? "?"}${
         sig ? ` signal=${sig}` : ""
       }]\x1b[0m\r\n`;
       termRef.current?.write(banner);
-      setExitBanner(`Agent exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
+      setExitBanner(`Session exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
     },
   });
@@ -1261,7 +1300,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   useEffect(() => {
     onConnectionInfoRef.current?.({
       socketState: socket.state,
-      v2: socket.v2,
+      v3: socket.v3,
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
       signalingTrust: socket.signalingTrust,
@@ -1269,7 +1308,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
   }, [
     socket.state,
-    socket.v2,
+    socket.v3,
     socket.dcOpen,
     socket.signedRtcRefusal,
     socket.signalingTrust,
@@ -1280,14 +1319,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // the DC normally opens within a second or two of attach.
   const [channelPending, setChannelPending] = useState(false);
   useEffect(() => {
-    const pending = socket.v2 && socket.state === "open" && !socket.dcOpen;
+    const pending = socket.v3 && socket.state === "open" && !socket.dcOpen;
     if (!pending) {
       setChannelPending(false);
       return;
     }
     const timer = setTimeout(() => setChannelPending(true), 1_500);
     return () => clearTimeout(timer);
-  }, [socket.v2, socket.state, socket.dcOpen]);
+  }, [socket.v3, socket.state, socket.dcOpen]);
   rawInputRef.current = rawInput;
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
@@ -1323,7 +1362,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const scheduleScrollbackCacheRefresh = useCallback(
     (delayMs?: number) => {
-      // Debounce on output, but bound the postponement: an agent that streams
+      // Debounce on output, but bound the postponement: an app that streams
       // faster than the debounce window would otherwise starve the refresh
       // forever, leaving the scrollback cache minutes stale.
       const unanchoredMode = !dcActiveRef.current;
@@ -1448,6 +1487,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const scrollDisposable = term.onScroll((ydisp) => {
       const t = termRef.current;
       setLiveEdge(t ? ydisp >= t.buffer.active.baseY : true);
+    });
+    const cursorDisposable = term.onCursorMove(() => {
+      onCursorMoveRef.current?.();
     });
     const xtermViewportEl = containerRef.current?.querySelector<HTMLElement>(".xterm-viewport");
     xtermViewportEl?.addEventListener("scroll", refreshLiveEdge, { passive: true });
@@ -1733,6 +1775,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       lastMobileReturnAtRef.current = performance.now();
       snapToLiveEdge();
+      trackPromptBytes(mobileReturnBytesRef.current);
       socketRef.current.sendBinary(mobileReturnBytesRef.current);
       if (term.textarea) term.textarea.value = "";
       return true;
@@ -2020,6 +2063,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           // Also mute the textarea input fallback (virtual keyboards) for
           // this press so it cannot double-send.
           lastMobileReturnAtRef.current = performance.now();
+          trackPromptBytes(ALT_ENTER);
           socketRef.current.sendBinary(ALT_ENTER);
         }
         return false;
@@ -2117,7 +2161,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const fitTerminal = (preserveScroll: boolean) => {
       // Parked (background) instance: never fit or resize. Its host may be in
       // an offscreen park at a different size; fitting would churn the PTY
-      // geometry and disturb whoever is actually looking at this agent. It
+      // geometry and disturb whoever is actually looking at this session. It
       // reclaims + fits when re-activated (see the `active` effect).
       if (!activeRef.current) return;
       const anchor = preserveScroll ? captureScrollAnchor() : null;
@@ -2227,6 +2271,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     return () => {
       ro.disconnect();
       scrollDisposable.dispose();
+      cursorDisposable.dispose();
       xtermViewportEl?.removeEventListener("scroll", refreshLiveEdge);
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
@@ -2279,8 +2324,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pinLiveViewportToBottomRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
-    // through `socketRef`, so it doesn't need to be in deps. pushOp is stable.
-  }, [snapToLiveEdge, pushOp]);
+    // through `socketRef`, so it doesn't need to be in deps. pushOp and
+    // trackPromptBytes are stable.
+  }, [snapToLiveEdge, pushOp, trackPromptBytes]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {
@@ -2330,7 +2376,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
           const outcomeUnknown =
-            error instanceof DirectAgentUploadError && error.code === "outcome_unknown";
+            error instanceof DirectSessionUploadError && error.code === "outcome_unknown";
           // Removing an attachment is silent only while cancellation still
           // proves there was no endpoint effect. Once the final chunk was
           // dispatched, the same abort can race publication; keep the removed
@@ -2415,7 +2461,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             error instanceof Error && error.message
               ? error.message
               : `${file.name || "File"} could not be uploaded.`;
-          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+          if (error instanceof DirectSessionUploadError && error.code === "outcome_unknown") {
             try {
               promoteUploadReconciliation(uploadId, file.name || "File", message);
             } catch {
@@ -2544,7 +2590,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       );
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
-      if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
+      if (withAttachments) {
+        trackPromptBytes(withAttachments);
+        socket.sendBinary(enc.encode(withAttachments));
+      }
       if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
         latencyHudRef.current.noteKeystroke(performance.now());
       }
@@ -2576,7 +2625,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDataDisposableRef.current?.dispose();
       onDataDisposableRef.current = null;
     };
-  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep]);
+  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep, trackPromptBytes]);
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
@@ -2591,6 +2640,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     () => ({
       sendInput: (data) => {
         snapToLiveEdge();
+        trackPromptBytes(data);
         socket.sendBinary(data);
       },
       resize: (cols, rows) => {
@@ -2793,7 +2843,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const after = capture();
         return {
           kind: "terminal-refresh-diagnostics",
-          agentId,
+          sessionId,
           userAgent: navigator.userAgent,
           before,
           after,
@@ -2820,7 +2870,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           dismissUploadReconciliation(uploadId);
           return { path: result.path, uploadId: result.uploadId };
         } catch (error) {
-          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+          if (error instanceof DirectSessionUploadError && error.code === "outcome_unknown") {
             try {
               promoteUploadReconciliation(uploadId, fileName, error.message);
             } catch {
@@ -2835,7 +2885,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       focus: () => termRef.current?.focus(),
       submit: () => {
         snapToLiveEdge();
-        socket.sendBinary(appendAttachmentsForSubmit("\r"));
+        const payload = appendAttachmentsForSubmit("\r");
+        trackPromptBytes(payload);
+        socket.sendBinary(payload);
         termRef.current?.focus();
       },
       pasteFromClipboard,
@@ -2844,6 +2896,32 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       takeControl: () => takeControlNowRef.current(),
       openUpload: () => fileInputRef.current?.click(),
       snapToLiveEdge,
+      getCursorRect: () => {
+        const term = termRef.current;
+        const container = terminalViewportRef.current;
+        const screen = containerRef.current?.querySelector(".xterm-screen");
+        if (!term || !container || !screen) return null;
+        const buffer = term.buffer.active;
+        // cursorY is relative to the live edge (baseY); a reader scrolled up
+        // in history has the cursor row below the visible viewport.
+        const rowOnScreen = buffer.baseY + buffer.cursorY - buffer.viewportY;
+        if (rowOnScreen < 0 || rowOnScreen >= term.rows) return null;
+        const screenRect = screen.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+        if (screenRect.width <= 0 || term.cols <= 0 || term.rows <= 0) return null;
+        const cellWidth = screenRect.width / term.cols;
+        const cellHeight =
+          terminalRowHeightRef.current > 0
+            ? terminalRowHeightRef.current
+            : screenRect.height / term.rows;
+        return {
+          left: screenRect.left - containerRect.left + buffer.cursorX * cellWidth,
+          top: screenRect.top - containerRect.top + rowOnScreen * cellHeight,
+          cellWidth,
+          cellHeight,
+        };
+      },
+      resetPromptState: () => promptTrackerRef.current.reset(),
     }),
     [
       appendAttachmentsForSubmit,
@@ -2856,7 +2934,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       promoteUploadReconciliation,
       reserveUploadReconciliation,
       socket,
-      agentId,
+      sessionId,
+      trackPromptBytes,
     ],
   );
 
@@ -2887,7 +2966,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     dragDepthRef.current = 0;
     setDropActive(false);
     // Dropped images feed the prompt like a local terminal drop (attachment
-    // chip / pasted path per agent kind); only non-image files take the
+    // chip / pasted path per session app); only non-image files take the
     // save-to-working-directory path, keeping plain uploads intentional.
     const images = files.filter(isImageFile);
     const others = files.filter((file) => !isImageFile(file));
@@ -2910,7 +2989,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   return (
     <div
       role="application"
-      aria-label="Agent terminal"
+      aria-label="Session terminal"
       className="relative size-full touch-none bg-[var(--color-terminal-bg)]"
       onPasteCapture={onPasteCapture}
       onDragEnter={onDragEnter}
@@ -2960,10 +3039,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         <div
           data-testid="upload-reconciliation"
           role="alert"
-          className="pointer-events-auto absolute left-2 top-2 z-40 flex max-w-[min(32rem,calc(100%-1rem))] flex-col gap-2 rounded-md border border-amber-500/60 bg-background/95 p-2 text-xs text-foreground shadow-lg backdrop-blur"
+          className="pointer-events-auto absolute left-2 top-2 z-40 flex max-w-[min(32rem,calc(100%-1rem))] flex-col gap-2 rounded-md border border-warning/60 bg-background/95 p-2 text-xs text-foreground shadow-lg backdrop-blur"
         >
           {uploadReconciliationFault && (
-            <div data-testid="upload-reconciliation-fault" className="font-medium text-amber-700">
+            <div data-testid="upload-reconciliation-fault" className="font-medium text-warning">
               {uploadReconciliationFault} New uploads are locked until storage recovers
               {uploadReconciliations.length > 0
                 ? " and you dismiss the retained record after checking it."
@@ -3096,7 +3175,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           {newOutputWhileAway && (
             <>
               <span>New</span>
-              <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden />
+              <span className="size-1.5 rounded-full bg-success" aria-hidden />
             </>
           )}
         </button>
@@ -3133,8 +3212,8 @@ function wheelEventToPixels(event: WheelEvent, rows: number): number {
       : event.deltaY;
 }
 
-function uploadReconciliationStorageKey(agentId: string): string {
-  return `${UPLOAD_RECONCILIATION_STORAGE_PREFIX}:${agentId}`;
+function uploadReconciliationStorageKey(sessionId: string): string {
+  return `${UPLOAD_RECONCILIATION_STORAGE_PREFIX}:${sessionId}`;
 }
 
 function uploadReconciliationStorageFault(): string {
@@ -3157,9 +3236,9 @@ function blockReservedUploadReconciliations(
   );
 }
 
-function dispatchUploadReconciliationEvent(agentId: string): void {
+function dispatchUploadReconciliationEvent(sessionId: string): void {
   try {
-    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { agentId } }));
+    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { sessionId } }));
   } catch {
     // The in-memory latch is authoritative for the current call even if a
     // hostile/broken event target prevents another mounted instance syncing.
@@ -3167,7 +3246,7 @@ function dispatchUploadReconciliationEvent(agentId: string): void {
 }
 
 function readUploadReconciliationHistoryFallback(
-  agentId: string,
+  sessionId: string,
 ): { records: UploadReconciliation[]; fault: string } | null {
   let state: unknown;
   try {
@@ -3178,7 +3257,7 @@ function readUploadReconciliationHistoryFallback(
   if (typeof state !== "object" || state === null) return null;
   const fallbacks = (state as Record<string, unknown>).__spawnUploadReconciliationFallback;
   if (typeof fallbacks !== "object" || fallbacks === null) return null;
-  const fallback = (fallbacks as Record<string, unknown>)[agentId];
+  const fallback = (fallbacks as Record<string, unknown>)[sessionId];
   if (typeof fallback !== "object" || fallback === null) return null;
   const records = (fallback as Record<string, unknown>).records;
   const fault = (fallback as Record<string, unknown>).fault;
@@ -3187,7 +3266,7 @@ function readUploadReconciliationHistoryFallback(
 }
 
 function writeUploadReconciliationHistoryFallback(
-  agentId: string,
+  sessionId: string,
   fallback: UploadReconciliationState | null,
 ): void {
   try {
@@ -3201,8 +3280,8 @@ function writeUploadReconciliationHistoryFallback(
         ? current.__spawnUploadReconciliationFallback
         : {};
     const fallbacks = { ...existing };
-    if (fallback) fallbacks[agentId] = fallback;
-    else delete fallbacks[agentId];
+    if (fallback) fallbacks[sessionId] = fallback;
+    else delete fallbacks[sessionId];
     window.history.replaceState(
       { ...current, __spawnUploadReconciliationFallback: fallbacks },
       document.title,
@@ -3213,17 +3292,17 @@ function writeUploadReconciliationHistoryFallback(
   }
 }
 
-function loadUploadReconciliationState(agentId: string): UploadReconciliationState {
+function loadUploadReconciliationState(sessionId: string): UploadReconciliationState {
   if (typeof window === "undefined") return { records: [], fault: null };
   const runtime = uploadReconciliationRuntime();
-  const historyFallback = readUploadReconciliationHistoryFallback(agentId);
+  const historyFallback = readUploadReconciliationHistoryFallback(sessionId);
   const memory = mergeUploadReconciliations(
-    runtime.memory.get(agentId) ?? [],
+    runtime.memory.get(sessionId) ?? [],
     historyFallback?.records ?? [],
   );
-  if (historyFallback) runtime.faults.set(agentId, historyFallback.fault);
+  if (historyFallback) runtime.faults.set(sessionId, historyFallback.fault);
   try {
-    const raw = window.sessionStorage.getItem(uploadReconciliationStorageKey(agentId));
+    const raw = window.sessionStorage.getItem(uploadReconciliationStorageKey(sessionId));
     let stored: UploadReconciliation[] = [];
     if (raw) {
       const parsed: unknown = JSON.parse(raw);
@@ -3255,24 +3334,24 @@ function loadUploadReconciliationState(agentId: string): UploadReconciliationSta
     const records = mergeUploadReconciliations(memory, stored);
     if (records.length > MAX_UPLOAD_RECONCILIATIONS) {
       runtime.faults.set(
-        agentId,
+        sessionId,
         "Upload reconciliation capacity was exceeded; no records were discarded.",
       );
     }
-    runtime.memory.set(agentId, records);
-    return { records, fault: runtime.faults.get(agentId) ?? null };
+    runtime.memory.set(sessionId, records);
+    return { records, fault: runtime.faults.get(sessionId) ?? null };
   } catch {
     const fault = uploadReconciliationStorageFault();
     const blocked = blockReservedUploadReconciliations(memory);
-    runtime.memory.set(agentId, blocked);
-    runtime.faults.set(agentId, fault);
-    writeUploadReconciliationHistoryFallback(agentId, { records: blocked, fault });
+    runtime.memory.set(sessionId, blocked);
+    runtime.faults.set(sessionId, fault);
+    writeUploadReconciliationHistoryFallback(sessionId, { records: blocked, fault });
     return { records: blocked, fault };
   }
 }
 
 function persistUploadReconciliations(
-  agentId: string,
+  sessionId: string,
   records: UploadReconciliation[],
   recordsOnFailure: UploadReconciliation[],
   clearFault = false,
@@ -3286,45 +3365,45 @@ function persistUploadReconciliations(
     );
   }
   const runtime = uploadReconciliationRuntime();
-  const existingFault = runtime.faults.get(agentId) ?? null;
+  const existingFault = runtime.faults.get(sessionId) ?? null;
   try {
-    const key = uploadReconciliationStorageKey(agentId);
+    const key = uploadReconciliationStorageKey(sessionId);
     if (records.length === 0) window.sessionStorage.removeItem(key);
     else window.sessionStorage.setItem(key, JSON.stringify(records));
-    runtime.memory.set(agentId, records);
+    runtime.memory.set(sessionId, records);
     if (clearFault) {
-      runtime.faults.delete(agentId);
-      writeUploadReconciliationHistoryFallback(agentId, null);
+      runtime.faults.delete(sessionId);
+      writeUploadReconciliationHistoryFallback(sessionId, null);
     } else if (existingFault) {
-      runtime.faults.set(agentId, existingFault);
-      writeUploadReconciliationHistoryFallback(agentId, {
+      runtime.faults.set(sessionId, existingFault);
+      writeUploadReconciliationHistoryFallback(sessionId, {
         records,
         fault: existingFault,
       });
     } else {
-      writeUploadReconciliationHistoryFallback(agentId, null);
+      writeUploadReconciliationHistoryFallback(sessionId, null);
     }
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
   } catch {
     const blocked = blockReservedUploadReconciliations(recordsOnFailure);
-    runtime.memory.set(agentId, blocked);
+    runtime.memory.set(sessionId, blocked);
     const fault = uploadReconciliationStorageFault();
-    runtime.faults.set(agentId, fault);
-    writeUploadReconciliationHistoryFallback(agentId, {
+    runtime.faults.set(sessionId, fault);
+    writeUploadReconciliationHistoryFallback(sessionId, {
       records: blocked,
       fault,
     });
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(fault);
   }
 }
 
 function reserveUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   fileName: string,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   if (state.fault) {
     const blocked = blockReservedUploadReconciliations(state.records);
     const existing = blocked.find((record) => record.uploadId === uploadId);
@@ -3343,10 +3422,10 @@ function reserveUploadReconciliationSlot(
           ]
         : state.records;
     const runtime = uploadReconciliationRuntime();
-    runtime.memory.set(agentId, records);
-    runtime.faults.set(agentId, state.fault);
-    writeUploadReconciliationHistoryFallback(agentId, { records, fault: state.fault });
-    dispatchUploadReconciliationEvent(agentId);
+    runtime.memory.set(sessionId, records);
+    runtime.faults.set(sessionId, state.fault);
+    writeUploadReconciliationHistoryFallback(sessionId, { records, fault: state.fault });
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (state.records.some((record) => record.uploadId === uploadId)) {
@@ -3369,20 +3448,20 @@ function reserveUploadReconciliationSlot(
   ];
   // A failed first write still retains the identity in same-window memory,
   // blocks endpoint dispatch, and survives SPA unmount/remount.
-  uploadReconciliationRuntime().memory.set(agentId, next);
-  persistUploadReconciliations(agentId, next, next);
+  uploadReconciliationRuntime().memory.set(sessionId, next);
+  persistUploadReconciliations(sessionId, next, next);
 }
 
 function promoteUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   fileName: string,
   message: string,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   const existing = state.records.find((record) => record.uploadId === uploadId);
   if (state.fault) {
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (!existing) {
@@ -3408,14 +3487,14 @@ function promoteUploadReconciliationSlot(
   );
   // Persist ambiguity before the final frame. On failure the durable reserved
   // record remains and the caller throws before DataChannel dispatch.
-  persistUploadReconciliations(agentId, next, state.records);
+  persistUploadReconciliations(sessionId, next, state.records);
 }
 
-function assertUploadReconciliationActive(agentId: string, uploadId: string): void {
-  const state = loadUploadReconciliationState(agentId);
+function assertUploadReconciliationActive(sessionId: string, uploadId: string): void {
+  const state = loadUploadReconciliationState(sessionId);
   const record = state.records.find((candidate) => candidate.uploadId === uploadId);
   if (state.fault) {
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (!record || record.phase === "blocked") {
@@ -3426,13 +3505,13 @@ function assertUploadReconciliationActive(agentId: string, uploadId: string): vo
 }
 
 function dismissUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   recoverFault: boolean,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   const next = state.records.filter((record) => record.uploadId !== uploadId);
-  persistUploadReconciliations(agentId, next, state.records, recoverFault);
+  persistUploadReconciliations(sessionId, next, state.records, recoverFault);
 }
 
 function mergeUploadReconciliations(
@@ -3549,7 +3628,7 @@ function flushViewportIntoScrollback(term: XTerm): string {
 }
 
 /**
- * Worker-backed agents ship snapshots as exact terminal byte streams,
+ * Worker-backed sessions ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
  * or null when the endpoint returned a plain replay without geometry markers.
@@ -3700,7 +3779,7 @@ function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // back to the agent after replay can echo fragments like "0;276;0c".
+  // back to the app after replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

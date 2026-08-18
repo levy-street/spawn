@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 
 export interface ComposerProps {
-  /** Send the (text + "\r") payload as raw bytes over the agent WS. */
+  /** Send the (text + "\r") payload as raw bytes to the session PTY. */
   onSend: (text: string) => void;
   /** "Raw" toggle disables the composer; the Terminal handles keystrokes itself. */
   rawMode: boolean;
