@@ -568,6 +568,18 @@ async def patch_host_tool_policy(
     return schemas.HostToolPolicyOut.model_validate(policy)
 
 
+# Registered before `/{host_id}` so the literal path wins the match.
+@router.delete("/self", status_code=status.HTTP_204_NO_CONTENT)
+async def deregister_self(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> None:
+    """A daemon revokes its OWN host registration — used by `spawnd exorcise`
+    and the possess re-identify dedup. Authenticated by the daemon token, so a
+    host can only remove itself; no owning-user session is required."""
+    await _revoke_host(session, host)
+
+
 @router.delete("/{host_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_host(
     host_id: str,
@@ -575,7 +587,13 @@ async def delete_host(
     user: User = Depends(auth.current_user),
 ) -> None:
     h = await _get_owned_host(session, host_id, user)
+    await _revoke_host(session, h)
 
+
+async def _revoke_host(session: AsyncSession, h: Host) -> None:
+    """Durable revocation cascade shared by the user- and daemon-authenticated
+    delete routes: drop the host's device codes and browser pins inside the same
+    transaction as the Host row, then disconnect any live daemon."""
     if h.host_key_algorithm is not None and h.host_public_key is not None:
         claimed_owner = await lock_host_key_claim(
             session,
@@ -609,6 +627,7 @@ async def delete_host(
             .where(HostBrowserPin.host_id == h.id)
             .execution_options(synchronize_session=False)
         )
+    host_id = h.id
     await session.delete(h)
     await session.commit()
 
