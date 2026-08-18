@@ -166,34 +166,6 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
       die "cargo is required to build the hosted spawnd binary"
     fi
   fi
-
-  # Pull macOS prebuilt daemon binaries so the installer can serve them: this
-  # Linux host can't build Darwin, and without a prebuilt every Mac install
-  # falls back to a fragile from-source toolchain build. Best-effort — a miss
-  # just restores that fallback. Needs an authed `gh` (private repo) with
-  # contents:read; the checksum gate refuses a corrupt or partial release.
-  if command -v gh >/dev/null 2>&1; then
-    darwin_tmp="$(mktemp -d)"
-    if gh release download prebuilt-latest --repo levy-street/spawn --dir "$darwin_tmp" --clobber >/dev/null 2>&1 \
-      && [[ -f "$darwin_tmp/SHA256SUMS" ]] \
-      && ( cd "$darwin_tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
-      for arch in aarch64 x86_64; do
-        triple="$arch-apple-darwin"
-        if [[ -f "$darwin_tmp/spawnd-$triple" && -f "$darwin_tmp/spawn-worker-$triple" ]]; then
-          dest="daemon/target/prebuilt/darwin-$arch"
-          mkdir -p "$dest"
-          install -m 0755 "$darwin_tmp/spawnd-$triple" "$dest/spawnd"
-          install -m 0755 "$darwin_tmp/spawn-worker-$triple" "$dest/spawn-worker"
-          printf 'remote deploy: installed darwin-%s prebuilt\n' "$arch"
-        fi
-      done
-    else
-      printf 'remote deploy: darwin prebuilt unavailable/unverified; Mac installs use source build\n'
-    fi
-    rm -rf "$darwin_tmp"
-  else
-    printf 'remote deploy: gh not found; skipping darwin prebuilt pull\n'
-  fi
 fi
 
 for service in $SPAWN_DEPLOY_SERVICES; do
@@ -207,3 +179,42 @@ done
 
 printf 'remote deploy: complete\n'
 REMOTE
+
+# Publish macOS prebuilt daemon binaries to the host. This Linux host can't
+# build Darwin, so CI builds them; we pull the checksummed `prebuilt-latest`
+# release HERE — the deploy invoker is already GitHub-authed, so prod needs no
+# gh/token — and scp them into the server's prebuilt dir. Best-effort: a miss
+# leaves the from-source fallback intact (and the server reads prebuilts live,
+# so no restart is needed).
+publish_darwin_prebuilts() {
+  command -v gh >/dev/null 2>&1 || {
+    printf 'deploy-prod: gh not found locally; skipping darwin prebuilt publish\n'
+    return 0
+  }
+  local tmp
+  tmp="$(mktemp -d)"
+  if ! gh release download prebuilt-latest --repo levy-street/spawn --dir "$tmp" --clobber >/dev/null 2>&1; then
+    printf 'deploy-prod: no prebuilt-latest release; skipping darwin prebuilt publish\n'
+    rm -rf "$tmp"
+    return 0
+  fi
+  if ! (cd "$tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+    printf 'deploy-prod: darwin prebuilt checksum verification failed; not publishing\n' >&2
+    rm -rf "$tmp"
+    return 0
+  fi
+  local arch triple dest
+  for arch in aarch64 x86_64; do
+    triple="$arch-apple-darwin"
+    dest="$remote_path/daemon/target/prebuilt/darwin-$arch"
+    if [[ -f "$tmp/spawnd-$triple" && -f "$tmp/spawn-worker-$triple" ]]; then
+      ssh "$host" "mkdir -p '$dest'"
+      scp -q "$tmp/spawnd-$triple" "$host:$dest/spawnd"
+      scp -q "$tmp/spawn-worker-$triple" "$host:$dest/spawn-worker"
+      ssh "$host" "chmod 755 '$dest/spawnd' '$dest/spawn-worker'"
+      printf 'deploy-prod: published darwin-%s prebuilt to %s\n' "$arch" "$host"
+    fi
+  done
+  rm -rf "$tmp"
+}
+publish_darwin_prebuilts || true
