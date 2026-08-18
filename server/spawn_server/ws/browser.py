@@ -42,7 +42,7 @@ router = APIRouter()
 log = logging.getLogger("spawn.ws.browser")
 SESSION_RTC_PROTOCOL = "spawn.pty"
 SESSION_RTC_PROTOCOL_VERSION = 2
-BROWSER_WS_PROTOCOL = "spawn.v2"
+BROWSER_WS_PROTOCOL = "spawn.v3"
 WS_CLOSE_PROTOCOL_REQUIRED = 4003
 WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
@@ -166,7 +166,7 @@ async def browser_ws(
     if BROWSER_WS_PROTOCOL not in offered:
         await websocket.accept()
         await websocket.send_json(
-            {"type": "protocol.required", "protocol": BROWSER_WS_PROTOCOL, "version": 2}
+            {"type": "protocol.required", "protocol": BROWSER_WS_PROTOCOL, "version": 3}
         )
         await websocket.close(code=WS_CLOSE_PROTOCOL_REQUIRED, reason="protocol upgrade required")
         return

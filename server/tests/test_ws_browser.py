@@ -63,7 +63,7 @@ class FakeBrowserWebSocket:
         if authorization is not None:
             self.headers["authorization"] = authorization
         self.cookies = cookies or {}
-        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v2"]}
+        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v3"]}
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -224,7 +224,7 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_sessions(cli
 
     missing = FakeBrowserWebSocket()
     await browser_ws(missing, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
-    assert missing.accepted_subprotocol == "spawn.v2"
+    assert missing.accepted_subprotocol == "spawn.v3"
     assert missing.closed == (1008, "not authenticated")
 
     daemon_token = auth.issue_daemon_token("00000000-0000-4000-8000-000000000001", user_a)
@@ -247,7 +247,7 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_sessions(cli
     await browser_ws(old, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     assert old.accepted_subprotocol is None
     assert _messages_of_type(old, "protocol.required") == [
-        {"type": "protocol.required", "protocol": "spawn.v2", "version": 2}
+        {"type": "protocol.required", "protocol": "spawn.v3", "version": 3}
     ]
     assert old.closed == (4003, "protocol upgrade required")
 
@@ -281,8 +281,8 @@ async def test_browser_upload_frame_fails_closed_without_forwarding_content(clie
 
 
 
-async def test_browser_ws_v2_never_relays_pty_bytes(client):
-    """spawn.v2 never exposes a server-side PTY byte path."""
+async def test_browser_ws_v3_never_relays_pty_bytes(client):
+    """spawn.v3 never exposes a server-side PTY byte path."""
 
     user_id, token = await _signup(client, "ws-browser-v2@example.com")
     host_id, pty_id = await _create_host_and_session(user_id)
@@ -292,12 +292,12 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
     await broker.register_daemon(daemon)
     await broker.attach_session_to_daemon(pty_id, daemon)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
     task = asyncio.create_task(browser_ws(ws, pty_session_id=pty_id, token=None))  # type: ignore[arg-type]
 
     try:
         await _wait_until(lambda: len(_messages_of_type(ws, "session.status")) >= 1)
-        assert ws.accepted_subprotocol == "spawn.v2"
+        assert ws.accepted_subprotocol == "spawn.v3"
         # Control frames still flow: signaling config reaches the browser.
         assert len(_messages_of_type(ws, "rtc.config")) == 1
         # History, snapshots, geometry and display ownership are now carried
@@ -323,7 +323,7 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
         await broker.unregister_daemon(daemon)
 
 
-async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client, monkeypatch):
+async def test_browser_ws_v3_reused_session_rejects_stale_binding_frames(client, monkeypatch):
     monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, token = await _signup(client, "ws-browser-v2-binding@example.com")
@@ -336,7 +336,7 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
     signal_task: asyncio.Task[None] | None = None
 
     ws = FakeBrowserWebSocket(
-        authorization=f"Bearer {token}", subprotocols=["spawn.v2"]
+        authorization=f"Bearer {token}", subprotocols=["spawn.v3"]
     )
     task = asyncio.create_task(
         browser_ws(ws, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
@@ -688,11 +688,11 @@ async def test_session_signed_offer_and_answer_are_opaque_symmetric_and_no_downg
         get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
-async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
+async def test_browser_ws_v3_rejects_binary_input_as_protocol_error(client):
     user_id, token = await _signup(client, "ws-browser-v2-input@example.com")
     _host_id, pty_id = await _create_host_and_session(user_id)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
     task = asyncio.create_task(browser_ws(ws, pty_session_id=pty_id, token=None))  # type: ignore[arg-type]
 
     await _wait_until(lambda: len(_messages_of_type(ws, "session.status")) >= 1)
@@ -703,11 +703,11 @@ async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
     assert ws.closed[0] == 4002
 
 
-async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
+async def test_browser_ws_v3_rejects_server_visible_viewport_control(client):
     user_id, token = await _signup(client, "ws-browser-v2-control@example.com")
     _host_id, pty_id = await _create_host_and_session(user_id)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
     task = asyncio.create_task(
         browser_ws(ws, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     )
