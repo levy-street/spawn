@@ -61,17 +61,91 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
 pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Directory holding worker sockets and scrollback dirs:
-/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir.
+/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir — with
+/// one hard constraint: the unix-socket paths it hands out must fit the
+/// platform's `sun_path` limit (104 bytes on macOS). macOS has no
+/// `XDG_RUNTIME_DIR`, so the fallback lands in
+/// `~/Library/Application Support/spawn/workers`; the `<uuid>.lifecycle.sock`
+/// under it is 107 bytes and `bind(2)` rejects it — every worker fails to
+/// start. When the preferred base can't hold a full-length socket leaf we
+/// divert to a short private directory instead.
 pub fn worker_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("SPAWND_WORKER_DIR").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => match dirs::runtime_dir() {
-            Some(run) => run.join("spawn").join("workers"),
-            None => config::config_dir()?.join("workers"),
-        },
+    let dir = if let Some(dir) = std::env::var_os("SPAWND_WORKER_DIR").filter(|v| !v.is_empty()) {
+        // An explicit override is trusted verbatim; a too-long path here is the
+        // operator's to answer for and surfaces loudly at bind time.
+        PathBuf::from(dir)
+    } else {
+        choose_worker_dir(
+            dirs::runtime_dir(),
+            || Ok(config::config_dir()?.join("workers")),
+            socket_dir_fits,
+            short_worker_dir,
+        )?
     };
     endpoint::ensure_private_dir(&dir)?;
     Ok(dir)
+}
+
+/// Prefer the runtime dir, fall back to the config dir — but only while the
+/// choice can still hold a full-length socket path; otherwise take `short`.
+/// `config_workers`/`short` are thunks so neither is materialized (the config
+/// dir is created as a side effect) unless actually chosen. Factored out and
+/// parameterized on `fits`/`short` so the divert branch is unit-testable on a
+/// host whose real `sun_path` limit wouldn't trip it.
+fn choose_worker_dir(
+    runtime_dir: Option<PathBuf>,
+    config_workers: impl FnOnce() -> Result<PathBuf>,
+    fits: impl Fn(&std::path::Path) -> bool,
+    short: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let preferred = match runtime_dir {
+        Some(run) => run.join("spawn").join("workers"),
+        None => config_workers()?,
+    };
+    if fits(&preferred) {
+        Ok(preferred)
+    } else {
+        short()
+    }
+}
+
+/// The longest socket leaf `worker_dir()` ever hosts: `<uuid>.lifecycle.sock`
+/// (`wire::lifecycle_socket_path`). A UUID renders as 36 characters.
+const LONGEST_SOCKET_LEAF_LEN: usize = 36 + ".lifecycle.sock".len();
+
+/// Usable `sun_path` length: the fixed buffer minus its NUL terminator.
+/// macOS/BSD carry a 104-byte buffer → 103; Linux 108 → 107.
+#[cfg(target_os = "macos")]
+const SUN_PATH_STRLEN_MAX: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_STRLEN_MAX: usize = 107;
+
+/// Whether `dir/<longest-leaf>` still fits an addressable socket path.
+fn path_fits(dir_len: usize, sun_path_strlen_max: usize) -> bool {
+    // dir + '/' + leaf, and the address as a whole still needs its NUL.
+    dir_len + 1 + LONGEST_SOCKET_LEAF_LEN <= sun_path_strlen_max
+}
+
+/// Whether every socket `worker_dir()` will bind under `dir` fits `sun_path`.
+fn socket_dir_fits(dir: &std::path::Path) -> bool {
+    path_fits(
+        dir.as_os_str().as_encoded_bytes().len(),
+        SUN_PATH_STRLEN_MAX,
+    )
+}
+
+/// Shortest reliably-private directory whose socket paths fit `sun_path` on
+/// every platform: `/tmp/spawn-<uid>/workers`. `/tmp` is sticky, and
+/// `ensure_private_dir` creates our subtree 0700 and rejects any pre-existing
+/// node we don't own — so a hostile `/tmp` entry can't redirect the daemon.
+/// (`std::env::temp_dir()` is deliberately avoided: `$TMPDIR` on macOS is a
+/// ~50-char path that would defeat the whole point.)
+fn short_worker_dir() -> Result<PathBuf> {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let base = PathBuf::from("/tmp").join(format!("spawn-{uid}"));
+    // Harden the per-uid parent too; ensure_private_dir only secures the leaf.
+    endpoint::ensure_private_dir(&base)?;
+    Ok(base.join("workers"))
 }
 
 fn socket_path(dir: &std::path::Path, agent_id: Uuid) -> PathBuf {
@@ -634,6 +708,57 @@ async fn read_hello(stream: &mut UnixStream, expected_agent_id: Uuid) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_socket_leaf_tracks_the_real_lifecycle_name() {
+        // The length guard is only correct while it matches the actual longest
+        // socket the worker binds. A nil UUID gives the canonical 36 chars.
+        let socket = std::path::Path::new("/x").join(format!("{}.sock", Uuid::nil()));
+        let leaf = wire::lifecycle_socket_path(&socket);
+        let leaf = leaf.file_name().unwrap().to_string_lossy();
+        assert!(leaf.ends_with(".lifecycle.sock"));
+        assert_eq!(leaf.len(), LONGEST_SOCKET_LEAF_LEN);
+    }
+
+    #[test]
+    fn macos_config_fallback_overflows_sun_path_but_linux_holds() {
+        // The real macOS runtime fallback base. This is the regression the fix
+        // exists for: its lifecycle socket is 107 bytes, past macOS's 103.
+        let base = std::path::Path::new("/Users/jeremy/Library/Application Support/spawn/workers");
+        let len = base.as_os_str().as_encoded_bytes().len();
+        assert_eq!(len + 1 + LONGEST_SOCKET_LEAF_LEN, 107);
+        assert!(!path_fits(len, 103), "must be rejected on macOS");
+        assert!(path_fits(len, 107), "the same path is fine on Linux");
+    }
+
+    #[test]
+    fn choose_worker_dir_diverts_only_when_the_preferred_base_overflows() {
+        // Preferred base overflows → take the short dir; config thunk still runs
+        // (no runtime dir) but its result is discarded for being too long.
+        let short = PathBuf::from("/tmp/spawn-1/workers");
+        let picked = choose_worker_dir(
+            None,
+            || {
+                Ok(PathBuf::from(
+                    "/Users/who/Library/Application Support/spawn/workers",
+                ))
+            },
+            |_| false,
+            || Ok(short.clone()),
+        )
+        .unwrap();
+        assert_eq!(picked, short);
+
+        // Runtime dir present and fits → keep it; neither fallback is touched.
+        let picked = choose_worker_dir(
+            Some(PathBuf::from("/run/user/1000")),
+            || unreachable!("config dir must not be consulted when runtime dir is present"),
+            |_| true,
+            || unreachable!("short dir must not be built when the preferred base fits"),
+        )
+        .unwrap();
+        assert_eq!(picked, PathBuf::from("/run/user/1000/spawn/workers"));
+    }
 
     #[tokio::test]
     async fn hello_agent_identity_is_validated_before_instance_trust() {
