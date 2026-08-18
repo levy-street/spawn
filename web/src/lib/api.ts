@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { LayoutV2, Tile } from "@/lib/grid";
 
 /**
  * Typed REST helpers. Shapes mirror `/proto/README.md` exactly.
@@ -85,13 +86,14 @@ export const HostSchema = z.object({
   host_key_fingerprint: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
-  agent_count: z.number().int(),
+  session_count: z.number().int(),
 });
 export type Host = z.infer<typeof HostSchema>;
 
-export const HostToolStatusSchema = z.object({
-  preset_id: z.string(),
-  preset_name: z.string(),
+/** Availability of one agent definition on one host (`GET /api/hosts/{id}/agents`). */
+export const HostAgentStatusSchema = z.object({
+  agent_id: z.string(),
+  agent_name: z.string(),
   agent_kind: z.string(),
   command: z.string(),
   install: z.string().nullable().optional(),
@@ -106,16 +108,16 @@ export const HostToolStatusSchema = z.object({
   last_auto_update_at: z.string().nullable().optional(),
   last_auto_update_error: z.string().nullable().optional(),
 });
-export type HostToolStatus = z.infer<typeof HostToolStatusSchema>;
+export type HostAgentStatus = z.infer<typeof HostAgentStatusSchema>;
 
-export const HostToolListSchema = z.object({
-  tools: z.array(HostToolStatusSchema).default([]),
+export const HostAgentListSchema = z.object({
+  agents: z.array(HostAgentStatusSchema).default([]),
 });
-export type HostToolList = z.infer<typeof HostToolListSchema>;
+export type HostAgentList = z.infer<typeof HostAgentListSchema>;
 
-export const HostToolInstallResultSchema = z.object({
-  preset_id: z.string(),
-  preset_name: z.string(),
+export const HostAgentInstallResultSchema = z.object({
+  agent_id: z.string(),
+  agent_name: z.string(),
   agent_kind: z.string(),
   command: z.string(),
   install: z.string().nullable().optional(),
@@ -123,31 +125,41 @@ export const HostToolInstallResultSchema = z.object({
   exit_code: z.number().int().nullable().optional(),
   output: z.string().default(""),
   error: z.string().nullable().optional(),
-  status: HostToolStatusSchema.nullable().optional(),
+  status: HostAgentStatusSchema.nullable().optional(),
 });
-export type HostToolInstallResult = z.infer<typeof HostToolInstallResultSchema>;
+export type HostAgentInstallResult = z.infer<typeof HostAgentInstallResultSchema>;
 
-export const HostToolPolicySchema = z.object({
-  preset_id: z.string(),
+export const HostAgentPolicySchema = z.object({
+  agent_id: z.string(),
   auto_update: z.boolean().default(false),
   last_checked_at: z.string().nullable().optional(),
   last_auto_update_at: z.string().nullable().optional(),
   last_auto_update_error: z.string().nullable().optional(),
 });
-export type HostToolPolicy = z.infer<typeof HostToolPolicySchema>;
+export type HostAgentPolicy = z.infer<typeof HostAgentPolicySchema>;
 
-export const AgentSchema = z.object({
+export const RecentDirSchema = z.object({
+  path: z.string(),
+  last_used_at: z.string(),
+});
+export type RecentDir = z.infer<typeof RecentDirSchema>;
+
+export const RecentDirsSchema = z.object({
+  dirs: z.array(RecentDirSchema).default([]),
+});
+export type RecentDirs = z.infer<typeof RecentDirsSchema>;
+
+/** A PTY on a host. Always the user's login shell in a chosen directory. */
+export const SessionSchema = z.object({
   id: z.string().uuid(),
   name: z.string().nullable().default(null),
   host_id: z.string().uuid(),
   host_name: z.string().nullable().default(null),
-  preset_id: z.string().uuid().nullable(),
   cwd: z.string(),
-  argv: z.array(z.string()),
-  env: z.record(z.string(), z.string()).default({}),
   status: z.enum(["starting", "running", "exited", "killed"]),
   started_at: z.string(),
   exited_at: z.string().nullable(),
+  exit_code: z.number().int().nullable(),
   last_output_at: z.string().nullable().default(null),
   last_input_at: z.string().nullable().default(null),
   last_activity_at: z.string().nullable().default(null),
@@ -155,32 +167,34 @@ export const AgentSchema = z.object({
     .enum(["starting", "active", "quiet", "waiting", "input_sent", "exited", "killed", "unknown"])
     .default("unknown"),
   activity_label: z.string().default("Unknown"),
-  exit_code: z.number().int().nullable(),
-  pinned_at: z.string().nullable().default(null),
-  archived_at: z.string().nullable().default(null),
+  /** Basename of the foreground process, reported by the daemon; null until
+   * the worker reports one (old workers never do). */
+  foreground_command: z.string().nullable().default(null),
+});
+export type Session = z.infer<typeof SessionSchema>;
+
+/** A launchable CLI tool definition — a shortcut, not a process. */
+export const AgentSchema = z.object({
+  id: z.string().uuid(),
+  /** null = built-in (immutable). */
+  owner_user_id: z.string().uuid().nullable(),
+  name: z.string(),
+  kind: z.string(),
+  command: z.string(),
+  env: z.record(z.string(), z.string()).default({}),
+  install: z.string().nullable().optional(),
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
-export const PresetSchema = z.object({
-  id: z.string().uuid(),
-  owner_user_id: z.string().uuid().nullable(),
-  name: z.string(),
-  agent_kind: z.string(),
-  default_argv: z.array(z.string()),
-  env_template: z.record(z.string(), z.string()).default({}),
-  install: z.string().nullable().optional(),
-});
-export type Preset = z.infer<typeof PresetSchema>;
-
-export interface PresetCreateInput {
+export interface AgentCreateInput {
   name: string;
-  agent_kind: string;
-  default_argv: string[];
-  env_template?: Record<string, string>;
+  kind: string;
+  command: string;
+  env?: Record<string, string>;
   install?: string | null;
 }
 
-export type PresetUpdateInput = Partial<PresetCreateInput>;
+export type AgentUpdateInput = Partial<AgentCreateInput>;
 
 export const SkillSchema = z.object({
   id: z.string().uuid(),
@@ -202,40 +216,41 @@ export interface SkillCreateInput {
 
 export type SkillUpdateInput = Partial<SkillCreateInput>;
 
-export const AgentAccessSchema = z.object({
-  agent_id: z.string().uuid(),
+export const SessionAccessSchema = z.object({
+  session_id: z.string().uuid(),
   skills: z.array(SkillSchema).default([]),
 });
-export type AgentAccess = z.infer<typeof AgentAccessSchema>;
+export type SessionAccess = z.infer<typeof SessionAccessSchema>;
 
-export const LayoutNodeSchema: z.ZodType<import("@/lib/layout").LayoutNode> = z.lazy(() =>
-  z.discriminatedUnion("type", [
-    z.object({ type: z.literal("pane"), agent_id: z.string().uuid() }),
-    z.object({
-      type: z.literal("split"),
-      direction: z.enum(["row", "column"]),
-      ratio: z.number().min(0.05).max(0.95),
-      a: LayoutNodeSchema,
-      b: LayoutNodeSchema,
-    }),
-  ]),
-) as z.ZodType<import("@/lib/layout").LayoutNode>;
-
-export const ScreenLayoutSchema = z.object({
-  root: LayoutNodeSchema.nullable().default(null),
+/** Grid layout v2 (§4.4): a 12×12 canvas of non-overlapping session tiles. */
+export const TileSchema: z.ZodType<Tile> = z.object({
+  session_id: z.string().uuid(),
+  x: z.number().int(),
+  y: z.number().int(),
+  w: z.number().int(),
+  h: z.number().int(),
 });
-export type ScreenLayout = z.infer<typeof ScreenLayoutSchema>;
 
-export const ScreenSchema = z.object({
+export const LayoutV2Schema: z.ZodType<LayoutV2> = z.object({
+  version: z.literal(2),
+  tiles: z.array(TileSchema),
+});
+
+export const WorkspaceSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
-  layout: ScreenLayoutSchema,
-  ephemeral: z.boolean().default(false),
-  pinned_at: z.string().nullable().optional(),
+  layout: LayoutV2Schema,
+  position: z.number().int().default(0),
   created_at: z.string(),
   updated_at: z.string(),
 });
-export type Screen = z.infer<typeof ScreenSchema>;
+export type Workspace = z.infer<typeof WorkspaceSchema>;
+
+export const WorkspaceCreateResultSchema = z.object({
+  workspace: WorkspaceSchema,
+  session: SessionSchema.nullable().default(null),
+});
+export type WorkspaceCreateResult = z.infer<typeof WorkspaceCreateResultSchema>;
 
 export const AuthResponseSchema = z.object({
   access_token: z.string(),
@@ -279,10 +294,14 @@ export const AuthProviderSchema = z.object({
 });
 export type AuthProvider = z.infer<typeof AuthProviderSchema>;
 
-export const AuthProviderListSchema = z.object({
+/** `GET /api/auth/config` — everything the auth/onboarding UI must know. */
+export const AuthConfigSchema = z.object({
   providers: z.array(AuthProviderSchema).default([]),
+  /** True only when the server actually enforces verification (mailer ready). */
+  email_verification_required: z.boolean().default(false),
+  invite_only: z.boolean().default(false),
 });
-export type AuthProviderList = z.infer<typeof AuthProviderListSchema>;
+export type AuthConfig = z.infer<typeof AuthConfigSchema>;
 
 export const BrowserDeviceSchema = z.object({
   id: z.string().uuid(),
@@ -352,10 +371,10 @@ export const auth = {
       method: "GET",
       schema: z.object({ user: UserSchema }),
     }),
-  providers: () =>
-    api("/api/auth/providers", {
+  config: () =>
+    api("/api/auth/config", {
       method: "GET",
-      schema: AuthProviderListSchema,
+      schema: AuthConfigSchema,
     }),
   approveDevice: (body: {
     user_code: string;
@@ -400,21 +419,28 @@ export const hosts = {
       schema: HostSchema,
     }),
   remove: (id: string) => api<void>(`/api/hosts/${id}`, { method: "DELETE" }),
-  tools: (id: string) =>
-    api(`/api/hosts/${id}/tools`, {
+  /** Availability of every agent definition on this host. */
+  agents: (id: string) =>
+    api(`/api/hosts/${id}/agents`, {
       method: "GET",
-      schema: HostToolListSchema,
+      schema: HostAgentListSchema,
     }),
-  installTool: (id: string, presetId: string) =>
-    api(`/api/hosts/${id}/tools/${presetId}/install`, {
+  installAgent: (id: string, agentId: string) =>
+    api(`/api/hosts/${id}/agents/${agentId}/install`, {
       method: "POST",
-      schema: HostToolInstallResultSchema,
+      schema: HostAgentInstallResultSchema,
     }),
-  updateToolPolicy: (id: string, presetId: string, body: { auto_update?: boolean }) =>
-    api(`/api/hosts/${id}/tools/${presetId}/policy`, {
+  updateAgentPolicy: (id: string, agentId: string, body: { auto_update?: boolean }) =>
+    api(`/api/hosts/${id}/agents/${agentId}/policy`, {
       method: "PATCH",
       body: JSON.stringify(body),
-      schema: HostToolPolicySchema,
+      schema: HostAgentPolicySchema,
+    }),
+  /** Recently used session directories on this host, newest first (max 8). */
+  recentDirs: (id: string) =>
+    api(`/api/hosts/${id}/recent-dirs`, {
+      method: "GET",
+      schema: RecentDirsSchema,
     }),
 };
 
@@ -462,7 +488,7 @@ export const AdminUserSchema = z.object({
   email_verified_at: z.string().nullable().default(null),
   is_admin: z.boolean().default(false),
   host_count: z.number().int().default(0),
-  agent_count: z.number().int().default(0),
+  session_count: z.number().int().default(0),
   browser_device_count: z.number().int().default(0),
 });
 export type AdminUser = z.infer<typeof AdminUserSchema>;
@@ -601,76 +627,122 @@ export const trust = {
     }),
 };
 
-export const agents = {
-  list: (params?: { host_id?: string; include_archived?: boolean }) => {
+export const sessions = {
+  list: (params?: { host_id?: string }) => {
     const search = new URLSearchParams();
     if (params?.host_id) search.set("host_id", params.host_id);
-    if (params?.include_archived) search.set("include_archived", "true");
     const qs = search.size ? `?${search.toString()}` : "";
-    return api(`/api/agents${qs}`, {
+    return api(`/api/sessions${qs}`, {
       method: "GET",
-      schema: z.array(AgentSchema),
+      schema: z.array(SessionSchema),
     });
   },
   get: (id: string) =>
-    api(`/api/agents/${id}`, {
+    api(`/api/sessions/${id}`, {
       method: "GET",
-      schema: AgentSchema,
+      schema: SessionSchema,
     }),
+  /**
+   * The daemon always spawns the login shell in `cwd` — no argv/env here.
+   * `workspace_id` transactionally appends a tile to that workspace; omit
+   * `tile` to let the server auto-place (§4.4).
+   */
   create: (body: {
-    name?: string;
     host_id: string;
-    preset_id?: string;
     cwd: string;
-    argv?: string[];
-    env?: Record<string, string>;
+    name?: string;
     skill_ids?: string[];
-    create_cwd?: boolean;
+    workspace_id?: string;
+    tile?: { x: number; y: number; w: number; h: number };
   }) =>
+    api("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: SessionSchema,
+    }),
+  update: (id: string, body: { name?: string | null }) =>
+    api(`/api/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: SessionSchema,
+    }),
+  rename: (id: string, name: string | null) => sessions.update(id, { name }),
+  /** Respawns the shell in the session's cwd. */
+  restart: (id: string) =>
+    api(`/api/sessions/${id}/restart`, {
+      method: "POST",
+      body: JSON.stringify({}),
+      schema: SessionSchema,
+    }),
+  /** Kill + hard delete. */
+  remove: (id: string) => api<void>(`/api/sessions/${id}`, { method: "DELETE" }),
+};
+
+export const sessionAccess = {
+  get: (sessionId: string) =>
+    api(`/api/sessions/${sessionId}/access`, {
+      method: "GET",
+      schema: SessionAccessSchema,
+    }),
+  update: (sessionId: string, body: { skill_ids?: string[] }) =>
+    api(`/api/sessions/${sessionId}/access`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: SessionAccessSchema,
+    }),
+};
+
+export const workspaces = {
+  /** Ordered by `position`. */
+  list: () =>
+    api("/api/workspaces", {
+      method: "GET",
+      schema: z.array(WorkspaceSchema),
+    }),
+  get: (id: string) =>
+    api(`/api/workspaces/${id}`, {
+      method: "GET",
+      schema: WorkspaceSchema,
+    }),
+  /** `first_session` atomically creates the workspace plus one full-canvas shell. */
+  create: (body?: {
+    name?: string;
+    first_session?: { host_id: string; cwd: string; skill_ids?: string[] };
+  }) =>
+    api("/api/workspaces", {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+      schema: WorkspaceCreateResultSchema,
+    }),
+  update: (id: string, body: { name?: string; layout?: LayoutV2; position?: number }) =>
+    api(`/api/workspaces/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: WorkspaceSchema,
+    }),
+  /** Kills and deletes every session referenced by its tiles. Confirm first. */
+  remove: (id: string) => api<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
+};
+
+export const agents = {
+  list: () =>
+    api("/api/agents", {
+      method: "GET",
+      schema: z.array(AgentSchema),
+    }),
+  create: (body: AgentCreateInput) =>
     api("/api/agents", {
       method: "POST",
       body: JSON.stringify(body),
       schema: AgentSchema,
     }),
-  update: (id: string, body: { name?: string | null; archived?: boolean; pinned?: boolean }) =>
+  update: (id: string, body: AgentUpdateInput) =>
     api(`/api/agents/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
       schema: AgentSchema,
     }),
-  restart: (id: string, body?: { create_cwd?: boolean }) =>
-    api(`/api/agents/${id}/restart`, {
-      method: "POST",
-      body: JSON.stringify(body ?? {}),
-      schema: AgentSchema,
-    }),
-  rename: (id: string, name: string | null) => agents.update(id, { name }),
-  pin: (id: string) => agents.update(id, { pinned: true }),
-  unpin: (id: string) => agents.update(id, { pinned: false }),
-  archive: (id: string) => agents.update(id, { archived: true }),
-  unarchive: (id: string) => agents.update(id, { archived: false }),
   remove: (id: string) => api<void>(`/api/agents/${id}`, { method: "DELETE" }),
-};
-
-export const presets = {
-  list: () =>
-    api("/api/presets", {
-      method: "GET",
-      schema: z.array(PresetSchema),
-    }),
-  create: (body: PresetCreateInput) =>
-    api("/api/presets", {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: PresetSchema,
-    }),
-  update: (id: string, body: PresetUpdateInput) =>
-    api(`/api/presets/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      schema: PresetSchema,
-    }),
-  remove: (id: string) => api<void>(`/api/presets/${id}`, { method: "DELETE" }),
 };
 
 export const skills = {
@@ -692,54 +764,6 @@ export const skills = {
       schema: SkillSchema,
     }),
   remove: (id: string) => api<void>(`/api/skills/${id}`, { method: "DELETE" }),
-};
-
-export const screens = {
-  list: () =>
-    api("/api/screens", {
-      method: "GET",
-      schema: z.array(ScreenSchema),
-    }),
-  get: (id: string) =>
-    api(`/api/screens/${id}`, {
-      method: "GET",
-      schema: ScreenSchema,
-    }),
-  create: (body: { name: string; layout?: ScreenLayout; ephemeral?: boolean }) =>
-    api("/api/screens", {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: ScreenSchema,
-    }),
-  update: (
-    id: string,
-    body: {
-      name?: string;
-      layout?: ScreenLayout;
-      ephemeral?: boolean;
-      pinned?: boolean;
-    },
-  ) =>
-    api(`/api/screens/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      schema: ScreenSchema,
-    }),
-  remove: (id: string) => api<void>(`/api/screens/${id}`, { method: "DELETE" }),
-};
-
-export const agentAccess = {
-  get: (agentId: string) =>
-    api(`/api/agents/${agentId}/access`, {
-      method: "GET",
-      schema: AgentAccessSchema,
-    }),
-  update: (agentId: string, body: { skill_ids?: string[] }) =>
-    api(`/api/agents/${agentId}/access`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      schema: AgentAccessSchema,
-    }),
 };
 
 export { API_URL };

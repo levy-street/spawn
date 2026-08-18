@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ApiError, auth, type User } from "@/lib/api";
+import { ApiError, auth, type AuthConfig, type User } from "@/lib/api";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses
@@ -25,6 +25,27 @@ export function useAuth() {
 
   return {
     user: q.data?.user ?? null,
+    loading: q.isLoading,
+    error: q.error,
+    refetch: q.refetch,
+  };
+}
+
+/**
+ * `useAuthConfig()` resolves `GET /api/auth/config`: OAuth providers plus the
+ * gates the server actually enforces (email verification, invite-only).
+ * Public endpoint — safe to call signed out (login/signup/onboarding).
+ */
+export function useAuthConfig() {
+  const q = useQuery<AuthConfig>({
+    queryKey: ["auth-config"],
+    queryFn: () => auth.config(),
+    staleTime: 5 * 60_000,
+    retry: 1,
+  });
+
+  return {
+    config: q.data ?? null,
     loading: q.isLoading,
     error: q.error,
     refetch: q.refetch,
